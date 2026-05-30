@@ -31,6 +31,9 @@ This is, deliberately, a **foundational conformance + SDK increment**, larger th
 | Permission | `request_permission` reverse-request handled as request/response; in 3a `PolicyEngine` is auto-approve → reply `selected:<allow option>`. The suspend→`input-required` path is deferred to 3e. |
 | Model | `session/set_model` best-effort: called only if a `model` is configured; an error (builtin OpenAI rejects it) is logged and the agent's default model is used — not a backend failure. |
 | Mode | `session/set_mode` (`read-only`/`auto`/`full-access`) called if `mode` configured; a bad mode id is a hard config error. Mode = agent posture, distinct from `PolicyEngine` (request resolution). |
+| Session id | `AcpBackend` owns a **bridge-`SessionId` ↔ agent-`sessionId` map** `[Cl-major]`. The AGENT mints its `sessionId` via `session/new`; the bridge no longer passes its synthesized id as the ACP session id (the v1 live path did, and never called `session/new` — another latent non-conformance). `session/new` is called **lazily on first `prompt` for a given bridge `SessionId`**; `prompt`/`cancel` translate through the map to the agent id; one ACP session per bridge `SessionId`. |
+| Conformance verification | Conformance is **CI-verifiable via wire-level golden assertions** (the actual JSON bytes our client emits match §11A) + a **captured real-agent frame corpus** replayed through our parser — NOT just the in-process fake agent (which shares the SDK and would not catch a non-conformance) `[Cl-major]`. |
+| Source label | The fan-out/local source label comes from **`cfg.agent.name`** (config), NOT a hardcoded `"kiro"` literal — it is wire-observable (`metadata["a2a-bridge.source"]` + artifact name) and must reflect the real agent `[Cl-major]`. |
 | Conductor | Not in 3a (single client). With the SDK adopted, the conductor fork/no-fork re-eval moves to 3b (registry), where composing multiple agents is the actual question. |
 | Codex transport | **codex-acp (ACP streaming)**, not `codex exec` one-shot. (The `a2a-local-bridge` PoC uses `codex exec`; noted as a reference alternative in §11 Appendix B, not adopted — it would make Codex a non-ACP backend and wouldn't fix the Kiro conformance.) |
 
@@ -71,6 +74,9 @@ resume; the `codex exec` one-shot backend (a possible future alt).
 - **S4 (gated).** Against real `codex-acp`: same round-trip; `session/set_mode` applies; an
   unauthenticated Codex surfaces as `AgentNotAuthenticated`.
 - **S5.** `bridge-core`/`bridge-acp` coverage gates hold; no FS/terminal caps advertised.
+- **S6 (conformance, CI).** Wire-golden assertions prove the outbound frames match §11A, and the
+  captured real-agent corpus replays correctly through the parser — conformance is verified in CI,
+  not only by the gated real-agent e2es.
 
 ## 4. Architecture & component changes
 
@@ -105,16 +111,23 @@ AcpBackend (bridge-acp/src/acp_backend.rs)
   Store the agent's `agentCapabilities`/`authMethods`.
 - **authenticate:** if the agent advertised auth methods, call `authenticate{methodId}` with the
   appropriate id (`chatgpt`/`apikey` for Codex); failure → `AgentNotAuthenticated`.
-- **session/new:** `{cwd:<absolute>, mcpServers:[]}` (3a passes no MCP servers); capture
-  `sessionId` (+ reported `modes`/`models`).
+- **session/new (lazy, agent mints the id):** on the FIRST `prompt` for a given bridge
+  `SessionId`, send `{cwd:<absolute>, mcpServers:[]}`; the agent returns its `sessionId`, which
+  `AcpBackend` stores in a `bridge SessionId → agent sessionId` map (+ reported `modes`/`models`).
+  Subsequent `prompt`/`cancel` for that bridge `SessionId` reuse the mapped agent id. `cancel`
+  translates through the map (no-op if no agent session was created). The bridge's synthesized
+  `SessionId` is NEVER sent as the ACP session id `[Cl-major]`.
 - **set_mode/set_model:** if configured (§4 Section-4 rules).
 - **session/prompt:** `{sessionId, prompt:[{type:"text",text:<part text>}...]}`.
 - **streaming:** `session/update` notifications; `agent_message_chunk.content` (a ContentBlock)
   → `Update::Text`. (Other update variants — `agent_thought_chunk`, `tool_call*`,
   `available_commands_update`, `current_mode_update` — are ignored/no-op in 3a, tolerant reader.)
 - **request_permission (reverse REQUEST):** `{sessionId, toolCall, options:[{optionId,name,kind}]}`
-  → `PolicyEngine.decide`; auto-approve → reply `{outcome:{outcome:"selected",optionId:<an
-  allow_once/allow_always option>}}`; on task cancel → `{outcome:{outcome:"cancelled"}}`.
+  → `PolicyEngine.decide`. `PolicyEngine` is option-agnostic (`Approve`/`Deny`); the **handler**
+  owns the option mapping `[Cl-nit]`: on `Approve`, select the first option whose `kind` is
+  `allow_once` (fallback `allow_always`) → `{outcome:{outcome:"selected",optionId}}`; on `Deny`,
+  select a `reject_once`/`reject_always` option (or `{outcome:"cancelled"}` if none); on task
+  cancel → `{outcome:{outcome:"cancelled"}}`.
 - **result:** prompt result `stopReason` (`end_turn`→Done; `cancelled`→cancel completion;
   others→Done) → `Update::Done{stop_reason}`.
 - **cancel:** `session/cancel` notification; the in-flight `session/prompt` returning `cancelled`
@@ -128,6 +141,17 @@ NDJSON on stdout; stderr is captured, never parsed). A reverse `fs/*`/`terminal/
 reply with the SDK's "method not supported" error.
 
 ## 7. Testing
+- **Wire-level golden assertions (the conformance proof)** `[Cl-major]`: assert the **actual JSON
+  bytes** `AcpBackend` emits for `initialize`, `session/new`, `session/prompt`, `session/cancel`,
+  `session/set_mode` match the §11A shapes EXACTLY (e.g. `prompt` is `[{"type":"text",...}]`,
+  `protocolVersion` is integer `1`, methods are `session/set_mode`) — captured from the outbound
+  side, NOT via an SDK round-trip. This is what actually proves conformance; the fake agent below
+  (sharing the SDK) only proves serialization symmetry + orchestration.
+- **Captured real-agent frame corpus** `[Cl-major]`: a small fixture of REAL frames captured from
+  `kiro-cli acp` AND `codex-acp` (including a 0.9.2-era `codex-acp` `session/update` /
+  `request_permission` capture), replayed through `AcpBackend`'s inbound parser, asserting we map
+  them to the right `Update`s / handler replies. Guards against the v1 failure mode (green CI,
+  broken against real agents) and the 0.9.2↔0.12.1 skew.
 - **In-process fake ACP agent** (SDK agent-side connection over in-memory duplex pipes):
   full-lifecycle round-trip (S1); cancel→`cancelled` (S1); `request_permission` round-trip,
   auto-approved (S2); `authenticate` failure→`AgentNotAuthenticated`; `set_mode` applied;
@@ -141,10 +165,19 @@ reply with the SDK's "method not supported" error.
 
 ## 8. Ripple & cleanup
 `KiroBackend`→`AcpBackend`, `kiro.rs`→`acp_backend.rs`; update `main`, the inbound server's
-backend type references, the fan-out `local_kiro_source` naming, and any test constructing
-`KiroBackend`. Remove the old non-conformant scripted-`/bin/sh` Kiro tests (replaced by the
-fake-agent tests). `replay.rs`/`framing.rs` stay (translator test doubles). The 2.6 `AcpBackend`
-(local) source used in fan-out is unaffected behaviorally (same `AgentBackend` contract).
+backend type references, and any test constructing `KiroBackend`. Remove the old non-conformant
+scripted-`/bin/sh` Kiro tests (replaced by the fake-agent + wire-golden tests).
+- **Fan-out source label** `[Cl-major]`: `local_kiro_source` hardcodes `Source::from_stream("kiro",…)`;
+  that literal is wire-observable (`metadata["a2a-bridge.source"]` + `artifact.name`, asserted in
+  `integration_fanout.rs`, `e2e_fanout_bridge.rs`). Change it to `cfg.agent.name` — it stays
+  `"kiro"` for the kiro config (so the existing fan-out tests remain valid) and becomes `"codex"`
+  for a codex config. Thread `agent.name` to where the source is built.
+- `replay.rs`/`framing.rs` stay, but `replay.rs` is explicitly a **translator-only test double**:
+  its NDJSON mimics the OLD (non-conformant) update shape and is NOT ACP-wire `[Cl-minor]`. That's
+  acceptable (it feeds the translator `Update`s, not the wire); add a comment saying so, and do
+  NOT treat its sample frames as a conformance reference (the §7 corpus is the wire reference).
+- The 2.6 `AcpBackend` (local) source used in fan-out is unaffected behaviorally (same
+  `AgentBackend` contract).
 
 ## 9. Forward note
 3b (registry) makes the conductor re-eval and multi-agent wiring; 3c adds Gemini (thin, on this
@@ -159,7 +192,10 @@ receive `session/update`/reverse requests) before building — the plan's first 
 discovery (the verify-then-build gate that worked in 2.5/2.6). Note the **version skew**:
 `codex-acp` links ACP 0.9.2 (`unstable` features); we compile against 0.12.1. The driven methods
 are wire-compatible (§11 A), but `unstable_session_model` gating differs — treat `set_model` as
-best-effort.
+best-effort. Also **verify (don't assume) that real `kiro-cli acp` falls back to local disk when
+we advertise no FS caps** `[Cl-minor]` — the research confirmed this for `codex-acp` only; if
+`kiro-cli` instead requires FS caps or errors, surface it in the S3 gated test and adjust (e.g.
+advertise minimal FS caps for kiro).
 
 ---
 
