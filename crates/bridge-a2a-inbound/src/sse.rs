@@ -63,6 +63,17 @@ pub fn event_to_streamresponse(ev: &Event, task_id: &str, context_id: &str) -> a
             last_chunk: Some(true),
             metadata: None,
         }),
+        // Terminal events are synthesised in Task 2; no SSE frame is emitted here.
+        EventKind::Terminal => a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+            task_id: task_id.to_owned(),
+            context_id: context_id.to_owned(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        }),
     }
 }
 
@@ -73,6 +84,8 @@ pub fn event_to_sse(ev: &Event, task_id: &str, context_id: &str) -> SseEvent {
     let event_name = match ev.kind() {
         EventKind::Status => EVENT_STATUS,
         EventKind::Artifact => EVENT_ARTIFACT,
+        // Terminal events are mapped in Task 2; use status-update as a placeholder.
+        EventKind::Terminal => EVENT_STATUS,
     };
     let data = serde_json::to_string(&sr).expect("a2a::StreamResponse always serializes");
     SseEvent::default().event(event_name).data(data)
