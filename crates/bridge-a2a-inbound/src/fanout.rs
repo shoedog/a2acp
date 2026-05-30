@@ -5,11 +5,13 @@
 //! that source as FAILED after emitting one labeled error frame), and after ALL
 //! sources terminate emits exactly one `Event::terminal(Completed|Failed)`.
 //!
-//! The coordinator is the **sole** sender to `tx`. `SourceCancel` is carried for
-//! Task 6 (cancellation) but unused here.
+//! The coordinator is the **sole** sender to `tx`. For Task 6 (cancellation),
+//! [`run_with_cancel`] adds a cancel watch + per-source `finished` flags so the
+//! server's fan-out supervisor can cancel surviving sources and end with
+//! `Terminal(Canceled)`; `SourceCancel` carries each source's real cancel handle.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bridge_core::domain::PeerTaskId;
@@ -64,7 +66,20 @@ impl Source {
     }
 }
 
-/// Run the N-ary fan-out coordinator.
+/// Why the fan-out coordinator stopped. The cancel supervisor uses this to decide
+/// whether to cancel surviving sources (on caller disconnect).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// All sources ended on their own; a Completed/Failed terminal frame was sent.
+    Ended,
+    /// The receiver was dropped mid-stream (caller disconnected); no terminal frame.
+    Disconnected,
+    /// An external cancel fired; a Canceled terminal frame was sent.
+    Cancelled,
+}
+
+/// Run the N-ary fan-out coordinator (no external cancellation — the legacy
+/// 2-arg entry point used by the coordinator unit tests).
 ///
 /// For each source, the inner stream is transformed so that:
 ///   * `Ok(ev)` yields `Ok(ev.with_source(id))`;
@@ -78,16 +93,46 @@ impl Source {
 /// exhausted, exactly one `Ok(Event::terminal(..))` is sent: `Completed` if any
 /// source succeeded, else `Failed`.
 pub async fn run(sources: Vec<Source>, tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>) {
+    // No external cancellation: a watch that never fires and per-source flags
+    // nobody observes. The terminal frame is Completed/Failed as before.
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let finished = sources
+        .iter()
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect();
+    run_with_cancel(sources, tx, cancel_rx, finished).await;
+}
+
+/// Run the fan-out coordinator with external cancellation (Task 6).
+///
+/// `cancel_rx` is a watch flag: when it becomes `true`, the coordinator stops
+/// merging and emits exactly one `Event::terminal(Canceled)` (instead of the
+/// usual Completed/Failed). `finished[i]` is set to `true` the moment source `i`'s
+/// stream ENDS (clean or degraded) — the cancel supervisor reads these flags so
+/// an already-finished source is a cancel no-op. Sources are consumed in order, so
+/// `finished[i]` corresponds to `sources[i]`.
+pub async fn run_with_cancel(
+    sources: Vec<Source>,
+    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    finished: Vec<Arc<AtomicBool>>,
+) -> RunOutcome {
     let total = sources.len();
     // Shared failure counter, incremented as each source ends FAILED.
     let failures = Arc::new(AtomicUsize::new(0));
 
     let mut per_source = Vec::with_capacity(total);
-    for source in sources {
-        let Source { id, stream, .. } = source; // `cancel` carried for Task 6.
+    for (idx, source) in sources.into_iter().enumerate() {
+        let Source { id, stream, .. } = source; // `cancel` extracted by the supervisor.
         let failures = Arc::clone(&failures);
+        // The per-source "finished" flag, flipped when this source's stream ends.
+        let done = finished
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         // Per-source transformed stream: stamps source id, degrades on first
-        // error (emit one labeled frame, then stop, recording failure).
+        // error (emit one labeled frame, then stop, recording failure), and sets
+        // its `finished` flag on end.
         let s = async_stream::stream! {
             let mut inner = stream;
             while let Some(item) = inner.next().await {
@@ -100,16 +145,48 @@ pub async fn run(sources: Vec<Source>, tx: tokio::sync::mpsc::Sender<Result<Even
                     }
                 }
             }
+            done.store(true, Ordering::SeqCst);
         };
         per_source.push(Box::pin(s) as Pin<Box<dyn Stream<Item = _> + Send>>);
     }
 
-    // Merge and forward every item; coordinator is the sole sender.
+    // Merge and forward every item; coordinator is the sole sender. A cancel
+    // signal interrupts the merge and ends with a Canceled terminal frame.
     let mut merged = select_all(per_source);
-    while let Some(item) = merged.next().await {
-        if tx.send(item).await.is_err() {
-            return; // receiver dropped; nothing more to do.
+    // If cancel is already latched, skip straight to the Canceled terminal.
+    let mut cancelled = *cancel_rx.borrow();
+    while !cancelled {
+        tokio::select! {
+            item = merged.next() => {
+                match item {
+                    Some(item) => {
+                        if tx.send(item).await.is_err() {
+                            // Receiver dropped mid-stream: caller disconnected.
+                            return RunOutcome::Disconnected;
+                        }
+                    }
+                    None => break, // all sources ended.
+                }
+            }
+            // Caller disconnected even while ALL sources are IDLE (no send would
+            // otherwise observe the drop). We own `tx`, so this fires exactly when
+            // the SSE receiver is gone.
+            _ = tx.closed() => {
+                return RunOutcome::Disconnected;
+            }
+            changed = cancel_rx.changed() => {
+                // Sender dropped or flag flipped; re-read to decide.
+                if changed.is_err() || *cancel_rx.borrow() {
+                    cancelled = true;
+                }
+            }
         }
+    }
+
+    if cancelled {
+        // Cancelled: exactly one terminal Canceled frame.
+        let _ = tx.send(Ok(Event::terminal(TaskOutcome::Canceled))).await;
+        return RunOutcome::Cancelled;
     }
 
     // All sources ended: emit exactly one terminal event.
@@ -120,6 +197,7 @@ pub async fn run(sources: Vec<Source>, tx: tokio::sync::mpsc::Sender<Result<Even
         TaskOutcome::Failed
     };
     let _ = tx.send(Ok(Event::terminal(outcome))).await;
+    RunOutcome::Ended
 }
 
 #[cfg(test)]
