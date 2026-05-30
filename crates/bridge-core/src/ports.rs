@@ -70,6 +70,11 @@ pub trait SessionStore: Send + Sync {
     async fn request_cancel(&self, task: &TaskId) -> Result<(), BridgeError>;
     /// Returns `true` if `request_cancel` has been called for this task.
     async fn cancel_requested(&self, task: &TaskId) -> Result<bool, BridgeError>;
+    /// Mark this task as a fan-out task (idempotent). Required to distinguish
+    /// fan-out tasks from plain delegate tasks (which also have a peer id).
+    async fn set_fanout(&self, task: &TaskId) -> Result<(), BridgeError>;
+    /// Returns `true` if `set_fanout` has been called for this task.
+    async fn is_fanout(&self, task: &TaskId) -> Result<bool, BridgeError>;
 }
 
 /// Sync routing decision — no async needed; plain fn.
@@ -113,6 +118,7 @@ mod tests {
         pending: std::sync::Mutex<std::collections::HashMap<String, PendingRequest>>,
         peer_tasks: std::sync::Mutex<std::collections::HashMap<String, PeerTaskId>>,
         cancels: std::sync::Mutex<std::collections::HashSet<String>>,
+        fanouts: std::sync::Mutex<std::collections::HashSet<String>>,
     }
     impl FakeStore {
         fn new() -> Self {
@@ -121,6 +127,7 @@ mod tests {
                 pending: Default::default(),
                 peer_tasks: Default::default(),
                 cancels: Default::default(),
+                fanouts: Default::default(),
             }
         }
     }
@@ -167,6 +174,13 @@ mod tests {
         }
         async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
             Ok(self.cancels.lock().unwrap().contains(t.as_str()))
+        }
+        async fn set_fanout(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.fanouts.lock().unwrap().insert(t.as_str().into());
+            Ok(())
+        }
+        async fn is_fanout(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(self.fanouts.lock().unwrap().contains(t.as_str()))
         }
     }
 
@@ -259,5 +273,17 @@ mod tests {
         let _ = SessionContext::test();
         let _ = InboundRequest::anon();
         let _ = InboundRequest::with_token("tok");
+    }
+
+    #[tokio::test]
+    async fn store_fanout_marker_roundtrips() {
+        let st = FakeStore::new();
+        let t = TaskId::parse("t-fanout").unwrap();
+        assert!(!st.is_fanout(&t).await.unwrap());
+        st.set_fanout(&t).await.unwrap();
+        assert!(st.is_fanout(&t).await.unwrap());
+        // Idempotent: setting again must not fail.
+        st.set_fanout(&t).await.unwrap();
+        assert!(st.is_fanout(&t).await.unwrap());
     }
 }

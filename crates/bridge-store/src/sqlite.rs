@@ -35,7 +35,8 @@ impl SqliteStore {
                 pending_kind TEXT,
                 created_at INTEGER NOT NULL DEFAULT 0,
                 peer_task_id TEXT,
-                cancel_requested INTEGER NOT NULL DEFAULT 0
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                fanout INTEGER NOT NULL DEFAULT 0
             );",
         )
         .map_err(|_| BridgeError::StoreFailure)
@@ -189,6 +190,34 @@ impl SessionStore for SqliteStore {
             }
         }
     }
+
+    async fn set_fanout(&self, task: &TaskId) -> Result<(), BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions(task_id, fanout) VALUES(?1, 1)
+             ON CONFLICT(task_id) DO UPDATE SET fanout = 1",
+            rusqlite::params![task.as_str()],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(())
+    }
+
+    async fn is_fanout(&self, task: &TaskId) -> Result<bool, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT fanout FROM sessions WHERE task_id = ?1")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![task.as_str()])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        match rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            None => Ok(false),
+            Some(row) => {
+                let flag: i64 = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+                Ok(flag != 0)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +302,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(s.take_pending(&t).await.unwrap().unwrap().request_id, "r2");
+    }
+
+    #[tokio::test]
+    async fn task_mode_roundtrips() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let t = TaskId::parse("t").unwrap();
+        assert!(!s.is_fanout(&t).await.unwrap());
+        s.set_fanout(&t).await.unwrap();
+        assert!(s.is_fanout(&t).await.unwrap());
     }
 }

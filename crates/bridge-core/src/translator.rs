@@ -298,6 +298,12 @@ mod tests {
         async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
             Ok(self.cancels.lock().unwrap().contains(t.as_str()))
         }
+        async fn set_fanout(&self, _t: &TaskId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn is_fanout(&self, _t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(false)
+        }
     }
 
     // approves non-interactive, denies interactive (mirrors AutoPolicy)

@@ -484,6 +484,10 @@ fn spawn_fanout_producer(
     let auth = routed.auth;
 
     tokio::spawn(async move {
+        // Mark this task as a fan-out task so Task 6 (cancel_task) can distinguish
+        // it from a plain delegate (which also has a peer id in the store).
+        let _ = store.set_fanout(&task).await;
+
         // 1. Build the local Kiro source.
         let kiro_source =
             local_kiro_source(backend, store, policy, task.clone(), session, parts.clone());
@@ -549,11 +553,16 @@ async fn unary_message(
     };
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
+    // Fan-out unary: collect all fanout::run events and build an a2a::Task
+    // response with both labeled artifacts.
+    if let RouteTarget::Fanout = routed.target {
+        return unary_fanout_message(srv, id, routed).await;
+    }
+
     // Collect the same event stream the streaming path produces, into one JSON
     // response. Local drives the translator; Delegate drives the delegation.
-    // Fan-out is not supported in unary mode; fall back to local.
     let collected: Vec<Result<Event, BridgeError>> = match routed.target {
-        RouteTarget::Local(_) | RouteTarget::Fanout => {
+        RouteTarget::Local(_) => {
             let translator = Translator::new();
             translator
                 .run(
@@ -606,6 +615,8 @@ async fn unary_message(
                 Err(e) => vec![Err(e)],
             }
         }
+        // Fanout handled above; this arm is unreachable.
+        RouteTarget::Fanout => unreachable!("fanout handled by unary_fanout_message"),
     };
 
     // Surface a terminal error if the pipeline failed/suspended.
@@ -631,6 +642,117 @@ async fn unary_message(
         "status": status_chunks,
     });
     jsonrpc_ok(id, result)
+}
+
+/// Unary fan-out path: run both sources concurrently via `fanout::run`, collect
+/// all events, then build an `a2a::Task` response with one `Artifact` per source.
+async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: RoutedCall) -> Response {
+    // Mark the task as fanout so Task 6 (cancel_task) can distinguish it.
+    let _ = srv.store.set_fanout(&routed.task).await;
+
+    // Build the local Kiro source.
+    let kiro_source = local_kiro_source(
+        srv.backend.clone(),
+        srv.store.clone(),
+        srv.policy.clone(),
+        routed.task.clone(),
+        routed.session.clone(),
+        routed.parts.clone(),
+    );
+
+    // Build the peer source by opening delegation.
+    let peer_source = match srv
+        .delegation
+        .delegate(&routed.auth, &routed.task, routed.parts)
+        .await
+    {
+        Ok(d) => Source::from_stream(
+            "peer",
+            d.events,
+            SourceCancel::Peer {
+                peer_task: d.peer_task,
+            },
+        ),
+        Err(e) => {
+            let (_, dummy_rx) = tokio::sync::watch::channel::<Option<PeerTaskId>>(None);
+            Source::failed(
+                "peer",
+                e,
+                SourceCancel::Peer {
+                    peer_task: dummy_rx,
+                },
+            )
+        }
+    };
+
+    // Drain all fanout events synchronously via an mpsc channel.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Event, BridgeError>>(64);
+    let run_handle = tokio::spawn(async move {
+        fanout::run(vec![kiro_source, peer_source], tx).await;
+    });
+
+    let mut all_events: Vec<Event> = Vec::new();
+    let mut terminal_outcome = TaskOutcome::Completed;
+    while let Some(item) = rx.recv().await {
+        match item {
+            Ok(ev) => {
+                if ev.kind() == &EventKind::Terminal {
+                    if let Some(o) = ev.outcome() {
+                        terminal_outcome = o;
+                    }
+                } else {
+                    all_events.push(ev);
+                }
+            }
+            Err(e) => return bridge_err_to_jsonrpc(id, &e),
+        }
+    }
+    let _ = run_handle.await;
+
+    // Build one a2a::Artifact per source from the collected artifact events.
+    let artifacts: Vec<a2a::Artifact> = all_events
+        .iter()
+        .filter(|e| e.kind() == &EventKind::Artifact)
+        .map(|e| {
+            let name = e.source().map(|s| s.to_owned());
+            a2a::Artifact {
+                artifact_id: a2a::new_artifact_id(),
+                name,
+                description: None,
+                parts: vec![a2a::Part::text(e.text())],
+                metadata: None,
+                extensions: None,
+            }
+        })
+        .collect();
+
+    let state = match terminal_outcome {
+        TaskOutcome::Completed => a2a::TaskState::Completed,
+        TaskOutcome::Failed => a2a::TaskState::Failed,
+        TaskOutcome::Canceled => a2a::TaskState::Canceled,
+    };
+
+    let task = a2a::Task {
+        id: routed.task.as_str().to_owned(),
+        context_id: routed.task.as_str().to_owned(),
+        status: a2a::TaskStatus {
+            state,
+            message: None,
+            timestamp: None,
+        },
+        artifacts: if artifacts.is_empty() {
+            None
+        } else {
+            Some(artifacts)
+        },
+        history: None,
+        metadata: None,
+    };
+
+    jsonrpc_ok(
+        id,
+        serde_json::to_value(&task).expect("a2a::Task serializes"),
+    )
 }
 
 /// `CancelTask` -> propagate cancel to the backend for the task's session.
@@ -1035,6 +1157,7 @@ mod tests {
         map: Mutex<std::collections::HashMap<String, String>>,
         peer_tasks: Mutex<std::collections::HashMap<String, PeerTaskId>>,
         cancels: Mutex<std::collections::HashSet<String>>,
+        fanouts: Mutex<std::collections::HashSet<String>>,
     }
     #[async_trait::async_trait]
     impl SessionStore for FakeStore {
@@ -1075,6 +1198,13 @@ mod tests {
         }
         async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
             Ok(self.cancels.lock().unwrap().contains(t.as_str()))
+        }
+        async fn set_fanout(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.fanouts.lock().unwrap().insert(t.as_str().into());
+            Ok(())
+        }
+        async fn is_fanout(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(self.fanouts.lock().unwrap().contains(t.as_str()))
         }
     }
 
@@ -1815,6 +1945,112 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("condition not met within budget");
+    }
+
+    // ---- Task 5b: explicit fan-out task-mode marker + unary fan-out Task shape ----
+
+    #[tokio::test]
+    async fn unary_fanout_returns_task_with_both_artifacts() {
+        // FakeBackend yields Text("KA") + Done -> kiro artifact "KA".
+        // FakeDelegation yields artifact("PA") -> peer artifact "PA".
+        // RouteTarget::Fanout via FanoutSkillRoute("fan-out").
+        // The unary response must be a JSON-RPC result whose result is an a2a::Task
+        // with status.state==Completed and artifacts: [{name:"kiro", text:"KA"}, {name:"peer", text:"PA"}].
+        struct KiroABackend;
+        #[async_trait::async_trait]
+        impl AgentBackend for KiroABackend {
+            async fn prompt(
+                &self,
+                _s: &SessionId,
+                _p: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                let updates = vec![
+                    Ok(Update::Text("KA".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ];
+                Ok(Box::pin(tokio_stream::iter(updates)))
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+        let deleg = FakeDelegation::new(vec![Ok(Event::artifact("PA"))], Some("p1"));
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(Arc::new(KiroABackend), store.clone(), deleg);
+
+        let resp = router(srv)
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("unary fanout response must be valid JSON: {e}: {body}"));
+        // Must be a JSON-RPC success (no error).
+        assert!(v.get("error").is_none(), "expected no error: {body}");
+        let result = &v["result"];
+        // The result IS the a2a::Task directly (contextId, id, status, artifacts).
+        // result.status.state must be Completed.
+        let state = result["status"]["state"].as_str().unwrap_or("");
+        assert_eq!(
+            state, "TASK_STATE_COMPLETED",
+            "status.state must be 'TASK_STATE_COMPLETED': {body}"
+        );
+        // result.artifacts must have 2 entries.
+        let artifacts = result["artifacts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("result.artifacts must be an array: {body}"));
+        assert_eq!(artifacts.len(), 2, "must have exactly 2 artifacts: {body}");
+        // Check that there is one artifact named "kiro" with text "KA" and one named "peer" with text "PA".
+        let names: Vec<&str> = artifacts
+            .iter()
+            .filter_map(|a| a["name"].as_str())
+            .collect();
+        assert!(names.contains(&"kiro"), "must have kiro artifact: {body}");
+        assert!(names.contains(&"peer"), "must have peer artifact: {body}");
+        let kiro_art = artifacts.iter().find(|a| a["name"] == "kiro").unwrap();
+        let kiro_text = kiro_art["parts"][0]["text"].as_str().unwrap_or("");
+        assert_eq!(kiro_text, "KA", "kiro artifact text must be 'KA': {body}");
+        let peer_art = artifacts.iter().find(|a| a["name"] == "peer").unwrap();
+        let peer_text = peer_art["parts"][0]["text"].as_str().unwrap_or("");
+        assert_eq!(peer_text, "PA", "peer artifact text must be 'PA': {body}");
+        // Also verify is_fanout was set on the task in the store.
+        let task_id = TaskId::parse("task-1").unwrap();
+        assert!(
+            store.is_fanout(&task_id).await.unwrap(),
+            "store must mark task-1 as fanout after unary fanout dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_single_source_response_unchanged() {
+        // Regression: plain (non-fanout) unary SendMessage still returns the legacy shape.
+        // The existing unary_send_message_returns_artifact test expects result.artifact.text == "PONG".
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        // Legacy shape: result.artifact.text, not result.task.artifacts.
+        assert_eq!(
+            v["result"]["artifact"]["text"], "PONG",
+            "single-source unary shape unchanged: {body}"
+        );
+        // Must NOT have result.artifacts (that's only the fan-out shape).
+        // In the legacy shape, result has "task" (with id+state), "artifact" (with text), "status".
+        assert!(
+            v["result"]["artifacts"].is_null(),
+            "single-source must not have result.artifacts (fan-out only): {body}"
+        );
     }
 
     // ---- Task 5a: fan-out streaming dispatch ----

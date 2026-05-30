@@ -273,6 +273,12 @@ mod tests {
         async fn cancel_requested(&self, _t: &TaskId) -> Result<bool, BridgeError> {
             Ok(false)
         }
+        async fn set_fanout(&self, _t: &TaskId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn is_fanout(&self, _t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(false)
+        }
     }
 
     struct AutoApprove;
