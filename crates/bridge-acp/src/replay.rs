@@ -20,7 +20,7 @@ impl ReplayBackend {
     }
 }
 
-fn frame_to_update(v: serde_json::Value) -> Option<Update> {
+pub(crate) fn frame_to_update(v: serde_json::Value) -> Option<Update> {
     if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
         match method {
             "session/update" => {
