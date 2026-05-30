@@ -1,0 +1,14 @@
+/Users/wesleyjinks/code/a2a-bridge/target/debug/deps/libthiserror-2a6a032935fc546e.rmeta: /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/lib.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/aserror.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/display.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/var.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/private.rs /Users/wesleyjinks/code/a2a-bridge/target/debug/build/thiserror-31bf819e69a6e0a3/out/private.rs
+
+/Users/wesleyjinks/code/a2a-bridge/target/debug/deps/libthiserror-2a6a032935fc546e.rlib: /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/lib.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/aserror.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/display.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/var.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/private.rs /Users/wesleyjinks/code/a2a-bridge/target/debug/build/thiserror-31bf819e69a6e0a3/out/private.rs
+
+/Users/wesleyjinks/code/a2a-bridge/target/debug/deps/thiserror-2a6a032935fc546e.d: /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/lib.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/aserror.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/display.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/var.rs /Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/private.rs /Users/wesleyjinks/code/a2a-bridge/target/debug/build/thiserror-31bf819e69a6e0a3/out/private.rs
+
+/Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/lib.rs:
+/Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/aserror.rs:
+/Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/display.rs:
+/Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/var.rs:
+/Users/wesleyjinks/.cargo/registry/src/index.crates.io-6f17d22bba15001f/thiserror-2.0.18/src/private.rs:
+/Users/wesleyjinks/code/a2a-bridge/target/debug/build/thiserror-31bf819e69a6e0a3/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/wesleyjinks/code/a2a-bridge/target/debug/build/thiserror-31bf819e69a6e0a3/out

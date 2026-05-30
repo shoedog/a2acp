@@ -39,15 +39,25 @@ accepted findings are folded in below and noted inline as `[Codex N]` / `[Claude
 ### 2.1 A2A version + wire binding (resolves the stale-API blocker) `[Codex 1]`
 
 v1 pins **A2A protocol v1** and adopts its current wire binding by depending on the official
-`a2aproject/a2a-rs` crate's **generated ProtoJSON types** rather than hand-writing wire types
-(v3 §6.1, schema-first). The bridge therefore speaks the current operation surface —
-`message:send`, `message:stream`, `tasks/{id}:get`, `tasks/{id}:cancel`,
-`tasks/{id}:subscribe` — and the ProtoJSON state enums (`TASK_STATE_SUBMITTED`,
-`TASK_STATE_WORKING`, `TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_AUTH_REQUIRED`,
-`TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`). The Agent Card is
-published at `/.well-known/agent-card.json`. The supported `A2A-Version` is pinned and
-asserted at the inbound boundary; unknown versions fail loudly with a structured error.
-All golden fixtures (§10) are generated against this pinned binding.
+`a2aproject/a2a-rs` crate (crates.io package **`a2a-lf` =0.3.0**, imported as `a2a`,
+Apache-2.0) for its generated ProtoJSON types rather than hand-writing wire types (v3 §6.1,
+schema-first). **Verified SDK names (2026-05-30; see ADR-003):** the JSON-RPC methods are
+PascalCase — **`SendMessage`**, **`SendStreamingMessage`**, **`GetTask`**, **`CancelTask`**,
+**`SubscribeToTask`** (earlier drafts used informal colon-shorthand like `message:send`; the
+wire names are the PascalCase forms above). The `TaskState` ProtoJSON values are
+`TASK_STATE_SUBMITTED/WORKING/INPUT_REQUIRED/AUTH_REQUIRED/COMPLETED/FAILED/CANCELED`, **plus
+two the bridge must also handle: `TASK_STATE_REJECTED` (→ our `RejectRequest` disposition)
+and `TASK_STATE_UNSPECIFIED` (treated as a protocol error)**. The Agent Card is published at
+`/.well-known/agent-card.json`. The supported `A2A-Version` is pinned and asserted at the
+inbound boundary; unknown versions fail loudly with a structured error. All golden fixtures
+(§10) are generated against this pinned binding.
+
+The ACP SDK is **`agent-client-protocol` =0.12.1** (Apache-2.0). Verified note: its permission
+method is **`request_permission`** (not `session/request_permission`); semantics unchanged.
+
+The inbound A2A server may be built on the official **`a2a-server-lf`** crate (axum-based,
+same workspace) rather than hand-rolled axum endpoints — decided at implementation time
+(Task 13) behind the `InboundTransport` seam; hand-rolled axum is the fallback.
 
 ## 3. Scope
 

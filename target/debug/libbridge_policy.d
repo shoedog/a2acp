@@ -1,0 +1,1 @@
+/Users/wesleyjinks/code/a2a-bridge/target/debug/libbridge_policy.rlib: /Users/wesleyjinks/code/a2a-bridge/crates/bridge-core/src/lib.rs /Users/wesleyjinks/code/a2a-bridge/crates/bridge-policy/src/lib.rs
