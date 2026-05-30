@@ -84,6 +84,41 @@ impl A2aClient {
             .map_err(|_| BridgeError::UpstreamA2aError)
     }
 
+    /// POST a `CancelTask` JSON-RPC request to the peer.
+    ///
+    /// Builds a `CancelTaskRequest` with the given `peer_task_id`, wraps it in
+    /// a JSON-RPC request, and POSTs it to the peer. Non-2xx or transport
+    /// errors are mapped to `UpstreamA2aError`.
+    pub async fn cancel(&self, peer_task_id: &str) -> Result<(), BridgeError> {
+        let params = a2a::CancelTaskRequest {
+            id: peer_task_id.to_string(),
+            metadata: None,
+            tenant: None,
+        };
+
+        let rpc = a2a::JsonRpcRequest::new(
+            a2a::JsonRpcId::String("cancel-1".into()),
+            a2a::methods::CANCEL_TASK,
+            Some(serde_json::to_value(&params).map_err(|_| BridgeError::UpstreamA2aError)?),
+        );
+
+        let resp = self
+            .http
+            .post(&self.url)
+            .bearer_auth(&self.bearer)
+            .header(a2a::SVC_PARAM_VERSION, a2a::VERSION)
+            .json(&rpc)
+            .send()
+            .await
+            .map_err(|_| BridgeError::UpstreamA2aError)?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(BridgeError::UpstreamA2aError)
+        }
+    }
+
     /// Open a streaming connection to the peer, parse the SSE body, and return
     /// a `Stream<Result<Event, BridgeError>>` plus a watch receiver for the
     /// peer task id captured from the first response event.
