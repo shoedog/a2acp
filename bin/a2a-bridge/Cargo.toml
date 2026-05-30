@@ -17,4 +17,10 @@ bridge-store = { path = "../../crates/bridge-store" }
 bridge-policy = { path = "../../crates/bridge-policy" }
 bridge-observ = { path = "../../crates/bridge-observ" }
 tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
