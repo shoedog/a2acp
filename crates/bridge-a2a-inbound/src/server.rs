@@ -195,8 +195,10 @@ async fn stream_message(
     let backend = srv.backend.clone();
     let store = srv.store.clone();
     let policy = srv.policy.clone();
-    let task = routed.task.clone();
-    let session = routed.session.clone();
+    // Extract task_id_str before routed fields are moved into the spawn.
+    let task_id_str = routed.task.as_str().to_owned();
+    let task = routed.task;
+    let session = routed.session;
     let parts = routed.parts;
 
     tokio::spawn(async move {
@@ -218,7 +220,9 @@ async fn stream_message(
         // Channel closes on drop -> SSE stream terminates after the final flush.
     });
 
-    let sse_stream = sse_event_stream(rx);
+    // Use the task id as the context id for now (consistent within a single stream).
+    let context_id_str = task_id_str.clone();
+    let sse_stream = sse_event_stream(rx, task_id_str, context_id_str);
     Sse::new(sse_stream)
         .keep_alive(KeepAlive::default())
         .into_response()
@@ -229,10 +233,12 @@ async fn stream_message(
 /// single `error` frame so the client sees a terminal signal.
 fn sse_event_stream(
     rx: tokio::sync::mpsc::Receiver<Result<Event, BridgeError>>,
+    task_id: String,
+    context_id: String,
 ) -> impl Stream<Item = Result<SseEvent, std::convert::Infallible>> {
-    tokio_stream::wrappers::ReceiverStream::new(rx).map(|item| {
+    tokio_stream::wrappers::ReceiverStream::new(rx).map(move |item| {
         let frame = match item {
-            Ok(ev) => event_to_sse(&ev),
+            Ok(ev) => event_to_sse(&ev, &task_id, &context_id),
             Err(e) => SseEvent::default()
                 .event("error")
                 .json_data(json!({ "kind": "error", "text": e.to_string() }))
@@ -670,6 +676,14 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    /// Extract all `data:` payloads from an SSE body (one per line starting with "data: ").
+    fn sse_data_payloads(body: &str) -> Vec<String> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|s| s.trim_end_matches('\r').to_owned())
+            .collect()
+    }
+
     #[tokio::test]
     async fn streaming_message_yields_artifact_event() {
         let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
@@ -683,6 +697,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
+        // The SSE event: field names are still present.
         assert!(
             body.contains("artifact-update"),
             "SSE body should contain an artifact frame: {body}"
@@ -690,6 +705,17 @@ mod tests {
         assert!(
             body.contains("PONG"),
             "artifact should carry the text: {body}"
+        );
+        // The data: payloads must parse as real a2a::StreamResponse — conformance check.
+        let payloads = sse_data_payloads(&body);
+        assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
+        let last = payloads.last().unwrap();
+        let sr: a2a::StreamResponse = serde_json::from_str(last).unwrap_or_else(|e| {
+            panic!("last data payload must parse as StreamResponse: {e}: {last}")
+        });
+        assert!(
+            matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
+            "final frame must be ArtifactUpdate: {last}"
         );
     }
 
@@ -715,6 +741,19 @@ mod tests {
                 "artifact must be the final frame: {body}"
             );
         }
+        // All data: payloads must parse as a2a::StreamResponse (wire-conformance).
+        let payloads = sse_data_payloads(&body);
+        for payload in &payloads {
+            let _: a2a::StreamResponse = serde_json::from_str(payload).unwrap_or_else(|e| {
+                panic!("data payload must parse as StreamResponse: {e}: {payload}")
+            });
+        }
+        // The last parsed payload must be ArtifactUpdate.
+        let last_sr: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap()).unwrap();
+        assert!(
+            matches!(last_sr, a2a::StreamResponse::ArtifactUpdate(_)),
+            "final frame must be ArtifactUpdate"
+        );
     }
 
     #[tokio::test]

@@ -1,43 +1,81 @@
-// sse.rs — translate pipeline `Event`s into A2A-shaped SSE frames.
+// sse.rs — translate pipeline `Event`s into real A2A `StreamResponse` SSE frames.
 //
 // The streaming A2A methods (`SendStreamingMessage`, `SubscribeToTask`) emit a
 // Server-Sent-Events stream. Each `bridge_core::translator::Event` becomes one
-// SSE frame whose `event:` field names the A2A event kind (`status-update` for
-// coalesced text, `artifact-update` for the final artifact) and whose `data:`
-// field carries a JSON-RPC-shaped payload with the text. The final flush — the
-// Artifact event — is always the last frame the stream yields (the translator
-// guarantees ordering; we preserve it here).
+// SSE frame whose `data:` field carries a JSON-serialized `a2a::StreamResponse`,
+// making our inbound stream parseable by any A2A-conformant client (including
+// our own outbound client). This closes the v1 wire-conformance gap.
+//
+// Design: `event_to_streamresponse` is the pure, testable seam that constructs
+// the correct `a2a::StreamResponse` variant; `event_to_sse` is a thin wrapper
+// that serialises the response and wraps it in an `axum::response::sse::Event`.
 
 use axum::response::sse::Event as SseEvent;
 use bridge_core::translator::{Event, EventKind};
-use serde_json::json;
 
 /// A2A SSE `event:` name for a coalesced text/status chunk.
 pub const EVENT_STATUS: &str = "status-update";
 /// A2A SSE `event:` name for the final artifact frame.
 pub const EVENT_ARTIFACT: &str = "artifact-update";
 
-/// Convert one pipeline [`Event`] into an SSE frame.
+/// Pure mapping from a pipeline [`Event`] to a real [`a2a::StreamResponse`].
 ///
-/// The `data` payload is a small JSON object `{ "kind", "text", "final" }`:
-/// `kind` echoes the event name, `text` is the chunk/artifact text, and
-/// `final` is `true` only for the artifact frame so clients can detect the
-/// terminal flush without buffering the whole stream.
-pub fn event_to_sse(ev: &Event) -> SseEvent {
-    let (name, is_final) = match ev.kind() {
-        EventKind::Status => (EVENT_STATUS, false),
-        EventKind::Artifact => (EVENT_ARTIFACT, true),
+/// * A `Status` event becomes a `StreamResponse::StatusUpdate` carrying the
+///   chunk text in a `Working` task status with an agent message.
+/// * An `Artifact` event becomes a `StreamResponse::ArtifactUpdate` with
+///   `last_chunk: Some(true)` so clients can detect the terminal flush.
+pub fn event_to_streamresponse(ev: &Event, task_id: &str, context_id: &str) -> a2a::StreamResponse {
+    match ev.kind() {
+        EventKind::Status => {
+            let message = a2a::Message {
+                message_id: a2a::new_message_id(),
+                context_id: Some(context_id.to_owned()),
+                task_id: Some(task_id.to_owned()),
+                role: a2a::Role::Agent,
+                parts: vec![a2a::Part::text(ev.text())],
+                metadata: None,
+                extensions: None,
+                reference_task_ids: None,
+            };
+            a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+                task_id: task_id.to_owned(),
+                context_id: context_id.to_owned(),
+                status: a2a::TaskStatus {
+                    state: a2a::TaskState::Working,
+                    message: Some(message),
+                    timestamp: None,
+                },
+                metadata: None,
+            })
+        }
+        EventKind::Artifact => a2a::StreamResponse::ArtifactUpdate(a2a::TaskArtifactUpdateEvent {
+            task_id: task_id.to_owned(),
+            context_id: context_id.to_owned(),
+            artifact: a2a::Artifact {
+                artifact_id: a2a::new_artifact_id(),
+                name: Some("output".into()),
+                description: None,
+                parts: vec![a2a::Part::text(ev.text())],
+                metadata: None,
+                extensions: None,
+            },
+            append: None,
+            last_chunk: Some(true),
+            metadata: None,
+        }),
+    }
+}
+
+/// Convert one pipeline [`Event`] into an SSE frame carrying a real
+/// `a2a::StreamResponse` as the `data:` JSON payload.
+pub fn event_to_sse(ev: &Event, task_id: &str, context_id: &str) -> SseEvent {
+    let sr = event_to_streamresponse(ev, task_id, context_id);
+    let event_name = match ev.kind() {
+        EventKind::Status => EVENT_STATUS,
+        EventKind::Artifact => EVENT_ARTIFACT,
     };
-    let payload = json!({
-        "kind": name,
-        "text": ev.text(),
-        "final": is_final,
-    });
-    // `json_data` serializes the value and sets it as the `data:` field.
-    SseEvent::default()
-        .event(name)
-        .json_data(payload)
-        .expect("serde_json::Value always serializes")
+    let data = serde_json::to_string(&sr).expect("a2a::StreamResponse always serializes");
+    SseEvent::default().event(event_name).data(data)
 }
 
 #[cfg(test)]
@@ -49,6 +87,89 @@ mod tests {
     use bridge_core::translator::Translator;
     use futures::StreamExt;
     use std::sync::Mutex;
+
+    // ---- TDD: pure function tests (no need to parse axum SseEvent internals) ----
+
+    #[test]
+    fn status_event_serializes_as_streamresponse_statusupdate() {
+        let sr = event_to_streamresponse(&Event::status("hello"), "task-1", "ctx-1");
+        let data = serde_json::to_string(&sr).unwrap();
+        let parsed: a2a::StreamResponse = serde_json::from_str(&data).unwrap();
+        assert!(matches!(parsed, a2a::StreamResponse::StatusUpdate(_)));
+        assert!(
+            data.contains("hello"),
+            "data should contain 'hello': {data}"
+        );
+    }
+
+    #[test]
+    fn artifact_event_serializes_as_streamresponse_artifactupdate_lastchunk() {
+        let sr = event_to_streamresponse(&Event::artifact("RESULT"), "task-1", "ctx-1");
+        let data = serde_json::to_string(&sr).unwrap();
+        let parsed: a2a::StreamResponse = serde_json::from_str(&data).unwrap();
+        match parsed {
+            a2a::StreamResponse::ArtifactUpdate(e) => {
+                assert_eq!(e.last_chunk, Some(true));
+            }
+            _ => panic!("expected artifactUpdate"),
+        }
+        assert!(
+            data.contains("RESULT"),
+            "data should contain 'RESULT': {data}"
+        );
+    }
+
+    #[test]
+    fn status_event_carries_task_and_context_ids() {
+        let sr = event_to_streamresponse(&Event::status("chunk"), "my-task", "my-ctx");
+        match sr {
+            a2a::StreamResponse::StatusUpdate(e) => {
+                assert_eq!(e.task_id, "my-task");
+                assert_eq!(e.context_id, "my-ctx");
+                assert_eq!(e.status.state, a2a::TaskState::Working);
+                let msg = e.status.message.expect("message should be set");
+                assert_eq!(msg.role, a2a::Role::Agent);
+                assert!(msg.parts.iter().any(|p| p.as_text() == Some("chunk")));
+            }
+            _ => panic!("expected StatusUpdate"),
+        }
+    }
+
+    #[test]
+    fn artifact_event_carries_task_and_context_ids() {
+        let sr = event_to_streamresponse(&Event::artifact("done"), "t-2", "c-2");
+        match sr {
+            a2a::StreamResponse::ArtifactUpdate(e) => {
+                assert_eq!(e.task_id, "t-2");
+                assert_eq!(e.context_id, "c-2");
+                assert_eq!(e.artifact.name.as_deref(), Some("output"));
+                assert!(e.artifact.parts.iter().any(|p| p.as_text() == Some("done")));
+                assert_eq!(e.last_chunk, Some(true));
+                assert!(e.append.is_none());
+            }
+            _ => panic!("expected ArtifactUpdate"),
+        }
+    }
+
+    #[test]
+    fn event_to_sse_produces_correct_event_names() {
+        // Verify the event: field is set correctly (inspect via Debug).
+        let status_sse = event_to_sse(&Event::status("hi"), "t", "c");
+        let artifact_sse = event_to_sse(&Event::artifact("bye"), "t", "c");
+        // The SseEvent Debug output includes the event name — use it as a proxy.
+        let status_debug = format!("{status_sse:?}");
+        let artifact_debug = format!("{artifact_sse:?}");
+        assert!(
+            status_debug.contains("status-update"),
+            "status SSE event name wrong: {status_debug}"
+        );
+        assert!(
+            artifact_debug.contains("artifact-update"),
+            "artifact SSE event name wrong: {artifact_debug}"
+        );
+    }
+
+    // ---- integration-style: verify the full translator→sse pipeline ----
 
     struct FakeBackend(Mutex<Option<Vec<Result<Update, BridgeError>>>>);
     #[async_trait::async_trait]
@@ -122,6 +243,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn translator_pipeline_last_event_is_artifact_streamresponse() {
+        let be = FakeBackend(Mutex::new(Some(vec![
+            Ok(Update::Text("hello".into())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ])));
+        let st = FakeStore;
+        let pol = AutoApprove;
+        let t = TaskId::parse("t").unwrap();
+        let s = SessionId::parse("s").unwrap();
+        let evs: Vec<Event> = Translator::new()
+            .run(&be, &st, &pol, &t, &s, vec![])
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Last event must map to ArtifactUpdate.
+        let last = evs.last().unwrap();
+        assert_eq!(last.kind(), &EventKind::Artifact);
+        let sr = event_to_streamresponse(last, t.as_str(), t.as_str());
+        assert!(matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)));
+
+        // First event must map to StatusUpdate.
+        let first = evs.first().unwrap();
+        assert_eq!(first.kind(), &EventKind::Status);
+        let sr_first = event_to_streamresponse(first, t.as_str(), t.as_str());
+        assert!(matches!(sr_first, a2a::StreamResponse::StatusUpdate(_)));
+    }
+
+    #[tokio::test]
     async fn artifact_event_is_marked_final() {
         let be = FakeBackend(Mutex::new(Some(vec![
             Ok(Update::Text("hello".into())),
@@ -143,8 +297,16 @@ mod tests {
         // Last event maps to the artifact SSE frame.
         let last = evs.last().unwrap();
         assert_eq!(last.kind(), &EventKind::Artifact);
-        // Conversion must not panic and must label the frame as the artifact.
-        let _sse = event_to_sse(last);
-        let _status = event_to_sse(evs.first().unwrap());
+        // Conversion must not panic and must produce ArtifactUpdate with last_chunk=true.
+        let sr = event_to_streamresponse(last, "t", "t");
+        match sr {
+            a2a::StreamResponse::ArtifactUpdate(e) => {
+                assert_eq!(e.last_chunk, Some(true));
+            }
+            _ => panic!("expected ArtifactUpdate"),
+        }
+        // event_to_sse must not panic.
+        let _sse = event_to_sse(last, "t", "t");
+        let _status = event_to_sse(evs.first().unwrap(), "t", "t");
     }
 }

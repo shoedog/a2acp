@@ -27,6 +27,7 @@ tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 serde_json = { workspace = true }
 axum = { workspace = true }
+a2a = { workspace = true }
 bridge-acp = { path = "../../crates/bridge-acp" }
 bridge-store = { path = "../../crates/bridge-store" }
 bridge-policy = { path = "../../crates/bridge-policy" }
