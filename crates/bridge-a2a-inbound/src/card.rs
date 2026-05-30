@@ -1,0 +1,105 @@
+// card.rs — A2A Agent Card advertising the Kiro skill, plus version-pin guard.
+//
+// The a2a-lf 0.3.0 API uses:
+//   - `AgentCard` { skills: Vec<AgentSkill>, supported_interfaces: Vec<AgentInterface>, … }
+//   - `AgentInterface::new(url, protocol_binding)` auto-sets protocol_version = a2a::VERSION
+//   - There is NO protocol_version field on AgentCard itself; it lives on each AgentInterface.
+//   - `a2a::VERSION = "1.0"` is the A2A v1 protocol version string the crate uses.
+
+use a2a::{
+    AgentCapabilities, AgentCard, AgentInterface, AgentSkill, TRANSPORT_PROTOCOL_JSONRPC, VERSION,
+};
+
+use bridge_core::error::BridgeError;
+
+/// The A2A protocol version this bridge is pinned to.
+/// Equals `a2a::VERSION` from the a2a-lf 0.3.0 crate (the A2A v1 wire protocol).
+pub const A2A_PINNED_VERSION: &str = VERSION;
+
+/// Build the AgentCard advertising one skill: routing requests to the Kiro CLI agent.
+///
+/// The card exposes a single JSONRPC interface at `<base_url>` and one skill
+/// (`kiro-code`) that describes driving the Kiro IDE/CLI for code generation tasks.
+pub fn agent_card(base_url: &str) -> AgentCard {
+    let skill = AgentSkill {
+        id: "kiro-code".to_string(),
+        name: "Kiro Code".to_string(),
+        description: "Drive the Kiro CLI agent to perform code generation, editing, and \
+                       development tasks on behalf of A2A clients."
+            .to_string(),
+        tags: vec!["code".to_string(), "kiro".to_string(), "cli".to_string()],
+        examples: Some(vec![
+            "Implement a Rust function that parses JSON".to_string(),
+            "Add unit tests to the auth module".to_string(),
+        ]),
+        input_modes: None,
+        output_modes: None,
+        security_requirements: None,
+    };
+
+    AgentCard {
+        name: "A2A-Bridge / Kiro".to_string(),
+        description: "A2A bridge that routes agent tasks to the Kiro CLI coding agent.".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        supported_interfaces: vec![AgentInterface::new(base_url, TRANSPORT_PROTOCOL_JSONRPC)],
+        capabilities: AgentCapabilities {
+            streaming: Some(true),
+            push_notifications: None,
+            extensions: None,
+            extended_agent_card: None,
+        },
+        default_input_modes: vec!["text/plain".to_string()],
+        default_output_modes: vec!["text/plain".to_string()],
+        skills: vec![skill],
+        provider: None,
+        documentation_url: None,
+        icon_url: None,
+        security_schemes: None,
+        security_requirements: None,
+        signatures: None,
+    }
+}
+
+/// Returns `Ok(())` if `v` matches the pinned A2A protocol version, otherwise
+/// `Err(BridgeError::A2aVersionMismatch)`.
+///
+/// Call this on the `A2A-Version` service parameter of every inbound request
+/// to reject clients speaking a different protocol revision.
+pub fn assert_supported_version(v: &str) -> Result<(), BridgeError> {
+    if v == A2A_PINNED_VERSION {
+        Ok(())
+    } else {
+        Err(BridgeError::A2aVersionMismatch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bridge_core::error::BridgeError;
+
+    #[test]
+    fn card_has_one_skill_and_pinned_version() {
+        let c = agent_card("http://localhost:8080");
+        assert_eq!(c.skills.len(), 1);
+        assert_eq!(c.skills[0].id, "kiro-code");
+        // Protocol version lives on the AgentInterface (not on AgentCard itself).
+        // AgentInterface::new() auto-sets protocol_version = a2a::VERSION.
+        assert_eq!(c.supported_interfaces.len(), 1);
+        assert_eq!(
+            c.supported_interfaces[0].protocol_version,
+            A2A_PINNED_VERSION
+        );
+        // Confirm the pinned constant matches the crate's own VERSION constant.
+        assert_eq!(A2A_PINNED_VERSION, a2a::VERSION);
+    }
+
+    #[test]
+    fn supported_version_accepts_pinned_rejects_other() {
+        assert!(assert_supported_version(A2A_PINNED_VERSION).is_ok());
+        assert_eq!(
+            assert_supported_version("0.0.0-bogus").unwrap_err(),
+            BridgeError::A2aVersionMismatch
+        );
+    }
+}
