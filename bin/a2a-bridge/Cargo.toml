@@ -24,3 +24,11 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+serde_json = { workspace = true }
+axum = { workspace = true }
+bridge-acp = { path = "../../crates/bridge-acp" }
+bridge-store = { path = "../../crates/bridge-store" }
+bridge-policy = { path = "../../crates/bridge-policy" }
+bridge-a2a-inbound = { path = "../../crates/bridge-a2a-inbound" }
+bridge-core = { path = "../../crates/bridge-core" }
