@@ -7,6 +7,14 @@ license.workspace = true
 [dependencies]
 bridge-core = { path = "../bridge-core" }
 async-trait = { workspace = true }
+a2a = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 tokio = { workspace = true }

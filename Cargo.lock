@@ -207,9 +207,16 @@ dependencies = [
 name = "bridge-a2a-outbound"
 version = "0.1.0"
 dependencies = [
+ "a2a-lf",
+ "async-stream",
  "async-trait",
+ "axum",
  "bridge-core",
+ "futures",
+ "reqwest",
+ "serde_json",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

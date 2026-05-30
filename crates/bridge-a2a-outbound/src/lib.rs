@@ -1,4 +1,10 @@
 //! bridge-a2a-outbound — outbound A2A DelegationPort (v1 stub; concrete impl is Increment 2.5).
+
+pub mod client;
+
+#[cfg(test)]
+pub(crate) mod testpeer;
+
 use bridge_core::domain::{Part, PeerTaskId};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::TaskId;
