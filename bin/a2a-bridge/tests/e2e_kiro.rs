@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_acp::{kiro::KiroBackend, supervisor::Supervised};
-use bridge_core::domain::TaskMeta;
+use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
 use bridge_core::ports::RouteDecision;
@@ -34,8 +34,8 @@ use serde_json::json;
 struct E2eKiroRoute;
 
 impl RouteDecision for E2eKiroRoute {
-    fn route(&self, _meta: &TaskMeta) -> Result<AgentId, BridgeError> {
-        AgentId::parse("kiro")
+    fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+        Ok(RouteTarget::Local(AgentId::parse("kiro")?))
     }
 }
 

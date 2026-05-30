@@ -31,10 +31,26 @@ pub trait AgentBackend: Send + Sync {
 #[async_trait::async_trait]
 pub trait InboundTransport: Send + Sync {}
 
-/// Delegation port — sends tasks to a downstream agent.
+/// A pinned, boxed stream of `Result<Event, BridgeError>` items.
+pub type DelegationStream =
+    Pin<Box<dyn futures::Stream<Item = Result<crate::translator::Event, BridgeError>> + Send>>;
+
+/// The result of delegating: a stream of events plus a watch channel for the peer task id.
+pub struct Delegation {
+    pub events: DelegationStream,
+    pub peer_task: tokio::sync::watch::Receiver<Option<PeerTaskId>>,
+}
+
+/// Delegation port — streams tasks to a downstream agent.
 #[async_trait::async_trait]
 pub trait DelegationPort: Send + Sync {
-    async fn delegate(&self, meta: &TaskMeta) -> Result<(), BridgeError>;
+    async fn delegate(
+        &self,
+        auth: &AuthContext,
+        local_task: &TaskId,
+        parts: Vec<Part>,
+    ) -> Result<Delegation, BridgeError>;
+    async fn cancel(&self, peer_task: &PeerTaskId) -> Result<(), BridgeError>;
 }
 
 /// Session store — persists task→session mappings and pending-request state.
@@ -48,7 +64,7 @@ pub trait SessionStore: Send + Sync {
 
 /// Sync routing decision — no async needed; plain fn.
 pub trait RouteDecision: Send + Sync {
-    fn route(&self, meta: &TaskMeta) -> Result<AgentId, BridgeError>;
+    fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError>;
 }
 
 /// Sync policy engine — evaluates a permission request against session context.
@@ -63,6 +79,17 @@ pub trait PolicyEngine: Send + Sync {
 /// Sync auth middleware — validates an inbound request.
 pub trait AuthMiddleware: Send + Sync {
     fn authorize(&self, req: &InboundRequest) -> Result<AuthContext, BridgeError>;
+}
+
+#[cfg(test)]
+mod v25rt {
+    use super::*;
+    use crate::ids::AgentId;
+    #[test]
+    fn route_target_local() {
+        let r = RouteTarget::Local(AgentId::parse("kiro").unwrap());
+        assert!(matches!(r, RouteTarget::Local(a) if a.as_str() == "kiro"));
+    }
 }
 
 #[cfg(test)]
@@ -135,8 +162,8 @@ mod tests {
 
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
-        fn route(&self, _t: &TaskMeta) -> Result<AgentId, BridgeError> {
-            AgentId::parse("kiro")
+        fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            Ok(RouteTarget::Local(AgentId::parse("kiro")?))
         }
     }
 
@@ -151,6 +178,24 @@ mod tests {
             matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_put_and_session_for_roundtrip() {
+        let st = FakeStore::new();
+        let t = TaskId::parse("t-sess").unwrap();
+        let s = SessionId::parse("s-abc").unwrap();
+        st.put(&t, &s).await.unwrap();
+        let found = st.session_for(&t).await.unwrap();
+        assert_eq!(found.unwrap().as_str(), "s-abc");
+    }
+
+    #[tokio::test]
+    async fn backend_cancel_returns_ok() {
+        FakeBackend
+            .cancel(&SessionId::parse("s").unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -172,7 +217,8 @@ mod tests {
 
     #[test]
     fn route_decision_is_sync_and_routes_to_kiro() {
-        assert_eq!(AlwaysKiro.route(&TaskMeta).unwrap().as_str(), "kiro");
+        let r = AlwaysKiro.route(&TaskMeta::default()).unwrap();
+        assert!(matches!(r, RouteTarget::Local(a) if a.as_str() == "kiro"));
     }
 
     #[test]

@@ -32,7 +32,7 @@ use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
-use bridge_core::domain::{InboundRequest, Part, TaskMeta};
+use bridge_core::domain::{InboundRequest, Part, RouteTarget, TaskMeta};
 use bridge_core::error::{A2aDisposition, BridgeError};
 use bridge_core::ids::{SessionId, TaskId};
 use bridge_core::ports::{AgentBackend, AuthMiddleware, PolicyEngine, RouteDecision, SessionStore};
@@ -111,8 +111,16 @@ impl InboundServer {
             .unwrap_or(A2A_PINNED_VERSION);
         assert_supported_version(version)?;
 
-        // 3. Route. v1 routing is metadata-only; we keep the AgentId for tracing.
-        let _agent = self.route.route(&TaskMeta)?;
+        // 3. Route. v1 routes to Local(kiro) only; Delegate returns a temporary error
+        //    (wired properly in Task 9).
+        match self.route.route(&TaskMeta::default())? {
+            RouteTarget::Local(_agent) => {
+                // happy path — continue with the local backend
+            }
+            RouteTarget::Delegate => {
+                return Err(BridgeError::UpstreamA2aError);
+            }
+        }
 
         // 4. Derive task/session ids from params (best-effort; v1 stubs allowed).
         let task = task_id_from_params(params)?;
@@ -415,7 +423,7 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
             .map(|m| m.get("text").is_some() || m.get("parts").is_some())
             .unwrap_or(false);
     if has_text {
-        vec![Part]
+        vec![Part::default()]
     } else {
         vec![]
     }
@@ -424,6 +432,7 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_core::domain::RouteTarget;
     use bridge_core::domain::{
         AuthContext, PendingRequest, PermissionDecision, PermissionRequest, SessionContext,
     };
@@ -529,8 +538,8 @@ mod tests {
 
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
-        fn route(&self, _t: &TaskMeta) -> Result<AgentId, BridgeError> {
-            AgentId::parse("kiro")
+        fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            Ok(RouteTarget::Local(AgentId::parse("kiro")?))
         }
     }
 

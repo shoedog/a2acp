@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::http::{Request, StatusCode};
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_acp::replay::ReplayBackend;
-use bridge_core::domain::TaskMeta;
+use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
 use bridge_core::ports::{PolicyEngine, RouteDecision, SessionStore};
@@ -26,8 +26,8 @@ use tower::ServiceExt;
 struct IntegKiroRoute;
 
 impl RouteDecision for IntegKiroRoute {
-    fn route(&self, _meta: &TaskMeta) -> Result<AgentId, BridgeError> {
-        AgentId::parse("kiro")
+    fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+        Ok(RouteTarget::Local(AgentId::parse("kiro")?))
     }
 }
 
