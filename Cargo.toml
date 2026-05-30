@@ -32,3 +32,4 @@ a2a = { package = "a2a-lf", version = "=0.3.0" }
 # Dev-only deps live in [workspace.dependencies] (Cargo has no workspace.dev-dependencies);
 # member crates opt in via `trybuild.workspace = true` under their own [dev-dependencies].
 trybuild = "1"
+tokio-test = "0.4"
