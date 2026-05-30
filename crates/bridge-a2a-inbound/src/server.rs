@@ -62,6 +62,15 @@ pub struct InboundServer {
     auth: Arc<dyn AuthMiddleware>,
     base_url: String,
     delegation: Arc<dyn DelegationPort>,
+    /// Single-cancel guard: the set of local task ids whose upstream peer
+    /// `CancelTask` has already been POSTed. An inbound `CancelTask` (the
+    /// `cancel_task()` handler) and the streaming cancel supervisor both race to
+    /// cancel an active delegated peer; this set ensures whichever wins the race
+    /// POSTs exactly once and the other skips. Both `cancel` paths must remain —
+    /// the handler covers the stream/supervisor already having ended, the
+    /// supervisor covers disconnect/latch during the stream — so this is a GUARD,
+    /// not a removed path.
+    cancelled_peers: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl InboundServer {
@@ -83,6 +92,7 @@ impl InboundServer {
             auth,
             base_url: base_url.into(),
             delegation,
+            cancelled_peers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -134,6 +144,17 @@ impl InboundServer {
             auth,
         })
     }
+}
+
+/// Single-cancel guard for an active delegated task. Atomically check-and-insert
+/// the local task id into the shared set, returning `true` exactly once per task
+/// — the caller that gets `true` "wins the race" and must POST the upstream
+/// `delegation.cancel(peer)`; all later callers get `false` and must skip.
+async fn try_win_peer_cancel(
+    guard: &Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    local: &TaskId,
+) -> bool {
+    guard.lock().await.insert(local.as_str().to_owned())
 }
 
 /// The result of the gate: the routed call ready for the translator or delegation.
@@ -255,6 +276,7 @@ fn spawn_delegate_producer(
 ) {
     let delegation = srv.delegation.clone();
     let store = srv.store.clone();
+    let guard = srv.cancelled_peers.clone();
     let local = routed.task;
     let parts = routed.parts;
     let auth = routed.auth;
@@ -276,6 +298,7 @@ fn spawn_delegate_producer(
         spawn_peer_persist(
             store.clone(),
             delegation.clone(),
+            guard.clone(),
             local.clone(),
             peer_watch.clone(),
         );
@@ -289,7 +312,7 @@ fn spawn_delegate_producer(
                         Some(ev) => {
                             if tx.send(ev).await.is_err() {
                                 // Receiver gone mid-send: treat as disconnect.
-                                cancel_peer_now(&delegation, &store, &local, &mut peer_watch).await;
+                                cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
                                 return;
                             }
                         }
@@ -298,12 +321,12 @@ fn spawn_delegate_producer(
                 }
                 // (ii) caller disconnected (works even if the peer stream is IDLE).
                 _ = tx.closed() => {
-                    cancel_peer_now(&delegation, &store, &local, &mut peer_watch).await;
+                    cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
                     return;
                 }
                 // (iii) an inbound CancelTask latched cancel_requested.
                 _ = poll_cancel_requested(store.as_ref(), &local) => {
-                    cancel_peer_now(&delegation, &store, &local, &mut peer_watch).await;
+                    cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
                     return;
                 }
             }
@@ -317,16 +340,19 @@ fn spawn_delegate_producer(
 fn spawn_peer_persist(
     store: Arc<dyn SessionStore>,
     delegation: Arc<dyn DelegationPort>,
+    guard: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     local: TaskId,
     mut peer_watch: tokio::sync::watch::Receiver<Option<PeerTaskId>>,
 ) {
     tokio::spawn(async move {
         loop {
-            // Clone the value out and drop the (non-Send) guard before awaiting.
+            // Clone the value out and drop the (non-Send) watch ref before awaiting.
             let current = peer_watch.borrow_and_update().clone();
             if let Some(peer) = current {
                 let _ = store.set_peer_task(&local, &peer).await;
-                if store.cancel_requested(&local).await.unwrap_or(false) {
+                if store.cancel_requested(&local).await.unwrap_or(false)
+                    && try_win_peer_cancel(&guard, &local).await
+                {
                     let _ = delegation.cancel(&peer).await;
                 }
                 return;
@@ -346,23 +372,29 @@ fn spawn_peer_persist(
 async fn cancel_peer_now(
     delegation: &Arc<dyn DelegationPort>,
     store: &Arc<dyn SessionStore>,
+    guard: &Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     local: &TaskId,
     peer_watch: &mut tokio::sync::watch::Receiver<Option<PeerTaskId>>,
 ) {
     // Latch first so the race (id appears later) is covered by spawn_peer_persist.
     let _ = store.request_cancel(local).await;
 
-    // Clone the value out and drop the (non-Send) guard before awaiting.
+    // Clone the value out and drop the (non-Send) watch ref before awaiting.
     let current = peer_watch.borrow().clone();
     if let Some(peer) = current {
-        let _ = delegation.cancel(&peer).await;
+        // Single-cancel guard: only POST if we win the race against cancel_task().
+        if try_win_peer_cancel(guard, local).await {
+            let _ = delegation.cancel(&peer).await;
+        }
         return;
     }
     // Peer id not yet known: wait briefly for it to appear, else rely on the latch.
     if peer_watch.changed().await.is_ok() {
         let next = peer_watch.borrow().clone();
         if let Some(peer) = next {
-            let _ = delegation.cancel(&peer).await;
+            if try_win_peer_cancel(guard, local).await {
+                let _ = delegation.cancel(&peer).await;
+            }
         }
     }
 }
@@ -435,14 +467,35 @@ async fn unary_message(
                 .delegate(&routed.auth, &routed.task, routed.parts)
                 .await
             {
-                Ok(mut delegated) => {
-                    // Persist local->peer once the peer id is known. Clone the
-                    // value out and drop the (non-Send) watch guard before await.
-                    let peer = delegated.peer_task.borrow_and_update().clone();
+                Ok(delegated) => {
+                    let mut peer_watch = delegated.peer_task;
+                    // Drain the events first: the real client captures the peer id
+                    // lazily as frames are consumed, so the watch only becomes
+                    // Some(peer) AFTER the stream has been driven. Reading it before
+                    // collect (the old behavior) saw None and never persisted the
+                    // mapping, leaving the unary-delegated task un-cancellable.
+                    let collected: Vec<Result<Event, BridgeError>> =
+                        delegated.events.collect().await;
+
+                    // Now persist local->peer. Clone the value out and drop the
+                    // (non-Send) watch ref before awaiting.
+                    let peer = peer_watch.borrow_and_update().clone();
                     if let Some(peer) = peer {
                         let _ = srv.store.set_peer_task(&routed.task, &peer).await;
+                        // Latch-apply: if an inbound CancelTask already requested a
+                        // cancel for this task, honor it now — respecting the
+                        // single-cancel guard so we don't double-POST.
+                        if srv
+                            .store
+                            .cancel_requested(&routed.task)
+                            .await
+                            .unwrap_or(false)
+                            && try_win_peer_cancel(&srv.cancelled_peers, &routed.task).await
+                        {
+                            let _ = srv.delegation.cancel(&peer).await;
+                        }
                     }
-                    delegated.events.collect().await
+                    collected
                 }
                 Err(e) => vec![Err(e)],
             }
@@ -501,11 +554,17 @@ async fn cancel_task(
     // will apply the cancel once the id appears) and signals an in-flight stream.
     let _ = srv.store.request_cancel(&task).await;
 
-    // S2b: if the task is delegated, cancel the peer directly.
+    // S2b: if the task is delegated, cancel the peer directly. This path covers
+    // the case where the stream/supervisor has already ended; the single-cancel
+    // guard ensures we don't double-POST when the supervisor is still alive and
+    // its poll_cancel_requested arm (woken by the request_cancel latch above)
+    // would otherwise cancel the same peer.
     match srv.store.peer_task_for(&task).await {
         Ok(Some(peer)) => {
-            if let Err(e) = srv.delegation.cancel(&peer).await {
-                return bridge_err_to_jsonrpc(id, &e);
+            if try_win_peer_cancel(&srv.cancelled_peers, &task).await {
+                if let Err(e) = srv.delegation.cancel(&peer).await {
+                    return bridge_err_to_jsonrpc(id, &e);
+                }
             }
         }
         _ => {
@@ -699,6 +758,10 @@ mod tests {
         /// If set, peer id becomes Some(this) only after the first event is emitted.
         peer_after_first: Option<PeerTaskId>,
         idle: bool,
+        /// If set, the peer id is sent from INSIDE the events stream as the first
+        /// frame is yielded (models the real client capturing the id lazily as
+        /// frames are consumed/drained, rather than on an independent timer).
+        peer_on_drain: Option<PeerTaskId>,
         cancels: Arc<Mutex<Vec<String>>>,
     }
 
@@ -709,6 +772,7 @@ mod tests {
                 peer_initial: peer.map(|p| PeerTaskId(p.into())),
                 peer_after_first: None,
                 idle: false,
+                peer_on_drain: None,
                 cancels: Arc::new(Mutex::new(Vec::new())),
             })
         }
@@ -718,6 +782,7 @@ mod tests {
                 peer_initial: peer.map(|p| PeerTaskId(p.into())),
                 peer_after_first: None,
                 idle: true,
+                peer_on_drain: None,
                 cancels: Arc::new(Mutex::new(Vec::new())),
             })
         }
@@ -728,6 +793,19 @@ mod tests {
                 peer_initial: None,
                 peer_after_first: Some(PeerTaskId(peer.into())),
                 idle: false,
+                peer_on_drain: None,
+                cancels: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+        /// Peer id captured lazily as frames are consumed: starts None and becomes
+        /// Some(peer) from inside the events stream when the first frame is drained.
+        fn late_peer_on_drain(events: Vec<Result<Event, BridgeError>>, peer: &str) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Some(events)),
+                peer_initial: None,
+                peer_after_first: None,
+                idle: false,
+                peer_on_drain: Some(PeerTaskId(peer.into())),
                 cancels: Arc::new(Mutex::new(Vec::new())),
             })
         }
@@ -749,6 +827,7 @@ mod tests {
                 tokio::sync::watch::channel::<Option<PeerTaskId>>(self.peer_initial.clone());
             let idle = self.idle;
             let after_first = self.peer_after_first.clone();
+            let on_drain = self.peer_on_drain.clone();
 
             // Drive the late peer-id update from an INDEPENDENT task (mirrors the
             // real outbound client, whose background reader updates the watch
@@ -767,7 +846,15 @@ mod tests {
             // channel stays open while the peer is in flight.
             let events: DelegationStream = Box::pin(async_stream::stream! {
                 let _hold = peer_tx;
+                let mut first = true;
                 for ev in scripted {
+                    // Capture the peer id lazily as the first frame is consumed.
+                    if first {
+                        if let Some(p) = on_drain.clone() {
+                            let _ = _hold.send(Some(p));
+                        }
+                        first = false;
+                    }
                     yield ev;
                 }
                 if idle {
@@ -1423,6 +1510,96 @@ mod tests {
             recorded.lock().unwrap().iter().any(|c| c == "p1"),
             "early-cancel latch must apply once the peer id appears: {:?}",
             recorded.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_cancel_on_active_delegated_stream_cancels_peer_exactly_once() {
+        // Fix 1: an inbound CancelTask on an ACTIVE delegated stream must result in
+        // exactly ONE upstream cancel("p1"), even though BOTH the cancel_task()
+        // handler (direct POST) and the supervisor's poll_cancel_requested arm
+        // would otherwise fire. The idle delegation keeps the supervisor alive,
+        // and peer_initial=Some("p1") means the peer id is known immediately so
+        // both paths can race to cancel.
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let deleg = FakeDelegation::idle(vec![Ok(Event::status("work"))], Some("p1"));
+        let recorded = deleg.cancels();
+        let srv = build_delegate(FakeBackend::new(), store.clone(), deleg);
+
+        // Open the delegate stream (do NOT drop the response, so the supervisor
+        // stays alive — tx.closed() never fires). The producer persists local->peer.
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Wait until local->peer is persisted (supervisor is running, peer known).
+        let local = TaskId::parse("task-1").unwrap();
+        for _ in 0..200 {
+            if store.peer_task_for(&local).await.unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.peer_task_for(&local).await.unwrap().is_some(),
+            "local->peer mapping must be persisted before CancelTask"
+        );
+
+        // POST CancelTask: cancel_task() POSTs directly AND latches request_cancel,
+        // which wakes the supervisor's poll_cancel_requested arm. With the guard,
+        // exactly one of them wins.
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "task-1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Give the supervisor time to (try to) fire its own cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let calls: Vec<String> = recorded.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one upstream cancel must be recorded, got: {calls:?}"
+        );
+        assert_eq!(calls[0], "p1");
+    }
+
+    #[tokio::test]
+    async fn unary_delegate_persists_local_to_peer() {
+        // Fix 2: a unary SendMessage delegate must persist local->peer. The peer id
+        // becomes Some("p1") only as the events stream is drained (late_peer), so
+        // reading the watch before draining (today's bug) yields None.
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let deleg = FakeDelegation::late_peer_on_drain(vec![Ok(Event::artifact("DONE"))], "p1");
+        let srv = build_delegate(FakeBackend::new(), store.clone(), deleg);
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        let local = TaskId::parse("task-1").unwrap();
+        assert_eq!(
+            store.peer_task_for(&local).await.unwrap(),
+            Some(PeerTaskId("p1".into())),
+            "unary delegate must persist local->peer after draining events"
         );
     }
 
