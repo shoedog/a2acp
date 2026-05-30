@@ -50,6 +50,21 @@ pub fn agent_card(base_url: &str) -> AgentCard {
         security_requirements: None,
     };
 
+    let fanout_skill = AgentSkill {
+        id: "fan-out".to_string(),
+        name: "Fan-Out".to_string(),
+        description: "Run on both the local agent and the configured peer (second opinion). \
+                       Merges responses from both sources into a single stream."
+            .to_string(),
+        tags: vec!["fanout".to_string(), "merge".to_string()],
+        examples: Some(vec![
+            "Get a second opinion on this implementation".to_string()
+        ]),
+        input_modes: None,
+        output_modes: None,
+        security_requirements: None,
+    };
+
     AgentCard {
         name: "A2A-Bridge / Kiro".to_string(),
         description: "A2A bridge that routes agent tasks to the Kiro CLI coding agent.".to_string(),
@@ -63,7 +78,7 @@ pub fn agent_card(base_url: &str) -> AgentCard {
         },
         default_input_modes: vec!["text/plain".to_string()],
         default_output_modes: vec!["text/plain".to_string()],
-        skills: vec![kiro_skill, delegate_skill],
+        skills: vec![kiro_skill, delegate_skill, fanout_skill],
         provider: None,
         documentation_url: None,
         icon_url: None,
@@ -94,7 +109,8 @@ mod tests {
     #[test]
     fn card_has_two_skills_and_pinned_version() {
         let c = agent_card("http://localhost:8080");
-        assert_eq!(c.skills.len(), 2);
+        // Updated for Task 5a: three skills now (kiro-code, delegate, fan-out).
+        assert!(c.skills.len() >= 2);
         assert!(c.skills.iter().any(|s| s.id == "kiro-code"));
         // Protocol version lives on the AgentInterface (not on AgentCard itself).
         // AgentInterface::new() auto-sets protocol_version = a2a::VERSION.
@@ -121,8 +137,18 @@ mod tests {
     #[test]
     fn card_advertises_two_skills() {
         let c = agent_card("http://localhost:8080");
-        assert_eq!(c.skills.len(), 2);
+        // Updated for Task 5a: three skills now.
+        assert!(c.skills.len() >= 2);
         assert!(c.skills.iter().any(|s| s.id == "delegate"));
         assert!(c.skills.iter().any(|s| s.id == "kiro-code"));
+    }
+
+    // ---- Task 5a: fan-out skill advertisement ----
+
+    #[test]
+    fn card_has_three_skills_incl_fanout() {
+        let c = agent_card("http://x");
+        assert_eq!(c.skills.len(), 3);
+        assert!(c.skills.iter().any(|s| s.id == "fan-out"));
     }
 }

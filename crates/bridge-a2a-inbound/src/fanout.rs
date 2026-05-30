@@ -18,6 +18,9 @@ use bridge_core::ids::SessionId;
 use bridge_core::translator::{Event, TaskOutcome};
 use futures::stream::{select_all, Stream, StreamExt};
 
+/// Pinned, boxed, `Send` event stream — the item type for fan-out sources.
+pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send>>;
+
 /// Per-source cancel handle, carried through fan-out for Task 6. Unused in `run`.
 pub enum SourceCancel {
     Kiro {

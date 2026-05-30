@@ -41,6 +41,7 @@ use bridge_core::ports::{
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
+use crate::fanout::{self, Source, SourceCancel};
 use crate::sse::event_to_sse;
 
 /// JSON-RPC 2.0 error code for an invalid request / rejected pipeline gate.
@@ -220,6 +221,7 @@ async fn stream_message(
     match routed.target {
         RouteTarget::Local(_) => spawn_local_producer(&srv, routed, tx),
         RouteTarget::Delegate => spawn_delegate_producer(&srv, routed, tx),
+        RouteTarget::Fanout => spawn_fanout_producer(&srv, routed, tx),
     }
 
     // Use the task id as the context id for now (consistent within a single stream).
@@ -434,6 +436,86 @@ async fn poll_cancel_requested(store: &dyn SessionStore, local: &TaskId) {
     }
 }
 
+/// Build a `Source` for the local Kiro backend by running the Translator inside an
+/// `async_stream::stream!` that owns all the `Arc` clones it needs — no lifetime fight.
+fn local_kiro_source(
+    backend: Arc<dyn AgentBackend>,
+    store: Arc<dyn SessionStore>,
+    policy: Arc<dyn PolicyEngine>,
+    task: TaskId,
+    session: SessionId,
+    parts: Vec<Part>,
+) -> Source {
+    let cancel = SourceCancel::Kiro {
+        session: session.clone(),
+    };
+    // Build the stream by cloning Arc refs into a `'static + Send` stream.
+    let stream: crate::fanout::EventStream = Box::pin(async_stream::stream! {
+        let translator = Translator::new();
+        let mut events = translator.run(
+            backend.as_ref(),
+            store.as_ref(),
+            policy.as_ref(),
+            &task,
+            &session,
+            parts,
+        );
+        while let Some(ev) = events.next().await {
+            yield ev;
+        }
+    });
+    Source::from_stream("kiro", stream, cancel)
+}
+
+/// Spawn the fan-out producer: build a Kiro source and a peer source, then run
+/// `fanout::run` which merges them and sends the terminal frame.
+fn spawn_fanout_producer(
+    srv: &Arc<InboundServer>,
+    routed: RoutedCall,
+    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+) {
+    let backend = srv.backend.clone();
+    let store = srv.store.clone();
+    let policy = srv.policy.clone();
+    let delegation = srv.delegation.clone();
+    let task = routed.task;
+    let session = routed.session;
+    let parts = routed.parts.clone();
+    let auth = routed.auth;
+
+    tokio::spawn(async move {
+        // 1. Build the local Kiro source.
+        let kiro_source =
+            local_kiro_source(backend, store, policy, task.clone(), session, parts.clone());
+
+        // 2. Build the peer source by opening delegation.
+        let peer_source = match delegation.delegate(&auth, &task, parts).await {
+            Ok(d) => Source::from_stream(
+                "peer",
+                d.events,
+                SourceCancel::Peer {
+                    peer_task: d.peer_task,
+                },
+            ),
+            Err(e) => {
+                // Delegation startup failed: emit one labeled error frame for the peer,
+                // then the coordinator's terminal frame covers completion.
+                let (_, dummy_rx) = tokio::sync::watch::channel::<Option<PeerTaskId>>(None);
+                Source::failed(
+                    "peer",
+                    e,
+                    SourceCancel::Peer {
+                        peer_task: dummy_rx,
+                    },
+                )
+            }
+        };
+
+        // 3. Run the fan-out coordinator (it sends the terminal frame).
+        fanout::run(vec![kiro_source, peer_source], tx).await;
+    });
+}
+
 /// Adapt the mpsc receiver into a stream of `Result<SseEvent, Infallible>`.
 /// Each translated [`Event`] becomes one SSE frame; backend errors become a
 /// single `error` frame so the client sees a terminal signal.
@@ -469,8 +551,9 @@ async fn unary_message(
 
     // Collect the same event stream the streaming path produces, into one JSON
     // response. Local drives the translator; Delegate drives the delegation.
+    // Fan-out is not supported in unary mode; fall back to local.
     let collected: Vec<Result<Event, BridgeError>> = match routed.target {
-        RouteTarget::Local(_) => {
+        RouteTarget::Local(_) | RouteTarget::Fanout => {
             let translator = Translator::new();
             translator
                 .run(
@@ -1309,9 +1392,11 @@ mod tests {
         let body = body_string(resp).await;
         let card: Value = serde_json::from_str(&body).unwrap();
         let skills = card["skills"].as_array().unwrap();
-        assert_eq!(skills.len(), 2);
+        // Updated for Task 5a: three skills (kiro-code, delegate, fan-out).
+        assert_eq!(skills.len(), 3);
         assert!(skills.iter().any(|s| s["id"] == "kiro-code"));
         assert!(skills.iter().any(|s| s["id"] == "delegate"));
+        assert!(skills.iter().any(|s| s["id"] == "fan-out"));
     }
 
     #[tokio::test]
@@ -1730,5 +1815,121 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("condition not met within budget");
+    }
+
+    // ---- Task 5a: fan-out streaming dispatch ----
+
+    /// Routes `skill=="fan-out"` to `Fanout`; `skill=="delegate"` to `Delegate`;
+    /// everything else to local kiro. Used only in fan-out tests.
+    struct FanoutSkillRoute;
+    impl RouteDecision for FanoutSkillRoute {
+        fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            match t.skill.as_deref() {
+                Some("fan-out") => Ok(RouteTarget::Fanout),
+                Some("delegate") => Ok(RouteTarget::Delegate),
+                _ => Ok(RouteTarget::Local(AgentId::parse("kiro")?)),
+            }
+        }
+    }
+
+    /// Build a fan-out-capable server sharing backend, store, and delegation.
+    fn build_fanout(
+        backend: Arc<dyn AgentBackend>,
+        store: Arc<dyn SessionStore>,
+        delegation: Arc<dyn DelegationPort>,
+    ) -> Arc<InboundServer> {
+        Arc::new(InboundServer::new(
+            backend,
+            store,
+            Arc::new(AutoApprove),
+            Arc::new(FanoutSkillRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            delegation,
+        ))
+    }
+
+    fn fanout_params() -> Value {
+        json!({ "message": {
+            "text": "go",
+            "metadata": { "a2a-bridge.skill": "fan-out" }
+        }})
+    }
+
+    #[tokio::test]
+    async fn fanout_streaming_merges_both_sources_with_terminal() {
+        // FakeBackend yields Text("KIRO") + Done -> kiro artifact "KIRO".
+        // FakeDelegation yields status("work") + artifact("PEER") -> peer artifact.
+        // Both sources labeled; terminal frame is Completed.
+        let deleg = FakeDelegation::new(
+            vec![Ok(Event::status("work")), Ok(Event::artifact("PEER"))],
+            Some("p1"),
+        );
+        let srv = build_fanout(FakeBackend::new(), Arc::new(FakeStore::default()), deleg);
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                fanout_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let payloads = sse_data_payloads(&body);
+        assert!(
+            !payloads.is_empty(),
+            "fan-out SSE must emit at least one frame: {body}"
+        );
+
+        // Parse all payloads as StreamResponse (wire conformance).
+        let parsed: Vec<a2a::StreamResponse> = payloads
+            .iter()
+            .map(|p| {
+                serde_json::from_str(p)
+                    .unwrap_or_else(|e| panic!("payload must parse as StreamResponse: {e}: {p}"))
+            })
+            .collect();
+
+        // There must be an artifact from kiro source.
+        let has_kiro_artifact = parsed.iter().any(|sr| {
+            matches!(sr, a2a::StreamResponse::ArtifactUpdate(e)
+                if e.metadata.as_ref()
+                    .and_then(|m| m.get("a2a-bridge.source"))
+                    .and_then(|v| v.as_str())
+                    == Some("kiro")
+            )
+        });
+        assert!(
+            has_kiro_artifact,
+            "fan-out SSE must contain a kiro-labeled artifact: {body}"
+        );
+
+        // There must be an artifact from peer source.
+        let has_peer_artifact = parsed.iter().any(|sr| {
+            matches!(sr, a2a::StreamResponse::ArtifactUpdate(e)
+                if e.metadata.as_ref()
+                    .and_then(|m| m.get("a2a-bridge.source"))
+                    .and_then(|v| v.as_str())
+                    == Some("peer")
+            )
+        });
+        assert!(
+            has_peer_artifact,
+            "fan-out SSE must contain a peer-labeled artifact: {body}"
+        );
+
+        // The LAST frame must be a terminal statusUpdate(Completed).
+        let last = parsed.last().unwrap();
+        assert!(
+            matches!(
+                last,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed
+            ),
+            "final fan-out frame must be terminal statusUpdate(Completed): {:?}",
+            payloads.last()
+        );
     }
 }

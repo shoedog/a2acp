@@ -25,6 +25,7 @@ pub struct PeerTaskId(pub String);
 pub enum RouteTarget {
     Local(crate::ids::AgentId),
     Delegate,
+    Fanout,
 }
 
 // --- Types added by Task 4 ---
@@ -141,6 +142,11 @@ mod v25 {
     fn route_target_delegate_variant() {
         let r = RouteTarget::Delegate;
         assert!(matches!(r, RouteTarget::Delegate));
+    }
+    #[test]
+    fn route_target_fanout_variant() {
+        let r = RouteTarget::Fanout;
+        assert!(matches!(r, RouteTarget::Fanout));
     }
     #[test]
     fn auth_context_roundtrips_caller() {
