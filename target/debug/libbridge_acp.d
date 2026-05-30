@@ -1,1 +1,1 @@
-/Users/wesleyjinks/code/a2a-bridge/target/debug/libbridge_acp.rlib: /Users/wesleyjinks/code/a2a-bridge/crates/bridge-acp/src/lib.rs /Users/wesleyjinks/code/a2a-bridge/crates/bridge-core/src/lib.rs
+/Users/wesleyjinks/code/a2a-bridge/target/debug/libbridge_acp.rlib: /Users/wesleyjinks/code/a2a-bridge/crates/bridge-acp/src/lib.rs /Users/wesleyjinks/code/a2a-bridge/crates/bridge-core/src/error.rs /Users/wesleyjinks/code/a2a-bridge/crates/bridge-core/src/ids.rs /Users/wesleyjinks/code/a2a-bridge/crates/bridge-core/src/lib.rs

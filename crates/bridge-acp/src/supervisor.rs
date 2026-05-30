@@ -118,4 +118,29 @@ mod tests {
         }
         let _ = std::fs::remove_file(format!("/tmp/a2a_desc_pid.{pid}"));
     }
+
+    #[tokio::test]
+    async fn term_ignoring_loop_forces_group_sigkill() {
+        // sh ignores TERM and re-spawns short sleeps in a loop: group-SIGTERM kills the
+        // current `sleep` but the loop (sh ignores TERM) survives the grace window, so only
+        // the SIGKILL group escalation can reap it.
+        let child = Supervised::spawn(
+            "/bin/sh",
+            &["-c", "trap '' TERM; while :; do sleep 0.2; done"],
+        )
+        .unwrap();
+        let pid = child.pid();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            proc_state(pid).is_some(),
+            "leader should be alive before terminate"
+        );
+        // short grace -> SIGTERM ignored by the loop -> timeout -> SIGKILL group
+        child.terminate(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            proc_state(pid).is_none(),
+            "group SIGKILL should have reaped the TERM-ignoring leader"
+        );
+    }
 }
