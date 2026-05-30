@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Coverage
+*.profraw
+*.profdata
+/lcov.info
+
+# Editor / OS
+.DS_Store
+*.swp
