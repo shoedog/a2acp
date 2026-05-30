@@ -219,8 +219,16 @@ impl AgentBackend for KiroBackend {
                                         return Some((Ok(u), (inner, prompt_id, false)));
                                     }
                                     None => {
-                                        // Result with no recognized shape — done.
-                                        return None;
+                                        // Result for our id with no recognized shape —
+                                        // must still surface as a terminal Done so the
+                                        // caller never sees a silent stream close
+                                        // (Issue 3, §5.3 "naive bridge" failure).
+                                        return Some((
+                                            Ok(Update::Done {
+                                                stop_reason: "unknown".into(),
+                                            }),
+                                            (inner, prompt_id, true),
+                                        ));
                                     }
                                 }
                             }
@@ -320,6 +328,24 @@ mod tests {
         assert!(
             matches!(s.next().await, Some(Ok(Update::Done{stop_reason})) if stop_reason == "cancelled")
         );
+    }
+
+    #[tokio::test]
+    async fn unrecognized_result_frame_still_yields_terminal_done() {
+        let be = KiroBackend::from_child(scripted(
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
+             read p; \
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}'; sleep 1",
+        ));
+        let sid = be.new_session().await.unwrap();
+        let mut s = be.prompt(&sid, vec![]).await.unwrap();
+        // must be a terminal Done, NOT a silent None
+        match s.next().await {
+            Some(Ok(Update::Done { .. })) => {}
+            other => {
+                panic!("expected terminal Done for an unrecognized result frame, got {other:?}")
+            }
+        }
     }
 
     #[tokio::test]
