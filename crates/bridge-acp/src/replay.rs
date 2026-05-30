@@ -28,13 +28,15 @@ pub(crate) fn frame_to_update(v: serde_json::Value) -> Option<Update> {
                 return Some(Update::Text(text.to_string()));
             }
             "session/request_permission" => {
-                let interactive =
-                    v.pointer("/params/kind").and_then(|k| k.as_str()) == Some("interactive");
-                return Some(Update::Permission(if interactive {
-                    PermissionRequest::interactive()
-                } else {
-                    PermissionRequest::read()
-                }));
+                let kind = v.pointer("/params/kind").and_then(|k| k.as_str());
+                let request_id = v
+                    .pointer("/params/requestId")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("");
+                return Some(Update::Permission(PermissionRequest::with_id(
+                    request_id,
+                    kind == Some("interactive"),
+                )));
             }
             _ => return None,
         }

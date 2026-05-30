@@ -30,15 +30,28 @@ pub struct PendingRequest {
 
 #[derive(Debug, Clone)]
 pub struct PermissionRequest {
+    pub request_id: String,
     pub interactive: bool,
 }
 
 impl PermissionRequest {
     pub fn read() -> Self {
-        Self { interactive: false }
+        Self {
+            request_id: String::new(),
+            interactive: false,
+        }
     }
     pub fn interactive() -> Self {
-        Self { interactive: true }
+        Self {
+            request_id: String::new(),
+            interactive: true,
+        }
+    }
+    pub fn with_id(request_id: impl Into<String>, interactive: bool) -> Self {
+        Self {
+            request_id: request_id.into(),
+            interactive,
+        }
     }
 }
 

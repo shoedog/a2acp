@@ -8,6 +8,7 @@ license.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+async-stream.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
 serde.workspace = true

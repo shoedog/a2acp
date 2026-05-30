@@ -172,10 +172,7 @@ mod tests {
 
     #[test]
     fn route_decision_is_sync_and_routes_to_kiro() {
-        assert_eq!(
-            AlwaysKiro.route(&TaskMeta).unwrap().as_str(),
-            "kiro"
-        );
+        assert_eq!(AlwaysKiro.route(&TaskMeta).unwrap().as_str(), "kiro");
     }
 
     #[test]

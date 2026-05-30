@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2"
 futures = "0.3"
+async-stream = "0.3"
 
 # Protocol SDKs — pinned exact versions verified 2026-05-30
 # a2a-lf is the crates.io package name for the `a2a` crate in a2aproject/a2a-rs
