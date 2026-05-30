@@ -1,4 +1,4 @@
-// route.rs — Composition-root routing: always routes inbound tasks to the Kiro backend.
+// route.rs — Composition-root routing for a2a-bridge binary.
 // Routing lives in the binary, NOT in bridge-policy (spec §8, Task 15).
 
 use bridge_core::domain::{RouteTarget, TaskMeta};
@@ -6,12 +6,17 @@ use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
 use bridge_core::ports::RouteDecision;
 
-/// v1 routing policy: every task is handled by the local Kiro backend.
-pub struct AlwaysKiro;
+/// Skill-aware routing (v2.5): tasks with `skill == "delegate"` are sent to the
+/// configured peer; all others fall back to the local Kiro backend.
+pub struct SkillRoute;
 
-impl RouteDecision for AlwaysKiro {
-    fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
-        Ok(RouteTarget::Local(AgentId::parse("kiro")?))
+impl RouteDecision for SkillRoute {
+    fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+        if meta.skill.as_deref() == Some("delegate") {
+            Ok(RouteTarget::Delegate)
+        } else {
+            Ok(RouteTarget::Local(AgentId::parse("kiro")?))
+        }
     }
 }
 
@@ -22,8 +27,18 @@ mod tests {
     use bridge_core::ports::RouteDecision;
 
     #[test]
-    fn always_routes_to_kiro() {
-        let r = AlwaysKiro.route(&TaskMeta::default()).unwrap();
-        assert!(matches!(r, RouteTarget::Local(a) if a.as_str() == "kiro"));
+    fn skill_route_delegates_on_delegate_skill() {
+        assert!(matches!(
+            SkillRoute
+                .route(&TaskMeta {
+                    skill: Some("delegate".into())
+                })
+                .unwrap(),
+            RouteTarget::Delegate
+        ));
+        assert!(matches!(
+            SkillRoute.route(&TaskMeta { skill: None }).unwrap(),
+            RouteTarget::Local(a) if a.as_str() == "kiro"
+        ));
     }
 }
