@@ -127,4 +127,15 @@ mod tests {
         let t = Task::submitted(TaskId::parse("abc").unwrap()).start();
         assert_eq!(t.id().as_str(), "abc");
     }
+
+    #[test]
+    fn fail_and_cancel_transitions() {
+        let t = Task::submitted(TaskId::parse("t").unwrap()).start();
+        let failed = t.fail();
+        assert!(matches!(failed.state(), TaskState::Failed));
+
+        let t2 = Task::submitted(TaskId::parse("t2").unwrap()).start();
+        let cancelled = t2.cancel();
+        assert!(matches!(cancelled.state(), TaskState::Canceled));
+    }
 }

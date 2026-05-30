@@ -1,7 +1,7 @@
 // sqlite.rs — SQLite-backed SessionStore (spec §7, Task 9).
 
 use bridge_core::{
-    domain::{PendingKind, PendingRequest},
+    domain::{PeerTaskId, PendingKind, PendingRequest},
     error::BridgeError,
     ids::{SessionId, TaskId},
     ports::SessionStore,
@@ -33,7 +33,9 @@ impl SqliteStore {
                 session_id TEXT,
                 pending_request_id TEXT,
                 pending_kind TEXT,
-                created_at INTEGER NOT NULL DEFAULT 0
+                created_at INTEGER NOT NULL DEFAULT 0,
+                peer_task_id TEXT,
+                cancel_requested INTEGER NOT NULL DEFAULT 0
             );",
         )
         .map_err(|_| BridgeError::StoreFailure)
@@ -131,14 +133,91 @@ impl SessionStore for SqliteStore {
             _ => Ok(None),
         }
     }
+
+    async fn set_peer_task(&self, task: &TaskId, peer: &PeerTaskId) -> Result<(), BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions(task_id, peer_task_id) VALUES(?1, ?2)
+             ON CONFLICT(task_id) DO UPDATE SET peer_task_id = excluded.peer_task_id",
+            rusqlite::params![task.as_str(), peer.0.as_str()],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(())
+    }
+
+    async fn peer_task_for(&self, task: &TaskId) -> Result<Option<PeerTaskId>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT peer_task_id FROM sessions WHERE task_id = ?1")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![task.as_str()])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        match rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            None => Ok(None),
+            Some(row) => {
+                let pid: Option<String> = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+                Ok(pid.map(PeerTaskId))
+            }
+        }
+    }
+
+    async fn request_cancel(&self, task: &TaskId) -> Result<(), BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions(task_id, cancel_requested) VALUES(?1, 1)
+             ON CONFLICT(task_id) DO UPDATE SET cancel_requested = 1",
+            rusqlite::params![task.as_str()],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(())
+    }
+
+    async fn cancel_requested(&self, task: &TaskId) -> Result<bool, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT cancel_requested FROM sessions WHERE task_id = ?1")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![task.as_str()])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        match rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            None => Ok(false),
+            Some(row) => {
+                let flag: i64 = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+                Ok(flag != 0)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bridge_core::domain::{PendingKind, PendingRequest};
+    use bridge_core::domain::{PeerTaskId, PendingKind, PendingRequest};
     use bridge_core::ids::{SessionId, TaskId};
     use bridge_core::ports::SessionStore;
+
+    #[tokio::test]
+    async fn peer_task_roundtrips() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let t = TaskId::parse("t").unwrap();
+        assert!(s.peer_task_for(&t).await.unwrap().is_none());
+        s.set_peer_task(&t, &PeerTaskId("p1".into())).await.unwrap();
+        assert_eq!(
+            s.peer_task_for(&t).await.unwrap().unwrap(),
+            PeerTaskId("p1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn early_cancel_latches() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let t = TaskId::parse("t").unwrap();
+        assert!(!s.cancel_requested(&t).await.unwrap());
+        s.request_cancel(&t).await.unwrap(); // before any peer id exists
+        assert!(s.cancel_requested(&t).await.unwrap());
+    }
 
     #[tokio::test]
     async fn put_then_session_for_roundtrips() {

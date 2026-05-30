@@ -66,4 +66,10 @@ mod tests {
         let (_outcome, _back) = s.send_prompt(vec![]);
         // compiles only because send_prompt exists on Session<Ready>
     }
+
+    #[test]
+    fn session_id_accessor() {
+        let s = Session::spawned(SessionId::parse("my-session").unwrap());
+        assert_eq!(s.id().as_str(), "my-session");
+    }
 }

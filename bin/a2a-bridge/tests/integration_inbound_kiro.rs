@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::http::{Request, StatusCode};
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_acp::replay::ReplayBackend;
-use bridge_core::domain::TaskMeta;
+use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
 use bridge_core::ports::{PolicyEngine, RouteDecision, SessionStore};
@@ -21,13 +21,21 @@ use bridge_store::sqlite::SqliteStore;
 use serde_json::json;
 use tower::ServiceExt;
 
+/// Extract all `data:` payloads from an SSE body (one per line starting with "data: ").
+fn sse_data_payloads(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|s| s.trim_end_matches('\r').to_owned())
+        .collect()
+}
+
 // ---- inline route (AlwaysKiro from the binary is not importable here) ----
 
 struct IntegKiroRoute;
 
 impl RouteDecision for IntegKiroRoute {
-    fn route(&self, _meta: &TaskMeta) -> Result<AgentId, BridgeError> {
-        AgentId::parse("kiro")
+    fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+        Ok(RouteTarget::Local(AgentId::parse("kiro")?))
     }
 }
 
@@ -55,6 +63,7 @@ fn build_router() -> axum::Router {
         route,
         auth,
         "http://localhost:8080",
+        Arc::new(bridge_a2a_outbound::StubDelegation),
     ));
     server.router()
 }
@@ -113,6 +122,17 @@ async fn streaming_message_drives_replay_backend_to_artifact() {
         body.contains("artifact-update"),
         "SSE body must contain an 'artifact-update' frame: {body}"
     );
+
+    // Wire-conformance: all data payloads must parse as a2a::StreamResponse.
+    let payloads = sse_data_payloads(&body);
+    assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
+    let last = payloads.last().unwrap();
+    let sr: a2a::StreamResponse = serde_json::from_str(last)
+        .unwrap_or_else(|e| panic!("final data payload must parse as StreamResponse: {e}: {last}"));
+    assert!(
+        matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
+        "final SSE frame must be ArtifactUpdate: {last}"
+    );
 }
 
 /// Ordering invariant: the artifact frame is the last named frame in the stream.
@@ -137,4 +157,18 @@ async fn artifact_frame_is_last_sse_frame() {
             "artifact-update must come after any status-update: {body}"
         );
     }
+
+    // Wire-conformance: all data: payloads must parse as a2a::StreamResponse,
+    // and the final one must be ArtifactUpdate.
+    let payloads = sse_data_payloads(&body);
+    for payload in &payloads {
+        let _: a2a::StreamResponse = serde_json::from_str(payload).unwrap_or_else(|e| {
+            panic!("data payload must parse as StreamResponse: {e}: {payload}")
+        });
+    }
+    let last_sr: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap()).unwrap();
+    assert!(
+        matches!(last_sr, a2a::StreamResponse::ArtifactUpdate(_)),
+        "final SSE frame must be ArtifactUpdate"
+    );
 }

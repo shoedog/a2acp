@@ -1,8 +1,8 @@
-// main.rs — A2A Bridge v1 composition root (spec §8, Task 15).
+// main.rs — A2A Bridge v2.5 composition root (spec §8, Task 15 / Task 10).
 //
 // Wires all port implementations together into a runnable binary:
-//   AlwaysGrant (auth) -> AlwaysKiro (route) -> KiroBackend (backend)
-//   AutoPolicy (policy) | SqliteStore (store) | StubDelegation (delegation)
+//   AlwaysGrant (auth) -> SkillRoute (route) -> KiroBackend (backend)
+//   AutoPolicy (policy) | SqliteStore (store) | PeerDelegation or StubDelegation (delegation)
 //
 // Server listens on cfg.server.addr (default 127.0.0.1:8080).
 
@@ -10,14 +10,16 @@ mod config;
 mod route;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bridge_a2a_inbound::server::InboundServer;
-use bridge_a2a_outbound::StubDelegation;
+use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
 use bridge_acp::{kiro::KiroBackend, supervisor::Supervised};
+use bridge_core::ports::DelegationPort;
 use bridge_policy::{auth::AlwaysGrant, permission::AutoPolicy};
 use bridge_store::sqlite::SqliteStore;
 use config::Config;
-use route::AlwaysKiro;
+use route::SkillRoute;
 
 /// Built-in default config used when `a2a-bridge.toml` is absent.
 const DEFAULT_CONFIG: &str = r#"
@@ -52,17 +54,23 @@ async fn main() -> Result<(), BoxError> {
     // 4. Build all port Arc<dyn Trait> wrappers.
     let auth = Arc::new(AlwaysGrant);
     let policy = Arc::new(AutoPolicy);
-    let route = Arc::new(AlwaysKiro);
+    let route = Arc::new(SkillRoute);
     let store = Arc::new(SqliteStore::open_in_memory()?);
-    // StubDelegation is not passed to InboundServer (unused on happy path) but is
-    // constructed here to prove the composition root is wired end-to-end.
-    let _delegation = Arc::new(StubDelegation);
+    // Delegation port: real PeerDelegation when [delegation] is configured; StubDelegation otherwise.
+    let delegation: Arc<dyn DelegationPort> = match &cfg.delegation {
+        Some(d) => Arc::new(PeerDelegation::new(
+            &d.peer_url,
+            &d.auth,
+            Duration::from_secs(d.timeout_secs),
+        )),
+        None => Arc::new(StubDelegation),
+    };
 
     // 5. Construct the inbound server and build its axum router.
-    //    InboundServer::new(backend, store, policy, route, auth, base_url)
+    //    InboundServer::new(backend, store, policy, route, auth, base_url, delegation)
     let base_url = format!("http://{}", cfg.server.addr);
     let server = Arc::new(InboundServer::new(
-        backend, store, policy, route, auth, base_url,
+        backend, store, policy, route, auth, base_url, delegation,
     ));
     let router = server.router();
 

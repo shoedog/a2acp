@@ -20,3 +20,4 @@ a2a.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
+async-stream.workspace = true

@@ -31,24 +31,50 @@ pub trait AgentBackend: Send + Sync {
 #[async_trait::async_trait]
 pub trait InboundTransport: Send + Sync {}
 
-/// Delegation port — sends tasks to a downstream agent.
-#[async_trait::async_trait]
-pub trait DelegationPort: Send + Sync {
-    async fn delegate(&self, meta: &TaskMeta) -> Result<(), BridgeError>;
+/// A pinned, boxed stream of `Result<Event, BridgeError>` items.
+pub type DelegationStream =
+    Pin<Box<dyn futures::Stream<Item = Result<crate::translator::Event, BridgeError>> + Send>>;
+
+/// The result of delegating: a stream of events plus a watch channel for the peer task id.
+pub struct Delegation {
+    pub events: DelegationStream,
+    pub peer_task: tokio::sync::watch::Receiver<Option<PeerTaskId>>,
 }
 
-/// Session store — persists task→session mappings and pending-request state.
+/// Delegation port — streams tasks to a downstream agent.
+#[async_trait::async_trait]
+pub trait DelegationPort: Send + Sync {
+    async fn delegate(
+        &self,
+        auth: &AuthContext,
+        local_task: &TaskId,
+        parts: Vec<Part>,
+    ) -> Result<Delegation, BridgeError>;
+    async fn cancel(&self, peer_task: &PeerTaskId) -> Result<(), BridgeError>;
+}
+
+/// Session store — persists task→session mappings, pending-request state,
+/// delegated peer-task ids, and the early-cancel latch.
 #[async_trait::async_trait]
 pub trait SessionStore: Send + Sync {
     async fn put(&self, task: &TaskId, session: &SessionId) -> Result<(), BridgeError>;
     async fn session_for(&self, task: &TaskId) -> Result<Option<SessionId>, BridgeError>;
     async fn put_pending(&self, task: &TaskId, req: &PendingRequest) -> Result<(), BridgeError>;
     async fn take_pending(&self, task: &TaskId) -> Result<Option<PendingRequest>, BridgeError>;
+
+    /// Persist the downstream peer-task id assigned during delegation.
+    async fn set_peer_task(&self, task: &TaskId, peer: &PeerTaskId) -> Result<(), BridgeError>;
+    /// Retrieve the peer-task id, if any.
+    async fn peer_task_for(&self, task: &TaskId) -> Result<Option<PeerTaskId>, BridgeError>;
+    /// Latch the early-cancel flag for this task (idempotent).
+    async fn request_cancel(&self, task: &TaskId) -> Result<(), BridgeError>;
+    /// Returns `true` if `request_cancel` has been called for this task.
+    async fn cancel_requested(&self, task: &TaskId) -> Result<bool, BridgeError>;
 }
 
 /// Sync routing decision — no async needed; plain fn.
 pub trait RouteDecision: Send + Sync {
-    fn route(&self, meta: &TaskMeta) -> Result<AgentId, BridgeError>;
+    fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError>;
 }
 
 /// Sync policy engine — evaluates a permission request against session context.
@@ -66,6 +92,17 @@ pub trait AuthMiddleware: Send + Sync {
 }
 
 #[cfg(test)]
+mod v25rt {
+    use super::*;
+    use crate::ids::AgentId;
+    #[test]
+    fn route_target_local() {
+        let r = RouteTarget::Local(AgentId::parse("kiro").unwrap());
+        assert!(matches!(r, RouteTarget::Local(a) if a.as_str() == "kiro"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::BridgeError;
@@ -74,12 +111,16 @@ mod tests {
     struct FakeStore {
         inner: std::sync::Mutex<std::collections::HashMap<String, String>>,
         pending: std::sync::Mutex<std::collections::HashMap<String, PendingRequest>>,
+        peer_tasks: std::sync::Mutex<std::collections::HashMap<String, PeerTaskId>>,
+        cancels: std::sync::Mutex<std::collections::HashSet<String>>,
     }
     impl FakeStore {
         fn new() -> Self {
             Self {
                 inner: Default::default(),
                 pending: Default::default(),
+                peer_tasks: Default::default(),
+                cancels: Default::default(),
             }
         }
     }
@@ -110,6 +151,23 @@ mod tests {
         async fn take_pending(&self, t: &TaskId) -> Result<Option<PendingRequest>, BridgeError> {
             Ok(self.pending.lock().unwrap().remove(t.as_str()))
         }
+        async fn set_peer_task(&self, t: &TaskId, peer: &PeerTaskId) -> Result<(), BridgeError> {
+            self.peer_tasks
+                .lock()
+                .unwrap()
+                .insert(t.as_str().into(), peer.clone());
+            Ok(())
+        }
+        async fn peer_task_for(&self, t: &TaskId) -> Result<Option<PeerTaskId>, BridgeError> {
+            Ok(self.peer_tasks.lock().unwrap().get(t.as_str()).cloned())
+        }
+        async fn request_cancel(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.cancels.lock().unwrap().insert(t.as_str().into());
+            Ok(())
+        }
+        async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(self.cancels.lock().unwrap().contains(t.as_str()))
+        }
     }
 
     struct FakeBackend;
@@ -135,8 +193,8 @@ mod tests {
 
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
-        fn route(&self, _t: &TaskMeta) -> Result<AgentId, BridgeError> {
-            AgentId::parse("kiro")
+        fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            Ok(RouteTarget::Local(AgentId::parse("kiro")?))
         }
     }
 
@@ -151,6 +209,24 @@ mod tests {
             matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_put_and_session_for_roundtrip() {
+        let st = FakeStore::new();
+        let t = TaskId::parse("t-sess").unwrap();
+        let s = SessionId::parse("s-abc").unwrap();
+        st.put(&t, &s).await.unwrap();
+        let found = st.session_for(&t).await.unwrap();
+        assert_eq!(found.unwrap().as_str(), "s-abc");
+    }
+
+    #[tokio::test]
+    async fn backend_cancel_returns_ok() {
+        FakeBackend
+            .cancel(&SessionId::parse("s").unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -172,7 +248,8 @@ mod tests {
 
     #[test]
     fn route_decision_is_sync_and_routes_to_kiro() {
-        assert_eq!(AlwaysKiro.route(&TaskMeta).unwrap().as_str(), "kiro");
+        let r = AlwaysKiro.route(&TaskMeta::default()).unwrap();
+        assert!(matches!(r, RouteTarget::Local(a) if a.as_str() == "kiro"));
     }
 
     #[test]

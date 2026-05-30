@@ -166,20 +166,24 @@ impl AgentBackend for KiroBackend {
     async fn prompt(
         &self,
         session: &SessionId,
-        _parts: Vec<bridge_core::domain::Part>,
+        parts: Vec<bridge_core::domain::Part>,
     ) -> Result<BackendStream, BridgeError> {
         let id = self.next_id();
         let session_id = session.as_str().to_string();
 
         {
             let mut g = self.inner.lock().await;
+            let serialized_parts: Vec<serde_json::Value> = parts
+                .iter()
+                .map(|p| serde_json::json!({ "text": p.text }))
+                .collect();
             let req = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": "session/prompt",
                 "params": {
                     "sessionId": &session_id,
-                    "parts": []
+                    "parts": serialized_parts
                 }
             });
             write_line(&mut g.stdin, &req).await?;
@@ -346,6 +350,30 @@ mod tests {
                 panic!("expected terminal Done for an unrecognized result frame, got {other:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_serializes_part_text_into_session_prompt() {
+        // child: emits sessionId; reads the prompt line from stdin; echoes that line's content back
+        // (stripped of quotes) inside a session/update text; then a result.
+        let be = KiroBackend::from_child(scripted(
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
+             IFS= read -r _new_req; \
+             IFS= read -r line; \
+             printf '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"text\":\"GOT:%s\"}}\\n' \"$(printf '%s' \"$line\" | tr -d '\\\"')\"; \
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}'; sleep 1"));
+        let sid = be.new_session().await.unwrap();
+        let mut s = be
+            .prompt(
+                &sid,
+                vec![bridge_core::domain::Part {
+                    text: "HELLO_PART".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        // the echoed prompt line must contain our part text -> proves it was serialized into session/prompt
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t.contains("HELLO_PART")));
     }
 
     #[tokio::test]

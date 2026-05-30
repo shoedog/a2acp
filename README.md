@@ -105,35 +105,53 @@ A real end-to-end round-trip against an authenticated `kiro-cli` is `#[ignore]`-
 cargo test -p a2a-bridge --test e2e_kiro -- --ignored --nocapture   # needs kiro-cli whoami
 ```
 
-## What v1 does / doesn't do
+### Outbound delegation (Increment 2.5)
 
-**In:** inbound A2A (Kiro), streaming SSE with coalescing, cancellation
-(prompt-result semantics), permission/auth suspend→resume, process-group reaping, the
-`DelegationPort` seam, structured tracing.
+The bridge can forward a task to a configured remote A2A peer: send a `SendStreamingMessage`
+with `metadata["a2a-bridge.skill"]="delegate"`, and the bridge POSTs it to the peer and
+streams the peer's `StreamResponse` events back to the caller. Configure one peer:
 
-**Deferred:** concrete outbound delegation + SSE stream-merge (Increment 2.5);
+```toml
+[delegation]
+peer_url    = "https://peer.example/"
+auth        = "bearer:${PEER_TOKEN}"   # ${ENV} expanded; missing var = error
+timeout_secs = 60                       # optional
+```
+
+Without a `[delegation]` section the bridge runs local-only (delegation is a no-op). A gated
+bridge-to-bridge e2e (one bridge's `delegate` skill → another bridge's `kiro-code`) is
+`#[ignore]`d: `cargo test -p a2a-bridge --test e2e_delegate_bridge -- --ignored`.
+
+## What the bridge does / doesn't do
+
+**In:** inbound A2A (Kiro) with **A2A-conformant `StreamResponse` SSE**; **outbound
+delegation to one configured peer** (passthrough); streaming with coalescing; cancellation
+(prompt-result semantics; peer cancel on inbound `CancelTask` and caller disconnect);
+permission/auth suspend→resume; **real message content threaded to Kiro and the peer**;
+process-group reaping; structured tracing.
+
+**Deferred:** **fan-out + concurrent stream-merge** (Kiro *and* peer merged — Increment 2.6);
 multi-agent adapters (Claude Code/Codex/Gemini, Increment 3); real permission policy;
-`session/load` resume; MCP-over-ACP; JWT/mTLS enforcement; container isolation.
+`session/load` resume; MCP-over-ACP; JWT/mTLS enforcement; container isolation; multiple
+peers / discovery / mesh.
 
-### Known v1 limitations (called out honestly; see ADR-0003 + the final review)
+### Known limitations (called out honestly; see ADR-0003 + reviews)
 
 - **ACP wire framing is hand-rolled.** `KiroBackend` drives ACP JSON-RPC directly over
   `serde_json` + the in-house `FrameReader`; the pinned `agent-client-protocol` crate's
   typed helpers are **not yet wired** (reserved for Increment 3, ADR-0003 Addendum 2).
 - **The `Task`/`Session` typestate is a compile-time spec artifact, not yet load-bearing.**
-  It is `trybuild`-verified but the runtime pipeline (`translator` → `server`) does not yet
-  route through `Session<Ready>::send_prompt`. The seam is preserved for later wiring.
+  It is `trybuild`-verified but the runtime pipeline does not yet route through
+  `Session<Ready>::send_prompt`. The seam is preserved for later wiring.
 - **Coalescing is char-cap only** (1200 chars + boundary flush); the 200 ms idle-flush half
-  of the spec contract is not yet implemented (invisible to fakes; matters on a slow real
-  stream).
-- **The running binary uses an in-memory SQLite store** (`open_in_memory`), so the
-  persisted pending-request (resume-after-restart) is not durable across process restart in
-  v1. The store seam supports a file-backed DB; wiring it is a one-line change.
-- **Message content is not yet threaded to the backend** (`Part` is a placeholder type), so
-  the inbound path proves wiring, not content fidelity — by design for a walking skeleton.
-- **Agent Card path / A2A conformance:** served at `/.well-known/agent-card.json` per the
-  spec; the published A2A v1 standard may use `/.well-known/agent.json` — unresolved
-  conformance item (ADR-0003), verify before claiming external A2A-client conformance.
+  of the spec contract is not yet implemented.
+- **The running binary uses an in-memory SQLite store** (`open_in_memory`), so persisted
+  state (pending-request resume, delegated-task mapping) is not durable across restart. The
+  store seam supports a file-backed DB; wiring it is a one-line change.
+- **Agent Card path:** served at `/.well-known/agent-card.json`; the published A2A v1
+  standard may use `/.well-known/agent.json` — verify before claiming external conformance.
+- **Outbound passthrough only; caller identity is not forwarded** to the peer (a configured
+  bearer is presented instead) — identity propagation is a later concern.
 
 ## License
 

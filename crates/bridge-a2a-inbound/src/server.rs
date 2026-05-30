@@ -32,10 +32,12 @@ use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
-use bridge_core::domain::{InboundRequest, Part, TaskMeta};
+use bridge_core::domain::{AuthContext, InboundRequest, Part, PeerTaskId, RouteTarget, TaskMeta};
 use bridge_core::error::{A2aDisposition, BridgeError};
 use bridge_core::ids::{SessionId, TaskId};
-use bridge_core::ports::{AgentBackend, AuthMiddleware, PolicyEngine, RouteDecision, SessionStore};
+use bridge_core::ports::{
+    AgentBackend, AuthMiddleware, DelegationPort, PolicyEngine, RouteDecision, SessionStore,
+};
 use bridge_core::translator::{Event, EventKind, Translator};
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
@@ -50,7 +52,7 @@ const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error.
 const JSONRPC_INTERNAL: i32 = -32603;
 
-/// The inbound A2A server. Holds the five pipeline ports plus the advertised
+/// The inbound A2A server. Holds the six pipeline ports plus the advertised
 /// base URL (used to build the Agent Card). Cheap to clone via `Arc`.
 pub struct InboundServer {
     backend: Arc<dyn AgentBackend>,
@@ -59,10 +61,20 @@ pub struct InboundServer {
     route: Arc<dyn RouteDecision>,
     auth: Arc<dyn AuthMiddleware>,
     base_url: String,
+    delegation: Arc<dyn DelegationPort>,
+    /// Single-cancel guard: the set of local task ids whose upstream peer
+    /// `CancelTask` has already been POSTed. An inbound `CancelTask` (the
+    /// `cancel_task()` handler) and the streaming cancel supervisor both race to
+    /// cancel an active delegated peer; this set ensures whichever wins the race
+    /// POSTs exactly once and the other skips. Both `cancel` paths must remain —
+    /// the handler covers the stream/supervisor already having ended, the
+    /// supervisor covers disconnect/latch during the stream — so this is a GUARD,
+    /// not a removed path.
+    cancelled_peers: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl InboundServer {
-    /// Construct a server from the five pipeline ports and the advertised base URL.
+    /// Construct a server from the six pipeline ports and the advertised base URL.
     pub fn new(
         backend: Arc<dyn AgentBackend>,
         store: Arc<dyn SessionStore>,
@@ -70,6 +82,7 @@ impl InboundServer {
         route: Arc<dyn RouteDecision>,
         auth: Arc<dyn AuthMiddleware>,
         base_url: impl Into<String>,
+        delegation: Arc<dyn DelegationPort>,
     ) -> Self {
         Self {
             backend,
@@ -78,6 +91,8 @@ impl InboundServer {
             route,
             auth,
             base_url: base_url.into(),
+            delegation,
+            cancelled_peers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -102,7 +117,7 @@ impl InboundServer {
             Some(t) => InboundRequest::with_token(&t),
             None => InboundRequest::anon(),
         };
-        let _auth_ctx = self.auth.authorize(&inbound)?;
+        let auth = self.auth.authorize(&inbound)?;
 
         // 2. Version gate: the A2A-Version header must match our pinned version.
         let version = headers
@@ -111,27 +126,44 @@ impl InboundServer {
             .unwrap_or(A2A_PINNED_VERSION);
         assert_supported_version(version)?;
 
-        // 3. Route. v1 routing is metadata-only; we keep the AgentId for tracing.
-        let _agent = self.route.route(&TaskMeta)?;
+        // 3. Route. Parse skill from params and pass to route decision. The
+        //    target (Local vs Delegate) is carried through so the handler picks
+        //    the local-backend producer or the delegation producer.
+        let task_meta = task_meta_from_params(params);
+        let target = self.route.route(&task_meta)?;
 
         // 4. Derive task/session ids from params (best-effort; v1 stubs allowed).
         let task = task_id_from_params(params)?;
         let session = SessionId::parse(format!("session-{}", task.as_str()))
             .unwrap_or_else(|_| SessionId::parse("session-default").unwrap());
-        // Persist the task->session mapping so CancelTask/GetTask can find it.
         Ok(RoutedCall {
             task,
             session,
             parts: parts_from_params(params),
+            target,
+            auth,
         })
     }
 }
 
-/// The result of the gate: the routed call ready for the translator.
+/// Single-cancel guard for an active delegated task. Atomically check-and-insert
+/// the local task id into the shared set, returning `true` exactly once per task
+/// — the caller that gets `true` "wins the race" and must POST the upstream
+/// `delegation.cancel(peer)`; all later callers get `false` and must skip.
+async fn try_win_peer_cancel(
+    guard: &Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    local: &TaskId,
+) -> bool {
+    guard.lock().await.insert(local.as_str().to_owned())
+}
+
+/// The result of the gate: the routed call ready for the translator or delegation.
 struct RoutedCall {
     task: TaskId,
     session: SessionId,
     parts: Vec<Part>,
+    target: RouteTarget,
+    auth: AuthContext,
 }
 
 // ---- axum handlers ----
@@ -179,15 +211,37 @@ async fn stream_message(
     // Persist task->session before driving the backend.
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
-    // Drive the translator on a spawned task feeding an mpsc channel, so the SSE
-    // response stream owns no borrowed references (the translator borrows `&'a
-    // dyn ...`). Cloning the Arcs into the task satisfies 'static.
+    // The SSE producer feeds events into an mpsc channel; the response stream
+    // owns no borrowed references. Both the local and delegate paths reuse this
+    // exact channel -> SSE wiring (DRY).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, BridgeError>>(64);
+    let task_id_str = routed.task.as_str().to_owned();
+
+    match routed.target {
+        RouteTarget::Local(_) => spawn_local_producer(&srv, routed, tx),
+        RouteTarget::Delegate => spawn_delegate_producer(&srv, routed, tx),
+    }
+
+    // Use the task id as the context id for now (consistent within a single stream).
+    let context_id_str = task_id_str.clone();
+    let sse_stream = sse_event_stream(rx, task_id_str, context_id_str);
+    Sse::new(sse_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// Spawn the local-backend producer: drive the translator and forward each
+/// translated event into the mpsc channel. Stops if the receiver is dropped.
+fn spawn_local_producer(
+    srv: &Arc<InboundServer>,
+    routed: RoutedCall,
+    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+) {
     let backend = srv.backend.clone();
     let store = srv.store.clone();
     let policy = srv.policy.clone();
-    let task = routed.task.clone();
-    let session = routed.session.clone();
+    let task = routed.task;
+    let session = routed.session;
     let parts = routed.parts;
 
     tokio::spawn(async move {
@@ -208,11 +262,153 @@ async fn stream_message(
         }
         // Channel closes on drop -> SSE stream terminates after the final flush.
     });
+}
 
-    let sse_stream = sse_event_stream(rx);
-    Sse::new(sse_stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+/// Spawn the delegate producer: open the delegation, persist `local->peer` as
+/// soon as the peer id is known, feed peer events into the same mpsc->SSE path,
+/// and run the CONSOLIDATED cancel supervisor (`select!` over the next peer
+/// event, `tx.closed()` for caller-disconnect — works even if the peer stream is
+/// IDLE — and an inbound `CancelTask` having latched `cancel_requested`).
+fn spawn_delegate_producer(
+    srv: &Arc<InboundServer>,
+    routed: RoutedCall,
+    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+) {
+    let delegation = srv.delegation.clone();
+    let store = srv.store.clone();
+    let guard = srv.cancelled_peers.clone();
+    let local = routed.task;
+    let parts = routed.parts;
+    let auth = routed.auth;
+
+    tokio::spawn(async move {
+        // 1. Open the delegation. On failure, surface a terminal error frame.
+        let delegated = match delegation.delegate(&auth, &local, parts).await {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        };
+        let mut events = delegated.events;
+        let mut peer_watch = delegated.peer_task;
+
+        // 2. Background watcher: persist local->peer once the id appears, and
+        //    honor the early-cancel latch (case c) the instant the id is known.
+        spawn_peer_persist(
+            store.clone(),
+            delegation.clone(),
+            guard.clone(),
+            local.clone(),
+            peer_watch.clone(),
+        );
+
+        // 3. Consolidated event/cancel loop.
+        loop {
+            tokio::select! {
+                // (i) next peer event -> forward to SSE.
+                maybe = events.next() => {
+                    match maybe {
+                        Some(ev) => {
+                            if tx.send(ev).await.is_err() {
+                                // Receiver gone mid-send: treat as disconnect.
+                                cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
+                                return;
+                            }
+                        }
+                        None => return, // peer stream terminated normally.
+                    }
+                }
+                // (ii) caller disconnected (works even if the peer stream is IDLE).
+                _ = tx.closed() => {
+                    cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
+                    return;
+                }
+                // (iii) an inbound CancelTask latched cancel_requested.
+                _ = poll_cancel_requested(store.as_ref(), &local) => {
+                    cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Watch the delegation's peer-task channel; when it becomes `Some(peer)`,
+/// persist `local->peer`. If a cancel was already requested (early-cancel latch),
+/// cancel the peer immediately (case c).
+fn spawn_peer_persist(
+    store: Arc<dyn SessionStore>,
+    delegation: Arc<dyn DelegationPort>,
+    guard: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    local: TaskId,
+    mut peer_watch: tokio::sync::watch::Receiver<Option<PeerTaskId>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            // Clone the value out and drop the (non-Send) watch ref before awaiting.
+            let current = peer_watch.borrow_and_update().clone();
+            if let Some(peer) = current {
+                let _ = store.set_peer_task(&local, &peer).await;
+                if store.cancel_requested(&local).await.unwrap_or(false)
+                    && try_win_peer_cancel(&guard, &local).await
+                {
+                    let _ = delegation.cancel(&peer).await;
+                }
+                return;
+            }
+            // Wait for the next change; if the sender is dropped, give up.
+            if peer_watch.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Resolve the peer id (from the watch; if still `None`, briefly await the next
+/// change so a just-assigned id is honored) and cancel the peer. The store's
+/// `request_cancel` latch is also set so a not-yet-known id is covered when it
+/// later appears via `spawn_peer_persist`.
+async fn cancel_peer_now(
+    delegation: &Arc<dyn DelegationPort>,
+    store: &Arc<dyn SessionStore>,
+    guard: &Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    local: &TaskId,
+    peer_watch: &mut tokio::sync::watch::Receiver<Option<PeerTaskId>>,
+) {
+    // Latch first so the race (id appears later) is covered by spawn_peer_persist.
+    let _ = store.request_cancel(local).await;
+
+    // Clone the value out and drop the (non-Send) watch ref before awaiting.
+    let current = peer_watch.borrow().clone();
+    if let Some(peer) = current {
+        // Single-cancel guard: only POST if we win the race against cancel_task().
+        if try_win_peer_cancel(guard, local).await {
+            let _ = delegation.cancel(&peer).await;
+        }
+        return;
+    }
+    // Peer id not yet known: wait briefly for it to appear, else rely on the latch.
+    if peer_watch.changed().await.is_ok() {
+        let next = peer_watch.borrow().clone();
+        if let Some(peer) = next {
+            if try_win_peer_cancel(guard, local).await {
+                let _ = delegation.cancel(&peer).await;
+            }
+        }
+    }
+}
+
+/// Resolve only once `cancel_requested(local)` is true. Polls the store on a
+/// short interval so an inbound `CancelTask` (which latches the flag) wakes the
+/// supervisor's `select!`.
+async fn poll_cancel_requested(store: &dyn SessionStore, local: &TaskId) {
+    loop {
+        if store.cancel_requested(local).await.unwrap_or(false) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// Adapt the mpsc receiver into a stream of `Result<SseEvent, Infallible>`.
@@ -220,10 +416,12 @@ async fn stream_message(
 /// single `error` frame so the client sees a terminal signal.
 fn sse_event_stream(
     rx: tokio::sync::mpsc::Receiver<Result<Event, BridgeError>>,
+    task_id: String,
+    context_id: String,
 ) -> impl Stream<Item = Result<SseEvent, std::convert::Infallible>> {
-    tokio_stream::wrappers::ReceiverStream::new(rx).map(|item| {
+    tokio_stream::wrappers::ReceiverStream::new(rx).map(move |item| {
         let frame = match item {
-            Ok(ev) => event_to_sse(&ev),
+            Ok(ev) => event_to_sse(&ev, &task_id, &context_id),
             Err(e) => SseEvent::default()
                 .event("error")
                 .json_data(json!({ "kind": "error", "text": e.to_string() }))
@@ -246,18 +444,63 @@ async fn unary_message(
     };
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
-    let translator = Translator::new();
-    let collected: Vec<Result<Event, BridgeError>> = translator
-        .run(
-            srv.backend.as_ref(),
-            srv.store.as_ref(),
-            srv.policy.as_ref(),
-            &routed.task,
-            &routed.session,
-            routed.parts,
-        )
-        .collect()
-        .await;
+    // Collect the same event stream the streaming path produces, into one JSON
+    // response. Local drives the translator; Delegate drives the delegation.
+    let collected: Vec<Result<Event, BridgeError>> = match routed.target {
+        RouteTarget::Local(_) => {
+            let translator = Translator::new();
+            translator
+                .run(
+                    srv.backend.as_ref(),
+                    srv.store.as_ref(),
+                    srv.policy.as_ref(),
+                    &routed.task,
+                    &routed.session,
+                    routed.parts,
+                )
+                .collect()
+                .await
+        }
+        RouteTarget::Delegate => {
+            match srv
+                .delegation
+                .delegate(&routed.auth, &routed.task, routed.parts)
+                .await
+            {
+                Ok(delegated) => {
+                    let mut peer_watch = delegated.peer_task;
+                    // Drain the events first: the real client captures the peer id
+                    // lazily as frames are consumed, so the watch only becomes
+                    // Some(peer) AFTER the stream has been driven. Reading it before
+                    // collect (the old behavior) saw None and never persisted the
+                    // mapping, leaving the unary-delegated task un-cancellable.
+                    let collected: Vec<Result<Event, BridgeError>> =
+                        delegated.events.collect().await;
+
+                    // Now persist local->peer. Clone the value out and drop the
+                    // (non-Send) watch ref before awaiting.
+                    let peer = peer_watch.borrow_and_update().clone();
+                    if let Some(peer) = peer {
+                        let _ = srv.store.set_peer_task(&routed.task, &peer).await;
+                        // Latch-apply: if an inbound CancelTask already requested a
+                        // cancel for this task, honor it now — respecting the
+                        // single-cancel guard so we don't double-POST.
+                        if srv
+                            .store
+                            .cancel_requested(&routed.task)
+                            .await
+                            .unwrap_or(false)
+                            && try_win_peer_cancel(&srv.cancelled_peers, &routed.task).await
+                        {
+                            let _ = srv.delegation.cancel(&peer).await;
+                        }
+                    }
+                    collected
+                }
+                Err(e) => vec![Err(e)],
+            }
+        }
+    };
 
     // Surface a terminal error if the pipeline failed/suspended.
     if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
@@ -305,14 +548,36 @@ async fn cancel_task(
         Ok(t) => t,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    // Look up the session for this task; fall back to the derived default.
-    let session = match srv.store.session_for(&task).await {
-        Ok(Some(s)) => s,
-        _ => SessionId::parse(format!("session-{}", task.as_str()))
-            .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
-    };
-    if let Err(e) = srv.backend.cancel(&session).await {
-        return bridge_err_to_jsonrpc(id, &e);
+
+    // Always latch the early-cancel flag: this covers the race where the peer id
+    // is not yet known (the streaming supervisor's select! / peer-persist watcher
+    // will apply the cancel once the id appears) and signals an in-flight stream.
+    let _ = srv.store.request_cancel(&task).await;
+
+    // S2b: if the task is delegated, cancel the peer directly. This path covers
+    // the case where the stream/supervisor has already ended; the single-cancel
+    // guard ensures we don't double-POST when the supervisor is still alive and
+    // its poll_cancel_requested arm (woken by the request_cancel latch above)
+    // would otherwise cancel the same peer.
+    match srv.store.peer_task_for(&task).await {
+        Ok(Some(peer)) => {
+            if try_win_peer_cancel(&srv.cancelled_peers, &task).await {
+                if let Err(e) = srv.delegation.cancel(&peer).await {
+                    return bridge_err_to_jsonrpc(id, &e);
+                }
+            }
+        }
+        _ => {
+            // Local task: cancel the backend for the task's session.
+            let session = match srv.store.session_for(&task).await {
+                Ok(Some(s)) => s,
+                _ => SessionId::parse(format!("session-{}", task.as_str()))
+                    .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
+            };
+            if let Err(e) = srv.backend.cancel(&session).await {
+                return bridge_err_to_jsonrpc(id, &e);
+            }
+        }
     }
     jsonrpc_ok(
         id,
@@ -405,36 +670,208 @@ fn task_id_from_params(params: &Value) -> Result<TaskId, BridgeError> {
     }
 }
 
-/// Pull message parts from params. v1 carries text as `message.text` or a raw
-/// `text` field; the domain `Part` is a unit type, so we map presence to a
-/// single part (the backend fake decides the actual content in tests).
+/// Extract `TaskMeta` from JSON-RPC params. Reads the skill selector from
+/// `params.message.metadata["a2a-bridge.skill"]` if present; all other fields
+/// are left at their defaults.
+fn task_meta_from_params(params: &Value) -> TaskMeta {
+    let skill = params
+        .get("message")
+        .and_then(|m| m.get("metadata"))
+        .and_then(|md| md.get("a2a-bridge.skill"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    TaskMeta { skill }
+}
+
+/// Pull message parts from params, extracting real text content.
+///
+/// Priority:
+/// 1. If `message.parts` is a non-empty array, map each element's `text`
+///    field to a `Part { text }`, skipping elements without a string `text`.
+/// 2. Else if `message.text` is a string, one `Part { text }`.
+/// 3. Else if a top-level `text` field is present, one `Part { text }`.
+/// 4. Otherwise empty vec.
 fn parts_from_params(params: &Value) -> Vec<Part> {
-    let has_text = params.get("text").is_some()
-        || params
-            .get("message")
-            .map(|m| m.get("text").is_some() || m.get("parts").is_some())
-            .unwrap_or(false);
-    if has_text {
-        vec![Part]
-    } else {
-        vec![]
+    let message = params.get("message");
+
+    // 1. message.parts array
+    if let Some(parts_arr) = message
+        .and_then(|m| m.get("parts"))
+        .and_then(|p| p.as_array())
+    {
+        if !parts_arr.is_empty() {
+            return parts_arr
+                .iter()
+                .filter_map(|elem| {
+                    elem.get("text").and_then(|t| t.as_str()).map(|t| Part {
+                        text: t.to_string(),
+                    })
+                })
+                .collect();
+        }
     }
+
+    // 2. message.text
+    if let Some(text) = message.and_then(|m| m.get("text")).and_then(|t| t.as_str()) {
+        return vec![Part {
+            text: text.to_string(),
+        }];
+    }
+
+    // 3. top-level text
+    if let Some(text) = params.get("text").and_then(|t| t.as_str()) {
+        return vec![Part {
+            text: text.to_string(),
+        }];
+    }
+
+    vec![]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_core::domain::RouteTarget;
     use bridge_core::domain::{
-        AuthContext, PendingRequest, PermissionDecision, PermissionRequest, SessionContext,
+        AuthContext, PeerTaskId, PendingRequest, PermissionDecision, PermissionRequest,
+        SessionContext,
     };
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, CallerId};
     use bridge_core::ports::*;
+    use bridge_core::ports::{Delegation, DelegationPort, DelegationStream};
+    use bridge_core::translator::Event;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use tower::ServiceExt;
 
     // ---- inline fakes ----
+
+    /// Delegation double. Yields a scripted set of events; exposes a preset
+    /// `peer_task` watch; records every `cancel(peer_id)` call. In "idle" mode it
+    /// yields its scripted events then hangs forever (a peer stream that never
+    /// completes), and its `peer_task` starts `None` and flips to `Some` after the
+    /// first event if `peer_after_first` is set.
+    struct FakeDelegation {
+        events: Mutex<Option<Vec<Result<Event, BridgeError>>>>,
+        peer_initial: Option<PeerTaskId>,
+        /// If set, peer id becomes Some(this) only after the first event is emitted.
+        peer_after_first: Option<PeerTaskId>,
+        idle: bool,
+        /// If set, the peer id is sent from INSIDE the events stream as the first
+        /// frame is yielded (models the real client capturing the id lazily as
+        /// frames are consumed/drained, rather than on an independent timer).
+        peer_on_drain: Option<PeerTaskId>,
+        cancels: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeDelegation {
+        fn new(events: Vec<Result<Event, BridgeError>>, peer: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Some(events)),
+                peer_initial: peer.map(|p| PeerTaskId(p.into())),
+                peer_after_first: None,
+                idle: false,
+                peer_on_drain: None,
+                cancels: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+        fn idle(events: Vec<Result<Event, BridgeError>>, peer: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Some(events)),
+                peer_initial: peer.map(|p| PeerTaskId(p.into())),
+                peer_after_first: None,
+                idle: true,
+                peer_on_drain: None,
+                cancels: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+        /// Late-binding peer id: starts None, becomes Some(peer) after the first event.
+        fn late_peer(events: Vec<Result<Event, BridgeError>>, peer: &str) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Some(events)),
+                peer_initial: None,
+                peer_after_first: Some(PeerTaskId(peer.into())),
+                idle: false,
+                peer_on_drain: None,
+                cancels: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+        /// Peer id captured lazily as frames are consumed: starts None and becomes
+        /// Some(peer) from inside the events stream when the first frame is drained.
+        fn late_peer_on_drain(events: Vec<Result<Event, BridgeError>>, peer: &str) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Some(events)),
+                peer_initial: None,
+                peer_after_first: None,
+                idle: false,
+                peer_on_drain: Some(PeerTaskId(peer.into())),
+                cancels: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+        fn cancels(&self) -> Arc<Mutex<Vec<String>>> {
+            self.cancels.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DelegationPort for FakeDelegation {
+        async fn delegate(
+            &self,
+            _auth: &AuthContext,
+            _local: &TaskId,
+            _parts: Vec<Part>,
+        ) -> Result<Delegation, BridgeError> {
+            let scripted = self.events.lock().unwrap().take().unwrap_or_default();
+            let (peer_tx, peer_rx) =
+                tokio::sync::watch::channel::<Option<PeerTaskId>>(self.peer_initial.clone());
+            let idle = self.idle;
+            let after_first = self.peer_after_first.clone();
+            let on_drain = self.peer_on_drain.clone();
+
+            // Drive the late peer-id update from an INDEPENDENT task (mirrors the
+            // real outbound client, whose background reader updates the watch
+            // regardless of whether the caller is still consuming events). This is
+            // what makes the early-cancel latch observable even after the
+            // supervisor stops polling the event stream (case c).
+            if let Some(p) = after_first {
+                let tx = peer_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                    let _ = tx.send(Some(p));
+                });
+            }
+
+            // Keep peer_tx alive for the lifetime of the stream so the watch
+            // channel stays open while the peer is in flight.
+            let events: DelegationStream = Box::pin(async_stream::stream! {
+                let _hold = peer_tx;
+                let mut first = true;
+                for ev in scripted {
+                    // Capture the peer id lazily as the first frame is consumed.
+                    if first {
+                        if let Some(p) = on_drain.clone() {
+                            let _ = _hold.send(Some(p));
+                        }
+                        first = false;
+                    }
+                    yield ev;
+                }
+                if idle {
+                    // Hang forever — an IDLE peer stream that never completes.
+                    futures::future::pending::<()>().await;
+                }
+            });
+            Ok(Delegation {
+                events,
+                peer_task: peer_rx,
+            })
+        }
+        async fn cancel(&self, peer_task: &PeerTaskId) -> Result<(), BridgeError> {
+            self.cancels.lock().unwrap().push(peer_task.0.clone());
+            Ok(())
+        }
+    }
 
     /// Backend that yields Text + Done and records whether prompt/cancel ran.
     struct FakeBackend {
@@ -490,6 +927,8 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         map: Mutex<std::collections::HashMap<String, String>>,
+        peer_tasks: Mutex<std::collections::HashMap<String, PeerTaskId>>,
+        cancels: Mutex<std::collections::HashSet<String>>,
     }
     #[async_trait::async_trait]
     impl SessionStore for FakeStore {
@@ -514,6 +953,23 @@ mod tests {
         async fn take_pending(&self, _t: &TaskId) -> Result<Option<PendingRequest>, BridgeError> {
             Ok(None)
         }
+        async fn set_peer_task(&self, t: &TaskId, peer: &PeerTaskId) -> Result<(), BridgeError> {
+            self.peer_tasks
+                .lock()
+                .unwrap()
+                .insert(t.as_str().into(), peer.clone());
+            Ok(())
+        }
+        async fn peer_task_for(&self, t: &TaskId) -> Result<Option<PeerTaskId>, BridgeError> {
+            Ok(self.peer_tasks.lock().unwrap().get(t.as_str()).cloned())
+        }
+        async fn request_cancel(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.cancels.lock().unwrap().insert(t.as_str().into());
+            Ok(())
+        }
+        async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(self.cancels.lock().unwrap().contains(t.as_str()))
+        }
     }
 
     struct AutoApprove;
@@ -529,8 +985,37 @@ mod tests {
 
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
-        fn route(&self, _t: &TaskMeta) -> Result<AgentId, BridgeError> {
-            AgentId::parse("kiro")
+        fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            Ok(RouteTarget::Local(AgentId::parse("kiro")?))
+        }
+    }
+
+    /// Routes `skill=="delegate"` to `Delegate`, everything else to local kiro.
+    struct SkillRoute;
+    impl RouteDecision for SkillRoute {
+        fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            if t.skill.as_deref() == Some("delegate") {
+                Ok(RouteTarget::Delegate)
+            } else {
+                Ok(RouteTarget::Local(AgentId::parse("kiro")?))
+            }
+        }
+    }
+
+    /// No-op delegation used by tests that never route to Delegate.
+    struct NoDelegation;
+    #[async_trait::async_trait]
+    impl DelegationPort for NoDelegation {
+        async fn delegate(
+            &self,
+            _auth: &AuthContext,
+            _local: &TaskId,
+            _parts: Vec<Part>,
+        ) -> Result<Delegation, BridgeError> {
+            Err(BridgeError::UpstreamA2aError)
+        }
+        async fn cancel(&self, _peer_task: &PeerTaskId) -> Result<(), BridgeError> {
+            Ok(())
         }
     }
 
@@ -558,7 +1043,33 @@ mod tests {
             Arc::new(AlwaysKiro),
             auth,
             "http://localhost:8080",
+            Arc::new(NoDelegation),
         ))
+    }
+
+    /// Build a delegate-capable server, sharing the given store + delegation so
+    /// tests can inspect peer-task persistence and recorded cancels.
+    fn build_delegate(
+        backend: Arc<dyn AgentBackend>,
+        store: Arc<dyn SessionStore>,
+        delegation: Arc<dyn DelegationPort>,
+    ) -> Arc<InboundServer> {
+        Arc::new(InboundServer::new(
+            backend,
+            store,
+            Arc::new(AutoApprove),
+            Arc::new(SkillRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            delegation,
+        ))
+    }
+
+    fn delegate_params() -> Value {
+        json!({ "message": {
+            "text": "go",
+            "metadata": { "a2a-bridge.skill": "delegate" }
+        }})
     }
 
     fn router(srv: Arc<InboundServer>) -> Router {
@@ -598,6 +1109,14 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    /// Extract all `data:` payloads from an SSE body (one per line starting with "data: ").
+    fn sse_data_payloads(body: &str) -> Vec<String> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|s| s.trim_end_matches('\r').to_owned())
+            .collect()
+    }
+
     #[tokio::test]
     async fn streaming_message_yields_artifact_event() {
         let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
@@ -611,6 +1130,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
+        // The SSE event: field names are still present.
         assert!(
             body.contains("artifact-update"),
             "SSE body should contain an artifact frame: {body}"
@@ -618,6 +1138,17 @@ mod tests {
         assert!(
             body.contains("PONG"),
             "artifact should carry the text: {body}"
+        );
+        // The data: payloads must parse as real a2a::StreamResponse — conformance check.
+        let payloads = sse_data_payloads(&body);
+        assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
+        let last = payloads.last().unwrap();
+        let sr: a2a::StreamResponse = serde_json::from_str(last).unwrap_or_else(|e| {
+            panic!("last data payload must parse as StreamResponse: {e}: {last}")
+        });
+        assert!(
+            matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
+            "final frame must be ArtifactUpdate: {last}"
         );
     }
 
@@ -643,6 +1174,19 @@ mod tests {
                 "artifact must be the final frame: {body}"
             );
         }
+        // All data: payloads must parse as a2a::StreamResponse (wire-conformance).
+        let payloads = sse_data_payloads(&body);
+        for payload in &payloads {
+            let _: a2a::StreamResponse = serde_json::from_str(payload).unwrap_or_else(|e| {
+                panic!("data payload must parse as StreamResponse: {e}: {payload}")
+            });
+        }
+        // The last parsed payload must be ArtifactUpdate.
+        let last_sr: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap()).unwrap();
+        assert!(
+            matches!(last_sr, a2a::StreamResponse::ArtifactUpdate(_)),
+            "final frame must be ArtifactUpdate"
+        );
     }
 
     #[tokio::test]
@@ -724,8 +1268,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         let card: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(card["skills"].as_array().unwrap().len(), 1);
-        assert_eq!(card["skills"][0]["id"], "kiro-code");
+        let skills = card["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 2);
+        assert!(skills.iter().any(|s| s["id"] == "kiro-code"));
+        assert!(skills.iter().any(|s| s["id"] == "delegate"));
     }
 
     #[tokio::test]
@@ -773,5 +1319,298 @@ mod tests {
         let body = body_string(resp).await;
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["code"], JSONRPC_METHOD_NOT_FOUND);
+    }
+
+    // ---- Task 7: skill metadata + real Part.text extraction ----
+
+    #[test]
+    fn skill_metadata_parsed_into_taskmeta() {
+        let p = serde_json::json!({"message":{"metadata":{"a2a-bridge.skill":"delegate"}}});
+        assert_eq!(task_meta_from_params(&p).skill.as_deref(), Some("delegate"));
+    }
+
+    #[test]
+    fn no_skill_metadata_is_none() {
+        let p = serde_json::json!({"message":{"text":"hi"}});
+        assert_eq!(task_meta_from_params(&p).skill, None);
+    }
+
+    #[test]
+    fn parts_from_message_text() {
+        let p = serde_json::json!({"message":{"text":"PING"}});
+        let v = parts_from_params(&p);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].text, "PING");
+    }
+
+    #[test]
+    fn parts_from_a2a_parts_array() {
+        let p = serde_json::json!({"message":{"parts":[{"text":"A"},{"text":"B"}]}});
+        let v = parts_from_params(&p);
+        assert_eq!(
+            v.iter().map(|x| x.text.clone()).collect::<Vec<_>>(),
+            vec!["A", "B"]
+        );
+    }
+
+    // ---- Task 9: delegate route + consolidated cancel ----
+
+    #[tokio::test]
+    async fn delegate_skill_streams_peer_artifact() {
+        let deleg = FakeDelegation::new(
+            vec![Ok(Event::status("work")), Ok(Event::artifact("DONE"))],
+            Some("p1"),
+        );
+        let srv = build_delegate(FakeBackend::new(), Arc::new(FakeStore::default()), deleg);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("artifact-update") && body.contains("DONE"),
+            "SSE body should carry the peer artifact: {body}"
+        );
+        let payloads = sse_data_payloads(&body);
+        let last = payloads.last().expect("at least one SSE data payload");
+        let sr: a2a::StreamResponse = serde_json::from_str(last)
+            .unwrap_or_else(|e| panic!("final frame must parse as StreamResponse: {e}: {last}"));
+        assert!(
+            matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
+            "final frame must be ArtifactUpdate: {last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_route_never_touches_local_backend() {
+        // PanicBackend would panic in prompt if the local path were taken.
+        let deleg = FakeDelegation::new(vec![Ok(Event::artifact("DONE"))], Some("p1"));
+        let srv = build_delegate(
+            Arc::new(PanicBackend),
+            Arc::new(FakeStore::default()),
+            deleg,
+        );
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("DONE"), "delegate must complete: {body}");
+    }
+
+    #[tokio::test]
+    async fn inbound_cancel_task_cancels_peer() {
+        // S2b: after a delegate stream persists local->peer, CancelTask cancels the peer.
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let deleg = FakeDelegation::new(vec![Ok(Event::artifact("DONE"))], Some("p1"));
+        let recorded = deleg.cancels();
+        let srv = build_delegate(FakeBackend::new(), store.clone(), deleg);
+
+        // Drive the delegate stream to completion so local->peer is persisted.
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let _ = body_string(resp).await;
+
+        // The peer-task mapping must now be present (task-1 is the synthesized id).
+        let local = TaskId::parse("task-1").unwrap();
+        for _ in 0..200 {
+            if store.peer_task_for(&local).await.unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.peer_task_for(&local).await.unwrap().is_some(),
+            "local->peer mapping must be persisted after the delegate stream"
+        );
+
+        // POST CancelTask for the local task id.
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "task-1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            recorded.lock().unwrap().iter().any(|c| c == "p1"),
+            "inbound CancelTask must cancel the peer: {:?}",
+            recorded.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_disconnect_cancels_idle_peer() {
+        // (b): idle peer (one event, then hangs). Drop the SSE receiver -> cancel("p1").
+        let deleg = FakeDelegation::idle(vec![Ok(Event::status("work"))], Some("p1"));
+        let recorded = deleg.cancels();
+        let srv = build_delegate(FakeBackend::new(), Arc::new(FakeStore::default()), deleg);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drop the response body (and its SSE receiver) -> caller disconnect.
+        drop(resp);
+        wait_until(|| recorded.lock().unwrap().iter().any(|c| c == "p1")).await;
+        assert!(
+            recorded.lock().unwrap().iter().any(|c| c == "p1"),
+            "dropping an idle peer stream must cancel the peer: {:?}",
+            recorded.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn early_cancel_before_peer_id_is_latched_then_applied() {
+        // (c): request_cancel BEFORE the peer id is known; id appears after first event.
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let local = TaskId::parse("task-1").unwrap();
+        // Latch the cancel before delegation runs.
+        store.request_cancel(&local).await.unwrap();
+
+        let deleg = FakeDelegation::late_peer(
+            vec![Ok(Event::status("work")), Ok(Event::artifact("DONE"))],
+            "p1",
+        );
+        let recorded = deleg.cancels();
+        let srv = build_delegate(FakeBackend::new(), store.clone(), deleg);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let _ = body_string(resp).await;
+        wait_until(|| recorded.lock().unwrap().iter().any(|c| c == "p1")).await;
+        assert!(
+            recorded.lock().unwrap().iter().any(|c| c == "p1"),
+            "early-cancel latch must apply once the peer id appears: {:?}",
+            recorded.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_cancel_on_active_delegated_stream_cancels_peer_exactly_once() {
+        // Fix 1: an inbound CancelTask on an ACTIVE delegated stream must result in
+        // exactly ONE upstream cancel("p1"), even though BOTH the cancel_task()
+        // handler (direct POST) and the supervisor's poll_cancel_requested arm
+        // would otherwise fire. The idle delegation keeps the supervisor alive,
+        // and peer_initial=Some("p1") means the peer id is known immediately so
+        // both paths can race to cancel.
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let deleg = FakeDelegation::idle(vec![Ok(Event::status("work"))], Some("p1"));
+        let recorded = deleg.cancels();
+        let srv = build_delegate(FakeBackend::new(), store.clone(), deleg);
+
+        // Open the delegate stream (do NOT drop the response, so the supervisor
+        // stays alive — tx.closed() never fires). The producer persists local->peer.
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Wait until local->peer is persisted (supervisor is running, peer known).
+        let local = TaskId::parse("task-1").unwrap();
+        for _ in 0..200 {
+            if store.peer_task_for(&local).await.unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.peer_task_for(&local).await.unwrap().is_some(),
+            "local->peer mapping must be persisted before CancelTask"
+        );
+
+        // POST CancelTask: cancel_task() POSTs directly AND latches request_cancel,
+        // which wakes the supervisor's poll_cancel_requested arm. With the guard,
+        // exactly one of them wins.
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "task-1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Give the supervisor time to (try to) fire its own cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let calls: Vec<String> = recorded.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one upstream cancel must be recorded, got: {calls:?}"
+        );
+        assert_eq!(calls[0], "p1");
+    }
+
+    #[tokio::test]
+    async fn unary_delegate_persists_local_to_peer() {
+        // Fix 2: a unary SendMessage delegate must persist local->peer. The peer id
+        // becomes Some("p1") only as the events stream is drained (late_peer), so
+        // reading the watch before draining (today's bug) yields None.
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let deleg = FakeDelegation::late_peer_on_drain(vec![Ok(Event::artifact("DONE"))], "p1");
+        let srv = build_delegate(FakeBackend::new(), store.clone(), deleg);
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        let local = TaskId::parse("task-1").unwrap();
+        assert_eq!(
+            store.peer_task_for(&local).await.unwrap(),
+            Some(PeerTaskId("p1".into())),
+            "unary delegate must persist local->peer after draining events"
+        );
+    }
+
+    /// Poll `cond` up to ~2s, sleeping briefly between checks. Panics on timeout.
+    async fn wait_until(mut cond: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not met within budget");
     }
 }

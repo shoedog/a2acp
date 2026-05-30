@@ -16,12 +16,12 @@ use bridge_core::error::BridgeError;
 /// Equals `a2a::VERSION` from the a2a-lf 0.3.0 crate (the A2A v1 wire protocol).
 pub const A2A_PINNED_VERSION: &str = VERSION;
 
-/// Build the AgentCard advertising one skill: routing requests to the Kiro CLI agent.
+/// Build the AgentCard advertising two skills: the primary Kiro coding skill and
+/// a `delegate` skill for forwarding tasks to a configured remote A2A peer.
 ///
-/// The card exposes a single JSONRPC interface at `<base_url>` and one skill
-/// (`kiro-code`) that describes driving the Kiro IDE/CLI for code generation tasks.
+/// The card exposes a single JSONRPC interface at `<base_url>`.
 pub fn agent_card(base_url: &str) -> AgentCard {
-    let skill = AgentSkill {
+    let kiro_skill = AgentSkill {
         id: "kiro-code".to_string(),
         name: "Kiro Code".to_string(),
         description: "Drive the Kiro CLI agent to perform code generation, editing, and \
@@ -31,6 +31,19 @@ pub fn agent_card(base_url: &str) -> AgentCard {
         examples: Some(vec![
             "Implement a Rust function that parses JSON".to_string(),
             "Add unit tests to the auth module".to_string(),
+        ]),
+        input_modes: None,
+        output_modes: None,
+        security_requirements: None,
+    };
+
+    let delegate_skill = AgentSkill {
+        id: "delegate".to_string(),
+        name: "Delegate".to_string(),
+        description: "Delegate the task to a configured remote A2A peer agent.".to_string(),
+        tags: vec!["delegate".to_string(), "proxy".to_string()],
+        examples: Some(vec![
+            "Forward this task to the upstream coding agent".to_string()
         ]),
         input_modes: None,
         output_modes: None,
@@ -50,7 +63,7 @@ pub fn agent_card(base_url: &str) -> AgentCard {
         },
         default_input_modes: vec!["text/plain".to_string()],
         default_output_modes: vec!["text/plain".to_string()],
-        skills: vec![skill],
+        skills: vec![kiro_skill, delegate_skill],
         provider: None,
         documentation_url: None,
         icon_url: None,
@@ -79,10 +92,10 @@ mod tests {
     use bridge_core::error::BridgeError;
 
     #[test]
-    fn card_has_one_skill_and_pinned_version() {
+    fn card_has_two_skills_and_pinned_version() {
         let c = agent_card("http://localhost:8080");
-        assert_eq!(c.skills.len(), 1);
-        assert_eq!(c.skills[0].id, "kiro-code");
+        assert_eq!(c.skills.len(), 2);
+        assert!(c.skills.iter().any(|s| s.id == "kiro-code"));
         // Protocol version lives on the AgentInterface (not on AgentCard itself).
         // AgentInterface::new() auto-sets protocol_version = a2a::VERSION.
         assert_eq!(c.supported_interfaces.len(), 1);
@@ -101,5 +114,15 @@ mod tests {
             assert_supported_version("0.0.0-bogus").unwrap_err(),
             BridgeError::A2aVersionMismatch
         );
+    }
+
+    // ---- Task 7: delegate skill advertisement ----
+
+    #[test]
+    fn card_advertises_two_skills() {
+        let c = agent_card("http://localhost:8080");
+        assert_eq!(c.skills.len(), 2);
+        assert!(c.skills.iter().any(|s| s.id == "delegate"));
+        assert!(c.skills.iter().any(|s| s.id == "kiro-code"));
     }
 }
