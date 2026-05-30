@@ -41,7 +41,7 @@ use bridge_core::ports::{
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
-use crate::fanout::{self, Source, SourceCancel};
+use crate::fanout::{self, Source};
 use crate::sse::event_to_sse;
 
 /// JSON-RPC 2.0 error code for an invalid request / rejected pipeline gate.
@@ -457,9 +457,6 @@ fn local_kiro_source(
     session: SessionId,
     parts: Vec<Part>,
 ) -> Source {
-    let cancel = SourceCancel::Kiro {
-        session: session.clone(),
-    };
     // Build the stream by cloning Arc refs into a `'static + Send` stream.
     let stream: crate::fanout::EventStream = Box::pin(async_stream::stream! {
         let translator = Translator::new();
@@ -475,7 +472,7 @@ fn local_kiro_source(
             yield ev;
         }
     });
-    Source::from_stream("kiro", stream, cancel)
+    Source::from_stream("kiro", stream)
 }
 
 /// Spawn the fan-out producer: build a Kiro source and a peer source, then run
@@ -515,14 +512,9 @@ fn spawn_fanout_producer(
         //    watch for the supervisor's latched peer cancel.
         let (peer_source, peer_watch) = match delegation.delegate(&auth, &task, parts).await {
             Ok(d) => {
+                // Keep the peer-task watch for the supervisor's latched peer cancel.
                 let watch = d.peer_task.clone();
-                let src = Source::from_stream(
-                    "peer",
-                    d.events,
-                    SourceCancel::Peer {
-                        peer_task: d.peer_task,
-                    },
-                );
+                let src = Source::from_stream("peer", d.events);
                 (src, watch)
             }
             Err(e) => {
@@ -530,13 +522,7 @@ fn spawn_fanout_producer(
                 // then the coordinator's terminal frame covers completion.
                 let (_, dummy_rx) = tokio::sync::watch::channel::<Option<PeerTaskId>>(None);
                 let watch = dummy_rx.clone();
-                let src = Source::failed(
-                    "peer",
-                    e,
-                    SourceCancel::Peer {
-                        peer_task: dummy_rx,
-                    },
-                );
+                let src = Source::failed("peer", e);
                 (src, watch)
             }
         };
@@ -834,23 +820,8 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
         .delegate(&routed.auth, &routed.task, routed.parts)
         .await
     {
-        Ok(d) => Source::from_stream(
-            "peer",
-            d.events,
-            SourceCancel::Peer {
-                peer_task: d.peer_task,
-            },
-        ),
-        Err(e) => {
-            let (_, dummy_rx) = tokio::sync::watch::channel::<Option<PeerTaskId>>(None);
-            Source::failed(
-                "peer",
-                e,
-                SourceCancel::Peer {
-                    peer_task: dummy_rx,
-                },
-            )
-        }
+        Ok(d) => Source::from_stream("peer", d.events),
+        Err(e) => Source::failed("peer", e),
     };
 
     // Drain all fanout events synchronously via an mpsc channel.
@@ -964,20 +935,29 @@ async fn cancel_task(
             _ => SessionId::parse(format!("session-{}", task.as_str()))
                 .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
         };
+        // Attempt BOTH cancels regardless of either's result so a failing Kiro
+        // cancel never orphans the peer's upstream task (and vice-versa). Each is
+        // still guarded by its per-source key, so exactly-once holds across this
+        // path and the supervisor. We collect the first error (if any) and return
+        // it only AFTER both cancels have been attempted.
+        let mut first_err: Option<BridgeError> = None;
         if try_win_cancel_key(&srv.cancelled_peers, format!("{}:kiro", task.as_str())).await {
             if let Err(e) = srv.backend.cancel(&session).await {
-                return bridge_err_to_jsonrpc(id, &e);
+                first_err.get_or_insert(e);
             }
         }
         if let Ok(Some(peer)) = srv.store.peer_task_for(&task).await {
             if try_win_cancel_key(&srv.cancelled_peers, format!("{}:peer", task.as_str())).await {
                 if let Err(e) = srv.delegation.cancel(&peer).await {
-                    return bridge_err_to_jsonrpc(id, &e);
+                    first_err.get_or_insert(e);
                 }
             }
         }
         // If the peer id is not yet known, the request_cancel latch (set above)
         // plus the supervisor's peer-watch applier cancel it once it appears.
+        if let Some(e) = first_err {
+            return bridge_err_to_jsonrpc(id, &e);
+        }
     } else {
         // S2b: if the task is delegated, cancel the peer directly. This path covers
         // the case where the stream/supervisor has already ended; the single-cancel
@@ -2730,6 +2710,65 @@ mod tests {
             peer_cancels.lock().unwrap().clone(),
             vec!["p1".to_string()],
             "fan-out cancel_task must cancel the peer exactly once"
+        );
+    }
+
+    /// Backend whose `cancel` ALWAYS errors — used to prove the fan-out
+    /// `cancel_task()` path does not orphan the peer when the Kiro cancel fails.
+    struct CancelErrBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for CancelErrBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            })])))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Err(BridgeError::AgentCrashed)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_task_fanout_kiro_cancel_error_still_cancels_peer() {
+        // Robustness: in the fan-out cancel_task() path, if the Kiro
+        // `backend.cancel` returns Err, the peer cancel MUST still fire (no
+        // orphaned upstream task) and the handler must still return a sensible
+        // result rather than bailing before the peer-cancel block.
+        let backend: Arc<dyn AgentBackend> = Arc::new(CancelErrBackend);
+        let deleg = FakeDelegation::new(vec![Ok(Event::artifact("DONE"))], Some("p1"));
+        let peer_cancels = deleg.cancels();
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(backend, store.clone(), deleg);
+
+        let local = TaskId::parse("task-1").unwrap();
+        let session = SessionId::parse("session-task-1").unwrap();
+        store.put(&local, &session).await.unwrap();
+        store
+            .set_peer_task(&local, &PeerTaskId("p1".into()))
+            .await
+            .unwrap();
+        store.set_fanout(&local).await.unwrap();
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "task-1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // Handler still returns a sensible (HTTP 200) JSON-RPC response.
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        wait_until(|| peer_cancels.lock().unwrap().iter().any(|c| c == "p1")).await;
+        assert_eq!(
+            peer_cancels.lock().unwrap().clone(),
+            vec!["p1".to_string()],
+            "the peer must NOT be orphaned when the Kiro cancel errors"
         );
     }
 }

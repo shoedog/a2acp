@@ -8,60 +8,47 @@
 //! The coordinator is the **sole** sender to `tx`. For Task 6 (cancellation),
 //! [`run_with_cancel`] adds a cancel watch + per-source `finished` flags so the
 //! server's fan-out supervisor can cancel surviving sources and end with
-//! `Terminal(Canceled)`; `SourceCancel` carries each source's real cancel handle.
+//! `Terminal(Canceled)`. The real cancel handles (the Kiro `session` / peer
+//! watch) are held separately by the server's supervisor, not by `Source`.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use bridge_core::domain::PeerTaskId;
 use bridge_core::error::BridgeError;
-use bridge_core::ids::SessionId;
 use bridge_core::translator::{Event, TaskOutcome};
 use futures::stream::{select_all, Stream, StreamExt};
 
 /// Pinned, boxed, `Send` event stream — the item type for fan-out sources.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send>>;
 
-/// Per-source cancel handle, carried through fan-out for Task 6. Unused in `run`.
-pub enum SourceCancel {
-    Kiro {
-        session: SessionId,
-    },
-    Peer {
-        peer_task: tokio::sync::watch::Receiver<Option<PeerTaskId>>,
-    },
-}
-
-/// One fan-out source: a labeled event-stream plus its cancel handle.
+/// One fan-out source: a labeled event-stream. Cancellation is driven by the
+/// server's supervisor via separately-held handles (Kiro `session` / peer watch),
+/// not through `Source`.
 pub struct Source {
     pub id: String,
     pub stream: Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send>>,
-    pub cancel: SourceCancel,
 }
 
 impl Source {
     pub fn from_stream(
         id: impl Into<String>,
         stream: Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send>>,
-        cancel: SourceCancel,
     ) -> Self {
         Self {
             id: id.into(),
             stream,
-            cancel,
         }
     }
 
     /// A pre-failed source (startup error): its stream immediately yields one
     /// labeled error then ends.
-    pub fn failed(id: impl Into<String>, err: BridgeError, cancel: SourceCancel) -> Self {
+    pub fn failed(id: impl Into<String>, err: BridgeError) -> Self {
         let id2 = id.into();
         let s = futures::stream::once(async move { Err(err) });
         Self {
             id: id2,
             stream: Box::pin(s),
-            cancel,
         }
     }
 }
@@ -123,7 +110,7 @@ pub async fn run_with_cancel(
 
     let mut per_source = Vec::with_capacity(total);
     for (idx, source) in sources.into_iter().enumerate() {
-        let Source { id, stream, .. } = source; // `cancel` extracted by the supervisor.
+        let Source { id, stream } = source;
         let failures = Arc::clone(&failures);
         // The per-source "finished" flag, flipped when this source's stream ends.
         let done = finished
@@ -203,15 +190,9 @@ pub async fn run_with_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bridge_core::ids::SessionId;
     use bridge_core::translator::EventKind;
-    fn kiro_cancel() -> SourceCancel {
-        SourceCancel::Kiro {
-            session: SessionId::parse("s").unwrap(),
-        }
-    }
     fn src(id: &str, items: Vec<Result<Event, BridgeError>>) -> Source {
-        Source::from_stream(id, Box::pin(tokio_stream::iter(items)), kiro_cancel())
+        Source::from_stream(id, Box::pin(tokio_stream::iter(items)))
     }
     async fn drive(sources: Vec<Source>) -> Vec<Result<Event, BridgeError>> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -304,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn pre_failed_source_degrades() {
         let out = drive(vec![
-            Source::failed("peer", BridgeError::UpstreamA2aError, kiro_cancel()),
+            Source::failed("peer", BridgeError::UpstreamA2aError),
             src("kiro", vec![Ok(Event::artifact("KART"))]),
         ])
         .await;
