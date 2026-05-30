@@ -164,6 +164,13 @@ async fn handle_rpc(
     }
 
     if method == a2a::methods::SEND_STREAMING_MESSAGE {
+        // Check for the HTTP-500 sentinel
+        if app.script.len() == 1 && app.script[0] == "__HTTP_500__" {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal server error"))
+                .unwrap();
+        }
         // Build SSE body from script
         build_sse_response(&app.script)
     } else {
@@ -238,6 +245,113 @@ pub fn script_status_then_final(text: &str) -> Vec<String> {
         serde_json::to_string(&status_event).expect("status_event serializes"),
         serde_json::to_string(&artifact_event).expect("artifact_event serializes"),
     ]
+}
+
+/// statusUpdate WORKING → artifactUpdate lastChunk=false (partial) → artifactUpdate
+/// lastChunk=true carrying `text`. Tests that intermediate artifact chunks are emitted
+/// as Status events and only the final chunk becomes an Artifact event.
+pub fn script_status_then_intermediate_then_final(text: &str) -> Vec<String> {
+    let task_id = a2a::new_task_id();
+    let context_id = a2a::new_context_id();
+
+    let status_event = a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        status: a2a::TaskStatus {
+            state: a2a::TaskState::Working,
+            message: None,
+            timestamp: None,
+        },
+        metadata: None,
+    });
+
+    let partial_artifact = a2a::StreamResponse::ArtifactUpdate(a2a::TaskArtifactUpdateEvent {
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        artifact: a2a::Artifact {
+            artifact_id: a2a::new_artifact_id(),
+            name: None,
+            description: None,
+            parts: vec![a2a::Part::text("partial...")],
+            metadata: None,
+            extensions: None,
+        },
+        append: None,
+        last_chunk: Some(false),
+        metadata: None,
+    });
+
+    let final_artifact = a2a::StreamResponse::ArtifactUpdate(a2a::TaskArtifactUpdateEvent {
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        artifact: a2a::Artifact {
+            artifact_id: a2a::new_artifact_id(),
+            name: None,
+            description: None,
+            parts: vec![a2a::Part::text(text)],
+            metadata: None,
+            extensions: None,
+        },
+        append: None,
+        last_chunk: Some(true),
+        metadata: None,
+    });
+
+    vec![
+        serde_json::to_string(&status_event).expect("status_event serializes"),
+        serde_json::to_string(&partial_artifact).expect("partial_artifact serializes"),
+        serde_json::to_string(&final_artifact).expect("final_artifact serializes"),
+    ]
+}
+
+/// A single statusUpdate with the given terminal state wire string (e.g. `"TASK_STATE_COMPLETED"`).
+/// No artifact follows — tests that terminal states end cleanly (Completed) or with error (others).
+pub fn script_terminal_state_no_artifact(state_wire: &str) -> Vec<String> {
+    let task_id = a2a::new_task_id();
+    let context_id = a2a::new_context_id();
+    // Build the JSON by hand — serde_json::to_string(&TaskState) produces the wire string,
+    // but we accept the state_wire directly so callers can use the exact wire string.
+    let json = serde_json::json!({
+        "statusUpdate": {
+            "taskId": task_id,
+            "contextId": context_id,
+            "status": { "state": state_wire }
+        }
+    });
+    vec![json.to_string()]
+}
+
+/// statusUpdate WORKING then the connection closes — no terminal signal.
+/// Tests the clean-EOF-before-terminal → error rule.
+pub fn script_status_then_close_no_terminal() -> Vec<String> {
+    let task_id = a2a::new_task_id();
+    let context_id = a2a::new_context_id();
+
+    let status_event = a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+        task_id,
+        context_id,
+        status: a2a::TaskStatus {
+            state: a2a::TaskState::Working,
+            message: None,
+            timestamp: None,
+        },
+        metadata: None,
+    });
+
+    vec![serde_json::to_string(&status_event).expect("status_event serializes")]
+}
+
+/// A statusUpdate with a failure/cancel/rejected terminal state (no artifact).
+/// Tests that non-Completed terminal states yield `Err(UpstreamA2aError)`.
+pub fn script_terminal_failure(state_wire: &str) -> Vec<String> {
+    script_terminal_state_no_artifact(state_wire)
+}
+
+/// The endpoint returns HTTP 500. Tests that non-2xx responses are rejected at `open_stream`.
+pub fn script_500() -> Vec<String> {
+    // Special sentinel: if the script contains this single sentinel string, the handler
+    // returns HTTP 500 instead of an SSE stream. The mock handler checks for this.
+    vec!["__HTTP_500__".to_string()]
 }
 
 /// A single artifactUpdate lastChunk=true frame (no status prefix).
