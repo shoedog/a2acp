@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "bin/a2a-bridge"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+axum = "0.7"
+tower = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2"
+futures = "0.3"
+async-stream = "0.3"
+
+# Protocol SDKs — pinned exact versions verified 2026-05-30
+# a2a-lf is the crates.io package name for the `a2a` crate in a2aproject/a2a-rs
+# agent-client-protocol: RESERVED pin — NOT yet wired in v1. KiroBackend hand-rolls the ACP
+# JSON-RPC framing over serde_json + the in-house FrameReader; this crate's typed helpers are
+# adopted in a later increment (see ADR-0003 Addendum 2). Pinned so the version is fixed when used.
+agent-client-protocol = "=0.12.1"
+a2a = { package = "a2a-lf", version = "=0.3.0" }
+
+# Dev-only deps live in [workspace.dependencies] (Cargo has no workspace.dev-dependencies);
+# member crates opt in via `trybuild.workspace = true` under their own [dev-dependencies].
+trybuild = "1"
+tokio-test = "0.4"
+toml = "0.8"

@@ -1,0 +1,19 @@
+[package]
+name = "bridge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+trybuild = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "bridge-a2a-outbound"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bridge-core = { path = "../bridge-core" }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

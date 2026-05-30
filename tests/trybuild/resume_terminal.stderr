@@ -1,0 +1,9 @@
+error[E0599]: no method named `resume` found for struct `Task<Terminal>` in the current scope
+ --> $WORKSPACE/tests/trybuild/resume_terminal.rs
+  |
+  |     let _ = done.resume(); // ERROR: no method resume on Task<Terminal>
+  |                  ^^^^^^ method not found in `Task<Terminal>`
+  |
+  = note: the method was found for
+          - `Task<bridge_core::task::AuthRequired>`
+          - `Task<bridge_core::task::InputRequired>`
