@@ -126,16 +126,30 @@ async fn streaming_message_drives_replay_backend_to_artifact() {
     // Wire-conformance: all data payloads must parse as a2a::StreamResponse.
     let payloads = sse_data_payloads(&body);
     assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
+    // Final frame: terminal statusUpdate(Completed) synthesized after the inner stream ends.
     let last = payloads.last().unwrap();
     let sr: a2a::StreamResponse = serde_json::from_str(last)
         .unwrap_or_else(|e| panic!("final data payload must parse as StreamResponse: {e}: {last}"));
     assert!(
-        matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
-        "final SSE frame must be ArtifactUpdate: {last}"
+        matches!(
+            &sr,
+            a2a::StreamResponse::StatusUpdate(e)
+                if e.status.state == a2a::TaskState::Completed
+        ),
+        "final SSE frame must be terminal statusUpdate(Completed): {last}"
+    );
+    // Penultimate frame must be the ArtifactUpdate.
+    let penultimate = &payloads[payloads.len() - 2];
+    let sr2: a2a::StreamResponse = serde_json::from_str(penultimate).unwrap_or_else(|e| {
+        panic!("penultimate data payload must parse as StreamResponse: {e}: {penultimate}")
+    });
+    assert!(
+        matches!(sr2, a2a::StreamResponse::ArtifactUpdate(_)),
+        "penultimate SSE frame must be ArtifactUpdate: {penultimate}"
     );
 }
 
-/// Ordering invariant: the artifact frame is the last named frame in the stream.
+/// Ordering invariant: the artifact frame precedes the terminal status frame.
 #[tokio::test]
 async fn artifact_frame_is_last_sse_frame() {
     let router = build_router();
@@ -143,23 +157,14 @@ async fn artifact_frame_is_last_sse_frame() {
     let body = body_string(router.oneshot(send_streaming_request()).await.unwrap()).await;
 
     let last_artifact = body.rfind("artifact-update");
-    let last_status = body.rfind("status-update");
 
     assert!(
         last_artifact.is_some(),
         "no artifact-update frame in SSE body: {body}"
     );
 
-    // If there are status frames they must precede the artifact (final flush).
-    if let Some(s_pos) = last_status {
-        assert!(
-            last_artifact.unwrap() > s_pos,
-            "artifact-update must come after any status-update: {body}"
-        );
-    }
-
-    // Wire-conformance: all data: payloads must parse as a2a::StreamResponse,
-    // and the final one must be ArtifactUpdate.
+    // Wire-conformance: all data: payloads must parse as a2a::StreamResponse.
+    // The final one must now be the terminal statusUpdate(Completed).
     let payloads = sse_data_payloads(&body);
     for payload in &payloads {
         let _: a2a::StreamResponse = serde_json::from_str(payload).unwrap_or_else(|e| {
@@ -168,7 +173,18 @@ async fn artifact_frame_is_last_sse_frame() {
     }
     let last_sr: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap()).unwrap();
     assert!(
-        matches!(last_sr, a2a::StreamResponse::ArtifactUpdate(_)),
-        "final SSE frame must be ArtifactUpdate"
+        matches!(
+            &last_sr,
+            a2a::StreamResponse::StatusUpdate(e)
+                if e.status.state == a2a::TaskState::Completed
+        ),
+        "final SSE frame must be terminal statusUpdate(Completed)"
+    );
+    // Penultimate must be ArtifactUpdate.
+    let penultimate: a2a::StreamResponse =
+        serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
+    assert!(
+        matches!(penultimate, a2a::StreamResponse::ArtifactUpdate(_)),
+        "penultimate SSE frame must be ArtifactUpdate"
     );
 }

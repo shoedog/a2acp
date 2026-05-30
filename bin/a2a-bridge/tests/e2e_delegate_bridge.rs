@@ -208,11 +208,23 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
         });
     }
 
+    // Final frame: terminal statusUpdate(Completed) synthesized after the stream ends.
     let last = payloads.last().unwrap();
     let sr: a2a::StreamResponse = serde_json::from_str(last).unwrap();
     assert!(
-        matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
-        "final SSE frame must be ArtifactUpdate: {last}"
+        matches!(
+            &sr,
+            a2a::StreamResponse::StatusUpdate(e)
+                if e.status.state == a2a::TaskState::Completed
+        ),
+        "final SSE frame must be terminal statusUpdate(Completed): {last}"
+    );
+    // Penultimate frame must be the ArtifactUpdate.
+    let penultimate = &payloads[payloads.len() - 2];
+    let sr2: a2a::StreamResponse = serde_json::from_str(penultimate).unwrap();
+    assert!(
+        matches!(sr2, a2a::StreamResponse::ArtifactUpdate(_)),
+        "penultimate SSE frame must be ArtifactUpdate: {penultimate}"
     );
 }
 

@@ -38,7 +38,7 @@ use bridge_core::ids::{SessionId, TaskId};
 use bridge_core::ports::{
     AgentBackend, AuthMiddleware, DelegationPort, PolicyEngine, RouteDecision, SessionStore,
 };
-use bridge_core::translator::{Event, EventKind, Translator};
+use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
 use crate::sse::event_to_sse;
@@ -254,13 +254,27 @@ fn spawn_local_producer(
             &session,
             parts,
         );
+        let mut errored = false;
         while let Some(ev) = events.next().await {
+            // Track whether the stream ended with an error.
+            if ev.is_err() {
+                errored = true;
+            }
             // If the receiver is gone (client disconnected) stop driving.
             if tx.send(ev).await.is_err() {
-                break;
+                // Receiver gone — skip the terminal frame (client disconnected).
+                return;
             }
         }
-        // Channel closes on drop -> SSE stream terminates after the final flush.
+        // Append exactly one terminal frame after the inner stream ends.
+        // A clean stream end -> Completed; an errored stream -> Failed.
+        let outcome = if errored {
+            TaskOutcome::Failed
+        } else {
+            TaskOutcome::Completed
+        };
+        let _ = tx.send(Ok(Event::terminal(outcome))).await;
+        // Channel closes on drop -> SSE stream terminates after the terminal flush.
     });
 }
 
@@ -287,6 +301,7 @@ fn spawn_delegate_producer(
             Ok(d) => d,
             Err(e) => {
                 let _ = tx.send(Err(e)).await;
+                // Delegation-open failure: no terminal frame — the error frame is terminal.
                 return;
             }
         };
@@ -313,20 +328,28 @@ fn spawn_delegate_producer(
                             if tx.send(ev).await.is_err() {
                                 // Receiver gone mid-send: treat as disconnect.
                                 cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
+                                // Client disconnected — no terminal frame needed.
                                 return;
                             }
                         }
-                        None => return, // peer stream terminated normally.
+                        None => {
+                            // Peer stream terminated normally — append terminal Completed frame.
+                            let _ = tx.send(Ok(Event::terminal(TaskOutcome::Completed))).await;
+                            return;
+                        }
                     }
                 }
                 // (ii) caller disconnected (works even if the peer stream is IDLE).
                 _ = tx.closed() => {
                     cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
+                    // Client disconnected — no terminal frame (receiver is gone).
                     return;
                 }
                 // (iii) an inbound CancelTask latched cancel_requested.
                 _ = poll_cancel_requested(store.as_ref(), &local) => {
                     cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
+                    // Canceled by inbound request — append terminal Canceled frame.
+                    let _ = tx.send(Ok(Event::terminal(TaskOutcome::Canceled))).await;
                     return;
                 }
             }
@@ -1142,13 +1165,27 @@ mod tests {
         // The data: payloads must parse as real a2a::StreamResponse — conformance check.
         let payloads = sse_data_payloads(&body);
         assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
+        // Final frame is now the terminal statusUpdate(Completed); artifact is penultimate.
         let last = payloads.last().unwrap();
         let sr: a2a::StreamResponse = serde_json::from_str(last).unwrap_or_else(|e| {
             panic!("last data payload must parse as StreamResponse: {e}: {last}")
         });
         assert!(
-            matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
-            "final frame must be ArtifactUpdate: {last}"
+            matches!(
+                &sr,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed
+            ),
+            "final frame must be terminal statusUpdate(Completed): {last}"
+        );
+        // The penultimate frame must be the artifact.
+        let penultimate = &payloads[payloads.len() - 2];
+        let sr2: a2a::StreamResponse = serde_json::from_str(penultimate).unwrap_or_else(|e| {
+            panic!("penultimate data payload must parse as StreamResponse: {e}: {penultimate}")
+        });
+        assert!(
+            matches!(sr2, a2a::StreamResponse::ArtifactUpdate(_)),
+            "penultimate frame must be ArtifactUpdate: {penultimate}"
         );
     }
 
@@ -1165,15 +1202,7 @@ mod tests {
             .unwrap();
         let body = body_string(resp).await;
         let last_artifact = body.rfind("artifact-update");
-        let last_status = body.rfind("status-update");
         assert!(last_artifact.is_some(), "no artifact frame: {body}");
-        // The artifact frame must come after any status frame (final flush).
-        if let Some(s) = last_status {
-            assert!(
-                last_artifact.unwrap() > s,
-                "artifact must be the final frame: {body}"
-            );
-        }
         // All data: payloads must parse as a2a::StreamResponse (wire-conformance).
         let payloads = sse_data_payloads(&body);
         for payload in &payloads {
@@ -1181,11 +1210,22 @@ mod tests {
                 panic!("data payload must parse as StreamResponse: {e}: {payload}")
             });
         }
-        // The last parsed payload must be ArtifactUpdate.
+        // The last parsed payload must be the terminal statusUpdate(Completed).
         let last_sr: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap()).unwrap();
         assert!(
-            matches!(last_sr, a2a::StreamResponse::ArtifactUpdate(_)),
-            "final frame must be ArtifactUpdate"
+            matches!(
+                &last_sr,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed
+            ),
+            "final frame must be terminal statusUpdate(Completed)"
+        );
+        // The penultimate must be the ArtifactUpdate.
+        let penultimate: a2a::StreamResponse =
+            serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
+        assert!(
+            matches!(penultimate, a2a::StreamResponse::ArtifactUpdate(_)),
+            "penultimate frame must be ArtifactUpdate"
         );
     }
 
@@ -1377,12 +1417,25 @@ mod tests {
             "SSE body should carry the peer artifact: {body}"
         );
         let payloads = sse_data_payloads(&body);
+        // Final frame: terminal statusUpdate(Completed) synthesized by the delegate producer.
         let last = payloads.last().expect("at least one SSE data payload");
         let sr: a2a::StreamResponse = serde_json::from_str(last)
             .unwrap_or_else(|e| panic!("final frame must parse as StreamResponse: {e}: {last}"));
         assert!(
-            matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
-            "final frame must be ArtifactUpdate: {last}"
+            matches!(
+                &sr,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed
+            ),
+            "final frame must be terminal statusUpdate(Completed): {last}"
+        );
+        // Penultimate: the ArtifactUpdate from the peer.
+        let penultimate = &payloads[payloads.len() - 2];
+        let sr2: a2a::StreamResponse = serde_json::from_str(penultimate)
+            .unwrap_or_else(|e| panic!("penultimate frame must parse as StreamResponse: {e}"));
+        assert!(
+            matches!(sr2, a2a::StreamResponse::ArtifactUpdate(_)),
+            "penultimate frame must be ArtifactUpdate: {penultimate}"
         );
     }
 
@@ -1600,6 +1653,71 @@ mod tests {
             store.peer_task_for(&local).await.unwrap(),
             Some(PeerTaskId("p1".into())),
             "unary delegate must persist local->peer after draining events"
+        );
+    }
+
+    // ---- Task 2: single-source terminal synthesis ----
+
+    /// A fake backend that yields a Status then an Artifact then ends cleanly.
+    struct TerminalSynthBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for TerminalSynthBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates = vec![
+                Ok(Update::Text("status-chunk".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn single_source_local_producer_appends_terminal_completed_frame() {
+        let srv = build(Arc::new(TerminalSynthBackend), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let payloads = sse_data_payloads(&body);
+        assert!(
+            payloads.len() >= 2,
+            "must have at least artifact + terminal: {body}"
+        );
+
+        // Final frame: terminal statusUpdate(Completed).
+        let last: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap())
+            .unwrap_or_else(|e| panic!("last data payload must parse as StreamResponse: {e}"));
+        assert!(
+            matches!(
+                &last,
+                a2a::StreamResponse::StatusUpdate(e) if e.status.state == a2a::TaskState::Completed
+            ),
+            "final frame must be terminal statusUpdate(Completed): {:?}",
+            payloads.last()
+        );
+
+        // Penultimate frame: the artifact from the translator.
+        let penultimate: a2a::StreamResponse = serde_json::from_str(&payloads[payloads.len() - 2])
+            .unwrap_or_else(|e| panic!("penultimate payload must parse as StreamResponse: {e}"));
+        assert!(
+            matches!(penultimate, a2a::StreamResponse::ArtifactUpdate(_)),
+            "penultimate frame must be ArtifactUpdate: {:?}",
+            &payloads[payloads.len() - 2]
         );
     }
 

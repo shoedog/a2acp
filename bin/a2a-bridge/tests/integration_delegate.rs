@@ -285,12 +285,26 @@ async fn delegate_skill_round_trips_through_peer() {
     let payloads = sse_data_payloads(&body);
     assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
 
+    // Final frame: terminal statusUpdate(Completed) synthesized after the delegate stream ends.
     let last = payloads.last().unwrap();
     let sr: a2a::StreamResponse = serde_json::from_str(last)
         .unwrap_or_else(|e| panic!("final data payload must parse as StreamResponse: {e}: {last}"));
     assert!(
-        matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
-        "final SSE frame must be ArtifactUpdate: {last}"
+        matches!(
+            &sr,
+            a2a::StreamResponse::StatusUpdate(e)
+                if e.status.state == a2a::TaskState::Completed
+        ),
+        "final SSE frame must be terminal statusUpdate(Completed): {last}"
+    );
+    // Penultimate frame must be the ArtifactUpdate from the peer.
+    let penultimate = &payloads[payloads.len() - 2];
+    let sr2: a2a::StreamResponse = serde_json::from_str(penultimate).unwrap_or_else(|e| {
+        panic!("penultimate data payload must parse as StreamResponse: {e}: {penultimate}")
+    });
+    assert!(
+        matches!(sr2, a2a::StreamResponse::ArtifactUpdate(_)),
+        "penultimate SSE frame must be ArtifactUpdate: {penultimate}"
     );
 
     // 5. S2a: assert the mock peer received a request body containing "PING".
