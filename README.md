@@ -115,6 +115,26 @@ cargo test -p a2a-bridge --test e2e_kiro -- --ignored --nocapture   # needs kiro
 multi-agent adapters (Claude Code/Codex/Gemini, Increment 3); real permission policy;
 `session/load` resume; MCP-over-ACP; JWT/mTLS enforcement; container isolation.
 
+### Known v1 limitations (called out honestly; see ADR-0003 + the final review)
+
+- **ACP wire framing is hand-rolled.** `KiroBackend` drives ACP JSON-RPC directly over
+  `serde_json` + the in-house `FrameReader`; the pinned `agent-client-protocol` crate's
+  typed helpers are **not yet wired** (reserved for Increment 3, ADR-0003 Addendum 2).
+- **The `Task`/`Session` typestate is a compile-time spec artifact, not yet load-bearing.**
+  It is `trybuild`-verified but the runtime pipeline (`translator` → `server`) does not yet
+  route through `Session<Ready>::send_prompt`. The seam is preserved for later wiring.
+- **Coalescing is char-cap only** (1200 chars + boundary flush); the 200 ms idle-flush half
+  of the spec contract is not yet implemented (invisible to fakes; matters on a slow real
+  stream).
+- **The running binary uses an in-memory SQLite store** (`open_in_memory`), so the
+  persisted pending-request (resume-after-restart) is not durable across process restart in
+  v1. The store seam supports a file-backed DB; wiring it is a one-line change.
+- **Message content is not yet threaded to the backend** (`Part` is a placeholder type), so
+  the inbound path proves wiring, not content fidelity — by design for a walking skeleton.
+- **Agent Card path / A2A conformance:** served at `/.well-known/agent-card.json` per the
+  spec; the published A2A v1 standard may use `/.well-known/agent.json` — unresolved
+  conformance item (ADR-0003), verify before claiming external A2A-client conformance.
+
 ## License
 
 Apache-2.0.

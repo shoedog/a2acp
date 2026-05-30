@@ -28,7 +28,7 @@ accepted findings are folded in below and noted inline as `[Codex N]` / `[Claude
 | Conductor adoption | Re-evaluate at Increment 3 (decision), implement if adopted at Increment 4 | v1 Addendum; §12; `[Claude D-2]` |
 | Architecture | Hexagonal (ports & adapters); domain-only core | v3 §3.2 |
 | A2A SDK | **`a2aproject/a2a-rs`** (official, Apache-2.0, A2A v1, generated ProtoJSON types), behind A2A traits | §2.1; ADR-003 |
-| ACP SDK | Official `agent-client-protocol` crate, behind `AgentBackend` | v1 §9.5 |
+| ACP SDK | `agent-client-protocol` =0.12.1 pinned but **NOT wired in v1** — `KiroBackend` hand-rolls ACP JSON-RPC over the in-house `FrameReader`; SDK typed-helper adoption deferred to Increment 3 (ADR-0003 Addendum 2) | v1 §9.5; ADR-0003 |
 | Direction | Inbound working in v1; **outbound = `DelegationPort` seam defined, impl deferred to Increment 2.5** | User decision; `[Codex 4]` `[Claude B-1]` |
 | Dependency policy | **Pin all SDK versions + scheduled upgrade-check cadence** (§11.2) | User decision; v1 §9.9 |
 | Packaging | Standalone binary; `forge` consumes it as an A2A client | v1 §10 |
@@ -52,8 +52,12 @@ and `TASK_STATE_UNSPECIFIED` (treated as a protocol error)**. The Agent Card is 
 inbound boundary; unknown versions fail loudly with a structured error. All golden fixtures
 (§10) are generated against this pinned binding.
 
-The ACP SDK is **`agent-client-protocol` =0.12.1** (Apache-2.0). Verified note: its permission
-method is **`request_permission`** (not `session/request_permission`); semantics unchanged.
+The ACP SDK is **`agent-client-protocol` =0.12.1** (Apache-2.0), pinned but **not yet wired
+in v1** — `KiroBackend` hand-rolls the ACP JSON-RPC framing (`session/new`, `session/prompt`,
+`session/cancel`, reading `session/update`/result frames) over `serde_json` + the in-house
+`FrameReader`; adopting the crate's typed helpers is deferred to Increment 3 (ADR-0003
+Addendum 2). Verified note: its permission method is **`request_permission`** (not
+`session/request_permission`); semantics unchanged.
 
 The inbound A2A server may be built on the official **`a2a-server-lf`** crate (axum-based,
 same workspace) rather than hand-rolled axum endpoints — decided at implementation time
