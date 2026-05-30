@@ -70,6 +70,7 @@ async fn real_kiro_round_trip_returns_pong() {
         route,
         auth,
         base_url.clone(),
+        Arc::new(bridge_a2a_outbound::StubDelegation),
     ));
     let router = server.router();
 

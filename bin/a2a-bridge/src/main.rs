@@ -54,15 +54,15 @@ async fn main() -> Result<(), BoxError> {
     let policy = Arc::new(AutoPolicy);
     let route = Arc::new(AlwaysKiro);
     let store = Arc::new(SqliteStore::open_in_memory()?);
-    // StubDelegation is not passed to InboundServer (unused on happy path) but is
-    // constructed here to prove the composition root is wired end-to-end.
-    let _delegation = Arc::new(StubDelegation);
+    // StubDelegation is the 6th port: no-op until a real peer is configured
+    // (Task 10 wires PeerDelegation from `[delegation]` config).
+    let delegation = Arc::new(StubDelegation);
 
     // 5. Construct the inbound server and build its axum router.
-    //    InboundServer::new(backend, store, policy, route, auth, base_url)
+    //    InboundServer::new(backend, store, policy, route, auth, base_url, delegation)
     let base_url = format!("http://{}", cfg.server.addr);
     let server = Arc::new(InboundServer::new(
-        backend, store, policy, route, auth, base_url,
+        backend, store, policy, route, auth, base_url, delegation,
     ));
     let router = server.router();
 

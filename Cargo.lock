@@ -191,6 +191,7 @@ name = "bridge-a2a-inbound"
 version = "0.1.0"
 dependencies = [
  "a2a-lf",
+ "async-stream",
  "async-trait",
  "axum",
  "bridge-core",
