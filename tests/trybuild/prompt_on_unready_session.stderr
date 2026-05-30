@@ -1,0 +1,8 @@
+error[E0599]: no method named `send_prompt` found for struct `Session<Spawned>` in the current scope
+ --> $WORKSPACE/tests/trybuild/prompt_on_unready_session.rs
+  |
+  |     let _ = s.send_prompt(vec![]); // ERROR: no method send_prompt on Session<Spawned>
+  |               ^^^^^^^^^^^ method not found in `Session<Spawned>`
+  |
+  = note: the method was found for
+          - `Session<bridge_core::session::Ready>`
