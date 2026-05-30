@@ -1,0 +1,20 @@
+[package]
+name = "a2a-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "a2a-bridge"
+path = "src/main.rs"
+
+[dependencies]
+bridge-core = { path = "../../crates/bridge-core" }
+bridge-acp = { path = "../../crates/bridge-acp" }
+bridge-a2a-inbound = { path = "../../crates/bridge-a2a-inbound" }
+bridge-a2a-outbound = { path = "../../crates/bridge-a2a-outbound" }
+bridge-store = { path = "../../crates/bridge-store" }
+bridge-policy = { path = "../../crates/bridge-policy" }
+bridge-observ = { path = "../../crates/bridge-observ" }
+tokio = { workspace = true }
+tracing.workspace = true
