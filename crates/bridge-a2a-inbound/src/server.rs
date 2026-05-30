@@ -111,9 +111,10 @@ impl InboundServer {
             .unwrap_or(A2A_PINNED_VERSION);
         assert_supported_version(version)?;
 
-        // 3. Route. v1 routes to Local(kiro) only; Delegate returns a temporary error
-        //    (wired properly in Task 9).
-        match self.route.route(&TaskMeta::default())? {
+        // 3. Route. Parse skill from params and pass to route decision. v1 only
+        //    uses Local(kiro); Delegate is wired properly in Task 9.
+        let task_meta = task_meta_from_params(params);
+        match self.route.route(&task_meta)? {
             RouteTarget::Local(_agent) => {
                 // happy path — continue with the local backend
             }
@@ -413,20 +414,62 @@ fn task_id_from_params(params: &Value) -> Result<TaskId, BridgeError> {
     }
 }
 
-/// Pull message parts from params. v1 carries text as `message.text` or a raw
-/// `text` field; the domain `Part` is a unit type, so we map presence to a
-/// single part (the backend fake decides the actual content in tests).
+/// Extract `TaskMeta` from JSON-RPC params. Reads the skill selector from
+/// `params.message.metadata["a2a-bridge.skill"]` if present; all other fields
+/// are left at their defaults.
+fn task_meta_from_params(params: &Value) -> TaskMeta {
+    let skill = params
+        .get("message")
+        .and_then(|m| m.get("metadata"))
+        .and_then(|md| md.get("a2a-bridge.skill"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    TaskMeta { skill }
+}
+
+/// Pull message parts from params, extracting real text content.
+///
+/// Priority:
+/// 1. If `message.parts` is a non-empty array, map each element's `text`
+///    field to a `Part { text }`, skipping elements without a string `text`.
+/// 2. Else if `message.text` is a string, one `Part { text }`.
+/// 3. Else if a top-level `text` field is present, one `Part { text }`.
+/// 4. Otherwise empty vec.
 fn parts_from_params(params: &Value) -> Vec<Part> {
-    let has_text = params.get("text").is_some()
-        || params
-            .get("message")
-            .map(|m| m.get("text").is_some() || m.get("parts").is_some())
-            .unwrap_or(false);
-    if has_text {
-        vec![Part::default()]
-    } else {
-        vec![]
+    let message = params.get("message");
+
+    // 1. message.parts array
+    if let Some(parts_arr) = message
+        .and_then(|m| m.get("parts"))
+        .and_then(|p| p.as_array())
+    {
+        if !parts_arr.is_empty() {
+            return parts_arr
+                .iter()
+                .filter_map(|elem| {
+                    elem.get("text").and_then(|t| t.as_str()).map(|t| Part {
+                        text: t.to_string(),
+                    })
+                })
+                .collect();
+        }
     }
+
+    // 2. message.text
+    if let Some(text) = message.and_then(|m| m.get("text")).and_then(|t| t.as_str()) {
+        return vec![Part {
+            text: text.to_string(),
+        }];
+    }
+
+    // 3. top-level text
+    if let Some(text) = params.get("text").and_then(|t| t.as_str()) {
+        return vec![Part {
+            text: text.to_string(),
+        }];
+    }
+
+    vec![]
 }
 
 #[cfg(test)]
@@ -753,8 +796,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         let card: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(card["skills"].as_array().unwrap().len(), 1);
-        assert_eq!(card["skills"][0]["id"], "kiro-code");
+        let skills = card["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 2);
+        assert!(skills.iter().any(|s| s["id"] == "kiro-code"));
+        assert!(skills.iter().any(|s| s["id"] == "delegate"));
     }
 
     #[tokio::test]
@@ -802,5 +847,37 @@ mod tests {
         let body = body_string(resp).await;
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["code"], JSONRPC_METHOD_NOT_FOUND);
+    }
+
+    // ---- Task 7: skill metadata + real Part.text extraction ----
+
+    #[test]
+    fn skill_metadata_parsed_into_taskmeta() {
+        let p = serde_json::json!({"message":{"metadata":{"a2a-bridge.skill":"delegate"}}});
+        assert_eq!(task_meta_from_params(&p).skill.as_deref(), Some("delegate"));
+    }
+
+    #[test]
+    fn no_skill_metadata_is_none() {
+        let p = serde_json::json!({"message":{"text":"hi"}});
+        assert_eq!(task_meta_from_params(&p).skill, None);
+    }
+
+    #[test]
+    fn parts_from_message_text() {
+        let p = serde_json::json!({"message":{"text":"PING"}});
+        let v = parts_from_params(&p);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].text, "PING");
+    }
+
+    #[test]
+    fn parts_from_a2a_parts_array() {
+        let p = serde_json::json!({"message":{"parts":[{"text":"A"},{"text":"B"}]}});
+        let v = parts_from_params(&p);
+        assert_eq!(
+            v.iter().map(|x| x.text.clone()).collect::<Vec<_>>(),
+            vec!["A", "B"]
+        );
     }
 }
