@@ -112,10 +112,24 @@ async fn mock_peer_handler(
             metadata: None,
         });
 
+        // Terminal statusUpdate(Completed) required by the new parser model (Increment 2.6 Task 3):
+        // the outbound client ends the stream only on a terminal StatusUpdate, not on lastChunk.
+        let completed_event = a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+            task_id: task_id.clone(),
+            context_id: context_id.clone(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+
         let sse_body = format!(
-            "data: {}\n\ndata: {}\n\n",
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
             serde_json::to_string(&status_event).expect("status serializes"),
             serde_json::to_string(&artifact_event).expect("artifact serializes"),
+            serde_json::to_string(&completed_event).expect("completed serializes"),
         );
 
         Response::builder()
