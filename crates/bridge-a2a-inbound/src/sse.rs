@@ -89,6 +89,25 @@ mod tests {
         ) -> Result<Option<bridge_core::domain::PendingRequest>, BridgeError> {
             Ok(None)
         }
+        async fn set_peer_task(
+            &self,
+            _t: &TaskId,
+            _peer: &bridge_core::domain::PeerTaskId,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn peer_task_for(
+            &self,
+            _t: &TaskId,
+        ) -> Result<Option<bridge_core::domain::PeerTaskId>, BridgeError> {
+            Ok(None)
+        }
+        async fn request_cancel(&self, _t: &TaskId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn cancel_requested(&self, _t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(false)
+        }
     }
 
     struct AutoApprove;

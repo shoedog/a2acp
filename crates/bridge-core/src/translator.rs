@@ -221,6 +221,8 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         pending: Mutex<HashMap<String, PendingRequest>>,
+        peer_tasks: Mutex<HashMap<String, crate::domain::PeerTaskId>>,
+        cancels: Mutex<std::collections::HashSet<String>>,
     }
     #[async_trait::async_trait]
     impl SessionStore for FakeStore {
@@ -239,6 +241,30 @@ mod tests {
         }
         async fn take_pending(&self, t: &TaskId) -> Result<Option<PendingRequest>, BridgeError> {
             Ok(self.pending.lock().unwrap().remove(t.as_str()))
+        }
+        async fn set_peer_task(
+            &self,
+            t: &TaskId,
+            peer: &crate::domain::PeerTaskId,
+        ) -> Result<(), BridgeError> {
+            self.peer_tasks
+                .lock()
+                .unwrap()
+                .insert(t.as_str().into(), peer.clone());
+            Ok(())
+        }
+        async fn peer_task_for(
+            &self,
+            t: &TaskId,
+        ) -> Result<Option<crate::domain::PeerTaskId>, BridgeError> {
+            Ok(self.peer_tasks.lock().unwrap().get(t.as_str()).cloned())
+        }
+        async fn request_cancel(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.cancels.lock().unwrap().insert(t.as_str().into());
+            Ok(())
+        }
+        async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(self.cancels.lock().unwrap().contains(t.as_str()))
         }
     }
 

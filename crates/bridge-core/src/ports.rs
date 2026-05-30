@@ -53,13 +53,23 @@ pub trait DelegationPort: Send + Sync {
     async fn cancel(&self, peer_task: &PeerTaskId) -> Result<(), BridgeError>;
 }
 
-/// Session store — persists task→session mappings and pending-request state.
+/// Session store — persists task→session mappings, pending-request state,
+/// delegated peer-task ids, and the early-cancel latch.
 #[async_trait::async_trait]
 pub trait SessionStore: Send + Sync {
     async fn put(&self, task: &TaskId, session: &SessionId) -> Result<(), BridgeError>;
     async fn session_for(&self, task: &TaskId) -> Result<Option<SessionId>, BridgeError>;
     async fn put_pending(&self, task: &TaskId, req: &PendingRequest) -> Result<(), BridgeError>;
     async fn take_pending(&self, task: &TaskId) -> Result<Option<PendingRequest>, BridgeError>;
+
+    /// Persist the downstream peer-task id assigned during delegation.
+    async fn set_peer_task(&self, task: &TaskId, peer: &PeerTaskId) -> Result<(), BridgeError>;
+    /// Retrieve the peer-task id, if any.
+    async fn peer_task_for(&self, task: &TaskId) -> Result<Option<PeerTaskId>, BridgeError>;
+    /// Latch the early-cancel flag for this task (idempotent).
+    async fn request_cancel(&self, task: &TaskId) -> Result<(), BridgeError>;
+    /// Returns `true` if `request_cancel` has been called for this task.
+    async fn cancel_requested(&self, task: &TaskId) -> Result<bool, BridgeError>;
 }
 
 /// Sync routing decision — no async needed; plain fn.
@@ -101,12 +111,16 @@ mod tests {
     struct FakeStore {
         inner: std::sync::Mutex<std::collections::HashMap<String, String>>,
         pending: std::sync::Mutex<std::collections::HashMap<String, PendingRequest>>,
+        peer_tasks: std::sync::Mutex<std::collections::HashMap<String, PeerTaskId>>,
+        cancels: std::sync::Mutex<std::collections::HashSet<String>>,
     }
     impl FakeStore {
         fn new() -> Self {
             Self {
                 inner: Default::default(),
                 pending: Default::default(),
+                peer_tasks: Default::default(),
+                cancels: Default::default(),
             }
         }
     }
@@ -136,6 +150,23 @@ mod tests {
         }
         async fn take_pending(&self, t: &TaskId) -> Result<Option<PendingRequest>, BridgeError> {
             Ok(self.pending.lock().unwrap().remove(t.as_str()))
+        }
+        async fn set_peer_task(&self, t: &TaskId, peer: &PeerTaskId) -> Result<(), BridgeError> {
+            self.peer_tasks
+                .lock()
+                .unwrap()
+                .insert(t.as_str().into(), peer.clone());
+            Ok(())
+        }
+        async fn peer_task_for(&self, t: &TaskId) -> Result<Option<PeerTaskId>, BridgeError> {
+            Ok(self.peer_tasks.lock().unwrap().get(t.as_str()).cloned())
+        }
+        async fn request_cancel(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.cancels.lock().unwrap().insert(t.as_str().into());
+            Ok(())
+        }
+        async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(self.cancels.lock().unwrap().contains(t.as_str()))
         }
     }
 
