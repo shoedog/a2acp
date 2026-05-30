@@ -38,9 +38,10 @@ use bridge_core::ids::{SessionId, TaskId};
 use bridge_core::ports::{
     AgentBackend, AuthMiddleware, DelegationPort, PolicyEngine, RouteDecision, SessionStore,
 };
-use bridge_core::translator::{Event, EventKind, Translator};
+use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
+use crate::fanout::{self, Source};
 use crate::sse::event_to_sse;
 
 /// JSON-RPC 2.0 error code for an invalid request / rejected pipeline gate.
@@ -157,6 +158,17 @@ async fn try_win_peer_cancel(
     guard.lock().await.insert(local.as_str().to_owned())
 }
 
+/// Per-source single-cancel guard. Like [`try_win_peer_cancel`] but keyed by an
+/// arbitrary string so fan-out can guard each source independently
+/// (`"{task}:kiro"`, `"{task}:peer"`) while plain-delegate keeps using the bare
+/// task id. Returns `true` exactly once per key — the winner performs the cancel.
+async fn try_win_cancel_key(
+    guard: &Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    key: String,
+) -> bool {
+    guard.lock().await.insert(key)
+}
+
 /// The result of the gate: the routed call ready for the translator or delegation.
 struct RoutedCall {
     task: TaskId,
@@ -220,6 +232,7 @@ async fn stream_message(
     match routed.target {
         RouteTarget::Local(_) => spawn_local_producer(&srv, routed, tx),
         RouteTarget::Delegate => spawn_delegate_producer(&srv, routed, tx),
+        RouteTarget::Fanout => spawn_fanout_producer(&srv, routed, tx),
     }
 
     // Use the task id as the context id for now (consistent within a single stream).
@@ -254,13 +267,27 @@ fn spawn_local_producer(
             &session,
             parts,
         );
+        let mut errored = false;
         while let Some(ev) = events.next().await {
+            // Track whether the stream ended with an error.
+            if ev.is_err() {
+                errored = true;
+            }
             // If the receiver is gone (client disconnected) stop driving.
             if tx.send(ev).await.is_err() {
-                break;
+                // Receiver gone — skip the terminal frame (client disconnected).
+                return;
             }
         }
-        // Channel closes on drop -> SSE stream terminates after the final flush.
+        // Append exactly one terminal frame after the inner stream ends.
+        // A clean stream end -> Completed; an errored stream -> Failed.
+        let outcome = if errored {
+            TaskOutcome::Failed
+        } else {
+            TaskOutcome::Completed
+        };
+        let _ = tx.send(Ok(Event::terminal(outcome))).await;
+        // Channel closes on drop -> SSE stream terminates after the terminal flush.
     });
 }
 
@@ -287,6 +314,7 @@ fn spawn_delegate_producer(
             Ok(d) => d,
             Err(e) => {
                 let _ = tx.send(Err(e)).await;
+                // Delegation-open failure: no terminal frame — the error frame is terminal.
                 return;
             }
         };
@@ -313,20 +341,28 @@ fn spawn_delegate_producer(
                             if tx.send(ev).await.is_err() {
                                 // Receiver gone mid-send: treat as disconnect.
                                 cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
+                                // Client disconnected — no terminal frame needed.
                                 return;
                             }
                         }
-                        None => return, // peer stream terminated normally.
+                        None => {
+                            // Peer stream terminated normally — append terminal Completed frame.
+                            let _ = tx.send(Ok(Event::terminal(TaskOutcome::Completed))).await;
+                            return;
+                        }
                     }
                 }
                 // (ii) caller disconnected (works even if the peer stream is IDLE).
                 _ = tx.closed() => {
                     cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
+                    // Client disconnected — no terminal frame (receiver is gone).
                     return;
                 }
                 // (iii) an inbound CancelTask latched cancel_requested.
                 _ = poll_cancel_requested(store.as_ref(), &local) => {
                     cancel_peer_now(&delegation, &store, &guard, &local, &mut peer_watch).await;
+                    // Canceled by inbound request — append terminal Canceled frame.
+                    let _ = tx.send(Ok(Event::terminal(TaskOutcome::Canceled))).await;
                     return;
                 }
             }
@@ -411,6 +447,233 @@ async fn poll_cancel_requested(store: &dyn SessionStore, local: &TaskId) {
     }
 }
 
+/// Build a `Source` for the local Kiro backend by running the Translator inside an
+/// `async_stream::stream!` that owns all the `Arc` clones it needs — no lifetime fight.
+fn local_kiro_source(
+    backend: Arc<dyn AgentBackend>,
+    store: Arc<dyn SessionStore>,
+    policy: Arc<dyn PolicyEngine>,
+    task: TaskId,
+    session: SessionId,
+    parts: Vec<Part>,
+) -> Source {
+    // Build the stream by cloning Arc refs into a `'static + Send` stream.
+    let stream: crate::fanout::EventStream = Box::pin(async_stream::stream! {
+        let translator = Translator::new();
+        let mut events = translator.run(
+            backend.as_ref(),
+            store.as_ref(),
+            policy.as_ref(),
+            &task,
+            &session,
+            parts,
+        );
+        while let Some(ev) = events.next().await {
+            yield ev;
+        }
+    });
+    Source::from_stream("kiro", stream)
+}
+
+/// Spawn the fan-out producer: build a Kiro source and a peer source, then run
+/// `fanout::run` which merges them and sends the terminal frame.
+fn spawn_fanout_producer(
+    srv: &Arc<InboundServer>,
+    routed: RoutedCall,
+    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+) {
+    let backend = srv.backend.clone();
+    let store = srv.store.clone();
+    let policy = srv.policy.clone();
+    let delegation = srv.delegation.clone();
+    let guard = srv.cancelled_peers.clone();
+    let task = routed.task;
+    let session = routed.session;
+    let parts = routed.parts.clone();
+    let auth = routed.auth;
+
+    tokio::spawn(async move {
+        // Mark this task as a fan-out task so Task 6 (cancel_task) can distinguish
+        // it from a plain delegate (which also has a peer id in the store).
+        let _ = store.set_fanout(&task).await;
+
+        // 1. Build the local Kiro source. We KEEP its cancel handle (the session)
+        //    so the supervisor can cancel Kiro immediately, never awaiting the peer.
+        let kiro_source = local_kiro_source(
+            backend.clone(),
+            store.clone(),
+            policy,
+            task.clone(),
+            session.clone(),
+            parts.clone(),
+        );
+
+        // 2. Build the peer source by opening delegation, keeping its peer-task
+        //    watch for the supervisor's latched peer cancel.
+        let (peer_source, peer_watch) = match delegation.delegate(&auth, &task, parts).await {
+            Ok(d) => {
+                // Keep the peer-task watch for the supervisor's latched peer cancel.
+                let watch = d.peer_task.clone();
+                let src = Source::from_stream("peer", d.events);
+                (src, watch)
+            }
+            Err(e) => {
+                // Delegation startup failed: emit one labeled error frame for the peer,
+                // then the coordinator's terminal frame covers completion.
+                let (_, dummy_rx) = tokio::sync::watch::channel::<Option<PeerTaskId>>(None);
+                let watch = dummy_rx.clone();
+                let src = Source::failed("peer", e);
+                (src, watch)
+            }
+        };
+
+        // 3. Cancel plumbing: a watch flag the coordinator observes, and one
+        //    "finished" flag per source (index-aligned with the sources vec).
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let kiro_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = vec![kiro_done.clone(), peer_done.clone()];
+
+        // 4. Run the coordinator on its own task (it OWNS `tx` and is the sole
+        //    sender — we never clone `tx`, so the SSE channel closes the instant
+        //    the coordinator ends). It returns a `RunOutcome` telling us whether
+        //    the caller disconnected mid-stream.
+        let coordinator = tokio::spawn(fanout::run_with_cancel(
+            vec![kiro_source, peer_source],
+            tx,
+            cancel_rx,
+            finished,
+        ));
+
+        // 4b. Finished-source claimer: when a source's stream ENDS, claim its
+        //     per-source guard key so NEITHER the supervisor NOR a racing
+        //     `cancel_task()` ever cancels an already-finished source. This is what
+        //     makes "a finished source is a cancel no-op" hold across both cancel
+        //     paths (the supervisor's flag check covers itself; this claim covers
+        //     cancel_task's direct path). It exits once both keys are claimed.
+        spawn_finished_claimer(
+            guard.clone(),
+            task.clone(),
+            kiro_done.clone(),
+            peer_done.clone(),
+        );
+
+        // 5. Supervisor: race the coordinator finishing against an inbound
+        //    CancelTask (the `request_cancel` latch). On a CancelTask we cancel
+        //    BOTH sources (Kiro immediately by its known session; peer latched via
+        //    its watch), each guarded + finished-aware, then flip the cancel flag.
+        //    If the coordinator finishes FIRST with `Disconnected` (caller dropped
+        //    the SSE receiver mid-stream) we cancel any surviving sources too.
+        let mut peer_watch = peer_watch;
+        tokio::select! {
+            // (i) coordinator ended on its own. If it was a mid-stream disconnect,
+            //     cancel any surviving sources (finished ones are a no-op).
+            joined = coordinator => {
+                if matches!(joined, Ok(fanout::RunOutcome::Disconnected)) {
+                    cancel_fanout_sources(
+                        &backend, &delegation, &store, &guard, &task,
+                        &session, &mut peer_watch, &kiro_done, &peer_done,
+                    )
+                    .await;
+                }
+            }
+            // (ii) an inbound CancelTask latched cancel_requested.
+            _ = poll_cancel_requested(store.as_ref(), &task) => {
+                cancel_fanout_sources(
+                    &backend, &delegation, &store, &guard, &task,
+                    &session, &mut peer_watch, &kiro_done, &peer_done,
+                )
+                .await;
+                let _ = cancel_tx.send(true);
+            }
+        }
+    });
+}
+
+/// Background claimer: as each fan-out source's stream ENDS (its `*_done` flag
+/// flips true), claim that source's per-source guard key (`"{task}:kiro"` /
+/// `"{task}:peer"`). Claiming the key makes any later `try_win_*` for it return
+/// `false`, so a finished source is never cancelled — by the supervisor OR by a
+/// racing `cancel_task()`. Polls on a short interval (mirrors
+/// `poll_cancel_requested`) and exits once both keys are claimed.
+fn spawn_finished_claimer(
+    guard: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    task: TaskId,
+    kiro_done: Arc<std::sync::atomic::AtomicBool>,
+    peer_done: Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut kiro_claimed = false;
+        let mut peer_claimed = false;
+        loop {
+            if !kiro_claimed && kiro_done.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = try_win_cancel_key(&guard, format!("{}:kiro", task.as_str())).await;
+                kiro_claimed = true;
+            }
+            if !peer_claimed && peer_done.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = try_win_cancel_key(&guard, format!("{}:peer", task.as_str())).await;
+                peer_claimed = true;
+            }
+            if kiro_claimed && peer_claimed {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+}
+
+/// Cancel BOTH fan-out sources on a cancel trigger: the Kiro session immediately
+/// by its known `session` (never awaiting the peer id) and the peer via its watch
+/// (latched if the id is not yet known). Each source is guarded by a per-source
+/// key (`"{task}:kiro"` / `"{task}:peer"`) so it is cancelled exactly once across
+/// the supervisor and `cancel_task()`, and a source whose stream already FINISHED
+/// is a cancel no-op.
+#[allow(clippy::too_many_arguments)]
+async fn cancel_fanout_sources(
+    backend: &Arc<dyn AgentBackend>,
+    delegation: &Arc<dyn DelegationPort>,
+    store: &Arc<dyn SessionStore>,
+    guard: &Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    task: &TaskId,
+    session: &SessionId,
+    peer_watch: &mut tokio::sync::watch::Receiver<Option<PeerTaskId>>,
+    kiro_done: &std::sync::atomic::AtomicBool,
+    peer_done: &std::sync::atomic::AtomicBool,
+) {
+    // Latch first so a not-yet-known peer id is covered by spawn-style appliers.
+    let _ = store.request_cancel(task).await;
+
+    // Kiro: cancel IMMEDIATELY by its known session, unless its stream finished.
+    if !kiro_done.load(std::sync::atomic::Ordering::SeqCst)
+        && try_win_cancel_key(guard, format!("{}:kiro", task.as_str())).await
+    {
+        let _ = backend.cancel(session).await;
+    }
+
+    // Peer: cancel via its watch (latched if the id is not yet known), unless its
+    // stream finished. Guarded by the per-source key.
+    if peer_done.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let current = peer_watch.borrow().clone();
+    if let Some(peer) = current {
+        if try_win_cancel_key(guard, format!("{}:peer", task.as_str())).await {
+            let _ = delegation.cancel(&peer).await;
+        }
+        return;
+    }
+    // Peer id not yet known: wait briefly for it, else rely on the request_cancel
+    // latch (the unary/streaming peer-id appliers honor it once the id appears).
+    if peer_watch.changed().await.is_ok() {
+        let next = peer_watch.borrow().clone();
+        if let Some(peer) = next {
+            if try_win_cancel_key(guard, format!("{}:peer", task.as_str())).await {
+                let _ = delegation.cancel(&peer).await;
+            }
+        }
+    }
+}
+
 /// Adapt the mpsc receiver into a stream of `Result<SseEvent, Infallible>`.
 /// Each translated [`Event`] becomes one SSE frame; backend errors become a
 /// single `error` frame so the client sees a terminal signal.
@@ -443,6 +706,12 @@ async fn unary_message(
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
     let _ = srv.store.put(&routed.task, &routed.session).await;
+
+    // Fan-out unary: collect all fanout::run events and build an a2a::Task
+    // response with both labeled artifacts.
+    if let RouteTarget::Fanout = routed.target {
+        return unary_fanout_message(srv, id, routed).await;
+    }
 
     // Collect the same event stream the streaming path produces, into one JSON
     // response. Local drives the translator; Delegate drives the delegation.
@@ -500,6 +769,8 @@ async fn unary_message(
                 Err(e) => vec![Err(e)],
             }
         }
+        // Fanout handled above; this arm is unreachable.
+        RouteTarget::Fanout => unreachable!("fanout handled by unary_fanout_message"),
     };
 
     // Surface a terminal error if the pipeline failed/suspended.
@@ -525,6 +796,102 @@ async fn unary_message(
         "status": status_chunks,
     });
     jsonrpc_ok(id, result)
+}
+
+/// Unary fan-out path: run both sources concurrently via `fanout::run`, collect
+/// all events, then build an `a2a::Task` response with one `Artifact` per source.
+async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: RoutedCall) -> Response {
+    // Mark the task as fanout so Task 6 (cancel_task) can distinguish it.
+    let _ = srv.store.set_fanout(&routed.task).await;
+
+    // Build the local Kiro source.
+    let kiro_source = local_kiro_source(
+        srv.backend.clone(),
+        srv.store.clone(),
+        srv.policy.clone(),
+        routed.task.clone(),
+        routed.session.clone(),
+        routed.parts.clone(),
+    );
+
+    // Build the peer source by opening delegation.
+    let peer_source = match srv
+        .delegation
+        .delegate(&routed.auth, &routed.task, routed.parts)
+        .await
+    {
+        Ok(d) => Source::from_stream("peer", d.events),
+        Err(e) => Source::failed("peer", e),
+    };
+
+    // Drain all fanout events synchronously via an mpsc channel.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Event, BridgeError>>(64);
+    let run_handle = tokio::spawn(async move {
+        fanout::run(vec![kiro_source, peer_source], tx).await;
+    });
+
+    let mut all_events: Vec<Event> = Vec::new();
+    let mut terminal_outcome = TaskOutcome::Completed;
+    while let Some(item) = rx.recv().await {
+        match item {
+            Ok(ev) => {
+                if ev.kind() == &EventKind::Terminal {
+                    if let Some(o) = ev.outcome() {
+                        terminal_outcome = o;
+                    }
+                } else {
+                    all_events.push(ev);
+                }
+            }
+            Err(e) => return bridge_err_to_jsonrpc(id, &e),
+        }
+    }
+    let _ = run_handle.await;
+
+    // Build one a2a::Artifact per source from the collected artifact events.
+    let artifacts: Vec<a2a::Artifact> = all_events
+        .iter()
+        .filter(|e| e.kind() == &EventKind::Artifact)
+        .map(|e| {
+            let name = e.source().map(|s| s.to_owned());
+            a2a::Artifact {
+                artifact_id: a2a::new_artifact_id(),
+                name,
+                description: None,
+                parts: vec![a2a::Part::text(e.text())],
+                metadata: None,
+                extensions: None,
+            }
+        })
+        .collect();
+
+    let state = match terminal_outcome {
+        TaskOutcome::Completed => a2a::TaskState::Completed,
+        TaskOutcome::Failed => a2a::TaskState::Failed,
+        TaskOutcome::Canceled => a2a::TaskState::Canceled,
+    };
+
+    let task = a2a::Task {
+        id: routed.task.as_str().to_owned(),
+        context_id: routed.task.as_str().to_owned(),
+        status: a2a::TaskStatus {
+            state,
+            message: None,
+            timestamp: None,
+        },
+        artifacts: if artifacts.is_empty() {
+            None
+        } else {
+            Some(artifacts)
+        },
+        history: None,
+        metadata: None,
+    };
+
+    jsonrpc_ok(
+        id,
+        serde_json::to_value(&task).expect("a2a::Task serializes"),
+    )
 }
 
 /// `CancelTask` -> propagate cancel to the backend for the task's session.
@@ -554,28 +921,67 @@ async fn cancel_task(
     // will apply the cancel once the id appears) and signals an in-flight stream.
     let _ = srv.store.request_cancel(&task).await;
 
-    // S2b: if the task is delegated, cancel the peer directly. This path covers
-    // the case where the stream/supervisor has already ended; the single-cancel
-    // guard ensures we don't double-POST when the supervisor is still alive and
-    // its poll_cancel_requested arm (woken by the request_cancel latch above)
-    // would otherwise cancel the same peer.
-    match srv.store.peer_task_for(&task).await {
-        Ok(Some(peer)) => {
-            if try_win_peer_cancel(&srv.cancelled_peers, &task).await {
+    // Decide cancel-both (fan-out) vs peer-only (plain delegate) vs local-only.
+    // Cx1: a fan-out task has BOTH a Kiro session AND a peer, so the peer-only
+    // branch (used for plain delegate) would LOSE the Kiro cancel — branch on
+    // is_fanout to cancel both, each guarded by its per-source key.
+    if srv.store.is_fanout(&task).await.unwrap_or(false) {
+        // Fan-out: cancel the Kiro session immediately by its known id (never
+        // awaiting the peer), AND the peer (latched if not yet known). The
+        // supervisor (if still alive) races on the same per-source keys, so each
+        // source is cancelled exactly once across both paths.
+        let session = match srv.store.session_for(&task).await {
+            Ok(Some(s)) => s,
+            _ => SessionId::parse(format!("session-{}", task.as_str()))
+                .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
+        };
+        // Attempt BOTH cancels regardless of either's result so a failing Kiro
+        // cancel never orphans the peer's upstream task (and vice-versa). Each is
+        // still guarded by its per-source key, so exactly-once holds across this
+        // path and the supervisor. We collect the first error (if any) and return
+        // it only AFTER both cancels have been attempted.
+        let mut first_err: Option<BridgeError> = None;
+        if try_win_cancel_key(&srv.cancelled_peers, format!("{}:kiro", task.as_str())).await {
+            if let Err(e) = srv.backend.cancel(&session).await {
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Ok(Some(peer)) = srv.store.peer_task_for(&task).await {
+            if try_win_cancel_key(&srv.cancelled_peers, format!("{}:peer", task.as_str())).await {
                 if let Err(e) = srv.delegation.cancel(&peer).await {
-                    return bridge_err_to_jsonrpc(id, &e);
+                    first_err.get_or_insert(e);
                 }
             }
         }
-        _ => {
-            // Local task: cancel the backend for the task's session.
-            let session = match srv.store.session_for(&task).await {
-                Ok(Some(s)) => s,
-                _ => SessionId::parse(format!("session-{}", task.as_str()))
-                    .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
-            };
-            if let Err(e) = srv.backend.cancel(&session).await {
-                return bridge_err_to_jsonrpc(id, &e);
+        // If the peer id is not yet known, the request_cancel latch (set above)
+        // plus the supervisor's peer-watch applier cancel it once it appears.
+        if let Some(e) = first_err {
+            return bridge_err_to_jsonrpc(id, &e);
+        }
+    } else {
+        // S2b: if the task is delegated, cancel the peer directly. This path covers
+        // the case where the stream/supervisor has already ended; the single-cancel
+        // guard ensures we don't double-POST when the supervisor is still alive and
+        // its poll_cancel_requested arm (woken by the request_cancel latch above)
+        // would otherwise cancel the same peer.
+        match srv.store.peer_task_for(&task).await {
+            Ok(Some(peer)) => {
+                if try_win_peer_cancel(&srv.cancelled_peers, &task).await {
+                    if let Err(e) = srv.delegation.cancel(&peer).await {
+                        return bridge_err_to_jsonrpc(id, &e);
+                    }
+                }
+            }
+            _ => {
+                // Local task: cancel the backend for the task's session.
+                let session = match srv.store.session_for(&task).await {
+                    Ok(Some(s)) => s,
+                    _ => SessionId::parse(format!("session-{}", task.as_str()))
+                        .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
+                };
+                if let Err(e) = srv.backend.cancel(&session).await {
+                    return bridge_err_to_jsonrpc(id, &e);
+                }
             }
         }
     }
@@ -797,6 +1203,19 @@ mod tests {
                 cancels: Arc::new(Mutex::new(Vec::new())),
             })
         }
+        /// IDLE peer stream (yields its events then hangs forever) whose peer id
+        /// binds LATE: starts None, becomes Some(peer) ~15ms after delegate runs.
+        /// Models a still-running peer whose id is not yet known at cancel time.
+        fn idle_late_peer(events: Vec<Result<Event, BridgeError>>, peer: &str) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Some(events)),
+                peer_initial: None,
+                peer_after_first: Some(PeerTaskId(peer.into())),
+                idle: true,
+                peer_on_drain: None,
+                cancels: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
         /// Peer id captured lazily as frames are consumed: starts None and becomes
         /// Some(peer) from inside the events stream when the first frame is drained.
         fn late_peer_on_drain(events: Vec<Result<Event, BridgeError>>, peer: &str) -> Arc<Self> {
@@ -929,6 +1348,7 @@ mod tests {
         map: Mutex<std::collections::HashMap<String, String>>,
         peer_tasks: Mutex<std::collections::HashMap<String, PeerTaskId>>,
         cancels: Mutex<std::collections::HashSet<String>>,
+        fanouts: Mutex<std::collections::HashSet<String>>,
     }
     #[async_trait::async_trait]
     impl SessionStore for FakeStore {
@@ -969,6 +1389,13 @@ mod tests {
         }
         async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
             Ok(self.cancels.lock().unwrap().contains(t.as_str()))
+        }
+        async fn set_fanout(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.fanouts.lock().unwrap().insert(t.as_str().into());
+            Ok(())
+        }
+        async fn is_fanout(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(self.fanouts.lock().unwrap().contains(t.as_str()))
         }
     }
 
@@ -1142,13 +1569,27 @@ mod tests {
         // The data: payloads must parse as real a2a::StreamResponse — conformance check.
         let payloads = sse_data_payloads(&body);
         assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
+        // Final frame is now the terminal statusUpdate(Completed); artifact is penultimate.
         let last = payloads.last().unwrap();
         let sr: a2a::StreamResponse = serde_json::from_str(last).unwrap_or_else(|e| {
             panic!("last data payload must parse as StreamResponse: {e}: {last}")
         });
         assert!(
-            matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
-            "final frame must be ArtifactUpdate: {last}"
+            matches!(
+                &sr,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed
+            ),
+            "final frame must be terminal statusUpdate(Completed): {last}"
+        );
+        // The penultimate frame must be the artifact.
+        let penultimate = &payloads[payloads.len() - 2];
+        let sr2: a2a::StreamResponse = serde_json::from_str(penultimate).unwrap_or_else(|e| {
+            panic!("penultimate data payload must parse as StreamResponse: {e}: {penultimate}")
+        });
+        assert!(
+            matches!(sr2, a2a::StreamResponse::ArtifactUpdate(_)),
+            "penultimate frame must be ArtifactUpdate: {penultimate}"
         );
     }
 
@@ -1165,15 +1606,7 @@ mod tests {
             .unwrap();
         let body = body_string(resp).await;
         let last_artifact = body.rfind("artifact-update");
-        let last_status = body.rfind("status-update");
         assert!(last_artifact.is_some(), "no artifact frame: {body}");
-        // The artifact frame must come after any status frame (final flush).
-        if let Some(s) = last_status {
-            assert!(
-                last_artifact.unwrap() > s,
-                "artifact must be the final frame: {body}"
-            );
-        }
         // All data: payloads must parse as a2a::StreamResponse (wire-conformance).
         let payloads = sse_data_payloads(&body);
         for payload in &payloads {
@@ -1181,11 +1614,22 @@ mod tests {
                 panic!("data payload must parse as StreamResponse: {e}: {payload}")
             });
         }
-        // The last parsed payload must be ArtifactUpdate.
+        // The last parsed payload must be the terminal statusUpdate(Completed).
         let last_sr: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap()).unwrap();
         assert!(
-            matches!(last_sr, a2a::StreamResponse::ArtifactUpdate(_)),
-            "final frame must be ArtifactUpdate"
+            matches!(
+                &last_sr,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed
+            ),
+            "final frame must be terminal statusUpdate(Completed)"
+        );
+        // The penultimate must be the ArtifactUpdate.
+        let penultimate: a2a::StreamResponse =
+            serde_json::from_str(&payloads[payloads.len() - 2]).unwrap();
+        assert!(
+            matches!(penultimate, a2a::StreamResponse::ArtifactUpdate(_)),
+            "penultimate frame must be ArtifactUpdate"
         );
     }
 
@@ -1269,9 +1713,11 @@ mod tests {
         let body = body_string(resp).await;
         let card: Value = serde_json::from_str(&body).unwrap();
         let skills = card["skills"].as_array().unwrap();
-        assert_eq!(skills.len(), 2);
+        // Updated for Task 5a: three skills (kiro-code, delegate, fan-out).
+        assert_eq!(skills.len(), 3);
         assert!(skills.iter().any(|s| s["id"] == "kiro-code"));
         assert!(skills.iter().any(|s| s["id"] == "delegate"));
+        assert!(skills.iter().any(|s| s["id"] == "fan-out"));
     }
 
     #[tokio::test]
@@ -1377,12 +1823,25 @@ mod tests {
             "SSE body should carry the peer artifact: {body}"
         );
         let payloads = sse_data_payloads(&body);
+        // Final frame: terminal statusUpdate(Completed) synthesized by the delegate producer.
         let last = payloads.last().expect("at least one SSE data payload");
         let sr: a2a::StreamResponse = serde_json::from_str(last)
             .unwrap_or_else(|e| panic!("final frame must parse as StreamResponse: {e}: {last}"));
         assert!(
-            matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
-            "final frame must be ArtifactUpdate: {last}"
+            matches!(
+                &sr,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed
+            ),
+            "final frame must be terminal statusUpdate(Completed): {last}"
+        );
+        // Penultimate: the ArtifactUpdate from the peer.
+        let penultimate = &payloads[payloads.len() - 2];
+        let sr2: a2a::StreamResponse = serde_json::from_str(penultimate)
+            .unwrap_or_else(|e| panic!("penultimate frame must parse as StreamResponse: {e}"));
+        assert!(
+            matches!(sr2, a2a::StreamResponse::ArtifactUpdate(_)),
+            "penultimate frame must be ArtifactUpdate: {penultimate}"
         );
     }
 
@@ -1603,6 +2062,71 @@ mod tests {
         );
     }
 
+    // ---- Task 2: single-source terminal synthesis ----
+
+    /// A fake backend that yields a Status then an Artifact then ends cleanly.
+    struct TerminalSynthBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for TerminalSynthBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates = vec![
+                Ok(Update::Text("status-chunk".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn single_source_local_producer_appends_terminal_completed_frame() {
+        let srv = build(Arc::new(TerminalSynthBackend), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let payloads = sse_data_payloads(&body);
+        assert!(
+            payloads.len() >= 2,
+            "must have at least artifact + terminal: {body}"
+        );
+
+        // Final frame: terminal statusUpdate(Completed).
+        let last: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap())
+            .unwrap_or_else(|e| panic!("last data payload must parse as StreamResponse: {e}"));
+        assert!(
+            matches!(
+                &last,
+                a2a::StreamResponse::StatusUpdate(e) if e.status.state == a2a::TaskState::Completed
+            ),
+            "final frame must be terminal statusUpdate(Completed): {:?}",
+            payloads.last()
+        );
+
+        // Penultimate frame: the artifact from the translator.
+        let penultimate: a2a::StreamResponse = serde_json::from_str(&payloads[payloads.len() - 2])
+            .unwrap_or_else(|e| panic!("penultimate payload must parse as StreamResponse: {e}"));
+        assert!(
+            matches!(penultimate, a2a::StreamResponse::ArtifactUpdate(_)),
+            "penultimate frame must be ArtifactUpdate: {:?}",
+            &payloads[payloads.len() - 2]
+        );
+    }
+
     /// Poll `cond` up to ~2s, sleeping briefly between checks. Panics on timeout.
     async fn wait_until(mut cond: impl FnMut() -> bool) {
         for _ in 0..200 {
@@ -1612,5 +2136,639 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("condition not met within budget");
+    }
+
+    // ---- Task 5b: explicit fan-out task-mode marker + unary fan-out Task shape ----
+
+    #[tokio::test]
+    async fn unary_fanout_returns_task_with_both_artifacts() {
+        // FakeBackend yields Text("KA") + Done -> kiro artifact "KA".
+        // FakeDelegation yields artifact("PA") -> peer artifact "PA".
+        // RouteTarget::Fanout via FanoutSkillRoute("fan-out").
+        // The unary response must be a JSON-RPC result whose result is an a2a::Task
+        // with status.state==Completed and artifacts: [{name:"kiro", text:"KA"}, {name:"peer", text:"PA"}].
+        struct KiroABackend;
+        #[async_trait::async_trait]
+        impl AgentBackend for KiroABackend {
+            async fn prompt(
+                &self,
+                _s: &SessionId,
+                _p: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                let updates = vec![
+                    Ok(Update::Text("KA".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ];
+                Ok(Box::pin(tokio_stream::iter(updates)))
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+        let deleg = FakeDelegation::new(vec![Ok(Event::artifact("PA"))], Some("p1"));
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(Arc::new(KiroABackend), store.clone(), deleg);
+
+        let resp = router(srv)
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("unary fanout response must be valid JSON: {e}: {body}"));
+        // Must be a JSON-RPC success (no error).
+        assert!(v.get("error").is_none(), "expected no error: {body}");
+        let result = &v["result"];
+        // The result IS the a2a::Task directly (contextId, id, status, artifacts).
+        // result.status.state must be Completed.
+        let state = result["status"]["state"].as_str().unwrap_or("");
+        assert_eq!(
+            state, "TASK_STATE_COMPLETED",
+            "status.state must be 'TASK_STATE_COMPLETED': {body}"
+        );
+        // result.artifacts must have 2 entries.
+        let artifacts = result["artifacts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("result.artifacts must be an array: {body}"));
+        assert_eq!(artifacts.len(), 2, "must have exactly 2 artifacts: {body}");
+        // Check that there is one artifact named "kiro" with text "KA" and one named "peer" with text "PA".
+        let names: Vec<&str> = artifacts
+            .iter()
+            .filter_map(|a| a["name"].as_str())
+            .collect();
+        assert!(names.contains(&"kiro"), "must have kiro artifact: {body}");
+        assert!(names.contains(&"peer"), "must have peer artifact: {body}");
+        let kiro_art = artifacts.iter().find(|a| a["name"] == "kiro").unwrap();
+        let kiro_text = kiro_art["parts"][0]["text"].as_str().unwrap_or("");
+        assert_eq!(kiro_text, "KA", "kiro artifact text must be 'KA': {body}");
+        let peer_art = artifacts.iter().find(|a| a["name"] == "peer").unwrap();
+        let peer_text = peer_art["parts"][0]["text"].as_str().unwrap_or("");
+        assert_eq!(peer_text, "PA", "peer artifact text must be 'PA': {body}");
+        // Also verify is_fanout was set on the task in the store.
+        let task_id = TaskId::parse("task-1").unwrap();
+        assert!(
+            store.is_fanout(&task_id).await.unwrap(),
+            "store must mark task-1 as fanout after unary fanout dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_single_source_response_unchanged() {
+        // Regression: plain (non-fanout) unary SendMessage still returns the legacy shape.
+        // The existing unary_send_message_returns_artifact test expects result.artifact.text == "PONG".
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        // Legacy shape: result.artifact.text, not result.task.artifacts.
+        assert_eq!(
+            v["result"]["artifact"]["text"], "PONG",
+            "single-source unary shape unchanged: {body}"
+        );
+        // Must NOT have result.artifacts (that's only the fan-out shape).
+        // In the legacy shape, result has "task" (with id+state), "artifact" (with text), "status".
+        assert!(
+            v["result"]["artifacts"].is_null(),
+            "single-source must not have result.artifacts (fan-out only): {body}"
+        );
+    }
+
+    // ---- Task 5a: fan-out streaming dispatch ----
+
+    /// Routes `skill=="fan-out"` to `Fanout`; `skill=="delegate"` to `Delegate`;
+    /// everything else to local kiro. Used only in fan-out tests.
+    struct FanoutSkillRoute;
+    impl RouteDecision for FanoutSkillRoute {
+        fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            match t.skill.as_deref() {
+                Some("fan-out") => Ok(RouteTarget::Fanout),
+                Some("delegate") => Ok(RouteTarget::Delegate),
+                _ => Ok(RouteTarget::Local(AgentId::parse("kiro")?)),
+            }
+        }
+    }
+
+    /// Build a fan-out-capable server sharing backend, store, and delegation.
+    fn build_fanout(
+        backend: Arc<dyn AgentBackend>,
+        store: Arc<dyn SessionStore>,
+        delegation: Arc<dyn DelegationPort>,
+    ) -> Arc<InboundServer> {
+        Arc::new(InboundServer::new(
+            backend,
+            store,
+            Arc::new(AutoApprove),
+            Arc::new(FanoutSkillRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            delegation,
+        ))
+    }
+
+    fn fanout_params() -> Value {
+        json!({ "message": {
+            "text": "go",
+            "metadata": { "a2a-bridge.skill": "fan-out" }
+        }})
+    }
+
+    #[tokio::test]
+    async fn fanout_streaming_merges_both_sources_with_terminal() {
+        // FakeBackend yields Text("KIRO") + Done -> kiro artifact "KIRO".
+        // FakeDelegation yields status("work") + artifact("PEER") -> peer artifact.
+        // Both sources labeled; terminal frame is Completed.
+        let deleg = FakeDelegation::new(
+            vec![Ok(Event::status("work")), Ok(Event::artifact("PEER"))],
+            Some("p1"),
+        );
+        let srv = build_fanout(FakeBackend::new(), Arc::new(FakeStore::default()), deleg);
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                fanout_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let payloads = sse_data_payloads(&body);
+        assert!(
+            !payloads.is_empty(),
+            "fan-out SSE must emit at least one frame: {body}"
+        );
+
+        // Parse all payloads as StreamResponse (wire conformance).
+        let parsed: Vec<a2a::StreamResponse> = payloads
+            .iter()
+            .map(|p| {
+                serde_json::from_str(p)
+                    .unwrap_or_else(|e| panic!("payload must parse as StreamResponse: {e}: {p}"))
+            })
+            .collect();
+
+        // There must be an artifact from kiro source.
+        let has_kiro_artifact = parsed.iter().any(|sr| {
+            matches!(sr, a2a::StreamResponse::ArtifactUpdate(e)
+                if e.metadata.as_ref()
+                    .and_then(|m| m.get("a2a-bridge.source"))
+                    .and_then(|v| v.as_str())
+                    == Some("kiro")
+            )
+        });
+        assert!(
+            has_kiro_artifact,
+            "fan-out SSE must contain a kiro-labeled artifact: {body}"
+        );
+
+        // There must be an artifact from peer source.
+        let has_peer_artifact = parsed.iter().any(|sr| {
+            matches!(sr, a2a::StreamResponse::ArtifactUpdate(e)
+                if e.metadata.as_ref()
+                    .and_then(|m| m.get("a2a-bridge.source"))
+                    .and_then(|v| v.as_str())
+                    == Some("peer")
+            )
+        });
+        assert!(
+            has_peer_artifact,
+            "fan-out SSE must contain a peer-labeled artifact: {body}"
+        );
+
+        // The LAST frame must be a terminal statusUpdate(Completed).
+        let last = parsed.last().unwrap();
+        assert!(
+            matches!(
+                last,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed
+            ),
+            "final fan-out frame must be terminal statusUpdate(Completed): {:?}",
+            payloads.last()
+        );
+    }
+
+    // ---- Task 6: fan-out cancel-all (immediate Kiro, latched peer, per-source guard) ----
+
+    /// Backend that counts `cancel(session)` calls and exposes a never-ending
+    /// prompt stream (so the kiro source stays ALIVE until cancelled). Used to
+    /// assert exactly-one Kiro cancel and immediate (non-peer-blocked) cancel.
+    struct CountingIdleBackend {
+        cancel_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl CountingIdleBackend {
+        fn new() -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let cancel_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    cancel_count: cancel_count.clone(),
+                }),
+                cancel_count,
+            )
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for CountingIdleBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            // One Text frame, then hang forever — an IDLE kiro stream.
+            let s = async_stream::stream! {
+                yield Ok(Update::Text("KWORK".into()));
+                futures::future::pending::<()>().await;
+            };
+            Ok(Box::pin(s))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            self.cancel_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Backend whose prompt ends immediately (kiro source FINISHES) and which
+    /// counts cancels — used to prove a finished source is a cancel no-op.
+    struct CountingDoneBackend {
+        cancel_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl CountingDoneBackend {
+        fn new() -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let cancel_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    cancel_count: cancel_count.clone(),
+                }),
+                cancel_count,
+            )
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for CountingDoneBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates = vec![
+                Ok(Update::Text("KDONE".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            self.cancel_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_cancel_cancels_all_sources_exactly_once() {
+        // A fan-out streaming task with both sources ALIVE (kiro idle, peer idle).
+        // POST an inbound CancelTask -> backend.cancel recorded exactly once AND
+        // delegation.cancel recorded exactly once; terminal is Canceled.
+        let (backend, kiro_cancels) = CountingIdleBackend::new();
+        let deleg = FakeDelegation::idle(vec![Ok(Event::status("pwork"))], Some("p1"));
+        let peer_cancels = deleg.cancels();
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(backend, store.clone(), deleg);
+
+        // Open the fan-out stream; keep the response so the supervisor stays alive.
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                fanout_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Wait until the task is marked fan-out (producer started).
+        let local = TaskId::parse("task-1").unwrap();
+        wait_until(|| futures::executor::block_on(store.is_fanout(&local)).unwrap_or(false)).await;
+
+        // POST CancelTask.
+        let resp2 = router(srv)
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "task-1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        // Both sources cancelled, each exactly once.
+        wait_until(|| {
+            kiro_cancels.load(Ordering::SeqCst) >= 1
+                && peer_cancels.lock().unwrap().iter().any(|c| c == "p1")
+        })
+        .await;
+        // Give any duplicate-cancel race time to (incorrectly) fire.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            kiro_cancels.load(Ordering::SeqCst),
+            1,
+            "backend.cancel must fire exactly once"
+        );
+        let peers: Vec<String> = peer_cancels.lock().unwrap().clone();
+        assert_eq!(
+            peers,
+            vec!["p1".to_string()],
+            "delegation.cancel must fire exactly once for the peer"
+        );
+
+        // Terminal frame on the stream is Canceled.
+        let body = body_string(resp).await;
+        let payloads = sse_data_payloads(&body);
+        let last = payloads.last().expect("at least one SSE frame");
+        let sr: a2a::StreamResponse = serde_json::from_str(last)
+            .unwrap_or_else(|e| panic!("final frame must parse as StreamResponse: {e}: {last}"));
+        assert!(
+            matches!(
+                &sr,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Canceled
+            ),
+            "final fan-out frame must be terminal statusUpdate(Canceled): {last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_cancel_does_not_block_on_peer_id() {
+        // Peer id is NOT yet known at cancel time (late_peer: appears after first
+        // event). Kiro cancel must fire IMMEDIATELY (within a short bound) without
+        // waiting on the peer id; the peer cancel is latched and applied once the
+        // watch yields an id.
+        let (backend, kiro_cancels) = CountingIdleBackend::new();
+        // Peer is idle (still running) and its id binds late. The Kiro cancel must
+        // not wait on the peer id; the peer cancel is latched and applied once the
+        // watch yields the id.
+        let deleg = FakeDelegation::idle_late_peer(vec![Ok(Event::status("pwork"))], "p1");
+        let peer_cancels = deleg.cancels();
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(backend, store.clone(), deleg);
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                fanout_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let local = TaskId::parse("task-1").unwrap();
+        wait_until(|| futures::executor::block_on(store.is_fanout(&local)).unwrap_or(false)).await;
+
+        // POST CancelTask and assert Kiro cancel fired within a short bound,
+        // regardless of the peer id.
+        let resp2 = router(srv)
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "task-1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        // Immediate Kiro cancel: within ~300ms (does not await the peer id).
+        let mut kiro_fired = false;
+        for _ in 0..30 {
+            if kiro_cancels.load(Ordering::SeqCst) >= 1 {
+                kiro_fired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            kiro_fired,
+            "Kiro cancel must fire immediately, not blocked on the peer id"
+        );
+
+        // The peer cancel is latched and applied once the id appears.
+        wait_until(|| peer_cancels.lock().unwrap().iter().any(|c| c == "p1")).await;
+        let _ = body_string(resp).await;
+    }
+
+    #[tokio::test]
+    async fn fanout_caller_disconnect_cancels_all() {
+        // Drop the SSE receiver mid-stream -> both backend.cancel and
+        // delegation.cancel recorded.
+        let (backend, kiro_cancels) = CountingIdleBackend::new();
+        let deleg = FakeDelegation::idle(vec![Ok(Event::status("pwork"))], Some("p1"));
+        let peer_cancels = deleg.cancels();
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(backend, store.clone(), deleg);
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                fanout_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let local = TaskId::parse("task-1").unwrap();
+        wait_until(|| futures::executor::block_on(store.is_fanout(&local)).unwrap_or(false)).await;
+
+        // Drop the response (and its SSE receiver) -> caller disconnect.
+        drop(resp);
+
+        wait_until(|| {
+            kiro_cancels.load(Ordering::SeqCst) >= 1
+                && peer_cancels.lock().unwrap().iter().any(|c| c == "p1")
+        })
+        .await;
+        assert_eq!(
+            kiro_cancels.load(Ordering::SeqCst),
+            1,
+            "disconnect must cancel the kiro source exactly once: {}",
+            kiro_cancels.load(Ordering::SeqCst)
+        );
+        assert!(
+            peer_cancels.lock().unwrap().iter().any(|c| c == "p1"),
+            "disconnect must cancel the peer source: {:?}",
+            peer_cancels.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_cancel_after_one_source_finished_cancels_only_survivor() {
+        // Kiro finishes (its stream ends); peer stays idle. Cancel ->
+        // delegation.cancel(peer) fires; backend.cancel is NOT called for the
+        // already-finished kiro.
+        let (backend, kiro_cancels) = CountingDoneBackend::new();
+        let deleg = FakeDelegation::idle(vec![Ok(Event::status("pwork"))], Some("p1"));
+        let peer_cancels = deleg.cancels();
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(backend, store.clone(), deleg);
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                fanout_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let local = TaskId::parse("task-1").unwrap();
+        wait_until(|| futures::executor::block_on(store.is_fanout(&local)).unwrap_or(false)).await;
+
+        // Give the kiro source time to finish (its stream ends quickly).
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // POST CancelTask.
+        let resp2 = router(srv)
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "task-1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        // Peer (the survivor) is cancelled.
+        wait_until(|| peer_cancels.lock().unwrap().iter().any(|c| c == "p1")).await;
+        // The finished kiro source is a cancel no-op.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            kiro_cancels.load(Ordering::SeqCst),
+            0,
+            "a finished kiro source must NOT be cancelled"
+        );
+        assert!(
+            peer_cancels.lock().unwrap().iter().any(|c| c == "p1"),
+            "the surviving peer source must be cancelled"
+        );
+        let _ = body_string(resp).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_task_fanout_cancels_both() {
+        // cancel_task() must branch on is_fanout: for a fan-out task, cancel BOTH
+        // the Kiro session (backend.cancel) AND the peer (delegation.cancel),
+        // each exactly once. We pre-seed the store as a fan-out task with both a
+        // session and a peer mapping, so cancel_task() exercises the both-branch
+        // directly (no live stream needed).
+        let (backend, kiro_cancels) = CountingDoneBackend::new();
+        let deleg = FakeDelegation::new(vec![Ok(Event::artifact("DONE"))], Some("p1"));
+        let peer_cancels = deleg.cancels();
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(backend, store.clone(), deleg);
+
+        let local = TaskId::parse("task-1").unwrap();
+        let session = SessionId::parse("session-task-1").unwrap();
+        store.put(&local, &session).await.unwrap();
+        store
+            .set_peer_task(&local, &PeerTaskId("p1".into()))
+            .await
+            .unwrap();
+        store.set_fanout(&local).await.unwrap();
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "task-1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        wait_until(|| {
+            kiro_cancels.load(Ordering::SeqCst) >= 1
+                && peer_cancels.lock().unwrap().iter().any(|c| c == "p1")
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(
+            kiro_cancels.load(Ordering::SeqCst),
+            1,
+            "fan-out cancel_task must cancel the Kiro session exactly once"
+        );
+        assert_eq!(
+            peer_cancels.lock().unwrap().clone(),
+            vec!["p1".to_string()],
+            "fan-out cancel_task must cancel the peer exactly once"
+        );
+    }
+
+    /// Backend whose `cancel` ALWAYS errors — used to prove the fan-out
+    /// `cancel_task()` path does not orphan the peer when the Kiro cancel fails.
+    struct CancelErrBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for CancelErrBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            })])))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Err(BridgeError::AgentCrashed)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_task_fanout_kiro_cancel_error_still_cancels_peer() {
+        // Robustness: in the fan-out cancel_task() path, if the Kiro
+        // `backend.cancel` returns Err, the peer cancel MUST still fire (no
+        // orphaned upstream task) and the handler must still return a sensible
+        // result rather than bailing before the peer-cancel block.
+        let backend: Arc<dyn AgentBackend> = Arc::new(CancelErrBackend);
+        let deleg = FakeDelegation::new(vec![Ok(Event::artifact("DONE"))], Some("p1"));
+        let peer_cancels = deleg.cancels();
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(backend, store.clone(), deleg);
+
+        let local = TaskId::parse("task-1").unwrap();
+        let session = SessionId::parse("session-task-1").unwrap();
+        store.put(&local, &session).await.unwrap();
+        store
+            .set_peer_task(&local, &PeerTaskId("p1".into()))
+            .await
+            .unwrap();
+        store.set_fanout(&local).await.unwrap();
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "task-1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // Handler still returns a sensible (HTTP 200) JSON-RPC response.
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        wait_until(|| peer_cancels.lock().unwrap().iter().any(|c| c == "p1")).await;
+        assert_eq!(
+            peer_cancels.lock().unwrap().clone(),
+            vec!["p1".to_string()],
+            "the peer must NOT be orphaned when the Kiro cancel errors"
+        );
     }
 }

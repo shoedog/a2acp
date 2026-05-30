@@ -12,10 +12,10 @@ pub struct SkillRoute;
 
 impl RouteDecision for SkillRoute {
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
-        if meta.skill.as_deref() == Some("delegate") {
-            Ok(RouteTarget::Delegate)
-        } else {
-            Ok(RouteTarget::Local(AgentId::parse("kiro")?))
+        match meta.skill.as_deref() {
+            Some("delegate") => Ok(RouteTarget::Delegate),
+            Some("fan-out") => Ok(RouteTarget::Fanout),
+            _ => Ok(RouteTarget::Local(AgentId::parse("kiro")?)),
         }
     }
 }
@@ -35,6 +35,22 @@ mod tests {
                 })
                 .unwrap(),
             RouteTarget::Delegate
+        ));
+        assert!(matches!(
+            SkillRoute.route(&TaskMeta { skill: None }).unwrap(),
+            RouteTarget::Local(a) if a.as_str() == "kiro"
+        ));
+    }
+
+    #[test]
+    fn skill_route_fanout_on_fanout_skill() {
+        assert!(matches!(
+            SkillRoute
+                .route(&TaskMeta {
+                    skill: Some("fan-out".into())
+                })
+                .unwrap(),
+            RouteTarget::Fanout
         ));
         assert!(matches!(
             SkillRoute.route(&TaskMeta { skill: None }).unwrap(),

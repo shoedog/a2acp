@@ -1,28 +1,39 @@
-// e2e_delegate_bridge.rs — Gated bridge-to-bridge end-to-end test (spec S2 + S2a, Task 11).
+// e2e_fanout_bridge.rs — Gated bridge-to-bridge fan-out end-to-end test (spec S3, Task 7).
 //
 // Stands up two REAL bridge instances (A and B) in-process:
+//
 //   Bridge B: InboundServer wired to a real KiroBackend (kiro-cli acp) on an
-//             ephemeral port. Serves the "kiro-code" skill.
-//   Bridge A: InboundServer wired to PeerDelegation pointing at Bridge B, with
-//             SkillRoute sending "delegate" requests to Bridge B.
+//             ephemeral port. Serves the "kiro-code" skill via AlwaysKiroRoute.
+//             Bridge B is the "peer" from A's perspective.
 //
-// The test POSTs a `SendStreamingMessage` with skill="delegate" and text "reply PONG"
-// to Bridge A. The request flows:
-//   Client → Bridge A (inbound) → PeerDelegation → Bridge B (inbound) → KiroBackend
+//   Bridge A: InboundServer wired to:
+//             - ReplayBackend (local Kiro side; yields a "KIRO_ART" artifact)
+//             - PeerDelegation pointing at Bridge B (peer side; yields whatever Kiro returns)
+//             - FanoutSkillRoute: skill="fan-out" -> RouteTarget::Fanout
 //
-// Bridge B's SSE response streams back through Bridge A's delegation path and out as
-// Bridge A's own SSE response to the test client.
+// The test POSTs a `SendStreamingMessage` with skill="fan-out" and text "reply PONG"
+// to Bridge A. The request flows fan-out style:
 //
-// Asserts that Bridge A's SSE response contains an artifact-update frame with "PONG".
+//   Client
+//     -> Bridge A (InboundServer / Fanout)
+//          -> local ReplayBackend          => source=kiro artifact
+//          -> PeerDelegation -> Bridge B  => source=peer artifact (via Kiro)
+//     <- merged SSE (both artifacts + terminal Completed)
+//
+// Asserts:
+//   1. Bridge A's SSE contains a source=kiro ArtifactUpdate.
+//   2. Bridge A's SSE contains a source=peer ArtifactUpdate.
+//   3. The LAST SSE frame is a terminal statusUpdate(Completed).
+//   4. All data: payloads parse as a2a::StreamResponse (wire-conformance).
 //
 // Run command (requires `kiro-cli whoami` to succeed):
-//   cargo test -p a2a-bridge --test e2e_delegate_bridge -- --ignored --nocapture
+//   cargo test -p a2a-bridge --test e2e_fanout_bridge -- --ignored --nocapture
 
 use std::sync::Arc;
 
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
-use bridge_acp::{kiro::KiroBackend, supervisor::Supervised};
+use bridge_acp::{kiro::KiroBackend, replay::ReplayBackend, supervisor::Supervised};
 use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
@@ -43,23 +54,22 @@ impl RouteDecision for AlwaysKiroRoute {
     }
 }
 
-/// Routes skill="delegate" to the peer; everything else to local Kiro (used by Bridge A).
-struct E2eSkillRoute;
+/// Routes skill="fan-out" to Fanout (local + peer); everything else to local Kiro.
+/// Used by Bridge A.
+struct FanoutSkillRoute;
 
-impl RouteDecision for E2eSkillRoute {
+impl RouteDecision for FanoutSkillRoute {
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
-        if meta.skill.as_deref() == Some("delegate") {
-            Ok(RouteTarget::Delegate)
+        if meta.skill.as_deref() == Some("fan-out") {
+            Ok(RouteTarget::Fanout)
         } else {
             Ok(RouteTarget::Local(AgentId::parse("kiro")?))
         }
     }
 }
 
-// ---- helper: start an InboundServer on an ephemeral TCP port ----
+// ---- helper: serve a router on an ephemeral TCP port ----
 
-/// Bind an ephemeral TCP port, serve the given router in a background task, and return
-/// the base URL (`http://127.0.0.1:<port>`).
 async fn serve_on_ephemeral_port(router: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -74,11 +84,20 @@ async fn serve_on_ephemeral_port(router: axum::Router) -> String {
     base_url
 }
 
-// ---- the gated bridge-to-bridge e2e test ----
+// ---- NDJSON for Bridge A's local ReplayBackend ----
+
+/// Yields one `session/update` text "KIRO_ART" then a Done frame.
+fn kiro_ndjson() -> Vec<u8> {
+    let text_frame = r#"{"method":"session/update","params":{"text":"KIRO_ART"}}"#;
+    let done_frame = r#"{"result":{"stopReason":"end_turn"}}"#;
+    format!("{text_frame}\n{done_frame}\n").into_bytes()
+}
+
+// ---- the gated bridge-to-bridge fan-out e2e test ----
 
 #[ignore = "needs authenticated kiro-cli + two bridge instances"]
 #[tokio::test]
-async fn bridge_a_delegates_through_bridge_b_to_kiro() {
+async fn bridge_a_fanout_through_bridge_b_to_kiro() {
     // ----------------------------------------------------------------
     // Bridge B — real Kiro backend, no delegation (serves kiro-code).
     // ----------------------------------------------------------------
@@ -104,25 +123,24 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // ----------------------------------------------------------------
-    // Bridge A — PeerDelegation → Bridge B, SkillRoute.
+    // Bridge A — fan-out:
+    //   local side  = ReplayBackend (KIRO_ART)
+    //   peer side   = PeerDelegation -> Bridge B -> real Kiro
     // ----------------------------------------------------------------
 
+    let backend_a = Arc::new(ReplayBackend::from_ndjson(kiro_ndjson()));
+    let store_a = Arc::new(SqliteStore::open_in_memory().expect("sqlite in-memory (A)"));
     let delegation_a: Arc<dyn DelegationPort> = Arc::new(PeerDelegation::new(
         &url_b,
         "bearer:test-token",
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(120),
     ));
-    let store_a = Arc::new(SqliteStore::open_in_memory().expect("sqlite in-memory (A)"));
-
-    // Bridge A has no local backend (any request routed Local would be an error
-    // in a real deployment, but the route ensures delegate skill always goes to B).
-    let backend_a: Arc<dyn bridge_core::ports::AgentBackend> = Arc::new(BridgeABackend);
 
     let server_a = Arc::new(InboundServer::new(
         backend_a,
         store_a,
         Arc::new(AutoPolicy),
-        Arc::new(E2eSkillRoute),
+        Arc::new(FanoutSkillRoute),
         Arc::new(AlwaysGrant),
         "http://127.0.0.1:0", // placeholder
         delegation_a,
@@ -134,7 +152,7 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // ----------------------------------------------------------------
-    // POST SendStreamingMessage to Bridge A.
+    // POST SendStreamingMessage to Bridge A with skill="fan-out".
     // ----------------------------------------------------------------
 
     let body = json!({
@@ -143,14 +161,14 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
         "method": "SendStreamingMessage",
         "params": {
             "message": {
-                "text": "Reply with exactly the single word PONG and nothing else.",
-                "metadata": { "a2a-bridge.skill": "delegate" }
+                "text": "reply PONG",
+                "metadata": { "a2a-bridge.skill": "fan-out" }
             }
         }
     });
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(180))
         .build()
         .expect("reqwest client must build");
 
@@ -175,22 +193,13 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
         .expect("response body must be valid UTF-8");
 
     eprintln!(
-        "=== Bridge A SSE response body ===\n{body_text}\n=================================="
+        "=== Bridge A fan-out SSE response body ===\n{body_text}\n========================================="
     );
 
     // ----------------------------------------------------------------
-    // Assert S2: the artifact came through A → B → Kiro.
+    // Parse every data: payload as a2a::StreamResponse (wire-conformance).
     // ----------------------------------------------------------------
-    assert!(
-        body_text.contains("artifact-update"),
-        "SSE body must contain an 'artifact-update' frame; got:\n{body_text}"
-    );
-    assert!(
-        body_text.to_ascii_uppercase().contains("PONG"),
-        "SSE body must contain 'PONG' (case-insensitive) from Kiro via Bridge B; got:\n{body_text}"
-    );
 
-    // Wire-conformance: all data: payloads must parse as a2a::StreamResponse.
     let payloads: Vec<String> = body_text
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -199,49 +208,65 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
 
     assert!(
         !payloads.is_empty(),
-        "no data payloads in SSE body: {body_text}"
+        "no data: payloads in SSE body: {body_text}"
     );
 
-    for payload in &payloads {
-        let _: a2a::StreamResponse = serde_json::from_str(payload).unwrap_or_else(|e| {
-            panic!("data payload must parse as StreamResponse: {e}: {payload}")
-        });
-    }
+    let stream_responses: Vec<a2a::StreamResponse> = payloads
+        .iter()
+        .map(|p| {
+            serde_json::from_str(p)
+                .unwrap_or_else(|e| panic!("data payload must parse as StreamResponse: {e}: {p}"))
+        })
+        .collect();
 
-    // Final frame: terminal statusUpdate(Completed) synthesized after the stream ends.
+    // ----------------------------------------------------------------
+    // S3.1: both source=kiro and source=peer ArtifactUpdate frames present.
+    // ----------------------------------------------------------------
+
+    let has_kiro_artifact = stream_responses.iter().any(|sr| {
+        if let a2a::StreamResponse::ArtifactUpdate(e) = sr {
+            e.metadata
+                .as_ref()
+                .and_then(|m| m.get("a2a-bridge.source"))
+                .and_then(|v| v.as_str())
+                == Some("kiro")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_kiro_artifact,
+        "SSE stream must contain an ArtifactUpdate with metadata[a2a-bridge.source]==\"kiro\": {body_text}"
+    );
+
+    let has_peer_artifact = stream_responses.iter().any(|sr| {
+        if let a2a::StreamResponse::ArtifactUpdate(e) = sr {
+            e.metadata
+                .as_ref()
+                .and_then(|m| m.get("a2a-bridge.source"))
+                .and_then(|v| v.as_str())
+                == Some("peer")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_peer_artifact,
+        "SSE stream must contain an ArtifactUpdate with metadata[a2a-bridge.source]==\"peer\" (via Bridge B -> Kiro): {body_text}"
+    );
+
+    // ----------------------------------------------------------------
+    // S3.2: the LAST frame is a terminal statusUpdate(Completed).
+    // ----------------------------------------------------------------
+
     let last = payloads.last().unwrap();
-    let sr: a2a::StreamResponse = serde_json::from_str(last).unwrap();
+    let last_sr: a2a::StreamResponse = serde_json::from_str(last).unwrap();
     assert!(
         matches!(
-            &sr,
+            &last_sr,
             a2a::StreamResponse::StatusUpdate(e)
                 if e.status.state == a2a::TaskState::Completed
         ),
-        "final SSE frame must be terminal statusUpdate(Completed): {last}"
+        "the LAST SSE frame must be a terminal statusUpdate(Completed): {last}"
     );
-    // Penultimate frame must be the ArtifactUpdate.
-    let penultimate = &payloads[payloads.len() - 2];
-    let sr2: a2a::StreamResponse = serde_json::from_str(penultimate).unwrap();
-    assert!(
-        matches!(sr2, a2a::StreamResponse::ArtifactUpdate(_)),
-        "penultimate SSE frame must be ArtifactUpdate: {penultimate}"
-    );
-}
-
-// ---- stub local backend for Bridge A (never called on the delegate path) ----
-
-struct BridgeABackend;
-
-#[async_trait::async_trait]
-impl bridge_core::ports::AgentBackend for BridgeABackend {
-    async fn prompt(
-        &self,
-        _s: &bridge_core::ids::SessionId,
-        _p: Vec<bridge_core::domain::Part>,
-    ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
-        Err(BridgeError::UpstreamA2aError)
-    }
-    async fn cancel(&self, _s: &bridge_core::ids::SessionId) -> Result<(), BridgeError> {
-        Ok(())
-    }
 }

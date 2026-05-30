@@ -10,8 +10,10 @@
 // the correct `a2a::StreamResponse` variant; `event_to_sse` is a thin wrapper
 // that serialises the response and wraps it in an `axum::response::sse::Event`.
 
+use std::collections::HashMap;
+
 use axum::response::sse::Event as SseEvent;
-use bridge_core::translator::{Event, EventKind};
+use bridge_core::translator::{Event, EventKind, TaskOutcome};
 
 /// A2A SSE `event:` name for a coalesced text/status chunk.
 pub const EVENT_STATUS: &str = "status-update";
@@ -24,7 +26,23 @@ pub const EVENT_ARTIFACT: &str = "artifact-update";
 ///   chunk text in a `Working` task status with an agent message.
 /// * An `Artifact` event becomes a `StreamResponse::ArtifactUpdate` with
 ///   `last_chunk: Some(true)` so clients can detect the terminal flush.
+/// * A `Terminal` event becomes a `StreamResponse::StatusUpdate` carrying the
+///   terminal `TaskState` (Completed/Failed/Canceled) with no message.
+/// * If `ev.source()` is `Some(id)`, `metadata["a2a-bridge.source"]` is set on
+///   the emitted event; for artifacts, `artifact.name` is also set to `id`.
 pub fn event_to_streamresponse(ev: &Event, task_id: &str, context_id: &str) -> a2a::StreamResponse {
+    /// Build a `metadata` map from a source label, if present.
+    fn source_metadata(ev: &Event) -> Option<HashMap<String, serde_json::Value>> {
+        ev.source().map(|id| {
+            let mut m = HashMap::new();
+            m.insert(
+                "a2a-bridge.source".to_owned(),
+                serde_json::Value::String(id.to_owned()),
+            );
+            m
+        })
+    }
+
     match ev.kind() {
         EventKind::Status => {
             let message = a2a::Message {
@@ -45,24 +63,48 @@ pub fn event_to_streamresponse(ev: &Event, task_id: &str, context_id: &str) -> a
                     message: Some(message),
                     timestamp: None,
                 },
-                metadata: None,
+                metadata: source_metadata(ev),
             })
         }
-        EventKind::Artifact => a2a::StreamResponse::ArtifactUpdate(a2a::TaskArtifactUpdateEvent {
-            task_id: task_id.to_owned(),
-            context_id: context_id.to_owned(),
-            artifact: a2a::Artifact {
-                artifact_id: a2a::new_artifact_id(),
-                name: Some("output".into()),
-                description: None,
-                parts: vec![a2a::Part::text(ev.text())],
-                metadata: None,
-                extensions: None,
-            },
-            append: None,
-            last_chunk: Some(true),
-            metadata: None,
-        }),
+        EventKind::Artifact => {
+            // Use source as the artifact name when present; otherwise fall back to "output".
+            let name = ev
+                .source()
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| "output".to_owned());
+            a2a::StreamResponse::ArtifactUpdate(a2a::TaskArtifactUpdateEvent {
+                task_id: task_id.to_owned(),
+                context_id: context_id.to_owned(),
+                artifact: a2a::Artifact {
+                    artifact_id: a2a::new_artifact_id(),
+                    name: Some(name),
+                    description: None,
+                    parts: vec![a2a::Part::text(ev.text())],
+                    metadata: None,
+                    extensions: None,
+                },
+                append: None,
+                last_chunk: Some(true),
+                metadata: source_metadata(ev),
+            })
+        }
+        EventKind::Terminal => {
+            let state = match ev.outcome() {
+                Some(TaskOutcome::Completed) | None => a2a::TaskState::Completed,
+                Some(TaskOutcome::Failed) => a2a::TaskState::Failed,
+                Some(TaskOutcome::Canceled) => a2a::TaskState::Canceled,
+            };
+            a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+                task_id: task_id.to_owned(),
+                context_id: context_id.to_owned(),
+                status: a2a::TaskStatus {
+                    state,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: source_metadata(ev),
+            })
+        }
     }
 }
 
@@ -73,6 +115,8 @@ pub fn event_to_sse(ev: &Event, task_id: &str, context_id: &str) -> SseEvent {
     let event_name = match ev.kind() {
         EventKind::Status => EVENT_STATUS,
         EventKind::Artifact => EVENT_ARTIFACT,
+        // Terminal events are mapped in Task 2; use status-update as a placeholder.
+        EventKind::Terminal => EVENT_STATUS,
     };
     let data = serde_json::to_string(&sr).expect("a2a::StreamResponse always serializes");
     SseEvent::default().event(event_name).data(data)
@@ -229,6 +273,12 @@ mod tests {
         async fn cancel_requested(&self, _t: &TaskId) -> Result<bool, BridgeError> {
             Ok(false)
         }
+        async fn set_fanout(&self, _t: &TaskId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn is_fanout(&self, _t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(false)
+        }
     }
 
     struct AutoApprove;
@@ -273,6 +323,55 @@ mod tests {
         assert_eq!(first.kind(), &EventKind::Status);
         let sr_first = event_to_streamresponse(first, t.as_str(), t.as_str());
         assert!(matches!(sr_first, a2a::StreamResponse::StatusUpdate(_)));
+    }
+
+    // ---- Task 2: Terminal mapping + source-labeled frames ----
+
+    #[test]
+    fn terminal_event_maps_to_status_update_with_terminal_state() {
+        use bridge_core::translator::{Event, TaskOutcome};
+        let done = event_to_streamresponse(&Event::terminal(TaskOutcome::Completed), "t", "c");
+        let a2a::StreamResponse::StatusUpdate(e) = done else {
+            panic!("expected StatusUpdate for Completed")
+        };
+        assert_eq!(e.status.state, a2a::TaskState::Completed);
+        let f = event_to_streamresponse(&Event::terminal(TaskOutcome::Failed), "t", "c");
+        assert!(
+            matches!(f, a2a::StreamResponse::StatusUpdate(e) if e.status.state == a2a::TaskState::Failed)
+        );
+        let c = event_to_streamresponse(&Event::terminal(TaskOutcome::Canceled), "t", "c");
+        assert!(
+            matches!(c, a2a::StreamResponse::StatusUpdate(e) if e.status.state == a2a::TaskState::Canceled)
+        );
+    }
+
+    #[test]
+    fn status_event_with_source_sets_metadata() {
+        use bridge_core::translator::Event;
+        let a2a::StreamResponse::StatusUpdate(e) =
+            event_to_streamresponse(&Event::status("x").with_source("peer"), "t", "c")
+        else {
+            panic!("expected StatusUpdate")
+        };
+        assert_eq!(
+            e.metadata.unwrap().get("a2a-bridge.source").unwrap(),
+            "peer"
+        );
+    }
+
+    #[test]
+    fn artifact_event_with_source_sets_name_and_metadata() {
+        use bridge_core::translator::Event;
+        let a2a::StreamResponse::ArtifactUpdate(e) =
+            event_to_streamresponse(&Event::artifact("R").with_source("kiro"), "t", "c")
+        else {
+            panic!("expected ArtifactUpdate")
+        };
+        assert_eq!(e.artifact.name.as_deref(), Some("kiro"));
+        assert_eq!(
+            e.metadata.unwrap().get("a2a-bridge.source").unwrap(),
+            "kiro"
+        );
     }
 
     #[tokio::test]

@@ -122,18 +122,36 @@ Without a `[delegation]` section the bridge runs local-only (delegation is a no-
 bridge-to-bridge e2e (one bridge's `delegate` skill → another bridge's `kiro-code`) is
 `#[ignore]`d: `cargo test -p a2a-bridge --test e2e_delegate_bridge -- --ignored`.
 
+### Fan-out / second opinion (Increment 2.6)
+
+Send a `SendStreamingMessage` with `metadata["a2a-bridge.skill"]="fan-out"` to run the **same
+prompt on both Kiro and the configured peer concurrently**, merged into one SSE. Every frame
+is source-labeled (`metadata["a2a-bridge.source"]="kiro"|"peer"`, and `artifact.name` on
+artifacts); both run to completion (two labeled artifacts) and the task ends with one terminal
+`StatusUpdate`. **Degrade-to-survivor:** if one source fails, its labeled error frame plus the
+survivor's result still come back and the task completes (`Completed`); only if both fail does
+it `Fail`. Cancel/disconnect cancels both sources. Requires a `[delegation]` peer. Gated e2e:
+`cargo test -p a2a-bridge --test e2e_fanout_bridge -- --ignored`.
+
+### A2A terminal model
+
+A streamed task ends with a terminal `StatusUpdate` (`Completed`/`Failed`/`Canceled`) — not an
+artifact's `lastChunk` (which marks only that artifact's completion). This holds for single-
+source and fan-out alike, so a task can carry multiple artifacts before its terminal status.
+
 ## What the bridge does / doesn't do
 
-**In:** inbound A2A (Kiro) with **A2A-conformant `StreamResponse` SSE**; **outbound
-delegation to one configured peer** (passthrough); streaming with coalescing; cancellation
-(prompt-result semantics; peer cancel on inbound `CancelTask` and caller disconnect);
+**In:** inbound A2A (Kiro) with **A2A-conformant `StreamResponse` SSE** + a terminal-status task
+model; **outbound delegation** (passthrough) and **fan-out / second opinion** (Kiro + peer
+merged, source-labeled, degrade-to-survivor); streaming with coalescing; cancellation
+(prompt-result semantics; both-source cancel on inbound `CancelTask` and caller disconnect);
 permission/auth suspend→resume; **real message content threaded to Kiro and the peer**;
 process-group reaping; structured tracing.
 
-**Deferred:** **fan-out + concurrent stream-merge** (Kiro *and* peer merged — Increment 2.6);
-multi-agent adapters (Claude Code/Codex/Gemini, Increment 3); real permission policy;
-`session/load` resume; MCP-over-ACP; JWT/mTLS enforcement; container isolation; multiple
-peers / discovery / mesh.
+**Deferred:** multi-agent adapters (Claude Code/Codex/Gemini, Increment 3 — which generalizes
+the N-ary fan-out coordinator to >2 sources); real permission policy; `session/load` resume;
+MCP-over-ACP; JWT/mTLS enforcement; container isolation; multiple peers / discovery / mesh;
+result reconciliation/voting.
 
 ### Known limitations (called out honestly; see ADR-0003 + reviews)
 

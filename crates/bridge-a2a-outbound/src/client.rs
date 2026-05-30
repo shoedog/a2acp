@@ -123,17 +123,16 @@ impl A2aClient {
     /// a `Stream<Result<Event, BridgeError>>` plus a watch receiver for the
     /// peer task id captured from the first response event.
     ///
-    /// Mapping rules (Codex 2/3/6/7):
+    /// Mapping rules (spec §3.1.4, Increment 2.6 Task 3):
     /// - Invalid JSON → `Err(UpstreamA2aError)`, end.
     /// - JSON with no known key (`statusUpdate`/`artifactUpdate`/`task`/`message`) → skip.
     /// - `StatusUpdate` terminal-Completed → end cleanly (no item).
     /// - `StatusUpdate` terminal-Failed/Canceled/Rejected → `Err`, end.
     /// - `StatusUpdate` non-terminal → `Event::status(message text or "")`.
-    /// - `ArtifactUpdate` lastChunk=true → `Event::artifact(text)`, end.
-    /// - `ArtifactUpdate` else → `Event::status(text)`.
+    /// - `ArtifactUpdate` (any chunk) → `Event::artifact(text)`, continue (do NOT end on lastChunk).
     /// - `Task` → capture id if present, no event.
     /// - `Message` → `Event::status(text)`.
-    /// - Clean EOF before any terminal signal → `Err(UpstreamA2aError)`.
+    /// - Clean EOF before any terminal `StatusUpdate` → `Err(UpstreamA2aError)`.
     pub async fn open_stream(
         &self,
         parts: &[Part],
@@ -177,7 +176,6 @@ impl A2aClient {
                                 MapResult::Skip => {}
                                 MapResult::Event(ev) => { yield Ok(ev); }
                                 MapResult::Terminal => { done = true; }
-                                MapResult::TerminalEvent(ev) => { yield Ok(ev); done = true; }
                                 MapResult::Error(e) => { yield Err(e); done = true; }
                             }
                         }
@@ -219,10 +217,6 @@ impl A2aClient {
                                     yield Ok(ev);
                                 }
                                 MapResult::Terminal => {
-                                    break 'outer;
-                                }
-                                MapResult::TerminalEvent(ev) => {
-                                    yield Ok(ev);
                                     break 'outer;
                                 }
                                 MapResult::Error(e) => {
@@ -270,11 +264,8 @@ enum MapResult {
     Skip,
     /// Yield this event and continue streaming.
     Event(Event),
-    /// Terminal reached cleanly (Completed / lastChunk=true already emitted):
-    /// end the stream without an error item.
+    /// Terminal `StatusUpdate(Completed)` reached: end the stream without an error item.
     Terminal,
-    /// Yield this event, then end cleanly (ArtifactUpdate lastChunk=true).
-    TerminalEvent(Event),
     /// Yield this error and end the stream.
     Error(BridgeError),
 }
@@ -338,13 +329,9 @@ fn parse_and_map(json_str: &str, tx: &watch::Sender<Option<PeerTaskId>>) -> MapR
                 .filter_map(|p| p.as_text())
                 .collect();
 
-            if e.last_chunk == Some(true) {
-                // Final chunk → Artifact event, end stream cleanly.
-                MapResult::TerminalEvent(Event::artifact(text))
-            } else {
-                // Intermediate chunk → Status event, continue.
-                MapResult::Event(Event::status(text))
-            }
+            // Every artifact chunk → Artifact event; continue streaming.
+            // The stream ends only on a terminal StatusUpdate, not on lastChunk.
+            MapResult::Event(Event::artifact(text))
         }
 
         a2a::StreamResponse::Task(t) => {
@@ -464,7 +451,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_artifact_only_on_lastchunk() {
+    async fn artifacts_emitted_and_stream_ends_on_terminal_status() {
+        // New model: every artifactUpdate → Event::artifact (regardless of lastChunk).
+        // Stream ends cleanly on the terminal statusUpdate(Completed) with no error item.
         let (url, _p) = testpeer::MockPeer::start(
             testpeer::script_status_then_intermediate_then_final("RESULT"),
         )
@@ -480,10 +469,12 @@ mod tests {
             kinds.push(e.kind().clone());
             last_text = e.text().to_string();
         }
+        // The Working statusUpdate produces at least one Status event.
         assert!(
             kinds.iter().filter(|k| **k == EventKind::Status).count() >= 1,
             "expected at least one Status event, got: {kinds:?}"
         );
+        // Both artifact chunks are emitted as Artifact events; the last one contains RESULT.
         assert_eq!(
             kinds.last(),
             Some(&EventKind::Artifact),
@@ -491,7 +482,7 @@ mod tests {
         );
         assert!(
             last_text.contains("RESULT"),
-            "artifact text must contain RESULT, got: {last_text:?}"
+            "last artifact text must contain RESULT, got: {last_text:?}"
         );
         assert!(peer_rx.borrow().is_some(), "peer task id must be captured");
     }
@@ -565,5 +556,64 @@ mod tests {
                 .is_err(),
             "HTTP 500 must return Err from open_stream"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 3 (new-model) tests: multi-artifact accumulation, terminal StatusUpdate
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn accumulates_multiple_artifacts_and_ends_on_terminal_status() {
+        let (url, _p) =
+            testpeer::MockPeer::start(testpeer::script_two_artifacts_then_completed("A", "B"))
+                .await;
+        let (mut ev, _rx) = A2aClient::new(&url, "bearer:T", dur())
+            .open_stream(&[part("x")])
+            .await
+            .unwrap();
+        let mut arts = vec![];
+        while let Some(it) = ev.next().await {
+            let e = it.unwrap();
+            if e.kind() == &EventKind::Artifact {
+                arts.push(e.text().to_string());
+            }
+        }
+        assert_eq!(arts, vec!["A", "B"]); // BOTH artifacts; stream ended on the terminal Completed status
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_status_is_error() {
+        let (url, _p) =
+            testpeer::MockPeer::start(testpeer::script_artifact_then_failed_status()).await;
+        let (mut ev, _rx) = A2aClient::new(&url, "bearer:T", dur())
+            .open_stream(&[part("x")])
+            .await
+            .unwrap();
+        let mut items = vec![];
+        while let Some(it) = ev.next().await {
+            items.push(it);
+        }
+        assert!(matches!(
+            items.last(),
+            Some(Err(BridgeError::UpstreamA2aError))
+        ));
+    }
+
+    #[tokio::test]
+    async fn artifact_then_clean_eof_without_terminal_is_error() {
+        let (url, _p) =
+            testpeer::MockPeer::start(testpeer::script_artifact_then_close_no_terminal("A")).await;
+        let (mut ev, _rx) = A2aClient::new(&url, "bearer:T", dur())
+            .open_stream(&[part("x")])
+            .await
+            .unwrap();
+        let mut items = vec![];
+        while let Some(it) = ev.next().await {
+            items.push(it);
+        }
+        assert!(matches!(
+            items.last(),
+            Some(Err(BridgeError::UpstreamA2aError))
+        ));
     }
 }

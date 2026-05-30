@@ -25,12 +25,22 @@ use crate::ports::{AgentBackend, PolicyEngine, SessionStore, Update};
 pub enum EventKind {
     Status,
     Artifact,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOutcome {
+    Completed,
+    Failed,
+    Canceled,
 }
 
 #[derive(Debug, Clone)]
 pub struct Event {
     kind: EventKind,
     text: String,
+    source: Option<String>,
+    outcome: Option<TaskOutcome>,
 }
 
 impl Event {
@@ -43,10 +53,22 @@ impl Event {
     pub fn text_len(&self) -> usize {
         self.text.chars().count()
     }
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+    pub fn with_source(mut self, s: impl Into<String>) -> Self {
+        self.source = Some(s.into());
+        self
+    }
+    pub fn outcome(&self) -> Option<TaskOutcome> {
+        self.outcome
+    }
     pub fn status(t: impl Into<String>) -> Self {
         Self {
             kind: EventKind::Status,
             text: t.into(),
+            source: None,
+            outcome: None,
         }
     }
     pub fn artifact(t: impl Into<String>) -> Self {
@@ -54,6 +76,16 @@ impl Event {
         Self {
             kind: EventKind::Artifact,
             text,
+            source: None,
+            outcome: None,
+        }
+    }
+    pub fn terminal(o: TaskOutcome) -> Self {
+        Self {
+            kind: EventKind::Terminal,
+            text: String::new(),
+            source: None,
+            outcome: Some(o),
         }
     }
 }
@@ -95,14 +127,14 @@ impl Translator {
                         while acc.chars().count() >= max_chunk {
                             let chunk: String = acc.chars().take(max_chunk).collect();
                             acc = acc.chars().skip(max_chunk).collect();
-                            yield Event { kind: EventKind::Status, text: chunk };
+                            yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
                         }
                     }
                     Ok(Update::Permission(req)) => {
                         // Flush pending text before handling the permission boundary.
                         if !acc.is_empty() {
                             let chunk = std::mem::take(&mut acc);
-                            yield Event { kind: EventKind::Status, text: chunk };
+                            yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
                         }
                         let ctx = SessionContext;
                         match policy.decide(&req, &ctx) {
@@ -126,7 +158,7 @@ impl Translator {
                         // Flush any pending coalesced text first.
                         if !acc.is_empty() {
                             let chunk = std::mem::take(&mut acc);
-                            yield Event { kind: EventKind::Status, text: chunk };
+                            yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
                         }
                         // Final artifact carries the accumulated/last text or stop_reason.
                         let payload = if !last_text.is_empty() {
@@ -134,14 +166,14 @@ impl Translator {
                         } else {
                             stop_reason
                         };
-                        yield Event { kind: EventKind::Artifact, text: payload };
+                        yield Event { kind: EventKind::Artifact, text: payload, source: None, outcome: None };
                         return;
                     }
                     Err(e) => {
                         // Flush pending text as a Status event, then fail (no restart).
                         if !acc.is_empty() {
                             let chunk = std::mem::take(&mut acc);
-                            yield Event { kind: EventKind::Status, text: chunk };
+                            yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
                         }
                         Err(e)?;
                     }
@@ -149,7 +181,7 @@ impl Translator {
             }
             // Stream ended without a terminal Done: flush any remaining text.
             if !acc.is_empty() {
-                yield Event { kind: EventKind::Status, text: acc };
+                yield Event { kind: EventKind::Status, text: acc, source: None, outcome: None };
             }
         })
     }
@@ -265,6 +297,12 @@ mod tests {
         }
         async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
             Ok(self.cancels.lock().unwrap().contains(t.as_str()))
+        }
+        async fn set_fanout(&self, _t: &TaskId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn is_fanout(&self, _t: &TaskId) -> Result<bool, BridgeError> {
+            Ok(false)
         }
     }
 
@@ -452,5 +490,118 @@ mod tests {
         let s = SessionId::parse("s").unwrap();
         st.put(&t, &s).await.unwrap();
         assert!(st.session_for(&t).await.unwrap().is_none());
+    }
+
+    /// Cover FakeStore::set_peer_task / peer_task_for / request_cancel / cancel_requested
+    /// stubs that are exercised by delegation-path tests but not by translator unit tests.
+    #[tokio::test]
+    async fn fake_store_peer_task_and_cancel_stubs_covered() {
+        use crate::domain::PeerTaskId;
+        let st = FakeStore::default();
+        let t = TaskId::parse("t").unwrap();
+        let peer = PeerTaskId("peer-1".into());
+        // peer_task_for before setting returns None.
+        assert!(st.peer_task_for(&t).await.unwrap().is_none());
+        // set then retrieve.
+        st.set_peer_task(&t, &peer).await.unwrap();
+        assert_eq!(st.peer_task_for(&t).await.unwrap().unwrap().0, "peer-1");
+        // cancel_requested before request returns false.
+        assert!(!st.cancel_requested(&t).await.unwrap());
+        // request_cancel then check.
+        st.request_cancel(&t).await.unwrap();
+        assert!(st.cancel_requested(&t).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod v26ev {
+    use super::*;
+    #[test]
+    fn event_source_default_none_and_with_source() {
+        assert_eq!(Event::status("x").source(), None);
+        assert_eq!(
+            Event::status("x").with_source("kiro").source(),
+            Some("kiro")
+        );
+    }
+    #[test]
+    fn terminal_event_carries_outcome() {
+        let e = Event::terminal(TaskOutcome::Completed);
+        assert_eq!(e.kind(), &EventKind::Terminal);
+        assert_eq!(e.outcome(), Some(TaskOutcome::Completed));
+    }
+    #[test]
+    fn outcome_variants() {
+        for o in [
+            TaskOutcome::Completed,
+            TaskOutcome::Failed,
+            TaskOutcome::Canceled,
+        ] {
+            assert_eq!(Event::terminal(o).outcome(), Some(o));
+        }
+    }
+    #[test]
+    fn event_clone_and_debug_derive_paths() {
+        // Exercise Clone + Debug derives on Event, EventKind, TaskOutcome.
+        let s = Event::status("hello");
+        let s2 = s.clone();
+        assert_eq!(s2.text(), "hello");
+        assert_eq!(s2.source(), None);
+        assert_eq!(s2.outcome(), None);
+        let a = Event::artifact("bye");
+        let a2 = a.clone();
+        assert_eq!(a2.kind(), &EventKind::Artifact);
+        let t = Event::terminal(TaskOutcome::Failed);
+        let t2 = t.clone();
+        assert_eq!(t2.kind(), &EventKind::Terminal);
+        assert_eq!(t2.outcome(), Some(TaskOutcome::Failed));
+        // Debug should not panic.
+        let _ = format!("{:?}", s2);
+        let _ = format!("{:?}", a2);
+        let _ = format!("{:?}", t2);
+        let _ = format!("{:?}", EventKind::Terminal);
+        let _ = format!("{:?}", EventKind::Status);
+        let _ = format!("{:?}", EventKind::Artifact);
+        let _ = format!("{:?}", TaskOutcome::Completed);
+        let _ = format!("{:?}", TaskOutcome::Failed);
+        let _ = format!("{:?}", TaskOutcome::Canceled);
+    }
+    #[test]
+    fn event_kind_terminal_eq() {
+        assert_eq!(EventKind::Terminal, EventKind::Terminal);
+        assert_ne!(EventKind::Terminal, EventKind::Status);
+        assert_ne!(EventKind::Terminal, EventKind::Artifact);
+    }
+    #[test]
+    fn status_and_artifact_ctors_have_no_source_or_outcome() {
+        // Explicitly verify the new fields on the existing constructors.
+        let s = Event::status(String::from("owned"));
+        assert_eq!(s.kind(), &EventKind::Status);
+        assert_eq!(s.text(), "owned");
+        assert_eq!(s.source(), None);
+        assert_eq!(s.outcome(), None);
+        let a = Event::artifact(String::from("result"));
+        assert_eq!(a.kind(), &EventKind::Artifact);
+        assert_eq!(a.text(), "result");
+        assert_eq!(a.source(), None);
+        assert_eq!(a.outcome(), None);
+    }
+    #[test]
+    fn event_drop_with_some_source_exercises_drop_glue() {
+        // Create and drop Events with Some(source) to exercise the Drop impl for Option<String>.
+        {
+            let e = Event::status("text").with_source(String::from("agent-1"));
+            assert_eq!(e.source(), Some("agent-1"));
+            // e is dropped here, exercising Drop for Option<String>
+        }
+        {
+            let e = Event::artifact("result").with_source(String::from("agent-2"));
+            assert_eq!(e.source(), Some("agent-2"));
+        }
+        {
+            let e = Event::terminal(TaskOutcome::Canceled).with_source(String::from("agent-3"));
+            assert_eq!(e.source(), Some("agent-3"));
+            assert_eq!(e.outcome(), Some(TaskOutcome::Canceled));
+        }
     }
 }

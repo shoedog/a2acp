@@ -112,10 +112,24 @@ async fn mock_peer_handler(
             metadata: None,
         });
 
+        // Terminal statusUpdate(Completed) required by the new parser model (Increment 2.6 Task 3):
+        // the outbound client ends the stream only on a terminal StatusUpdate, not on lastChunk.
+        let completed_event = a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+            task_id: task_id.clone(),
+            context_id: context_id.clone(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+
         let sse_body = format!(
-            "data: {}\n\ndata: {}\n\n",
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
             serde_json::to_string(&status_event).expect("status serializes"),
             serde_json::to_string(&artifact_event).expect("artifact serializes"),
+            serde_json::to_string(&completed_event).expect("completed serializes"),
         );
 
         Response::builder()
@@ -285,12 +299,26 @@ async fn delegate_skill_round_trips_through_peer() {
     let payloads = sse_data_payloads(&body);
     assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
 
+    // Final frame: terminal statusUpdate(Completed) synthesized after the delegate stream ends.
     let last = payloads.last().unwrap();
     let sr: a2a::StreamResponse = serde_json::from_str(last)
         .unwrap_or_else(|e| panic!("final data payload must parse as StreamResponse: {e}: {last}"));
     assert!(
-        matches!(sr, a2a::StreamResponse::ArtifactUpdate(_)),
-        "final SSE frame must be ArtifactUpdate: {last}"
+        matches!(
+            &sr,
+            a2a::StreamResponse::StatusUpdate(e)
+                if e.status.state == a2a::TaskState::Completed
+        ),
+        "final SSE frame must be terminal statusUpdate(Completed): {last}"
+    );
+    // Penultimate frame must be the ArtifactUpdate from the peer.
+    let penultimate = &payloads[payloads.len() - 2];
+    let sr2: a2a::StreamResponse = serde_json::from_str(penultimate).unwrap_or_else(|e| {
+        panic!("penultimate data payload must parse as StreamResponse: {e}: {penultimate}")
+    });
+    assert!(
+        matches!(sr2, a2a::StreamResponse::ArtifactUpdate(_)),
+        "penultimate SSE frame must be ArtifactUpdate: {penultimate}"
     );
 
     // 5. S2a: assert the mock peer received a request body containing "PING".
