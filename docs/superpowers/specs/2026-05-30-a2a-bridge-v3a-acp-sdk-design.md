@@ -31,7 +31,7 @@ This is, deliberately, a **foundational conformance + SDK increment**, larger th
 | Permission | `request_permission` reverse-request handled as request/response; in 3a `PolicyEngine` is auto-approve → reply `selected:<allow option>`. The suspend→`input-required` path is deferred to 3e. |
 | Model | `session/set_model` best-effort: called only if a `model` is configured; an error (builtin OpenAI rejects it) is logged and the agent's default model is used — not a backend failure. |
 | Mode | `session/set_mode` (`read-only`/`auto`/`full-access`) called if `mode` configured; a bad mode id is a hard config error. Mode = agent posture, distinct from `PolicyEngine` (request resolution). |
-| Session id | `AcpBackend` owns a **bridge-`SessionId` ↔ agent-`sessionId` map** `[Cl-major]`. The AGENT mints its `sessionId` via `session/new`; the bridge no longer passes its synthesized id as the ACP session id (the v1 live path did, and never called `session/new` — another latent non-conformance). `session/new` is called **lazily on first `prompt` for a given bridge `SessionId`**; `prompt`/`cancel` translate through the map to the agent id; one ACP session per bridge `SessionId`. |
+| Session id | `AcpBackend` owns a **bridge-`SessionId` ↔ agent-`sessionId` map** `[Cl-major]`. The AGENT mints its `sessionId` via `session/new`; the bridge no longer passes its synthesized id as the ACP session id (the v1 live path did, and never called `session/new` — another latent non-conformance). `session/new` is called **lazily on first `prompt` for a given bridge `SessionId`**, **serialized to exactly-once per `SessionId`** (a per-`SessionId` async once-cell/mutex — concurrent first prompts must NOT mint two ACP sessions) `[Cx-pass2-major]`. `prompt`/`cancel` translate through the map; one ACP session per bridge `SessionId`. A **`cancel` that races session creation is LATCHED** (not a silent no-op) and applied once the agent session id is known (mirrors the 2.5 peer-cancel latch) — never lose a cancel. |
 | Conformance verification | Conformance is **CI-verifiable via wire-level golden assertions** (the actual JSON bytes our client emits match §11A) + a **captured real-agent frame corpus** replayed through our parser — NOT just the in-process fake agent (which shares the SDK and would not catch a non-conformance) `[Cl-major]`. |
 | Source label | The fan-out/local source label comes from **`cfg.agent.name`** (config), NOT a hardcoded `"kiro"` literal — it is wire-observable (`metadata["a2a-bridge.source"]` + artifact name) and must reflect the real agent `[Cl-major]`. |
 | Conductor | Not in 3a (single client). With the SDK adopted, the conductor fork/no-fork re-eval moves to 3b (registry), where composing multiple agents is the actual question. |
@@ -114,9 +114,12 @@ AcpBackend (bridge-acp/src/acp_backend.rs)
 - **session/new (lazy, agent mints the id):** on the FIRST `prompt` for a given bridge
   `SessionId`, send `{cwd:<absolute>, mcpServers:[]}`; the agent returns its `sessionId`, which
   `AcpBackend` stores in a `bridge SessionId → agent sessionId` map (+ reported `modes`/`models`).
-  Subsequent `prompt`/`cancel` for that bridge `SessionId` reuse the mapped agent id. `cancel`
-  translates through the map (no-op if no agent session was created). The bridge's synthesized
-  `SessionId` is NEVER sent as the ACP session id `[Cl-major]`.
+  Subsequent `prompt`/`cancel` for that bridge `SessionId` reuse the mapped agent id. Session
+  creation is **serialized per `SessionId`** (async once-cell/mutex) so concurrent first prompts
+  mint exactly one ACP session `[Cx-pass2]`. A `cancel` arriving **before** the agent session
+  exists is **latched** and applied when `session/new` completes (never dropped); a `cancel` after
+  the session ended is a no-op. The bridge's synthesized `SessionId` is NEVER sent as the ACP
+  session id `[Cl-major]`.
 - **set_mode/set_model:** if configured (§4 Section-4 rules).
 - **session/prompt:** `{sessionId, prompt:[{type:"text",text:<part text>}...]}`.
 - **streaming:** `session/update` notifications; `agent_message_chunk.content` (a ContentBlock)
