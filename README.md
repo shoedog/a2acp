@@ -123,7 +123,8 @@ proven uncompilable by `trybuild` compile-fail tests.
 
 Wire conformance is verified by `tests/golden_frames.rs` (hand-authored expected
 JSON for every outbound ACP frame) and `tests/corpus_replay.rs` (real captured
-frames from `kiro-cli 2.5.0` fed through the live mapping functions).
+frames from `kiro-cli 2.5.0` and `codex-acp 0.15.0` fed through the live mapping
+functions).
 
 ### Gated real-agent e2e tests (ACP conformant client)
 
@@ -142,19 +143,22 @@ lifecycle (`initialize` → `session/new` → `session/prompt`), asserts the str
 text contains `PONG` and the turn ends with `end_turn`. This was run against
 kiro-cli 2.5.0 and passed — the kiro DoD gate is MET.
 
-**codex-acp** (gate UNMET — compile-only; `codex-acp` absent from authoring env):
+**codex-acp** (gate MET — run and passing against zed-industries/codex-acp 0.15.0):
 
 ```bash
 cargo test -p a2a-bridge --test e2e_acp_codex -- --ignored --nocapture
 # Prereqs: codex-acp on PATH and authenticated; codex-acp is distinct from codex-cli
 ```
 
-`codex-acp` is not installable in the environment where Increment 3a was authored
-(only `codex` 0.130.0, which has no `acp` subcommand). The codex wire frames in
-`tests/corpus/codex-acp.jsonl` are provisional (derived from spec, not captured). The
-`real_capture_corpus_present` test is `#[ignore]`'d and FAILS naming codex when
-run — the open gate is intentionally visible. Run this test when `codex-acp` is
-available to complete the codex DoD gate.
+This test spawns a real zed-industries/codex-acp 0.15.0 process, drives the full
+conformant lifecycle (`initialize` → `authenticate` → `session/new` →
+`session/set_mode` → `session/prompt`), and yielded streamed `PONG` (across two
+`agent_message_chunk` frames) and `end_turn` — the codex DoD gate is MET. The real
+captured round-trip lives in `tests/corpus/codex-acp.jsonl` (`_provenance:REAL-CAPTURE`)
+and replays through the live mapping functions; the `real_capture_corpus_present` test
+now passes (un-ignored) since both kiro-cli and codex-acp have real captures. codex-acp
+emits a few unmodeled `session/update` variants (`available_commands_update`,
+`config_option_update`, `usage_update`) which the tolerant reader drops.
 
 ### Original gated smoke (pre-3a, v1 inbound pipeline)
 
@@ -208,16 +212,13 @@ message content threaded to the agent and the peer**; process-group reaping; str
 tracing.
 
 **Deferred:** multi-agent adapters beyond kiro/codex-acp (Claude Code/Gemini, Increment 3b+
-— which generalizes the N-ary fan-out coordinator to >2 sources); codex-acp DoD gate
-completion (pending install); real permission policy; `session/load` resume; MCP-over-ACP;
+— which generalizes the N-ary fan-out coordinator to >2 sources); real permission policy;
+`session/load` resume; MCP-over-ACP;
 fs/terminal client capabilities; JWT/mTLS enforcement; container isolation; multiple peers /
 discovery / mesh; result reconciliation/voting.
 
 ### Known limitations (called out honestly; see ADR-0003, ADR-0004 + reviews)
 
-- **codex-acp DoD gate UNMET.** The codex-acp real-capture corpus and live e2e
-  are not yet run (codex-acp not installed in the authoring env). The kiro gate IS
-  met. See ADR-0004 and the `real_capture_corpus_present` ignored test.
 - **The `Task`/`Session` typestate is a compile-time spec artifact, not yet load-bearing.**
   It is `trybuild`-verified but the runtime pipeline does not yet route through
   `Session<Ready>::send_prompt`. The seam is preserved for later wiring.

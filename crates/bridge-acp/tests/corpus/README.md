@@ -16,21 +16,28 @@ is a real conformance proof — not the v1 circular one.
 | agent      | real capture? | provenance                  |
 |------------|---------------|-----------------------------|
 | kiro-cli   | **YES — MET** | `REAL-CAPTURE` (v2.5.0)     |
-| codex-acp  | **NO — UNMET**| `provisional-from-spec-§11A`|
+| codex-acp  | **YES — MET** | `REAL-CAPTURE` (v0.15.0)    |
 
 - **kiro-cli — GATE MET.** `kiro-cli.jsonl` is a real round-trip captured from
   `kiro-cli acp` 2.5.0 in this environment (initialize → session/new → session/prompt →
   real `agent_message_chunk` → real `stopReason:end_turn` result). The inbound frames
   replay correctly through `AcpBackend`.
 
-- **codex-acp — GATE UNMET.** `codex-acp.jsonl` is HAND-AUTHORED provisional scaffolding.
-  `codex-acp` is NOT installed here: `codex-cli 0.130.0` is present but exposes no `acp`
-  subcommand and no `codex-acp` binary. To CLOSE the codex gate, capture REAL frames from
-  `codex-acp` (T9 gated e2e or a manual run) and replace `codex-acp.jsonl`, flipping its
-  `_provenance` to `REAL-CAPTURE`.
+- **codex-acp — GATE MET.** `codex-acp.jsonl` is a real round-trip captured from
+  zed-industries/codex-acp 0.15.0 (initialize → authenticate(chatgpt) → session/new →
+  set_mode(read-only) → session/prompt → 2× real `agent_message_chunk` → real
+  `stopReason:end_turn` result). The agent streamed `PONG` across two chunks (`"P"` +
+  `"ONG"`) and emitted several unmodeled `session/update` variants
+  (`available_commands_update`, `config_option_update`, `usage_update`); the inbound
+  frames replay correctly through `AcpBackend`, the chunks join to `PONG`, and the
+  unmodeled updates are DROPPED. The live `e2e_acp_codex` round-trip also passed against
+  this agent (PONG / end_turn). Note: `usage_update` is NOT a variant of the SDK 0.12.1
+  `SessionNotification` type, so it fails SDK deserialization — and is dropped exactly as
+  the live SDK dispatch drops it (parse-error → `send_error_notification`, connection
+  continues), which the replay path mirrors.
 
 The `real_capture_corpus_present` test in `tests/corpus_replay.rs` scans every file for a
-`REAL-CAPTURE` provenance header. It is `#[ignore]`d precisely BECAUSE it does not yet pass
-for all agents (codex is unmet) — running it (`cargo test -- --ignored
-real_capture_corpus_present`) prints exactly which agents still need a real capture, so CI
-can never imply the gate is met when it isn't.
+`REAL-CAPTURE` provenance header. Both agents now have real captures, so it is a normal
+(non-ignored) test that PASSES. If any corpus is ever regressed back to provisional
+scaffolding, the default `cargo test` run fails naming exactly which agent lost its real
+capture, so CI can never imply the gate is met when it isn't.

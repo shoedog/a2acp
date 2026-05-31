@@ -14,8 +14,8 @@
 //
 // DoD GATE: at least one REAL frame per agent must replay. See `tests/corpus/README.md`
 // and the `real_capture_corpus_present` test below for the per-agent met/unmet status.
-// kiro-cli is MET (real capture); codex-acp is UNMET (provisional, codex-acp not
-// installed in this environment).
+// Both kiro-cli and codex-acp are MET (real captures): kiro-cli from `kiro-cli acp`
+// 2.5.0, codex-acp from zed-industries/codex-acp 0.15.0.
 
 use agent_client_protocol::schema::{
     RequestPermissionOutcome, RequestPermissionRequest, SessionNotification, StopReason,
@@ -102,10 +102,21 @@ fn replay(frame: &Value) -> Option<ReplayOutcome> {
             // Agent->client streaming update. Deserialize to the SDK's
             // `SessionNotification` (the real parse boundary) and map via the
             // production helper.
+            //
+            // TOLERANT DROP on parse failure: a `session/update` whose `sessionUpdate`
+            // variant is unknown to the SDK 0.12.1 `SessionNotification` type (e.g.
+            // codex-acp's `usage_update`, absent from this SDK version) fails to
+            // deserialize. The live SDK dispatch (`typed.rs` `handle_if`) treats this
+            // exact case as `Some(Err)` → `send_error_notification` and CONTINUES the
+            // connection without invoking our `on_receive_notification` handler — i.e.
+            // the frame is dropped, not fatal. We mirror that here: a deser failure is
+            // a tolerant DROP (`None`), NOT a panic, so the corpus reflects real
+            // production behavior against the real agent.
             "session/update" => {
-                let notif: SessionNotification = serde_json::from_value(params)
-                    .expect("a session/update frame must deserialize as SessionNotification");
-                return AcpBackend::map_session_update(notif).map(ReplayOutcome::Update);
+                return match serde_json::from_value::<SessionNotification>(params) {
+                    Ok(notif) => AcpBackend::map_session_update(notif).map(ReplayOutcome::Update),
+                    Err(_) => None,
+                };
             }
             // Reverse permission request. Deserialize to the SDK's
             // `RequestPermissionRequest` and decide via the production policy seam
@@ -137,6 +148,12 @@ fn replay(frame: &Value) -> Option<ReplayOutcome> {
 enum ReplayOutcome {
     Update(Update),
     Done(String),
+    // `replay()` still routes `session/request_permission` frames through the real
+    // `decide_for_corpus` policy seam, so this variant stays wired for any future
+    // capture that carries a reverse permission request. Neither real capture
+    // (kiro-cli, codex-acp) issued one during its PONG round-trip, so the payload is
+    // not asserted today; it surfaces via Debug if an unexpected outcome is hit.
+    #[allow(dead_code)]
     PermissionOutcome(RequestPermissionOutcome),
 }
 
@@ -189,78 +206,83 @@ fn kiro_real_capture_replays_through_backend() {
     );
 }
 
-// ── codex-acp: PROVISIONAL (DoD gate UNMET — codex-acp not installed) ─────────
+// ── codex-acp: REAL capture (DoD gate MET) ───────────────────────────────────
 //
-// This replays the HAND-AUTHORED provisional codex frames through the SAME path to
-// prove the replay infra accepts a (future) real codex capture. It explicitly
-// asserts the corpus is NOT yet a real capture, so this test would FAIL if someone
-// mislabeled provisional frames as real — and a real capture dropped in later flips
-// `is_real_capture()` true, at which point this guard is updated alongside.
+// Real round-trip captured off the wire from zed-industries/codex-acp 0.15.0
+// (initialize → authenticate(chatgpt) → session/new → set_mode(read-only) →
+// session/prompt → 2× agent_message_chunk → end_turn result). The codex agent
+// streamed `PONG` across two chunks ("P" + "ONG"), and emitted several unmodeled
+// `session/update` variants (`available_commands_update`, `config_option_update`,
+// `usage_update`) that the tolerant reader must DROP. We replay the recv frames
+// through the SAME production path the kiro test uses.
 
 #[test]
-fn codex_provisional_frames_replay_but_gate_is_unmet() {
+fn codex_real_capture_replays_pong_and_drops_unmodeled() {
     let corpus = load_corpus("codex-acp");
     assert!(
-        !corpus.is_real_capture(),
-        "DoD GATE: the codex-acp corpus is PROVISIONAL (codex-acp is not installed here). \
-         If this assertion fails, a REAL codex capture has been added — good! — and the \
-         gate is now MET for codex: update this test and the README gate table accordingly."
+        corpus.is_real_capture(),
+        "codex-acp corpus MUST be a REAL capture to satisfy the DoD gate; provenance: {}",
+        corpus.provenance
     );
 
-    let mut texts = Vec::new();
-    let mut done = None;
-    let mut perm = None;
+    let mut texts: Vec<String> = Vec::new();
+    let mut done: Option<String> = None;
+    let mut modeled = 0usize;
 
     for frame in corpus.recv_frames() {
         match replay(frame) {
-            Some(ReplayOutcome::Update(Update::Text(t))) => texts.push(t),
-            Some(ReplayOutcome::Done(s)) => done = Some(s),
-            Some(ReplayOutcome::PermissionOutcome(o)) => perm = Some(o),
-            Some(other) => panic!("unexpected outcome: {other:?}"),
-            // the agent_thought_chunk is a tolerant DROP.
+            Some(ReplayOutcome::Update(Update::Text(t))) => {
+                modeled += 1;
+                texts.push(t);
+            }
+            Some(ReplayOutcome::Done(stop)) => {
+                modeled += 1;
+                done = Some(stop);
+            }
+            Some(other) => panic!("unexpected modeled outcome from codex capture: {other:?}"),
+            // tolerant DROP: the unmodeled available_commands_update /
+            // config_option_update / usage_update session/updates, plus the
+            // initialize/authenticate/session-new/set_mode results.
             None => {}
         }
     }
 
-    // The two agent_message_chunk frames stream in order; the thought chunk is dropped.
+    // The two REAL agent_message_chunk frames stream "P" then "ONG"; joined = PONG.
     assert_eq!(
         texts,
-        vec![
-            "Hello from ".to_string(),
-            "codex (provisional).".to_string()
-        ],
-        "provisional agent_message_chunks must replay as ordered Update::Text"
+        vec!["P".to_string(), "ONG".to_string()],
+        "the real codex agent_message_chunks must replay to ordered Update::Text(\"P\"|\"ONG\")"
     );
-    // The result frame maps to Done.
-    assert_eq!(done.as_deref(), Some("end_turn"));
-    // The request_permission frame, under the default auto-approve policy, selects
-    // the AllowOnce option (proving decide_permission runs over a real SDK-parsed req).
-    match perm {
-        Some(RequestPermissionOutcome::Selected(sel)) => {
-            assert_eq!(
-                sel.option_id.0.as_ref(),
-                "allow-once",
-                "auto-approve must select the AllowOnce option"
-            );
-        }
-        other => panic!("expected Selected(allow-once), got {other:?}"),
-    }
+    assert_eq!(
+        texts.concat(),
+        "PONG",
+        "the real codex agent_message_chunks joined must equal PONG"
+    );
+    // The REAL prompt result must map to the captured stop reason.
+    assert_eq!(
+        done.as_deref(),
+        Some("end_turn"),
+        "the real codex prompt result must replay to Update::Done{{end_turn}}"
+    );
+    // Exactly the two text chunks + the result are modeled; the three unmodeled
+    // session/update variants contributed nothing (tolerant DROP).
+    assert_eq!(
+        modeled, 3,
+        "only the 2 text chunks + the prompt result are modeled; \
+         available_commands_update/config_option_update/usage_update are DROPPED"
+    );
 }
 
 // ── DoD GATE marker test ─────────────────────────────────────────────────────
 //
 // Scans EVERY corpus file for a REAL-CAPTURE provenance header and asserts every
-// known agent has one. It is #[ignore]d precisely because it does NOT currently
-// pass: codex-acp is still provisional. Run it explicitly to see the gate status:
-//
-//     cargo test -p bridge-acp --test corpus_replay -- --ignored real_capture
-//
-// It will FAIL with a message naming the agents that still need a real capture, so
-// the unmet gate can never be silently overlooked by a green default `cargo test`.
-// When a real codex capture lands, this test passes and the #[ignore] can be removed.
+// known agent has one. Both kiro-cli (kiro-cli acp 2.5.0) and codex-acp
+// (zed-industries/codex-acp 0.15.0) now ship a real captured round-trip, so the
+// "unmet" set is empty and this test PASSES — the DoD gate is MET for every agent.
+// It is intentionally a normal (non-ignored) test now: should anyone regress a
+// corpus back to provisional scaffolding, the default `cargo test` run fails with
+// a message naming exactly which agent lost its real capture.
 #[test]
-#[ignore = "DoD GATE UNMET: codex-acp has no real capture (codex-acp not installed). \
-            kiro-cli IS a real capture. Run with --ignored to see which agents remain."]
 fn real_capture_corpus_present() {
     let agents = ["kiro-cli", "codex-acp"];
     let missing: Vec<&str> = agents
