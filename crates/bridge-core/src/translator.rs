@@ -19,7 +19,7 @@ use futures::{Stream, StreamExt};
 use crate::domain::{Part, PendingKind, PendingRequest, SessionContext};
 use crate::error::BridgeError;
 use crate::ids::{SessionId, TaskId};
-use crate::ports::{AgentBackend, PolicyEngine, SessionStore, Update};
+use crate::ports::{AgentBackend, PolicyEngine, SessionStore, Update, STOP_REASON_CANCELLED};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
@@ -160,11 +160,11 @@ impl Translator {
                             let chunk = std::mem::take(&mut acc);
                             yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
                         }
-                        // A user-cancelled turn ends with stop_reason == "cancelled"
+                        // A user-cancelled turn ends with stop_reason == STOP_REASON_CANCELLED
                         // (the ACP wire string for StopReason::Cancelled). Detect it
                         // BEFORE moving `stop_reason` into the artifact payload, so we
                         // can emit a terminal Canceled signal after the artifact.
-                        let cancelled = stop_reason == "cancelled";
+                        let cancelled = stop_reason == STOP_REASON_CANCELLED;
                         // Final artifact carries the accumulated/last text or stop_reason.
                         let payload = if !last_text.is_empty() {
                             last_text.clone()

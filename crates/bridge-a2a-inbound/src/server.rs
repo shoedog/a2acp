@@ -1370,7 +1370,7 @@ mod tests {
         }
     }
 
-    /// Backend whose turn ends with `Update::Done{stop_reason:"cancelled"}` (the
+    /// Backend whose turn ends with `Update::Done{stop_reason:STOP_REASON_CANCELLED}` (the
     /// ACP wire string for a user-cancelled turn). Used to prove the local producer
     /// reports `Canceled` (not `Completed`).
     struct CancelledBackend;
@@ -1384,7 +1384,7 @@ mod tests {
             let updates = vec![
                 Ok(Update::Text("PARTIAL".into())),
                 Ok(Update::Done {
-                    stop_reason: "cancelled".into(),
+                    stop_reason: STOP_REASON_CANCELLED.into(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -1742,6 +1742,26 @@ mod tests {
         assert_eq!(
             completed_terminals, 0,
             "a cancelled turn must not emit a Completed terminal: {body}"
+        );
+        // Ordering guard: an ArtifactUpdate must appear before the Canceled terminal.
+        // The translator emits Artifact then Terminal(Canceled); the SSE layer must
+        // preserve that order. Mirror the pattern in streaming_message_yields_artifact_event:
+        // assert the penultimate payload is an ArtifactUpdate.
+        assert!(
+            payloads.len() >= 2,
+            "must have at least artifact + terminal frames: {body}"
+        );
+        let penultimate: a2a::StreamResponse = serde_json::from_str(&payloads[payloads.len() - 2])
+            .unwrap_or_else(|e| {
+                panic!(
+                    "penultimate payload must parse as StreamResponse: {e}: {}",
+                    &payloads[payloads.len() - 2]
+                )
+            });
+        assert!(
+            matches!(penultimate, a2a::StreamResponse::ArtifactUpdate(_)),
+            "penultimate frame must be ArtifactUpdate before the Canceled terminal: {}",
+            &payloads[payloads.len() - 2]
         );
     }
 

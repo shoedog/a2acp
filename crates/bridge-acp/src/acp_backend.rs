@@ -33,7 +33,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use bridge_core::domain::{PermissionDecision, PermissionRequest, SessionContext};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::ports::{AgentBackend, BackendStream, PolicyEngine, Update};
+use bridge_core::ports::{
+    AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED,
+};
 
 use crate::supervisor::Supervised;
 
@@ -984,7 +986,7 @@ impl AcpBackend {
             StopReason::MaxTokens => "max_tokens",
             StopReason::MaxTurnRequests => "max_turn_requests",
             StopReason::Refusal => "refusal",
-            StopReason::Cancelled => "cancelled",
+            StopReason::Cancelled => STOP_REASON_CANCELLED,
             _ => "unknown",
         }
         .to_string()
@@ -2288,9 +2290,13 @@ mod tests {
     async fn prompt_maps_stop_reasons() {
         // A non-end_turn StopReason must map correctly onto Update::Done. Check
         // two: max_tokens and cancelled.
+        // NOTE: the Cancelled entry uses STOP_REASON_CANCELLED (the shared const)
+        // to pin the const's VALUE to the ACP wire spelling. Any change to the
+        // const string is caught here; both producer and consumer reference the
+        // same const, so drift between them is impossible.
         for (sr, expected) in [
             (StopReason::MaxTokens, "max_tokens"),
-            (StopReason::Cancelled, "cancelled"),
+            (StopReason::Cancelled, STOP_REASON_CANCELLED),
         ] {
             let rec = Recorder::new("agent-sess-SR");
             rec.set_stop_reason(sr).await;
