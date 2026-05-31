@@ -25,6 +25,7 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+futures = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
 a2a = { workspace = true }
