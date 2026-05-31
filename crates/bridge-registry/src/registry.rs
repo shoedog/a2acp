@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures::future::BoxFuture;
-use tokio::sync::OnceCell;
+use tokio::sync::{Notify, OnceCell};
 
 use bridge_core::domain::{AgentEntry, RegistrySnapshot};
 use bridge_core::error::BridgeError;
@@ -21,13 +22,21 @@ pub type SpawnFn = Arc<
         + Sync,
 >;
 
+/// Default grace before a lease-draining retirement task force-retires a backend
+/// whose leases never reach zero (e.g. a stuck in-flight prompt). [spec §7]
+pub(crate) const DEFAULT_RETIRE_GRACE: Duration = Duration::from_secs(30);
+
 /// One registry slot: the (swappable) entry config, the lazily-spawned backend,
-/// a retired flag (set by reconcile in T4/T5), and the active-lease counter.
+/// a retired flag (set by reconcile in T4/T5), the active-lease counter, and a
+/// lease-drop wakeup so the T5 retirement task can drain without polling.
 pub(crate) struct Slot {
     pub entry: ArcSwap<AgentEntry>,
     pub backend: OnceCell<Arc<dyn AgentBackend>>,
     pub retired: AtomicBool,
     pub leases: Arc<AtomicUsize>,
+    /// Notified on every lease drop so the detached retirement task wakes the
+    /// instant `leases` reaches zero (no sleep-polling).
+    pub lease_notify: Arc<Notify>,
 }
 
 impl Slot {
@@ -37,6 +46,7 @@ impl Slot {
             backend: OnceCell::new(),
             retired: AtomicBool::new(false),
             leases: Arc::new(AtomicUsize::new(0)),
+            lease_notify: Arc::new(Notify::new()),
         })
     }
 }
@@ -47,17 +57,24 @@ pub(crate) struct State {
     pub default: AgentId,
 }
 
-/// RAII lease: increments a slot's active count on construction, decrements on drop.
-struct LeaseGuard(Arc<AtomicUsize>);
+/// RAII lease: increments a slot's active count on construction, decrements on
+/// drop AND notifies the slot's lease-drop waiters so a draining retirement task
+/// wakes the moment the count could reach zero.
+struct LeaseGuard {
+    count: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+}
 impl LeaseGuard {
-    fn new(c: Arc<AtomicUsize>) -> Self {
-        c.fetch_add(1, SeqCst);
-        Self(c)
+    fn new(count: Arc<AtomicUsize>, notify: Arc<Notify>) -> Self {
+        count.fetch_add(1, SeqCst);
+        Self { count, notify }
     }
 }
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, SeqCst);
+        // Decrement BEFORE notifying so a woken drain task observes the new count.
+        self.count.fetch_sub(1, SeqCst);
+        self.notify.notify_waiters();
     }
 }
 impl Lease for LeaseGuard {}
@@ -66,6 +83,9 @@ impl Lease for LeaseGuard {}
 pub struct Registry {
     state: ArcSwap<State>,
     spawn: SpawnFn,
+    /// Grace deadline for the lease-draining retirement task: if a retired slot's
+    /// leases don't reach zero within this window, the backend is force-retired.
+    grace: Duration,
 }
 
 /// Shared snapshot validation: rejects duplicate ids, disallowed cmds, and a
@@ -97,6 +117,16 @@ impl Registry {
     /// Build a registry from a snapshot. Validates first → malformed config fails
     /// loudly at boot rather than at first resolve. [spec §7]
     pub fn new(snap: RegistrySnapshot, spawn: SpawnFn) -> Result<Self, BridgeError> {
+        Self::with_grace(snap, spawn, DEFAULT_RETIRE_GRACE)
+    }
+
+    /// Like [`Registry::new`] but with an explicit lease-drain grace deadline.
+    /// Tests use a short grace so the force-retire path is exercised quickly.
+    pub fn with_grace(
+        snap: RegistrySnapshot,
+        spawn: SpawnFn,
+        grace: Duration,
+    ) -> Result<Self, BridgeError> {
         validate(&snap)?;
         let slots = snap
             .entries
@@ -109,6 +139,7 @@ impl Registry {
                 default: snap.default,
             }),
             spawn,
+            grace,
         })
     }
 
@@ -122,6 +153,39 @@ impl Registry {
     #[allow(dead_code)] // wired up by the atomic reconcile in Task 4
     pub(crate) fn spawn_fn(&self) -> &SpawnFn {
         &self.spawn
+    }
+
+    /// Detached lease-draining retirement [spec §7]. The slot is already marked
+    /// `retired` (blocks NEW leases via resolve's post-spawn re-check) and absent
+    /// from the live map. This task awaits `leases == 0` — woken by the slot's
+    /// `lease_notify` on each drop — or a grace deadline, then calls `retire()`.
+    /// The slot `Arc` is moved in so it outlives the `apply` that spawned us.
+    ///
+    /// `retire()` may also be invoked by `resolve`'s race-loss path, so backends
+    /// MUST treat repeat/concurrent `retire()` as idempotent.
+    fn spawn_retirement(slot: Arc<Slot>, grace: Duration) {
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + grace;
+            loop {
+                if slot.leases.load(SeqCst) == 0 {
+                    break;
+                }
+                // Register the wakeup BEFORE re-checking the count: this closes the
+                // lost-wakeup window where a lease drops (and notifies) between our
+                // load above and our registration here.
+                let notified = slot.lease_notify.notified();
+                if slot.leases.load(SeqCst) == 0 {
+                    break;
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep_until(deadline) => break, // grace → force retire
+                }
+            }
+            if let Some(b) = slot.backend.get() {
+                let _ = b.retire().await;
+            }
+        });
     }
 }
 
@@ -151,7 +215,7 @@ impl AgentRegistry for Registry {
             // CRUX: take the lease (fetch_add) BEFORE checking `retired`. This closes
             // the window where a concurrent retirement could observe leases==0 between
             // our retired-check and our increment, and drain the backend out from under us.
-            let lease = LeaseGuard::new(slot.leases.clone());
+            let lease = LeaseGuard::new(slot.leases.clone(), slot.lease_notify.clone());
             if slot.retired.load(SeqCst) {
                 // Lost the spawn/retire race: give the lease back so retirement can
                 // drain, retire our (possibly freshly-spawned) backend, then re-resolve
@@ -216,18 +280,16 @@ impl AgentRegistry for Registry {
 
         // Retire by slot-instance identity = removed ∪ replaced. The old `State` Arc
         // (and thus the removed slots + their leases) stays alive until this loop ends.
-        // `old` is an `Arc<State>` (load_full), not an ArcSwap guard, so awaiting is safe.
         for (id, s) in old.slots.iter() {
             let kept = next.get(id).is_some_and(|n| Arc::ptr_eq(n, s));
             if !kept {
-                // Mark retired BEFORE touching the backend to close resolve's spawn/retire
-                // race (resolve takes a lease, then re-checks this flag).
+                // Mark retired SYNCHRONOUSLY (closes resolve's spawn/retire race:
+                // resolve takes a lease, then re-checks this flag and bails). Then hand
+                // the slot to a detached lease-draining task that awaits leases==0 (or
+                // the grace deadline) before retire(). apply() never .awaits the retire,
+                // so a config reload can't block on a slow in-flight lease. [spec §7]
                 s.retired.store(true, SeqCst);
-                // T4: retire synchronously here so tests can observe it. T5 replaces this
-                // with a lease-draining retirement task (await leases==0 before retire()).
-                if let Some(b) = s.backend.get() {
-                    let _ = b.retire().await;
-                }
+                Self::spawn_retirement(s.clone(), self.grace);
             }
         }
         Ok(())
@@ -309,6 +371,26 @@ mod tests {
             version: None,
             extensions: BTreeMap::new(),
         }
+    }
+
+    /// Poll a retire-counter until it reaches `want`, bounded so a regression
+    /// fails fast instead of hanging. The detached retirement task is driven by a
+    /// `Notify` wakeup, so this resolves promptly once the lease is dropped.
+    async fn await_retired(retired: &Arc<AtomicUsize>, want: usize) {
+        let fut = async {
+            while retired.load(SeqCst) < want {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), fut)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for retire count {} (got {})",
+                    want,
+                    retired.load(SeqCst)
+                )
+            });
     }
 
     fn snapshot(ids: &[&str]) -> RegistrySnapshot {
@@ -493,11 +575,11 @@ mod tests {
             !Arc::ptr_eq(&slot_before, &slot_after),
             "cmd change must produce a NEW slot instance"
         );
-        assert_eq!(
-            retired.load(SeqCst),
-            1,
-            "the OLD backend instance must be retired on a cmd change"
-        );
+        // T5: retirement is detached and lease-draining. `_r` is still holding a
+        // lease on the OLD slot, so retire() must NOT fire yet. Drop the lease, then
+        // the detached task drains (leases==0) and retires the old backend.
+        drop(_r);
+        await_retired(&retired, 1).await;
 
         let _r2 = reg.resolve(&a).await.unwrap();
         assert_eq!(
@@ -520,7 +602,7 @@ mod tests {
         let a = AgentId::parse("a").unwrap();
         let b = AgentId::parse("b").unwrap();
 
-        let _r = reg.resolve(&a).await.unwrap(); // warm "a"'s backend
+        let r = reg.resolve(&a).await.unwrap(); // warm "a"'s backend
 
         // new snapshot drops "a", keeps "b" (default must stay valid).
         let snap = snapshot(&["b"]);
@@ -534,7 +616,9 @@ mod tests {
             reg.slot_arc(&a).is_none(),
             "removed slot must be absent from the live map"
         );
-        assert_eq!(retired.load(SeqCst), 1, "removed backend must be retired");
+        // T5: detached drain — drop the lease, then the removed backend retires.
+        drop(r);
+        await_retired(&retired, 1).await;
         // "b" still resolvable.
         let _ = reg.resolve(&b).await.unwrap();
     }
@@ -615,5 +699,91 @@ mod tests {
             "no respawn across idempotent applies"
         );
         assert_eq!(retired.load(SeqCst), 0, "kept slot is never retired");
+    }
+
+    // --- Task 5: lease-draining detached retirement ---------------------------
+
+    #[tokio::test]
+    async fn retirement_waits_for_leases_then_retires() {
+        // A resolve that wins the race holds a live lease. apply() removes the
+        // slot: it marks it retired synchronously but must NOT retire() the backend
+        // while the lease is alive. Once the Resolved is dropped (leases→0), the
+        // detached task drains and retire() fires.
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            snapshot(&["a", "b"]),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap();
+        let a = AgentId::parse("a").unwrap();
+
+        let held = reg.resolve(&a).await.unwrap(); // lease alive on "a"
+        assert_eq!(reg.lease_count(&a), 1);
+
+        reg.apply(snapshot(&["b"])).await.unwrap(); // removes "a"
+
+        // Give the detached task room to (incorrectly) run; it must block on the lease.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            retired.load(SeqCst),
+            0,
+            "retire() must NOT fire while a lease is still held"
+        );
+
+        drop(held); // leases → 0, notify wakes the drain task
+        await_retired(&retired, 1).await;
+    }
+
+    #[tokio::test]
+    async fn retirement_grace_forces_retire() {
+        // A lease is held and never dropped. With a short grace override, the
+        // detached task hits its deadline and force-retires anyway.
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::with_grace(
+            snapshot(&["a", "b"]),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+        let a = AgentId::parse("a").unwrap();
+
+        let held = reg.resolve(&a).await.unwrap(); // lease alive, never dropped
+        let old_slot = reg.slot_arc(&a).unwrap();
+        assert_eq!(old_slot.leases.load(SeqCst), 1);
+
+        reg.apply(snapshot(&["b"])).await.unwrap(); // removes "a"
+
+        // Grace (20ms) elapses → retire() fires even though the lease is still held.
+        await_retired(&retired, 1).await;
+        assert_eq!(
+            old_slot.leases.load(SeqCst),
+            1,
+            "lease was never released — retire was forced by the grace deadline"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn retirement_immediate_when_no_leases() {
+        // Resolve-and-drop so leases==0, then apply removing "a": the drain task
+        // sees leases==0 immediately and retires promptly.
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            snapshot(&["a", "b"]),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap();
+        let a = AgentId::parse("a").unwrap();
+
+        drop(reg.resolve(&a).await.unwrap()); // warm + drop → leases==0
+        assert_eq!(reg.lease_count(&a), 0);
+
+        reg.apply(snapshot(&["b"])).await.unwrap(); // removes "a"
+        await_retired(&retired, 1).await;
     }
 }
