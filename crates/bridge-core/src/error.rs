@@ -53,6 +53,10 @@ pub enum BridgeError {
     StoreFailure,
     #[error("invalid state transition")]
     InvalidStateTransition,
+    #[error("unknown agent: {id}")]
+    UnknownAgent { id: String },
+    #[error("invalid config: {reason}")]
+    ConfigInvalid { reason: String },
 }
 
 impl BridgeError {

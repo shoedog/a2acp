@@ -1,0 +1,15 @@
+[package]
+name = "bridge-registry"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bridge-core = { path = "../bridge-core" }
+tokio = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
