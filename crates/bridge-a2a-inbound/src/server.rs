@@ -1129,7 +1129,10 @@ fn task_meta_from_params(params: &Value) -> TaskMeta {
         .and_then(|md| md.get("a2a-bridge.skill"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    TaskMeta { skill }
+    TaskMeta {
+        skill,
+        ..Default::default()
+    }
 }
 
 /// Pull message parts from params, extracting real text content.

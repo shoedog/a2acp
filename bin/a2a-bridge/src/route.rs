@@ -31,13 +31,19 @@ mod tests {
         assert!(matches!(
             SkillRoute
                 .route(&TaskMeta {
-                    skill: Some("delegate".into())
+                    skill: Some("delegate".into()),
+                    ..Default::default()
                 })
                 .unwrap(),
             RouteTarget::Delegate
         ));
         assert!(matches!(
-            SkillRoute.route(&TaskMeta { skill: None }).unwrap(),
+            SkillRoute
+                .route(&TaskMeta {
+                    skill: None,
+                    ..Default::default()
+                })
+                .unwrap(),
             RouteTarget::Local(a) if a.as_str() == "kiro"
         ));
     }
@@ -47,13 +53,19 @@ mod tests {
         assert!(matches!(
             SkillRoute
                 .route(&TaskMeta {
-                    skill: Some("fan-out".into())
+                    skill: Some("fan-out".into()),
+                    ..Default::default()
                 })
                 .unwrap(),
             RouteTarget::Fanout
         ));
         assert!(matches!(
-            SkillRoute.route(&TaskMeta { skill: None }).unwrap(),
+            SkillRoute
+                .route(&TaskMeta {
+                    skill: None,
+                    ..Default::default()
+                })
+                .unwrap(),
             RouteTarget::Local(a) if a.as_str() == "kiro"
         ));
     }
