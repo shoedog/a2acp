@@ -154,3 +154,66 @@ fn prompt_request_params_are_wire_conformant() {
         "the text block must carry the part text"
     );
 }
+
+// session/cancel wire-golden [Cl-M4] (ACP §11A). `session/cancel` is a JSON-RPC
+// NOTIFICATION — NOT a request — so the wire frame has a `method` and `params`
+// but NO `id` and no response, with `params:{ "sessionId": <agent id> }`. We
+// (a) assert the SDK-typed `CancelNotification` value the backend constructs
+// serializes to exactly the hand-authored `params`, then (b) hand-author the
+// full JSON-RPC notification frame around that SAME params value and prove the
+// notification shape: `id` is ABSENT, `method` is `session/cancel`, and
+// `params.sessionId` is present. The expected JSON is hand-authored to the spec
+// (NOT `to_value` of an SDK frame type), so a regression to a request-shaped
+// frame (an `id` appearing) or a renamed/wrong sessionId field is caught here.
+#[test]
+fn cancel_notification_is_a_wire_conformant_notification() {
+    use agent_client_protocol::schema::SessionId as AgentSessionId;
+
+    // The EXACT notification value the backend transmits for an active session.
+    let notif = AcpBackend::cancel_notification(AgentSessionId::new("agent-sess-1"));
+    let params: Value = serde_json::to_value(&notif).expect("CancelNotification serializes");
+
+    // (a) Hand-authored expected `params` per ACP §11A: just the sessionId. The
+    // `_meta` field is `skip_serializing_none`, so an unset meta must be ABSENT.
+    let expected_params = serde_json::json!({ "sessionId": "agent-sess-1" });
+    assert_eq!(
+        params, expected_params,
+        "session/cancel params must be {{\"sessionId\":<id>}}, got {params:?}"
+    );
+    assert_eq!(
+        params.get("sessionId"),
+        Some(&Value::from("agent-sess-1")),
+        "params.sessionId must be the agent-minted id"
+    );
+    assert!(
+        params.get("_meta").is_none(),
+        "an unset _meta must be omitted from the wire frame: {params:?}"
+    );
+
+    // (b) Hand-author the full JSON-RPC notification FRAME around that same params
+    // value and assert the NOTIFICATION shape (method + params, NO id, no result).
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": params,
+    });
+    assert!(
+        frame.get("id").is_none(),
+        "session/cancel is a NOTIFICATION — it must carry NO `id` field: {frame:?}"
+    );
+    assert_eq!(
+        frame.get("method"),
+        Some(&Value::from("session/cancel")),
+        "the notification method must be `session/cancel`"
+    );
+    assert_eq!(
+        frame.get("jsonrpc"),
+        Some(&Value::from("2.0")),
+        "JSON-RPC 2.0 envelope"
+    );
+    assert_eq!(
+        frame.pointer("/params/sessionId"),
+        Some(&Value::from("agent-sess-1")),
+        "params.sessionId must be present in the notification frame: {frame:?}"
+    );
+}

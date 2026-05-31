@@ -34,6 +34,17 @@ use crate::supervisor::Supervised;
 /// `connect`/`spawn` forever; on elapse we return a clear `BridgeError`.
 const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Default grace a `cancel` (or an early stream-drop) gives the agent to honor
+/// `session/cancel` and return its terminal `StopReason::Cancelled` result
+/// before we escalate. On elapse we SIGTERM→SIGKILL the whole agent process
+/// (see [`AcpBackend::escalate_terminate`]) so a hung in-flight turn cannot hold
+/// the per-session turn lock — and hang the caller's stream — forever.
+const DEFAULT_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Grace handed to `Supervised::terminate` between SIGTERM and the SIGKILL
+/// escalation when we nuke the agent process on a cancel/drop timeout.
+const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Static configuration for an ACP agent connection.
 ///
 /// `model` / `mode` are introduced now but only consumed by later tasks
@@ -52,6 +63,12 @@ pub struct AcpConfig {
     /// return `BridgeError::AgentCrashed` rather than hanging. Task 6 surfaces
     /// this as a clear handshake-timeout error to the caller.
     pub handshake_timeout: std::time::Duration,
+    /// Bound on how long a `cancel` (or an early stream-drop) waits for the
+    /// agent to honor `session/cancel` and return its terminal result before we
+    /// escalate by terminating the agent process. Defaults to
+    /// [`DEFAULT_CANCEL_GRACE`]; tests override it to a short value to assert the
+    /// hung-agent escalation deterministically without hanging the suite.
+    pub cancel_grace: std::time::Duration,
 }
 
 impl Default for AcpConfig {
@@ -61,6 +78,7 @@ impl Default for AcpConfig {
             model: None,
             mode: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            cancel_grace: DEFAULT_CANCEL_GRACE,
         }
     }
 }
@@ -153,6 +171,17 @@ struct AgentSession {
     /// agent session exists, so the minting task can fire `session/cancel` as
     /// soon as the id is known.
     cancel_requested: AtomicBool,
+    /// Per-turn KILL SWITCH the grace escalation fires to unblock a hung driver.
+    /// `prompt` installs a FRESH `Notify` here for each turn and hands the driver
+    /// a clone; the driver `select!`s on it so that, when a cancelled turn does
+    /// not complete within grace, the cancel watcher (or the driver's own
+    /// drop-path) can notify it to abandon its `send_request` await — surfacing a
+    /// terminal `Err`, releasing the lock, and ending the caller's stream even if
+    /// the agent never answers. `None` between turns. (Alongside this we also
+    /// `terminate()` a real `Supervised` child so a runaway agent PROCESS is
+    /// actually killed; the kill switch is what makes the in-process transport —
+    /// which has no process to kill — unblock deterministically too.)
+    turn_kill: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 impl AgentSession {
@@ -161,6 +190,7 @@ impl AgentSession {
             agent_id: OnceCell::new(),
             turn_lock: Arc::new(Mutex::new(())),
             cancel_requested: AtomicBool::new(false),
+            turn_kill: Arc::new(StdMutex::new(None)),
         }
     }
 }
@@ -175,9 +205,16 @@ pub struct AcpBackend {
     /// The spawned `Supervised` child, held for the whole backend lifetime so
     /// `kill_on_drop(true)` does not SIGKILL it the instant `spawn` returns.
     /// `Some` on the `spawn`/`from_child` paths (we own the child); `None` on
-    /// `connect` (in-process transport). Task 4 reads it for explicit
-    /// `terminate()` on cancel-timeout.
-    supervised: Option<Supervised>,
+    /// `connect` (in-process transport).
+    ///
+    /// Behind an `Arc<StdMutex<Option<_>>>` because the cancel grace-watcher and
+    /// the driver's early-drop path escalate by TAKING the child out and
+    /// `terminate()`-ing it — and `terminate(self, _)` consumes `Supervised`,
+    /// which a `&self` method cannot move out of a plain field. The shared,
+    /// take-once handle lets either escalation path claim the child exactly once
+    /// (the loser sees `None`), and the backend still drops it on `Drop` if no
+    /// escalation ever fired.
+    supervised: Arc<StdMutex<Option<Supervised>>>,
     id_counter: Arc<AtomicU64>,
     /// Static config (cwd for `session/new`, model/mode for later tasks).
     config: Option<AcpConfig>,
@@ -234,6 +271,19 @@ impl AcpBackend {
         PromptRequest::new(agent_id, blocks)
     }
 
+    /// Build the `session/cancel` NOTIFICATION this backend sends to cancel an
+    /// in-flight turn (via `request_cancel` / the cancel latch). ACP §11A:
+    /// `session/cancel` is a NOTIFICATION (no `id`, no response), with
+    /// `params:{ "sessionId": <agent id> }`.
+    ///
+    /// Exposed so the wire-golden test can assert the serialized `params` shape
+    /// (`{"sessionId":<id>}`) and notification-shape against the SAME value the
+    /// backend transmits — not a re-derivation of the SDK type.
+    #[must_use]
+    pub fn cancel_notification(agent_id: AgentSessionId) -> CancelNotification {
+        CancelNotification::new(agent_id)
+    }
+
     /// **Production** constructor: spawn `cmd args` as a `Supervised` child
     /// (its own process group, tested SIGTERM→SIGKILL reaping) and drive the
     /// ACP connection over its stdin/stdout as `ByteStreams`.
@@ -251,8 +301,8 @@ impl AcpBackend {
         // `supervised` (the process-group owner) MUST live for the whole backend
         // lifetime: `kill_on_drop(true)` would SIGKILL the child the instant it
         // dropped, killing the event-loop task's pipes. Hold it on the backend.
-        let mut backend = Self::connect(transport, config).await?;
-        backend.supervised = Some(supervised);
+        let backend = Self::connect(transport, config).await?;
+        *backend.supervised.lock().expect("supervised lock") = Some(supervised);
         Ok(backend)
     }
 
@@ -346,7 +396,7 @@ impl AcpBackend {
                 _shutdown: shutdown_tx,
                 updates,
             }),
-            supervised: None,
+            supervised: Arc::new(StdMutex::new(None)),
             id_counter: Arc::new(AtomicU64::new(1)),
             config: Some(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -513,8 +563,8 @@ impl AcpBackend {
         let stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed)?;
         let stdout = child.stdout.take().ok_or(BridgeError::AgentCrashed)?;
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-        let mut backend = Self::connect(transport, config).await?;
-        backend.supervised = Some(supervised);
+        let backend = Self::connect(transport, config).await?;
+        *backend.supervised.lock().expect("supervised lock") = Some(supervised);
         Ok(backend)
     }
 
@@ -523,6 +573,39 @@ impl AcpBackend {
     #[allow(dead_code)] // retained for later tasks that mint request ids
     fn next_id(&self) -> u64 {
         self.id_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The configured cancel grace (see [`AcpConfig::cancel_grace`]). Falls back
+    /// to the default if no config is set (the `conn: None` test-only path).
+    fn cancel_grace(&self) -> std::time::Duration {
+        self.config
+            .as_ref()
+            .map(|c| c.cancel_grace)
+            .unwrap_or(DEFAULT_CANCEL_GRACE)
+    }
+
+    /// Last-resort escalation when a cancelled turn does not complete within the
+    /// grace window: TAKE the supervised child (exactly once — a concurrent
+    /// escalator sees `None`) and SIGTERM→SIGKILL the whole agent PROCESS.
+    ///
+    /// NOTE this NUKES THE ENTIRE AGENT CONNECTION, not just the one turn: this
+    /// backend multiplexes all bridge sessions over a single agent process, so
+    /// there is no per-turn kill. It is the acceptable last resort for a hung
+    /// agent that ignores `session/cancel` — killing it closes the stdio pipes,
+    /// which makes every in-flight `send_request` error out, so each driver
+    /// surfaces `Err` and releases its turn lock (no caller hangs forever).
+    ///
+    /// On the in-process `connect` test path `supervised` is `None`, so this is a
+    /// no-op there (closing the duplex channel is the test's own concern).
+    /// `terminate(self, _)` is async + consumes the child, so we run it on a
+    /// detached task and return immediately.
+    fn escalate_terminate(supervised: &Arc<StdMutex<Option<Supervised>>>) {
+        let taken = supervised.lock().ok().and_then(|mut g| g.take());
+        if let Some(child) = taken {
+            tokio::spawn(async move {
+                child.terminate(TERMINATE_GRACE).await;
+            });
+        }
     }
 
     /// Map an ACP `StopReason` to the bridge's `Update::Done` stop_reason string.
@@ -599,19 +682,69 @@ impl AgentBackend for AcpBackend {
         let cx = self.cx()?.clone();
         let req = Self::prompt_request(agent_id.clone(), &parts);
 
+        // Install a FRESH per-turn kill switch on the session: the external cancel
+        // grace-watcher fires it to unblock a hung driver (see `cancel`). The
+        // driver `select!`s on it and clears the slot on exit.
+        let kill = Arc::new(tokio::sync::Notify::new());
+        *entry.turn_kill.lock().expect("turn_kill lock") = Some(Arc::clone(&kill));
+
         // (3) Driver: holds the turn lock for the whole streamed turn (it OWNS
         // `turn_guard`, releasing the lock only when it finishes) and awaits the
         // `PromptResponse`; the SDK delivers chunks meanwhile via the handler.
         let registry_for_driver = Arc::clone(&registry);
         let agent_id_for_driver = agent_id.clone();
+        let supervised_for_driver = Arc::clone(&self.supervised);
+        let kill_slot = Arc::clone(&entry.turn_kill);
+        let grace = self.cancel_grace();
         tokio::spawn(async move {
             // Hold the turn lock for the entire turn.
             let _turn = turn_guard;
-            let outcome = cx.send_request(req).block_task().await;
+
+            // Await the prompt result, but bail out on either:
+            //   * the CONSUMER dropping the stream (`done_sender.closed()` resolves
+            //     when the paired `rx`, moved into the returned `BackendStream`, is
+            //     dropped — the A2A caller disconnected mid-turn); we must then
+            //     cancel the agent turn rather than leave it running holding the
+            //     turn lock; or
+            //   * the external cancel grace-watcher firing the kill switch (a hung
+            //     agent that ignored `session/cancel` past grace) — we abandon the
+            //     await so the lock releases and the caller's stream ends.
+            let prompt_fut = cx.send_request(req).block_task();
+            tokio::pin!(prompt_fut);
+            let outcome: Result<_, ()> = tokio::select! {
+                outcome = &mut prompt_fut => outcome.map_err(|_| ()),
+                _ = kill.notified() => Err(()),
+                _ = done_sender.closed() => {
+                    // Early stream-drop → cancel THIS turn's agent session, then
+                    // CONTINUE awaiting the prompt result so the turn lock still
+                    // releases when the agent finishes/errors. A hung agent that
+                    // never returns after the cancel is bounded by a grace timer:
+                    // on elapse we nuke the process (closing the pipes) AND treat
+                    // the turn as failed so the stream ends even on the in-process
+                    // transport (which has no process to kill).
+                    let _ = cx.send_notification(CancelNotification::new(
+                        agent_id_for_driver.clone(),
+                    ));
+                    tokio::select! {
+                        outcome = &mut prompt_fut => outcome.map_err(|_| ()),
+                        _ = kill.notified() => Err(()),
+                        _ = tokio::time::sleep(grace) => {
+                            AcpBackend::escalate_terminate(&supervised_for_driver);
+                            Err(())
+                        }
+                    }
+                }
+            };
+
             // Unregister this turn's sender FIRST so no late chunk is routed
             // after the terminal Done is emitted.
             if let Ok(mut map) = registry_for_driver.lock() {
                 map.remove(&agent_id_for_driver);
+            }
+            // Clear the kill switch slot now the turn is ending (next turn installs
+            // its own); avoids a stale notify firing across turns.
+            if let Ok(mut slot) = kill_slot.lock() {
+                *slot = None;
             }
             let event = match outcome {
                 // Turn COMPLETED (incl. a real StopReason::Cancelled, which maps
@@ -620,11 +753,14 @@ impl AgentBackend for AcpBackend {
                     stop_reason: AcpBackend::stop_reason_str(resp.stop_reason),
                 }),
                 // A transport/agent error (agent crash / mid-turn transport
-                // failure) FAILED the turn: surface a terminal Err on the stream
-                // so downstream reports the inbound A2A caller `Failed` — never a
-                // silent Done{"unknown"} that reads as a clean `Completed`.
-                Err(_) => TurnEvent::Failed(BridgeError::AgentCrashed),
+                // failure), OR a kill-switch/grace escalation, FAILED the turn:
+                // surface a terminal Err on the stream so downstream reports the
+                // inbound A2A caller `Failed` — never a silent Done{"unknown"}
+                // that reads as a clean `Completed`.
+                Err(()) => TurnEvent::Failed(BridgeError::AgentCrashed),
             };
+            // If the consumer already dropped the stream this `send` is a no-op,
+            // but the lock-release below is what matters there.
             let _ = done_sender.send(event);
             // `_turn` (the OwnedMutexGuard) drops here, releasing the turn lock.
         });
@@ -650,15 +786,69 @@ impl AgentBackend for AcpBackend {
         Ok(Box::pin(stream))
     }
 
-    /// Send `session/cancel` for the bridge session (via the cancel latch).
+    /// Cancel the in-flight turn for the bridge session.
     ///
     /// Spec §5.3 / Codex finding 2: cancellation COMPLETION is the prompt RESULT
-    /// arriving on the `BackendStream` with `stopReason:"cancelled"`, NOT the act
-    /// of sending this notification. Task 4 builds that completion (awaiting the
-    /// cancelled `StopReason` on the stream + SIGTERM-on-timeout fallback) on top
-    /// of this minimal latch+send.
+    /// arriving on the `BackendStream` with `stopReason:"cancelled"` (→
+    /// `Update::Done{"cancelled"}`), NOT the act of sending this notification.
+    /// This method's job is therefore twofold:
+    ///
+    /// 1. `request_cancel` sends `session/cancel` for the in-flight turn's agent
+    ///    session (honoring the create/cancel latch race). A well-behaved agent
+    ///    then returns `StopReason::Cancelled`, the driver emits
+    ///    `Update::Done{"cancelled"}`, and the caller's stream completes — that
+    ///    completion is the contract, owned by the prompt driver (Task 3).
+    ///
+    /// 2. HUNG-AGENT bound: a real agent might NEVER return after `session/cancel`,
+    ///    leaving the driver parked on `send_request` while it holds the per-turn
+    ///    lock and the caller's stream hangs forever. So if an in-flight turn does
+    ///    not complete within [`AcpConfig::cancel_grace`], we ESCALATE by
+    ///    terminating the agent process (`escalate_terminate`): killing it closes
+    ///    the stdio pipes → `send_request` errors → the driver surfaces `Err`,
+    ///    releases the lock, and the stream ends. We detect "turn completed" by
+    ///    re-acquiring the per-session `turn_lock` (the driver holds it for the
+    ///    whole turn and drops it on EVERY exit), so a successful lock-acquire
+    ///    within grace means the turn finished and no escalation is needed.
+    ///
+    /// The grace watcher runs on a detached task so `cancel` stays prompt (it does
+    /// not block the caller for the grace window). If no turn is in flight (the
+    /// lock is free right now), there is nothing to bound and we skip the watcher.
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        self.request_cancel(session).await
+        self.request_cancel(session).await?;
+
+        let entry = self.session_entry(session).await;
+        // No in-flight turn → the lock is free → nothing to bound. (A turn that
+        // starts AFTER this check is a fresh turn, not the one this cancel
+        // targeted, so it is correct not to arm a watcher for it.)
+        if entry.turn_lock.try_lock().is_ok() {
+            return Ok(());
+        }
+
+        let turn_lock = Arc::clone(&entry.turn_lock);
+        let supervised = Arc::clone(&self.supervised);
+        let kill_slot = Arc::clone(&entry.turn_kill);
+        let grace = self.cancel_grace();
+        tokio::spawn(async move {
+            // Wait up to `grace` for the in-flight turn to release the lock (its
+            // driver drops the guard on every exit). If it does, the turn
+            // completed (cleanly cancelled or otherwise) — no escalation. If the
+            // grace elapses first, the agent ignored `session/cancel`: ESCALATE.
+            if tokio::time::timeout(grace, turn_lock.lock()).await.is_err() {
+                // Nuke a real agent PROCESS (closes its pipes → every in-flight
+                // `send_request` errors). For the in-process transport (no child)
+                // this is a no-op, so ALSO fire the per-turn kill switch to unblock
+                // the driver deterministically; either path ends the turn with a
+                // terminal `Err`, releases the lock, and unhangs the caller.
+                AcpBackend::escalate_terminate(&supervised);
+                let kill = kill_slot.lock().ok().and_then(|g| g.clone());
+                if let Some(k) = kill {
+                    // `notify_one` stores a permit if the driver has not yet
+                    // registered its `notified()` waiter, so the kill is never lost.
+                    k.notify_one();
+                }
+            }
+        });
+        Ok(())
     }
 }
 
@@ -833,14 +1023,14 @@ mod tests {
 
         let backend = AcpBackend {
             conn: None,
-            supervised: Some(supervised),
+            supervised: Arc::new(StdMutex::new(Some(supervised))),
             id_counter: Arc::new(AtomicU64::new(1)),
             config: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(
-            backend.supervised.is_some(),
+            backend.supervised.lock().unwrap().is_some(),
             "backend must retain the Supervised child (B1)"
         );
 
@@ -857,7 +1047,8 @@ mod tests {
         );
 
         // Clean up deterministically (SIGTERM->reap), leaving no zombie.
-        if let Some(s) = backend.supervised {
+        let taken = backend.supervised.lock().unwrap().take();
+        if let Some(s) = taken {
             s.terminate(Duration::from_millis(100)).await;
         }
     }
@@ -936,6 +1127,22 @@ mod tests {
         prompt_updates: Arc<Mutex<Vec<ScriptedUpdate>>>,
         /// The `StopReason` the prompt handler returns. `EndTurn` by default.
         stop_reason: Arc<Mutex<StopReason>>,
+        /// When set, the prompt handler WAITS for a `session/cancel` to arrive
+        /// (awaits `cancel_arrived`) AFTER emitting its updates and BEFORE
+        /// responding — modeling a real agent that only ends the turn once it has
+        /// observed the cancel, returning whatever `stop_reason` is configured
+        /// (typically `StopReason::Cancelled`). Proves completion is the RESULT,
+        /// not the notification send.
+        wait_cancel_before_respond: Arc<AtomicBool>,
+        /// When set (with `wait_cancel_before_respond`), the prompt handler NEVER
+        /// responds after observing the cancel — it parks forever, modeling a hung
+        /// agent that ignores `session/cancel`. The backend must then escalate
+        /// (terminate) to unblock the turn.
+        hang_after_cancel: Arc<AtomicBool>,
+        /// Fires when a `session/cancel` is recorded, used by the prompt handler
+        /// to await the cancel deterministically (separate from `cancel_seen`,
+        /// which the test driver awaits, so neither consumes the other's permit).
+        cancel_arrived: Arc<Notify>,
     }
 
     impl Recorder {
@@ -955,6 +1162,9 @@ mod tests {
                 fail_prompt: Arc::new(AtomicBool::new(false)),
                 prompt_updates: Arc::new(Mutex::new(Vec::new())),
                 stop_reason: Arc::new(Mutex::new(StopReason::EndTurn)),
+                wait_cancel_before_respond: Arc::new(AtomicBool::new(false)),
+                hang_after_cancel: Arc::new(AtomicBool::new(false)),
+                cancel_arrived: Arc::new(Notify::new()),
             }
         }
 
@@ -1048,24 +1258,50 @@ mod tests {
                                 ))?;
                             }
 
-                            // Optionally hold the turn open until released, so a
-                            // second concurrent turn — if the lock failed — would
-                            // interleave and be caught by the ordering log.
-                            if r.gate_prompt.load(Ordering::SeqCst) {
-                                r.prompt_gate.notified().await;
-                            }
-                            // Optionally FAIL the turn: respond with a JSON-RPC
-                            // error so the client's `send_request` returns `Err`,
-                            // exercising the transport/agent-error path. Logged as
-                            // "fail" (not "end") so a test can distinguish.
-                            if r.fail_prompt.load(Ordering::SeqCst) {
-                                r.prompt_log.lock().await.push("fail");
-                                responder.respond_with_internal_error("agent failed the turn")?;
-                                return Ok(());
-                            }
-                            r.prompt_log.lock().await.push("end");
-                            let sr = *r.stop_reason.lock().await;
-                            responder.respond(PromptResponse::new(sr))?;
+                            // Offload the (possibly-blocking) gate-wait + response to
+                            // a spawned task via `cx.spawn`, then RETURN from the
+                            // handler immediately. This is REQUIRED: SDK request
+                            // handlers run inside the dispatch loop and block all
+                            // further message processing while awaiting — so a handler
+                            // that parked on a gate would prevent the agent from ever
+                            // dispatching an incoming `session/cancel`. Spawning frees
+                            // the loop to deliver the cancel that these gates await.
+                            let r2 = r.clone();
+                            cx.spawn(async move {
+                                // Optionally hold the turn open until released, so a
+                                // second concurrent turn — if the lock failed — would
+                                // interleave and be caught by the ordering log.
+                                if r2.gate_prompt.load(Ordering::SeqCst) {
+                                    r2.prompt_gate.notified().await;
+                                }
+                                // Optionally WAIT for `session/cancel` before ending
+                                // the turn (agent only ends once it sees the cancel).
+                                // `notify_one` holds a permit if the cancel already
+                                // arrived, so this is race-safe for the single cancel
+                                // these tests send.
+                                if r2.wait_cancel_before_respond.load(Ordering::SeqCst) {
+                                    r2.cancel_arrived.notified().await;
+                                    // Optionally HANG forever after observing the
+                                    // cancel (agent ignores it): backend must escalate.
+                                    if r2.hang_after_cancel.load(Ordering::SeqCst) {
+                                        std::future::pending::<()>().await;
+                                    }
+                                }
+                                // Optionally FAIL the turn: respond with a JSON-RPC
+                                // error so the client's `send_request` returns `Err`,
+                                // exercising the transport/agent-error path. Logged as
+                                // "fail" (not "end") so a test can distinguish.
+                                if r2.fail_prompt.load(Ordering::SeqCst) {
+                                    r2.prompt_log.lock().await.push("fail");
+                                    responder
+                                        .respond_with_internal_error("agent failed the turn")?;
+                                    return Ok(());
+                                }
+                                r2.prompt_log.lock().await.push("end");
+                                let sr = *r2.stop_reason.lock().await;
+                                responder.respond(PromptResponse::new(sr))?;
+                                Ok(())
+                            })?;
                             Ok(())
                         }
                     },
@@ -1077,6 +1313,7 @@ mod tests {
                         async move {
                             r.cancels.lock().await.push(notif.session_id.0.to_string());
                             r.cancel_seen.notify_one();
+                            r.cancel_arrived.notify_one();
                             Ok(())
                         }
                     },
@@ -1089,9 +1326,15 @@ mod tests {
 
     /// Build a backend connected to a fresh recording agent; returns both.
     async fn connect_recording(rec: Recorder) -> AcpBackend {
+        connect_recording_with(rec, test_config()).await
+    }
+
+    /// Like [`connect_recording`] but with a caller-supplied config (e.g. a short
+    /// `cancel_grace` so the hung-agent escalation can be asserted deterministically).
+    async fn connect_recording_with(rec: Recorder, config: AcpConfig) -> AcpBackend {
         let (client_side, agent_side) = Channel::duplex();
         spawn_recording_agent(agent_side, rec);
-        AcpBackend::connect(client_side, test_config())
+        AcpBackend::connect(client_side, config)
             .await
             .expect("initialize handshake succeeds against recording agent")
     }
@@ -1480,5 +1723,240 @@ mod tests {
             .await
             .expect("cancel must reach the agent");
         assert_eq!(rec.cancels.lock().await.as_slice(), &["agent-sess-CAN"]);
+    }
+
+    // ── Task 4: cancel completion = the prompt RESULT ──────────────────────────
+
+    #[tokio::test]
+    async fn cancel_completion_is_the_prompt_result() {
+        // Spec §5.3: cancellation COMPLETION is the prompt RESULT (StopReason::
+        // Cancelled → Update::Done{"cancelled"}), NOT the act of sending
+        // `session/cancel`. The fake agent emits one chunk, then WAITS for
+        // `session/cancel` before returning `StopReason::Cancelled`. We read the
+        // first Text, issue `cancel(S)`, and assert: (a) the agent recorded the
+        // `session/cancel`, and (b) the stream completes with Done{"cancelled"} —
+        // which can only arrive AFTER the cancelled RESULT, since the agent blocks
+        // until it sees the cancel. Deterministic gates, no sleeps.
+        let rec = Recorder::new("agent-sess-CCR");
+        rec.set_updates(vec![ScriptedUpdate::Text("chunk-1")]).await;
+        rec.set_stop_reason(StopReason::Cancelled).await;
+        rec.wait_cancel_before_respond.store(true, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-CCR");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        // First the streamed chunk arrives (the turn is in flight, NOT yet done).
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "chunk-1"));
+
+        // Now cancel. The agent is blocked waiting for exactly this notification.
+        be.cancel(&key).await.unwrap();
+
+        // The agent must record the session/cancel for the in-flight turn's id.
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("cancel must reach the agent");
+        assert_eq!(rec.cancels.lock().await.as_slice(), &["agent-sess-CCR"]);
+
+        // The stream completes via the agent's Cancelled RESULT → Done{"cancelled"}.
+        // (It could NOT have completed before the cancel: the agent blocked on it.)
+        match tokio::time::timeout(Duration::from_secs(2), s.next())
+            .await
+            .expect("stream must complete after the cancelled result")
+        {
+            Some(Ok(Update::Done { stop_reason })) => {
+                assert_eq!(
+                    stop_reason, "cancelled",
+                    "completion is the Cancelled RESULT"
+                );
+            }
+            other => panic!("expected Done{{\"cancelled\"}}, got {other:?}"),
+        }
+        assert!(s.next().await.is_none(), "stream terminates after Done");
+    }
+
+    #[tokio::test]
+    async fn cancel_racing_creation_still_cancels() {
+        // A cancel issued BEFORE `session/new` completes must not be dropped: after
+        // the id is minted, EXACTLY ONE `session/cancel` reaches the agent, and the
+        // subsequent turn completes CANCELLED (completion = the Cancelled result).
+        let rec = Recorder::new("agent-sess-RC");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        // The turn, once it runs, blocks for the cancel then returns Cancelled —
+        // so the latched cancel both lands AND drives the turn to completion.
+        rec.wait_cancel_before_respond.store(true, Ordering::SeqCst);
+        rec.set_stop_reason(StopReason::Cancelled).await;
+        let be = Arc::new(connect_recording(rec.clone()).await);
+        let key = bkey("bridge-RC");
+
+        // Start the prompt; its `ensure_session` parks on the gated `session/new`.
+        let b1 = Arc::clone(&be);
+        let k1 = key.clone();
+        let prompt = tokio::spawn(async move {
+            let mut s = b1.prompt(&k1, vec![]).await.unwrap();
+            let mut last = None;
+            while let Some(item) = s.next().await {
+                last = Some(item);
+            }
+            last
+        });
+        // Wait until `session/new` is in flight (handler entered, parked on gate).
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("session/new must be in flight before the racing cancel");
+
+        // Cancel RACES ahead of creation: only the latch is set (id not yet minted),
+        // so nothing is on the wire yet.
+        be.cancel(&key).await.unwrap();
+        assert!(
+            rec.cancels.lock().await.is_empty(),
+            "cancel before session/new must not be sent against a non-existent id"
+        );
+
+        // Release session/new; the minting task flushes the latched cancel, which
+        // also unblocks the (cancel-waiting) turn → it returns Cancelled.
+        rec.new_session_gate.notify_waiters();
+
+        // Exactly one session/cancel reaches the agent for the freshly-minted id.
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("latched cancel must reach the agent after session/new");
+        assert_eq!(rec.cancels.lock().await.as_slice(), &["agent-sess-RC"]);
+
+        // And the turn completes CANCELLED (the result), not via the notification.
+        let last = tokio::time::timeout(Duration::from_secs(2), prompt)
+            .await
+            .expect("the racing-cancel turn must complete, not hang")
+            .unwrap();
+        match last {
+            Some(Ok(Update::Done { stop_reason })) => {
+                assert_eq!(
+                    stop_reason, "cancelled",
+                    "racing cancel completes the turn cancelled"
+                );
+            }
+            other => panic!("expected terminal Done{{\"cancelled\"}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_hung_agent_is_terminated_within_grace() {
+        // A hung agent that receives `session/cancel` but NEVER returns must not
+        // hang the caller forever. With a SHORT cancel grace, the backend escalates
+        // (fires the per-turn kill switch — and would `terminate()` a real child)
+        // so the turn ends with a terminal Err WITHIN the grace bound. An outer
+        // `timeout` makes a regression (no escalation) fail fast instead of hanging.
+        let rec = Recorder::new("agent-sess-HUNG");
+        rec.set_updates(vec![ScriptedUpdate::Text("partial")]).await;
+        rec.wait_cancel_before_respond.store(true, Ordering::SeqCst);
+        rec.hang_after_cancel.store(true, Ordering::SeqCst);
+        let cfg = AcpConfig {
+            cancel_grace: Duration::from_millis(150),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-HUNG");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        // The streamed chunk arrives; the turn is in flight.
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "partial"));
+
+        // Cancel; the agent records it but then hangs forever (never responds).
+        be.cancel(&key).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("cancel must reach the (hung) agent");
+
+        // The turn MUST be terminated within the grace bound: the stream ends with
+        // a terminal Err (the kill-switch escalation), not a hang. Bound it well
+        // above the 150ms grace but far below a "hung" wall so a regression fails.
+        match tokio::time::timeout(Duration::from_secs(2), s.next())
+            .await
+            .expect("hung turn must be terminated within grace, not hang")
+        {
+            Some(Err(BridgeError::AgentCrashed)) => {}
+            other => panic!("hung-agent escalation must end the turn with Err, got {other:?}"),
+        }
+        assert!(
+            s.next().await.is_none(),
+            "stream terminates after the escalation Err"
+        );
+
+        // The turn lock is released (escalation dropped the driver's guard): a
+        // subsequent prompt on S can proceed (it would deadlock if still held).
+        rec.wait_cancel_before_respond
+            .store(false, Ordering::SeqCst);
+        rec.hang_after_cancel.store(false, Ordering::SeqCst);
+        rec.set_stop_reason(StopReason::EndTurn).await;
+        let mut s2 = tokio::time::timeout(Duration::from_secs(2), be.prompt(&key, vec![]))
+            .await
+            .expect("a fresh prompt must acquire the released turn lock")
+            .unwrap();
+        let done = loop {
+            match tokio::time::timeout(Duration::from_secs(2), s2.next())
+                .await
+                .expect("fresh turn must complete")
+            {
+                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(_) => continue,
+                None => panic!("fresh turn ended without Done"),
+            }
+        };
+        assert_eq!(
+            done, "end_turn",
+            "the lock released → the next turn runs to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_cancels_agent_turn() {
+        // If the CONSUMER drops the returned BackendStream mid-turn (client
+        // disconnect), the agent turn must be CANCELLED (not left running holding
+        // the turn lock). The agent gates its prompt open; we drop the stream,
+        // assert the agent records a `session/cancel`, then let it respond and
+        // assert the turn lock RELEASED (a subsequent prompt on S proceeds).
+        let rec = Recorder::new("agent-sess-DROP");
+        rec.set_updates(vec![ScriptedUpdate::Text("streaming")])
+            .await;
+        // Hold the turn open so it is unambiguously in flight when we drop.
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-DROP");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        // The turn is in flight (chunk delivered; prompt handler parked on gate).
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "streaming"));
+
+        // Consumer disconnects: drop the stream. The driver's `done_sender.closed()`
+        // branch must fire and send `session/cancel` for this turn's agent id.
+        drop(s);
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("dropping the stream must cancel the agent turn");
+        assert_eq!(rec.cancels.lock().await.as_slice(), &["agent-sess-DROP"]);
+
+        // Let the (now-cancelled) turn finish so the driver releases the lock.
+        rec.prompt_gate.notify_one();
+        rec.gate_prompt.store(false, Ordering::SeqCst);
+
+        // The turn lock must have released: a subsequent prompt on S proceeds and
+        // completes (it would block forever if the dropped turn still held it).
+        let mut s2 = tokio::time::timeout(Duration::from_secs(2), be.prompt(&key, vec![]))
+            .await
+            .expect("a fresh prompt must acquire the released turn lock")
+            .unwrap();
+        let done = loop {
+            match tokio::time::timeout(Duration::from_secs(2), s2.next())
+                .await
+                .expect("fresh turn must complete")
+            {
+                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(_) => continue,
+                None => panic!("fresh turn ended without Done"),
+            }
+        };
+        assert_eq!(
+            done, "end_turn",
+            "the dropped turn released the lock → next turn runs"
+        );
     }
 }
