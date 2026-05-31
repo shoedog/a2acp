@@ -276,10 +276,22 @@ fn spawn_local_producer(
             parts,
         );
         let mut errored = false;
+        // Whether the translator already emitted its own terminal frame (a
+        // user-cancelled turn ends with Update::Done{stop_reason:"cancelled"},
+        // which the translator maps to a terminal Canceled event). If so we must
+        // NOT append a second terminal — we honor the one it sent.
+        let mut translator_terminal = false;
         while let Some(ev) = events.next().await {
             // Track whether the stream ended with an error.
             if ev.is_err() {
                 errored = true;
+            }
+            // Note a translator-emitted terminal (e.g. Canceled) so we don't
+            // overwrite it with our default clean-end Completed below.
+            if let Ok(e) = &ev {
+                if e.kind() == &EventKind::Terminal {
+                    translator_terminal = true;
+                }
             }
             // If the receiver is gone (client disconnected) stop driving.
             if tx.send(ev).await.is_err() {
@@ -287,14 +299,17 @@ fn spawn_local_producer(
                 return;
             }
         }
-        // Append exactly one terminal frame after the inner stream ends.
+        // Append exactly one terminal frame after the inner stream ends, UNLESS
+        // the translator already sent its own terminal (cancelled turn).
         // A clean stream end -> Completed; an errored stream -> Failed.
-        let outcome = if errored {
-            TaskOutcome::Failed
-        } else {
-            TaskOutcome::Completed
-        };
-        let _ = tx.send(Ok(Event::terminal(outcome))).await;
+        if !translator_terminal {
+            let outcome = if errored {
+                TaskOutcome::Failed
+            } else {
+                TaskOutcome::Completed
+            };
+            let _ = tx.send(Ok(Event::terminal(outcome))).await;
+        }
         // Channel closes on drop -> SSE stream terminates after the terminal flush.
     });
 }
@@ -478,6 +493,14 @@ fn local_kiro_source(
             parts,
         );
         while let Some(ev) = events.next().await {
+            // A fan-out SOURCE must never emit a terminal frame — the fan-out
+            // coordinator owns the single terminal decision. The translator may now
+            // emit a terminal Canceled on a cancelled local Done (used by the
+            // local-only producer); swallow it here so it doesn't leak into the
+            // merge as a labeled mid-stream terminal.
+            if matches!(&ev, Ok(e) if e.kind() == &EventKind::Terminal) {
+                continue;
+            }
             yield ev;
         }
     });
@@ -801,8 +824,16 @@ async fn unary_message(
         .map(|e| e.text())
         .collect();
 
+    // The terminal state is Completed unless the translator emitted a terminal
+    // outcome (a cancelled local turn -> Canceled); a backend error is handled
+    // above as a JSON-RPC error.
+    let state = match events.iter().rev().find_map(|e| e.outcome()) {
+        Some(TaskOutcome::Canceled) => "TASK_STATE_CANCELED",
+        Some(TaskOutcome::Failed) => "TASK_STATE_FAILED",
+        _ => "TASK_STATE_COMPLETED",
+    };
     let result = json!({
-        "task": { "id": routed.task.as_str(), "state": "TASK_STATE_COMPLETED" },
+        "task": { "id": routed.task.as_str(), "state": state },
         "artifact": { "text": artifact_text },
         "status": status_chunks,
     });
@@ -1339,6 +1370,30 @@ mod tests {
         }
     }
 
+    /// Backend whose turn ends with `Update::Done{stop_reason:"cancelled"}` (the
+    /// ACP wire string for a user-cancelled turn). Used to prove the local producer
+    /// reports `Canceled` (not `Completed`).
+    struct CancelledBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for CancelledBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates = vec![
+                Ok(Update::Text("PARTIAL".into())),
+                Ok(Update::Done {
+                    stop_reason: "cancelled".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
     /// Backend that panics if prompt is ever called — proves gating short-circuits.
     struct PanicBackend;
     #[async_trait::async_trait]
@@ -1645,6 +1700,68 @@ mod tests {
             matches!(penultimate, a2a::StreamResponse::ArtifactUpdate(_)),
             "penultimate frame must be ArtifactUpdate"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_cancelled_done_yields_terminal_canceled() {
+        // A local turn ending with Done{stop_reason:"cancelled"} must produce a
+        // terminal statusUpdate(Canceled) — NOT Completed.
+        let srv = build(Arc::new(CancelledBackend), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let payloads = sse_data_payloads(&body);
+        assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
+        // Exactly one terminal frame, and it is Canceled.
+        let last_sr: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap()).unwrap();
+        assert!(
+            matches!(
+                &last_sr,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Canceled
+            ),
+            "final frame must be terminal statusUpdate(Canceled): {}",
+            payloads.last().unwrap()
+        );
+        // No Completed terminal should appear (the producer must not append one).
+        let completed_terminals = payloads
+            .iter()
+            .filter_map(|p| serde_json::from_str::<a2a::StreamResponse>(p).ok())
+            .filter(|sr| {
+                matches!(sr, a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed)
+            })
+            .count();
+        assert_eq!(
+            completed_terminals, 0,
+            "a cancelled turn must not emit a Completed terminal: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_cancelled_done_returns_canceled_state() {
+        // The unary local path must report TASK_STATE_CANCELED for a cancelled turn.
+        let srv = build(Arc::new(CancelledBackend), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_CANCELED");
+        assert_eq!(v["result"]["artifact"]["text"], "PARTIAL");
     }
 
     #[tokio::test]
