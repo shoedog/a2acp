@@ -43,58 +43,6 @@ impl From<toml::de::Error> for ConfigError {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub struct Config {
-    pub agent: AgentConfig,
-    pub server: ServerConfig,
-    #[serde(default)]
-    pub delegation: Option<DelegationConfig>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct AgentConfig {
-    pub name: String,
-    pub cmd: String,
-    pub args: Vec<String>,
-    /// Optional model id; threaded into `AcpConfig::model` (best-effort
-    /// `session/set_model`). Absent = the agent's default model.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Optional session mode id; threaded into `AcpConfig::mode` (hard
-    /// `session/set_mode`). Absent = the agent's default mode.
-    #[serde(default)]
-    pub mode: Option<String>,
-    /// Optional auth-method id; threaded into `AcpConfig::auth_method`. Absent =
-    /// the first method the agent advertises at `initialize`.
-    #[serde(default)]
-    pub auth_method: Option<String>,
-    /// Optional absolute working directory the agent runs sessions in. Absent =
-    /// the bridge's current working directory (resolved at startup). See
-    /// [`AgentConfig::resolve_cwd`].
-    #[serde(default)]
-    pub cwd: Option<String>,
-}
-
-impl AgentConfig {
-    /// Resolve the agent `cwd`: the configured value if present, otherwise the
-    /// process's current working directory. The result MUST be absolute (ACP §11A
-    /// requires an absolute `cwd` for `session/new`); a configured relative path is
-    /// joined onto the current directory to make it absolute.
-    pub fn resolve_cwd(&self) -> std::io::Result<std::path::PathBuf> {
-        match &self.cwd {
-            Some(c) => {
-                let p = std::path::PathBuf::from(c);
-                if p.is_absolute() {
-                    Ok(p)
-                } else {
-                    Ok(std::env::current_dir()?.join(p))
-                }
-            }
-            None => std::env::current_dir(),
-        }
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_addr")]
     pub addr: String,
@@ -137,18 +85,6 @@ fn expand_env(s: &str) -> Result<String, ConfigError> {
     Ok(result)
 }
 
-impl Config {
-    pub fn parse(s: &str) -> Result<Self, ConfigError> {
-        let mut cfg: Config = toml::from_str(s)?;
-        // Expand env vars in delegation strings after deserialization.
-        if let Some(d) = cfg.delegation.as_mut() {
-            d.peer_url = expand_env(&d.peer_url)?;
-            d.auth = expand_env(&d.auth)?;
-        }
-        Ok(cfg)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Multi-agent registry config (Task 7 / Increment 3b).
 // Parses a TOML with `[[agents]]` array + optional `[registry]` section.
@@ -157,7 +93,6 @@ impl Config {
 
 /// Top-level TOML structure for the multi-agent bridge config.
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)] // wired to main in Task 12
 pub struct RegistryConfig {
     pub default: String,
     #[serde(default)]
@@ -171,7 +106,6 @@ pub struct RegistryConfig {
 
 /// `[registry]` section — optional; controls which cmds are allowed.
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)] // wired to main in Task 12
 pub struct RegistrySection {
     #[serde(default)]
     pub allowed_cmds: Vec<String>,
@@ -180,7 +114,6 @@ pub struct RegistrySection {
 /// One entry in the `[[agents]]` array, as parsed from TOML.
 /// String fields are converted to typed domain values in `into_snapshot`.
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)] // wired to main in Task 12
 pub struct AgentEntryToml {
     pub id: String,
     pub cmd: String,
@@ -211,13 +144,18 @@ pub struct AgentEntryToml {
     pub extensions: BTreeMap<String, toml::Value>,
 }
 
-#[allow(dead_code)] // wired to main in Task 12
 impl RegistryConfig {
     /// Parse a multi-agent TOML string into a `RegistryConfig`.
-    /// Mirrors `Config::parse` (TOML deserialization; env-expansion of `[delegation]`
-    /// is NOT applied here — Task 12 can add it when wiring to main).
+    /// TOML deserialization plus env-expansion of the `[delegation]` `peer_url`/`auth`
+    /// strings (so a `${PEER_TOKEN}`-style secret is resolved from the environment,
+    /// matching the inbound-server expectation that the auth header is already concrete).
     pub fn parse(s: &str) -> Result<Self, ConfigError> {
-        Ok(toml::from_str(s)?)
+        let mut cfg: RegistryConfig = toml::from_str(s)?;
+        if let Some(d) = cfg.delegation.as_mut() {
+            d.peer_url = expand_env(&d.peer_url)?;
+            d.auth = expand_env(&d.auth)?;
+        }
+        Ok(cfg)
     }
 
     /// Convert this parsed config into a `RegistrySnapshot` with typed domain values.
@@ -269,7 +207,6 @@ impl RegistryConfig {
 
 /// Parse an effort-level string into the `Effort` enum.
 /// Valid inputs (case-sensitive): "minimal", "low", "medium", "high", "max".
-#[allow(dead_code)] // wired to main in Task 12
 fn parse_effort(s: &str) -> Result<Effort, ConfigError> {
     Ok(match s {
         "minimal" => Effort::Minimal,
@@ -308,12 +245,10 @@ fn parse_effort(s: &str) -> Result<Effort, ConfigError> {
 
 /// File-backed [`ConfigSource`](bridge_core::ports::ConfigSource): loads a
 /// `RegistrySnapshot` from a TOML file and watches its parent directory for edits.
-#[allow(dead_code)] // wired to main in Task 12
 pub struct FileConfigSource {
     path: std::path::PathBuf,
 }
 
-#[allow(dead_code)] // wired to main in Task 12
 impl FileConfigSource {
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
         Self { path: path.into() }
@@ -452,70 +387,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_minimal_toml() {
-        let c =
-            Config::parse("[agent]\nname=\"kiro\"\ncmd=\"kiro-cli\"\nargs=[\"acp\"]\n[server]\n")
-                .unwrap();
-        assert_eq!(c.agent.name, "kiro");
-        assert_eq!(c.agent.cmd, "kiro-cli");
-        assert_eq!(c.agent.args, vec!["acp"]);
-        assert_eq!(c.server.addr, "127.0.0.1:8080");
-    }
-
-    #[test]
-    fn config_without_delegation_still_valid() {
-        let c = Config::parse("[agent]\nname=\"k\"\ncmd=\"k\"\nargs=[]\n[server]\n").unwrap();
-        assert!(c.delegation.is_none());
-    }
-
-    #[test]
     fn delegation_parsed_with_env_expansion() {
         std::env::set_var("PEER_TOKEN_T10", "sek");
-        let c = Config::parse("[agent]\nname=\"k\"\ncmd=\"k\"\nargs=[]\n[server]\n[delegation]\npeer_url=\"http://p\"\nauth=\"bearer:${PEER_TOKEN_T10}\"\n").unwrap();
+        let c = RegistryConfig::parse(
+            "default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\nargs=[]\n[server]\n\
+             [delegation]\npeer_url=\"http://p\"\nauth=\"bearer:${PEER_TOKEN_T10}\"\n",
+        )
+        .unwrap();
         let d = c.delegation.unwrap();
         assert_eq!(d.peer_url, "http://p");
         assert_eq!(d.auth, "bearer:sek");
     }
 
     #[test]
-    fn config_parses_optional_agent_model_mode_cwd() {
-        // An [agent] section with model/mode/cwd/auth_method is accepted and
-        // threaded onto AgentConfig.
-        let c = Config::parse(
-            "[agent]\nname=\"codex\"\ncmd=\"codex\"\nargs=[\"acp\"]\n\
-             model=\"gpt-x\"\nmode=\"yolo\"\nauth_method=\"oauth\"\ncwd=\"/work/dir\"\n[server]\n",
+    fn config_without_delegation_still_valid() {
+        let c = RegistryConfig::parse(
+            "default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\nargs=[]\n[server]\n",
         )
         .unwrap();
-        assert_eq!(c.agent.model.as_deref(), Some("gpt-x"));
-        assert_eq!(c.agent.mode.as_deref(), Some("yolo"));
-        assert_eq!(c.agent.auth_method.as_deref(), Some("oauth"));
-        assert_eq!(c.agent.cwd.as_deref(), Some("/work/dir"));
-        // A configured absolute cwd resolves to itself (absolute).
-        let resolved = c.agent.resolve_cwd().unwrap();
-        assert_eq!(resolved, std::path::PathBuf::from("/work/dir"));
-        assert!(resolved.is_absolute());
-    }
-
-    #[test]
-    fn config_agent_model_mode_cwd_are_optional() {
-        // Absence of model/mode/cwd/auth_method is fine; cwd resolves to the
-        // process current dir (absolute) when unset.
-        let c = Config::parse("[agent]\nname=\"k\"\ncmd=\"k\"\nargs=[]\n[server]\n").unwrap();
-        assert!(c.agent.model.is_none());
-        assert!(c.agent.mode.is_none());
-        assert!(c.agent.auth_method.is_none());
-        assert!(c.agent.cwd.is_none());
-        let resolved = c.agent.resolve_cwd().unwrap();
-        assert!(
-            resolved.is_absolute(),
-            "default cwd (current_dir) must be absolute: {resolved:?}"
-        );
+        assert!(c.delegation.is_none());
+        assert_eq!(c.server.addr, "127.0.0.1:8080");
     }
 
     #[test]
     fn missing_env_var_errors() {
-        let r = Config::parse("[agent]\nname=\"k\"\ncmd=\"k\"\nargs=[]\n[server]\n[delegation]\npeer_url=\"http://p\"\nauth=\"bearer:${DEFINITELY_UNSET_VAR_XYZ}\"\n");
-        assert!(r.is_err());
+        let r = RegistryConfig::parse(
+            "default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\nargs=[]\n[server]\n\
+             [delegation]\npeer_url=\"http://p\"\nauth=\"bearer:${DEFINITELY_UNSET_VAR_XYZ}\"\n",
+        );
+        assert!(matches!(r, Err(ConfigError::MissingEnvVar(_))));
     }
 
     // -----------------------------------------------------------------------

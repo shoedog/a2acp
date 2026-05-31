@@ -1493,11 +1493,16 @@ fn task_meta_from_params(params: &Value) -> Result<TaskMeta, BridgeError> {
         .map(|s| s.to_string());
 
     // Agent: if the key is present, parse it (rejects empty → InvalidRequest); if absent → None.
+    // Remap the AgentId newtype's `field: "AgentId"` to the wire field name `"agent"`
+    // so the JSON-RPC error points at the `a2a-bridge.agent` metadata key (Task-9 nit).
     let agent = match metadata
         .and_then(|md| md.get("a2a-bridge.agent"))
         .and_then(|v| v.as_str())
     {
-        Some(s) => Some(bridge_core::ids::AgentId::parse(s)?),
+        Some(s) => Some(
+            bridge_core::ids::AgentId::parse(s)
+                .map_err(|_| BridgeError::InvalidRequest { field: "agent" })?,
+        ),
         None => None,
     };
 
