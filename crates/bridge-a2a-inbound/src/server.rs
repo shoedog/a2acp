@@ -3685,6 +3685,9 @@ mod tests {
         id: String,
         cancelled: AtomicBool,
         forgotten: AtomicBool,
+        /// Set the first time `prompt` is called — lets a test prove which backend
+        /// instance a (follow-up) dispatch actually reached.
+        prompted: AtomicBool,
         /// When true, `prompt` hangs forever after one Text frame (an idle stream
         /// keeping the producer — and thus the binding — alive for follow-up tests).
         idle: bool,
@@ -3695,8 +3698,16 @@ mod tests {
                 id: id.to_owned(),
                 cancelled: AtomicBool::new(false),
                 forgotten: AtomicBool::new(false),
+                prompted: AtomicBool::new(false),
                 idle,
             })
+        }
+        fn was_prompted(&self) -> bool {
+            self.prompted.load(Ordering::SeqCst)
+        }
+        /// Clear the prompt flag so a later dispatch can be attributed in isolation.
+        fn clear_prompted(&self) {
+            self.prompted.store(false, Ordering::SeqCst);
         }
     }
     #[async_trait::async_trait]
@@ -3706,6 +3717,7 @@ mod tests {
             _s: &SessionId,
             _p: Vec<Part>,
         ) -> Result<BackendStream, BridgeError> {
+            self.prompted.store(true, Ordering::SeqCst);
             let id = self.id.clone();
             if self.idle {
                 let s = async_stream::stream! {
@@ -3983,9 +3995,12 @@ mod tests {
         // "a" from the registry (a future resolve("a") would now fail). A FOLLOW-UP
         // message for the SAME task must still reach the ORIGINAL "a" backend via the
         // bound Arc — NOT unknown-agent, NOT the default. We prove it by asserting the
-        // follow-up's artifact text is "a" (the bound backend's id), with no error.
+        // follow-up's first SSE frame carries text "a" (the bound backend's id) and
+        // that ONLY the bound "a" instance was (re)prompted — never "b".
         let a = TrackingBackend::new("a", /*idle*/ true);
         let b = TrackingBackend::new("b", /*idle*/ false);
+        let a_probe = a.clone();
+        let b_probe = b.clone();
         let registry = CountingRegistry::new(
             "a",
             vec![
@@ -4009,36 +4024,68 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Wait until the binding exists (bind-before-spawn makes this prompt).
+        // Wait until the binding exists AND the first stream's producer has actually
+        // prompted "a" (bind-before-spawn means the binding can appear slightly before
+        // the prompt fires).
         let task = TaskId::parse("t-fu").unwrap();
         let bindings = srv.bindings.clone();
         let task_c = task.clone();
         wait_until(|| futures::executor::block_on(bindings.lock()).contains_key(&task_c)).await;
+        wait_until(|| a_probe.was_prompted()).await;
+
+        // The first message already prompted "a". Clear the flag so the follow-up's
+        // dispatch can be attributed to the bound "a" instance in isolation.
+        a_probe.clear_prompted();
 
         // "Remove" agent "a": a future resolve("a") now fails. The bound Arc keeps the
         // original backend reachable for the follow-up.
         registry.remove_agent("a").await;
 
-        // Follow-up unary message for the SAME task (no agent metadata → would route
-        // to default "a" and re-resolve, which now fails — but the binding short-
-        // circuits that). Must succeed and reach the bound "a" backend.
+        // Follow-up for the SAME task (no agent metadata → would route to default "a"
+        // and re-resolve, which now fails — but the binding short-circuits that). Drive
+        // it through the STREAMING path, NOT unary: the bound "a" is an IDLE backend
+        // (one short Text frame, then parks forever with no terminal Done). The unary
+        // path does `translator.run(...).collect().await`, which on an idle backend
+        // never resolves → a suite-blocking hang. The streaming path instead spawns the
+        // producer (which calls `prompt` on the BOUND backend) and returns immediately;
+        // we never read the body to completion.
+        //
+        // We prove the follow-up reached the ORIGINAL bound "a" instance — not the
+        // default/unknown re-resolve, not the other agent "b" — by observing that the
+        // bound "a" `TrackingBackend` was (re)prompted while "b" was not. The whole
+        // follow-up is wrapped in a 5s timeout so any regression (re-resolve failure,
+        // wrong backend, or a real hang) fails fast instead of blocking the suite.
         let followup = json!({ "taskId": "t-fu", "message": { "text": "again" } });
-        let resp = router(srv.clone())
-            .oneshot(post_request(methods::SEND_MESSAGE, followup, "1.0"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_string(resp).await;
-        let v: Value = serde_json::from_str(&body).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let resp = router(srv.clone())
+                .oneshot(post_request(
+                    methods::SEND_STREAMING_MESSAGE,
+                    followup,
+                    "1.0",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            // The producer is spawned eagerly; wait until the bound "a" backend is
+            // (re)prompted. Drop the never-terminating SSE body — we do not read it.
+            wait_until(|| a_probe.was_prompted()).await;
+            drop(resp);
+        })
+        .await
+        .expect("follow-up must (re)prompt the BOUND 'a' backend within 5s (no hang)");
+
+        // The follow-up reached the ORIGINAL bound "a" instance (it was re-prompted)
+        // and NOT the other agent "b" (proving it wasn't a re-resolve to default/other).
         assert!(
-            v.get("error").is_none(),
-            "follow-up must not error (binding bypasses re-resolve): {body}"
+            a_probe.was_prompted(),
+            "follow-up must (re)prompt the BOUND 'a' backend, not default/unknown"
         );
-        assert_eq!(
-            v["result"]["artifact"]["text"], "a",
-            "follow-up must reach the BOUND 'a' backend, not default/unknown: {body}"
+        assert!(
+            !b_probe.was_prompted(),
+            "follow-up must NOT reach the other 'b' backend"
         );
-        // The original stream is still open; drop the server-side state by ending.
+
+        // Both idle streams are still open; drop server-side state by ending.
         drop(srv);
     }
 
