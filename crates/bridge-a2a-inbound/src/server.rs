@@ -98,6 +98,10 @@ impl Drop for BindingGuard {
         let task = self.task.clone();
         let session = self.session.clone();
         let backend = self.backend.clone();
+        // Note: the spawn-in-Drop pattern means an eviction enqueued during runtime
+        // shutdown may not run (the Tokio runtime may be torn down before the task
+        // executes), leaving the binding and lease un-evicted. This is acceptable for
+        // a single-process bridge that is exiting anyway.
         tokio::spawn(async move {
             // Take the binding out of the map and drop its Lease explicitly → the
             // slot's active-task count decrements. Then forget the per-session stash.
@@ -302,9 +306,9 @@ async fn resolve_configure_bind(
     overrides: Option<&AgentOverride>,
 ) -> Result<LocalDispatch, BridgeError> {
     // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
-    // route/resolve/recompute. Reapply the bound effective config to the session
-    // (idempotent re-stash) so the follow-up runs under the SAME config the task was
-    // bound with, then prompt the bound backend.
+    // route/resolve/recompute. Re-stash the bound effective config (harmless
+    // idempotent overwrite; per T6 it only affects a not-yet-minted session, never
+    // retroactively re-configures a live one), then prompt the bound backend.
     {
         let bindings = srv.bindings.lock().await;
         if let Some(binding) = bindings.get(task) {
@@ -367,10 +371,22 @@ async fn resolve_for_fanout(
 /// — the one driving the task — so a multi-agent or post-reload cancel never hits the
 /// WRONG backend (the spec-critical property the default-fallback violated).
 ///
-/// The fallback to resolving the registry default remains ONLY for the genuinely-no-
-/// binding case: a cancel that arrives after the binding was already evicted (the task
-/// is no longer a live local task), or a fan-out cancel whose backend is pre-seeded in
-/// the store rather than bound. For a live local task the binding always wins.
+/// When no `TaskBinding` exists, the function resolves the **registry default** agent
+/// as a fallback (calls `registry.default_id()` then `registry.resolve()`). This
+/// covers two legitimate no-binding cases: (1) a cancel that arrives after the binding
+/// was already evicted (the task completed/failed/was-canceled and is no longer a live
+/// local task), and (2) a fan-out task's Kiro cancel, which never creates a
+/// `TaskBinding` (fan-out uses `resolve_for_fanout` instead). There is no store
+/// read here — the fallback goes directly to the registry.
+///
+/// // TODO(3d): In 3b a `Fanout` route's local agent IS always the registry default
+/// // (`local_agent_id` returns `default_id()` for any non-Local target, and the
+/// // router returns `RouteTarget::Fanout` for fan-out tasks). So resolving the
+/// // registry default here cancels the correct backend. When Increment 3d adds
+/// // fan-out across NON-default registered agents, a fan-out cancel must target the
+/// // specific instance that drove each source (e.g. via the held backend from
+/// // `resolve_for_fanout`, or a per-source binding), NOT the registry default —
+/// // otherwise it cancels the wrong backend for any non-default fan-out leg.
 async fn cancel_backend_for(
     srv: &InboundServer,
     task: &TaskId,
@@ -378,6 +394,8 @@ async fn cancel_backend_for(
     if let Some(binding) = srv.bindings.lock().await.get(task) {
         return Ok(binding.backend.clone());
     }
+    // Fallback: no binding exists — resolve the registry default agent.
+    // See function doc for the two legitimate no-binding cases this covers.
     let default = srv.registry.default_id();
     Ok(srv.registry.resolve(&default).await?.backend)
 }
