@@ -88,10 +88,19 @@ async fn main() -> Result<(), BoxError> {
     };
 
     // 6. Construct the inbound server and build its axum router.
-    //    InboundServer::new(backend, store, policy, route, auth, base_url, delegation)
+    //    InboundServer::new(backend, store, policy, route, auth, base_url, delegation, local_source_label)
+    // The local-source label (wire-observable in fan-out artifacts) comes from
+    // `[agent] name` so a non-Kiro agent (e.g. codex) isn't mislabeled "kiro".
     let base_url = format!("http://{}", cfg.server.addr);
     let server = Arc::new(InboundServer::new(
-        backend, store, policy, route, auth, base_url, delegation,
+        backend,
+        store,
+        policy,
+        route,
+        auth,
+        base_url,
+        delegation,
+        cfg.agent.name.clone(),
     ));
     let router = server.router();
 

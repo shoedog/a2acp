@@ -1,5 +1,11 @@
 // replay.rs — streaming raw-NDJSON replay backend for testing the translator (Task 11).
 // Feeds bytes through the real FrameReader so the parse boundary is exercised.
+//
+// TRANSLATOR-ONLY TEST DOUBLE: `ReplayBackend` is NOT the real ACP backend
+// (`AcpBackend`, Increment 3a). It implements `AgentBackend` purely to drive the
+// translator / fan-out pipeline from canned NDJSON in integration + e2e tests
+// (`integration_inbound_kiro`, `integration_fanout`, `e2e_fanout_bridge`). It does
+// not speak ACP over a child process — don't mistake it for production wiring.
 
 use std::pin::Pin;
 

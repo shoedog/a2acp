@@ -109,6 +109,7 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
         Arc::new(AlwaysGrant),
         "http://127.0.0.1:0", // placeholder; real URL built after bind
         Arc::new(StubDelegation),
+        "kiro",
     ));
     let router_b = server_b.router();
     let url_b = serve_on_ephemeral_port(router_b).await;
@@ -139,6 +140,7 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
         Arc::new(AlwaysGrant),
         "http://127.0.0.1:0", // placeholder
         delegation_a,
+        "kiro",
     ));
     let router_a = server_a.router();
     let url_a = serve_on_ephemeral_port(router_a).await;

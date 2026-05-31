@@ -268,6 +268,7 @@ async fn delegate_skill_round_trips_through_peer() {
         auth,
         "http://localhost:8080",
         delegation,
+        "kiro",
     ));
     let router = server.router();
 

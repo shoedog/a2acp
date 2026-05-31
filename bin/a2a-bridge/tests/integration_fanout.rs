@@ -259,6 +259,7 @@ fn build_fanout_server(peer_url: &str) -> axum::Router {
         auth,
         "http://localhost:8080",
         delegation,
+        "kiro",
     ));
     server.router()
 }

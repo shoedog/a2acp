@@ -63,6 +63,10 @@ pub struct InboundServer {
     auth: Arc<dyn AuthMiddleware>,
     base_url: String,
     delegation: Arc<dyn DelegationPort>,
+    /// Wire-observable label for the LOCAL backend's fan-out source (e.g. `"kiro"`,
+    /// `"codex"`). Fed from `[agent] name` so a non-Kiro agent isn't mislabeled in
+    /// fan-out artifacts. Used by [`local_kiro_source`] for the local `Source` id.
+    local_source_label: String,
     /// Single-cancel guard: the set of local task ids whose upstream peer
     /// `CancelTask` has already been POSTed. An inbound `CancelTask` (the
     /// `cancel_task()` handler) and the streaming cancel supervisor both race to
@@ -75,7 +79,9 @@ pub struct InboundServer {
 }
 
 impl InboundServer {
-    /// Construct a server from the six pipeline ports and the advertised base URL.
+    /// Construct a server from the six pipeline ports, the advertised base URL,
+    /// and the local-source label (the fan-out id for the local backend).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend: Arc<dyn AgentBackend>,
         store: Arc<dyn SessionStore>,
@@ -84,6 +90,7 @@ impl InboundServer {
         auth: Arc<dyn AuthMiddleware>,
         base_url: impl Into<String>,
         delegation: Arc<dyn DelegationPort>,
+        local_source_label: impl Into<String>,
     ) -> Self {
         Self {
             backend,
@@ -93,6 +100,7 @@ impl InboundServer {
             auth,
             base_url: base_url.into(),
             delegation,
+            local_source_label: local_source_label.into(),
             cancelled_peers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
@@ -450,6 +458,7 @@ async fn poll_cancel_requested(store: &dyn SessionStore, local: &TaskId) {
 /// Build a `Source` for the local Kiro backend by running the Translator inside an
 /// `async_stream::stream!` that owns all the `Arc` clones it needs — no lifetime fight.
 fn local_kiro_source(
+    label: String,
     backend: Arc<dyn AgentBackend>,
     store: Arc<dyn SessionStore>,
     policy: Arc<dyn PolicyEngine>,
@@ -472,7 +481,7 @@ fn local_kiro_source(
             yield ev;
         }
     });
-    Source::from_stream("kiro", stream)
+    Source::from_stream(label, stream)
 }
 
 /// Spawn the fan-out producer: build a Kiro source and a peer source, then run
@@ -487,6 +496,7 @@ fn spawn_fanout_producer(
     let policy = srv.policy.clone();
     let delegation = srv.delegation.clone();
     let guard = srv.cancelled_peers.clone();
+    let local_source_label = srv.local_source_label.clone();
     let task = routed.task;
     let session = routed.session;
     let parts = routed.parts.clone();
@@ -500,6 +510,7 @@ fn spawn_fanout_producer(
         // 1. Build the local Kiro source. We KEEP its cancel handle (the session)
         //    so the supervisor can cancel Kiro immediately, never awaiting the peer.
         let kiro_source = local_kiro_source(
+            local_source_label,
             backend.clone(),
             store.clone(),
             policy,
@@ -806,6 +817,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
 
     // Build the local Kiro source.
     let kiro_source = local_kiro_source(
+        srv.local_source_label.clone(),
         srv.backend.clone(),
         srv.store.clone(),
         srv.policy.clone(),
@@ -1471,6 +1483,7 @@ mod tests {
             auth,
             "http://localhost:8080",
             Arc::new(NoDelegation),
+            "kiro",
         ))
     }
 
@@ -1489,6 +1502,7 @@ mod tests {
             Arc::new(AlwaysGrant),
             "http://localhost:8080",
             delegation,
+            "kiro",
         ))
     }
 
@@ -2265,6 +2279,17 @@ mod tests {
         store: Arc<dyn SessionStore>,
         delegation: Arc<dyn DelegationPort>,
     ) -> Arc<InboundServer> {
+        build_fanout_labeled(backend, store, delegation, "kiro")
+    }
+
+    /// Like [`build_fanout`] but with an explicit local-source label so a test can
+    /// assert the fan-out local source is labeled from config (e.g. `"codex"`).
+    fn build_fanout_labeled(
+        backend: Arc<dyn AgentBackend>,
+        store: Arc<dyn SessionStore>,
+        delegation: Arc<dyn DelegationPort>,
+        local_source_label: &str,
+    ) -> Arc<InboundServer> {
         Arc::new(InboundServer::new(
             backend,
             store,
@@ -2273,6 +2298,7 @@ mod tests {
             Arc::new(AlwaysGrant),
             "http://localhost:8080",
             delegation,
+            local_source_label.to_string(),
         ))
     }
 
@@ -2357,6 +2383,65 @@ mod tests {
             ),
             "final fan-out frame must be terminal statusUpdate(Completed): {:?}",
             payloads.last()
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_local_source_labeled_from_config() {
+        // The local-source label is fed from `[agent] name`, not hardcoded "kiro".
+        // With a "codex" agent the fan-out local artifact must be labeled "codex".
+        let deleg = FakeDelegation::new(
+            vec![Ok(Event::status("work")), Ok(Event::artifact("PEER"))],
+            Some("p1"),
+        );
+        let srv = build_fanout_labeled(
+            FakeBackend::new(),
+            Arc::new(FakeStore::default()),
+            deleg,
+            "codex",
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                fanout_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let payloads = sse_data_payloads(&body);
+        let parsed: Vec<a2a::StreamResponse> = payloads
+            .iter()
+            .map(|p| serde_json::from_str(p).expect("payload parses as StreamResponse"))
+            .collect();
+
+        // The local source's artifact must be labeled "codex" (wire-observable),
+        // and NOT "kiro".
+        let has_codex_artifact = parsed.iter().any(|sr| {
+            matches!(sr, a2a::StreamResponse::ArtifactUpdate(e)
+                if e.metadata.as_ref()
+                    .and_then(|m| m.get("a2a-bridge.source"))
+                    .and_then(|v| v.as_str())
+                    == Some("codex")
+            )
+        });
+        assert!(
+            has_codex_artifact,
+            "fan-out local source must be labeled 'codex' (from agent.name): {body}"
+        );
+        let has_kiro_artifact = parsed.iter().any(|sr| {
+            matches!(sr, a2a::StreamResponse::ArtifactUpdate(e)
+                if e.metadata.as_ref()
+                    .and_then(|m| m.get("a2a-bridge.source"))
+                    .and_then(|v| v.as_str())
+                    == Some("kiro")
+            )
+        });
+        assert!(
+            !has_kiro_artifact,
+            "no source should be hardcoded 'kiro' when agent.name is 'codex': {body}"
         );
     }
 
