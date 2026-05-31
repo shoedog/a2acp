@@ -1,32 +1,33 @@
-// acp_backend.rs — AcpBackend: drives an ACP agent child process over JSON-RPC line-framed stdio.
-// Spec §5.3 cancellation rule: completion is the prompt RESULT (stopReason:"cancelled"),
-// NOT the act of sending session/cancel. See Codex finding 2.
+// acp_backend.rs — AcpBackend: a conformant ACP *client* over the
+// `agent-client-protocol` SDK (=0.12.1). It drives `initialize`, lazy
+// `session/new`, streaming `session/prompt` (fan-in of `session/update`
+// notifications), and `session/cancel`.
+//
+// Spec §5.3 cancellation rule: completion is the prompt RESULT (stopReason
+// "cancelled"), NOT the act of sending session/cancel. See Codex finding 2.
+// Full cancel *completion* semantics live in Task 4; Task 3's `cancel` only
+// latches + sends the notification.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, AuthMethod, CancelNotification, InitializeRequest, InitializeResponse,
-    NewSessionRequest, ProtocolVersion, SessionId as AgentSessionId,
+    AgentCapabilities, AuthMethod, CancelNotification, ContentBlock, InitializeRequest,
+    InitializeResponse, NewSessionRequest, PromptRequest, ProtocolVersion,
+    SessionId as AgentSessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use async_trait::async_trait;
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{oneshot, Mutex, OnceCell};
+use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{AgentBackend, BackendStream, Update};
 
-use crate::framing::FrameReader;
-use crate::replay::frame_to_update;
 use crate::supervisor::Supervised;
-
-const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Default bound on the `initialize` handshake. A real agent that connects its
 /// stdio but never sends the initialize response would otherwise hang
@@ -64,17 +65,29 @@ impl Default for AcpConfig {
     }
 }
 
-// ── Legacy (v1, scripted-only) inner state ──────────────────────────────────
+// ── Streaming routing registry ───────────────────────────────────────────────
 //
-// Retained verbatim so the renamed type keeps the v1 `prompt`/`cancel` behavior
-// green for the inline scripted tests and the gated e2es while the conformant
-// SDK `prompt`/`cancel` are built in Increment 3a Tasks 2–4. Only populated by
-// `from_child`; the SDK constructors (`spawn`/`connect`) leave it `None`.
+// `session/update` notifications are delivered by the SDK on its event-loop
+// task: a notification handler registered on the `Client.builder()`. That
+// handler runs INSIDE the loop, so it MUST NOT call `cx` / block — it may only
+// forward. We route each turn's chunks to its driver via an mpsc keyed by the
+// agent session id.
+//
+// The lock is a plain `std::sync::Mutex` (NOT the async `tokio::Mutex`): the
+// handler only does a `get` + non-blocking `send` under it, never awaits while
+// holding it, so a non-async lock is correct and avoids `.await` in the handler.
+type UpdateSender = mpsc::UnboundedSender<TurnEvent>;
+type UpdateRegistry = Arc<StdMutex<HashMap<AgentSessionId, UpdateSender>>>;
 
-struct Inner {
-    stdin: ChildStdin,
-    reader: FrameReader<BufReader<ChildStdout>>,
-    supervised: Supervised,
+/// What the notification handler forwards to a turn's driver/stream. Kept
+/// minimal: only the variants the bridge models today. Unmodeled
+/// `SessionUpdate` variants are dropped by the handler (tolerant reader).
+enum TurnEvent {
+    /// A streamed chunk of the agent's textual response.
+    Text(String),
+    /// The terminal turn result. Pushed by the driver after the `PromptResponse`
+    /// arrives, carrying the mapped `Update::Done`. Always the last event.
+    Done(Update),
 }
 
 // ── SDK connection handle ────────────────────────────────────────────────────
@@ -97,6 +110,11 @@ struct AcpConn {
     /// lets the loop task exit cleanly. Tasks 2+ may signal it explicitly to
     /// drive shutdown / terminate.
     _shutdown: oneshot::Sender<()>,
+    /// Per-turn chunk routing: agent session id → the `Sender` for the turn
+    /// currently streaming on that session. Shared with the notification handler
+    /// closure registered in `connect`. `prompt` registers a `Sender` here
+    /// BEFORE sending `session/prompt` and removes it once the turn ends.
+    updates: UpdateRegistry,
 }
 
 // ── Per-bridge-session agent state ───────────────────────────────────────────
@@ -120,9 +138,11 @@ struct AgentSession {
     /// The agent-minted session id, set exactly once by the `session/new` that
     /// `ensure_session` drives. `OnceCell` guarantees single init under races.
     agent_id: OnceCell<AgentSessionId>,
-    /// Per-session turn lock. Held for the duration of a prompt turn (Task 3) so
-    /// turns on one agent session run strictly sequentially.
-    turn_lock: Mutex<()>,
+    /// Per-session turn lock. Held for the duration of a prompt turn so turns on
+    /// one agent session run strictly sequentially. `Arc<Mutex<()>>` (not a bare
+    /// field) so `prompt` can take an OWNED guard (`lock_owned`) and move it into
+    /// the driver task that holds it for the whole streamed turn.
+    turn_lock: Arc<Mutex<()>>,
     /// Cancel latch: set by `request_cancel` when a cancel arrives before the
     /// agent session exists, so the minting task can fire `session/cancel` as
     /// soon as the id is known.
@@ -133,7 +153,7 @@ impl AgentSession {
     fn new() -> Self {
         Self {
             agent_id: OnceCell::new(),
-            turn_lock: Mutex::new(()),
+            turn_lock: Arc::new(Mutex::new(())),
             cancel_requested: AtomicBool::new(false),
         }
     }
@@ -142,19 +162,18 @@ impl AgentSession {
 // ── Public struct ────────────────────────────────────────────────────────────
 
 pub struct AcpBackend {
-    /// Legacy scripted path state (`from_child` only). `None` on the SDK path.
-    inner: Option<Arc<Mutex<Inner>>>,
-    /// SDK connection handle (`spawn`/`connect` only). `None` on the legacy path.
+    /// SDK connection handle. Always present (all constructors build the SDK
+    /// connection); `Option` only so the `cx()`/`updates()` accessors have a
+    /// clean error seam if a future constructor ever leaves it unset.
     conn: Option<AcpConn>,
     /// The spawned `Supervised` child, held for the whole backend lifetime so
     /// `kill_on_drop(true)` does not SIGKILL it the instant `spawn` returns.
-    /// `Some` only on the `spawn` (production) path; `None` on `connect`
-    /// (in-process transport) and the legacy `from_child` path. Task 2 reads it
-    /// for explicit `terminate()`.
+    /// `Some` on the `spawn`/`from_child` paths (we own the child); `None` on
+    /// `connect` (in-process transport). Task 4 reads it for explicit
+    /// `terminate()` on cancel-timeout.
     supervised: Option<Supervised>,
     id_counter: Arc<AtomicU64>,
-    /// Static config (cwd for `session/new`, model/mode for later tasks). `None`
-    /// on the legacy (`from_child`) path which never mints SDK sessions.
+    /// Static config (cwd for `session/new`, model/mode for later tasks).
     config: Option<AcpConfig>,
     /// bridge-session-key → per-session agent state. The map itself is behind a
     /// `Mutex` held ONLY long enough to look up / insert the `Arc<AgentSession>`;
@@ -187,6 +206,26 @@ impl AcpBackend {
     #[must_use]
     pub fn new_session_request(cwd: impl Into<PathBuf>) -> NewSessionRequest {
         NewSessionRequest::new(cwd).mcp_servers(vec![])
+    }
+
+    /// Build the `session/prompt` request the backend sends for a turn: the
+    /// agent session id plus each bridge `Part` mapped to a tagged text
+    /// `ContentBlock`. ACP §11A: the wire field is `prompt` (an array of tagged
+    /// content blocks), NOT `parts`.
+    ///
+    /// Exposed so the wire-golden test can assert the serialized `params` shape
+    /// (`{"sessionId":<id>,"prompt":[{"type":"text","text":<t>}]}`) against the
+    /// SAME value `prompt` transmits — not a re-derivation of the SDK type.
+    #[must_use]
+    pub fn prompt_request(
+        agent_id: AgentSessionId,
+        parts: &[bridge_core::domain::Part],
+    ) -> PromptRequest {
+        let blocks: Vec<ContentBlock> = parts
+            .iter()
+            .map(|p| ContentBlock::Text(TextContent::new(p.text.clone())))
+            .collect();
+        PromptRequest::new(agent_id, blocks)
     }
 
     /// **Production** constructor: spawn `cmd args` as a `Supervised` child
@@ -223,6 +262,11 @@ impl AcpBackend {
         let (cx_tx, cx_rx) = oneshot::channel::<ConnectionTo<Agent>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+        // Per-turn chunk routing registry, shared between the notification
+        // handler (below) and `prompt` (which registers/unregisters senders).
+        let updates: UpdateRegistry = Arc::new(StdMutex::new(HashMap::new()));
+        let updates_handler = Arc::clone(&updates);
+
         // The event loop owns a long-lived task. `main_fn` publishes a clone of
         // `cx` and then parks on `shutdown_rx` so the connection stays open for
         // the lifetime of the backend (returning from `main_fn` would close it).
@@ -230,6 +274,33 @@ impl AcpBackend {
             let _ = Client
                 .builder()
                 .name("a2a-bridge")
+                // `session/update` fan-in. This runs ON the event loop, so it
+                // must NEVER call `cx`/block — it only routes a chunk to the
+                // matching turn's mpsc and returns. Unmodeled `SessionUpdate`
+                // variants are dropped (tolerant reader). A `send` failure
+                // (receiver gone: turn already ended) is ignored.
+                .on_receive_notification(
+                    move |notif: SessionNotification, _cx| {
+                        let updates = Arc::clone(&updates_handler);
+                        async move {
+                            if let SessionUpdate::AgentMessageChunk(chunk) = notif.update {
+                                if let ContentBlock::Text(t) = chunk.content {
+                                    // Plain get + non-blocking send under a
+                                    // std::Mutex: no await is held across the lock.
+                                    if let Ok(map) = updates.lock() {
+                                        if let Some(tx) = map.get(&notif.session_id) {
+                                            let _ = tx.send(TurnEvent::Text(t.text));
+                                        }
+                                    }
+                                }
+                                // else: ignore non-text chunk content.
+                            }
+                            // else: ignore unmodeled SessionUpdate variants.
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
                 .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
                     // Hand a clone back to the AcpBackend; ignore send errors
                     // (receiver dropped => backend gone => nothing to drive).
@@ -262,12 +333,12 @@ impl AcpBackend {
             .map_err(|_| BridgeError::AgentCrashed)??;
 
         Ok(Self {
-            inner: None,
             conn: Some(AcpConn {
                 cx,
                 agent_capabilities: resp.agent_capabilities,
                 auth_methods: resp.auth_methods,
                 _shutdown: shutdown_tx,
+                updates,
             }),
             supervised: None,
             id_counter: Arc::new(AtomicU64::new(1)),
@@ -277,28 +348,32 @@ impl AcpBackend {
     }
 
     /// Negotiated agent capabilities from the most recent `initialize`.
-    /// `None` on the legacy (`from_child`) path.
     #[must_use]
     pub fn agent_capabilities(&self) -> Option<&AgentCapabilities> {
         self.conn.as_ref().map(|c| &c.agent_capabilities)
     }
 
     /// Authentication methods the agent advertised at `initialize`.
-    /// `None` on the legacy (`from_child`) path.
     #[must_use]
     pub fn auth_methods(&self) -> Option<&[AuthMethod]> {
         self.conn.as_ref().map(|c| c.auth_methods.as_slice())
     }
 
-    /// Access the SDK connection handle. Returns `Err(AgentCrashed)` on the
-    /// legacy (`from_child`) path where no SDK connection exists, so Task 2's
-    /// prompt routing gets a clean error seam instead of a panic inside the
-    /// event loop. Used by later tasks to send agent-bound requests.
-    #[allow(dead_code)]
+    /// Access the SDK connection handle. Returns `Err(AgentCrashed)` if no SDK
+    /// connection exists, so prompt routing gets a clean error seam instead of a
+    /// panic inside the event loop. Used to send agent-bound requests.
     fn cx(&self) -> Result<&ConnectionTo<Agent>, BridgeError> {
         self.conn
             .as_ref()
             .map(|c| &c.cx)
+            .ok_or(BridgeError::AgentCrashed)
+    }
+
+    /// The per-turn chunk routing registry shared with the notification handler.
+    fn updates(&self) -> Result<&UpdateRegistry, BridgeError> {
+        self.conn
+            .as_ref()
+            .map(|c| &c.updates)
             .ok_or(BridgeError::AgentCrashed)
     }
 
@@ -311,7 +386,6 @@ impl AcpBackend {
     /// async `lock().await` is held only for nanoseconds — there is no deadlock
     /// risk and no chance of holding the map lock across an await. (`try_lock`
     /// would PANIC if two tasks on different runtime threads raced here.)
-    #[allow(dead_code)] // wired into production prompt/cancel in Tasks 3/4
     async fn session_entry(&self, key: &SessionId) -> Arc<AgentSession> {
         let mut map = self.sessions.lock().await;
         if let Some(s) = map.get(key) {
@@ -342,8 +416,7 @@ impl AcpBackend {
     /// latch and sends. If `request_cancel` ran after the id became observable,
     /// it and the drain race on the same `swap` and exactly one sends.
     ///
-    /// Task 3 calls this, then acquires `turn_lock` and sends `session/prompt`.
-    #[allow(dead_code)] // wired into production prompt in Task 3
+    /// `prompt` calls this, then acquires `turn_lock` and sends `session/prompt`.
     async fn ensure_session(&self, key: &SessionId) -> Result<AgentSessionId, BridgeError> {
         let entry = self.session_entry(key).await;
         let cx = self.cx()?;
@@ -391,53 +464,6 @@ impl AcpBackend {
         Ok(id.clone())
     }
 
-    /// Ensure the session exists, then acquire its per-session turn lock and hold
-    /// it for the duration of `body`, passing `body` the agent session id. Turns
-    /// for one bridge session run STRICTLY SEQUENTIALLY [Cx-M2]: a second caller
-    /// blocks on `turn_lock` until the first releases.
-    ///
-    /// This is the seam Task 3's conformant `prompt` is built on: ensure → lock →
-    /// send `session/prompt` + stream updates, all inside `body`.
-    #[allow(dead_code)] // wired into production prompt in Task 3
-    async fn run_turn<F, Fut, T>(&self, key: &SessionId, body: F) -> Result<T, BridgeError>
-    where
-        F: FnOnce(AgentSessionId) -> Fut,
-        Fut: std::future::Future<Output = Result<T, BridgeError>>,
-    {
-        let entry = self.session_entry(key).await;
-        // Mint (or reuse) the agent session BEFORE taking the turn lock, so a
-        // first-prompt's `session/new` doesn't hold the turn lock while awaiting.
-        let agent_id = self.ensure_session(key).await?;
-        let _turn = entry.turn_lock.lock().await;
-        body(agent_id).await
-    }
-
-    /// Send a single `session/prompt` for `agent_id` and await its terminal
-    /// response, returning the stop reason as a string. This is a MINIMAL
-    /// blocking send used to exercise the turn lock in Task 2; Task 3 replaces
-    /// it with the conformant streaming `prompt` (session/update fan-in). It is
-    /// deliberately not wired into the public `prompt` yet.
-    #[allow(dead_code)] // superseded by the streaming prompt in Task 3
-    async fn send_prompt_blocking(
-        &self,
-        agent_id: AgentSessionId,
-        parts: Vec<bridge_core::domain::Part>,
-    ) -> Result<String, BridgeError> {
-        use agent_client_protocol::schema::{ContentBlock, PromptRequest, TextContent};
-        let cx = self.cx()?;
-        let blocks: Vec<ContentBlock> = parts
-            .into_iter()
-            .map(|p| ContentBlock::Text(TextContent::new(p.text)))
-            .collect();
-        let req = PromptRequest::new(agent_id, blocks);
-        let resp = cx
-            .send_request(req)
-            .block_task()
-            .await
-            .map_err(|_| BridgeError::AgentCrashed)?;
-        Ok(format!("{:?}", resp.stop_reason))
-    }
-
     /// Record a cancel for bridge key `key`, honoring the create/cancel race.
     ///
     /// * If the agent session already exists, send `session/cancel` for it now.
@@ -448,7 +474,6 @@ impl AcpBackend {
     ///
     /// Task 4 builds full `cancel()` completion semantics (waiting for the
     /// prompt result with `stopReason:"cancelled"`) on top of this.
-    #[allow(dead_code)] // wired into production cancel in Task 4
     async fn request_cancel(&self, key: &SessionId) -> Result<(), BridgeError> {
         let entry = self.session_entry(key).await;
         let cx = self.cx()?;
@@ -466,139 +491,49 @@ impl AcpBackend {
         Ok(())
     }
 
-    /// Construct from an already-spawned scripted child (used in tests and when
-    /// the caller has already set up the process).
+    /// Construct from an already-spawned `Supervised` child, driving the ACP
+    /// connection over its stdin/stdout via the SDK — a thin shim over `connect`
+    /// (same `ByteStreams` + tokio→futures-io compat as `spawn`, but for a child
+    /// the caller already spawned). The returned backend owns `supervised` for
+    /// its lifetime (so `kill_on_drop` does not SIGKILL it on return).
     ///
-    /// LEGACY (v1) path: drives the hand-rolled JSON-RPC framing for the
-    /// scripted prompt/cancel tests and the gated e2es. The conformant SDK path
-    /// is `spawn`/`connect`; this is retained to keep the workspace green until
-    /// Tasks 2–4 replace the prompt/cancel innards.
-    pub fn from_child(mut supervised: Supervised) -> Self {
+    /// This replaces the v1 hand-rolled JSON-RPC `from_child`; call sites (the
+    /// gated e2es, `main`) now `.await` it.
+    pub async fn from_child(
+        mut supervised: Supervised,
+        config: AcpConfig,
+    ) -> Result<Self, BridgeError> {
         let child = supervised.child_mut();
-        let stdin = child.stdin.take().expect("stdin must be piped");
-        let stdout = child.stdout.take().expect("stdout must be piped");
-        let reader = FrameReader::new(BufReader::new(stdout), MAX_FRAME);
-        Self {
-            inner: Some(Arc::new(Mutex::new(Inner {
-                stdin,
-                reader,
-                supervised,
-            }))),
-            conn: None,
-            // Legacy path owns its child via `Inner::supervised`; the SDK slot is unused.
-            supervised: None,
-            id_counter: Arc::new(AtomicU64::new(1)),
-            // Legacy path never mints SDK sessions: no config, empty map.
-            config: None,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// Send `session/new`, read back the `{result:{sessionId}}` response.
-    pub async fn new_session(&self) -> Result<SessionId, BridgeError> {
-        let id = self.next_id();
-        let mut g = self.legacy_inner().lock().await;
-        let req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "session/new",
-            "params": {}
-        });
-        write_line(&mut g.stdin, &req).await?;
-        // Read frames until we get the result for this id.
-        loop {
-            let frame = g.reader.next().await.ok_or(BridgeError::AgentCrashed)??;
-            if frame.get("id").and_then(|v| v.as_u64()) == Some(id) {
-                let sid = frame
-                    .pointer("/result/sessionId")
-                    .and_then(|v| v.as_str())
-                    .ok_or(BridgeError::FrameError)?;
-                return SessionId::parse(sid);
-            }
-            // unexpected frame before the session/new reply — skip it
-        }
-    }
-
-    /// Send `session/cancel`, then wait for the prompt result to arrive with
-    /// `stopReason:"cancelled"`. On timeout, SIGTERM the process group and
-    /// return `Err(CancelTimeout)`.
-    ///
-    /// NOTE: This method reads frames directly from the child's stdout reader.
-    /// It must only be called when the stream returned by `prompt()` has been
-    /// dropped (or will not be polled concurrently), otherwise both this
-    /// method and the stream would contend for the same reader.
-    pub async fn cancel_with_timeout(
-        &self,
-        session: &SessionId,
-        grace: std::time::Duration,
-    ) -> Result<(), BridgeError> {
-        self.send_cancel(session).await?;
-        // Wait for the child's stdout to produce the cancelled result within grace.
-        let result = tokio::time::timeout(grace, self.wait_for_done()).await;
-        match result {
-            Ok(Ok(_stop_reason)) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_elapsed) => {
-                // Grace elapsed — kill the process group, reap, return CancelTimeout.
-                let dummy = Supervised::spawn("/bin/sh", &["-c", "exit 0"])
-                    .map_err(|_| BridgeError::AgentCrashed)?;
-                let supervised = {
-                    let mut g = self.legacy_inner().lock().await;
-                    std::mem::replace(&mut g.supervised, dummy)
-                };
-                supervised
-                    .terminate(std::time::Duration::from_millis(100))
-                    .await;
-                Err(BridgeError::CancelTimeout)
-            }
-        }
+        let stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed)?;
+        let stdout = child.stdout.take().ok_or(BridgeError::AgentCrashed)?;
+        let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+        let mut backend = Self::connect(transport, config).await?;
+        backend.supervised = Some(supervised);
+        Ok(backend)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// The legacy scripted-path inner state. Only the `from_child` constructor
-    /// populates it; the legacy `prompt`/`cancel`/`new_session` paths require it.
-    fn legacy_inner(&self) -> &Arc<Mutex<Inner>> {
-        self.inner
-            .as_ref()
-            .expect("legacy path requires from_child construction")
-    }
-
+    #[allow(dead_code)] // retained for later tasks that mint request ids
     fn next_id(&self) -> u64 {
         self.id_counter.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn send_cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        let id = self.next_id();
-        let mut g = self.legacy_inner().lock().await;
-        let req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "session/cancel",
-            "params": { "sessionId": session.as_str() }
-        });
-        write_line(&mut g.stdin, &req).await
-    }
-
-    /// Read frames from stdout until a `Done` update arrives; return the stop_reason.
-    /// This is used by `cancel_with_timeout` to wait for the prompt result.
-    async fn wait_for_done(&self) -> Result<String, BridgeError> {
-        loop {
-            let frame = {
-                let mut g = self.legacy_inner().lock().await;
-                g.reader.next().await
-            };
-            match frame {
-                None => return Err(BridgeError::AgentCrashed),
-                Some(Err(e)) => return Err(e),
-                Some(Ok(v)) => {
-                    if let Some(Update::Done { stop_reason }) = frame_to_update(v) {
-                        return Ok(stop_reason);
-                    }
-                    // other frames (notifications) are consumed silently
-                }
-            }
+    /// Map an ACP `StopReason` to the bridge's `Update::Done` stop_reason string.
+    /// We use the ACP wire spelling (snake_case) so it matches the protocol and
+    /// the existing `Update::Done { stop_reason: String }` convention (e.g.
+    /// `end_turn`, `max_tokens`, `cancelled`). The enum is `#[non_exhaustive]`,
+    /// so an unknown future variant maps to `"unknown"` rather than failing.
+    fn stop_reason_str(stop: StopReason) -> String {
+        match stop {
+            StopReason::EndTurn => "end_turn",
+            StopReason::MaxTokens => "max_tokens",
+            StopReason::MaxTurnRequests => "max_turn_requests",
+            StopReason::Refusal => "refusal",
+            StopReason::Cancelled => "cancelled",
+            _ => "unknown",
         }
+        .to_string()
     }
 }
 
@@ -606,130 +541,107 @@ impl AcpBackend {
 
 #[async_trait]
 impl AgentBackend for AcpBackend {
-    /// Write `session/prompt` to the child's stdin and return a stream that
-    /// yields `Update`s from the child's stdout until a Done frame arrives.
+    /// Conformant streaming `session/prompt`.
     ///
-    /// The stream drives the child's stdout reader directly; `cancel()` writes
-    /// `session/cancel` to stdin. The COMPLETION of a cancel is the prompt
-    /// RESULT carrying `stopReason:"cancelled"` — which arrives on this stream.
+    /// 1. `ensure_session` mints/gets the agent session id (lazy, exactly-once).
+    /// 2. Register an mpsc `Sender` in the routing registry keyed by the agent
+    ///    id BEFORE sending the prompt, so the notification handler can route
+    ///    this turn's `agent_message_chunk`s and no chunk races past
+    ///    registration.
+    /// 3. Spawn a driver task that holds the per-session turn lock for the WHOLE
+    ///    streamed turn and `block_task().await`s the `PromptResponse`; the SDK
+    ///    delivers chunks meanwhile via the handler → the registered `Sender`.
+    /// 4. On the response, the driver unregisters the `Sender` and pushes a
+    ///    terminal `Update::Done { stop_reason }` (StopReason mapped), then
+    ///    releases the turn lock (by dropping the guard it owns).
+    ///
+    /// The returned `BackendStream` yields the streamed `Update::Text`s in order,
+    /// then exactly one `Update::Done`.
     async fn prompt(
         &self,
         session: &SessionId,
         parts: Vec<bridge_core::domain::Part>,
     ) -> Result<BackendStream, BridgeError> {
-        let id = self.next_id();
-        let session_id = session.as_str().to_string();
+        // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
+        // first-prompt's `session/new` doesn't hold the lock while awaiting.
+        let entry = self.session_entry(session).await;
+        let agent_id = self.ensure_session(session).await?;
 
+        // Acquire the turn lock as an OWNED guard so it can move into the driver
+        // task and be held for the whole streamed turn (released on drop there).
+        let turn_guard: OwnedMutexGuard<()> = Arc::clone(&entry.turn_lock).lock_owned().await;
+
+        // Build the per-turn channel and register its sender BEFORE sending the
+        // prompt, so the handler routes every chunk (no drop between send and
+        // registration). The driver keeps a clone of the sender to push the
+        // terminal Done onto the SAME channel the chunks flow through (so the
+        // stream yields chunks then Done, in order).
+        let (tx, rx) = mpsc::unbounded_channel::<TurnEvent>();
+        let done_sender = tx.clone();
+        let registry = Arc::clone(self.updates()?);
         {
-            let mut g = self.legacy_inner().lock().await;
-            let serialized_parts: Vec<serde_json::Value> = parts
-                .iter()
-                .map(|p| serde_json::json!({ "text": p.text }))
-                .collect();
-            let req = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "session/prompt",
-                "params": {
-                    "sessionId": &session_id,
-                    "parts": serialized_parts
-                }
-            });
-            write_line(&mut g.stdin, &req).await?;
+            let mut map = registry.lock().map_err(|_| BridgeError::AgentCrashed)?;
+            map.insert(agent_id.clone(), tx);
         }
 
-        // Build a stream that pulls frames from the shared reader.
-        // We hold the Arc<Mutex<Inner>> and lock it per frame.
-        let inner = Arc::clone(self.legacy_inner());
+        let cx = self.cx()?.clone();
+        let req = Self::prompt_request(agent_id.clone(), &parts);
 
-        let stream = futures::stream::unfold(
-            (inner, id, false), // (inner, prompt_id, done)
-            |(inner, prompt_id, done)| async move {
-                if done {
-                    return None;
-                }
-                loop {
-                    let frame = {
-                        let mut g = inner.lock().await;
-                        g.reader.next().await
-                    };
-                    match frame {
-                        None => return None, // child closed stdout
-                        Some(Err(e)) => {
-                            return Some((Err(e), (inner, prompt_id, true)));
-                        }
-                        Some(Ok(v)) => {
-                            // Check if this is the result for our prompt request.
-                            let is_our_result =
-                                v.get("id").and_then(|x| x.as_u64()) == Some(prompt_id);
-                            if is_our_result {
-                                // Must be a result frame — map it.
-                                match frame_to_update(v) {
-                                    Some(u @ Update::Done { .. }) => {
-                                        return Some((Ok(u), (inner, prompt_id, true)));
-                                    }
-                                    Some(u) => {
-                                        return Some((Ok(u), (inner, prompt_id, false)));
-                                    }
-                                    None => {
-                                        // Result for our id with no recognized shape —
-                                        // must still surface as a terminal Done so the
-                                        // caller never sees a silent stream close
-                                        // (Issue 3, §5.3 "naive bridge" failure).
-                                        return Some((
-                                            Ok(Update::Done {
-                                                stop_reason: "unknown".into(),
-                                            }),
-                                            (inner, prompt_id, true),
-                                        ));
-                                    }
-                                }
-                            }
-                            // Notification or other frame — map and yield if recognized.
-                            match frame_to_update(v) {
-                                Some(Update::Done { stop_reason }) => {
-                                    // Done arrived as a notification (shouldn't happen in
-                                    // well-behaved protocol, but handle defensively).
-                                    return Some((
-                                        Ok(Update::Done { stop_reason }),
-                                        (inner, prompt_id, true),
-                                    ));
-                                }
-                                Some(u) => {
-                                    return Some((Ok(u), (inner, prompt_id, false)));
-                                }
-                                None => continue, // skip unknown frames
-                            }
-                        }
-                    }
-                }
-            },
-        );
+        // (3) Driver: holds the turn lock for the whole streamed turn (it OWNS
+        // `turn_guard`, releasing the lock only when it finishes) and awaits the
+        // `PromptResponse`; the SDK delivers chunks meanwhile via the handler.
+        let registry_for_driver = Arc::clone(&registry);
+        let agent_id_for_driver = agent_id.clone();
+        tokio::spawn(async move {
+            // Hold the turn lock for the entire turn.
+            let _turn = turn_guard;
+            let outcome = cx.send_request(req).block_task().await;
+            // Unregister this turn's sender FIRST so no late chunk is routed
+            // after the terminal Done is emitted.
+            if let Ok(mut map) = registry_for_driver.lock() {
+                map.remove(&agent_id_for_driver);
+            }
+            let done = match outcome {
+                Ok(resp) => Update::Done {
+                    stop_reason: AcpBackend::stop_reason_str(resp.stop_reason),
+                },
+                // A transport/agent error ends the turn: surface a terminal Done
+                // so the stream never closes silently (§5.3 "naive bridge").
+                Err(_) => Update::Done {
+                    stop_reason: "unknown".to_string(),
+                },
+            };
+            let _ = done_sender.send(TurnEvent::Done(done));
+            // `_turn` (the OwnedMutexGuard) drops here, releasing the turn lock.
+        });
+
+        // The returned stream drains the per-turn channel, mapping events to
+        // `Update`s and terminating after the Done.
+        let stream = futures::stream::unfold((rx, false), |(mut rx, done)| async move {
+            if done {
+                return None;
+            }
+            match rx.recv().await {
+                Some(TurnEvent::Text(t)) => Some((Ok(Update::Text(t)), (rx, false))),
+                Some(TurnEvent::Done(u)) => Some((Ok(u), (rx, true))),
+                // Channel closed without a Done (driver dropped) — terminate.
+                None => None,
+            }
+        });
 
         Ok(Box::pin(stream))
     }
 
-    /// Write `session/cancel` to the child's stdin and return immediately.
+    /// Send `session/cancel` for the bridge session (via the cancel latch).
     ///
-    /// Spec §5.3 / Codex finding 2: cancellation completion is signalled by
-    /// the prompt RESULT arriving on the BackendStream with
-    /// `stopReason:"cancelled"`, NOT by the act of sending this notification.
-    /// The caller must poll the stream to observe the completion.
+    /// Spec §5.3 / Codex finding 2: cancellation COMPLETION is the prompt RESULT
+    /// arriving on the `BackendStream` with `stopReason:"cancelled"`, NOT the act
+    /// of sending this notification. Task 4 builds that completion (awaiting the
+    /// cancelled `StopReason` on the stream + SIGTERM-on-timeout fallback) on top
+    /// of this minimal latch+send.
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        self.send_cancel(session).await
+        self.request_cancel(session).await
     }
-}
-
-// ── Utility ──────────────────────────────────────────────────────────────────
-
-async fn write_line(stdin: &mut ChildStdin, v: &serde_json::Value) -> Result<(), BridgeError> {
-    let mut line = serde_json::to_vec(v).expect("serialization is infallible");
-    line.push(b'\n');
-    stdin
-        .write_all(&line)
-        .await
-        .map_err(|_| BridgeError::AgentCrashed)?;
-    stdin.flush().await.map_err(|_| BridgeError::AgentCrashed)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -742,102 +654,6 @@ mod tests {
     use bridge_core::ports::{AgentBackend, Update};
     use futures::StreamExt;
     use std::time::Duration;
-
-    fn scripted(script: &str) -> Supervised {
-        Supervised::spawn("/bin/sh", &["-c", script]).unwrap()
-    }
-
-    #[tokio::test]
-    async fn new_session_then_prompt_streams_text_then_done() {
-        // child: replies sessionId to the first request, then on the prompt emits one update + result.
-        let be = AcpBackend::from_child(scripted(
-            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
-             read line; \
-             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"text\":\"PONG\"}}'; \
-             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}'; sleep 1"));
-        let sid = be.new_session().await.unwrap();
-        assert_eq!(sid.as_str(), "s1");
-        let mut s = be.prompt(&sid, vec![]).await.unwrap();
-        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "PONG"));
-        assert!(
-            matches!(s.next().await, Some(Ok(Update::Done{stop_reason})) if stop_reason == "end_turn")
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_completion_is_the_prompt_result_not_the_notification() {
-        // child emits sessionId, then an update, then (only after reading the cancel line) the cancelled result.
-        let be = AcpBackend::from_child(scripted(
-            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
-             read p; \
-             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"text\":\"work\"}}'; \
-             read c; \
-             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"cancelled\"}}'; sleep 1"));
-        let sid = be.new_session().await.unwrap();
-        let mut s = be.prompt(&sid, vec![]).await.unwrap();
-        assert!(matches!(s.next().await, Some(Ok(Update::Text(_))))); // got the update
-        be.cancel(&sid).await.unwrap(); // writes session/cancel
-                                        // completion arrives as the prompt RESULT, not from the notification send:
-        assert!(
-            matches!(s.next().await, Some(Ok(Update::Done{stop_reason})) if stop_reason == "cancelled")
-        );
-    }
-
-    #[tokio::test]
-    async fn unrecognized_result_frame_still_yields_terminal_done() {
-        let be = AcpBackend::from_child(scripted(
-            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
-             read p; \
-             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}'; sleep 1",
-        ));
-        let sid = be.new_session().await.unwrap();
-        let mut s = be.prompt(&sid, vec![]).await.unwrap();
-        // must be a terminal Done, NOT a silent None
-        match s.next().await {
-            Some(Ok(Update::Done { .. })) => {}
-            other => {
-                panic!("expected terminal Done for an unrecognized result frame, got {other:?}")
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn prompt_serializes_part_text_into_session_prompt() {
-        // child: emits sessionId; reads the prompt line from stdin; echoes that line's content back
-        // (stripped of quotes) inside a session/update text; then a result.
-        let be = AcpBackend::from_child(scripted(
-            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
-             IFS= read -r _new_req; \
-             IFS= read -r line; \
-             printf '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"text\":\"GOT:%s\"}}\\n' \"$(printf '%s' \"$line\" | tr -d '\\\"')\"; \
-             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}'; sleep 1"));
-        let sid = be.new_session().await.unwrap();
-        let mut s = be
-            .prompt(
-                &sid,
-                vec![bridge_core::domain::Part {
-                    text: "HELLO_PART".into(),
-                }],
-            )
-            .await
-            .unwrap();
-        // the echoed prompt line must contain our part text -> proves it was serialized into session/prompt
-        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t.contains("HELLO_PART")));
-    }
-
-    #[tokio::test]
-    async fn cancel_timeout_sigterms_and_errors() {
-        // child gives a session, never returns a prompt result -> cancel_with_timeout times out, reaps, errors.
-        let be = AcpBackend::from_child(scripted(
-            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; sleep 30"));
-        let sid = be.new_session().await.unwrap();
-        let _ = be.prompt(&sid, vec![]).await.unwrap();
-        let err = be
-            .cancel_with_timeout(&sid, Duration::from_millis(200))
-            .await
-            .unwrap_err();
-        assert_eq!(err, BridgeError::CancelTimeout);
-    }
 
     // ── SDK connection path (transport-generic, in-process fake agent) ──────────
 
@@ -998,7 +814,6 @@ mod tests {
             .unwrap();
 
         let backend = AcpBackend {
-            inner: None,
             conn: None,
             supervised: Some(supervised),
             id_counter: Arc::new(AtomicU64::new(1)),
@@ -1045,10 +860,24 @@ mod tests {
     // `CancelNotification`, `NewSessionRequest`, `AgentSessionId` are already in
     // scope via `super::*`; import only the agent-side response/prompt types.
     use agent_client_protocol::schema::{
-        NewSessionResponse, PromptRequest, PromptResponse, StopReason,
+        ContentChunk, NewSessionResponse, PromptRequest, PromptResponse, StopReason,
     };
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Notify;
+
+    /// A scripted `session/update` the fake agent emits mid-turn, before it
+    /// returns the `PromptResponse`. Lets a test drive the streaming fan-in:
+    /// text chunks (modeled) and unmodeled variants (thought / tool call) that
+    /// the tolerant reader must drop.
+    #[derive(Clone)]
+    enum ScriptedUpdate {
+        /// `session/update` with an `agent_message_chunk` carrying this text.
+        Text(&'static str),
+        /// `session/update` with an `agent_thought_chunk` (unmodeled → dropped).
+        Thought(&'static str),
+        /// `session/update` with an empty `plan` (unmodeled → dropped).
+        Plan,
+    }
 
     #[derive(Clone)]
     struct Recorder {
@@ -1075,6 +904,16 @@ mod tests {
         prompt_gate: Arc<Notify>,
         /// Fires when a prompt turn STARTS, so the driver can sequence turns.
         prompt_started: Arc<Notify>,
+        /// Whether the prompt handler waits on `prompt_gate` before responding.
+        /// Default `false` (respond immediately, after emitting any updates), so
+        /// streaming tests don't have to drive the gate. The turn-ordering test
+        /// sets it `true` to hold turns open.
+        gate_prompt: Arc<AtomicBool>,
+        /// Scripted `session/update`s the prompt handler emits (in order) BEFORE
+        /// it returns the `PromptResponse`. Empty by default.
+        prompt_updates: Arc<Mutex<Vec<ScriptedUpdate>>>,
+        /// The `StopReason` the prompt handler returns. `EndTurn` by default.
+        stop_reason: Arc<Mutex<StopReason>>,
     }
 
     impl Recorder {
@@ -1090,7 +929,20 @@ mod tests {
                 prompt_log: Arc::new(Mutex::new(Vec::new())),
                 prompt_gate: Arc::new(Notify::new()),
                 prompt_started: Arc::new(Notify::new()),
+                gate_prompt: Arc::new(AtomicBool::new(false)),
+                prompt_updates: Arc::new(Mutex::new(Vec::new())),
+                stop_reason: Arc::new(Mutex::new(StopReason::EndTurn)),
             }
+        }
+
+        /// Script the `session/update`s this agent emits before responding.
+        async fn set_updates(&self, updates: Vec<ScriptedUpdate>) {
+            *self.prompt_updates.lock().await = updates;
+        }
+
+        /// Set the `StopReason` the prompt turn returns.
+        async fn set_stop_reason(&self, sr: StopReason) {
+            *self.stop_reason.lock().await = sr;
         }
     }
 
@@ -1140,19 +992,48 @@ mod tests {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
-                    move |_req: PromptRequest,
+                    move |req: PromptRequest,
                           responder: agent_client_protocol::Responder<PromptResponse>,
-                          _cx| {
+                          cx: ConnectionTo<Client>| {
                         let r = r_prompt.clone();
                         async move {
                             r.prompt_log.lock().await.push("start");
                             r.prompt_started.notify_one();
-                            // Hold the turn open until released, so a second
-                            // concurrent turn — if the lock failed — would
+
+                            // Emit the scripted `session/update`s BEFORE responding,
+                            // so they stream to the client mid-turn (the fan-in the
+                            // backend routes). `cx` here is the agent's connection
+                            // to the client; sending a `SessionNotification` is the
+                            // wire `session/update`.
+                            let sid = req.session_id.clone();
+                            let updates = r.prompt_updates.lock().await.clone();
+                            for u in updates {
+                                let update = match u {
+                                    ScriptedUpdate::Text(t) => SessionUpdate::AgentMessageChunk(
+                                        ContentChunk::new(ContentBlock::Text(TextContent::new(t))),
+                                    ),
+                                    ScriptedUpdate::Thought(t) => SessionUpdate::AgentThoughtChunk(
+                                        ContentChunk::new(ContentBlock::Text(TextContent::new(t))),
+                                    ),
+                                    ScriptedUpdate::Plan => SessionUpdate::Plan(
+                                        agent_client_protocol::schema::Plan::new(vec![]),
+                                    ),
+                                };
+                                cx.send_notification(SessionNotification::new(
+                                    sid.clone(),
+                                    update,
+                                ))?;
+                            }
+
+                            // Optionally hold the turn open until released, so a
+                            // second concurrent turn — if the lock failed — would
                             // interleave and be caught by the ordering log.
-                            r.prompt_gate.notified().await;
+                            if r.gate_prompt.load(Ordering::SeqCst) {
+                                r.prompt_gate.notified().await;
+                            }
                             r.prompt_log.lock().await.push("end");
-                            responder.respond(PromptResponse::new(StopReason::EndTurn))?;
+                            let sr = *r.stop_reason.lock().await;
+                            responder.respond(PromptResponse::new(sr))?;
                             Ok(())
                         }
                     },
@@ -1359,33 +1240,37 @@ mod tests {
         // The recording agent holds each prompt open on `prompt_gate`; if the
         // turn lock failed, both turns would "start" before either "end" and the
         // ordering log would interleave (start,start,...). With the lock, the
-        // log MUST be start,end,start,end.
+        // log MUST be start,end,start,end. The streaming `prompt` holds the turn
+        // lock in its driver task for the whole turn, so the SECOND `prompt`
+        // call blocks acquiring the lock until the first turn completes.
         let rec = Recorder::new("agent-sess-SEQ");
+        rec.gate_prompt.store(true, Ordering::SeqCst);
         let be = Arc::new(connect_recording(rec.clone()).await);
         let key = bkey("bridge-SEQ");
 
         // Pre-mint so neither turn pays the session/new cost inside the lock.
         be.ensure_session(&key).await.unwrap();
 
-        let run_turn = |be: Arc<AcpBackend>, key: SessionId| async move {
-            let be2 = Arc::clone(&be);
-            be.run_turn(&key, move |agent_id| async move {
-                // A real `session/prompt` under the held turn lock, so the agent
-                // observes start/end ordering. Task 3 swaps this for streaming.
-                be2.send_prompt_blocking(agent_id, vec![]).await.map(|_| ())
-            })
-            .await
-        };
+        // Turn 1: kick off the prompt and a task that drains its stream to Done.
+        let mut s1 = be.prompt(&key, vec![]).await.unwrap();
+        let d1 = tokio::spawn(async move { while s1.next().await.is_some() {} });
 
-        let h1 = tokio::spawn(run_turn(Arc::clone(&be), key.clone()));
-        // Wait for turn 1 to actually START (holding the lock) before turn 2.
+        // Wait for turn 1 to actually START (its driver holds the lock).
         tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
             .await
             .expect("turn 1 starts");
 
-        let h2 = tokio::spawn(run_turn(Arc::clone(&be), key.clone()));
-        // Give turn 2 time to (try to) start; it MUST be blocked on the lock,
-        // so the agent has NOT seen a second prompt start yet.
+        // Turn 2: this `prompt` call blocks acquiring the turn lock (held by
+        // turn 1's driver). Drive it from a task so we can observe it WAITING.
+        let be2 = Arc::clone(&be);
+        let key2 = key.clone();
+        let h2 = tokio::spawn(async move {
+            let mut s2 = be2.prompt(&key2, vec![]).await.unwrap();
+            while s2.next().await.is_some() {}
+        });
+
+        // Turn 2 MUST be blocked on the lock: the agent has NOT seen a second
+        // prompt start yet.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             rec.prompt_log.lock().await.as_slice(),
@@ -1393,20 +1278,113 @@ mod tests {
             "second turn must WAIT for the first (no interleave)"
         );
 
-        // Release turn 1; it ends, then turn 2 starts and ends.
-        rec.prompt_gate.notify_one(); // unblock turn 1
+        // Release turn 1; it ends (driver drops the lock), then turn 2 starts.
+        rec.prompt_gate.notify_one();
         tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
             .await
             .expect("turn 2 starts after turn 1 released");
         rec.prompt_gate.notify_one(); // unblock turn 2
 
-        h1.await.unwrap().unwrap();
-        h2.await.unwrap().unwrap();
+        d1.await.unwrap();
+        h2.await.unwrap();
 
         assert_eq!(
             rec.prompt_log.lock().await.as_slice(),
             &["start", "end", "start", "end"],
             "turns run strictly sequentially, never interleaved"
         );
+    }
+
+    // ── Task 3: streaming session/prompt + agent_message_chunk fan-in ──────────
+
+    #[tokio::test]
+    async fn prompt_streams_text_then_done() {
+        // The agent emits two `agent_message_chunk`s then returns end_turn; the
+        // stream must yield Update::Text×2 in order, then Update::Done{end_turn}.
+        let rec = Recorder::new("agent-sess-STREAM");
+        rec.set_updates(vec![
+            ScriptedUpdate::Text("hello "),
+            ScriptedUpdate::Text("world"),
+        ])
+        .await;
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-STREAM");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "hello "));
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "world"));
+        assert!(
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+        );
+        assert!(s.next().await.is_none(), "stream terminates after Done");
+    }
+
+    #[tokio::test]
+    async fn prompt_ignores_unmodeled_updates() {
+        // Between the two text chunks the agent emits an agent_thought_chunk and
+        // a plan (both unmodeled). The tolerant reader drops them: the stream
+        // still yields exactly the two texts + Done.
+        let rec = Recorder::new("agent-sess-IGN");
+        rec.set_updates(vec![
+            ScriptedUpdate::Thought("(thinking)"),
+            ScriptedUpdate::Text("A"),
+            ScriptedUpdate::Plan,
+            ScriptedUpdate::Text("B"),
+            ScriptedUpdate::Thought("(more thinking)"),
+        ])
+        .await;
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-IGN");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "A"));
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "B"));
+        assert!(
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+        );
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_maps_stop_reasons() {
+        // A non-end_turn StopReason must map correctly onto Update::Done. Check
+        // two: max_tokens and cancelled.
+        for (sr, expected) in [
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::Cancelled, "cancelled"),
+        ] {
+            let rec = Recorder::new("agent-sess-SR");
+            rec.set_stop_reason(sr).await;
+            let be = connect_recording(rec.clone()).await;
+            let key = bkey("bridge-SR");
+
+            let mut s = be.prompt(&key, vec![]).await.unwrap();
+            let last = loop {
+                match s.next().await {
+                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(_) => continue,
+                    None => panic!("stream ended without a Done"),
+                }
+            };
+            assert_eq!(last, expected, "StopReason {sr:?} maps to {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_sends_session_cancel_for_active_session() {
+        // Minimal SDK-fake-agent cancel test (Task 4 owns completion semantics):
+        // a cancel on an active session sends `session/cancel` for its agent id.
+        let rec = Recorder::new("agent-sess-CAN");
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-CAN");
+
+        // Make the session active (minted) so cancel goes straight out.
+        be.ensure_session(&key).await.unwrap();
+        be.cancel(&key).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("cancel must reach the agent");
+        assert_eq!(rec.cancels.lock().await.as_slice(), &["agent-sess-CAN"]);
     }
 }

@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
-use bridge_acp::{acp_backend::AcpBackend, supervisor::Supervised};
+use bridge_acp::{
+    acp_backend::{AcpBackend, AcpConfig},
+    supervisor::Supervised,
+};
 use bridge_core::ports::DelegationPort;
 use bridge_policy::{auth::AlwaysGrant, permission::AutoPolicy};
 use bridge_store::sqlite::SqliteStore;
@@ -46,10 +49,16 @@ async fn main() -> Result<(), BoxError> {
     };
     let cfg = Config::parse(&toml_src)?;
 
-    // 3. Spawn the agent child process.
+    // 3. Spawn the agent child process and drive the conformant ACP connection
+    //    over its stdio via the SDK (`from_child` initializes the connection).
     let args_ref: Vec<&str> = cfg.agent.args.iter().map(String::as_str).collect();
     let supervised = Supervised::spawn(&cfg.agent.cmd, &args_ref)?;
-    let backend = Arc::new(AcpBackend::from_child(supervised));
+    let acp_config = AcpConfig {
+        // Sessions run in the bridge's current working directory (absolute).
+        cwd: std::env::current_dir()?,
+        ..AcpConfig::default()
+    };
+    let backend = Arc::new(AcpBackend::from_child(supervised, acp_config).await?);
 
     // 4. Build all port Arc<dyn Trait> wrappers.
     let auth = Arc::new(AlwaysGrant);

@@ -22,7 +22,10 @@ use std::sync::Arc;
 
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
-use bridge_acp::{acp_backend::AcpBackend, supervisor::Supervised};
+use bridge_acp::{
+    acp_backend::{AcpBackend, AcpConfig},
+    supervisor::Supervised,
+};
 use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
@@ -85,7 +88,17 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
 
     let supervised_b = Supervised::spawn("kiro-cli", &["acp"])
         .expect("kiro-cli must be on PATH and authenticated; run `kiro-cli whoami` first");
-    let backend_b = Arc::new(AcpBackend::from_child(supervised_b));
+    let backend_b = Arc::new(
+        AcpBackend::from_child(
+            supervised_b,
+            AcpConfig {
+                cwd: std::env::current_dir().expect("cwd"),
+                ..AcpConfig::default()
+            },
+        )
+        .await
+        .expect("ACP connection initializes (B)"),
+    );
     let store_b = Arc::new(SqliteStore::open_in_memory().expect("sqlite in-memory (B)"));
 
     let server_b = Arc::new(InboundServer::new(

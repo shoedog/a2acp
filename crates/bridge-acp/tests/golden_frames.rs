@@ -96,3 +96,61 @@ fn new_session_request_params_are_wire_conformant() {
     // Must NOT be a degenerate empty object — guards the `params: {}` regression.
     assert_ne!(v, serde_json::json!({}), "params must not collapse to {{}}");
 }
+
+// session/prompt wire-golden (ACP §11A). The bridge must send the prompt body
+// as `prompt`: an ARRAY of TAGGED content blocks (`{"type":"text","text":<t>}`),
+// NOT the v1 hand-rolled `parts:[{"text":<t>}]`. The expected JSON below is
+// HAND-AUTHORED to the spec shape; we assert the SDK-typed value the backend
+// constructs serializes to exactly it (so a regression to `parts` or an
+// untagged block is caught here).
+#[test]
+fn prompt_request_params_are_wire_conformant() {
+    use agent_client_protocol::schema::SessionId as AgentSessionId;
+    use bridge_core::domain::Part;
+
+    // The exact request value `prompt` transmits for a single text part.
+    let req = AcpBackend::prompt_request(
+        AgentSessionId::new("agent-sess-1"),
+        &[Part {
+            text: "hello".into(),
+        }],
+    );
+    let v: Value = serde_json::to_value(&req).expect("PromptRequest serializes");
+
+    // Hand-authored expected `params` per ACP §11A.
+    let expected = serde_json::json!({
+        "sessionId": "agent-sess-1",
+        "prompt": [
+            { "type": "text", "text": "hello" }
+        ]
+    });
+    assert_eq!(
+        v, expected,
+        "session/prompt params must be {{\"sessionId\":<id>,\"prompt\":[tagged text]}}, got {v:?}"
+    );
+
+    // Spell out the field-shape invariants the equality above guarantees.
+    assert_eq!(
+        v.get("sessionId"),
+        Some(&Value::from("agent-sess-1")),
+        "sessionId must be the agent-minted id"
+    );
+    assert!(
+        v.get("parts").is_none(),
+        "the body field must be `prompt`, NOT the v1 `parts`: {v:?}"
+    );
+    let prompt = v.get("prompt").expect("prompt field present");
+    let arr = prompt.as_array().expect("prompt must be an array");
+    assert_eq!(arr.len(), 1, "one part -> one content block");
+    let block = &arr[0];
+    assert_eq!(
+        block.get("type"),
+        Some(&Value::from("text")),
+        "each prompt block must be a TAGGED text block (\"type\":\"text\"): {block:?}"
+    );
+    assert_eq!(
+        block.get("text"),
+        Some(&Value::from("hello")),
+        "the text block must carry the part text"
+    );
+}
