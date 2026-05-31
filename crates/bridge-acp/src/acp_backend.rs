@@ -538,11 +538,14 @@ impl AcpBackend {
                 .await;
         });
 
-        // Bound the whole handshake (transport connect + initialize response) so
-        // an agent that opens stdio but never replies cannot hang us forever.
-        // A closed transport EOFs cleanly (the `map_err` arms below); a true hang
-        // is caught by the outer timeout.
-        let handshake = async {
+        // Bound the WHOLE handshake — transport connect + `initialize` response +
+        // `authenticate` — under the SAME `handshake_timeout`. `authenticate` MUST
+        // be inside this bounded block: an agent that answers `initialize` but then
+        // HANGS on `authenticate` would otherwise block `connect`/`spawn`/`main`
+        // forever. A closed transport EOFs cleanly (the `map_err` arms); a true
+        // hang on either step is caught by the outer timeout.
+        let auth_method_cfg = config.auth_method.clone();
+        let handshake = async move {
             let cx = cx_rx.await.map_err(|_| BridgeError::AgentCrashed)?;
 
             // Run the ACP `initialize` handshake and capture the negotiated caps.
@@ -551,44 +554,63 @@ impl AcpBackend {
                 .block_task()
                 .await
                 .map_err(|_| BridgeError::AgentCrashed)?;
+
+            // ── authenticate ──────────────────────────────────────────────────
+            //
+            // Lifecycle order: initialize → authenticate → (later) session/new. The
+            // `initialize` response lists the auth methods the agent supports. If it
+            // advertised NONE (and none is configured), the agent needs no
+            // client-driven auth, so we SKIP. Otherwise attempt `authenticate` ONCE
+            // with either the configured method id or the first advertised one.
+            //
+            // POLICY for an already-authenticated agent (the T9 gated e2e validates
+            // against real codex): codex with an existing login may still advertise
+            // methods but not actually require a fresh auth — and may either accept a
+            // redundant `authenticate` (success → fine) or REJECT it. We cannot
+            // distinguish "wrong credentials" from "redundant auth" from the wire, so
+            // we choose the pragmatic, least-surprising policy: attempt ONCE; treat a
+            // SUCCESS (or no advertised methods) as authenticated; a definitive Err
+            // is FATAL and surfaces `AgentNotAuthenticated`. This matches the
+            // spec-intended flow (authenticate before sessions) while keeping the
+            // bound tight. (If a future real agent is found to reject redundant auth,
+            // revisit toward a softer policy.)
+            let chosen = match auth_method_cfg.as_deref() {
+                Some(m) => {
+                    // I4: a configured auth_method that the agent did NOT advertise
+                    // is a likely operator misconfiguration. We still ATTEMPT it
+                    // (the agent is authoritative — it may accept an unlisted id),
+                    // but WARN naming the configured value and the advertised list so
+                    // an opaque `AgentNotAuthenticated` can be diagnosed.
+                    let advertised: Vec<String> = resp
+                        .auth_methods
+                        .iter()
+                        .map(|a| a.id().0.to_string())
+                        .collect();
+                    if !advertised.iter().any(|a| a == m) {
+                        tracing::warn!(
+                            configured_auth_method = %m,
+                            advertised = ?advertised,
+                            "configured auth_method is not among the methods the agent \
+                             advertised; attempting anyway (agent is authoritative)"
+                        );
+                    }
+                    Some(AuthMethodId::new(m))
+                }
+                None => resp.auth_methods.first().map(|a| a.id().clone()),
+            };
+            if let Some(method_id) = chosen {
+                cx.send_request(AuthenticateRequest::new(method_id))
+                    .block_task()
+                    .await
+                    .map_err(|_| BridgeError::AgentNotAuthenticated)?;
+            }
+
             Ok::<_, BridgeError>((cx, resp))
         };
 
         let (cx, resp) = tokio::time::timeout(config.handshake_timeout, handshake)
             .await
             .map_err(|_| BridgeError::AgentCrashed)??;
-
-        // ── authenticate ──────────────────────────────────────────────────────
-        //
-        // Lifecycle order: initialize → authenticate → (later) session/new. The
-        // `initialize` response lists the auth methods the agent supports. If it
-        // advertised NONE, the agent needs no client-driven auth, so we SKIP. If
-        // it advertised ≥1, attempt `authenticate` ONCE with either the
-        // configured method id or the first advertised one.
-        //
-        // POLICY for an already-authenticated agent (the T9 gated e2e validates
-        // against real codex): codex with an existing login may still advertise
-        // methods but not actually require a fresh auth — and may either accept a
-        // redundant `authenticate` (success → fine) or REJECT it. We cannot
-        // distinguish "wrong credentials" from "redundant auth" from the wire, so
-        // we choose the pragmatic, least-surprising policy: attempt ONCE; treat a
-        // SUCCESS (or no advertised methods) as authenticated; a definitive Err
-        // is FATAL and surfaces `AgentNotAuthenticated`. This matches the
-        // spec-intended flow (authenticate before sessions) while keeping the bound
-        // tight — a real operator with bad/absent credentials gets a clear error
-        // rather than a confusing `session/new` failure later. (If a future real
-        // agent is found to reject redundant auth, revisit toward a softer policy.)
-        let chosen = config
-            .auth_method
-            .as_deref()
-            .map(AuthMethodId::new)
-            .or_else(|| resp.auth_methods.first().map(|m| m.id().clone()));
-        if let Some(method_id) = chosen {
-            cx.send_request(AuthenticateRequest::new(method_id))
-                .block_task()
-                .await
-                .map_err(|_| BridgeError::AgentNotAuthenticated)?;
-        }
 
         Ok(Self {
             conn: Some(AcpConn {
@@ -758,6 +780,11 @@ impl AcpBackend {
             .as_ref()
             .map(|c| c.cwd.clone())
             .ok_or(BridgeError::AgentCrashed)?;
+        // Capture the configured mode/model up front (cloned `String`s) so the
+        // init closure can own them — session configuration now lives INSIDE the
+        // closure (see below), so its captures must be `'static`/move-safe.
+        let mode = self.config.as_ref().and_then(|c| c.mode.clone());
+        let model = self.config.as_ref().and_then(|c| c.model.clone());
 
         // Did THIS call mint the agent session? The init closure runs for at most
         // one caller (`OnceCell`); set the flag inside it so only the minter does
@@ -766,60 +793,58 @@ impl AcpBackend {
         let id = entry
             .agent_id
             .get_or_try_init(|| async {
-                // The init closure does ONLY `session/new`: send the request and
-                // return the freshly-minted id. The cancel-latch drain is moved
-                // OUT of here (see below) so it runs AFTER `OnceCell` makes the id
-                // observable — closing the lost-cancel window where a concurrent
-                // `request_cancel` saw `get() == None`, didn't send, and the
-                // in-closure drain had already swapped the latch to false.
                 newly_minted = true;
+                // (1) session/new — mint the agent session id.
                 let req = Self::new_session_request(cwd);
                 let resp = cx
                     .send_request(req)
                     .block_task()
                     .await
                     .map_err(|_| BridgeError::AgentCrashed)?;
-                Ok::<_, BridgeError>(resp.session_id)
+                let id = resp.session_id;
+
+                // (2) set_mode — HARD error, configured INSIDE the closure (before
+                // returning the id). The operator asked for a specific mode; if the
+                // agent REJECTS the mode id we FAIL session setup. Because this
+                // `?`-returns from the init closure, `get_or_try_init` FAILS and the
+                // `OnceCell` stays UNINITIALIZED — so the next `ensure_session`
+                // re-runs the full mint+configure rather than seeing a committed-but-
+                // unconfigured session and silently proceeding in the WRONG mode.
+                // (No prompt is sent on a failed setup, so the minted-then-abandoned
+                // agent session does no uncontrolled work.)
+                if let Some(mode) = mode.as_deref() {
+                    cx.send_request(Self::set_mode_request(id.clone(), mode))
+                        .block_task()
+                        .await
+                        .map_err(|_| BridgeError::AgentCrashed)?;
+                }
+
+                // (3) set_model — BEST-EFFORT (NON-FATAL). Rationale: codex-acp's
+                // `set_model` is custom-provider-only; the builtin OpenAI provider
+                // returns `models:null` / errors on `session/set_model`. A model-set
+                // failure must therefore NOT kill the session — we LOG it and
+                // continue, running the agent's default model. (A configured model
+                // the agent silently ignores is acceptable; a hard failure here
+                // would make every session on such an agent unusable.)
+                if let Some(model) = model.as_deref() {
+                    if let Err(e) = cx
+                        .send_request(Self::set_model_request(id.clone(), model))
+                        .block_task()
+                        .await
+                    {
+                        tracing::warn!(
+                            model = %model,
+                            error = ?e,
+                            "session/set_model failed; continuing with the agent's default \
+                             model (set_model is best-effort: e.g. builtin OpenAI returns \
+                             models:null)"
+                        );
+                    }
+                }
+
+                Ok::<_, BridgeError>(id)
             })
             .await?;
-
-        // Post-mint session configuration — runs EXACTLY ONCE per agent session,
-        // tied to the mint (`newly_minted`), NOT to every prompt. Applied AFTER the
-        // id is published so a concurrent `ensure_session` for the same key never
-        // re-applies it. Lifecycle: session/new → set_mode → set_model.
-        if newly_minted {
-            // set_mode — HARD. The operator asked for a specific mode; if the
-            // agent REJECTS the mode id (unknown/unsupported) we FAIL session
-            // setup so the misconfiguration surfaces rather than silently running
-            // in the wrong mode.
-            if let Some(mode) = self.config.as_ref().and_then(|c| c.mode.clone()) {
-                cx.send_request(Self::set_mode_request(id.clone(), mode))
-                    .block_task()
-                    .await
-                    .map_err(|_| BridgeError::AgentCrashed)?;
-            }
-            // set_model — BEST-EFFORT (NON-FATAL). Rationale: codex-acp's
-            // `set_model` is custom-provider-only; the builtin OpenAI provider
-            // returns `models:null` / errors on `session/set_model`. A model-set
-            // failure must therefore NOT kill the session — we LOG it and continue,
-            // running the agent's default model. (A configured model that the
-            // agent silently ignores is acceptable; a hard failure here would make
-            // every session on such an agent unusable.)
-            if let Some(model) = self.config.as_ref().and_then(|c| c.model.clone()) {
-                if let Err(e) = cx
-                    .send_request(Self::set_model_request(id.clone(), model.clone()))
-                    .block_task()
-                    .await
-                {
-                    tracing::warn!(
-                        model = %model,
-                        error = %e,
-                        "session/set_model failed; continuing with the agent's default model \
-                         (set_model is best-effort: e.g. builtin OpenAI returns models:null)"
-                    );
-                }
-            }
-        }
 
         // Post-init cancel-latch drain — runs only on the minting call, and only
         // AFTER `get_or_try_init` returned, i.e. once the id is observable to a
@@ -2880,9 +2905,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_mode_bad_id_is_hard_error() {
-        // The agent REJECTS the configured mode id -> session setup must FAIL
-        // (hard error), surfacing to the caller rather than silently continuing.
+    async fn set_mode_bad_id_is_hard_error_and_leaves_cell_uninitialized() {
+        // The agent REJECTS the configured mode id. Because set_mode is configured
+        // INSIDE the `get_or_try_init` closure (before the id is returned), a hard
+        // `?`-error makes `get_or_try_init` FAIL and the `OnceCell` stays
+        // UNINITIALIZED. So:
+        //   (a) `ensure_session` returns the hard error, AND
+        //   (b) a SECOND `ensure_session` re-runs the FULL mint+set_mode (re-mints,
+        //       re-attempts set_mode) and also errors — it does NOT silently
+        //       proceed on a committed-but-unconfigured session in the WRONG mode.
         let rec = Recorder::new("agent-sess-BADMODE");
         rec.reject_set_mode.store(true, Ordering::SeqCst);
         let be = connect_recording_with(rec.clone(), test_config_with_mode("nonexistent")).await;
@@ -2892,8 +2923,33 @@ mod tests {
             Err(BridgeError::AgentCrashed) => {}
             other => panic!("a rejected set_mode must fail session setup, got {other:?}"),
         }
-        // The agent did record the (rejected) mode request.
+        // The agent recorded the (rejected) mode request from the first attempt.
         assert_eq!(rec.set_modes.lock().await.as_slice(), &["nonexistent"]);
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            1,
+            "first ensure_session minted exactly once"
+        );
+
+        // SECOND attempt: cell is uninitialized → the closure re-runs → re-mints
+        // and re-attempts set_mode, then errors again. NOT a silent success.
+        match be.ensure_session(&key).await {
+            Err(BridgeError::AgentCrashed) => {}
+            other => panic!(
+                "a re-attempt after a set_mode failure must re-run and error, \
+                 not silently proceed unconfigured, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            2,
+            "the uninitialized cell makes the SECOND ensure_session re-mint (no masking)"
+        );
+        assert_eq!(
+            rec.set_modes.lock().await.as_slice(),
+            &["nonexistent", "nonexistent"],
+            "set_mode is re-attempted on retry (committed-but-unconfigured session is impossible)"
+        );
     }
 
     #[tokio::test]
@@ -2991,5 +3047,94 @@ mod tests {
             Err(e) => panic!("a hung initialize handshake must surface a clear error, got {e:?}"),
             Ok(_) => panic!("a hung initialize handshake must surface a clear error, got Ok"),
         }
+    }
+
+    /// Spawn a fake agent that ANSWERS `initialize` (advertising one auth method)
+    /// but NEVER answers `authenticate` — it parks the responder forever. Models an
+    /// agent that hangs on the auth step; `authenticate` must be bounded by the
+    /// same `handshake_timeout` as `initialize` (B3) or `connect` would hang.
+    fn spawn_init_ok_auth_hangs_agent(channel: Channel) {
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name("auth-hang-agent")
+                .on_receive_request(
+                    move |_req: InitializeRequest,
+                          responder: agent_client_protocol::Responder<InitializeResponse>,
+                          _cx| async move {
+                        responder.respond(
+                            InitializeResponse::new(ProtocolVersion::V1).auth_methods(vec![
+                                AuthMethod::Agent(AuthMethodAgent::new(
+                                    AuthMethodId::new("oauth"),
+                                    "OAuth",
+                                )),
+                            ]),
+                        )?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |_req: agent_client_protocol::schema::AuthenticateRequest,
+                          _responder: agent_client_protocol::Responder<
+                        agent_client_protocol::schema::AuthenticateResponse,
+                    >,
+                          _cx| async move {
+                        // Never respond: park forever holding the responder so the
+                        // client's `authenticate` request hangs (channel stays open).
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(channel)
+                .await;
+        });
+    }
+
+    #[tokio::test]
+    async fn authenticate_hang_is_bounded() {
+        // B3: an agent that answers `initialize` but HANGS on `authenticate` must
+        // NOT block `connect` forever — `authenticate` is inside the bounded
+        // handshake, so `connect` returns a clear error within `handshake_timeout`.
+        // Outer timeout so a regression (unbounded authenticate) fails FAST.
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_init_ok_auth_hangs_agent(agent_side);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            AcpBackend::connect(client_side, test_config_short_handshake()),
+        )
+        .await
+        .expect("connect must return within the handshake bound, not hang on authenticate");
+        match outcome {
+            Err(BridgeError::AgentCrashed) => {}
+            Err(e) => panic!("a hung authenticate must surface a clear bounded error, got {e:?}"),
+            Ok(_) => panic!("a hung authenticate must surface a clear bounded error, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_auth_method_not_advertised_still_attempts() {
+        // I4: a configured `auth_method` that the agent did NOT advertise is still
+        // attempted (the agent is authoritative). Here the agent advertises a
+        // DIFFERENT method ("oauth") and REJECTS the (mismatched) configured one;
+        // the backend attempts the configured id, warns about the mismatch, and the
+        // rejection surfaces cleanly as `AgentNotAuthenticated`.
+        let rec = Recorder::new("agent-sess-AUTHMISMATCH");
+        rec.advertise_auth_method("oauth").await;
+        rec.reject_authenticate.store(true, Ordering::SeqCst);
+        let cfg = AcpConfig {
+            auth_method: Some("apikey".to_string()),
+            ..test_config()
+        };
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_recording_agent(agent_side, rec.clone());
+        match AcpBackend::connect(client_side, cfg).await {
+            Err(BridgeError::AgentNotAuthenticated) => {}
+            Err(e) => panic!("a mismatched+rejected auth_method must fail cleanly, got {e:?}"),
+            Ok(_) => panic!("a mismatched+rejected auth_method must fail cleanly, got Ok"),
+        }
+        // The backend attempted the CONFIGURED method id (not the advertised one).
+        assert_eq!(rec.authenticates.lock().await.as_slice(), &["apikey"]);
     }
 }
