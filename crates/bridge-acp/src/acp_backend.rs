@@ -2,13 +2,19 @@
 // Spec §5.3 cancellation rule: completion is the prompt RESULT (stopReason:"cancelled"),
 // NOT the act of sending session/cancel. See Codex finding 2.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use agent_client_protocol::schema::{
+    AgentCapabilities, AuthMethod, InitializeRequest, InitializeResponse, ProtocolVersion,
+};
+use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use async_trait::async_trait;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
@@ -20,7 +26,27 @@ use crate::supervisor::Supervised;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
-// ── Inner state shared across all async ops ─────────────────────────────────
+/// Static configuration for an ACP agent connection.
+///
+/// `model` / `mode` are introduced now but only consumed by later tasks
+/// (`set_model` / `set_mode` after `session/new`); Task 1 only uses `cwd`
+/// when building sessions, which arrives in a later task too.
+#[derive(Debug, Clone)]
+pub struct AcpConfig {
+    /// Absolute working directory the agent runs sessions in.
+    pub cwd: PathBuf,
+    /// Optional model id to request via `session/set_model` (later tasks).
+    pub model: Option<String>,
+    /// Optional mode id to request via `session/set_mode` (later tasks).
+    pub mode: Option<String>,
+}
+
+// ── Legacy (v1, scripted-only) inner state ──────────────────────────────────
+//
+// Retained verbatim so the renamed type keeps the v1 `prompt`/`cancel` behavior
+// green for the inline scripted tests and the gated e2es while the conformant
+// SDK `prompt`/`cancel` are built in Increment 3a Tasks 2–4. Only populated by
+// `from_child`; the SDK constructors (`spawn`/`connect`) leave it `None`.
 
 struct Inner {
     stdin: ChildStdin,
@@ -28,27 +54,163 @@ struct Inner {
     supervised: Supervised,
 }
 
+// ── SDK connection handle ────────────────────────────────────────────────────
+//
+// The connection's event loop (`connect_with`) owns a single task that runs
+// until the connection closes, so we cannot keep the loop "in line". Instead
+// `connect`/`spawn` start the loop in a dedicated tokio task whose `main_fn`
+// publishes a clone of the `ConnectionTo<Agent>` handle out through a oneshot,
+// then parks until shutdown. All agent-bound requests go through that cloned
+// `cx`. (Driving the loop via a command channel is the alternative; a shared
+// `cx` is simpler and is what Tasks 2–6 build prompt/cancel on top of.)
+struct AcpConn {
+    cx: ConnectionTo<Agent>,
+    /// Negotiated agent capabilities from `initialize`.
+    agent_capabilities: AgentCapabilities,
+    /// Authentication methods the agent advertised (drives `authenticate`).
+    auth_methods: Vec<AuthMethod>,
+    /// Held for the backend's lifetime: the event-loop task parks on the paired
+    /// receiver, so dropping this (on backend drop) closes the connection and
+    /// lets the loop task exit cleanly. Tasks 2+ may signal it explicitly to
+    /// drive shutdown / terminate.
+    _shutdown: oneshot::Sender<()>,
+}
+
 // ── Public struct ────────────────────────────────────────────────────────────
 
 pub struct AcpBackend {
-    inner: Arc<Mutex<Inner>>,
+    /// Legacy scripted path state (`from_child` only). `None` on the SDK path.
+    inner: Option<Arc<Mutex<Inner>>>,
+    /// SDK connection handle (`spawn`/`connect` only). `None` on the legacy path.
+    conn: Option<AcpConn>,
     id_counter: Arc<AtomicU64>,
 }
 
 impl AcpBackend {
+    /// Build the `initialize` request this backend sends to the agent.
+    ///
+    /// Exposed so the wire-golden test can assert the serialized frame is
+    /// conformant (integer `protocolVersion`, no fs/terminal capabilities)
+    /// against the SAME value the connection actually transmits.
+    #[must_use]
+    pub fn initialize_request() -> InitializeRequest {
+        // `InitializeRequest::new` defaults `client_capabilities` to
+        // `ClientCapabilities::default()`, which advertises no fs read/write and
+        // no terminal support — exactly what we want (no fs/terminal seam).
+        InitializeRequest::new(ProtocolVersion::V1)
+    }
+
+    /// **Production** constructor: spawn `cmd args` as a `Supervised` child
+    /// (its own process group, tested SIGTERM→SIGKILL reaping) and drive the
+    /// ACP connection over its stdin/stdout as `ByteStreams`.
+    ///
+    /// This is `Supervised` + `connect(ByteStreams)`: process lifecycle stays
+    /// with `Supervised`; protocol drive is the shared `connect` core.
+    pub async fn spawn(cmd: &str, args: &[&str], config: AcpConfig) -> Result<Self, BridgeError> {
+        let mut supervised = Supervised::spawn(cmd, args).map_err(|_| BridgeError::AgentCrashed)?;
+        let child = supervised.child_mut();
+        let stdin = child.stdin.take().expect("stdin must be piped");
+        let stdout = child.stdout.take().expect("stdout must be piped");
+        // The crate uses `futures` async-io; our child uses tokio pipes — adapt
+        // with tokio_util::compat. ByteStreams::new(outgoing_writer, incoming_reader).
+        let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+        // NOTE: `supervised` (the process-group owner) is dropped at the end of
+        // this fn; `kill_on_drop(true)` keeps the child reaped. Task 2+ will hold
+        // it for explicit `terminate()` on cancel timeout.
+        Self::connect(transport, config).await
+    }
+
+    /// **Transport-generic** core constructor. Accepts any SDK transport, so
+    /// in-process fake-agent unit tests can pass `Channel::duplex()`.
+    ///
+    /// Starts the connection event loop in a dedicated task, captures a clone of
+    /// the `ConnectionTo<Agent>` handle, then runs `initialize`.
+    pub async fn connect(
+        transport: impl ConnectTo<Client> + 'static,
+        _config: AcpConfig,
+    ) -> Result<Self, BridgeError> {
+        let (cx_tx, cx_rx) = oneshot::channel::<ConnectionTo<Agent>>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        // The event loop owns a long-lived task. `main_fn` publishes a clone of
+        // `cx` and then parks on `shutdown_rx` so the connection stays open for
+        // the lifetime of the backend (returning from `main_fn` would close it).
+        tokio::spawn(async move {
+            let _ = Client
+                .builder()
+                .name("a2a-bridge")
+                .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
+                    // Hand a clone back to the AcpBackend; ignore send errors
+                    // (receiver dropped => backend gone => nothing to drive).
+                    let _ = cx_tx.send(cx.clone());
+                    // Park until the backend signals shutdown (or is dropped).
+                    let _ = shutdown_rx.await;
+                    Ok(())
+                })
+                .await;
+        });
+
+        let cx = cx_rx.await.map_err(|_| BridgeError::AgentCrashed)?;
+
+        // Run the ACP `initialize` handshake and capture the negotiated caps.
+        let resp: InitializeResponse = cx
+            .send_request(Self::initialize_request())
+            .block_task()
+            .await
+            .map_err(|_| BridgeError::AgentCrashed)?;
+
+        Ok(Self {
+            inner: None,
+            conn: Some(AcpConn {
+                cx,
+                agent_capabilities: resp.agent_capabilities,
+                auth_methods: resp.auth_methods,
+                _shutdown: shutdown_tx,
+            }),
+            id_counter: Arc::new(AtomicU64::new(1)),
+        })
+    }
+
+    /// Negotiated agent capabilities from the most recent `initialize`.
+    /// `None` on the legacy (`from_child`) path.
+    #[must_use]
+    pub fn agent_capabilities(&self) -> Option<&AgentCapabilities> {
+        self.conn.as_ref().map(|c| &c.agent_capabilities)
+    }
+
+    /// Authentication methods the agent advertised at `initialize`.
+    /// `None` on the legacy (`from_child`) path.
+    #[must_use]
+    pub fn auth_methods(&self) -> Option<&[AuthMethod]> {
+        self.conn.as_ref().map(|c| c.auth_methods.as_slice())
+    }
+
+    /// Access the SDK connection handle (panics on the legacy path). Used by
+    /// later tasks to send agent-bound requests; kept private for now.
+    #[allow(dead_code)]
+    fn cx(&self) -> &ConnectionTo<Agent> {
+        &self.conn.as_ref().expect("SDK connection present").cx
+    }
+
     /// Construct from an already-spawned scripted child (used in tests and when
     /// the caller has already set up the process).
+    ///
+    /// LEGACY (v1) path: drives the hand-rolled JSON-RPC framing for the
+    /// scripted prompt/cancel tests and the gated e2es. The conformant SDK path
+    /// is `spawn`/`connect`; this is retained to keep the workspace green until
+    /// Tasks 2–4 replace the prompt/cancel innards.
     pub fn from_child(mut supervised: Supervised) -> Self {
         let child = supervised.child_mut();
         let stdin = child.stdin.take().expect("stdin must be piped");
         let stdout = child.stdout.take().expect("stdout must be piped");
         let reader = FrameReader::new(BufReader::new(stdout), MAX_FRAME);
         Self {
-            inner: Arc::new(Mutex::new(Inner {
+            inner: Some(Arc::new(Mutex::new(Inner {
                 stdin,
                 reader,
                 supervised,
-            })),
+            }))),
+            conn: None,
             id_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -56,7 +218,7 @@ impl AcpBackend {
     /// Send `session/new`, read back the `{result:{sessionId}}` response.
     pub async fn new_session(&self) -> Result<SessionId, BridgeError> {
         let id = self.next_id();
-        let mut g = self.inner.lock().await;
+        let mut g = self.legacy_inner().lock().await;
         let req = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -102,7 +264,7 @@ impl AcpBackend {
                 let dummy = Supervised::spawn("/bin/sh", &["-c", "exit 0"])
                     .map_err(|_| BridgeError::AgentCrashed)?;
                 let supervised = {
-                    let mut g = self.inner.lock().await;
+                    let mut g = self.legacy_inner().lock().await;
                     std::mem::replace(&mut g.supervised, dummy)
                 };
                 supervised
@@ -115,13 +277,21 @@ impl AcpBackend {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
+    /// The legacy scripted-path inner state. Only the `from_child` constructor
+    /// populates it; the legacy `prompt`/`cancel`/`new_session` paths require it.
+    fn legacy_inner(&self) -> &Arc<Mutex<Inner>> {
+        self.inner
+            .as_ref()
+            .expect("legacy path requires from_child construction")
+    }
+
     fn next_id(&self) -> u64 {
         self.id_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     async fn send_cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
         let id = self.next_id();
-        let mut g = self.inner.lock().await;
+        let mut g = self.legacy_inner().lock().await;
         let req = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -136,7 +306,7 @@ impl AcpBackend {
     async fn wait_for_done(&self) -> Result<String, BridgeError> {
         loop {
             let frame = {
-                let mut g = self.inner.lock().await;
+                let mut g = self.legacy_inner().lock().await;
                 g.reader.next().await
             };
             match frame {
@@ -172,7 +342,7 @@ impl AgentBackend for AcpBackend {
         let session_id = session.as_str().to_string();
 
         {
-            let mut g = self.inner.lock().await;
+            let mut g = self.legacy_inner().lock().await;
             let serialized_parts: Vec<serde_json::Value> = parts
                 .iter()
                 .map(|p| serde_json::json!({ "text": p.text }))
@@ -191,7 +361,7 @@ impl AgentBackend for AcpBackend {
 
         // Build a stream that pulls frames from the shared reader.
         // We hold the Arc<Mutex<Inner>> and lock it per frame.
-        let inner = Arc::clone(&self.inner);
+        let inner = Arc::clone(self.legacy_inner());
 
         let stream = futures::stream::unfold(
             (inner, id, false), // (inner, prompt_id, done)
@@ -388,5 +558,81 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, BridgeError::CancelTimeout);
+    }
+
+    // ── SDK connection path (transport-generic, in-process fake agent) ──────────
+
+    use agent_client_protocol::schema::{
+        AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodId, InitializeRequest,
+        InitializeResponse, ProtocolVersion,
+    };
+    use agent_client_protocol::{Agent, Channel};
+
+    /// Spawn an in-process fake ACP agent on `channel` that answers `initialize`
+    /// with the given response. Returns immediately; the agent loop runs in a task.
+    fn spawn_fake_agent(channel: Channel, resp: InitializeResponse) {
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name("fake-agent")
+                .on_receive_request(
+                    move |_req: InitializeRequest,
+                          responder: agent_client_protocol::Responder<InitializeResponse>,
+                          _cx| {
+                        let resp = resp.clone();
+                        async move {
+                            responder.respond(resp)?;
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(channel)
+                .await;
+        });
+    }
+
+    fn test_config() -> AcpConfig {
+        AcpConfig {
+            cwd: std::path::PathBuf::from("/tmp"),
+            model: None,
+            mode: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_runs_initialize_and_captures_agent_capabilities() {
+        // Fake agent advertises one auth method; assert the backend captured the
+        // negotiated InitializeResponse (caps + auth methods) over the transport seam.
+        let (client_side, agent_side) = Channel::duplex();
+        let resp = InitializeResponse::new(ProtocolVersion::V1)
+            .agent_capabilities(AgentCapabilities::default())
+            .auth_methods(vec![AuthMethod::Agent(AuthMethodAgent::new(
+                AuthMethodId::new("oauth"),
+                "OAuth",
+            ))]);
+        spawn_fake_agent(agent_side, resp);
+
+        let be = AcpBackend::connect(client_side, test_config())
+            .await
+            .expect("initialize handshake succeeds");
+
+        assert!(
+            be.agent_capabilities().is_some(),
+            "SDK path must capture agent capabilities"
+        );
+        let methods = be.auth_methods().expect("auth methods captured");
+        assert_eq!(methods.len(), 1, "advertised auth method round-trips");
+    }
+
+    #[tokio::test]
+    async fn connect_errors_when_agent_never_answers() {
+        // Agent side is dropped immediately -> initialize never completes -> AgentCrashed.
+        let (client_side, agent_side) = Channel::duplex();
+        drop(agent_side);
+        match AcpBackend::connect(client_side, test_config()).await {
+            Err(e) => assert_eq!(e, BridgeError::AgentCrashed),
+            Ok(_) => panic!("expected AgentCrashed when the agent never answers initialize"),
+        }
     }
 }
