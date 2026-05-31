@@ -86,8 +86,14 @@ enum TurnEvent {
     /// A streamed chunk of the agent's textual response.
     Text(String),
     /// The terminal turn result. Pushed by the driver after the `PromptResponse`
-    /// arrives, carrying the mapped `Update::Done`. Always the last event.
+    /// arrives, carrying the mapped `Update::Done`. Always the last event on a
+    /// turn that the agent COMPLETED (incl. a real `StopReason::Cancelled`).
     Done(Update),
+    /// A terminal turn FAILURE: `session/prompt` returned `Err` (agent crash /
+    /// transport failure mid-turn). The `unfold` stream maps this to a terminal
+    /// `Err` item, so a crash surfaces to the A2A caller as `Failed` — never the
+    /// silent `Done{"unknown"}` that downstream reads as a clean `Completed`.
+    Failed(BridgeError),
 }
 
 // ── SDK connection handle ────────────────────────────────────────────────────
@@ -552,11 +558,17 @@ impl AgentBackend for AcpBackend {
     ///    streamed turn and `block_task().await`s the `PromptResponse`; the SDK
     ///    delivers chunks meanwhile via the handler → the registered `Sender`.
     /// 4. On the response, the driver unregisters the `Sender` and pushes a
-    ///    terminal `Update::Done { stop_reason }` (StopReason mapped), then
-    ///    releases the turn lock (by dropping the guard it owns).
+    ///    terminal event, then releases the turn lock (by dropping the guard it
+    ///    owns). A completed turn (incl. a real `StopReason::Cancelled`) pushes
+    ///    `TurnEvent::Done` → stream yields `Ok(Update::Done{stop_reason})`. A
+    ///    `session/prompt` `Err` (agent crash / transport failure) pushes
+    ///    `TurnEvent::Failed` → stream yields a terminal `Err` so downstream
+    ///    reports the A2A caller `Failed` (NOT a silent `Done{"unknown"}` that
+    ///    would read as a clean `Completed`).
     ///
     /// The returned `BackendStream` yields the streamed `Update::Text`s in order,
-    /// then exactly one `Update::Done`.
+    /// then exactly one terminal item: `Ok(Update::Done)` on success, or `Err`
+    /// on a transport/agent failure.
     async fn prompt(
         &self,
         session: &SessionId,
@@ -601,17 +613,19 @@ impl AgentBackend for AcpBackend {
             if let Ok(mut map) = registry_for_driver.lock() {
                 map.remove(&agent_id_for_driver);
             }
-            let done = match outcome {
-                Ok(resp) => Update::Done {
+            let event = match outcome {
+                // Turn COMPLETED (incl. a real StopReason::Cancelled, which maps
+                // to Done{"cancelled"} — NOT an error). Emit the mapped Done.
+                Ok(resp) => TurnEvent::Done(Update::Done {
                     stop_reason: AcpBackend::stop_reason_str(resp.stop_reason),
-                },
-                // A transport/agent error ends the turn: surface a terminal Done
-                // so the stream never closes silently (§5.3 "naive bridge").
-                Err(_) => Update::Done {
-                    stop_reason: "unknown".to_string(),
-                },
+                }),
+                // A transport/agent error (agent crash / mid-turn transport
+                // failure) FAILED the turn: surface a terminal Err on the stream
+                // so downstream reports the inbound A2A caller `Failed` — never a
+                // silent Done{"unknown"} that reads as a clean `Completed`.
+                Err(_) => TurnEvent::Failed(BridgeError::AgentCrashed),
             };
-            let _ = done_sender.send(TurnEvent::Done(done));
+            let _ = done_sender.send(event);
             // `_turn` (the OwnedMutexGuard) drops here, releasing the turn lock.
         });
 
@@ -624,7 +638,11 @@ impl AgentBackend for AcpBackend {
             match rx.recv().await {
                 Some(TurnEvent::Text(t)) => Some((Ok(Update::Text(t)), (rx, false))),
                 Some(TurnEvent::Done(u)) => Some((Ok(u), (rx, true))),
-                // Channel closed without a Done (driver dropped) — terminate.
+                // Terminal failure: yield the Err as the final stream item, then
+                // end. Downstream re-yields the Err → producer marks `errored` →
+                // terminal frame is `TaskOutcome::Failed` (the correct path).
+                Some(TurnEvent::Failed(e)) => Some((Err(e), (rx, true))),
+                // Channel closed without a Done/Failed (driver dropped) — terminate.
                 None => None,
             }
         });
@@ -909,6 +927,10 @@ mod tests {
         /// streaming tests don't have to drive the gate. The turn-ordering test
         /// sets it `true` to hold turns open.
         gate_prompt: Arc<AtomicBool>,
+        /// Whether the prompt handler FAILS the turn (responds with a JSON-RPC
+        /// error instead of a `PromptResponse`), so the client's `send_request`
+        /// returns `Err` — driving the transport/agent-error path deterministically.
+        fail_prompt: Arc<AtomicBool>,
         /// Scripted `session/update`s the prompt handler emits (in order) BEFORE
         /// it returns the `PromptResponse`. Empty by default.
         prompt_updates: Arc<Mutex<Vec<ScriptedUpdate>>>,
@@ -930,6 +952,7 @@ mod tests {
                 prompt_gate: Arc::new(Notify::new()),
                 prompt_started: Arc::new(Notify::new()),
                 gate_prompt: Arc::new(AtomicBool::new(false)),
+                fail_prompt: Arc::new(AtomicBool::new(false)),
                 prompt_updates: Arc::new(Mutex::new(Vec::new())),
                 stop_reason: Arc::new(Mutex::new(StopReason::EndTurn)),
             }
@@ -1030,6 +1053,15 @@ mod tests {
                             // interleave and be caught by the ordering log.
                             if r.gate_prompt.load(Ordering::SeqCst) {
                                 r.prompt_gate.notified().await;
+                            }
+                            // Optionally FAIL the turn: respond with a JSON-RPC
+                            // error so the client's `send_request` returns `Err`,
+                            // exercising the transport/agent-error path. Logged as
+                            // "fail" (not "end") so a test can distinguish.
+                            if r.fail_prompt.load(Ordering::SeqCst) {
+                                r.prompt_log.lock().await.push("fail");
+                                responder.respond_with_internal_error("agent failed the turn")?;
+                                return Ok(());
                             }
                             r.prompt_log.lock().await.push("end");
                             let sr = *r.stop_reason.lock().await;
@@ -1260,6 +1292,15 @@ mod tests {
             .await
             .expect("turn 1 starts");
 
+        // Subscribe to turn 2's potential start BEFORE spawning it, so a
+        // (broken-lock) start can never slip past us between spawn and wait. The
+        // `Notified` future is registered as a waiter the moment it's polled.
+        let turn2_start = rec.prompt_started.notified();
+        tokio::pin!(turn2_start);
+        // Poll once to register as a waiter without blocking (Pending expected:
+        // turn 2 hasn't started, nor has it even been spawned yet).
+        let _ = futures::poll!(turn2_start.as_mut());
+
         // Turn 2: this `prompt` call blocks acquiring the turn lock (held by
         // turn 1's driver). Drive it from a task so we can observe it WAITING.
         let be2 = Arc::clone(&be);
@@ -1269,9 +1310,20 @@ mod tests {
             while s2.next().await.is_some() {}
         });
 
-        // Turn 2 MUST be blocked on the lock: the agent has NOT seen a second
-        // prompt start yet.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Turn 2 MUST stay blocked on the lock while turn 1 holds it. Deterministic
+        // gate (no timing proxy): a BROKEN lock lets turn 2 start, which fires
+        // `prompt_started` — so we wait on the pre-registered `turn2_start` notify
+        // and REQUIRE it to TIME OUT (turn 2 stayed blocked). With a working lock
+        // the wait always elapses; with a broken lock turn 2's start resolves the
+        // notify before the bound and the test fails reliably (not a sleep proxy).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), turn2_start.as_mut())
+                .await
+                .is_err(),
+            "second turn must stay blocked on the lock while turn 1 holds it \
+             (a broken lock would fire prompt_started before the bound)"
+        );
+        // And the agent's own log confirms exactly one start outstanding.
         assert_eq!(
             rec.prompt_log.lock().await.as_slice(),
             &["start"],
@@ -1279,8 +1331,10 @@ mod tests {
         );
 
         // Release turn 1; it ends (driver drops the lock), then turn 2 starts.
+        // Reuse the SAME pre-registered `turn2_start` waiter to observe turn 2's
+        // actual start (avoids a second registered waiter racing the notify).
         rec.prompt_gate.notify_one();
-        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+        tokio::time::timeout(Duration::from_secs(2), turn2_start.as_mut())
             .await
             .expect("turn 2 starts after turn 1 released");
         rec.prompt_gate.notify_one(); // unblock turn 2
@@ -1368,6 +1422,46 @@ mod tests {
             };
             assert_eq!(last, expected, "StopReason {sr:?} maps to {expected}");
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_turn_error_surfaces_as_stream_err() {
+        // A transport/agent error mid-turn (here: the agent FAILS `session/prompt`
+        // with a JSON-RPC error, deterministically gated by `fail_prompt`) must
+        // surface as a terminal `Err` on the BackendStream — NOT a silent
+        // `Ok(Update::Done{"unknown"})`. The Err is what downstream re-yields so
+        // the inbound A2A caller is reported `Failed`, not a clean `Completed`.
+        let rec = Recorder::new("agent-sess-FAIL");
+        // Stream a chunk first, THEN fail: proves chunks already delivered still
+        // flow and the failure is the terminal item (not a swallowed Done).
+        rec.set_updates(vec![ScriptedUpdate::Text("partial")]).await;
+        rec.fail_prompt.store(true, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-FAIL");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        // The streamed chunk arrives first (ordering preserved).
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "partial"));
+        // The turn's terminal item is an Err — NOT a Done.
+        match s.next().await {
+            Some(Err(BridgeError::AgentCrashed)) => {}
+            other => panic!(
+                "prompt-turn error must surface as terminal Err(AgentCrashed), got {other:?}"
+            ),
+        }
+        // Stream ends after the terminal Err (no trailing Done).
+        assert!(
+            s.next().await.is_none(),
+            "stream terminates after the error item"
+        );
+
+        // The agent recorded the turn-start then a fail (not an end) — confirming
+        // the prompt reached the agent and the failure path was the one taken.
+        assert_eq!(
+            rec.prompt_log.lock().await.as_slice(),
+            &["start", "fail"],
+            "agent saw the prompt start then failed the turn"
+        );
     }
 
     #[tokio::test]
