@@ -128,12 +128,19 @@ the translator check.
 - **kiro-cli gate MET**: the live gated e2e (`e2e_acp_kiro.rs`) was run against
   real `kiro-cli 2.5.0` and yielded `PONG` / `end_turn` — no conformance bug, no
   fs capabilities required.
-- **codex-acp gate UNMET**: `codex-acp` is not installable in the authoring
-  environment (`codex` 0.130.0 has no `acp` subcommand). The codex e2e
-  (`e2e_acp_codex.rs`) is `#[ignore]`'d and compile-only. A non-ignore-gated
-  `codex_provisional_frames_replay_but_gate_is_unmet` test + an ignored
-  `real_capture_corpus_present` test (which FAILS naming codex) are present so
-  the open gate cannot be overlooked in CI.
+- **codex-acp gate MET**: a real round-trip was captured off the wire from
+  zed-industries/codex-acp 0.15.0 (which speaks `protocolVersion:1`) and the live
+  `e2e_acp_codex` round-trip passed against it (`PONG` / `end_turn`). The captured
+  corpus (`tests/corpus/codex-acp.jsonl`, `_provenance:REAL-CAPTURE`) replays through
+  the same `map_session_update` / `stop_reason_str` path: the two `agent_message_chunk`
+  frames join to `PONG`, the `end_turn` result maps to `Update::Done`, and the unmodeled
+  `available_commands_update` / `config_option_update` / `usage_update` updates are
+  DROPPED. The `codex_real_capture_replays_pong_and_drops_unmodeled` test asserts this,
+  and `real_capture_corpus_present` is now a normal (non-ignored) PASSING test since both
+  agents have real captures. One observed novelty: codex's `usage_update` is absent from
+  the SDK 0.12.1 `SessionNotification` enum, so it fails SDK deserialization — and is
+  dropped exactly as the live SDK dispatch drops a parse error (`send_error_notification`,
+  connection continues), not fatally.
 
 ---
 
@@ -145,7 +152,8 @@ the translator check.
   guaranteed for every driven method (not hand-maintained).
 - The full lifecycle (initialize → authenticate → session/new → set_mode →
   set_model → session/prompt → cancel) is now CI-proven via wire-golden tests,
-  a real captured corpus, and a live kiro round-trip.
+  real captured corpora (kiro-cli 2.5.0 + codex-acp 0.15.0), and live kiro and
+  codex round-trips.
 - The transport-generic seam (`connect(transport)`) makes unit tests
   fully in-process — no real agent process required for the 47 backend tests.
 - Reverse `session/request_permission` is now handled correctly and off the event
@@ -155,19 +163,24 @@ the translator check.
 
 **Discrepancies and open items:**
 
-- **SDK version skew.** `codex-acp` links `agent-client-protocol` 0.9.2 (with
-  unstable features); the bridge compiles 0.12.1. The two versions are
-  wire-compatible for the driven methods; no incompatibility has been observed
-  against real kiro (which also uses a different internal version).
+- **SDK version skew.** An earlier note assumed a `codex-acp` ↔ bridge skew of
+  `agent-client-protocol` 0.9.2 vs 0.12.1. That 0.9.2 assumption came from the
+  **cola-io fork** and does NOT apply to the official **zed-industries/codex-acp**
+  adapter we validated: that adapter speaks `protocolVersion:1` and our 0.12.1 client
+  is wire-compatible with it — validated live (full PONG / end_turn round-trip) and via
+  the captured-corpus replay. No incompatibility was observed against real codex-acp
+  0.15.0 (nor against real kiro, which also uses a different internal version). The one
+  shape codex emits that our SDK version does not model — the `usage_update`
+  `session/update` variant — is tolerantly dropped, not fatal.
 - **`unstable_session_model` feature.** `session/set_model` is behind a Cargo
   feature flag in 0.12.1. This is declared on the `bridge-acp` dep and is stable
   enough for the driven use.
-- **codex-acp DoD gate UNMET.** The codex-acp real-capture corpus and live e2e
-  cannot be completed until `codex-acp` is available in the target environment.
-  The codex wire frames in `tests/corpus/codex-acp.jsonl` are provisional (derived from
-  spec, not captured). This is the one remaining open conformance item for
-  Increment 3a; it is explicitly unforgettable via the `real_capture_corpus_present`
-  `#[ignore]` test that fails when run.
+- **codex-acp DoD gate MET.** The codex-acp real-capture corpus and live e2e are
+  now complete against zed-industries/codex-acp 0.15.0: `tests/corpus/codex-acp.jsonl`
+  is a `REAL-CAPTURE` round-trip (no longer provisional) and the live `e2e_acp_codex`
+  round-trip passed (`PONG` / `end_turn`). With both kiro-cli and codex-acp captured,
+  the `real_capture_corpus_present` test is now a normal (non-ignored) passing gate;
+  no open conformance item remains for Increment 3a on this axis.
 - **fs/terminal: unsupported by design.** The bridge advertises no fs or terminal
   client capabilities. An agent requiring fs/terminal for a basic prompt would
   hang at the prompt step (the no-fs-caps property under test in `e2e_acp_kiro`).
