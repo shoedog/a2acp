@@ -143,18 +143,6 @@ impl Registry {
         })
     }
 
-    /// Access to the swappable state, for `apply`'s reconcile in Task 4.
-    #[allow(dead_code)] // wired up by the atomic reconcile in Task 4
-    pub(crate) fn state(&self) -> &ArcSwap<State> {
-        &self.state
-    }
-
-    /// Access to the spawn factory, for `apply`'s reconcile in Task 4.
-    #[allow(dead_code)] // wired up by the atomic reconcile in Task 4
-    pub(crate) fn spawn_fn(&self) -> &SpawnFn {
-        &self.spawn
-    }
-
     /// Detached lease-draining retirement [spec §7]. The slot is already marked
     /// `retired` (blocks NEW leases via resolve's post-spawn re-check) and absent
     /// from the live map. This task awaits `leases == 0` — woken by the slot's
