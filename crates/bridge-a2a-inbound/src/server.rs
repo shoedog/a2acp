@@ -135,10 +135,11 @@ impl InboundServer {
             .unwrap_or(A2A_PINNED_VERSION);
         assert_supported_version(version)?;
 
-        // 3. Route. Parse skill from params and pass to route decision. The
+        // 3. Route. Parse skill/agent/overrides from params and pass to route decision. The
         //    target (Local vs Delegate) is carried through so the handler picks
         //    the local-backend producer or the delegation producer.
-        let task_meta = task_meta_from_params(params);
+        //    Invalid metadata (bad agent id, unknown effort) returns InvalidRequest → client error.
+        let task_meta = task_meta_from_params(params)?;
         let target = self.route.route(&task_meta)?;
 
         // 4. Derive task/session ids from params (best-effort; v1 stubs allowed).
@@ -1119,20 +1120,78 @@ fn task_id_from_params(params: &Value) -> Result<TaskId, BridgeError> {
     }
 }
 
-/// Extract `TaskMeta` from JSON-RPC params. Reads the skill selector from
-/// `params.message.metadata["a2a-bridge.skill"]` if present; all other fields
-/// are left at their defaults.
-fn task_meta_from_params(params: &Value) -> TaskMeta {
-    let skill = params
-        .get("message")
-        .and_then(|m| m.get("metadata"))
+/// Parse an effort-level string into the `Effort` enum, returning
+/// `BridgeError::InvalidRequest{field:"effort"}` for unrecognised strings.
+fn parse_effort_meta(s: &str) -> Result<bridge_core::domain::Effort, BridgeError> {
+    use bridge_core::domain::Effort;
+    match s {
+        "minimal" => Ok(Effort::Minimal),
+        "low" => Ok(Effort::Low),
+        "medium" => Ok(Effort::Medium),
+        "high" => Ok(Effort::High),
+        "max" => Ok(Effort::Max),
+        _ => Err(BridgeError::InvalidRequest { field: "effort" }),
+    }
+}
+
+/// Extract `TaskMeta` from JSON-RPC params.
+///
+/// Reads from `params.message.metadata`:
+/// - `a2a-bridge.skill`  → `TaskMeta::skill`
+/// - `a2a-bridge.agent`  → `TaskMeta::agent` (if present, must be non-empty; absent → `None`)
+/// - `a2a-bridge.model` / `a2a-bridge.effort` / `a2a-bridge.mode` → `TaskMeta::overrides`
+///
+/// Returns `Err(BridgeError::InvalidRequest)` if `agent` is present but empty/invalid,
+/// or if `effort` is present but not one of the recognised tier strings.
+fn task_meta_from_params(params: &Value) -> Result<TaskMeta, BridgeError> {
+    let metadata = params.get("message").and_then(|m| m.get("metadata"));
+
+    let skill = metadata
         .and_then(|md| md.get("a2a-bridge.skill"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    TaskMeta {
+
+    // Agent: if the key is present, parse it (rejects empty → InvalidRequest); if absent → None.
+    let agent = match metadata
+        .and_then(|md| md.get("a2a-bridge.agent"))
+        .and_then(|v| v.as_str())
+    {
+        Some(s) => Some(bridge_core::ids::AgentId::parse(s)?),
+        None => None,
+    };
+
+    // Per-request overrides: build Some(AgentOverride) if ANY of the three override keys is present.
+    let model = metadata
+        .and_then(|md| md.get("a2a-bridge.model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let effort = match metadata
+        .and_then(|md| md.get("a2a-bridge.effort"))
+        .and_then(|v| v.as_str())
+    {
+        Some(s) => Some(parse_effort_meta(s)?),
+        None => None,
+    };
+    let mode = metadata
+        .and_then(|md| md.get("a2a-bridge.mode"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let overrides = if model.is_some() || effort.is_some() || mode.is_some() {
+        Some(bridge_core::domain::AgentOverride {
+            model,
+            effort,
+            mode,
+        })
+    } else {
+        None
+    };
+
+    Ok(TaskMeta {
         skill,
-        ..Default::default()
-    }
+        agent,
+        overrides,
+    })
 }
 
 /// Pull message parts from params, extracting real text content.
@@ -1926,13 +1985,76 @@ mod tests {
     #[test]
     fn skill_metadata_parsed_into_taskmeta() {
         let p = serde_json::json!({"message":{"metadata":{"a2a-bridge.skill":"delegate"}}});
-        assert_eq!(task_meta_from_params(&p).skill.as_deref(), Some("delegate"));
+        assert_eq!(
+            task_meta_from_params(&p).unwrap().skill.as_deref(),
+            Some("delegate")
+        );
     }
 
     #[test]
     fn no_skill_metadata_is_none() {
         let p = serde_json::json!({"message":{"text":"hi"}});
-        assert_eq!(task_meta_from_params(&p).skill, None);
+        assert_eq!(task_meta_from_params(&p).unwrap().skill, None);
+    }
+
+    // ---- Task 9: task_meta_from_params reads agent + overrides ----
+
+    #[test]
+    fn task_meta_reads_agent_and_overrides() {
+        let p = serde_json::json!({
+            "message": {
+                "metadata": {
+                    "a2a-bridge.agent": "codex",
+                    "a2a-bridge.model": "gpt-5.5",
+                    "a2a-bridge.effort": "high",
+                    "a2a-bridge.mode": "read-only"
+                }
+            }
+        });
+        let meta = task_meta_from_params(&p).unwrap();
+        assert_eq!(meta.agent.as_ref().map(|a| a.as_str()), Some("codex"));
+        let ov = meta.overrides.as_ref().expect("overrides should be Some");
+        assert_eq!(ov.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(ov.effort, Some(bridge_core::domain::Effort::High));
+        assert_eq!(ov.mode.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn task_meta_invalid_effort_returns_err() {
+        let p = serde_json::json!({
+            "message": {
+                "metadata": {
+                    "a2a-bridge.effort": "bogus"
+                }
+            }
+        });
+        match task_meta_from_params(&p) {
+            Err(BridgeError::InvalidRequest { field: "effort" }) => {}
+            other => panic!("expected InvalidRequest{{field:\"effort\"}}, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_meta_empty_agent_returns_err() {
+        let p = serde_json::json!({
+            "message": {
+                "metadata": {
+                    "a2a-bridge.agent": ""
+                }
+            }
+        });
+        match task_meta_from_params(&p) {
+            Err(BridgeError::InvalidRequest { .. }) => {}
+            other => panic!("expected InvalidRequest, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_meta_absent_agent_is_none() {
+        // Absent `a2a-bridge.agent` key → agent field is None (default falls through at route time).
+        let p = serde_json::json!({"message":{"metadata":{"a2a-bridge.skill":"delegate"}}});
+        let meta = task_meta_from_params(&p).unwrap();
+        assert!(meta.agent.is_none());
     }
 
     #[test]

@@ -15,8 +15,11 @@ use std::time::Duration;
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
 use bridge_acp::acp_backend::{AcpBackend, AcpConfig};
+use bridge_core::domain::{AgentEntry, RegistrySnapshot};
+use bridge_core::ids::AgentId;
 use bridge_core::ports::{DelegationPort, PolicyEngine};
 use bridge_policy::{auth::AlwaysGrant, permission::AutoPolicy};
+use bridge_registry::registry::Registry;
 use bridge_store::sqlite::SqliteStore;
 use config::Config;
 use route::SkillRoute;
@@ -75,7 +78,40 @@ async fn main() -> Result<(), BoxError> {
 
     // 5. Build the remaining port Arc<dyn Trait> wrappers.
     let auth = Arc::new(AlwaysGrant);
-    let route = Arc::new(SkillRoute);
+
+    // Build a single-entry registry for the configured [agent] so SkillRoute can
+    // use default_id() to fall back to it. Task 12 will replace this with the full
+    // multi-agent RegistryConfig wiring; for now a minimal snapshot keeps main green.
+    let agent_id = AgentId::parse(cfg.agent.name.clone())?;
+    let agent_entry = AgentEntry {
+        id: agent_id.clone(),
+        cmd: cfg.agent.cmd.clone(),
+        args: cfg.agent.args.clone(),
+        model_provider: None,
+        model: cfg.agent.model.clone(),
+        effort: None,
+        mode: cfg.agent.mode.clone(),
+        cwd: cfg.agent.cwd.clone(),
+        auth_method: cfg.agent.auth_method.clone(),
+        name: Some(cfg.agent.name.clone()),
+        description: None,
+        tags: vec![],
+        version: None,
+        extensions: Default::default(),
+    };
+    let single_snap = RegistrySnapshot {
+        default: agent_id,
+        entries: vec![agent_entry],
+        allowed_cmds: vec![cfg.agent.cmd.clone()],
+    };
+    // SpawnFn for the single-agent registry: reuse the already-spawned backend.
+    let backend_for_spawn = Arc::clone(&backend);
+    let spawn_fn: bridge_registry::registry::SpawnFn = Arc::new(move |_entry| {
+        let b = Arc::clone(&backend_for_spawn);
+        Box::pin(async move { Ok(b as Arc<dyn bridge_core::ports::AgentBackend>) })
+    });
+    let registry = Arc::new(Registry::new(single_snap, spawn_fn)?);
+    let route = Arc::new(SkillRoute::new(registry));
     let store = Arc::new(SqliteStore::open_in_memory()?);
     // Delegation port: real PeerDelegation when [delegation] is configured; StubDelegation otherwise.
     let delegation: Arc<dyn DelegationPort> = match &cfg.delegation {
