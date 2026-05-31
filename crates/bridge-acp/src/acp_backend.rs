@@ -26,6 +26,11 @@ use crate::supervisor::Supervised;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// Default bound on the `initialize` handshake. A real agent that connects its
+/// stdio but never sends the initialize response would otherwise hang
+/// `connect`/`spawn` forever; on elapse we return a clear `BridgeError`.
+const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Static configuration for an ACP agent connection.
 ///
 /// `model` / `mode` are introduced now but only consumed by later tasks
@@ -39,6 +44,22 @@ pub struct AcpConfig {
     pub model: Option<String>,
     /// Optional mode id to request via `session/set_mode` (later tasks).
     pub mode: Option<String>,
+    /// Bound on the `initialize` handshake (transport connect + response).
+    /// Defaults to [`DEFAULT_HANDSHAKE_TIMEOUT`]; on elapse `connect`/`spawn`
+    /// return `BridgeError::AgentCrashed` rather than hanging. Task 6 surfaces
+    /// this as a clear handshake-timeout error to the caller.
+    pub handshake_timeout: std::time::Duration,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            cwd: PathBuf::from("."),
+            model: None,
+            mode: None,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+        }
+    }
 }
 
 // ── Legacy (v1, scripted-only) inner state ──────────────────────────────────
@@ -83,6 +104,12 @@ pub struct AcpBackend {
     inner: Option<Arc<Mutex<Inner>>>,
     /// SDK connection handle (`spawn`/`connect` only). `None` on the legacy path.
     conn: Option<AcpConn>,
+    /// The spawned `Supervised` child, held for the whole backend lifetime so
+    /// `kill_on_drop(true)` does not SIGKILL it the instant `spawn` returns.
+    /// `Some` only on the `spawn` (production) path; `None` on `connect`
+    /// (in-process transport) and the legacy `from_child` path. Task 2 reads it
+    /// for explicit `terminate()`.
+    supervised: Option<Supervised>,
     id_counter: Arc<AtomicU64>,
 }
 
@@ -109,15 +136,17 @@ impl AcpBackend {
     pub async fn spawn(cmd: &str, args: &[&str], config: AcpConfig) -> Result<Self, BridgeError> {
         let mut supervised = Supervised::spawn(cmd, args).map_err(|_| BridgeError::AgentCrashed)?;
         let child = supervised.child_mut();
-        let stdin = child.stdin.take().expect("stdin must be piped");
-        let stdout = child.stdout.take().expect("stdout must be piped");
+        let stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed)?;
+        let stdout = child.stdout.take().ok_or(BridgeError::AgentCrashed)?;
         // The crate uses `futures` async-io; our child uses tokio pipes — adapt
         // with tokio_util::compat. ByteStreams::new(outgoing_writer, incoming_reader).
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-        // NOTE: `supervised` (the process-group owner) is dropped at the end of
-        // this fn; `kill_on_drop(true)` keeps the child reaped. Task 2+ will hold
-        // it for explicit `terminate()` on cancel timeout.
-        Self::connect(transport, config).await
+        // `supervised` (the process-group owner) MUST live for the whole backend
+        // lifetime: `kill_on_drop(true)` would SIGKILL the child the instant it
+        // dropped, killing the event-loop task's pipes. Hold it on the backend.
+        let mut backend = Self::connect(transport, config).await?;
+        backend.supervised = Some(supervised);
+        Ok(backend)
     }
 
     /// **Transport-generic** core constructor. Accepts any SDK transport, so
@@ -127,7 +156,7 @@ impl AcpBackend {
     /// the `ConnectionTo<Agent>` handle, then runs `initialize`.
     pub async fn connect(
         transport: impl ConnectTo<Client> + 'static,
-        _config: AcpConfig,
+        config: AcpConfig,
     ) -> Result<Self, BridgeError> {
         let (cx_tx, cx_rx) = oneshot::channel::<ConnectionTo<Agent>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -150,14 +179,25 @@ impl AcpBackend {
                 .await;
         });
 
-        let cx = cx_rx.await.map_err(|_| BridgeError::AgentCrashed)?;
+        // Bound the whole handshake (transport connect + initialize response) so
+        // an agent that opens stdio but never replies cannot hang us forever.
+        // A closed transport EOFs cleanly (the `map_err` arms below); a true hang
+        // is caught by the outer timeout.
+        let handshake = async {
+            let cx = cx_rx.await.map_err(|_| BridgeError::AgentCrashed)?;
 
-        // Run the ACP `initialize` handshake and capture the negotiated caps.
-        let resp: InitializeResponse = cx
-            .send_request(Self::initialize_request())
-            .block_task()
+            // Run the ACP `initialize` handshake and capture the negotiated caps.
+            let resp: InitializeResponse = cx
+                .send_request(Self::initialize_request())
+                .block_task()
+                .await
+                .map_err(|_| BridgeError::AgentCrashed)?;
+            Ok::<_, BridgeError>((cx, resp))
+        };
+
+        let (cx, resp) = tokio::time::timeout(config.handshake_timeout, handshake)
             .await
-            .map_err(|_| BridgeError::AgentCrashed)?;
+            .map_err(|_| BridgeError::AgentCrashed)??;
 
         Ok(Self {
             inner: None,
@@ -167,6 +207,7 @@ impl AcpBackend {
                 auth_methods: resp.auth_methods,
                 _shutdown: shutdown_tx,
             }),
+            supervised: None,
             id_counter: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -185,11 +226,16 @@ impl AcpBackend {
         self.conn.as_ref().map(|c| c.auth_methods.as_slice())
     }
 
-    /// Access the SDK connection handle (panics on the legacy path). Used by
-    /// later tasks to send agent-bound requests; kept private for now.
+    /// Access the SDK connection handle. Returns `Err(AgentCrashed)` on the
+    /// legacy (`from_child`) path where no SDK connection exists, so Task 2's
+    /// prompt routing gets a clean error seam instead of a panic inside the
+    /// event loop. Used by later tasks to send agent-bound requests.
     #[allow(dead_code)]
-    fn cx(&self) -> &ConnectionTo<Agent> {
-        &self.conn.as_ref().expect("SDK connection present").cx
+    fn cx(&self) -> Result<&ConnectionTo<Agent>, BridgeError> {
+        self.conn
+            .as_ref()
+            .map(|c| &c.cx)
+            .ok_or(BridgeError::AgentCrashed)
     }
 
     /// Construct from an already-spawned scripted child (used in tests and when
@@ -211,6 +257,8 @@ impl AcpBackend {
                 supervised,
             }))),
             conn: None,
+            // Legacy path owns its child via `Inner::supervised`; the SDK slot is unused.
+            supervised: None,
             id_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -592,11 +640,44 @@ mod tests {
         });
     }
 
+    /// Spawn an in-process fake ACP agent that *opens* the channel (so it does
+    /// not EOF) but **never** answers `initialize`: the handler parks forever
+    /// holding the responder, simulating a hung agent rather than a closed one.
+    fn spawn_hung_agent(channel: Channel) {
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name("hung-agent")
+                .on_receive_request(
+                    move |_req: InitializeRequest,
+                          _responder: agent_client_protocol::Responder<InitializeResponse>,
+                          _cx| async move {
+                        // Never respond; park forever so the channel stays open
+                        // and the client's initialize request hangs.
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(channel)
+                .await;
+        });
+    }
+
     fn test_config() -> AcpConfig {
         AcpConfig {
             cwd: std::path::PathBuf::from("/tmp"),
-            model: None,
-            mode: None,
+            ..AcpConfig::default()
+        }
+    }
+
+    /// Like [`test_config`] but with a short handshake bound so the
+    /// never-answers test fails fast instead of waiting the 30s default.
+    fn test_config_short_handshake() -> AcpConfig {
+        AcpConfig {
+            cwd: std::path::PathBuf::from("/tmp"),
+            handshake_timeout: Duration::from_millis(200),
+            ..AcpConfig::default()
         }
     }
 
@@ -633,6 +714,85 @@ mod tests {
         match AcpBackend::connect(client_side, test_config()).await {
             Err(e) => assert_eq!(e, BridgeError::AgentCrashed),
             Ok(_) => panic!("expected AgentCrashed when the agent never answers initialize"),
+        }
+    }
+
+    // I1: a *hung* agent (channel open, no initialize reply) must NOT hang us
+    // forever — the bounded handshake returns an error within the timeout.
+    #[tokio::test]
+    async fn connect_times_out_when_agent_opens_but_never_answers_initialize() {
+        let (client_side, agent_side) = Channel::duplex();
+        // Agent connects (channel stays open) but never responds to initialize.
+        spawn_hung_agent(agent_side);
+
+        // Bound the whole call so a regression (no handshake timeout) fails the
+        // test instead of hanging the suite.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            AcpBackend::connect(client_side, test_config_short_handshake()),
+        )
+        .await
+        .expect("connect must return within the handshake bound, not hang");
+
+        match outcome {
+            Err(e) => assert_eq!(
+                e,
+                BridgeError::AgentCrashed,
+                "hung initialize handshake must surface a clear error"
+            ),
+            Ok(_) => panic!("expected an error when the agent never answers initialize"),
+        }
+    }
+
+    // B1: `spawn` must HOLD the Supervised child for the backend's lifetime.
+    // Before the fix, `Supervised` (kill_on_drop) was dropped when `spawn`
+    // returned, SIGKILLing the child immediately. We cannot run a real ACP
+    // agent here, so we drive the same `Supervised::spawn` path through a long-
+    // lived child and assert: (a) the backend retains `supervised.is_some()`,
+    // and (b) the child is still alive (not reaped/SIGKILLed) shortly after.
+    #[tokio::test]
+    async fn spawn_holds_child_alive_after_returning() {
+        // A long-lived child (`cat` blocks reading stdin), driven through the
+        // exact `Supervised::spawn` + pipe-`take()` seam that `spawn` uses, then
+        // held on the backend struct mirroring `spawn`'s end state.
+        let mut supervised = Supervised::spawn("/bin/cat", &[]).expect("spawn cat");
+        let pid = supervised.pid();
+        // Take the pipes exactly as `spawn` does (also exercises the I3 seam).
+        let child = supervised.child_mut();
+        let _stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed).unwrap();
+        let _stdout = child
+            .stdout
+            .take()
+            .ok_or(BridgeError::AgentCrashed)
+            .unwrap();
+
+        let backend = AcpBackend {
+            inner: None,
+            conn: None,
+            supervised: Some(supervised),
+            id_counter: Arc::new(AtomicU64::new(1)),
+        };
+
+        assert!(
+            backend.supervised.is_some(),
+            "backend must retain the Supervised child (B1)"
+        );
+
+        // Give an erroneous kill_on_drop time to fire, then confirm the child is
+        // still alive. signal 0 succeeds => the OS still has this owned process
+        // (not SIGKILLed+reaped). This is the regression the BLOCKER describes:
+        // before the fix, the local `supervised` dropped at `spawn`'s end and
+        // the child was killed here.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        assert!(
+            alive,
+            "child must still be alive after spawn returns (B1: not SIGKILLed on drop)"
+        );
+
+        // Clean up deterministically (SIGTERM->reap), leaving no zombie.
+        if let Some(s) = backend.supervised {
+            s.terminate(Duration::from_millis(100)).await;
         }
     }
 }

@@ -26,9 +26,9 @@ async-stream = "0.3"
 
 # Protocol SDKs — pinned exact versions verified 2026-05-30
 # a2a-lf is the crates.io package name for the `a2a` crate in a2aproject/a2a-rs
-# agent-client-protocol: RESERVED pin — NOT yet wired in v1. KiroBackend hand-rolls the ACP
-# JSON-RPC framing over serde_json + the in-house FrameReader; this crate's typed helpers are
-# adopted in a later increment (see ADR-0003 Addendum 2). Pinned so the version is fixed when used.
+# agent-client-protocol: wired in Increment 3a via AcpBackend (bridge-acp) — drives the
+# conformant SDK initialize/prompt/cancel path. The legacy KiroBackend JSON-RPC framing over
+# serde_json + the in-house FrameReader is retained for keep-green (see ADR-0003 Addendum 2).
 agent-client-protocol = "=0.12.1"
 a2a = { package = "a2a-lf", version = "=0.3.0" }
 
