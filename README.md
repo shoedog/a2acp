@@ -1,13 +1,16 @@
 # a2a-bridge
 
-A single Rust binary that exposes a local CLI coding agent (**Kiro**) as an
-**A2A**-compliant network service. Remote A2A callers send tasks; the bridge drives the
-CLI agent over **ACP** (JSON-RPC/stdio) and streams results back over SSE.
+A single Rust binary that exposes a local CLI coding agent (**Kiro**, or any
+ACP-speaking agent) as an **A2A**-compliant network service. Remote A2A callers
+send tasks; the bridge drives the CLI agent over **ACP** (the Agent Client
+Protocol, JSON-RPC/stdio) via a conformant SDK client and streams results back
+over SSE.
 
-This is the **v1 "walking skeleton"** — the inbound path works end-to-end; the outbound
-delegation seam is defined but stubbed (concrete impl is Increment 2.5). See
-`docs/superpowers/specs/2026-05-29-a2a-bridge-v1-design.md` for the design and
-`docs/superpowers/plans/2026-05-30-a2a-bridge-v1.md` for the implementation plan.
+Increment 3a (ADR-0004) replaced the hand-rolled ACP driver with a fully
+conformant `AcpBackend` over the official `agent-client-protocol =0.12.1` SDK.
+See `docs/superpowers/specs/2026-05-29-a2a-bridge-v1-design.md` for the design
+and `docs/superpowers/plans/2026-05-30-a2a-bridge-v1.md` for the implementation
+plan.
 
 ## Architecture
 
@@ -41,7 +44,13 @@ A2A caller ──HTTP/JSON-RPC/SSE──▶ bridge-a2a-inbound (axum)
 - **A2A v1** via the official `a2a` crate (package `a2a-lf` =0.3.0). Methods: `SendMessage`,
   `SendStreamingMessage`, `GetTask`, `CancelTask`, `SubscribeToTask`. Version pinned to
   `a2a::VERSION = "1.0"`; header `A2A-Version`.
-- **ACP** via `agent-client-protocol` =0.12.1 over NDJSON/stdio.
+- **ACP** via `agent-client-protocol` =0.12.1 (Apache-2.0,
+  `github.com/agentclientprotocol/rust-sdk`) — the official SDK drives the full
+  conformant lifecycle: `initialize` → `authenticate` → `session/new` →
+  `session/set_mode` → `session/set_model` → `session/prompt` (streamed
+  `agent_message_chunk` → `PromptResponse`) → `session/cancel`. Reverse
+  `request_permission` from the agent is handled bidirectionally via `PolicyEngine`.
+  See ADR-0004.
 
 Both SDK versions are pinned (`Cargo.lock` committed) and maintained per the
 dependency-currency policy in the spec (§11.2).
@@ -58,13 +67,28 @@ Create `a2a-bridge.toml` (or rely on the built-in default):
 
 ```toml
 [agent]
-name = "kiro"
-cmd  = "kiro-cli"
-args = ["acp"]
+name = "kiro"          # display name; also the fan-out source label
+cmd  = "kiro-cli"      # agent binary on PATH
+args = ["acp"]         # arguments passed to cmd
+# Optional ACP session settings (all default to absent / process cwd):
+# model      = "gpt-4o"      # best-effort session/set_model (non-fatal if rejected)
+# mode       = "read-only"   # hard session/set_mode (fatal if rejected)
+# cwd        = "/work/dir"   # absolute working dir for session/new (defaults to current_dir)
+# auth_method = "oauth"      # auth method id to use at initialize (defaults to first advertised)
 
 [server]
 addr = "127.0.0.1:8080"
 ```
+
+| `[agent]` key | Required | Description |
+|---|---|---|
+| `name` | yes | Human name; also drives the fan-out source label in artifacts |
+| `cmd` | yes | Agent binary to spawn (must be on PATH) |
+| `args` | yes | Arguments passed to `cmd` (e.g. `["acp"]` for kiro-cli / codex-acp) |
+| `model` | no | Model id for `session/set_model` (best-effort; ignored if agent rejects) |
+| `mode` | no | Mode id for `session/set_mode` (hard error if agent rejects) |
+| `cwd` | no | Absolute working directory for `session/new`; defaults to bridge's `current_dir()` |
+| `auth_method` | no | Auth method id for `authenticate`; defaults to first method the agent advertises |
 
 ```bash
 ./target/release/a2a-bridge          # spawns `kiro-cli acp`, serves A2A on addr
@@ -76,18 +100,19 @@ installed and authenticated on the host (`kiro-cli whoami`).
 ## Testing & coverage
 
 ```bash
-cargo test --workspace                # ~68 tests, all in-process (no external agent)
+cargo test --workspace                # ~200 tests, all in-process (no external agent)
 ```
 
 Coverage is gated in CI (`cargo-llvm-cov`), enforced as a floor, measured per crate:
 
-| Scope | Gate | Current |
+| Scope | Gate | Current (Increment 3a) |
 |-------|------|---------|
-| Workspace | ≥ 85% lines | ~93% |
-| `bridge-core` (domain/typestate/translator) | ≥ 90% lines | ~95% |
-| `bridge-acp` (parse boundary, supervisor) | ≥ 90% lines | ~93% |
+| Workspace | ≥ 85% lines | ~94% |
+| `bridge-core` (domain/typestate/translator) | ≥ 90% lines | ~99% |
+| `bridge-acp` (conformant ACP client, supervisor) | ≥ 90% lines | ~95% |
 
 ```bash
+cargo llvm-cov clean --workspace      # mandatory before measuring (stale-cache bug)
 cargo llvm-cov --workspace --fail-under-lines 85
 cargo llvm-cov -p bridge-core --fail-under-lines 90
 cargo llvm-cov -p bridge-acp  --fail-under-lines 90
@@ -96,10 +121,42 @@ cargo llvm-cov -p bridge-acp  --fail-under-lines 90
 Typestate invariants (e.g. prompting a non-ready session, resuming a terminal task) are
 proven uncompilable by `trybuild` compile-fail tests.
 
-### Gated real-agent smoke
+Wire conformance is verified by `tests/golden_frames.rs` (hand-authored expected
+JSON for every outbound ACP frame) and `tests/corpus_replay.rs` (real captured
+frames from `kiro-cli 2.5.0` fed through the live mapping functions).
 
-A real end-to-end round-trip against an authenticated `kiro-cli` is `#[ignore]`-gated
-(not in default CI):
+### Gated real-agent e2e tests (ACP conformant client)
+
+Two gated end-to-end tests drive the conformant `AcpBackend` directly against a
+real agent (`#[ignore]`-gated, not in default CI):
+
+**kiro-cli** (gate MET — run and passing against kiro-cli 2.5.0):
+
+```bash
+cargo test -p a2a-bridge --test e2e_acp_kiro -- --ignored --nocapture
+# Prereqs: kiro-cli on PATH and authenticated (kiro-cli whoami), network access
+```
+
+This test spawns a real `kiro-cli acp` process, drives the full conformant
+lifecycle (`initialize` → `session/new` → `session/prompt`), asserts the streamed
+text contains `PONG` and the turn ends with `end_turn`. This was run against
+kiro-cli 2.5.0 and passed — the kiro DoD gate is MET.
+
+**codex-acp** (gate UNMET — compile-only; `codex-acp` absent from authoring env):
+
+```bash
+cargo test -p a2a-bridge --test e2e_acp_codex -- --ignored --nocapture
+# Prereqs: codex-acp on PATH and authenticated; codex-acp is distinct from codex-cli
+```
+
+`codex-acp` is not installable in the environment where Increment 3a was authored
+(only `codex` 0.130.0, which has no `acp` subcommand). The codex wire frames in
+`tests/corpus/codex-acp.jsonl` are provisional (derived from spec, not captured). The
+`real_capture_corpus_present` test is `#[ignore]`'d and FAILS naming codex when
+run — the open gate is intentionally visible. Run this test when `codex-acp` is
+available to complete the codex DoD gate.
+
+### Original gated smoke (pre-3a, v1 inbound pipeline)
 
 ```bash
 cargo test -p a2a-bridge --test e2e_kiro -- --ignored --nocapture   # needs kiro-cli whoami
@@ -141,23 +198,26 @@ source and fan-out alike, so a task can carry multiple artifacts before its term
 
 ## What the bridge does / doesn't do
 
-**In:** inbound A2A (Kiro) with **A2A-conformant `StreamResponse` SSE** + a terminal-status task
-model; **outbound delegation** (passthrough) and **fan-out / second opinion** (Kiro + peer
-merged, source-labeled, degrade-to-survivor); streaming with coalescing; cancellation
-(prompt-result semantics; both-source cancel on inbound `CancelTask` and caller disconnect);
-permission/auth suspend→resume; **real message content threaded to Kiro and the peer**;
-process-group reaping; structured tracing.
+**In:** inbound A2A with **A2A-conformant `StreamResponse` SSE** + a terminal-status task
+model; **conformant ACP client** (`agent-client-protocol` =0.12.1 SDK, bidirectional,
+wire-golden-tested, live kiro-validated); **outbound delegation** (passthrough) and
+**fan-out / second opinion** (Kiro + peer merged, source-labeled, degrade-to-survivor);
+streaming with coalescing; cancellation (prompt-result semantics; both-source cancel on
+inbound `CancelTask` and caller disconnect); permission/auth suspend→resume; **real
+message content threaded to the agent and the peer**; process-group reaping; structured
+tracing.
 
-**Deferred:** multi-agent adapters (Claude Code/Codex/Gemini, Increment 3 — which generalizes
-the N-ary fan-out coordinator to >2 sources); real permission policy; `session/load` resume;
-MCP-over-ACP; JWT/mTLS enforcement; container isolation; multiple peers / discovery / mesh;
-result reconciliation/voting.
+**Deferred:** multi-agent adapters beyond kiro/codex-acp (Claude Code/Gemini, Increment 3b+
+— which generalizes the N-ary fan-out coordinator to >2 sources); codex-acp DoD gate
+completion (pending install); real permission policy; `session/load` resume; MCP-over-ACP;
+fs/terminal client capabilities; JWT/mTLS enforcement; container isolation; multiple peers /
+discovery / mesh; result reconciliation/voting.
 
-### Known limitations (called out honestly; see ADR-0003 + reviews)
+### Known limitations (called out honestly; see ADR-0003, ADR-0004 + reviews)
 
-- **ACP wire framing is hand-rolled.** `KiroBackend` drives ACP JSON-RPC directly over
-  `serde_json` + the in-house `FrameReader`; the pinned `agent-client-protocol` crate's
-  typed helpers are **not yet wired** (reserved for Increment 3, ADR-0003 Addendum 2).
+- **codex-acp DoD gate UNMET.** The codex-acp real-capture corpus and live e2e
+  are not yet run (codex-acp not installed in the authoring env). The kiro gate IS
+  met. See ADR-0004 and the `real_capture_corpus_present` ignored test.
 - **The `Task`/`Session` typestate is a compile-time spec artifact, not yet load-bearing.**
   It is `trybuild`-verified but the runtime pipeline does not yet route through
   `Session<Ready>::send_prompt`. The seam is preserved for later wiring.

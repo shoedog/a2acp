@@ -2,7 +2,7 @@
 //
 // This test stands up the REAL pipeline against a live `kiro-cli acp` process:
 //   Supervised::spawn("kiro-cli", ["acp"])
-//     -> KiroBackend::from_child
+//     -> AcpBackend::from_child
 //     -> InboundServer (AlwaysGrant, AutoPolicy, inline RouteDecision -> "kiro")
 //     -> axum server on an ephemeral TCP port
 //
@@ -19,7 +19,10 @@
 use std::sync::Arc;
 
 use bridge_a2a_inbound::server::InboundServer;
-use bridge_acp::{kiro::KiroBackend, supervisor::Supervised};
+use bridge_acp::{
+    acp_backend::{AcpBackend, AcpConfig},
+    supervisor::Supervised,
+};
 use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
@@ -48,7 +51,15 @@ async fn real_kiro_round_trip_returns_pong() {
     let supervised = Supervised::spawn("kiro-cli", &["acp"])
         .expect("kiro-cli must be on PATH and executable; run `kiro-cli whoami` first");
 
-    let backend = Arc::new(KiroBackend::from_child(supervised));
+    let acp_config = AcpConfig {
+        cwd: std::env::current_dir().expect("cwd"),
+        ..AcpConfig::default()
+    };
+    let backend = Arc::new(
+        AcpBackend::from_child(supervised, acp_config)
+            .await
+            .expect("ACP connection initializes"),
+    );
 
     // 2. Wire all ports — mirrors the composition root in main.rs exactly.
     let auth = Arc::new(AlwaysGrant);
@@ -71,6 +82,7 @@ async fn real_kiro_round_trip_returns_pong() {
         auth,
         base_url.clone(),
         Arc::new(bridge_a2a_outbound::StubDelegation),
+        "kiro",
     ));
     let router = server.router();
 

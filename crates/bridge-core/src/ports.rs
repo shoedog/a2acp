@@ -5,6 +5,14 @@ use crate::{domain::*, error::BridgeError, ids::*};
 use futures::Stream;
 use std::pin::Pin;
 
+/// Wire spelling of the ACP `StopReason::Cancelled` stop-reason string.
+///
+/// Both the ACP adapter (`bridge-acp`) and the domain translator (`bridge-core`)
+/// must agree on this one value: the adapter emits it into `Update::Done`; the
+/// translator matches it to drive `TaskOutcome::Canceled`. A single const here
+/// is the ONE source of truth — drift between producer and consumer is impossible.
+pub const STOP_REASON_CANCELLED: &str = "cancelled";
+
 /// Streaming update from an agent backend.
 #[derive(Debug)]
 pub enum Update {

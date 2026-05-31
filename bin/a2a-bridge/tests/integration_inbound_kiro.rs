@@ -64,6 +64,7 @@ fn build_router() -> axum::Router {
         auth,
         "http://localhost:8080",
         Arc::new(bridge_a2a_outbound::StubDelegation),
+        "kiro",
     ));
     server.router()
 }

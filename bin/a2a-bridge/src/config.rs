@@ -46,6 +46,43 @@ pub struct AgentConfig {
     pub name: String,
     pub cmd: String,
     pub args: Vec<String>,
+    /// Optional model id; threaded into `AcpConfig::model` (best-effort
+    /// `session/set_model`). Absent = the agent's default model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional session mode id; threaded into `AcpConfig::mode` (hard
+    /// `session/set_mode`). Absent = the agent's default mode.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Optional auth-method id; threaded into `AcpConfig::auth_method`. Absent =
+    /// the first method the agent advertises at `initialize`.
+    #[serde(default)]
+    pub auth_method: Option<String>,
+    /// Optional absolute working directory the agent runs sessions in. Absent =
+    /// the bridge's current working directory (resolved at startup). See
+    /// [`AgentConfig::resolve_cwd`].
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+impl AgentConfig {
+    /// Resolve the agent `cwd`: the configured value if present, otherwise the
+    /// process's current working directory. The result MUST be absolute (ACP §11A
+    /// requires an absolute `cwd` for `session/new`); a configured relative path is
+    /// joined onto the current directory to make it absolute.
+    pub fn resolve_cwd(&self) -> std::io::Result<std::path::PathBuf> {
+        match &self.cwd {
+            Some(c) => {
+                let p = std::path::PathBuf::from(c);
+                if p.is_absolute() {
+                    Ok(p)
+                } else {
+                    Ok(std::env::current_dir()?.join(p))
+                }
+            }
+            None => std::env::current_dir(),
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -131,6 +168,41 @@ mod tests {
         let d = c.delegation.unwrap();
         assert_eq!(d.peer_url, "http://p");
         assert_eq!(d.auth, "bearer:sek");
+    }
+
+    #[test]
+    fn config_parses_optional_agent_model_mode_cwd() {
+        // An [agent] section with model/mode/cwd/auth_method is accepted and
+        // threaded onto AgentConfig.
+        let c = Config::parse(
+            "[agent]\nname=\"codex\"\ncmd=\"codex\"\nargs=[\"acp\"]\n\
+             model=\"gpt-x\"\nmode=\"yolo\"\nauth_method=\"oauth\"\ncwd=\"/work/dir\"\n[server]\n",
+        )
+        .unwrap();
+        assert_eq!(c.agent.model.as_deref(), Some("gpt-x"));
+        assert_eq!(c.agent.mode.as_deref(), Some("yolo"));
+        assert_eq!(c.agent.auth_method.as_deref(), Some("oauth"));
+        assert_eq!(c.agent.cwd.as_deref(), Some("/work/dir"));
+        // A configured absolute cwd resolves to itself (absolute).
+        let resolved = c.agent.resolve_cwd().unwrap();
+        assert_eq!(resolved, std::path::PathBuf::from("/work/dir"));
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn config_agent_model_mode_cwd_are_optional() {
+        // Absence of model/mode/cwd/auth_method is fine; cwd resolves to the
+        // process current dir (absolute) when unset.
+        let c = Config::parse("[agent]\nname=\"k\"\ncmd=\"k\"\nargs=[]\n[server]\n").unwrap();
+        assert!(c.agent.model.is_none());
+        assert!(c.agent.mode.is_none());
+        assert!(c.agent.auth_method.is_none());
+        assert!(c.agent.cwd.is_none());
+        let resolved = c.agent.resolve_cwd().unwrap();
+        assert!(
+            resolved.is_absolute(),
+            "default cwd (current_dir) must be absolute: {resolved:?}"
+        );
     }
 
     #[test]

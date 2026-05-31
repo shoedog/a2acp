@@ -19,7 +19,7 @@ use futures::{Stream, StreamExt};
 use crate::domain::{Part, PendingKind, PendingRequest, SessionContext};
 use crate::error::BridgeError;
 use crate::ids::{SessionId, TaskId};
-use crate::ports::{AgentBackend, PolicyEngine, SessionStore, Update};
+use crate::ports::{AgentBackend, PolicyEngine, SessionStore, Update, STOP_REASON_CANCELLED};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
@@ -160,6 +160,11 @@ impl Translator {
                             let chunk = std::mem::take(&mut acc);
                             yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
                         }
+                        // A user-cancelled turn ends with stop_reason == STOP_REASON_CANCELLED
+                        // (the ACP wire string for StopReason::Cancelled). Detect it
+                        // BEFORE moving `stop_reason` into the artifact payload, so we
+                        // can emit a terminal Canceled signal after the artifact.
+                        let cancelled = stop_reason == STOP_REASON_CANCELLED;
                         // Final artifact carries the accumulated/last text or stop_reason.
                         let payload = if !last_text.is_empty() {
                             last_text.clone()
@@ -167,6 +172,13 @@ impl Translator {
                             stop_reason
                         };
                         yield Event { kind: EventKind::Artifact, text: payload, source: None, outcome: None };
+                        // A cancelled Done drives a terminal Canceled outcome so the
+                        // local-backend producer reports Canceled (not Completed) to the
+                        // A2A caller. A normal end_turn emits no terminal here, leaving
+                        // the producer's clean-end -> Completed mapping intact.
+                        if cancelled {
+                            yield Event::terminal(TaskOutcome::Canceled);
+                        }
                         return;
                     }
                     Err(e) => {
@@ -460,9 +472,11 @@ mod tests {
 
     #[tokio::test]
     async fn done_with_no_text_uses_stop_reason_as_artifact() {
-        // Done arriving with no prior text -> Artifact payload falls back to stop_reason.
+        // Done arriving with no prior text -> Artifact payload falls back to
+        // stop_reason. A "ran_out_of_turns" (non-cancel) stop_reason yields ONLY the
+        // artifact (no terminal frame); the producer maps clean-end -> Completed.
         let be = FakeBackend::new(vec![Ok(Update::Done {
-            stop_reason: "cancelled".into(),
+            stop_reason: "ran_out_of_turns".into(),
         })]);
         let st = FakeStore::default();
         let pol = AutoApprove;
@@ -476,7 +490,58 @@ mod tests {
             .collect();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].kind(), &EventKind::Artifact);
-        assert_eq!(evs[0].text(), "cancelled");
+        assert_eq!(evs[0].text(), "ran_out_of_turns");
+    }
+
+    #[tokio::test]
+    async fn done_cancelled_emits_artifact_then_terminal_canceled() {
+        // A user-cancelled turn ends with Update::Done{stop_reason:"cancelled"}.
+        // The translator emits the final artifact, then a terminal Canceled event so
+        // the local-backend producer reports Canceled (not Completed) to the caller.
+        let be = FakeBackend::new(vec![
+            Ok(Update::Text("partial".into())),
+            Ok(Update::Done {
+                stop_reason: "cancelled".into(),
+            }),
+        ]);
+        let st = FakeStore::default();
+        let pol = AutoApprove;
+        let (t, s) = ids();
+        let evs: Vec<Event> = Translator::new()
+            .run(&be, &st, &pol, &t, &s, vec![])
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        // ... Status("partial"), Artifact("partial"), Terminal(Canceled).
+        assert!(evs.iter().any(|e| e.kind() == &EventKind::Artifact));
+        let last = evs.last().unwrap();
+        assert_eq!(last.kind(), &EventKind::Terminal);
+        assert_eq!(last.outcome(), Some(TaskOutcome::Canceled));
+    }
+
+    #[tokio::test]
+    async fn done_end_turn_emits_no_terminal() {
+        // A normal end_turn must NOT emit a terminal event — the producer maps the
+        // clean stream end to Completed.
+        let be = FakeBackend::new(vec![
+            Ok(Update::Text("done".into())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ]);
+        let st = FakeStore::default();
+        let pol = AutoApprove;
+        let (t, s) = ids();
+        let evs: Vec<Event> = Translator::new()
+            .run(&be, &st, &pol, &t, &s, vec![])
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(evs.iter().all(|e| e.kind() != &EventKind::Terminal));
     }
 
     /// Cover the FakeBackend::cancel and FakeStore::put/session_for stubs so
