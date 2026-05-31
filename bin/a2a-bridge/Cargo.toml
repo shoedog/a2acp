@@ -41,5 +41,6 @@ bridge-store = { path = "../../crates/bridge-store" }
 bridge-policy = { path = "../../crates/bridge-policy" }
 bridge-a2a-inbound = { path = "../../crates/bridge-a2a-inbound" }
 bridge-core = { path = "../../crates/bridge-core" }
+bridge-registry = { path = "../../crates/bridge-registry" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 tempfile = "3"

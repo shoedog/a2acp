@@ -12,6 +12,8 @@
 
 use std::sync::{Arc, Mutex};
 
+mod common;
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request};
@@ -261,7 +263,7 @@ async fn delegate_skill_round_trips_through_peer() {
     let backend = Arc::new(PanicBackend);
 
     let server = Arc::new(InboundServer::new(
-        backend,
+        common::single_agent_registry("kiro", backend),
         store,
         policy,
         route,

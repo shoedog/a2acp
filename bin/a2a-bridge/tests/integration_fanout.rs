@@ -10,6 +10,8 @@
 
 use std::sync::{Arc, Mutex};
 
+mod common;
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request};
@@ -252,7 +254,7 @@ fn build_fanout_server(peer_url: &str) -> axum::Router {
     ));
 
     let server = Arc::new(InboundServer::new(
-        backend,
+        common::single_agent_registry("kiro", backend),
         store,
         policy,
         route,

@@ -21,6 +21,8 @@ use bridge_store::sqlite::SqliteStore;
 use serde_json::json;
 use tower::ServiceExt;
 
+mod common;
+
 /// Extract all `data:` payloads from an SSE body (one per line starting with "data: ").
 fn sse_data_payloads(body: &str) -> Vec<String> {
     body.lines()
@@ -57,7 +59,7 @@ fn build_router() -> axum::Router {
     let auth = Arc::new(AlwaysGrant);
 
     let server = Arc::new(InboundServer::new(
-        backend,
+        common::single_agent_registry("kiro", backend),
         store,
         policy,
         route,

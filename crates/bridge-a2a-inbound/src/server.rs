@@ -18,6 +18,7 @@
 // control through its own task store / executor traits, which fights our
 // auth->route->translate pipeline. axum 0.7 is already proven in this workspace.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -32,11 +33,15 @@ use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
-use bridge_core::domain::{AuthContext, InboundRequest, Part, PeerTaskId, RouteTarget, TaskMeta};
+use bridge_core::domain::{
+    effective_config, AgentOverride, AuthContext, EffectiveConfig, InboundRequest, Part,
+    PeerTaskId, RouteTarget, TaskMeta,
+};
 use bridge_core::error::{A2aDisposition, BridgeError};
-use bridge_core::ids::{SessionId, TaskId};
+use bridge_core::ids::{AgentId, SessionId, TaskId};
 use bridge_core::ports::{
-    AgentBackend, AuthMiddleware, DelegationPort, PolicyEngine, RouteDecision, SessionStore,
+    AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
+    RouteDecision, SessionStore,
 };
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 
@@ -53,10 +58,31 @@ const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error.
 const JSONRPC_INTERNAL: i32 = -32603;
 
+/// A task's binding to its resolved registry instance, created on the FIRST local
+/// message. Holds the backend driving the task, the effective config applied to its
+/// session, and the registry [`Lease`] keeping the slot alive for the task's
+/// lifetime (the lease drops when the binding is removed — full eviction is T11).
+struct TaskBinding {
+    backend: Arc<dyn AgentBackend>,
+    #[allow(dead_code)] // surfaced for T11 follow-up reuse; T10 only records it.
+    eff: EffectiveConfig,
+    #[allow(dead_code)] // held so the slot isn't retired mid-task; dropped on eviction (T11).
+    lease: Box<dyn Lease>,
+}
+
 /// The inbound A2A server. Holds the six pipeline ports plus the advertised
 /// base URL (used to build the Agent Card). Cheap to clone via `Arc`.
 pub struct InboundServer {
-    backend: Arc<dyn AgentBackend>,
+    /// The agent registry (3b): replaces the single `backend`. First-message LOCAL
+    /// dispatch resolves the routed `AgentId` to a `(backend, lease)` here, applies
+    /// per-session config, and instance-binds the task (see [`InboundServer::bindings`]).
+    registry: Arc<dyn AgentRegistry>,
+    /// Task → resolved-instance binding, created on a task's FIRST local message.
+    /// Holds the backend, its effective config, and the registry lease keeping the
+    /// slot alive for the task's lifetime. T10 only CREATES bindings (and uses them
+    /// for cancel when present); T11 adds binding-check-before-route on follow-ups
+    /// and RAII eviction on producer exit.
+    bindings: Arc<tokio::sync::Mutex<HashMap<TaskId, TaskBinding>>>,
     store: Arc<dyn SessionStore>,
     policy: Arc<dyn PolicyEngine>,
     route: Arc<dyn RouteDecision>,
@@ -83,7 +109,7 @@ impl InboundServer {
     /// and the local-source label (the fan-out id for the local backend).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        backend: Arc<dyn AgentBackend>,
+        registry: Arc<dyn AgentRegistry>,
         store: Arc<dyn SessionStore>,
         policy: Arc<dyn PolicyEngine>,
         route: Arc<dyn RouteDecision>,
@@ -93,7 +119,8 @@ impl InboundServer {
         local_source_label: impl Into<String>,
     ) -> Self {
         Self {
-            backend,
+            registry,
+            bindings: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             store,
             policy,
             route,
@@ -152,6 +179,9 @@ impl InboundServer {
             parts: parts_from_params(params),
             target,
             auth,
+            // Per-request overrides ride along so LOCAL dispatch can compute the
+            // effective config (entry defaults layered with these) before the prompt.
+            overrides: task_meta.overrides,
         })
     }
 }
@@ -185,6 +215,89 @@ struct RoutedCall {
     parts: Vec<Part>,
     target: RouteTarget,
     auth: AuthContext,
+    /// Per-request config overrides parsed from `a2a-bridge.{model,effort,mode}`.
+    /// LOCAL dispatch layers these on the resolved entry's defaults via
+    /// [`effective_config`] before `configure_session`. The selected `AgentId`
+    /// itself is carried by `target` (`RouteTarget::Local(id)`).
+    overrides: Option<AgentOverride>,
+}
+
+/// Extract the resolved `AgentId` from a `RouteTarget::Local`, falling back to the
+/// registry default for any non-Local target (the fan-out local source resolves the
+/// default; Delegate never reaches here).
+fn local_agent_id(srv: &InboundServer, target: &RouteTarget) -> AgentId {
+    match target {
+        RouteTarget::Local(id) => id.clone(),
+        _ => srv.registry.default_id(),
+    }
+}
+
+/// First-message LOCAL dispatch core: resolve the agent id to a `(backend, lease)`,
+/// compute its effective config (entry defaults layered with the per-request
+/// override), apply it via `configure_session`, then instance-BIND the task by
+/// inserting a [`TaskBinding`] keyed on the task id. Returns the backend ready for
+/// the translator. On resolve/configure failure the error propagates (callers map
+/// it to a `Failed` terminal / JSON-RPC error — never a panic).
+///
+/// The lease is held inside the stored `TaskBinding` for the task's lifetime, so a
+/// concurrent config reload can't retire the slot out from under an in-flight task.
+/// (T11 makes follow-ups and cancel fully binding-driven and evicts on producer exit.)
+async fn resolve_configure_bind(
+    srv: &InboundServer,
+    agent_id: &AgentId,
+    task: &TaskId,
+    session: &SessionId,
+    overrides: Option<&AgentOverride>,
+) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+    let resolved = srv.registry.resolve(agent_id).await?;
+    let eff = effective_config(&resolved.entry, overrides);
+    resolved.backend.configure_session(session, &eff).await?;
+    let backend = resolved.backend.clone();
+    srv.bindings.lock().await.insert(
+        task.clone(),
+        TaskBinding {
+            backend: backend.clone(),
+            eff,
+            lease: resolved.lease,
+        },
+    );
+    Ok(backend)
+}
+
+/// Fan-out variant of [`resolve_configure_bind`]: resolve the local agent, apply
+/// its effective config, and return the `(backend, lease)` so the fan-out producer
+/// can HOLD them for the source's lifetime — the same instance drives the prompt
+/// AND the cancel, and the lease keeps the slot from retiring mid-fan-out. Unlike
+/// the single-source path it does NOT insert a [`TaskBinding`]: a fan-out task is
+/// not a follow-up-local task, so it has no binding-driven follow-up to serve.
+async fn resolve_for_fanout(
+    srv: &InboundServer,
+    agent_id: &AgentId,
+    _task: &TaskId,
+    session: &SessionId,
+    overrides: Option<&AgentOverride>,
+) -> Result<(Arc<dyn AgentBackend>, Box<dyn Lease>), BridgeError> {
+    let resolved = srv.registry.resolve(agent_id).await?;
+    let eff = effective_config(&resolved.entry, overrides);
+    resolved.backend.configure_session(session, &eff).await?;
+    Ok((resolved.backend, resolved.lease))
+}
+
+/// Resolve the backend to cancel a LOCAL task. T10 is binding-or-fallback: if the
+/// first message already created a [`TaskBinding`], use that exact instance (the one
+/// driving the task). Otherwise — e.g. a cancel for a task whose binding has been
+/// pruned, or a pre-seeded fan-out test — fall back to resolving the registry
+/// default agent. T11 makes follow-up/cancel FULLY binding-driven (the fallback is a
+/// pre-T11 bridge so existing cancel tests keep passing).
+async fn cancel_backend_for(
+    srv: &InboundServer,
+    task: &TaskId,
+) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+    if let Some(binding) = srv.bindings.lock().await.get(task) {
+        return Ok(binding.backend.clone());
+    }
+    let default = srv.registry.default_id();
+    Ok(srv.registry.resolve(&default).await?.backend)
 }
 
 // ---- axum handlers ----
@@ -259,14 +372,36 @@ fn spawn_local_producer(
     routed: RoutedCall,
     tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
 ) {
-    let backend = srv.backend.clone();
+    let srv = srv.clone();
     let store = srv.store.clone();
     let policy = srv.policy.clone();
+    let agent_id = local_agent_id(&srv, &routed.target);
     let task = routed.task;
     let session = routed.session;
     let parts = routed.parts;
+    let overrides = routed.overrides;
 
     tokio::spawn(async move {
+        // First-message dispatch: resolve the routed agent, apply its effective
+        // config, and bind the task. A resolve/configure failure (e.g. an unknown
+        // agent) becomes a single terminal Failed frame — never a panic.
+        let backend = match resolve_configure_bind(
+            &srv,
+            &agent_id,
+            &task,
+            &session,
+            overrides.as_ref(),
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+                return;
+            }
+        };
+
         let translator = Translator::new();
         let mut events = translator.run(
             backend.as_ref(),
@@ -515,33 +650,46 @@ fn spawn_fanout_producer(
     routed: RoutedCall,
     tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
 ) {
-    let backend = srv.backend.clone();
+    let srv = srv.clone();
     let store = srv.store.clone();
     let policy = srv.policy.clone();
     let delegation = srv.delegation.clone();
     let guard = srv.cancelled_peers.clone();
     let local_source_label = srv.local_source_label.clone();
+    let agent_id = local_agent_id(&srv, &routed.target);
     let task = routed.task;
     let session = routed.session;
     let parts = routed.parts.clone();
     let auth = routed.auth;
+    let overrides = routed.overrides;
 
     tokio::spawn(async move {
         // Mark this task as a fan-out task so Task 6 (cancel_task) can distinguish
         // it from a plain delegate (which also has a peer id in the store).
         let _ = store.set_fanout(&task).await;
 
-        // 1. Build the local Kiro source. We KEEP its cancel handle (the session)
-        //    so the supervisor can cancel Kiro immediately, never awaiting the peer.
-        let kiro_source = local_kiro_source(
-            local_source_label,
-            backend.clone(),
-            store.clone(),
-            policy,
-            task.clone(),
-            session.clone(),
-            parts.clone(),
-        );
+        // 1. Resolve the local agent ONCE and HOLD its (backend, lease) for the
+        //    source's lifetime: the SAME instance drives the prompt AND is used for
+        //    the cancel, so a cmd-change reload mid-fan-out can't swap the backend
+        //    out from under either path. `_lease` is kept alive until the producer
+        //    task exits. A resolve/configure failure makes the local source a single
+        //    labeled error frame (the coordinator's terminal still covers completion).
+        let (kiro_source, kiro_backend, _lease): (Source, Option<Arc<dyn AgentBackend>>, _) =
+            match resolve_for_fanout(&srv, &agent_id, &task, &session, overrides.as_ref()).await {
+                Ok((backend, lease)) => {
+                    let src = local_kiro_source(
+                        local_source_label,
+                        backend.clone(),
+                        store.clone(),
+                        policy,
+                        task.clone(),
+                        session.clone(),
+                        parts.clone(),
+                    );
+                    (src, Some(backend), Some(lease))
+                }
+                Err(e) => (Source::failed(&local_source_label, e), None, None),
+            };
 
         // 2. Build the peer source by opening delegation, keeping its peer-task
         //    watch for the supervisor's latched peer cancel.
@@ -606,7 +754,7 @@ fn spawn_fanout_producer(
             joined = coordinator => {
                 if matches!(joined, Ok(fanout::RunOutcome::Disconnected)) {
                     cancel_fanout_sources(
-                        &backend, &delegation, &store, &guard, &task,
+                        kiro_backend.as_ref(), &delegation, &store, &guard, &task,
                         &session, &mut peer_watch, &kiro_done, &peer_done,
                     )
                     .await;
@@ -615,7 +763,7 @@ fn spawn_fanout_producer(
             // (ii) an inbound CancelTask latched cancel_requested.
             _ = poll_cancel_requested(store.as_ref(), &task) => {
                 cancel_fanout_sources(
-                    &backend, &delegation, &store, &guard, &task,
+                    kiro_backend.as_ref(), &delegation, &store, &guard, &task,
                     &session, &mut peer_watch, &kiro_done, &peer_done,
                 )
                 .await;
@@ -665,7 +813,9 @@ fn spawn_finished_claimer(
 /// is a cancel no-op.
 #[allow(clippy::too_many_arguments)]
 async fn cancel_fanout_sources(
-    backend: &Arc<dyn AgentBackend>,
+    // The HELD local backend (the same resolved instance that drove the prompt).
+    // `None` when the local source failed to resolve — there is then nothing to cancel.
+    backend: Option<&Arc<dyn AgentBackend>>,
     delegation: &Arc<dyn DelegationPort>,
     store: &Arc<dyn SessionStore>,
     guard: &Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
@@ -679,10 +829,14 @@ async fn cancel_fanout_sources(
     let _ = store.request_cancel(task).await;
 
     // Kiro: cancel IMMEDIATELY by its known session, unless its stream finished.
-    if !kiro_done.load(std::sync::atomic::Ordering::SeqCst)
-        && try_win_cancel_key(guard, format!("{}:kiro", task.as_str())).await
-    {
-        let _ = backend.cancel(session).await;
+    // Use the HELD instance (never re-resolved) so a cmd-change reload can't cancel
+    // a different backend than the one running the prompt.
+    if let Some(backend) = backend {
+        if !kiro_done.load(std::sync::atomic::Ordering::SeqCst)
+            && try_win_cancel_key(guard, format!("{}:kiro", task.as_str())).await
+        {
+            let _ = backend.cancel(session).await;
+        }
     }
 
     // Peer: cancel via its watch (latched if the id is not yet known), unless its
@@ -751,11 +905,25 @@ async fn unary_message(
     // Collect the same event stream the streaming path produces, into one JSON
     // response. Local drives the translator; Delegate drives the delegation.
     let collected: Vec<Result<Event, BridgeError>> = match routed.target {
-        RouteTarget::Local(_) => {
+        RouteTarget::Local(ref agent_id) => {
+            // First-message dispatch: resolve the routed agent, apply its effective
+            // config, and bind the task. An unknown agent surfaces as a JSON-RPC error.
+            let backend = match resolve_configure_bind(
+                &srv,
+                agent_id,
+                &routed.task,
+                &routed.session,
+                routed.overrides.as_ref(),
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => return bridge_err_to_jsonrpc(id, &e),
+            };
             let translator = Translator::new();
             translator
                 .run(
-                    srv.backend.as_ref(),
+                    backend.as_ref(),
                     srv.store.as_ref(),
                     srv.policy.as_ref(),
                     &routed.task,
@@ -847,16 +1015,33 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
     // Mark the task as fanout so Task 6 (cancel_task) can distinguish it.
     let _ = srv.store.set_fanout(&routed.task).await;
 
-    // Build the local Kiro source.
-    let kiro_source = local_kiro_source(
-        srv.local_source_label.clone(),
-        srv.backend.clone(),
-        srv.store.clone(),
-        srv.policy.clone(),
-        routed.task.clone(),
-        routed.session.clone(),
-        routed.parts.clone(),
-    );
+    // Resolve the local agent ONCE, apply its effective config, and HOLD its lease
+    // (`_lease`) for the unary collect's lifetime so the slot can't retire mid-run.
+    // A resolve/configure failure makes the local source a single labeled error frame.
+    let agent_id = local_agent_id(&srv, &routed.target);
+    let (kiro_source, _lease) = match resolve_for_fanout(
+        &srv,
+        &agent_id,
+        &routed.task,
+        &routed.session,
+        routed.overrides.as_ref(),
+    )
+    .await
+    {
+        Ok((backend, lease)) => {
+            let src = local_kiro_source(
+                srv.local_source_label.clone(),
+                backend,
+                srv.store.clone(),
+                srv.policy.clone(),
+                routed.task.clone(),
+                routed.session.clone(),
+                routed.parts.clone(),
+            );
+            (src, Some(lease))
+        }
+        Err(e) => (Source::failed(&srv.local_source_label, e), None),
+    };
 
     // Build the peer source by opening delegation.
     let peer_source = match srv
@@ -986,8 +1171,17 @@ async fn cancel_task(
         // it only AFTER both cancels have been attempted.
         let mut first_err: Option<BridgeError> = None;
         if try_win_cancel_key(&srv.cancelled_peers, format!("{}:kiro", task.as_str())).await {
-            if let Err(e) = srv.backend.cancel(&session).await {
-                first_err.get_or_insert(e);
+            // Prefer the task's bound instance; fall back to the default agent if no
+            // binding exists yet (binding-or-fallback; T11 makes this binding-only).
+            match cancel_backend_for(&srv, &task).await {
+                Ok(backend) => {
+                    if let Err(e) = backend.cancel(&session).await {
+                        first_err.get_or_insert(e);
+                    }
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
             }
         }
         if let Ok(Some(peer)) = srv.store.peer_task_for(&task).await {
@@ -1017,13 +1211,19 @@ async fn cancel_task(
                 }
             }
             _ => {
-                // Local task: cancel the backend for the task's session.
+                // Local task: cancel the backend for the task's session. Prefer the
+                // task's bound instance; fall back to the default agent if no binding
+                // exists yet (binding-or-fallback; T11 makes this binding-only).
                 let session = match srv.store.session_for(&task).await {
                     Ok(Some(s)) => s,
                     _ => SessionId::parse(format!("session-{}", task.as_str()))
                         .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
                 };
-                if let Err(e) = srv.backend.cancel(&session).await {
+                let backend = match cancel_backend_for(&srv, &task).await {
+                    Ok(b) => b,
+                    Err(e) => return bridge_err_to_jsonrpc(id, &e),
+                };
+                if let Err(e) = backend.cancel(&session).await {
                     return bridge_err_to_jsonrpc(id, &e);
                 }
             }
@@ -1243,6 +1443,7 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
 mod tests {
     use super::*;
     use bridge_core::domain::RouteTarget;
+    use bridge_core::domain::{AgentEntry, EffectiveConfig, RegistrySnapshot};
     use bridge_core::domain::{
         AuthContext, PeerTaskId, PendingRequest, PermissionDecision, PermissionRequest,
         SessionContext,
@@ -1257,6 +1458,95 @@ mod tests {
     use tower::ServiceExt;
 
     // ---- inline fakes ----
+
+    /// No-op registry lease (the in-test registry tracks nothing).
+    struct NoopLease;
+    impl Lease for NoopLease {}
+
+    /// A minimal in-test `AgentRegistry`: maps agent ids to `(entry, backend)`.
+    /// `resolve` returns `UnknownAgent` for an absent id (so the unknown-agent
+    /// path is exercised without a panic). Used in place of the single `backend`.
+    struct FakeRegistry {
+        default: AgentId,
+        entries: std::collections::HashMap<String, AgentEntry>,
+        backends: std::collections::HashMap<String, Arc<dyn AgentBackend>>,
+    }
+
+    impl FakeRegistry {
+        /// A single-agent registry mapping `id` → `backend` with a bare entry (no
+        /// model/effort/mode). Mirrors the legacy single-backend wiring.
+        fn single(id: &str, backend: Arc<dyn AgentBackend>) -> Arc<Self> {
+            Self::with_entries(id, vec![(bare_entry(id), backend)])
+        }
+
+        /// A multi-agent registry. `default` is the first entry's id. Each tuple
+        /// supplies the entry config (so `configure_session` receives base config)
+        /// and the backend resolved for that id.
+        fn with_entries(
+            default: &str,
+            agents: Vec<(AgentEntry, Arc<dyn AgentBackend>)>,
+        ) -> Arc<Self> {
+            let mut entries = std::collections::HashMap::new();
+            let mut backends = std::collections::HashMap::new();
+            for (entry, backend) in agents {
+                let key = entry.id.as_str().to_owned();
+                entries.insert(key.clone(), entry);
+                backends.insert(key, backend);
+            }
+            Arc::new(Self {
+                default: AgentId::parse(default).unwrap(),
+                entries,
+                backends,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for FakeRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            let key = id.as_str();
+            match (self.entries.get(key), self.backends.get(key)) {
+                (Some(entry), Some(backend)) => Ok(Resolved {
+                    entry: Arc::new(entry.clone()),
+                    backend: backend.clone(),
+                    lease: Box::new(NoopLease),
+                }),
+                _ => Err(BridgeError::UnknownAgent { id: key.to_owned() }),
+            }
+        }
+        fn default_id(&self) -> AgentId {
+            self.default.clone()
+        }
+        async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<AgentId> {
+            self.entries
+                .keys()
+                .map(|k| AgentId::parse(k).unwrap())
+                .collect()
+        }
+    }
+
+    /// An `AgentEntry` with the given id and no model/effort/mode defaults.
+    fn bare_entry(id: &str) -> AgentEntry {
+        AgentEntry {
+            id: AgentId::parse(id).unwrap(),
+            cmd: "fake".into(),
+            args: vec![],
+            model_provider: None,
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: None,
+            auth_method: None,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: Default::default(),
+        }
+    }
 
     /// Delegation double. Yields a scripted set of events; exposes a preset
     /// `peer_task` watch; records every `cancel(peer_id)` call. In "idle" mode it
@@ -1593,7 +1883,7 @@ mod tests {
 
     fn build(backend: Arc<dyn AgentBackend>, auth: Arc<dyn AuthMiddleware>) -> Arc<InboundServer> {
         Arc::new(InboundServer::new(
-            backend,
+            FakeRegistry::single("kiro", backend),
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
             Arc::new(AlwaysKiro),
@@ -1612,7 +1902,7 @@ mod tests {
         delegation: Arc<dyn DelegationPort>,
     ) -> Arc<InboundServer> {
         Arc::new(InboundServer::new(
-            backend,
+            FakeRegistry::single("kiro", backend),
             store,
             Arc::new(AutoApprove),
             Arc::new(SkillRoute),
@@ -2553,7 +2843,7 @@ mod tests {
         local_source_label: &str,
     ) -> Arc<InboundServer> {
         Arc::new(InboundServer::new(
-            backend,
+            FakeRegistry::single("kiro", backend),
             store,
             Arc::new(AutoApprove),
             Arc::new(FanoutSkillRoute),
@@ -3116,6 +3406,279 @@ mod tests {
             peer_cancels.lock().unwrap().clone(),
             vec!["p1".to_string()],
             "the peer must NOT be orphaned when the Kiro cancel errors"
+        );
+    }
+
+    // ---- Task 10: registry-resolved local dispatch + per-session config ----
+
+    /// A backend that records the `EffectiveConfig` it received via
+    /// `configure_session` and reports a unique tag (its `id`) when prompted, so a
+    /// test can prove WHICH agent's backend was driven. Yields Text(id) + Done.
+    struct RecordingBackend {
+        id: String,
+        prompted: AtomicBool,
+        configured: Arc<Mutex<Option<EffectiveConfig>>>,
+    }
+    impl RecordingBackend {
+        fn new(id: &str) -> (Arc<Self>, Arc<Mutex<Option<EffectiveConfig>>>) {
+            let configured = Arc::new(Mutex::new(None));
+            (
+                Arc::new(Self {
+                    id: id.to_owned(),
+                    prompted: AtomicBool::new(false),
+                    configured: configured.clone(),
+                }),
+                configured,
+            )
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for RecordingBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.prompted.store(true, Ordering::SeqCst);
+            let updates = vec![
+                Ok(Update::Text(self.id.clone())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn configure_session(
+            &self,
+            _session: &SessionId,
+            cfg: &EffectiveConfig,
+        ) -> Result<(), BridgeError> {
+            *self.configured.lock().unwrap() = Some(cfg.clone());
+            Ok(())
+        }
+    }
+
+    /// A route that honors `meta.agent` (resolving to `Local(agent)`), falling back
+    /// to the registry default — mirrors the real binary `SkillRoute` for the local
+    /// arm so the registry-resolution path is exercised by agent id.
+    struct RegistryRoute {
+        default: AgentId,
+    }
+    impl RouteDecision for RegistryRoute {
+        fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            Ok(RouteTarget::Local(
+                t.agent.clone().unwrap_or_else(|| self.default.clone()),
+            ))
+        }
+    }
+
+    /// An `AgentEntry` with a model default (used to prove base config flows).
+    fn entry_with_model(id: &str, model: &str) -> AgentEntry {
+        let mut e = bare_entry(id);
+        e.model = Some(model.into());
+        e
+    }
+
+    /// Build a server over an explicit registry + `RegistryRoute(default)`.
+    fn build_registry(registry: Arc<dyn AgentRegistry>, default: &str) -> Arc<InboundServer> {
+        Arc::new(InboundServer::new(
+            registry,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(RegistryRoute {
+                default: AgentId::parse(default).unwrap(),
+            }),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "a",
+        ))
+    }
+
+    /// A unary SendMessage selecting `agent`, with optional model override.
+    fn agent_params(agent: &str, model: Option<&str>) -> Value {
+        let mut md = json!({ "a2a-bridge.agent": agent });
+        if let Some(m) = model {
+            md["a2a-bridge.model"] = json!(m);
+        }
+        json!({ "message": { "text": "go", "metadata": md } })
+    }
+
+    #[tokio::test]
+    async fn local_dispatch_routes_by_agent_id() {
+        // Registry has "a" and "b"; a request selecting agent="b" must drive the
+        // "b" backend (its artifact text is "b"), NOT the "a"/default backend.
+        let (a, _a_cfg) = RecordingBackend::new("a");
+        let (b, _b_cfg) = RecordingBackend::new("b");
+        let a_prompted = a.clone();
+        let b_prompted = b.clone();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![
+                (bare_entry("a"), a as Arc<dyn AgentBackend>),
+                (bare_entry("b"), b as Arc<dyn AgentBackend>),
+            ],
+        );
+        let srv = build_registry(registry, "a");
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params("b", None),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"]["artifact"]["text"], "b",
+            "agent=b must drive the b backend: {body}"
+        );
+        assert!(
+            b_prompted.prompted.load(Ordering::SeqCst),
+            "the b backend must be prompted"
+        );
+        assert!(
+            !a_prompted.prompted.load(Ordering::SeqCst),
+            "the a/default backend must NOT be prompted"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_agent_returns_clear_error() {
+        // agent="zzz" is absent → a JSON-RPC error mentioning the unknown agent,
+        // never a panic.
+        let (a, _) = RecordingBackend::new("a");
+        let registry =
+            FakeRegistry::with_entries("a", vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)]);
+        let srv = build_registry(registry, "a");
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params("zzz", None),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("error").is_some(),
+            "expected a JSON-RPC error: {body}"
+        );
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("unknown agent") && msg.contains("zzz"),
+            "error must name the unknown agent: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_agent_streaming_yields_failed_terminal_not_panic() {
+        // Streaming counterpart: an unknown agent must produce a terminal Failed
+        // SSE frame, never a panic.
+        let (a, _) = RecordingBackend::new("a");
+        let registry =
+            FakeRegistry::with_entries("a", vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)]);
+        let srv = build_registry(registry, "a");
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                agent_params("zzz", None),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("unknown agent"),
+            "SSE error frame must mention the unknown agent: {body}"
+        );
+        let payloads = sse_data_payloads(&body);
+        let last: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap()).unwrap();
+        assert!(
+            matches!(
+                &last,
+                a2a::StreamResponse::StatusUpdate(e) if e.status.state == a2a::TaskState::Failed
+            ),
+            "final frame must be terminal statusUpdate(Failed): {}",
+            payloads.last().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn override_applies_via_configure_session() {
+        // agent="a" + model override → the a backend's configure_session receives
+        // EffectiveConfig{ model: "override-m", .. }.
+        let (a, a_cfg) = RecordingBackend::new("a");
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(entry_with_model("a", "base-m"), a as Arc<dyn AgentBackend>)],
+        );
+        let srv = build_registry(registry, "a");
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params("a", Some("override-m")),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        let cfg = a_cfg
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("configure_session ran");
+        assert_eq!(
+            cfg.model.as_deref(),
+            Some("override-m"),
+            "the per-request model override must reach configure_session"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_config_applied_with_no_override() {
+        // agent="a" (entry "a" has model="base-m"), NO override → configure_session
+        // receives the entry's base model.
+        let (a, a_cfg) = RecordingBackend::new("a");
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(entry_with_model("a", "base-m"), a as Arc<dyn AgentBackend>)],
+        );
+        let srv = build_registry(registry, "a");
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params("a", None),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        let cfg = a_cfg
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("configure_session ran");
+        assert_eq!(
+            cfg.model.as_deref(),
+            Some("base-m"),
+            "the entry's base model must flow even with no override"
         );
     }
 }

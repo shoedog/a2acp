@@ -31,6 +31,8 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
 use bridge_acp::{
@@ -122,7 +124,7 @@ async fn bridge_a_fanout_through_bridge_b_to_kiro() {
     let store_b = Arc::new(SqliteStore::open_in_memory().expect("sqlite in-memory (B)"));
 
     let server_b = Arc::new(InboundServer::new(
-        backend_b,
+        common::single_agent_registry("kiro", backend_b),
         store_b,
         Arc::new(AutoPolicy),
         Arc::new(AlwaysKiroRoute),
@@ -152,7 +154,7 @@ async fn bridge_a_fanout_through_bridge_b_to_kiro() {
     ));
 
     let server_a = Arc::new(InboundServer::new(
-        backend_a,
+        common::single_agent_registry("kiro", backend_a),
         store_a,
         Arc::new(AutoPolicy),
         Arc::new(FanoutSkillRoute),

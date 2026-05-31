@@ -111,7 +111,7 @@ async fn main() -> Result<(), BoxError> {
         Box::pin(async move { Ok(b as Arc<dyn bridge_core::ports::AgentBackend>) })
     });
     let registry = Arc::new(Registry::new(single_snap, spawn_fn)?);
-    let route = Arc::new(SkillRoute::new(registry));
+    let route = Arc::new(SkillRoute::new(registry.clone()));
     let store = Arc::new(SqliteStore::open_in_memory()?);
     // Delegation port: real PeerDelegation when [delegation] is configured; StubDelegation otherwise.
     let delegation: Arc<dyn DelegationPort> = match &cfg.delegation {
@@ -124,12 +124,14 @@ async fn main() -> Result<(), BoxError> {
     };
 
     // 6. Construct the inbound server and build its axum router.
-    //    InboundServer::new(backend, store, policy, route, auth, base_url, delegation, local_source_label)
-    // The local-source label (wire-observable in fan-out artifacts) comes from
-    // `[agent] name` so a non-Kiro agent (e.g. codex) isn't mislabeled "kiro".
+    //    InboundServer::new(registry, store, policy, route, auth, base_url, delegation, local_source_label)
+    // The inbound server now holds the agent registry (3b): first-message LOCAL
+    // dispatch resolves the routed agent id, applies its effective config, and binds
+    // the task. The local-source label (wire-observable in fan-out artifacts) comes
+    // from `[agent] name` so a non-Kiro agent (e.g. codex) isn't mislabeled "kiro".
     let base_url = format!("http://{}", cfg.server.addr);
     let server = Arc::new(InboundServer::new(
-        backend,
+        registry,
         store,
         policy,
         route,
