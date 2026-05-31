@@ -173,19 +173,63 @@ impl AgentRegistry for Registry {
         self.state.load().default.clone()
     }
 
-    async fn apply(&self, snap: RegistrySnapshot) -> Result<(), BridgeError> {
-        // MINIMAL non-atomic version: validate + wholesale swap. Task 4 replaces this
-        // with an atomic reconcile that preserves live slots and retires removed ones.
-        validate(&snap)?;
-        let slots = snap
-            .entries
-            .into_iter()
-            .map(|e| (e.id.clone(), Slot::new(e)))
-            .collect();
+    async fn apply(&self, desired: RegistrySnapshot) -> Result<(), BridgeError> {
+        // Atomic reconcile [spec §7]:
+        //  - validate first → malformed config is rejected before any state change.
+        //  - reuse the live slot for a config-only edit (same cmd/args/cwd/auth_method)
+        //    so its warm OnceCell backend + active leases survive [req #1].
+        //  - a new slot for an add OR a cmd/args/cwd/auth change.
+        //  - swap the (slots, default) pair in ONE store → no partial-snapshot window.
+        //  - retire by slot-INSTANCE identity (Arc ptr) = removed ∪ replaced [req #2];
+        //    retired slots are simply absent from `next` so resolve can't livelock [req #3].
+        validate(&desired)?;
+        let old = self.state.load_full();
+        let mut next: HashMap<AgentId, Arc<Slot>> = HashMap::new();
+        for e in desired.entries {
+            // `e` is owned; clone the id before moving `e` into the slot.
+            let id = e.id.clone();
+            let reuse = old.slots.get(&id).filter(|cur| {
+                let c = cur.entry.load();
+                c.cmd == e.cmd
+                    && c.args == e.args
+                    && c.cwd == e.cwd
+                    && c.auth_method == e.auth_method
+            });
+            match reuse {
+                // Config-only edit: keep the warm slot, swap only its entry config.
+                Some(cur) => {
+                    cur.entry.store(Arc::new(e));
+                    next.insert(id, cur.clone());
+                }
+                // Add OR cmd/args/cwd/auth change → fresh slot (cold backend).
+                None => {
+                    next.insert(id, Slot::new(e));
+                }
+            }
+        }
+
+        // ATOMIC: store the slot map and default together in a single ArcSwap swap.
         self.state.store(Arc::new(State {
-            slots,
-            default: snap.default,
+            slots: next.clone(),
+            default: desired.default,
         }));
+
+        // Retire by slot-instance identity = removed ∪ replaced. The old `State` Arc
+        // (and thus the removed slots + their leases) stays alive until this loop ends.
+        // `old` is an `Arc<State>` (load_full), not an ArcSwap guard, so awaiting is safe.
+        for (id, s) in old.slots.iter() {
+            let kept = next.get(id).is_some_and(|n| Arc::ptr_eq(n, s));
+            if !kept {
+                // Mark retired BEFORE touching the backend to close resolve's spawn/retire
+                // race (resolve takes a lease, then re-checks this flag).
+                s.retired.store(true, SeqCst);
+                // T4: retire synchronously here so tests can observe it. T5 replaces this
+                // with a lease-draining retirement task (await leases==0 before retire()).
+                if let Some(b) = s.backend.get() {
+                    let _ = b.retire().await;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -205,6 +249,12 @@ impl Registry {
             .map(|s| s.leases.load(SeqCst))
             .unwrap_or(0)
     }
+
+    /// Test-only: the `Arc<Slot>` instance currently mapped for `id` (clone of the
+    /// Arc, so identity is preserved for `Arc::ptr_eq` checks). `None` if absent.
+    fn slot_arc(&self, id: &AgentId) -> Option<Arc<Slot>> {
+        self.state.load().slots.get(id).cloned()
+    }
 }
 
 #[cfg(test)]
@@ -215,8 +265,11 @@ mod tests {
     use bridge_core::ports::{BackendStream, Update};
     use std::collections::BTreeMap;
 
-    // A backend that records nothing; just satisfies the trait.
-    struct FakeBackend;
+    // A backend that records its `retire()` calls into a shared counter, so
+    // reconcile tests can assert that removed/replaced backends were retired.
+    struct FakeBackend {
+        retired: Arc<AtomicUsize>,
+    }
     #[async_trait::async_trait]
     impl AgentBackend for FakeBackend {
         async fn prompt(
@@ -231,6 +284,10 @@ mod tests {
             })))
         }
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn retire(&self) -> Result<(), BridgeError> {
+            self.retired.fetch_add(1, SeqCst);
             Ok(())
         }
     }
@@ -263,11 +320,18 @@ mod tests {
     }
 
     /// A SpawnFn that counts invocations and (optionally) fails the first N calls.
-    fn counting_spawn(count: Arc<AtomicUsize>, fail_first: usize) -> SpawnFn {
+    /// Every spawned backend shares `retired`, so reconcile tests can assert how
+    /// many backends got `retire()`d.
+    fn counting_spawn_recording(
+        count: Arc<AtomicUsize>,
+        fail_first: usize,
+        retired: Arc<AtomicUsize>,
+    ) -> SpawnFn {
         let fails_left = Arc::new(AtomicUsize::new(fail_first));
         Arc::new(move |_entry| {
             let count = count.clone();
             let fails_left = fails_left.clone();
+            let retired = retired.clone();
             Box::pin(async move {
                 count.fetch_add(1, SeqCst);
                 // Decrement-and-test: fail while there are failures budgeted.
@@ -277,9 +341,14 @@ mod tests {
                         reason: "spawn boom".into(),
                     });
                 }
-                Ok(Arc::new(FakeBackend) as Arc<dyn AgentBackend>)
+                Ok(Arc::new(FakeBackend { retired }) as Arc<dyn AgentBackend>)
             })
         })
+    }
+
+    /// Convenience for the existing tests that don't care about retire counts.
+    fn counting_spawn(count: Arc<AtomicUsize>, fail_first: usize) -> SpawnFn {
+        counting_spawn_recording(count, fail_first, Arc::new(AtomicUsize::new(0)))
     }
 
     #[tokio::test]
@@ -356,5 +425,195 @@ mod tests {
             Err(other) => panic!("expected ConfigInvalid, got {other:?}"),
             Ok(_) => panic!("expected ConfigInvalid, got Ok"),
         }
+    }
+
+    // --- Task 4: atomic apply() reconcile -------------------------------------
+
+    #[tokio::test]
+    async fn config_only_edit_keeps_same_backend() {
+        // Req #1: same cmd/args/cwd/auth_method, different model → reuse the live
+        // slot (warm OnceCell backend + leases survive); only the entry config changes.
+        let count = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(snapshot(&["a"]), counting_spawn(count.clone(), 0)).unwrap();
+        let a = AgentId::parse("a").unwrap();
+
+        let _r = reg.resolve(&a).await.unwrap(); // spawns + warms the backend
+        assert_eq!(count.load(SeqCst), 1);
+        let slot_before = reg.slot_arc(&a).unwrap();
+
+        // config-only edit: same cmd, new model.
+        let mut snap = snapshot(&["a"]);
+        snap.entries[0].model = Some("opus".into());
+        reg.apply(snap).await.unwrap();
+
+        let slot_after = reg.slot_arc(&a).unwrap();
+        assert!(
+            Arc::ptr_eq(&slot_before, &slot_after),
+            "config-only edit must reuse the SAME slot instance (warm backend survives)"
+        );
+
+        let _r2 = reg.resolve(&a).await.unwrap();
+        assert_eq!(
+            count.load(SeqCst),
+            1,
+            "no respawn: the warm backend was preserved across a config-only edit"
+        );
+        assert_eq!(
+            reg.slot_arc(&a).unwrap().entry.load().model.as_deref(),
+            Some("opus"),
+            "the new model is live on the reused slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_change_replaces_slot_and_retires_old() {
+        // Req #2: a same-id cmd change is a NEW slot → the OLD instance must be
+        // retired (retire-by-Arc-ptr identity, not id-set difference).
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            snapshot(&["a"]),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap();
+        let a = AgentId::parse("a").unwrap();
+
+        let _r = reg.resolve(&a).await.unwrap(); // spawns OLD backend (cmd=fake-cmd)
+        assert_eq!(count.load(SeqCst), 1);
+        let slot_before = reg.slot_arc(&a).unwrap();
+
+        // cmd change: new cmd → new slot. (allow the new cmd through validate)
+        let mut snap = snapshot(&["a"]);
+        snap.entries[0].cmd = "other-cmd".into();
+        snap.allowed_cmds = vec!["fake-cmd".into(), "other-cmd".into()];
+        reg.apply(snap).await.unwrap();
+
+        let slot_after = reg.slot_arc(&a).unwrap();
+        assert!(
+            !Arc::ptr_eq(&slot_before, &slot_after),
+            "cmd change must produce a NEW slot instance"
+        );
+        assert_eq!(
+            retired.load(SeqCst),
+            1,
+            "the OLD backend instance must be retired on a cmd change"
+        );
+
+        let _r2 = reg.resolve(&a).await.unwrap();
+        assert_eq!(
+            count.load(SeqCst),
+            2,
+            "resolve after a cmd change spawns a fresh backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_then_resolve_unknown() {
+        // Req #3: removed slot leaves the live map; its backend gets retired.
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            snapshot(&["a", "b"]),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap();
+        let a = AgentId::parse("a").unwrap();
+        let b = AgentId::parse("b").unwrap();
+
+        let _r = reg.resolve(&a).await.unwrap(); // warm "a"'s backend
+
+        // new snapshot drops "a", keeps "b" (default must stay valid).
+        let snap = snapshot(&["b"]);
+        reg.apply(snap).await.unwrap();
+
+        match reg.resolve(&a).await {
+            Err(BridgeError::UnknownAgent { id }) => assert_eq!(id, "a"),
+            other => panic!("expected UnknownAgent, got {:?}", other.err()),
+        }
+        assert!(
+            reg.slot_arc(&a).is_none(),
+            "removed slot must be absent from the live map"
+        );
+        assert_eq!(retired.load(SeqCst), 1, "removed backend must be retired");
+        // "b" still resolvable.
+        let _ = reg.resolve(&b).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_validates() {
+        let reg = Registry::new(
+            snapshot(&["a"]),
+            counting_spawn(Arc::new(AtomicUsize::new(0)), 0),
+        )
+        .unwrap();
+
+        // duplicate ids
+        let mut dup = snapshot(&["a"]);
+        dup.entries.push(entry("a"));
+        match reg.apply(dup).await {
+            Err(BridgeError::ConfigInvalid { reason }) => {
+                assert!(reason.contains("duplicate"), "got: {reason}")
+            }
+            other => panic!("expected ConfigInvalid(duplicate), got {other:?}"),
+        }
+
+        // default not in entries
+        let mut bad_default = snapshot(&["a"]);
+        bad_default.default = AgentId::parse("ghost").unwrap();
+        match reg.apply(bad_default).await {
+            Err(BridgeError::ConfigInvalid { reason }) => {
+                assert!(reason.contains("default"), "got: {reason}")
+            }
+            other => panic!("expected ConfigInvalid(default), got {other:?}"),
+        }
+
+        // cmd not in allowed_cmds
+        let mut bad_cmd = snapshot(&["a"]);
+        bad_cmd.entries[0].cmd = "evil".into();
+        match reg.apply(bad_cmd).await {
+            Err(BridgeError::ConfigInvalid { reason }) => {
+                assert!(reason.contains("cmd not allowed"), "got: {reason}")
+            }
+            other => panic!("expected ConfigInvalid(cmd), got {other:?}"),
+        }
+
+        // the failed applies left the original state intact
+        assert!(reg.slot_arc(&AgentId::parse("a").unwrap()).is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_is_idempotent() {
+        // Applying the same snapshot twice keeps the warm slot (no respawn, no
+        // retire of the kept slot).
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            snapshot(&["a"]),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap();
+        let a = AgentId::parse("a").unwrap();
+
+        let _r = reg.resolve(&a).await.unwrap(); // warm backend
+        let slot0 = reg.slot_arc(&a).unwrap();
+
+        reg.apply(snapshot(&["a"])).await.unwrap();
+        let slot1 = reg.slot_arc(&a).unwrap();
+        assert!(Arc::ptr_eq(&slot0, &slot1), "first re-apply keeps the slot");
+
+        reg.apply(snapshot(&["a"])).await.unwrap();
+        let slot2 = reg.slot_arc(&a).unwrap();
+        assert!(
+            Arc::ptr_eq(&slot1, &slot2),
+            "second re-apply keeps the slot"
+        );
+
+        let _r2 = reg.resolve(&a).await.unwrap();
+        assert_eq!(
+            count.load(SeqCst),
+            1,
+            "no respawn across idempotent applies"
+        );
+        assert_eq!(retired.load(SeqCst), 0, "kept slot is never retired");
     }
 }
