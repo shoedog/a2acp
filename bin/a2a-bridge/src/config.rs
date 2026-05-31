@@ -285,6 +285,168 @@ fn parse_effort(s: &str) -> Result<Effort, ConfigError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// FileConfigSource — the File `ConfigSource` adapter (Task 8 / Increment 3b).
+//
+// `load()` reads + parses the TOML at `path` into a `RegistrySnapshot` (via the
+// Task-7 `RegistryConfig::parse` → `into_snapshot` pipeline). `watch()` returns a
+// stream that fires whenever the file changes on disk.
+//
+// The four must-haves for a robust file watch:
+//   (a) PARENT-DIR watch — editors save by atomic-rename (write `.tmp`, rename over
+//       the target), which gives the file a NEW inode; a file-inode watch goes stale
+//       and silently misses the edit. Watching the parent directory survives this.
+//   (b) DEBOUNCE — one logical save can emit several fs events; we coalesce a burst
+//       into a single re-load with a short settle window.
+//   (c) WATCHER KEPT ALIVE — `notify::RecommendedWatcher` stops delivering events the
+//       moment it is dropped, so it MUST be moved into (and live for the whole life of)
+//       the spawned task.
+//   (d) KEEP-LAST-GOOD — a transient parse failure (e.g. a half-written file) MUST NOT
+//       tear the stream down; we log and skip emitting, leaving the consumer on the
+//       last good snapshot.
+// ---------------------------------------------------------------------------
+
+/// File-backed [`ConfigSource`](bridge_core::ports::ConfigSource): loads a
+/// `RegistrySnapshot` from a TOML file and watches its parent directory for edits.
+#[allow(dead_code)] // wired to main in Task 12
+pub struct FileConfigSource {
+    path: std::path::PathBuf,
+}
+
+#[allow(dead_code)] // wired to main in Task 12
+impl FileConfigSource {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Read + parse the TOML at `path` into a `RegistrySnapshot`. Shared by `load()`
+    /// and the watch task's re-load. `None` on read/parse failure (so the watch task
+    /// can keep-last-good); `load()` maps the failure to a `BridgeError` instead.
+    async fn try_load(path: &std::path::Path) -> Option<RegistrySnapshot> {
+        let s = tokio::fs::read_to_string(path).await.ok()?;
+        RegistryConfig::parse(&s)
+            .and_then(|c| c.into_snapshot())
+            .ok()
+    }
+}
+
+#[async_trait::async_trait]
+impl bridge_core::ports::ConfigSource for FileConfigSource {
+    async fn load(&self) -> Result<RegistrySnapshot, bridge_core::error::BridgeError> {
+        let s = tokio::fs::read_to_string(&self.path).await.map_err(|e| {
+            bridge_core::error::BridgeError::ConfigInvalid {
+                reason: format!("read {}: {e}", self.path.display()),
+            }
+        })?;
+        RegistryConfig::parse(&s)
+            .and_then(|c| c.into_snapshot())
+            .map_err(|e| bridge_core::error::BridgeError::ConfigInvalid {
+                reason: e.to_string(),
+            })
+    }
+
+    fn watch(&self) -> futures::stream::BoxStream<'static, RegistrySnapshot> {
+        let path = self.path.clone();
+        // (a) Watch the PARENT directory, not the file inode — atomic-rename saves
+        // replace the inode, which a file-watch would miss after the first event.
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // The filename we re-load on any relevant directory event.
+        let file_name = path.file_name().map(|n| n.to_os_string());
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<RegistrySnapshot>(8);
+
+        // notify's callback runs on its own thread; bridge its events to async land
+        // over an unbounded channel of "something changed" signals.
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let filter_name = file_name.clone();
+        // Create + REGISTER the watcher SYNCHRONOUSLY, before this function returns.
+        // Registering inside the spawned task would race the caller: a `watch()`-then-
+        // edit sequence could fire the (single) edit before the watcher is live and miss
+        // it forever. Events that land before the loop starts are buffered in `raw_rx`.
+        let watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(ev) = res {
+                    // Filter to events touching OUR file (by filename) when notify gives us
+                    // paths; if it gives none, treat it as a coarse signal and re-check by
+                    // path below. Robust to atomic-rename, which reports the target path in
+                    // the rename's `paths`.
+                    let relevant = match &filter_name {
+                        Some(name) => {
+                            ev.paths.is_empty()
+                                || ev
+                                    .paths
+                                    .iter()
+                                    .any(|p| p.file_name() == Some(name.as_os_str()))
+                        }
+                        None => true,
+                    };
+                    if relevant {
+                        let _ = raw_tx.send(());
+                    }
+                }
+            }) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::warn!(error = %e, "config watcher init failed; watch disabled");
+                    None
+                }
+            };
+        let watcher = watcher.and_then(|mut w| {
+            use notify::Watcher;
+            match w.watch(&parent, notify::RecursiveMode::NonRecursive) {
+                Ok(()) => Some(w),
+                Err(e) => {
+                    tracing::warn!(dir = %parent.display(), error = %e, "config watch failed; watch disabled");
+                    None
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            // (c) Keep the watcher alive for the whole task — `notify` stops delivering
+            // events the instant it is dropped. `None` = init failed; the loop below then
+            // idles until the receiver is dropped.
+            let _watcher = watcher;
+
+            loop {
+                // Block until at least one change signal arrives.
+                if raw_rx.recv().await.is_none() {
+                    break; // watcher dropped (only happens at task end) → stop.
+                }
+                // (b) Debounce: let a burst of events for one logical save settle, then
+                // drain the backlog so we re-load exactly once per settled edit.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                while raw_rx.try_recv().is_ok() {}
+
+                // Re-load by PATH (not inode) so we pick up the freshly-renamed file.
+                match Self::try_load(&path).await {
+                    // (d) Keep-last-good: only emit on a successful parse.
+                    Some(snap) => {
+                        if tx.send(snap).await.is_err() {
+                            break; // (e) receiver dropped → stop the task.
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "config reload failed; keeping last-good"
+                        );
+                    }
+                }
+            }
+
+            // (c) `_watcher` lived for the whole task; drop it explicitly here.
+            drop(_watcher);
+        });
+
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +612,114 @@ cmd = "beta-cli"
             matches!(err, ConfigError::Registry(_)),
             "expected Registry variant, got: {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // FileConfigSource tests (Task 8 / Increment 3b)
+    // -----------------------------------------------------------------------
+
+    const V1_STRING: &str = r#"default="codex"
+[registry]
+allowed_cmds=["codex-acp"]
+[[agents]]
+id="codex"
+cmd="codex-acp"
+[server]
+addr="127.0.0.1:8080"
+"#;
+
+    // A self-consistent v2: default="kiro", one agent id="kiro"/cmd="kiro-cli",
+    // allowed_cmds=["kiro-cli"].
+    const V2_STRING: &str = r#"default="kiro"
+[registry]
+allowed_cmds=["kiro-cli"]
+[[agents]]
+id="kiro"
+cmd="kiro-cli"
+args=["acp"]
+[server]
+addr="127.0.0.1:8080"
+"#;
+
+    #[tokio::test]
+    async fn load_parses_via_into_snapshot() {
+        use bridge_core::ports::ConfigSource;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a2a-bridge.toml");
+        std::fs::write(&path, V1_STRING).unwrap();
+        let src = FileConfigSource::new(path.clone());
+        let snap = src.load().await.unwrap();
+        assert_eq!(snap.default.as_str(), "codex");
+        assert_eq!(snap.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_errors_on_missing_file() {
+        use bridge_core::ports::ConfigSource;
+        let dir = tempfile::tempdir().unwrap();
+        let src = FileConfigSource::new(dir.path().join("does-not-exist.toml"));
+        let err = src.load().await.unwrap_err();
+        assert!(
+            matches!(err, bridge_core::error::BridgeError::ConfigInvalid { .. }),
+            "expected ConfigInvalid, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_emits_on_edit_via_atomic_rename() {
+        use bridge_core::ports::ConfigSource;
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a2a-bridge.toml");
+        std::fs::write(&path, V1_STRING).unwrap();
+
+        let src = FileConfigSource::new(path.clone());
+        // load() returns v1.
+        assert_eq!(src.load().await.unwrap().default.as_str(), "codex");
+
+        // Start watching, then ATOMICALLY RENAME a v2 over the file (editor-style
+        // save → new inode — the footgun a file-inode watch silently misses).
+        let mut stream = src.watch();
+        let tmp = dir.path().join(".a2a-bridge.toml.tmp");
+        std::fs::write(&tmp, V2_STRING).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+
+        // A snapshot with default "kiro" must arrive within the timeout. The window
+        // is generous (200ms debounce + fs-event latency) to stay non-flaky.
+        let snap = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("watch must emit within 5s")
+            .expect("stream not ended");
+        assert_eq!(snap.default.as_str(), "kiro");
+    }
+
+    #[tokio::test]
+    async fn watch_keeps_last_good_on_parse_error() {
+        use bridge_core::ports::ConfigSource;
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a2a-bridge.toml");
+        std::fs::write(&path, V1_STRING).unwrap();
+
+        let src = FileConfigSource::new(path.clone());
+        let mut stream = src.watch();
+
+        // First write GARBAGE (parse fails) — must NOT emit, must NOT tear down.
+        let tmp = dir.path().join(".garbage.tmp");
+        std::fs::write(&tmp, "this is not valid toml = = =").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+
+        // Then write a valid v2 — the stream survives and emits the good snapshot.
+        let tmp2 = dir.path().join(".v2.tmp");
+        std::fs::write(&tmp2, V2_STRING).unwrap();
+        std::fs::rename(&tmp2, &path).unwrap();
+
+        let snap = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("watch must still emit after a transient parse error")
+            .expect("stream not ended");
+        assert_eq!(snap.default.as_str(), "kiro");
     }
 }
