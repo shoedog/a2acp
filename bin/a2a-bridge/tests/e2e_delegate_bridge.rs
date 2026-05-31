@@ -1,14 +1,14 @@
 // e2e_delegate_bridge.rs — Gated bridge-to-bridge end-to-end test (spec S2 + S2a, Task 11).
 //
 // Stands up two REAL bridge instances (A and B) in-process:
-//   Bridge B: InboundServer wired to a real KiroBackend (kiro-cli acp) on an
+//   Bridge B: InboundServer wired to a real AcpBackend (kiro-cli acp) on an
 //             ephemeral port. Serves the "kiro-code" skill.
 //   Bridge A: InboundServer wired to PeerDelegation pointing at Bridge B, with
 //             SkillRoute sending "delegate" requests to Bridge B.
 //
 // The test POSTs a `SendStreamingMessage` with skill="delegate" and text "reply PONG"
 // to Bridge A. The request flows:
-//   Client → Bridge A (inbound) → PeerDelegation → Bridge B (inbound) → KiroBackend
+//   Client → Bridge A (inbound) → PeerDelegation → Bridge B (inbound) → AcpBackend
 //
 // Bridge B's SSE response streams back through Bridge A's delegation path and out as
 // Bridge A's own SSE response to the test client.
@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
-use bridge_acp::{kiro::KiroBackend, supervisor::Supervised};
+use bridge_acp::{acp_backend::AcpBackend, supervisor::Supervised};
 use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
@@ -85,7 +85,7 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
 
     let supervised_b = Supervised::spawn("kiro-cli", &["acp"])
         .expect("kiro-cli must be on PATH and authenticated; run `kiro-cli whoami` first");
-    let backend_b = Arc::new(KiroBackend::from_child(supervised_b));
+    let backend_b = Arc::new(AcpBackend::from_child(supervised_b));
     let store_b = Arc::new(SqliteStore::open_in_memory().expect("sqlite in-memory (B)"));
 
     let server_b = Arc::new(InboundServer::new(

@@ -1,7 +1,7 @@
 // main.rs — A2A Bridge v2.5 composition root (spec §8, Task 15 / Task 10).
 //
 // Wires all port implementations together into a runnable binary:
-//   AlwaysGrant (auth) -> SkillRoute (route) -> KiroBackend (backend)
+//   AlwaysGrant (auth) -> SkillRoute (route) -> AcpBackend (backend)
 //   AutoPolicy (policy) | SqliteStore (store) | PeerDelegation or StubDelegation (delegation)
 //
 // Server listens on cfg.server.addr (default 127.0.0.1:8080).
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
-use bridge_acp::{kiro::KiroBackend, supervisor::Supervised};
+use bridge_acp::{acp_backend::AcpBackend, supervisor::Supervised};
 use bridge_core::ports::DelegationPort;
 use bridge_policy::{auth::AlwaysGrant, permission::AutoPolicy};
 use bridge_store::sqlite::SqliteStore;
@@ -49,7 +49,7 @@ async fn main() -> Result<(), BoxError> {
     // 3. Spawn the agent child process.
     let args_ref: Vec<&str> = cfg.agent.args.iter().map(String::as_str).collect();
     let supervised = Supervised::spawn(&cfg.agent.cmd, &args_ref)?;
-    let backend = Arc::new(KiroBackend::from_child(supervised));
+    let backend = Arc::new(AcpBackend::from_child(supervised));
 
     // 4. Build all port Arc<dyn Trait> wrappers.
     let auth = Arc::new(AlwaysGrant);

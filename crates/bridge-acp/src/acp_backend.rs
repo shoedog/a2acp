@@ -1,4 +1,4 @@
-// kiro.rs — KiroBackend: drives a Kiro child process over JSON-RPC line-framed stdio.
+// acp_backend.rs — AcpBackend: drives an ACP agent child process over JSON-RPC line-framed stdio.
 // Spec §5.3 cancellation rule: completion is the prompt RESULT (stopReason:"cancelled"),
 // NOT the act of sending session/cancel. See Codex finding 2.
 
@@ -30,12 +30,12 @@ struct Inner {
 
 // ── Public struct ────────────────────────────────────────────────────────────
 
-pub struct KiroBackend {
+pub struct AcpBackend {
     inner: Arc<Mutex<Inner>>,
     id_counter: Arc<AtomicU64>,
 }
 
-impl KiroBackend {
+impl AcpBackend {
     /// Construct from an already-spawned scripted child (used in tests and when
     /// the caller has already set up the process).
     pub fn from_child(mut supervised: Supervised) -> Self {
@@ -156,7 +156,7 @@ impl KiroBackend {
 // ── AgentBackend impl ────────────────────────────────────────────────────────
 
 #[async_trait]
-impl AgentBackend for KiroBackend {
+impl AgentBackend for AcpBackend {
     /// Write `session/prompt` to the child's stdin and return a stream that
     /// yields `Update`s from the child's stdout until a Done frame arrives.
     ///
@@ -301,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn new_session_then_prompt_streams_text_then_done() {
         // child: replies sessionId to the first request, then on the prompt emits one update + result.
-        let be = KiroBackend::from_child(scripted(
+        let be = AcpBackend::from_child(scripted(
             "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
              read line; \
              printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"text\":\"PONG\"}}'; \
@@ -318,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_completion_is_the_prompt_result_not_the_notification() {
         // child emits sessionId, then an update, then (only after reading the cancel line) the cancelled result.
-        let be = KiroBackend::from_child(scripted(
+        let be = AcpBackend::from_child(scripted(
             "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
              read p; \
              printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"text\":\"work\"}}'; \
@@ -336,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn unrecognized_result_frame_still_yields_terminal_done() {
-        let be = KiroBackend::from_child(scripted(
+        let be = AcpBackend::from_child(scripted(
             "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
              read p; \
              printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}'; sleep 1",
@@ -356,7 +356,7 @@ mod tests {
     async fn prompt_serializes_part_text_into_session_prompt() {
         // child: emits sessionId; reads the prompt line from stdin; echoes that line's content back
         // (stripped of quotes) inside a session/update text; then a result.
-        let be = KiroBackend::from_child(scripted(
+        let be = AcpBackend::from_child(scripted(
             "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; \
              IFS= read -r _new_req; \
              IFS= read -r line; \
@@ -379,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_timeout_sigterms_and_errors() {
         // child gives a session, never returns a prompt result -> cancel_with_timeout times out, reaps, errors.
-        let be = KiroBackend::from_child(scripted(
+        let be = AcpBackend::from_child(scripted(
             "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"s1\"}}'; sleep 30"));
         let sid = be.new_session().await.unwrap();
         let _ = be.prompt(&sid, vec![]).await.unwrap();

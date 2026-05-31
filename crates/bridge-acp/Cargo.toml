@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+agent-client-protocol = { workspace = true }
 bridge-core = { path = "../bridge-core" }
 thiserror.workspace = true
 async-trait.workspace = true
