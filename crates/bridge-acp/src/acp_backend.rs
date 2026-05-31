@@ -14,18 +14,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, AuthMethod, CancelNotification, ContentBlock, InitializeRequest,
-    InitializeResponse, NewSessionRequest, PromptRequest, ProtocolVersion,
-    SessionId as AgentSessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
+    AgentCapabilities, AuthMethod, CancelNotification, ContentBlock, CreateTerminalRequest,
+    CreateTerminalResponse, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    KillTerminalResponse, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
+    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionId as AgentSessionId, SessionNotification, SessionUpdate,
+    StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use bridge_core::domain::{PermissionDecision, PermissionRequest, SessionContext};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::ports::{AgentBackend, BackendStream, Update};
+use bridge_core::ports::{AgentBackend, BackendStream, PolicyEngine, Update};
 
 use crate::supervisor::Supervised;
 
@@ -81,6 +88,58 @@ impl Default for AcpConfig {
             cancel_grace: DEFAULT_CANCEL_GRACE,
         }
     }
+}
+
+// ── Default permission policy ────────────────────────────────────────────────
+//
+// Reverse `session/request_permission` requests are decided by a `PolicyEngine`
+// (injected — see `AcpBackend::policy` / `with_policy`). The deployed 3a policy
+// is auto-approve. So the backend defaults to this internal auto-approve impl
+// when no policy is injected, keeping every existing `connect`/`spawn`/`from_child`
+// call site (main + the e2es) source-compatible. `with_policy` overrides it.
+//
+// `decide` is the `bridge_core::ports::PolicyEngine` SYNC contract: `Approve`
+// means grant; the auto-approver never denies. (A real `bridge_policy::AutoPolicy`
+// denies INTERACTIVE asks; here we model the agent tool-call permission as
+// non-interactive auto-grant, which Task 6's `main` can override by threading a
+// concrete `PolicyEngine` through `with_policy`.)
+struct AutoApprovePolicy;
+
+impl PolicyEngine for AutoApprovePolicy {
+    fn decide(
+        &self,
+        _req: &PermissionRequest,
+        _ctx: &SessionContext,
+    ) -> Result<PermissionDecision, BridgeError> {
+        Ok(PermissionDecision::Approve)
+    }
+}
+
+/// Register `method_not_found` reject handlers for a set of UNSUPPORTED inbound
+/// request types onto a `Client` connection builder, returning the extended
+/// builder. See the `fs/terminal UNSUPPORTED` note in [`AcpBackend::connect`] for
+/// WHY explicit handlers are required (this SDK does NOT auto-reply to an
+/// unregistered method — it drops it, hanging the agent's `block_task`).
+///
+/// Each generated handler is trivial + synchronous (responds immediately, no
+/// await), so it never stalls the dispatch loop. Returning the `respond` error
+/// (if the peer is gone) up out of the handler is fine: a lost reply to an
+/// unsupported request is not a connection-fatal condition the SDK escalates here.
+macro_rules! reject_unsupported {
+    ($builder:expr; $( $req:ty => $resp:ty ),+ $(,)?) => {{
+        let b = $builder;
+        $(
+            let b = b.on_receive_request(
+                move |_req: $req,
+                      responder: agent_client_protocol::Responder<$resp>,
+                      _cx: ConnectionTo<Agent>| async move {
+                    responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        )+
+        b
+    }};
 }
 
 // ── Streaming routing registry ───────────────────────────────────────────────
@@ -223,7 +282,21 @@ pub struct AcpBackend {
     /// it is dropped before any `session/new` await so the mint of one session
     /// never blocks lookups of another.
     sessions: Arc<Mutex<HashMap<SessionId, Arc<AgentSession>>>>,
+    /// Policy engine that decides reverse `session/request_permission` requests.
+    /// Defaults to an internal auto-approve impl (the deployed 3a policy); a
+    /// caller (Task 6's `main`) threads a concrete engine via [`Self::with_policy`].
+    ///
+    /// Behind `Arc<StdMutex<Arc<dyn PolicyEngine>>>` so the SAME handle is shared
+    /// with the permission handler registered inside [`Self::connect`]'s event-loop
+    /// task, yet [`Self::with_policy`] — which runs AFTER `connect` returns — can
+    /// still SWAP the engine the already-registered handler reads. The handler
+    /// clones the inner `Arc` out under the lock (no await held), so swapping never
+    /// races a decision.
+    policy: PolicyHandle,
 }
+
+/// Shared, swappable handle to the active [`PolicyEngine`]. See [`AcpBackend::policy`].
+type PolicyHandle = Arc<StdMutex<Arc<dyn PolicyEngine>>>;
 
 impl AcpBackend {
     /// Build the `initialize` request this backend sends to the agent.
@@ -323,11 +396,20 @@ impl AcpBackend {
         let updates: UpdateRegistry = Arc::new(StdMutex::new(HashMap::new()));
         let updates_handler = Arc::clone(&updates);
 
+        // Active policy engine for reverse `session/request_permission` requests.
+        // Default = auto-approve (deployed 3a policy); `with_policy` swaps the
+        // inner `Arc` later. Shared with the permission handler below so the
+        // handler always reads the CURRENT engine.
+        let policy: PolicyHandle = Arc::new(StdMutex::new(
+            Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
+        ));
+        let policy_handler = Arc::clone(&policy);
+
         // The event loop owns a long-lived task. `main_fn` publishes a clone of
         // `cx` and then parks on `shutdown_rx` so the connection stays open for
         // the lifetime of the backend (returning from `main_fn` would close it).
         tokio::spawn(async move {
-            let _ = Client
+            let builder = Client
                 .builder()
                 .name("a2a-bridge")
                 // `session/update` fan-in. This runs ON the event loop, so it
@@ -357,6 +439,61 @@ impl AcpBackend {
                     },
                     agent_client_protocol::on_receive_notification!(),
                 )
+                // Reverse `session/request_permission`. A real ACP agent (e.g.
+                // codex-acp) issues this BACK to us mid-turn. CRITICAL: SDK request
+                // handlers run ON the dispatch loop and BLOCK all further message
+                // processing while they `await`. So we MUST NOT decide-and-respond
+                // inline — a slow policy (or merely holding the loop) would stall the
+                // in-flight `session/cancel`, the next `agent_message_chunk`, and the
+                // `PromptResponse`, deadlocking the turn. Instead we OFFLOAD the
+                // decide+respond to a `cx.spawn` task (the `Responder` is `Send` and
+                // moves into it) and RETURN immediately, freeing the loop to keep
+                // dispatching. The decide itself is the sync `PolicyEngine::decide`.
+                .on_receive_request(
+                    move |req: RequestPermissionRequest,
+                          responder: agent_client_protocol::Responder<
+                        RequestPermissionResponse,
+                    >,
+                          cx: ConnectionTo<Agent>| {
+                        let policy = Arc::clone(&policy_handler);
+                        async move {
+                            // Offload so the dispatch loop is NOT blocked. The
+                            // spawned task owns the `Responder` and answers from there.
+                            cx.spawn(async move {
+                                let outcome = Self::decide_permission(&policy, &req);
+                                // Ignore a `respond` error (peer gone / turn ended):
+                                // returning `Err` from a `cx.spawn` task would shut the
+                                // whole connection down, which a lost reply must not do.
+                                let _ = responder.respond(RequestPermissionResponse::new(outcome));
+                                Ok(())
+                            })?;
+                            // Return PROMPTLY — the loop keeps dispatching.
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                );
+
+            // fs/terminal UNSUPPORTED. We advertise NO fs/terminal client
+            // capabilities at `initialize`, so a CONFORMANT agent never sends these.
+            // But a non-conformant agent might — and (verified against this SDK
+            // version, 0.12.1) an UNREGISTERED inbound request is NOT auto-replied by
+            // the default dispatch: it is silently dropped, hanging the agent's
+            // `block_task` forever. So we register explicit reject handlers that
+            // immediately answer `method_not_found`, keeping the agent unblocked and
+            // the loop running. Each handler is trivial + synchronous, so it never
+            // stalls the loop.
+            let builder = reject_unsupported!(builder;
+                ReadTextFileRequest => ReadTextFileResponse,
+                WriteTextFileRequest => WriteTextFileResponse,
+                CreateTerminalRequest => CreateTerminalResponse,
+                TerminalOutputRequest => TerminalOutputResponse,
+                ReleaseTerminalRequest => ReleaseTerminalResponse,
+                WaitForTerminalExitRequest => WaitForTerminalExitResponse,
+                KillTerminalRequest => KillTerminalResponse,
+            );
+
+            let _ = builder
                 .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
                     // Hand a clone back to the AcpBackend; ignore send errors
                     // (receiver dropped => backend gone => nothing to drive).
@@ -400,7 +537,85 @@ impl AcpBackend {
             id_counter: Arc::new(AtomicU64::new(1)),
             config: Some(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            policy,
         })
+    }
+
+    /// Inject a concrete [`PolicyEngine`] for reverse `session/request_permission`
+    /// decisions, replacing the default auto-approve. Swaps the engine the already-
+    /// registered permission handler reads (see [`Self::policy`]), so it takes
+    /// effect for subsequent requests. Builder-style so call sites stay
+    /// `connect(..)?.with_policy(..)`; Task 6's `main` threads its policy through here.
+    #[must_use]
+    pub fn with_policy(self, policy: Arc<dyn PolicyEngine>) -> Self {
+        if let Ok(mut p) = self.policy.lock() {
+            *p = policy;
+        }
+        self
+    }
+
+    /// Decide a reverse `session/request_permission` and map the `PolicyEngine`
+    /// verdict onto an ACP [`RequestPermissionOutcome`].
+    ///
+    /// Mapping (per the Task-5 policy table):
+    /// * **Approve** → select the first `AllowOnce` option; fallback the first
+    ///   `AllowAlways`; fallback the first option of ANY kind; if the agent sent
+    ///   NO options at all, `Cancelled` (the only conformant choice — we cannot
+    ///   invent an option id).
+    /// * **Deny** (`Err(PermissionDenied)`) → first `RejectOnce`; fallback first
+    ///   `RejectAlways`; fallback `Cancelled` if no reject option exists.
+    /// * **Any other policy error** (abstain) → `Cancelled`.
+    fn decide_permission(
+        policy: &PolicyHandle,
+        req: &RequestPermissionRequest,
+    ) -> RequestPermissionOutcome {
+        // Model the agent's tool-call permission ask as a non-interactive
+        // `PermissionRequest` carrying the tool-call id (best-effort request id).
+        // The default auto-approver approves it; a real engine may deny/abstain.
+        let perm_req = PermissionRequest::with_id(req.tool_call.tool_call_id.0.to_string(), false);
+        let decision = policy
+            .lock()
+            .ok()
+            .map(|p| p.decide(&perm_req, &SessionContext));
+
+        // Pick the first option whose kind matches any in `kinds`, in priority order.
+        let select = |kinds: &[PermissionOptionKind]| -> Option<RequestPermissionOutcome> {
+            for k in kinds {
+                if let Some(opt) = req.options.iter().find(|o| o.kind == *k) {
+                    return Some(RequestPermissionOutcome::Selected(
+                        SelectedPermissionOutcome::new(opt.option_id.clone()),
+                    ));
+                }
+            }
+            None
+        };
+
+        match decision {
+            // Approve: prefer the least-committal grant.
+            Some(Ok(PermissionDecision::Approve)) => select(&[
+                PermissionOptionKind::AllowOnce,
+                PermissionOptionKind::AllowAlways,
+            ])
+            // No allow option → fall back to the first offered option (the safe
+            // conformant choice: still a valid selection; never fabricates an id).
+            .or_else(|| {
+                req.options.first().map(|opt| {
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                        opt.option_id.clone(),
+                    ))
+                })
+            })
+            // Agent offered NO options at all → the only conformant reply is Cancelled.
+            .unwrap_or(RequestPermissionOutcome::Cancelled),
+            // Deny: pick a reject option; if none exists, Cancelled.
+            Some(Err(BridgeError::PermissionDenied)) => select(&[
+                PermissionOptionKind::RejectOnce,
+                PermissionOptionKind::RejectAlways,
+            ])
+            .unwrap_or(RequestPermissionOutcome::Cancelled),
+            // Abstain / any other policy error / poisoned lock → Cancelled.
+            _ => RequestPermissionOutcome::Cancelled,
+        }
     }
 
     /// Negotiated agent capabilities from the most recent `initialize`.
@@ -1027,6 +1242,9 @@ mod tests {
             id_counter: Arc::new(AtomicU64::new(1)),
             config: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            policy: Arc::new(StdMutex::new(
+                Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
+            )),
         };
 
         assert!(
@@ -1069,7 +1287,9 @@ mod tests {
     // `CancelNotification`, `NewSessionRequest`, `AgentSessionId` are already in
     // scope via `super::*`; import only the agent-side response/prompt types.
     use agent_client_protocol::schema::{
-        ContentChunk, NewSessionResponse, PromptRequest, PromptResponse, StopReason,
+        ContentChunk, NewSessionResponse, PermissionOption, PermissionOptionId, PromptRequest,
+        PromptResponse, RequestPermissionRequest, RequestPermissionResponse, StopReason,
+        ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
     };
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Notify;
@@ -1143,6 +1363,31 @@ mod tests {
         /// to await the cancel deterministically (separate from `cancel_seen`,
         /// which the test driver awaits, so neither consumes the other's permit).
         cancel_arrived: Arc<Notify>,
+
+        // ── Task 5: reverse `session/request_permission` ──────────────────────
+        /// When set, the prompt handler issues a `session/request_permission`
+        /// request BACK to the client (mid-turn) before ending the turn, offering
+        /// the options scripted in `permission_options`, and records the client's
+        /// reply in `permission_reply`.
+        request_permission: Arc<AtomicBool>,
+        /// The options the reverse permission request offers (order preserved).
+        permission_options: Arc<Mutex<Vec<PermissionOption>>>,
+        /// The client's reply to the reverse permission request:
+        /// `Some(Some(option_id))` = Selected; `Some(None)` = Cancelled; `None` =
+        /// no reply recorded yet (request not issued / still in flight / errored).
+        permission_reply: Arc<Mutex<Option<Option<String>>>>,
+        /// Fires once the client's permission reply has been recorded.
+        permission_replied: Arc<Notify>,
+        /// When set (with `request_permission`), the prompt handler emits its
+        /// scripted text chunks + ends the turn ONLY AFTER it has received the
+        /// permission reply — modeling a real agent that gates the rest of the
+        /// turn on the permission decision. Proves the client's permission handler
+        /// did NOT stall the dispatch loop (otherwise the reply, and hence these
+        /// chunks + the PromptResponse, could never arrive → the test hangs).
+        gate_turn_on_permission: Arc<AtomicBool>,
+        /// Fires when the reverse permission request handler ENTERS (request about
+        /// to be sent to the client), so a test can sequence deterministically.
+        permission_requested: Arc<Notify>,
     }
 
     impl Recorder {
@@ -1165,6 +1410,12 @@ mod tests {
                 wait_cancel_before_respond: Arc::new(AtomicBool::new(false)),
                 hang_after_cancel: Arc::new(AtomicBool::new(false)),
                 cancel_arrived: Arc::new(Notify::new()),
+                request_permission: Arc::new(AtomicBool::new(false)),
+                permission_options: Arc::new(Mutex::new(Vec::new())),
+                permission_reply: Arc::new(Mutex::new(None)),
+                permission_replied: Arc::new(Notify::new()),
+                gate_turn_on_permission: Arc::new(AtomicBool::new(false)),
+                permission_requested: Arc::new(Notify::new()),
             }
         }
 
@@ -1176,6 +1427,43 @@ mod tests {
         /// Set the `StopReason` the prompt turn returns.
         async fn set_stop_reason(&self, sr: StopReason) {
             *self.stop_reason.lock().await = sr;
+        }
+
+        /// Arm the reverse `session/request_permission` path: the prompt turn will
+        /// issue a permission request offering `options` and record the client's reply.
+        async fn arm_permission(&self, options: Vec<PermissionOption>) {
+            *self.permission_options.lock().await = options;
+            self.request_permission.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Build the `[allow_once, reject_once]` option pair used by the permission
+    /// tests, with stable ids `"a"` / `"r"`.
+    fn allow_reject_options() -> Vec<PermissionOption> {
+        vec![
+            PermissionOption::new(
+                PermissionOptionId::new("a"),
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                PermissionOptionId::new("r"),
+                "Reject once",
+                PermissionOptionKind::RejectOnce,
+            ),
+        ]
+    }
+
+    /// A `PolicyEngine` double that always DENIES (returns `PermissionDenied`),
+    /// so the deny-path option mapping can be asserted deterministically.
+    struct DenyPolicy;
+    impl PolicyEngine for DenyPolicy {
+        fn decide(
+            &self,
+            _req: &PermissionRequest,
+            _ctx: &SessionContext,
+        ) -> Result<PermissionDecision, BridgeError> {
+            Err(BridgeError::PermissionDenied)
         }
     }
 
@@ -1233,41 +1521,97 @@ mod tests {
                             r.prompt_log.lock().await.push("start");
                             r.prompt_started.notify_one();
 
-                            // Emit the scripted `session/update`s BEFORE responding,
-                            // so they stream to the client mid-turn (the fan-in the
-                            // backend routes). `cx` here is the agent's connection
-                            // to the client; sending a `SessionNotification` is the
-                            // wire `session/update`.
-                            let sid = req.session_id.clone();
-                            let updates = r.prompt_updates.lock().await.clone();
-                            for u in updates {
-                                let update = match u {
-                                    ScriptedUpdate::Text(t) => SessionUpdate::AgentMessageChunk(
-                                        ContentChunk::new(ContentBlock::Text(TextContent::new(t))),
-                                    ),
-                                    ScriptedUpdate::Thought(t) => SessionUpdate::AgentThoughtChunk(
-                                        ContentChunk::new(ContentBlock::Text(TextContent::new(t))),
-                                    ),
-                                    ScriptedUpdate::Plan => SessionUpdate::Plan(
-                                        agent_client_protocol::schema::Plan::new(vec![]),
-                                    ),
-                                };
-                                cx.send_notification(SessionNotification::new(
-                                    sid.clone(),
-                                    update,
-                                ))?;
-                            }
-
-                            // Offload the (possibly-blocking) gate-wait + response to
-                            // a spawned task via `cx.spawn`, then RETURN from the
-                            // handler immediately. This is REQUIRED: SDK request
-                            // handlers run inside the dispatch loop and block all
-                            // further message processing while awaiting — so a handler
-                            // that parked on a gate would prevent the agent from ever
-                            // dispatching an incoming `session/cancel`. Spawning frees
-                            // the loop to deliver the cancel that these gates await.
+                            // Offload the WHOLE turn body (update emission + optional
+                            // reverse permission request + gate-wait + response) to a
+                            // spawned task via `cx.spawn`, then RETURN from the handler
+                            // immediately. REQUIRED: SDK request handlers run inside the
+                            // dispatch loop and block all further message processing
+                            // while awaiting — so a handler that parked (on a gate, or
+                            // on the client's reply to a reverse permission request)
+                            // would prevent the agent from dispatching incoming messages
+                            // (the cancel, the permission reply). Spawning frees the loop.
                             let r2 = r.clone();
+                            let sid = req.session_id.clone();
+                            let cx2 = cx.clone();
                             cx.spawn(async move {
+                                // Helper: emit the scripted `session/update`s (the
+                                // streaming fan-in the backend routes). `cx2` is the
+                                // agent's connection to the client; a `SessionNotification`
+                                // is the wire `session/update`.
+                                let emit_updates = || async {
+                                    let updates = r2.prompt_updates.lock().await.clone();
+                                    for u in updates {
+                                        let update = match u {
+                                            ScriptedUpdate::Text(t) => {
+                                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                                    ContentBlock::Text(TextContent::new(t)),
+                                                ))
+                                            }
+                                            ScriptedUpdate::Thought(t) => {
+                                                SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                                                    ContentBlock::Text(TextContent::new(t)),
+                                                ))
+                                            }
+                                            ScriptedUpdate::Plan => SessionUpdate::Plan(
+                                                agent_client_protocol::schema::Plan::new(vec![]),
+                                            ),
+                                        };
+                                        cx2.send_notification(SessionNotification::new(
+                                            sid.clone(),
+                                            update,
+                                        ))?;
+                                    }
+                                    Ok::<(), agent_client_protocol::Error>(())
+                                };
+
+                                // Whether the rest of the turn (chunks + response) is
+                                // gated on the reverse permission reply.
+                                let gate_on_perm = r2.request_permission.load(Ordering::SeqCst)
+                                    && r2.gate_turn_on_permission.load(Ordering::SeqCst);
+
+                                // If NOT gating on the permission, emit the chunks now
+                                // (preserves the original "stream then respond" order).
+                                if !gate_on_perm {
+                                    emit_updates().await?;
+                                }
+
+                                // Optionally issue a reverse `session/request_permission`
+                                // BACK to the client mid-turn and record its reply. This
+                                // is the bidirectional-peer path the backend's handler
+                                // answers. We send the request and `block_task().await`
+                                // the reply — which can ONLY arrive if the client's
+                                // permission handler did not stall the client's loop.
+                                if r2.request_permission.load(Ordering::SeqCst) {
+                                    r2.permission_requested.notify_one();
+                                    let options = r2.permission_options.lock().await.clone();
+                                    let perm_req = RequestPermissionRequest::new(
+                                        sid.clone(),
+                                        ToolCallUpdate::new(
+                                            ToolCallId::new("tool-1"),
+                                            ToolCallUpdateFields::default(),
+                                        ),
+                                        options,
+                                    );
+                                    let resp: RequestPermissionResponse =
+                                        cx2.send_request(perm_req).block_task().await?;
+                                    let recorded = match resp.outcome {
+                                        RequestPermissionOutcome::Selected(sel) => {
+                                            Some(sel.option_id.0.to_string())
+                                        }
+                                        RequestPermissionOutcome::Cancelled => None,
+                                        _ => None,
+                                    };
+                                    *r2.permission_reply.lock().await = Some(recorded);
+                                    r2.permission_replied.notify_one();
+                                }
+
+                                // If gating on the permission, NOW emit the remaining
+                                // chunks (after the reply) — so a stalled client loop
+                                // would prevent them (and the response) from ever arriving.
+                                if gate_on_perm {
+                                    emit_updates().await?;
+                                }
+
                                 // Optionally hold the turn open until released, so a
                                 // second concurrent turn — if the lock failed — would
                                 // interleave and be caught by the ordering log.
@@ -1957,6 +2301,286 @@ mod tests {
         assert_eq!(
             done, "end_turn",
             "the dropped turn released the lock → next turn runs"
+        );
+    }
+
+    // ── Task 5: reverse session/request_permission handler ─────────────────────
+
+    #[tokio::test]
+    async fn permission_auto_approved_selects_allow_once() {
+        // The agent issues `session/request_permission` mid-turn with options
+        // [{a, allow_once}, {r, reject_once}]. The default auto-approve policy
+        // must make the backend reply Selected{optionId:"a"} (the allow_once).
+        let rec = Recorder::new("agent-sess-PERM");
+        rec.arm_permission(allow_reject_options()).await;
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-PERM");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        // Drain to Done; the permission round-trip happens during the turn.
+        let done = loop {
+            match tokio::time::timeout(Duration::from_secs(2), s.next())
+                .await
+                .expect("turn must complete (permission auto-approved)")
+            {
+                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(_) => continue,
+                None => panic!("stream ended without Done"),
+            }
+        };
+        assert_eq!(done, "end_turn");
+
+        // The agent recorded the client's reply: Selected the allow_once id "a".
+        tokio::time::timeout(Duration::from_secs(2), rec.permission_replied.notified())
+            .await
+            .expect("client must have replied to the permission request");
+        assert_eq!(
+            *rec.permission_reply.lock().await,
+            Some(Some("a".to_string())),
+            "auto-approve selects the allow_once option"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_deny_selects_reject_or_cancelled() {
+        // With a DENY policy injected via `with_policy`, the backend must reply
+        // Selected{optionId:"r"} (the reject_once option) — not the allow.
+        let rec = Recorder::new("agent-sess-DENY");
+        rec.arm_permission(allow_reject_options()).await;
+        let be = connect_recording(rec.clone())
+            .await
+            .with_policy(Arc::new(DenyPolicy));
+        let key = bkey("bridge-DENY");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        let done = loop {
+            match tokio::time::timeout(Duration::from_secs(2), s.next())
+                .await
+                .expect("turn must complete (permission denied)")
+            {
+                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(_) => continue,
+                None => panic!("stream ended without Done"),
+            }
+        };
+        assert_eq!(done, "end_turn");
+
+        tokio::time::timeout(Duration::from_secs(2), rec.permission_replied.notified())
+            .await
+            .expect("client must have replied to the permission request");
+        assert_eq!(
+            *rec.permission_reply.lock().await,
+            Some(Some("r".to_string())),
+            "deny selects the reject_once option"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_deny_with_no_reject_option_is_cancelled() {
+        // Deny policy, but the agent offers ONLY an allow_once option (no reject).
+        // The conformant reply is then `Cancelled` (no reject to select, and we
+        // must not approve under a deny).
+        let rec = Recorder::new("agent-sess-DENYC");
+        rec.arm_permission(vec![PermissionOption::new(
+            PermissionOptionId::new("a"),
+            "Allow once",
+            PermissionOptionKind::AllowOnce,
+        )])
+        .await;
+        let be = connect_recording(rec.clone())
+            .await
+            .with_policy(Arc::new(DenyPolicy));
+        let key = bkey("bridge-DENYC");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        while tokio::time::timeout(Duration::from_secs(2), s.next())
+            .await
+            .expect("turn must complete")
+            .is_some()
+        {}
+
+        tokio::time::timeout(Duration::from_secs(2), rec.permission_replied.notified())
+            .await
+            .expect("client must have replied");
+        assert_eq!(
+            *rec.permission_reply.lock().await,
+            Some(None),
+            "deny with no reject option → Cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_read_request_is_unsupported() {
+        // The backend registers NO `fs/read_text_file` handler and advertises no
+        // fs caps, so the SDK's default dispatch auto-responds with a
+        // method-not-found error to any inbound `fs/read_text_file`. We prove this
+        // by having a fake AGENT issue `fs/read_text_file` BACK to the backend's
+        // client and recording the reply: it must be `Err` (not a panic / hang),
+        // and the connection must remain usable afterwards (a prompt completes).
+        use agent_client_protocol::schema::{ReadTextFileRequest, ReadTextFileResponse};
+
+        // Agent records the outcome of its fs/read probe. Spawned BEFORE the client
+        // connects so the initialize handshake succeeds.
+        let err_flag = Arc::new(AtomicBool::new(false));
+        let ok_flag = Arc::new(AtomicBool::new(false));
+        let probe_done = Arc::new(Notify::new());
+        // A second prompt round-trip after the probe proves the connection survives.
+        let prompt_done = Arc::new(Notify::new());
+
+        let (client_side, agent_side) = Channel::duplex();
+        let err_f = Arc::clone(&err_flag);
+        let ok_f = Arc::clone(&ok_flag);
+        let probe_f = Arc::clone(&probe_done);
+        let prompt_f = Arc::clone(&prompt_done);
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name("fs-probe-agent")
+                .on_receive_request(
+                    move |_req: InitializeRequest,
+                          responder: agent_client_protocol::Responder<InitializeResponse>,
+                          _cx| async move {
+                        responder.respond(InitializeResponse::new(ProtocolVersion::V1))?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |_req: NewSessionRequest,
+                          responder: agent_client_protocol::Responder<NewSessionResponse>,
+                          _cx| async move {
+                        responder
+                            .respond(NewSessionResponse::new(AgentSessionId::new("fs-sess")))?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                // The prompt handler probes fs/read_text_file BACK at the client
+                // mid-turn (offloaded), records the Err it gets, THEN ends the turn.
+                // This mirrors the proven reverse-request mechanism and proves the
+                // connection stays usable (the same turn completes).
+                .on_receive_request(
+                    move |_req: PromptRequest,
+                          responder: agent_client_protocol::Responder<PromptResponse>,
+                          cx: ConnectionTo<Client>| {
+                        let err_f = Arc::clone(&err_f);
+                        let ok_f = Arc::clone(&ok_f);
+                        let probe_f = Arc::clone(&probe_f);
+                        let prompt_f = Arc::clone(&prompt_f);
+                        async move {
+                            let cx2 = cx.clone();
+                            cx.spawn(async move {
+                                let req = ReadTextFileRequest::new(
+                                    AgentSessionId::new("fs-sess"),
+                                    "/etc/hosts",
+                                );
+                                let res: Result<ReadTextFileResponse, _> =
+                                    cx2.send_request(req).block_task().await;
+                                match res {
+                                    Ok(_) => ok_f.store(true, Ordering::SeqCst),
+                                    Err(_) => err_f.store(true, Ordering::SeqCst),
+                                }
+                                probe_f.notify_one();
+                                // Connection still usable: end the turn normally.
+                                responder.respond(PromptResponse::new(StopReason::EndTurn))?;
+                                prompt_f.notify_one();
+                                Ok(())
+                            })?;
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_side)
+                .await;
+        });
+
+        let be = AcpBackend::connect(client_side, test_config())
+            .await
+            .expect("client initialize");
+
+        // Drive a prompt; the agent's prompt handler issues the fs/read probe.
+        let key = bkey("bridge-FS");
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+
+        // The agent's fs/read_text_file probe must return Err (unsupported), promptly.
+        tokio::time::timeout(Duration::from_secs(3), probe_done.notified())
+            .await
+            .expect("fs/read probe must complete (not hang)");
+        assert!(
+            err_flag.load(Ordering::SeqCst),
+            "fs/read_text_file must be unsupported (method-not-found Err)"
+        );
+        assert!(
+            !ok_flag.load(Ordering::SeqCst),
+            "fs/read_text_file must NOT succeed (no fs caps advertised)"
+        );
+
+        // The connection is still usable: the same turn completes (Done).
+        let completed = loop {
+            match tokio::time::timeout(Duration::from_secs(2), s.next())
+                .await
+                .expect("connection still usable after unsupported request")
+            {
+                Some(Ok(Update::Done { .. })) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        };
+        assert!(
+            completed,
+            "the connection keeps working after an unsupported request"
+        );
+        // The agent saw the post-probe prompt too.
+        tokio::time::timeout(Duration::from_secs(2), prompt_done.notified())
+            .await
+            .expect("post-probe prompt must reach the agent");
+    }
+
+    #[tokio::test]
+    async fn permission_mid_prompt_does_not_stall_loop() {
+        // [Cx-M4] THE KEY TEST. The agent, mid-turn, issues a
+        // `session/request_permission` request and WAITS for the client's reply
+        // BEFORE emitting its remaining `agent_message_chunk`(s) + the
+        // `PromptResponse` (`gate_turn_on_permission`). The backend's permission
+        // handler runs ON the client's dispatch loop; if it BLOCKED the loop while
+        // deciding/responding, the reply could never be sent → the gated chunks
+        // and the prompt result could never arrive → this test would HANG. The
+        // outer `timeout` makes such a regression FAIL FAST.
+        let rec = Recorder::new("agent-sess-MID");
+        rec.arm_permission(allow_reject_options()).await;
+        rec.gate_turn_on_permission.store(true, Ordering::SeqCst);
+        rec.set_updates(vec![ScriptedUpdate::Text("after-perm")])
+            .await;
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-MID");
+
+        let driven = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut s = be.prompt(&key, vec![]).await.unwrap();
+            // The chunk is emitted ONLY after the permission reply was received by
+            // the agent — so receiving it proves the reply round-tripped, i.e. the
+            // client's permission handler did NOT stall the loop.
+            assert!(
+                matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "after-perm"),
+                "the post-permission chunk must arrive (loop not stalled)"
+            );
+            let done = loop {
+                match s.next().await {
+                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(_) => continue,
+                    None => panic!("stream ended without Done"),
+                }
+            };
+            assert_eq!(done, "end_turn");
+        })
+        .await;
+        driven.expect("mid-prompt permission must not stall the loop (stream completes)");
+
+        // And the backend's auto-approve selected the allow_once "a".
+        assert_eq!(
+            *rec.permission_reply.lock().await,
+            Some(Some("a".to_string())),
+            "auto-approve selected allow_once mid-prompt"
         );
     }
 }
