@@ -53,3 +53,46 @@ fn initialize_request_is_wire_conformant() {
         "must not advertise terminal access: {caps:?}"
     );
 }
+
+// session/new wire-golden [Cl-M4]. The bridge must send a CONFORMANT
+// `session/new` params object per ACP §11A: an absolute `cwd` string and an
+// explicit `mcpServers` ARRAY (here empty `[]`) — NOT an empty object `{}` and
+// NOT an omitted field. The expected JSON below is HAND-AUTHORED to the spec
+// shape; we assert the SDK-typed value the backend constructs serializes to
+// exactly it (so a regression to `{}` or a string-typed array is caught here).
+#[test]
+fn new_session_request_params_are_wire_conformant() {
+    // The exact request value `ensure_session` transmits, for an absolute cwd.
+    let req = AcpBackend::new_session_request("/work/dir");
+    let v: Value = serde_json::to_value(&req).expect("NewSessionRequest serializes");
+
+    // Hand-authored expected `params` per ACP §11A: absolute cwd + empty array.
+    let expected = serde_json::json!({
+        "cwd": "/work/dir",
+        "mcpServers": []
+    });
+    assert_eq!(
+        v, expected,
+        "session/new params must be {{\"cwd\":<abs>,\"mcpServers\":[]}}, got {v:?}"
+    );
+
+    // Spell out the field-shape invariants the equality above guarantees, so a
+    // failure points at the exact conformance rule that broke.
+    let cwd = v.get("cwd").expect("cwd field present");
+    assert_eq!(
+        cwd,
+        &Value::from("/work/dir"),
+        "cwd must be the absolute path string"
+    );
+    assert!(
+        std::path::Path::new(cwd.as_str().unwrap()).is_absolute(),
+        "cwd must serialize as an ABSOLUTE path: {cwd:?}"
+    );
+    let mcp = v.get("mcpServers").expect("mcpServers field present");
+    assert!(
+        mcp.is_array() && mcp.as_array().unwrap().is_empty(),
+        "mcpServers must be an empty ARRAY [], not {{}} or omitted: {mcp:?}"
+    );
+    // Must NOT be a degenerate empty object — guards the `params: {}` regression.
+    assert_ne!(v, serde_json::json!({}), "params must not collapse to {{}}");
+}

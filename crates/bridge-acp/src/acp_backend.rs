@@ -2,18 +2,20 @@
 // Spec §5.3 cancellation rule: completion is the prompt RESULT (stopReason:"cancelled"),
 // NOT the act of sending session/cancel. See Codex finding 2.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, AuthMethod, InitializeRequest, InitializeResponse, ProtocolVersion,
+    AgentCapabilities, AuthMethod, CancelNotification, InitializeRequest, InitializeResponse,
+    NewSessionRequest, ProtocolVersion, SessionId as AgentSessionId,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use async_trait::async_trait;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, OnceCell};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use bridge_core::error::BridgeError;
@@ -97,6 +99,46 @@ struct AcpConn {
     _shutdown: oneshot::Sender<()>,
 }
 
+// ── Per-bridge-session agent state ───────────────────────────────────────────
+//
+// The bridge multiplexes many bridge sessions (keyed by `bridge_core` `SessionId`)
+// over one ACP connection. Each bridge session maps to exactly one agent-minted
+// `session/new` session, created LAZILY on first use and reused thereafter.
+//
+// `AgentSession` is the per-bridge-session state Tasks 2–4 build on:
+//   * `agent_id`  — a `OnceCell` so concurrent first-prompts mint the agent
+//                   session EXACTLY ONCE; the init future runs once and every
+//                   concurrent caller awaits the same result (no double-mint).
+//   * `turn_lock` — serializes prompt turns for this session [Cx-M2]: a second
+//                   prompt waits here until the in-flight turn releases, so turns
+//                   never interleave on one agent session.
+//   * `cancel_requested` — the cancel LATCH [Cx-M2]: a `cancel` that races ahead
+//                   of `session/new` sets this; the minting task observes it the
+//                   instant the id exists and fires `session/cancel` so the
+//                   cancel is never dropped.
+struct AgentSession {
+    /// The agent-minted session id, set exactly once by the `session/new` that
+    /// `ensure_session` drives. `OnceCell` guarantees single init under races.
+    agent_id: OnceCell<AgentSessionId>,
+    /// Per-session turn lock. Held for the duration of a prompt turn (Task 3) so
+    /// turns on one agent session run strictly sequentially.
+    turn_lock: Mutex<()>,
+    /// Cancel latch: set by `request_cancel` when a cancel arrives before the
+    /// agent session exists, so the minting task can fire `session/cancel` as
+    /// soon as the id is known.
+    cancel_requested: AtomicBool,
+}
+
+impl AgentSession {
+    fn new() -> Self {
+        Self {
+            agent_id: OnceCell::new(),
+            turn_lock: Mutex::new(()),
+            cancel_requested: AtomicBool::new(false),
+        }
+    }
+}
+
 // ── Public struct ────────────────────────────────────────────────────────────
 
 pub struct AcpBackend {
@@ -111,6 +153,14 @@ pub struct AcpBackend {
     /// for explicit `terminate()`.
     supervised: Option<Supervised>,
     id_counter: Arc<AtomicU64>,
+    /// Static config (cwd for `session/new`, model/mode for later tasks). `None`
+    /// on the legacy (`from_child`) path which never mints SDK sessions.
+    config: Option<AcpConfig>,
+    /// bridge-session-key → per-session agent state. The map itself is behind a
+    /// `Mutex` held ONLY long enough to look up / insert the `Arc<AgentSession>`;
+    /// it is dropped before any `session/new` await so the mint of one session
+    /// never blocks lookups of another.
+    sessions: Arc<Mutex<HashMap<SessionId, Arc<AgentSession>>>>,
 }
 
 impl AcpBackend {
@@ -125,6 +175,18 @@ impl AcpBackend {
         // `ClientCapabilities::default()`, which advertises no fs read/write and
         // no terminal support — exactly what we want (no fs/terminal seam).
         InitializeRequest::new(ProtocolVersion::V1)
+    }
+
+    /// Build the `session/new` request this backend sends to mint an agent
+    /// session for a bridge session. `cwd` MUST be an absolute path (ACP §11A);
+    /// `mcpServers` is sent as an explicit empty array, never omitted.
+    ///
+    /// Exposed so the wire-golden test can assert the serialized `params` shape
+    /// (`{"cwd":<abs>,"mcpServers":[]}`) against the SAME value `ensure_session`
+    /// transmits — not a re-derivation of the SDK type.
+    #[must_use]
+    pub fn new_session_request(cwd: impl Into<PathBuf>) -> NewSessionRequest {
+        NewSessionRequest::new(cwd).mcp_servers(vec![])
     }
 
     /// **Production** constructor: spawn `cmd args` as a `Supervised` child
@@ -209,6 +271,8 @@ impl AcpBackend {
             }),
             supervised: None,
             id_counter: Arc::new(AtomicU64::new(1)),
+            config: Some(config),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -238,6 +302,146 @@ impl AcpBackend {
             .ok_or(BridgeError::AgentCrashed)
     }
 
+    /// Look up (or create) the per-bridge-session state for `key`, cloning the
+    /// `Arc` out so the map mutex is released before any await. Always returns
+    /// the SAME `Arc` for a given key, so the `OnceCell`/turn-lock/latch inside
+    /// are shared across all callers for that bridge session.
+    #[allow(dead_code)] // wired into production prompt/cancel in Tasks 3/4
+    fn session_entry(&self, key: &SessionId) -> Arc<AgentSession> {
+        let mut map = self
+            .sessions
+            .try_lock()
+            .expect("session map is never held across an await");
+        if let Some(s) = map.get(key) {
+            return Arc::clone(s);
+        }
+        let s = Arc::new(AgentSession::new());
+        map.insert(key.clone(), Arc::clone(&s));
+        s
+    }
+
+    /// Ensure the agent-minted session for bridge key `key` exists, minting it
+    /// LAZILY via `session/new` on first call and reusing the stored id after.
+    ///
+    /// Exactly-once minting [Cx-M2]: concurrent first calls for the same `key`
+    /// share one `OnceCell` init future, so the agent sees `session/new` ONCE.
+    ///
+    /// Cancel-latch [Cx-M2]: the minting task — and only it — checks the latch
+    /// the instant the id exists; if a `cancel` raced ahead of creation, it fires
+    /// `session/cancel` for the freshly-minted id so the cancel is not dropped.
+    /// The latch is *claimed* with an atomic swap so exactly one of the minting
+    /// task and a concurrent `request_cancel` sends the notification (no double).
+    ///
+    /// Task 3 calls this, then acquires `turn_lock` and sends `session/prompt`.
+    #[allow(dead_code)] // wired into production prompt in Task 3
+    async fn ensure_session(&self, key: &SessionId) -> Result<AgentSessionId, BridgeError> {
+        let entry = self.session_entry(key);
+        let cx = self.cx()?;
+        let cwd = self
+            .config
+            .as_ref()
+            .map(|c| c.cwd.clone())
+            .ok_or(BridgeError::AgentCrashed)?;
+
+        let id = entry
+            .agent_id
+            .get_or_try_init(|| async {
+                let req = Self::new_session_request(cwd);
+                let resp = cx
+                    .send_request(req)
+                    .block_task()
+                    .await
+                    .map_err(|_| BridgeError::AgentCrashed)?;
+                let agent_id = resp.session_id;
+                // Cancel-latch: only the minting task reaches here. If a cancel
+                // raced ahead of `session/new`, CLAIM it (swap→false) and flush
+                // it now against the new id. The swap ensures a concurrent
+                // `request_cancel` that already fired won't make us double-send.
+                if entry.cancel_requested.swap(false, Ordering::SeqCst) {
+                    cx.send_notification(CancelNotification::new(agent_id.clone()))
+                        .map_err(|_| BridgeError::AgentCrashed)?;
+                }
+                Ok::<_, BridgeError>(agent_id)
+            })
+            .await?;
+        Ok(id.clone())
+    }
+
+    /// Ensure the session exists, then acquire its per-session turn lock and hold
+    /// it for the duration of `body`, passing `body` the agent session id. Turns
+    /// for one bridge session run STRICTLY SEQUENTIALLY [Cx-M2]: a second caller
+    /// blocks on `turn_lock` until the first releases.
+    ///
+    /// This is the seam Task 3's conformant `prompt` is built on: ensure → lock →
+    /// send `session/prompt` + stream updates, all inside `body`.
+    #[allow(dead_code)] // wired into production prompt in Task 3
+    async fn run_turn<F, Fut, T>(&self, key: &SessionId, body: F) -> Result<T, BridgeError>
+    where
+        F: FnOnce(AgentSessionId) -> Fut,
+        Fut: std::future::Future<Output = Result<T, BridgeError>>,
+    {
+        let entry = self.session_entry(key);
+        // Mint (or reuse) the agent session BEFORE taking the turn lock, so a
+        // first-prompt's `session/new` doesn't hold the turn lock while awaiting.
+        let agent_id = self.ensure_session(key).await?;
+        let _turn = entry.turn_lock.lock().await;
+        body(agent_id).await
+    }
+
+    /// Send a single `session/prompt` for `agent_id` and await its terminal
+    /// response, returning the stop reason as a string. This is a MINIMAL
+    /// blocking send used to exercise the turn lock in Task 2; Task 3 replaces
+    /// it with the conformant streaming `prompt` (session/update fan-in). It is
+    /// deliberately not wired into the public `prompt` yet.
+    #[allow(dead_code)] // superseded by the streaming prompt in Task 3
+    async fn send_prompt_blocking(
+        &self,
+        agent_id: AgentSessionId,
+        parts: Vec<bridge_core::domain::Part>,
+    ) -> Result<String, BridgeError> {
+        use agent_client_protocol::schema::{ContentBlock, PromptRequest, TextContent};
+        let cx = self.cx()?;
+        let blocks: Vec<ContentBlock> = parts
+            .into_iter()
+            .map(|p| ContentBlock::Text(TextContent::new(p.text)))
+            .collect();
+        let req = PromptRequest::new(agent_id, blocks);
+        let resp = cx
+            .send_request(req)
+            .block_task()
+            .await
+            .map_err(|_| BridgeError::AgentCrashed)?;
+        Ok(format!("{:?}", resp.stop_reason))
+    }
+
+    /// Record a cancel for bridge key `key`, honoring the create/cancel race.
+    ///
+    /// * If the agent session already exists, send `session/cancel` for it now.
+    /// * If `session/new` is still in flight (or hasn't started), set the latch
+    ///   so `ensure_session` flushes the cancel the instant the id is minted.
+    /// * If `key` was never seen (session ended / never started), it's a no-op
+    ///   on the wire but still latches a freshly-created entry defensively.
+    ///
+    /// Task 4 builds full `cancel()` completion semantics (waiting for the
+    /// prompt result with `stopReason:"cancelled"`) on top of this.
+    #[allow(dead_code)] // wired into production cancel in Task 4
+    async fn request_cancel(&self, key: &SessionId) -> Result<(), BridgeError> {
+        let entry = self.session_entry(key);
+        let cx = self.cx()?;
+        // Set the latch FIRST so a `session/new` completing concurrently observes
+        // it. If the id is ALREADY present, CLAIM the latch (swap→false): if we
+        // win the claim we fire now; if the minting task already claimed and
+        // fired, we don't double-send.
+        entry.cancel_requested.store(true, Ordering::SeqCst);
+        if let Some(agent_id) = entry.agent_id.get() {
+            if entry.cancel_requested.swap(false, Ordering::SeqCst) {
+                cx.send_notification(CancelNotification::new(agent_id.clone()))
+                    .map_err(|_| BridgeError::AgentCrashed)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Construct from an already-spawned scripted child (used in tests and when
     /// the caller has already set up the process).
     ///
@@ -260,6 +464,9 @@ impl AcpBackend {
             // Legacy path owns its child via `Inner::supervised`; the SDK slot is unused.
             supervised: None,
             id_counter: Arc::new(AtomicU64::new(1)),
+            // Legacy path never mints SDK sessions: no config, empty map.
+            config: None,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -771,6 +978,8 @@ mod tests {
             conn: None,
             supervised: Some(supervised),
             id_counter: Arc::new(AtomicU64::new(1)),
+            config: None,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(
@@ -794,5 +1003,315 @@ mod tests {
         if let Some(s) = backend.supervised {
             s.terminate(Duration::from_millis(100)).await;
         }
+    }
+
+    // ── Recording fake agent (session/new lazy-once, cancel-latch, turn order) ──
+    //
+    // A single in-process fake agent that RECORDS the requests it receives, so
+    // Task-2 tests can assert protocol-level invariants:
+    //   * `new_session_calls`  — count of `session/new` (exactly-once minting).
+    //   * `new_session_gate`   — an awaitable barrier the agent waits on BEFORE
+    //                            replying to `session/new`, so a test can open
+    //                            the concurrent/racing window deterministically.
+    //   * `cancels`            — agent session ids seen via `session/cancel`
+    //                            (the cancel-latch must land one here).
+    //   * `prompt_starts/ends` — prompt-turn ordering, to prove turns run
+    //                            sequentially (non-interleaved) under the lock.
+    // Tasks 3/4 reuse this harness for prompt streaming / cancel completion.
+    // `CancelNotification`, `NewSessionRequest`, `AgentSessionId` are already in
+    // scope via `super::*`; import only the agent-side response/prompt types.
+    use agent_client_protocol::schema::{
+        NewSessionResponse, PromptRequest, PromptResponse, StopReason,
+    };
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+
+    #[derive(Clone)]
+    struct Recorder {
+        /// Number of `session/new` requests the agent received.
+        new_session_calls: Arc<AtomicUsize>,
+        /// Released to let a pending `session/new` reply proceed. When `None`,
+        /// `session/new` replies immediately.
+        new_session_gate: Arc<Notify>,
+        /// Whether `session/new` should wait on the gate before replying.
+        gate_new_session: Arc<AtomicBool>,
+        /// The agent-minted session id the fake returns from `session/new`.
+        minted_id: &'static str,
+        /// Agent session ids observed via `session/cancel` notifications.
+        cancels: Arc<Mutex<Vec<String>>>,
+        /// Fires every time a `session/cancel` is recorded (for awaiting it).
+        cancel_seen: Arc<Notify>,
+        /// Ordered log of prompt-turn events ("start", "end") to detect overlap.
+        prompt_log: Arc<Mutex<Vec<&'static str>>>,
+        /// Released to let an in-flight prompt turn complete (per-turn barrier).
+        prompt_gate: Arc<Notify>,
+        /// Fires when a prompt turn STARTS, so the driver can sequence turns.
+        prompt_started: Arc<Notify>,
+    }
+
+    impl Recorder {
+        fn new(minted_id: &'static str) -> Self {
+            Self {
+                new_session_calls: Arc::new(AtomicUsize::new(0)),
+                new_session_gate: Arc::new(Notify::new()),
+                gate_new_session: Arc::new(AtomicBool::new(false)),
+                minted_id,
+                cancels: Arc::new(Mutex::new(Vec::new())),
+                cancel_seen: Arc::new(Notify::new()),
+                prompt_log: Arc::new(Mutex::new(Vec::new())),
+                prompt_gate: Arc::new(Notify::new()),
+                prompt_started: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    /// Spawn the recording fake agent on `channel`, wired to `rec`'s shared state.
+    fn spawn_recording_agent(channel: Channel, rec: Recorder) {
+        tokio::spawn(async move {
+            let r_init = rec.clone();
+            let r_new = rec.clone();
+            let r_prompt = rec.clone();
+            let r_cancel = rec.clone();
+            let _ = Agent
+                .builder()
+                .name("recording-agent")
+                .on_receive_request(
+                    move |_req: InitializeRequest,
+                          responder: agent_client_protocol::Responder<InitializeResponse>,
+                          _cx| {
+                        let _ = &r_init;
+                        async move {
+                            responder.respond(InitializeResponse::new(ProtocolVersion::V1))?;
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |_req: NewSessionRequest,
+                          responder: agent_client_protocol::Responder<NewSessionResponse>,
+                          _cx| {
+                        let r = r_new.clone();
+                        async move {
+                            r.new_session_calls.fetch_add(1, Ordering::SeqCst);
+                            if r.gate_new_session.load(Ordering::SeqCst) {
+                                // Hold the reply until the test opens the gate,
+                                // widening the create/cancel + concurrency window.
+                                r.new_session_gate.notified().await;
+                            }
+                            responder.respond(NewSessionResponse::new(AgentSessionId::new(
+                                r.minted_id,
+                            )))?;
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |_req: PromptRequest,
+                          responder: agent_client_protocol::Responder<PromptResponse>,
+                          _cx| {
+                        let r = r_prompt.clone();
+                        async move {
+                            r.prompt_log.lock().await.push("start");
+                            r.prompt_started.notify_one();
+                            // Hold the turn open until released, so a second
+                            // concurrent turn — if the lock failed — would
+                            // interleave and be caught by the ordering log.
+                            r.prompt_gate.notified().await;
+                            r.prompt_log.lock().await.push("end");
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))?;
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_notification(
+                    move |notif: CancelNotification, _cx| {
+                        let r = r_cancel.clone();
+                        async move {
+                            r.cancels.lock().await.push(notif.session_id.0.to_string());
+                            r.cancel_seen.notify_one();
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_to(channel)
+                .await;
+        });
+    }
+
+    /// Build a backend connected to a fresh recording agent; returns both.
+    async fn connect_recording(rec: Recorder) -> AcpBackend {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_recording_agent(agent_side, rec);
+        AcpBackend::connect(client_side, test_config())
+            .await
+            .expect("initialize handshake succeeds against recording agent")
+    }
+
+    fn bkey(s: &str) -> SessionId {
+        SessionId::parse(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_new_minted_lazily_and_mapped() {
+        // First `ensure_session(S)` triggers ONE session/new; the agent id is
+        // stored and REUSED by subsequent calls (no second session/new).
+        let rec = Recorder::new("agent-sess-1");
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-A");
+
+        let id1 = be.ensure_session(&key).await.unwrap();
+        assert_eq!(id1.0.as_ref(), "agent-sess-1", "agent-minted id is mapped");
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            1,
+            "first ensure_session mints exactly one agent session"
+        );
+
+        // Reuse: a second ensure_session returns the SAME id, no new mint.
+        let id2 = be.ensure_session(&key).await.unwrap();
+        assert_eq!(id2.0.as_ref(), "agent-sess-1");
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            1,
+            "subsequent ensure_session reuses the stored id (no second session/new)"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_prompts_mint_one_session() {
+        // Two concurrent first `ensure_session(S)` calls must mint the agent
+        // session EXACTLY ONCE. Gate session/new so both callers are in flight
+        // simultaneously before either reply lands.
+        let rec = Recorder::new("agent-sess-X");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        let be = Arc::new(connect_recording(rec.clone()).await);
+        let key = bkey("bridge-CONC");
+
+        let b1 = Arc::clone(&be);
+        let b2 = Arc::clone(&be);
+        let k1 = key.clone();
+        let k2 = key.clone();
+        let h1 = tokio::spawn(async move { b1.ensure_session(&k1).await });
+        let h2 = tokio::spawn(async move { b2.ensure_session(&k2).await });
+
+        // Let both tasks reach the (single) session/new init before unblocking.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Release the held session/new reply (only one is ever in flight).
+        rec.new_session_gate.notify_waiters();
+
+        let r1 = h1.await.unwrap().unwrap();
+        let r2 = h2.await.unwrap().unwrap();
+        assert_eq!(r1.0.as_ref(), "agent-sess-X");
+        assert_eq!(
+            r2.0.as_ref(),
+            "agent-sess-X",
+            "both share the one minted id"
+        );
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            1,
+            "concurrent first-prompts mint session/new EXACTLY ONCE"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_racing_session_creation_is_latched() {
+        // A cancel issued BEFORE session/new completes must NOT be dropped: once
+        // the agent id is minted, the latch fires a session/cancel for it.
+        let rec = Recorder::new("agent-sess-LATCH");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        let be = Arc::new(connect_recording(rec.clone()).await);
+        let key = bkey("bridge-RACE");
+
+        // Start the mint; it parks on the gate (session/new not yet answered).
+        let b1 = Arc::clone(&be);
+        let k1 = key.clone();
+        let mint = tokio::spawn(async move { b1.ensure_session(&k1).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Cancel RACES ahead of creation: only the latch should be set (the id
+        // does not exist yet), so no cancel is sent on the wire YET.
+        be.request_cancel(&key).await.unwrap();
+        assert!(
+            rec.cancels.lock().await.is_empty(),
+            "cancel before session/new must not be sent against a non-existent id"
+        );
+
+        // Now let session/new finish; the minting task must flush the latch.
+        rec.new_session_gate.notify_waiters();
+        let minted = mint.await.unwrap().unwrap();
+        assert_eq!(minted.0.as_ref(), "agent-sess-LATCH");
+
+        // Await the recorded session/cancel deterministically.
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("latched cancel must reach the agent after session/new");
+        let cancels = rec.cancels.lock().await;
+        assert_eq!(
+            cancels.as_slice(),
+            &["agent-sess-LATCH"],
+            "latched cancel fires exactly once for the freshly-minted id"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_prompt_on_active_session_serializes() {
+        // [Cx-M2] Two turns for the same bridge session must run SEQUENTIALLY.
+        // The recording agent holds each prompt open on `prompt_gate`; if the
+        // turn lock failed, both turns would "start" before either "end" and the
+        // ordering log would interleave (start,start,...). With the lock, the
+        // log MUST be start,end,start,end.
+        let rec = Recorder::new("agent-sess-SEQ");
+        let be = Arc::new(connect_recording(rec.clone()).await);
+        let key = bkey("bridge-SEQ");
+
+        // Pre-mint so neither turn pays the session/new cost inside the lock.
+        be.ensure_session(&key).await.unwrap();
+
+        let run_turn = |be: Arc<AcpBackend>, key: SessionId| async move {
+            let be2 = Arc::clone(&be);
+            be.run_turn(&key, move |agent_id| async move {
+                // A real `session/prompt` under the held turn lock, so the agent
+                // observes start/end ordering. Task 3 swaps this for streaming.
+                be2.send_prompt_blocking(agent_id, vec![]).await.map(|_| ())
+            })
+            .await
+        };
+
+        let h1 = tokio::spawn(run_turn(Arc::clone(&be), key.clone()));
+        // Wait for turn 1 to actually START (holding the lock) before turn 2.
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("turn 1 starts");
+
+        let h2 = tokio::spawn(run_turn(Arc::clone(&be), key.clone()));
+        // Give turn 2 time to (try to) start; it MUST be blocked on the lock,
+        // so the agent has NOT seen a second prompt start yet.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            rec.prompt_log.lock().await.as_slice(),
+            &["start"],
+            "second turn must WAIT for the first (no interleave)"
+        );
+
+        // Release turn 1; it ends, then turn 2 starts and ends.
+        rec.prompt_gate.notify_one(); // unblock turn 1
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("turn 2 starts after turn 1 released");
+        rec.prompt_gate.notify_one(); // unblock turn 2
+
+        h1.await.unwrap().unwrap();
+        h2.await.unwrap().unwrap();
+
+        assert_eq!(
+            rec.prompt_log.lock().await.as_slice(),
+            &["start", "end", "start", "end"],
+            "turns run strictly sequentially, never interleaved"
+        );
     }
 }
