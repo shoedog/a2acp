@@ -121,7 +121,7 @@ the translator check.
   hand-authored expected values. These are non-tautological: they compare against
   the frame the backend actually constructs, not a re-derivation of the same SDK
   type.
-- Captured real-agent corpus (`tests/corpus/kiro/`) + replay test
+- Captured real-agent corpus (`tests/corpus/kiro-cli.jsonl`) + replay test
   (`tests/corpus_replay.rs`): real frames captured off the wire from
   `kiro-cli 2.5.0` are fed through the exact `map_session_update` /
   `decide_permission` / `stop_reason_str` functions the live connection runs.
@@ -164,7 +164,7 @@ the translator check.
   enough for the driven use.
 - **codex-acp DoD gate UNMET.** The codex-acp real-capture corpus and live e2e
   cannot be completed until `codex-acp` is available in the target environment.
-  The codex wire frames in `tests/corpus/codex/` are provisional (derived from
+  The codex wire frames in `tests/corpus/codex-acp.jsonl` are provisional (derived from
   spec, not captured). This is the one remaining open conformance item for
   Increment 3a; it is explicitly unforgettable via the `real_capture_corpus_present`
   `#[ignore]` test that fails when run.

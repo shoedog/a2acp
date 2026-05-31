@@ -151,7 +151,7 @@ cargo test -p a2a-bridge --test e2e_acp_codex -- --ignored --nocapture
 
 `codex-acp` is not installable in the environment where Increment 3a was authored
 (only `codex` 0.130.0, which has no `acp` subcommand). The codex wire frames in
-`tests/corpus/codex/` are provisional (derived from spec, not captured). The
+`tests/corpus/codex-acp.jsonl` are provisional (derived from spec, not captured). The
 `real_capture_corpus_present` test is `#[ignore]`'d and FAILS naming codex when
 run — the open gate is intentionally visible. Run this test when `codex-acp` is
 available to complete the codex DoD gate.

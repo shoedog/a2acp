@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::{
@@ -282,7 +282,6 @@ pub struct AcpBackend {
     /// (the loser sees `None`), and the backend still drops it on `Drop` if no
     /// escalation ever fired.
     supervised: Arc<StdMutex<Option<Supervised>>>,
-    id_counter: Arc<AtomicU64>,
     /// Static config (cwd for `session/new`, model/mode for later tasks).
     config: Option<AcpConfig>,
     /// bridge-session-key → per-session agent state. The map itself is behind a
@@ -557,6 +556,7 @@ impl AcpBackend {
                 .send_request(Self::initialize_request())
                 .block_task()
                 .await
+                .inspect_err(|e| tracing::warn!(error = ?e, "initialize handshake failed"))
                 .map_err(|_| BridgeError::AgentCrashed)?;
 
             // ── authenticate ──────────────────────────────────────────────────
@@ -625,7 +625,6 @@ impl AcpBackend {
                 updates,
             }),
             supervised: Arc::new(StdMutex::new(None)),
-            id_counter: Arc::new(AtomicU64::new(1)),
             config: Some(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             policy,
@@ -804,6 +803,7 @@ impl AcpBackend {
                     .send_request(req)
                     .block_task()
                     .await
+                    .inspect_err(|e| tracing::warn!(error = ?e, "session/new mint failed"))
                     .map_err(|_| BridgeError::AgentCrashed)?;
                 let id = resp.session_id;
 
@@ -913,11 +913,6 @@ impl AcpBackend {
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
-
-    #[allow(dead_code)] // retained for later tasks that mint request ids
-    fn next_id(&self) -> u64 {
-        self.id_counter.fetch_add(1, Ordering::Relaxed)
-    }
 
     /// The configured cancel grace (see [`AcpConfig::cancel_grace`]). Falls back
     /// to the default if no config is set (the `conn: None` test-only path).
@@ -1151,7 +1146,14 @@ impl AgentBackend for AcpBackend {
                 // surface a terminal Err on the stream so downstream reports the
                 // inbound A2A caller `Failed` — never a silent Done{"unknown"}
                 // that reads as a clean `Completed`.
-                Err(()) => TurnEvent::Failed(BridgeError::AgentCrashed),
+                Err(()) => {
+                    tracing::warn!(
+                        session = ?agent_id_for_driver,
+                        "session/prompt failed (transport/SDK error or kill-switch): \
+                         surfacing AgentCrashed"
+                    );
+                    TurnEvent::Failed(BridgeError::AgentCrashed)
+                }
             };
             // If the consumer already dropped the stream this `send` is a no-op,
             // but the lock-release below is what matters there.
@@ -1432,7 +1434,6 @@ mod tests {
         let backend = AcpBackend {
             conn: None,
             supervised: Arc::new(StdMutex::new(Some(supervised))),
-            id_counter: Arc::new(AtomicU64::new(1)),
             config: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             policy: Arc::new(StdMutex::new(
