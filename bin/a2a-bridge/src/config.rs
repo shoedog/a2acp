@@ -13,7 +13,6 @@ pub enum ConfigError {
     MissingEnvVar(String),
     /// Invalid registry config value (e.g. unknown effort level, empty agent id).
     /// Wired to main in Task 12.
-    #[allow(dead_code)]
     Registry(String),
 }
 

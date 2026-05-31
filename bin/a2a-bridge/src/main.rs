@@ -81,12 +81,24 @@ async fn main() -> Result<(), BoxError> {
     let spawn: SpawnFn = Arc::new(move |entry: Arc<AgentEntry>| {
         let policy = Arc::clone(&policy_for_spawn);
         Box::pin(async move {
-            // Absolute working directory (ACP §11A). A configured value is used
-            // as-is; absent falls back to the bridge's current directory.
+            // Absolute working directory (ACP §11A). A relative configured value
+            // is joined onto current_dir() to become absolute; an absolute one is
+            // used as-is; absent falls back to the bridge's current directory.
             let cwd = match entry.cwd.clone() {
-                Some(c) => PathBuf::from(c),
+                Some(c) => {
+                    let p = PathBuf::from(c);
+                    if p.is_absolute() {
+                        p
+                    } else {
+                        std::env::current_dir()
+                            .map_err(|e| BridgeError::ConfigInvalid {
+                                reason: format!("cwd: {e}"),
+                            })?
+                            .join(p)
+                    }
+                }
                 None => std::env::current_dir().map_err(|e| BridgeError::ConfigInvalid {
-                    reason: format!("resolve current_dir for cwd: {e}"),
+                    reason: format!("cwd: {e}"),
                 })?,
             };
             let args: Vec<String> = entry.args.clone();
