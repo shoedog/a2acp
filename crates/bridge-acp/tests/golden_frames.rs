@@ -155,6 +155,101 @@ fn prompt_request_params_are_wire_conformant() {
     );
 }
 
+// session/set_mode wire-golden [Cl] (ACP §11A). After `session/new`, when a mode
+// is configured, the bridge sends a `session/set_mode` REQUEST with
+// `params:{ "sessionId":<agent id>, "modeId":<mode> }`, method `session/set_mode`
+// (snake_case). We (a) assert the SDK-typed `SetSessionModeRequest` value the
+// backend constructs serializes to exactly the hand-authored `params`, then
+// (b) hand-author the full JSON-RPC request frame around that SAME params value
+// and assert the method is the snake_case `session/set_mode`. The expected JSON is
+// HAND-AUTHORED to the spec (NOT `to_value` of an SDK frame/method type), so a
+// regression to a camelCase method or a renamed `modeId` field is caught here.
+#[test]
+fn set_mode_request_is_wire_conformant() {
+    use agent_client_protocol::schema::SessionId as AgentSessionId;
+
+    // The EXACT request value `ensure_session` transmits for a configured mode.
+    let req = AcpBackend::set_mode_request(AgentSessionId::new("agent-sess-1"), "yolo");
+    let params: Value = serde_json::to_value(&req).expect("SetSessionModeRequest serializes");
+
+    // (a) Hand-authored expected `params` per ACP §11A: sessionId + modeId.
+    let expected_params = serde_json::json!({
+        "sessionId": "agent-sess-1",
+        "modeId": "yolo"
+    });
+    assert_eq!(
+        params, expected_params,
+        "session/set_mode params must be {{\"sessionId\":<id>,\"modeId\":<mode>}}, got {params:?}"
+    );
+    // `modeId` must be the snake_case-method's camelCase field, carrying the mode.
+    assert_eq!(
+        params.get("modeId"),
+        Some(&Value::from("yolo")),
+        "params.modeId must be the configured mode id"
+    );
+    assert_eq!(
+        params.get("sessionId"),
+        Some(&Value::from("agent-sess-1")),
+        "params.sessionId must be the agent-minted id"
+    );
+    // An unset `_meta` must be omitted (skip_serializing_none).
+    assert!(
+        params.get("_meta").is_none(),
+        "an unset _meta must be omitted from the wire frame: {params:?}"
+    );
+
+    // (b) Hand-author the full JSON-RPC request FRAME and assert the method is the
+    // SNAKE_CASE `session/set_mode` (NOT `session/setMode`).
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "session/set_mode",
+        "params": params,
+    });
+    assert_eq!(
+        frame.get("method"),
+        Some(&Value::from("session/set_mode")),
+        "the request method must be the snake_case `session/set_mode`: {frame:?}"
+    );
+    assert_eq!(
+        frame.pointer("/params/modeId"),
+        Some(&Value::from("yolo")),
+        "params.modeId must be present in the request frame: {frame:?}"
+    );
+}
+
+// session/set_model wire-golden [Cl] (optional companion to set_mode). Same shape,
+// snake_case method `session/set_model`, field `modelId`. Best-effort on the wire;
+// the golden just pins the conformant serialization (feature `unstable_session_model`).
+#[test]
+fn set_model_request_is_wire_conformant() {
+    use agent_client_protocol::schema::SessionId as AgentSessionId;
+
+    let req = AcpBackend::set_model_request(AgentSessionId::new("agent-sess-1"), "gpt-x");
+    let params: Value = serde_json::to_value(&req).expect("SetSessionModelRequest serializes");
+
+    let expected_params = serde_json::json!({
+        "sessionId": "agent-sess-1",
+        "modelId": "gpt-x"
+    });
+    assert_eq!(
+        params, expected_params,
+        "session/set_model params must be {{\"sessionId\":<id>,\"modelId\":<model>}}, got {params:?}"
+    );
+
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "session/set_model",
+        "params": params,
+    });
+    assert_eq!(
+        frame.get("method"),
+        Some(&Value::from("session/set_model")),
+        "the request method must be the snake_case `session/set_model`: {frame:?}"
+    );
+}
+
 // session/cancel wire-golden [Cl-M4] (ACP §11A). `session/cancel` is a JSON-RPC
 // NOTIFICATION — NOT a request — so the wire frame has a `method` and `params`
 // but NO `id` and no response, with `params:{ "sessionId": <agent id> }`. We

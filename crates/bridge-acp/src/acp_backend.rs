@@ -14,15 +14,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, AuthMethod, CancelNotification, ContentBlock, CreateTerminalRequest,
-    CreateTerminalResponse, InitializeRequest, InitializeResponse, KillTerminalRequest,
-    KillTerminalResponse, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
-    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification,
+    ContentBlock, CreateTerminalRequest, CreateTerminalResponse, InitializeRequest,
+    InitializeResponse, KillTerminalRequest, KillTerminalResponse, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionId as AgentSessionId, SessionNotification, SessionUpdate,
-    StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    SetSessionModeRequest, SetSessionModelRequest, StopReason, TerminalOutputRequest,
+    TerminalOutputResponse, TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use async_trait::async_trait;
@@ -54,17 +55,21 @@ const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(50
 
 /// Static configuration for an ACP agent connection.
 ///
-/// `model` / `mode` are introduced now but only consumed by later tasks
-/// (`set_model` / `set_mode` after `session/new`); Task 1 only uses `cwd`
-/// when building sessions, which arrives in a later task too.
+/// `mode` drives a HARD `session/set_mode` after each `session/new` (a rejected
+/// mode fails session setup); `model` drives a BEST-EFFORT `session/set_model`
+/// (a failure is logged and the session continues — see [`AcpBackend::ensure_session`]).
+/// `auth_method` optionally pins which advertised auth method `connect` uses.
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
     /// Absolute working directory the agent runs sessions in.
     pub cwd: PathBuf,
-    /// Optional model id to request via `session/set_model` (later tasks).
+    /// Optional model id to request via `session/set_model` (best-effort).
     pub model: Option<String>,
-    /// Optional mode id to request via `session/set_mode` (later tasks).
+    /// Optional mode id to request via `session/set_mode` (hard error if rejected).
     pub mode: Option<String>,
+    /// Optional auth-method id to use for `authenticate`. When `None`, `connect`
+    /// uses the FIRST method the agent advertised at `initialize` (if any).
+    pub auth_method: Option<String>,
     /// Bound on the `initialize` handshake (transport connect + response).
     /// Defaults to [`DEFAULT_HANDSHAKE_TIMEOUT`]; on elapse `connect`/`spawn`
     /// return `BridgeError::AgentCrashed` rather than hanging. Task 6 surfaces
@@ -84,6 +89,7 @@ impl Default for AcpConfig {
             cwd: PathBuf::from("."),
             model: None,
             mode: None,
+            auth_method: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             cancel_grace: DEFAULT_CANCEL_GRACE,
         }
@@ -357,6 +363,33 @@ impl AcpBackend {
         CancelNotification::new(agent_id)
     }
 
+    /// Build the `session/set_mode` request the backend sends after `session/new`
+    /// when [`AcpConfig::mode`] is set. ACP §11A: `params:{ "sessionId":<agent id>,
+    /// "modeId":<mode> }`, method `session/set_mode` (snake_case).
+    ///
+    /// Exposed so the wire-golden test can assert the serialized `params` shape
+    /// against the SAME value `ensure_session` transmits — not a re-derivation of
+    /// the SDK type.
+    #[must_use]
+    pub fn set_mode_request(
+        agent_id: AgentSessionId,
+        mode_id: impl Into<String>,
+    ) -> SetSessionModeRequest {
+        SetSessionModeRequest::new(agent_id, mode_id.into())
+    }
+
+    /// Build the `session/set_model` request the backend sends (BEST-EFFORT) after
+    /// `session/new` when [`AcpConfig::model`] is set. ACP §11A:
+    /// `params:{ "sessionId":<agent id>, "modelId":<model> }`, method
+    /// `session/set_model` (snake_case, behind the `unstable_session_model` feature).
+    #[must_use]
+    pub fn set_model_request(
+        agent_id: AgentSessionId,
+        model_id: impl Into<String>,
+    ) -> SetSessionModelRequest {
+        SetSessionModelRequest::new(agent_id, model_id.into())
+    }
+
     /// **Production** constructor: spawn `cmd args` as a `Supervised` child
     /// (its own process group, tested SIGTERM→SIGKILL reaping) and drive the
     /// ACP connection over its stdin/stdout as `ByteStreams`.
@@ -524,6 +557,38 @@ impl AcpBackend {
         let (cx, resp) = tokio::time::timeout(config.handshake_timeout, handshake)
             .await
             .map_err(|_| BridgeError::AgentCrashed)??;
+
+        // ── authenticate ──────────────────────────────────────────────────────
+        //
+        // Lifecycle order: initialize → authenticate → (later) session/new. The
+        // `initialize` response lists the auth methods the agent supports. If it
+        // advertised NONE, the agent needs no client-driven auth, so we SKIP. If
+        // it advertised ≥1, attempt `authenticate` ONCE with either the
+        // configured method id or the first advertised one.
+        //
+        // POLICY for an already-authenticated agent (the T9 gated e2e validates
+        // against real codex): codex with an existing login may still advertise
+        // methods but not actually require a fresh auth — and may either accept a
+        // redundant `authenticate` (success → fine) or REJECT it. We cannot
+        // distinguish "wrong credentials" from "redundant auth" from the wire, so
+        // we choose the pragmatic, least-surprising policy: attempt ONCE; treat a
+        // SUCCESS (or no advertised methods) as authenticated; a definitive Err
+        // is FATAL and surfaces `AgentNotAuthenticated`. This matches the
+        // spec-intended flow (authenticate before sessions) while keeping the bound
+        // tight — a real operator with bad/absent credentials gets a clear error
+        // rather than a confusing `session/new` failure later. (If a future real
+        // agent is found to reject redundant auth, revisit toward a softer policy.)
+        let chosen = config
+            .auth_method
+            .as_deref()
+            .map(AuthMethodId::new)
+            .or_else(|| resp.auth_methods.first().map(|m| m.id().clone()));
+        if let Some(method_id) = chosen {
+            cx.send_request(AuthenticateRequest::new(method_id))
+                .block_task()
+                .await
+                .map_err(|_| BridgeError::AgentNotAuthenticated)?;
+        }
 
         Ok(Self {
             conn: Some(AcpConn {
@@ -717,6 +782,44 @@ impl AcpBackend {
                 Ok::<_, BridgeError>(resp.session_id)
             })
             .await?;
+
+        // Post-mint session configuration — runs EXACTLY ONCE per agent session,
+        // tied to the mint (`newly_minted`), NOT to every prompt. Applied AFTER the
+        // id is published so a concurrent `ensure_session` for the same key never
+        // re-applies it. Lifecycle: session/new → set_mode → set_model.
+        if newly_minted {
+            // set_mode — HARD. The operator asked for a specific mode; if the
+            // agent REJECTS the mode id (unknown/unsupported) we FAIL session
+            // setup so the misconfiguration surfaces rather than silently running
+            // in the wrong mode.
+            if let Some(mode) = self.config.as_ref().and_then(|c| c.mode.clone()) {
+                cx.send_request(Self::set_mode_request(id.clone(), mode))
+                    .block_task()
+                    .await
+                    .map_err(|_| BridgeError::AgentCrashed)?;
+            }
+            // set_model — BEST-EFFORT (NON-FATAL). Rationale: codex-acp's
+            // `set_model` is custom-provider-only; the builtin OpenAI provider
+            // returns `models:null` / errors on `session/set_model`. A model-set
+            // failure must therefore NOT kill the session — we LOG it and continue,
+            // running the agent's default model. (A configured model that the
+            // agent silently ignores is acceptable; a hard failure here would make
+            // every session on such an agent unusable.)
+            if let Some(model) = self.config.as_ref().and_then(|c| c.model.clone()) {
+                if let Err(e) = cx
+                    .send_request(Self::set_model_request(id.clone(), model.clone()))
+                    .block_task()
+                    .await
+                {
+                    tracing::warn!(
+                        model = %model,
+                        error = %e,
+                        "session/set_model failed; continuing with the agent's default model \
+                         (set_model is best-effort: e.g. builtin OpenAI returns models:null)"
+                    );
+                }
+            }
+        }
 
         // Post-init cancel-latch drain — runs only on the minting call, and only
         // AFTER `get_or_try_init` returned, i.e. once the id is observable to a
@@ -1102,6 +1205,20 @@ mod tests {
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
+                // An agent that advertises an auth method must answer `authenticate`
+                // (the backend attempts it post-initialize); accept it.
+                .on_receive_request(
+                    move |_req: agent_client_protocol::schema::AuthenticateRequest,
+                          responder: agent_client_protocol::Responder<
+                        agent_client_protocol::schema::AuthenticateResponse,
+                    >,
+                          _cx| async move {
+                        responder
+                            .respond(agent_client_protocol::schema::AuthenticateResponse::new())?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
                 .connect_to(channel)
                 .await;
         });
@@ -1284,8 +1401,10 @@ mod tests {
     // `CancelNotification`, `NewSessionRequest`, `AgentSessionId` are already in
     // scope via `super::*`; import only the agent-side response/prompt types.
     use agent_client_protocol::schema::{
-        ContentChunk, NewSessionResponse, PermissionOption, PermissionOptionId, PromptRequest,
-        PromptResponse, RequestPermissionRequest, RequestPermissionResponse, StopReason,
+        AuthenticateRequest, AuthenticateResponse, ContentChunk, NewSessionResponse,
+        PermissionOption, PermissionOptionId, PromptRequest, PromptResponse,
+        RequestPermissionRequest, RequestPermissionResponse, SetSessionModeRequest,
+        SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
         ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
     };
     use std::sync::atomic::AtomicUsize;
@@ -1385,6 +1504,30 @@ mod tests {
         /// Fires when the reverse permission request handler ENTERS (request about
         /// to be sent to the client), so a test can sequence deterministically.
         permission_requested: Arc<Notify>,
+
+        // ── Task 6: set_mode / set_model / authenticate ───────────────────────
+        /// Mode ids observed via `session/set_mode` requests (in order).
+        set_modes: Arc<Mutex<Vec<String>>>,
+        /// Fires every time a `session/set_mode` is recorded.
+        set_mode_seen: Arc<Notify>,
+        /// When set, the `session/set_mode` handler REJECTS the request with a
+        /// JSON-RPC error (modeling an agent that does not know the mode id).
+        reject_set_mode: Arc<AtomicBool>,
+        /// Model ids observed via `session/set_model` requests (in order).
+        set_models: Arc<Mutex<Vec<String>>>,
+        /// Fires every time a `session/set_model` is recorded.
+        set_model_seen: Arc<Notify>,
+        /// When set, the `session/set_model` handler REJECTS the request with a
+        /// JSON-RPC error (modeling an agent — e.g. builtin OpenAI — that errors
+        /// on set_model). The backend treats this as NON-FATAL.
+        reject_set_model: Arc<AtomicBool>,
+        /// Auth-method ids observed via `authenticate` requests (in order).
+        authenticates: Arc<Mutex<Vec<String>>>,
+        /// When set, the `authenticate` handler REJECTS with a JSON-RPC error
+        /// (modeling an auth failure). The backend surfaces `AgentNotAuthenticated`.
+        reject_authenticate: Arc<AtomicBool>,
+        /// Auth methods the fake agent advertises in its `initialize` response.
+        auth_methods: Arc<Mutex<Vec<AuthMethod>>>,
     }
 
     impl Recorder {
@@ -1413,6 +1556,15 @@ mod tests {
                 permission_replied: Arc::new(Notify::new()),
                 gate_turn_on_permission: Arc::new(AtomicBool::new(false)),
                 permission_requested: Arc::new(Notify::new()),
+                set_modes: Arc::new(Mutex::new(Vec::new())),
+                set_mode_seen: Arc::new(Notify::new()),
+                reject_set_mode: Arc::new(AtomicBool::new(false)),
+                set_models: Arc::new(Mutex::new(Vec::new())),
+                set_model_seen: Arc::new(Notify::new()),
+                reject_set_model: Arc::new(AtomicBool::new(false)),
+                authenticates: Arc::new(Mutex::new(Vec::new())),
+                reject_authenticate: Arc::new(AtomicBool::new(false)),
+                auth_methods: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1431,6 +1583,14 @@ mod tests {
         async fn arm_permission(&self, options: Vec<PermissionOption>) {
             *self.permission_options.lock().await = options;
             self.request_permission.store(true, Ordering::SeqCst);
+        }
+
+        /// Advertise a single agent auth method with id `id` at `initialize`.
+        async fn advertise_auth_method(&self, id: &'static str) {
+            *self.auth_methods.lock().await = vec![AuthMethod::Agent(AuthMethodAgent::new(
+                AuthMethodId::new(id),
+                id,
+            ))];
         }
     }
 
@@ -1468,7 +1628,10 @@ mod tests {
     fn spawn_recording_agent(channel: Channel, rec: Recorder) {
         tokio::spawn(async move {
             let r_init = rec.clone();
+            let r_auth = rec.clone();
             let r_new = rec.clone();
+            let r_mode = rec.clone();
+            let r_model = rec.clone();
             let r_prompt = rec.clone();
             let r_cancel = rec.clone();
             let _ = Agent
@@ -1478,9 +1641,70 @@ mod tests {
                     move |_req: InitializeRequest,
                           responder: agent_client_protocol::Responder<InitializeResponse>,
                           _cx| {
-                        let _ = &r_init;
+                        let r = r_init.clone();
                         async move {
-                            responder.respond(InitializeResponse::new(ProtocolVersion::V1))?;
+                            // Advertise the configured auth methods (default: none)
+                            // so the backend's `authenticate` step can be exercised.
+                            let methods = r.auth_methods.lock().await.clone();
+                            responder.respond(
+                                InitializeResponse::new(ProtocolVersion::V1).auth_methods(methods),
+                            )?;
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |req: AuthenticateRequest,
+                          responder: agent_client_protocol::Responder<AuthenticateResponse>,
+                          _cx| {
+                        let r = r_auth.clone();
+                        async move {
+                            r.authenticates
+                                .lock()
+                                .await
+                                .push(req.method_id.0.to_string());
+                            if r.reject_authenticate.load(Ordering::SeqCst) {
+                                responder.respond_with_internal_error("auth rejected")?;
+                            } else {
+                                responder.respond(AuthenticateResponse::new())?;
+                            }
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |req: SetSessionModeRequest,
+                          responder: agent_client_protocol::Responder<SetSessionModeResponse>,
+                          _cx| {
+                        let r = r_mode.clone();
+                        async move {
+                            r.set_modes.lock().await.push(req.mode_id.0.to_string());
+                            r.set_mode_seen.notify_one();
+                            if r.reject_set_mode.load(Ordering::SeqCst) {
+                                responder.respond_with_internal_error("unknown mode id")?;
+                            } else {
+                                responder.respond(SetSessionModeResponse::new())?;
+                            }
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |req: SetSessionModelRequest,
+                          responder: agent_client_protocol::Responder<SetSessionModelResponse>,
+                          _cx| {
+                        let r = r_model.clone();
+                        async move {
+                            r.set_models.lock().await.push(req.model_id.0.to_string());
+                            r.set_model_seen.notify_one();
+                            if r.reject_set_model.load(Ordering::SeqCst) {
+                                responder.respond_with_internal_error("set_model unsupported")?;
+                            } else {
+                                responder.respond(SetSessionModelResponse::new())?;
+                            }
                             Ok(())
                         }
                     },
@@ -2615,5 +2839,157 @@ mod tests {
             Some(Some("a".to_string())),
             "auto-approve selected allow_once mid-prompt"
         );
+    }
+
+    // ── Task 6: set_mode / set_model / authenticate ────────────────────────────
+
+    /// `test_config` with a configured `mode`.
+    fn test_config_with_mode(mode: &str) -> AcpConfig {
+        AcpConfig {
+            mode: Some(mode.to_string()),
+            ..test_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn set_mode_applied_after_session_new() {
+        // With a configured mode, minting a session sends ONE `session/set_mode`
+        // carrying that mode id; a second `ensure_session` (same key) reuses the
+        // session and does NOT re-apply it (once per session, tied to the mint).
+        let rec = Recorder::new("agent-sess-MODE");
+        let be = connect_recording_with(rec.clone(), test_config_with_mode("yolo")).await;
+        let key = bkey("bridge-MODE");
+
+        be.ensure_session(&key).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.set_mode_seen.notified())
+            .await
+            .expect("set_mode must reach the agent after session/new");
+        assert_eq!(
+            rec.set_modes.lock().await.as_slice(),
+            &["yolo"],
+            "set_mode applied once with the configured mode id"
+        );
+
+        // Reuse: a second ensure_session must NOT re-apply set_mode.
+        be.ensure_session(&key).await.unwrap();
+        assert_eq!(
+            rec.set_modes.lock().await.as_slice(),
+            &["yolo"],
+            "set_mode is applied exactly once per session (not per prompt/ensure)"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_mode_bad_id_is_hard_error() {
+        // The agent REJECTS the configured mode id -> session setup must FAIL
+        // (hard error), surfacing to the caller rather than silently continuing.
+        let rec = Recorder::new("agent-sess-BADMODE");
+        rec.reject_set_mode.store(true, Ordering::SeqCst);
+        let be = connect_recording_with(rec.clone(), test_config_with_mode("nonexistent")).await;
+        let key = bkey("bridge-BADMODE");
+
+        match be.ensure_session(&key).await {
+            Err(BridgeError::AgentCrashed) => {}
+            other => panic!("a rejected set_mode must fail session setup, got {other:?}"),
+        }
+        // The agent did record the (rejected) mode request.
+        assert_eq!(rec.set_modes.lock().await.as_slice(), &["nonexistent"]);
+    }
+
+    #[tokio::test]
+    async fn set_model_error_is_non_fatal() {
+        // The agent ERRORS `session/set_model` (modeling builtin OpenAI returning
+        // models:null). This must be NON-FATAL: the session is still set up, the
+        // model failure is logged, and a subsequent prompt still completes.
+        let rec = Recorder::new("agent-sess-MODELERR");
+        rec.reject_set_model.store(true, Ordering::SeqCst);
+        let cfg = AcpConfig {
+            model: Some("gpt-x".to_string()),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-MODELERR");
+
+        // Session setup succeeds despite the set_model error.
+        be.ensure_session(&key).await.expect(
+            "a set_model error must NOT fail session setup (best-effort: continue on the \
+             agent's default model)",
+        );
+        tokio::time::timeout(Duration::from_secs(2), rec.set_model_seen.notified())
+            .await
+            .expect("set_model must have reached the (erroring) agent");
+        assert_eq!(rec.set_models.lock().await.as_slice(), &["gpt-x"]);
+
+        // And a subsequent prompt still works (the connection/session survived).
+        rec.set_updates(vec![ScriptedUpdate::Text("ok")]).await;
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "ok"));
+        assert!(
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_failure_surfaces_agent_not_authenticated() {
+        // The agent advertises an auth method, then REJECTS `authenticate`. The
+        // backend must surface `AgentNotAuthenticated` from `connect` (hard fail).
+        let rec = Recorder::new("agent-sess-AUTH");
+        rec.advertise_auth_method("oauth").await;
+        rec.reject_authenticate.store(true, Ordering::SeqCst);
+
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_recording_agent(agent_side, rec.clone());
+        match AcpBackend::connect(client_side, test_config()).await {
+            Err(BridgeError::AgentNotAuthenticated) => {}
+            Err(e) => panic!("authenticate failure must surface AgentNotAuthenticated, got {e:?}"),
+            Ok(_) => panic!("authenticate failure must surface AgentNotAuthenticated, got Ok"),
+        }
+        // The backend attempted authenticate with the advertised method id.
+        assert_eq!(rec.authenticates.lock().await.as_slice(), &["oauth"]);
+    }
+
+    #[tokio::test]
+    async fn authenticate_attempts_first_advertised_method() {
+        // An agent that advertises a method and ACCEPTS `authenticate` connects
+        // cleanly; the backend used the first advertised method id.
+        let rec = Recorder::new("agent-sess-AUTHOK");
+        rec.advertise_auth_method("oauth").await;
+        let be = connect_recording(rec.clone()).await;
+        // Connected successfully -> authenticate was attempted with "oauth".
+        assert_eq!(rec.authenticates.lock().await.as_slice(), &["oauth"]);
+        // And the backend captured the advertised method.
+        assert_eq!(be.auth_methods().map(<[_]>::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn no_auth_methods_skips_authenticate() {
+        // An agent that advertises NO auth methods needs no client-driven auth:
+        // the backend must SKIP `authenticate` entirely (no request on the wire).
+        let rec = Recorder::new("agent-sess-NOAUTH");
+        // (default: auth_methods empty)
+        let _be = connect_recording(rec.clone()).await;
+        assert!(
+            rec.authenticates.lock().await.is_empty(),
+            "no advertised auth methods -> authenticate must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_surfaces_clear_error() {
+        // A non-responsive agent that opens stdio but NEVER answers `initialize`
+        // must surface a clear BOUNDED error within `handshake_timeout`, not hang.
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_hung_agent(agent_side);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            AcpBackend::connect(client_side, test_config_short_handshake()),
+        )
+        .await
+        .expect("connect must return within the handshake bound, not hang");
+        match outcome {
+            Err(BridgeError::AgentCrashed) => {}
+            Err(e) => panic!("a hung initialize handshake must surface a clear error, got {e:?}"),
+            Ok(_) => panic!("a hung initialize handshake must surface a clear error, got Ok"),
+        }
     }
 }

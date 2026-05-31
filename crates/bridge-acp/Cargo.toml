@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-agent-client-protocol = { workspace = true }
+# `unstable_session_model` enables the SDK's `SetSessionModelRequest`/`ModelId`
+# types + the `session/set_model` JsonRpcRequest impl, which the backend uses for
+# best-effort model selection (Task 6). Those types do NOT exist without it.
+agent-client-protocol = { workspace = true, features = ["unstable_session_model"] }
 bridge-core = { path = "../bridge-core" }
 thiserror.workspace = true
 async-trait.workspace = true
