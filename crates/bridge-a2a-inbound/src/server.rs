@@ -99,9 +99,11 @@ impl Drop for BindingGuard {
         let session = self.session.clone();
         let backend = self.backend.clone();
         tokio::spawn(async move {
-            // Removing the binding drops its Lease → the slot's active-task count
-            // decrements. Then forget the per-session config stash.
-            bindings.lock().await.remove(&task);
+            // Take the binding out of the map and drop its Lease explicitly → the
+            // slot's active-task count decrements. Then forget the per-session stash.
+            if let Some(binding) = bindings.lock().await.remove(&task) {
+                drop(binding.lease);
+            }
             backend.forget_session(&session).await;
         });
     }
@@ -299,12 +301,22 @@ async fn resolve_configure_bind(
     session: &SessionId,
     overrides: Option<&AgentOverride>,
 ) -> Result<LocalDispatch, BridgeError> {
-    // Follow-up: a binding already exists → reuse the bound backend, no re-resolve.
-    if let Some(binding) = srv.bindings.lock().await.get(task) {
-        return Ok(LocalDispatch {
-            backend: binding.backend.clone(),
-            guard: None,
-        });
+    // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
+    // route/resolve/recompute. Reapply the bound effective config to the session
+    // (idempotent re-stash) so the follow-up runs under the SAME config the task was
+    // bound with, then prompt the bound backend.
+    {
+        let bindings = srv.bindings.lock().await;
+        if let Some(binding) = bindings.get(task) {
+            let backend = binding.backend.clone();
+            let eff = binding.eff.clone();
+            drop(bindings);
+            backend.configure_session(session, &eff).await?;
+            return Ok(LocalDispatch {
+                backend,
+                guard: None,
+            });
+        }
     }
     // First message: resolve, configure, bind, and hand back an eviction guard.
     let resolved = srv.registry.resolve(agent_id).await?;
@@ -503,7 +515,23 @@ fn spawn_local_producer(
         // which the translator maps to a terminal Canceled event). If so we must
         // NOT append a second terminal — we honor the one it sent.
         let mut translator_terminal = false;
-        while let Some(ev) = events.next().await {
+        loop {
+            // Race the next translator event against caller-disconnect. The
+            // `tx.closed()` arm is essential for an IDLE backend stream: a producer
+            // parked in `events.next()` (a still-running turn) would otherwise never
+            // observe the dropped receiver, and its `_guard` Drop (lease/stash
+            // eviction) would never fire. On disconnect we return early → guard drops.
+            let ev = tokio::select! {
+                maybe = events.next() => match maybe {
+                    Some(ev) => ev,
+                    None => break,
+                },
+                _ = tx.closed() => {
+                    // Receiver gone (client disconnected) — stop driving; the `_guard`
+                    // Drop evicts the binding/lease/stash on this early return.
+                    return;
+                }
+            };
             // Track whether the stream ended with an error.
             if ev.is_err() {
                 errored = true;
