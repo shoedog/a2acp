@@ -559,9 +559,10 @@ impl AcpBackend {
     ///
     /// Mapping (per the Task-5 policy table):
     /// * **Approve** → select the first `AllowOnce` option; fallback the first
-    ///   `AllowAlways`; fallback the first option of ANY kind; if the agent sent
-    ///   NO options at all, `Cancelled` (the only conformant choice — we cannot
-    ///   invent an option id).
+    ///   `AllowAlways`; if NEITHER allow option exists (e.g. agent offered only
+    ///   reject options), `Cancelled`. We must NOT fall back to the first
+    ///   arbitrary option: selecting a reject option under an approve policy
+    ///   would be a correctness inversion (permanent deny when intent was grant).
     /// * **Deny** (`Err(PermissionDenied)`) → first `RejectOnce`; fallback first
     ///   `RejectAlways`; fallback `Cancelled` if no reject option exists.
     /// * **Any other policy error** (abstain) → `Cancelled`.
@@ -596,16 +597,12 @@ impl AcpBackend {
                 PermissionOptionKind::AllowOnce,
                 PermissionOptionKind::AllowAlways,
             ])
-            // No allow option → fall back to the first offered option (the safe
-            // conformant choice: still a valid selection; never fabricates an id).
-            .or_else(|| {
-                req.options.first().map(|opt| {
-                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                        opt.option_id.clone(),
-                    ))
-                })
-            })
-            // Agent offered NO options at all → the only conformant reply is Cancelled.
+            // No allow option offered (e.g. agent only has reject options) →
+            // Cancelled. We must NOT fall back to an arbitrary first option: if
+            // the agent offered ONLY reject options, selecting one would
+            // permanently blacklist a tool call under an *approve* policy —
+            // a correctness inversion. Cancelled doesn't grant but also doesn't
+            // permanently deny; it is strictly safer than selecting a reject.
             .unwrap_or(RequestPermissionOutcome::Cancelled),
             // Deny: pick a reject option; if none exists, Cancelled.
             Some(Err(BridgeError::PermissionDenied)) => select(&[
@@ -2406,6 +2403,42 @@ mod tests {
             *rec.permission_reply.lock().await,
             Some(None),
             "deny with no reject option → Cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_approve_with_no_allow_option_is_cancelled() {
+        // Bug #5 regression: Approve policy, but the agent offers ONLY a reject
+        // option (no AllowOnce / AllowAlways). The old code fell back to
+        // `req.options.first()` — selecting the RejectAlways — permanently
+        // blacklisting the tool call under an approve policy (correctness
+        // inversion). The fix: when no allow option exists, the backend must
+        // reply `Cancelled` (does not grant, but does NOT permanently deny).
+        let rec = Recorder::new("agent-sess-APPC");
+        rec.arm_permission(vec![PermissionOption::new(
+            PermissionOptionId::new("r"),
+            "Reject always",
+            PermissionOptionKind::RejectAlways,
+        )])
+        .await;
+        // Default policy is auto-approve; no `with_policy` override needed.
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-APPC");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        while tokio::time::timeout(Duration::from_secs(2), s.next())
+            .await
+            .expect("turn must complete")
+            .is_some()
+        {}
+
+        tokio::time::timeout(Duration::from_secs(2), rec.permission_replied.notified())
+            .await
+            .expect("client must have replied");
+        assert_eq!(
+            *rec.permission_reply.lock().await,
+            Some(None),
+            "approve with no allow option → Cancelled (never a reject option)"
         );
     }
 
