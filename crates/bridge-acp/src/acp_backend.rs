@@ -454,19 +454,21 @@ impl AcpBackend {
                     move |notif: SessionNotification, _cx| {
                         let updates = Arc::clone(&updates_handler);
                         async move {
-                            if let SessionUpdate::AgentMessageChunk(chunk) = notif.update {
-                                if let ContentBlock::Text(t) = chunk.content {
-                                    // Plain get + non-blocking send under a
-                                    // std::Mutex: no await is held across the lock.
-                                    if let Ok(map) = updates.lock() {
-                                        if let Some(tx) = map.get(&notif.session_id) {
-                                            let _ = tx.send(TurnEvent::Text(t.text));
-                                        }
+                            // Map the inbound `session/update` to a modeled `Update`
+                            // via the SAME pure helper the corpus replay tests drive,
+                            // so a captured real-agent frame exercises this exact path.
+                            let session_id = notif.session_id.clone();
+                            if let Some(Update::Text(text)) = Self::map_session_update(notif) {
+                                // Plain get + non-blocking send under a
+                                // std::Mutex: no await is held across the lock.
+                                if let Ok(map) = updates.lock() {
+                                    if let Some(tx) = map.get(&session_id) {
+                                        let _ = tx.send(TurnEvent::Text(text));
                                     }
                                 }
-                                // else: ignore non-text chunk content.
                             }
-                            // else: ignore unmodeled SessionUpdate variants.
+                            // else: ignore unmodeled SessionUpdate variants /
+                            // non-text chunk content (tolerant reader).
                             Ok(())
                         }
                     },
@@ -948,6 +950,29 @@ impl AcpBackend {
         }
     }
 
+    /// Map an inbound `session/update` notification (the agent→client streaming
+    /// direction) to a modeled [`Update`], or `None` for an unmodeled variant.
+    ///
+    /// This is the SINGLE inbound-frame mapping seam: the live `on_receive_notification`
+    /// handler registered in [`Self::connect`] calls THIS function, and so does the
+    /// captured-agent corpus replay test. So a REAL `agent_message_chunk` frame
+    /// captured off the wire is parsed (SDK `SessionNotification` deserialization)
+    /// and mapped through the exact same code that runs in production — that is what
+    /// makes the corpus replay a real conformance proof, not a circular one.
+    ///
+    /// Only `agent_message_chunk` with text content is modeled today (→
+    /// `Update::Text`); every other `SessionUpdate` variant (thought chunks, plans,
+    /// tool-call updates, …) and non-text content is a tolerant-reader DROP (`None`).
+    #[must_use]
+    pub fn map_session_update(notif: SessionNotification) -> Option<Update> {
+        if let SessionUpdate::AgentMessageChunk(chunk) = notif.update {
+            if let ContentBlock::Text(t) = chunk.content {
+                return Some(Update::Text(t.text));
+            }
+        }
+        None
+    }
+
     /// Map an ACP `StopReason` to the bridge's `Update::Done` stop_reason string.
     /// We use the ACP wire spelling (snake_case) so it matches the protocol and
     /// the existing `Update::Done { stop_reason: String }` convention (e.g.
@@ -963,6 +988,33 @@ impl AcpBackend {
             _ => "unknown",
         }
         .to_string()
+    }
+
+    // ── Corpus-replay seams ──────────────────────────────────────────────────
+    //
+    // These thin wrappers expose the production inbound mapping over the DEFAULT
+    // (auto-approve) policy / the wire `stop_reason` mapping, so the captured-agent
+    // frame corpus replay test (`tests/corpus_replay.rs`) can feed a REAL frame
+    // through the EXACT logic the live connection runs — without standing up a full
+    // transport. They add no new behavior; they only re-expose existing code.
+
+    /// Decide a reverse `session/request_permission` under the DEFAULT auto-approve
+    /// policy (the deployed 3a policy), for the corpus replay test. Drives the same
+    /// [`Self::decide_permission`] the live permission handler calls.
+    #[must_use]
+    pub fn decide_for_corpus(req: &RequestPermissionRequest) -> RequestPermissionOutcome {
+        let policy: PolicyHandle = Arc::new(StdMutex::new(
+            Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
+        ));
+        Self::decide_permission(&policy, req)
+    }
+
+    /// Map a prompt-result [`StopReason`] to the wire `stop_reason` string, for the
+    /// corpus replay test. Drives the same [`Self::stop_reason_str`] the prompt
+    /// driver uses to build `Update::Done`.
+    #[must_use]
+    pub fn stop_reason_for_corpus(stop: StopReason) -> String {
+        Self::stop_reason_str(stop)
     }
 }
 
