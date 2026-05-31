@@ -61,13 +61,50 @@ const JSONRPC_INTERNAL: i32 = -32603;
 /// A task's binding to its resolved registry instance, created on the FIRST local
 /// message. Holds the backend driving the task, the effective config applied to its
 /// session, and the registry [`Lease`] keeping the slot alive for the task's
-/// lifetime (the lease drops when the binding is removed — full eviction is T11).
+/// lifetime. The lease drops when the binding is removed from the map ([`BindingGuard`]
+/// eviction on producer exit), decrementing the slot's active-task count.
 struct TaskBinding {
     backend: Arc<dyn AgentBackend>,
-    #[allow(dead_code)] // surfaced for T11 follow-up reuse; T10 only records it.
+    /// The effective config applied to the task's session — reused by binding-driven
+    /// follow-ups (they prompt the bound backend without recomputing config). Kept on
+    /// the binding so the resolved config is available for the task's whole lifetime.
     eff: EffectiveConfig,
-    #[allow(dead_code)] // held so the slot isn't retired mid-task; dropped on eviction (T11).
+    /// The registry lease keeping the slot alive for the task. Dropped (releasing the
+    /// slot's active-task count) when the binding is removed on producer exit.
     lease: Box<dyn Lease>,
+}
+
+/// RAII eviction guard owned by a task's producer. While alive it represents the
+/// task's binding; on `Drop` — whether the producer returns cleanly (Done/Failed/
+/// Canceled) OR early (client disconnect / error) — it removes the [`TaskBinding`]
+/// from the map (dropping the [`Lease`] → the slot's active-task count decrements)
+/// and forgets the backend's per-session stash. This is the spec-critical
+/// "eviction on EVERY producer exit": a leaked lease keeps a slot un-retirable
+/// forever, so the guard must fire on the non-clean paths a manual cleanup might miss.
+///
+/// `Drop` is synchronous but the eviction is async (mutex lock + `forget_session`),
+/// so it is performed on a spawned task. A follow-up that REUSES an existing binding
+/// does NOT own a guard — only the FIRST message's producer evicts.
+struct BindingGuard {
+    bindings: Arc<tokio::sync::Mutex<HashMap<TaskId, TaskBinding>>>,
+    task: TaskId,
+    backend: Arc<dyn AgentBackend>,
+    session: SessionId,
+}
+
+impl Drop for BindingGuard {
+    fn drop(&mut self) {
+        let bindings = self.bindings.clone();
+        let task = self.task.clone();
+        let session = self.session.clone();
+        let backend = self.backend.clone();
+        tokio::spawn(async move {
+            // Removing the binding drops its Lease → the slot's active-task count
+            // decrements. Then forget the per-session config stash.
+            bindings.lock().await.remove(&task);
+            backend.forget_session(&session).await;
+        });
+    }
 }
 
 /// The inbound A2A server. Holds the six pipeline ports plus the advertised
@@ -232,23 +269,44 @@ fn local_agent_id(srv: &InboundServer, target: &RouteTarget) -> AgentId {
     }
 }
 
-/// First-message LOCAL dispatch core: resolve the agent id to a `(backend, lease)`,
-/// compute its effective config (entry defaults layered with the per-request
-/// override), apply it via `configure_session`, then instance-BIND the task by
-/// inserting a [`TaskBinding`] keyed on the task id. Returns the backend ready for
-/// the translator. On resolve/configure failure the error propagates (callers map
-/// it to a `Failed` terminal / JSON-RPC error — never a panic).
+/// The local backend ready to drive a task, plus its RAII eviction guard. A
+/// FIRST-message dispatch returns `Some(guard)` (the producer owns it → evicts the
+/// binding/lease/stash on exit); a FOLLOW-UP that reused an existing binding returns
+/// `None` (the original producer owns eviction — a follow-up must not evict a still-
+/// live binding when its own short-lived call ends).
+struct LocalDispatch {
+    backend: Arc<dyn AgentBackend>,
+    guard: Option<BindingGuard>,
+}
+
+/// LOCAL dispatch — binding-driven (T11). If the task already has a [`TaskBinding`]
+/// (a FOLLOW-UP / re-send for a live task) reuse the BOUND backend directly: bypass
+/// `route()`/`resolve()`/`configure_session` entirely, so a concurrent registry edit
+/// (the bound agent removed) can't make a follow-up fail or hit the wrong backend.
+/// Otherwise (a FIRST message) resolve the agent id to a `(backend, lease)`, compute
+/// its effective config (entry defaults layered with the per-request override), apply
+/// it via `configure_session`, insert a [`TaskBinding`], and hand back a
+/// [`BindingGuard`] so the producer evicts on exit. On resolve/configure failure the
+/// error propagates (callers map it to a `Failed` terminal / JSON-RPC error).
 ///
-/// The lease is held inside the stored `TaskBinding` for the task's lifetime, so a
-/// concurrent config reload can't retire the slot out from under an in-flight task.
-/// (T11 makes follow-ups and cancel fully binding-driven and evicts on producer exit.)
+/// Bind-before-spawn: callers run this in the handler BEFORE spawning the producer,
+/// so the binding exists the instant the call returns — a follow-up or cancel can
+/// never race an async bind window.
 async fn resolve_configure_bind(
     srv: &InboundServer,
     agent_id: &AgentId,
     task: &TaskId,
     session: &SessionId,
     overrides: Option<&AgentOverride>,
-) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+) -> Result<LocalDispatch, BridgeError> {
+    // Follow-up: a binding already exists → reuse the bound backend, no re-resolve.
+    if let Some(binding) = srv.bindings.lock().await.get(task) {
+        return Ok(LocalDispatch {
+            backend: binding.backend.clone(),
+            guard: None,
+        });
+    }
+    // First message: resolve, configure, bind, and hand back an eviction guard.
     let resolved = srv.registry.resolve(agent_id).await?;
     let eff = effective_config(&resolved.entry, overrides);
     resolved.backend.configure_session(session, &eff).await?;
@@ -261,7 +319,16 @@ async fn resolve_configure_bind(
             lease: resolved.lease,
         },
     );
-    Ok(backend)
+    let guard = BindingGuard {
+        bindings: srv.bindings.clone(),
+        task: task.clone(),
+        backend: backend.clone(),
+        session: session.clone(),
+    };
+    Ok(LocalDispatch {
+        backend,
+        guard: Some(guard),
+    })
 }
 
 /// Fan-out variant of [`resolve_configure_bind`]: resolve the local agent, apply
@@ -283,12 +350,15 @@ async fn resolve_for_fanout(
     Ok((resolved.backend, resolved.lease))
 }
 
-/// Resolve the backend to cancel a LOCAL task. T10 is binding-or-fallback: if the
-/// first message already created a [`TaskBinding`], use that exact instance (the one
-/// driving the task). Otherwise — e.g. a cancel for a task whose binding has been
-/// pruned, or a pre-seeded fan-out test — fall back to resolving the registry
-/// default agent. T11 makes follow-up/cancel FULLY binding-driven (the fallback is a
-/// pre-T11 bridge so existing cancel tests keep passing).
+/// Resolve the backend to cancel a LOCAL task — binding-driven (T11). If the task has
+/// a live [`TaskBinding`] (created by its first message), cancel THAT exact instance
+/// — the one driving the task — so a multi-agent or post-reload cancel never hits the
+/// WRONG backend (the spec-critical property the default-fallback violated).
+///
+/// The fallback to resolving the registry default remains ONLY for the genuinely-no-
+/// binding case: a cancel that arrives after the binding was already evicted (the task
+/// is no longer a live local task), or a fan-out cancel whose backend is pre-seeded in
+/// the store rather than bound. For a live local task the binding always wins.
 async fn cancel_backend_for(
     srv: &InboundServer,
     task: &TaskId,
@@ -352,7 +422,32 @@ async fn stream_message(
     let task_id_str = routed.task.as_str().to_owned();
 
     match routed.target {
-        RouteTarget::Local(_) => spawn_local_producer(&srv, routed, tx),
+        RouteTarget::Local(_) => {
+            // Bind-before-spawn: resolve+configure+bind (or reuse a follow-up binding)
+            // in the handler so the binding exists the instant the producer starts —
+            // a follow-up or cancel can never race an async bind window. On a
+            // resolve/configure failure (e.g. unknown agent) emit a terminal Failed
+            // SSE frame rather than a JSON-RPC error (streaming has already committed
+            // to an SSE response).
+            let agent_id = local_agent_id(&srv, &routed.target);
+            match resolve_configure_bind(
+                &srv,
+                &agent_id,
+                &routed.task,
+                &routed.session,
+                routed.overrides.as_ref(),
+            )
+            .await
+            {
+                Ok(dispatch) => spawn_local_producer(&srv, routed, dispatch, tx),
+                Err(e) => {
+                    tokio::spawn(async move {
+                        let _ = tx.send(Err(e)).await;
+                        let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+                    });
+                }
+            };
+        }
         RouteTarget::Delegate => spawn_delegate_producer(&srv, routed, tx),
         RouteTarget::Fanout => spawn_fanout_producer(&srv, routed, tx),
     }
@@ -365,42 +460,33 @@ async fn stream_message(
         .into_response()
 }
 
-/// Spawn the local-backend producer: drive the translator and forward each
-/// translated event into the mpsc channel. Stops if the receiver is dropped.
+/// Spawn the local-backend producer for an already-resolved [`LocalDispatch`]: drive
+/// the translator on the bound backend and forward each translated event into the
+/// mpsc channel. Stops if the receiver is dropped (client disconnect).
+///
+/// The producer OWNS the dispatch's [`BindingGuard`] (when present — a first message;
+/// a follow-up reuses the binding and carries no guard). The guard is moved into the
+/// spawned task and dropped on EVERY exit — clean terminal flush, translator-emitted
+/// terminal, OR early `return` on receiver-gone — so the binding/lease/stash are
+/// evicted on the non-clean disconnect path too, not just on a clean Done/Failed.
 fn spawn_local_producer(
     srv: &Arc<InboundServer>,
     routed: RoutedCall,
+    dispatch: LocalDispatch,
     tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
 ) {
-    let srv = srv.clone();
     let store = srv.store.clone();
     let policy = srv.policy.clone();
-    let agent_id = local_agent_id(&srv, &routed.target);
     let task = routed.task;
     let session = routed.session;
     let parts = routed.parts;
-    let overrides = routed.overrides;
+    let backend = dispatch.backend;
+    // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
+    let guard = dispatch.guard;
 
     tokio::spawn(async move {
-        // First-message dispatch: resolve the routed agent, apply its effective
-        // config, and bind the task. A resolve/configure failure (e.g. an unknown
-        // agent) becomes a single terminal Failed frame — never a panic.
-        let backend = match resolve_configure_bind(
-            &srv,
-            &agent_id,
-            &task,
-            &session,
-            overrides.as_ref(),
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
-                return;
-            }
-        };
+        // Hold the guard for the whole producer; dropped on every return path below.
+        let _guard = guard;
 
         let translator = Translator::new();
         let mut events = translator.run(
@@ -429,7 +515,8 @@ fn spawn_local_producer(
                     translator_terminal = true;
                 }
             }
-            // If the receiver is gone (client disconnected) stop driving.
+            // If the receiver is gone (client disconnected) stop driving. The
+            // `_guard` Drop still evicts the binding/lease/stash on this early return.
             if tx.send(ev).await.is_err() {
                 // Receiver gone — skip the terminal frame (client disconnected).
                 return;
@@ -446,7 +533,8 @@ fn spawn_local_producer(
             };
             let _ = tx.send(Ok(Event::terminal(outcome))).await;
         }
-        // Channel closes on drop -> SSE stream terminates after the terminal flush.
+        // `_guard` drops here too (clean exit) → eviction. Channel closes on drop ->
+        // SSE stream terminates after the terminal flush.
     });
 }
 
@@ -907,8 +995,12 @@ async fn unary_message(
     let collected: Vec<Result<Event, BridgeError>> = match routed.target {
         RouteTarget::Local(ref agent_id) => {
             // First-message dispatch: resolve the routed agent, apply its effective
-            // config, and bind the task. An unknown agent surfaces as a JSON-RPC error.
-            let backend = match resolve_configure_bind(
+            // config, and bind the task (or reuse a follow-up binding). An unknown
+            // agent surfaces as a JSON-RPC error. The dispatch's BindingGuard binds
+            // for the call's DURATION (so an interleaved cancel finds the binding) and
+            // is dropped at the end of this scope → eviction after `collect().await`.
+            // A follow-up reuses the binding and carries no guard (no premature evict).
+            let dispatch = match resolve_configure_bind(
                 &srv,
                 agent_id,
                 &routed.task,
@@ -917,13 +1009,16 @@ async fn unary_message(
             )
             .await
             {
-                Ok(b) => b,
+                Ok(d) => d,
                 Err(e) => return bridge_err_to_jsonrpc(id, &e),
             };
+            // Held until this arm returns; its Drop evicts the binding/lease/stash
+            // after the synchronous collect completes.
+            let _guard = dispatch.guard;
             let translator = Translator::new();
             translator
                 .run(
-                    backend.as_ref(),
+                    dispatch.backend.as_ref(),
                     srv.store.as_ref(),
                     srv.policy.as_ref(),
                     &routed.task,
@@ -3461,6 +3556,154 @@ mod tests {
         }
     }
 
+    /// A lease that decrements a shared counter on drop — so a test can assert the
+    /// slot's active-task count returns to zero after the binding is evicted.
+    struct CountingLease {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for CountingLease {
+        fn drop(&mut self) {
+            self.count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl Lease for CountingLease {}
+
+    /// A registry over `RecordingBackend`s that tracks a per-agent live-lease count:
+    /// `resolve` increments the agent's counter (handing out a `CountingLease` that
+    /// decrements on drop) so a test can assert eviction released the lease, and
+    /// `apply` can REMOVE an agent so a follow-up that re-resolved it would fail —
+    /// proving the follow-up uses the BOUND Arc instead.
+    struct CountingRegistry {
+        default: AgentId,
+        inner: tokio::sync::Mutex<CountingRegistryInner>,
+        leases: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
+    }
+    struct CountingRegistryInner {
+        entries: std::collections::HashMap<String, AgentEntry>,
+        backends: std::collections::HashMap<String, Arc<dyn AgentBackend>>,
+    }
+    impl CountingRegistry {
+        fn new(default: &str, agents: Vec<(AgentEntry, Arc<dyn AgentBackend>)>) -> Arc<Self> {
+            let mut entries = std::collections::HashMap::new();
+            let mut backends = std::collections::HashMap::new();
+            let mut leases = std::collections::HashMap::new();
+            for (entry, backend) in agents {
+                let key = entry.id.as_str().to_owned();
+                leases.insert(
+                    key.clone(),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                );
+                entries.insert(key.clone(), entry);
+                backends.insert(key, backend);
+            }
+            Arc::new(Self {
+                default: AgentId::parse(default).unwrap(),
+                inner: tokio::sync::Mutex::new(CountingRegistryInner { entries, backends }),
+                leases,
+            })
+        }
+        /// The current live-lease count for an agent (0 once all its leases dropped).
+        fn lease_count(&self, id: &str) -> usize {
+            self.leases
+                .get(id)
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0)
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentRegistry for CountingRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            let key = id.as_str();
+            let inner = self.inner.lock().await;
+            match (inner.entries.get(key), inner.backends.get(key)) {
+                (Some(entry), Some(backend)) => {
+                    let count = self.leases.get(key).expect("agent has a lease counter");
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(Resolved {
+                        entry: Arc::new(entry.clone()),
+                        backend: backend.clone(),
+                        lease: Box::new(CountingLease {
+                            count: count.clone(),
+                        }),
+                    })
+                }
+                _ => Err(BridgeError::UnknownAgent { id: key.to_owned() }),
+            }
+        }
+        fn default_id(&self) -> AgentId {
+            self.default.clone()
+        }
+        async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<AgentId> {
+            Vec::new()
+        }
+    }
+    impl CountingRegistry {
+        /// Test-only mutation standing in for an `apply` that REMOVES `id` (the real
+        /// reconcile drains on the lease; here we just make a future `resolve(id)` fail).
+        async fn remove_agent(&self, id: &str) {
+            let mut inner = self.inner.lock().await;
+            inner.entries.remove(id);
+            inner.backends.remove(id);
+        }
+    }
+
+    /// A `RecordingBackend`-like backend that additionally records `cancel` and
+    /// `forget_session` calls, so a test can prove cancel reached the BOUND backend
+    /// and that eviction forgot the per-session stash.
+    struct TrackingBackend {
+        id: String,
+        cancelled: AtomicBool,
+        forgotten: AtomicBool,
+        /// When true, `prompt` hangs forever after one Text frame (an idle stream
+        /// keeping the producer — and thus the binding — alive for follow-up tests).
+        idle: bool,
+    }
+    impl TrackingBackend {
+        fn new(id: &str, idle: bool) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_owned(),
+                cancelled: AtomicBool::new(false),
+                forgotten: AtomicBool::new(false),
+                idle,
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for TrackingBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let id = self.id.clone();
+            if self.idle {
+                let s = async_stream::stream! {
+                    yield Ok(Update::Text(id));
+                    futures::future::pending::<()>().await;
+                };
+                Ok(Box::pin(s))
+            } else {
+                let updates = vec![
+                    Ok(Update::Text(id)),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ];
+                Ok(Box::pin(tokio_stream::iter(updates)))
+            }
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            self.cancelled.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn forget_session(&self, _session: &SessionId) {
+            self.forgotten.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// A route that honors `meta.agent` (resolving to `Local(agent)`), falling back
     /// to the registry default — mirrors the real binary `SkillRoute` for the local
     /// arm so the registry-resolution path is exercised by agent id.
@@ -3679,6 +3922,240 @@ mod tests {
             cfg.model.as_deref(),
             Some("base-m"),
             "the entry's base model must flow even with no override"
+        );
+    }
+
+    // ---- Task 11: binding-driven follow-up/cancel + RAII eviction ----
+
+    /// Build a server over an explicit registry + `RegistryRoute(default)`, sharing
+    /// the given store so a test can inspect persisted task/session state.
+    fn build_registry_store(
+        registry: Arc<dyn AgentRegistry>,
+        store: Arc<dyn SessionStore>,
+        default: &str,
+    ) -> Arc<InboundServer> {
+        Arc::new(InboundServer::new(
+            registry,
+            store,
+            Arc::new(AutoApprove),
+            Arc::new(RegistryRoute {
+                default: AgentId::parse(default).unwrap(),
+            }),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "a",
+        ))
+    }
+
+    #[tokio::test]
+    async fn followup_uses_bound_backend_after_registry_edit() {
+        // Start a task on agent "a" using an IDLE backend so the first stream's
+        // producer stays alive — the binding therefore persists. Then "remove" agent
+        // "a" from the registry (a future resolve("a") would now fail). A FOLLOW-UP
+        // message for the SAME task must still reach the ORIGINAL "a" backend via the
+        // bound Arc — NOT unknown-agent, NOT the default. We prove it by asserting the
+        // follow-up's artifact text is "a" (the bound backend's id), with no error.
+        let a = TrackingBackend::new("a", /*idle*/ true);
+        let b = TrackingBackend::new("b", /*idle*/ false);
+        let registry = CountingRegistry::new(
+            "a",
+            vec![
+                (bare_entry("a"), a as Arc<dyn AgentBackend>),
+                (bare_entry("b"), b as Arc<dyn AgentBackend>),
+            ],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_registry_store(registry.clone(), store.clone(), "a");
+
+        // First message (streaming) on agent "a" with an explicit task id so the
+        // follow-up targets the same task. The idle backend keeps the producer (and
+        // thus the binding) alive.
+        let first = json!({
+            "taskId": "t-fu",
+            "message": { "text": "go", "metadata": { "a2a-bridge.agent": "a" } }
+        });
+        let resp = router(srv.clone())
+            .oneshot(post_request(methods::SEND_STREAMING_MESSAGE, first, "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Wait until the binding exists (bind-before-spawn makes this prompt).
+        let task = TaskId::parse("t-fu").unwrap();
+        let bindings = srv.bindings.clone();
+        let task_c = task.clone();
+        wait_until(|| futures::executor::block_on(bindings.lock()).contains_key(&task_c)).await;
+
+        // "Remove" agent "a": a future resolve("a") now fails. The bound Arc keeps the
+        // original backend reachable for the follow-up.
+        registry.remove_agent("a").await;
+
+        // Follow-up unary message for the SAME task (no agent metadata → would route
+        // to default "a" and re-resolve, which now fails — but the binding short-
+        // circuits that). Must succeed and reach the bound "a" backend.
+        let followup = json!({ "taskId": "t-fu", "message": { "text": "again" } });
+        let resp = router(srv.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, followup, "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("error").is_none(),
+            "follow-up must not error (binding bypasses re-resolve): {body}"
+        );
+        assert_eq!(
+            v["result"]["artifact"]["text"], "a",
+            "follow-up must reach the BOUND 'a' backend, not default/unknown: {body}"
+        );
+        // The original stream is still open; drop the server-side state by ending.
+        drop(srv);
+    }
+
+    #[tokio::test]
+    async fn cancel_uses_bound_backend_not_default() {
+        // Start a task on the NON-default agent "b" (binding created). An inbound
+        // tasks/cancel must cancel the "b" backend (the bound instance), NOT the
+        // default "a".
+        let a = TrackingBackend::new("a", /*idle*/ false);
+        let b = TrackingBackend::new("b", /*idle*/ true);
+        let a_probe = a.clone();
+        let b_probe = b.clone();
+        let registry = CountingRegistry::new(
+            "a",
+            vec![
+                (bare_entry("a"), a as Arc<dyn AgentBackend>),
+                (bare_entry("b"), b as Arc<dyn AgentBackend>),
+            ],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_registry_store(registry, store, "a");
+
+        // First (streaming, idle) message on agent "b" → binding for "b".
+        let first = json!({
+            "taskId": "t-cb",
+            "message": { "text": "go", "metadata": { "a2a-bridge.agent": "b" } }
+        });
+        let resp = router(srv.clone())
+            .oneshot(post_request(methods::SEND_STREAMING_MESSAGE, first, "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let task = TaskId::parse("t-cb").unwrap();
+        let bindings = srv.bindings.clone();
+        let task_c = task.clone();
+        wait_until(|| futures::executor::block_on(bindings.lock()).contains_key(&task_c)).await;
+
+        // Cancel the task.
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::CANCEL_TASK,
+                json!({ "taskId": "t-cb" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        wait_until(|| b_probe.cancelled.load(Ordering::SeqCst)).await;
+        assert!(
+            b_probe.cancelled.load(Ordering::SeqCst),
+            "cancel must reach the BOUND 'b' backend"
+        );
+        assert!(
+            !a_probe.cancelled.load(Ordering::SeqCst),
+            "cancel must NOT reach the default 'a' backend"
+        );
+        drop(srv);
+    }
+
+    #[tokio::test]
+    async fn binding_and_lease_evicted_on_producer_exit() {
+        // Start AND complete a local task (non-idle backend → producer exits cleanly).
+        // After the producer exits, the binding is removed, the slot's lease is
+        // released (lease_count == 0), and the per-session stash is forgotten.
+        let a = TrackingBackend::new("a", /*idle*/ false);
+        let a_probe = a.clone();
+        let registry =
+            CountingRegistry::new("a", vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)]);
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_registry_store(registry.clone(), store, "a");
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "taskId": "t-ev", "message": { "text": "go" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drain the stream to completion so the producer exits.
+        let _ = body_string(resp).await;
+
+        let task = TaskId::parse("t-ev").unwrap();
+        let bindings = srv.bindings.clone();
+        let task_c = task.clone();
+        // Eviction is async (spawned from the guard's Drop); poll for it.
+        wait_until(|| !futures::executor::block_on(bindings.lock()).contains_key(&task_c)).await;
+        wait_until(|| registry.lease_count("a") == 0).await;
+        assert_eq!(
+            registry.lease_count("a"),
+            0,
+            "the slot's lease must be released after the producer exits"
+        );
+        wait_until(|| a_probe.forgotten.load(Ordering::SeqCst)).await;
+        assert!(
+            a_probe.forgotten.load(Ordering::SeqCst),
+            "eviction must forget the per-session stash"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_evicted_on_early_disconnect() {
+        // Start a streaming task with an IDLE backend (producer stays alive), then
+        // drop the SSE receiver mid-stream (client disconnect). The RAII guard must
+        // still fire: binding removed AND lease released — proving eviction on the
+        // NON-clean exit path.
+        let a = TrackingBackend::new("a", /*idle*/ true);
+        let registry =
+            CountingRegistry::new("a", vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)]);
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_registry_store(registry.clone(), store, "a");
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "taskId": "t-dc", "message": { "text": "go" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let task = TaskId::parse("t-dc").unwrap();
+        let bindings = srv.bindings.clone();
+        let task_c = task.clone();
+        wait_until(|| futures::executor::block_on(bindings.lock()).contains_key(&task_c)).await;
+        assert_eq!(
+            registry.lease_count("a"),
+            1,
+            "lease held while task is live"
+        );
+
+        // Drop the response (SSE receiver) → client disconnect mid-stream.
+        drop(resp);
+
+        let task_c2 = task.clone();
+        wait_until(|| !futures::executor::block_on(bindings.lock()).contains_key(&task_c2)).await;
+        wait_until(|| registry.lease_count("a") == 0).await;
+        assert_eq!(
+            registry.lease_count("a"),
+            0,
+            "the RAII guard must release the lease on early disconnect"
         );
     }
 }
