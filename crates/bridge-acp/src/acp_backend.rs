@@ -306,12 +306,14 @@ impl AcpBackend {
     /// `Arc` out so the map mutex is released before any await. Always returns
     /// the SAME `Arc` for a given key, so the `OnceCell`/turn-lock/latch inside
     /// are shared across all callers for that bridge session.
+    ///
+    /// The critical section is a HashMap get-or-insert that NEVER yields, so the
+    /// async `lock().await` is held only for nanoseconds — there is no deadlock
+    /// risk and no chance of holding the map lock across an await. (`try_lock`
+    /// would PANIC if two tasks on different runtime threads raced here.)
     #[allow(dead_code)] // wired into production prompt/cancel in Tasks 3/4
-    fn session_entry(&self, key: &SessionId) -> Arc<AgentSession> {
-        let mut map = self
-            .sessions
-            .try_lock()
-            .expect("session map is never held across an await");
+    async fn session_entry(&self, key: &SessionId) -> Arc<AgentSession> {
+        let mut map = self.sessions.lock().await;
         if let Some(s) = map.get(key) {
             return Arc::clone(s);
         }
@@ -326,16 +328,24 @@ impl AcpBackend {
     /// Exactly-once minting [Cx-M2]: concurrent first calls for the same `key`
     /// share one `OnceCell` init future, so the agent sees `session/new` ONCE.
     ///
-    /// Cancel-latch [Cx-M2]: the minting task — and only it — checks the latch
-    /// the instant the id exists; if a `cancel` raced ahead of creation, it fires
+    /// Cancel-latch [Cx-M2]: the minting task — and only it — drains the latch
+    /// AFTER `OnceCell` has published the id (so a concurrent `request_cancel`
+    /// can already observe it); if a `cancel` raced ahead of creation it fires
     /// `session/cancel` for the freshly-minted id so the cancel is not dropped.
     /// The latch is *claimed* with an atomic swap so exactly one of the minting
     /// task and a concurrent `request_cancel` sends the notification (no double).
     ///
+    /// Lost-cancel window closed: the drain runs after `get_or_try_init` returns,
+    /// not inside the init closure. If a `request_cancel` ran while the id was
+    /// not yet observable (`get() == None`), it stored `true` and did not send;
+    /// the post-init drain (which runs once the id IS observable) then sees the
+    /// latch and sends. If `request_cancel` ran after the id became observable,
+    /// it and the drain race on the same `swap` and exactly one sends.
+    ///
     /// Task 3 calls this, then acquires `turn_lock` and sends `session/prompt`.
     #[allow(dead_code)] // wired into production prompt in Task 3
     async fn ensure_session(&self, key: &SessionId) -> Result<AgentSessionId, BridgeError> {
-        let entry = self.session_entry(key);
+        let entry = self.session_entry(key).await;
         let cx = self.cx()?;
         let cwd = self
             .config
@@ -343,27 +353,41 @@ impl AcpBackend {
             .map(|c| c.cwd.clone())
             .ok_or(BridgeError::AgentCrashed)?;
 
+        // Did THIS call mint the agent session? The init closure runs for at most
+        // one caller (`OnceCell`); set the flag inside it so only the minter does
+        // the post-init latch drain below.
+        let mut newly_minted = false;
         let id = entry
             .agent_id
             .get_or_try_init(|| async {
+                // The init closure does ONLY `session/new`: send the request and
+                // return the freshly-minted id. The cancel-latch drain is moved
+                // OUT of here (see below) so it runs AFTER `OnceCell` makes the id
+                // observable — closing the lost-cancel window where a concurrent
+                // `request_cancel` saw `get() == None`, didn't send, and the
+                // in-closure drain had already swapped the latch to false.
+                newly_minted = true;
                 let req = Self::new_session_request(cwd);
                 let resp = cx
                     .send_request(req)
                     .block_task()
                     .await
                     .map_err(|_| BridgeError::AgentCrashed)?;
-                let agent_id = resp.session_id;
-                // Cancel-latch: only the minting task reaches here. If a cancel
-                // raced ahead of `session/new`, CLAIM it (swap→false) and flush
-                // it now against the new id. The swap ensures a concurrent
-                // `request_cancel` that already fired won't make us double-send.
-                if entry.cancel_requested.swap(false, Ordering::SeqCst) {
-                    cx.send_notification(CancelNotification::new(agent_id.clone()))
-                        .map_err(|_| BridgeError::AgentCrashed)?;
-                }
-                Ok::<_, BridgeError>(agent_id)
+                Ok::<_, BridgeError>(resp.session_id)
             })
             .await?;
+
+        // Post-init cancel-latch drain — runs only on the minting call, and only
+        // AFTER `get_or_try_init` returned, i.e. once the id is observable to a
+        // concurrent `request_cancel`. CLAIM the latch with an atomic swap so
+        // exactly one of {this drain, a concurrent `request_cancel`} sends the
+        // notification (the other sees `false` and is a no-op): no double-send,
+        // and no lost cancel (see the interleaving argument on the method docs).
+        if newly_minted && entry.cancel_requested.swap(false, Ordering::SeqCst) {
+            cx.send_notification(CancelNotification::new(id.clone()))
+                .map_err(|_| BridgeError::AgentCrashed)?;
+        }
+
         Ok(id.clone())
     }
 
@@ -380,7 +404,7 @@ impl AcpBackend {
         F: FnOnce(AgentSessionId) -> Fut,
         Fut: std::future::Future<Output = Result<T, BridgeError>>,
     {
-        let entry = self.session_entry(key);
+        let entry = self.session_entry(key).await;
         // Mint (or reuse) the agent session BEFORE taking the turn lock, so a
         // first-prompt's `session/new` doesn't hold the turn lock while awaiting.
         let agent_id = self.ensure_session(key).await?;
@@ -426,7 +450,7 @@ impl AcpBackend {
     /// prompt result with `stopReason:"cancelled"`) on top of this.
     #[allow(dead_code)] // wired into production cancel in Task 4
     async fn request_cancel(&self, key: &SessionId) -> Result<(), BridgeError> {
-        let entry = self.session_entry(key);
+        let entry = self.session_entry(key).await;
         let cx = self.cx()?;
         // Set the latch FIRST so a `session/new` completing concurrently observes
         // it. If the id is ALREADY present, CLAIM the latch (swap→false): if we
@@ -1035,6 +1059,10 @@ mod tests {
         new_session_gate: Arc<Notify>,
         /// Whether `session/new` should wait on the gate before replying.
         gate_new_session: Arc<AtomicBool>,
+        /// Fires when a `session/new` handler ENTERS (before it awaits the gate),
+        /// so a driver can deterministically know the mint is in flight without
+        /// sleeping. Used to order create/cancel + concurrency races.
+        new_session_started: Arc<Notify>,
         /// The agent-minted session id the fake returns from `session/new`.
         minted_id: &'static str,
         /// Agent session ids observed via `session/cancel` notifications.
@@ -1055,6 +1083,7 @@ mod tests {
                 new_session_calls: Arc::new(AtomicUsize::new(0)),
                 new_session_gate: Arc::new(Notify::new()),
                 gate_new_session: Arc::new(AtomicBool::new(false)),
+                new_session_started: Arc::new(Notify::new()),
                 minted_id,
                 cancels: Arc::new(Mutex::new(Vec::new())),
                 cancel_seen: Arc::new(Notify::new()),
@@ -1094,6 +1123,9 @@ mod tests {
                         let r = r_new.clone();
                         async move {
                             r.new_session_calls.fetch_add(1, Ordering::SeqCst);
+                            // Signal entry BEFORE awaiting the gate so a driver can
+                            // deterministically know the mint is in flight (no sleep).
+                            r.new_session_started.notify_one();
                             if r.gate_new_session.load(Ordering::SeqCst) {
                                 // Hold the reply until the test opens the gate,
                                 // widening the create/cancel + concurrency window.
@@ -1198,8 +1230,11 @@ mod tests {
         let h1 = tokio::spawn(async move { b1.ensure_session(&k1).await });
         let h2 = tokio::spawn(async move { b2.ensure_session(&k2).await });
 
-        // Let both tasks reach the (single) session/new init before unblocking.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Deterministically wait for the (single) session/new init to be in flight
+        // — its handler signals on entry — before unblocking, instead of sleeping.
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("a session/new must reach the agent");
         // Release the held session/new reply (only one is ever in flight).
         rec.new_session_gate.notify_waiters();
 
@@ -1231,7 +1266,11 @@ mod tests {
         let b1 = Arc::clone(&be);
         let k1 = key.clone();
         let mint = tokio::spawn(async move { b1.ensure_session(&k1).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait deterministically until session/new is in flight (handler entered,
+        // parked on the gate) before racing the cancel — no load-sensitive sleep.
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("session/new must be in flight before the racing cancel");
 
         // Cancel RACES ahead of creation: only the latch should be set (the id
         // does not exist yet), so no cancel is sent on the wire YET.
@@ -1255,6 +1294,62 @@ mod tests {
             cancels.as_slice(),
             &["agent-sess-LATCH"],
             "latched cancel fires exactly once for the freshly-minted id"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_latched_during_mint_fires_exactly_once_no_double_send() {
+        // B2 regression: a cancel issued WHILE session/new is in flight must be
+        // delivered EXACTLY ONCE once the id is minted — never lost (the bug:
+        // in-closure drain ran before OnceCell published the id, so a concurrent
+        // request_cancel saw get()==None, didn't send, and the latch was cleared
+        // → lost), and never double-sent (drain + request_cancel both fire).
+        let rec = Recorder::new("agent-sess-B2");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        let be = Arc::new(connect_recording(rec.clone()).await);
+        let key = bkey("bridge-B2");
+
+        // Mint parks on the gate (session/new entered but not yet answered).
+        let b1 = Arc::clone(&be);
+        let k1 = key.clone();
+        let mint = tokio::spawn(async move { b1.ensure_session(&k1).await });
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("session/new must be in flight before the racing cancel");
+
+        // Cancel races ahead of the id becoming observable: it stores the latch
+        // and (since the id does not exist yet) sends nothing on the wire.
+        be.request_cancel(&key).await.unwrap();
+        assert!(
+            rec.cancels.lock().await.is_empty(),
+            "cancel before the id is observable must not be sent yet"
+        );
+
+        // Release session/new; the post-init drain (only the minter) flushes the
+        // latched cancel against the freshly-published id.
+        rec.new_session_gate.notify_waiters();
+        let minted = mint.await.unwrap().unwrap();
+        assert_eq!(minted.0.as_ref(), "agent-sess-B2");
+
+        // Exactly one session/cancel must land — proving not-lost.
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("latched cancel must reach the agent after the id is minted");
+
+        // A SECOND cancel on the now-active (reused) session goes straight out via
+        // request_cancel (id observable), so we expect exactly two total — proving
+        // the first was neither lost nor double-sent (a double would make this 3).
+        be.request_cancel(&key).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("post-mint cancel reaches the agent");
+
+        let cancels = rec.cancels.lock().await;
+        assert_eq!(
+            cancels.as_slice(),
+            &["agent-sess-B2", "agent-sess-B2"],
+            "latched cancel fires exactly once (not lost, not doubled); the later \
+             cancel fires once via the observable-id path"
         );
     }
 
