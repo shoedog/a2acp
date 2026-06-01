@@ -286,6 +286,33 @@ async fn route_to_each_agent_by_id() {
     assert_ne!(kiro_stop, "cancelled", "kiro turn must not be cancelled");
 }
 
+/// THE 3-AGENT HEADLINE: one registry holding ALL THREE real agents — codex, kiro,
+/// AND gemini — each selected purely by id, each answering its own PONG prompt.
+/// Resolves the dead_code warnings on `three_agent_snapshot` + GEMINI_* constants
+/// introduced in Task 1.
+#[tokio::test]
+#[ignore = "needs codex-acp + kiro-cli + gemini on PATH, all authed; makes real model calls"]
+async fn route_to_each_of_three_agents_by_id() {
+    let registry = Arc::new(
+        Registry::new(three_agent_snapshot(), acp_spawn_fn())
+            .expect("three-agent registry must validate + build"),
+    );
+
+    for (id, label) in [
+        (CODEX_ID, "s-codex3"),
+        (KIRO_ID, "s-kiro3"),
+        (GEMINI_ID, "s-gemini3"),
+    ] {
+        let (text, stop) = route_and_prompt(&registry, id, label, None).await;
+        eprintln!("=== {id} (3-agent registry) text ===\n{text}\n=== stop: {stop} ===");
+        assert!(
+            text.to_ascii_uppercase().contains("PONG"),
+            "agent {id:?} must stream PONG from one 3-agent registry; got text={text:?} stop={stop:?}"
+        );
+        assert_ne!(stop, "cancelled", "{id} turn must not be cancelled");
+    }
+}
+
 /// A per-request `AgentOverride` layered via `effective_config` is accepted by the
 /// real agent at session mint. We override codex's `mode` (a HARD `session/set_mode`
 /// for codex-acp); reaching `Update::Done` proves the override config was applied —
