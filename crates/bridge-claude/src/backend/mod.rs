@@ -278,8 +278,24 @@ impl AgentBackend for ClaudeCliBackend {
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        // Filled in Task 10.
-        let _ = session;
+        // Set the cancel latch on the proc so the reader maps the resulting EOF /
+        // error-result to Canceled, not Failed (§4 precedence), then invalidate the
+        // slot (hard kill) by identity. Returns immediately; the in-flight prompt
+        // stream observes Done{cancelled} via the reader. No-op if the session has
+        // no slot.
+        let slot = {
+            let map = self.inner.sessions.lock().await;
+            map.get(session).cloned()
+        };
+        if let Some(slot) = slot {
+            // SLOT-level latch first — honored even if the proc isn't minted yet (a
+            // cancel during the spawn window); the prompt's post-lock check sees it.
+            slot.cancel_requested.store(true, Ordering::SeqCst);
+            if let Some(proc) = slot.proc.get() {
+                proc.cancel_requested.store(true, Ordering::SeqCst);
+            }
+            Self::invalidate_slot(&self.inner, session, &slot).await;
+        }
         Ok(())
     }
 
