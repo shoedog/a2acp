@@ -84,3 +84,27 @@ So Claude can be a plain `kind="acp"` registry entry through the **existing conf
 - **No-fs posture retained:** `AcpBackend` advertises no fs/terminal capability, so the adapter
   won't send `fs/*` reverse calls — Claude (like kiro/codex/gemini through the bridge) cannot
   read/write files. fs-proxying is a separate, larger decision, out of scope here.
+
+## Restoring `bridge-claude` (if we need it back)
+
+The retirement was done as **one atomic commit** specifically so it is trivially recoverable.
+
+- **Retirement commit:** `15f89ac` *(refactor: retire bridge-claude + collapse AgentKind to Acp-only)*,
+  also reachable as the annotated tag **`bridge-claude-retired`**. It deleted, in one diff: the
+  `crates/bridge-claude/` crate (config/wire/proc/backend/reaper + all tests), `bin/a2a-bridge/tests/e2e_claude.rs`,
+  the `AgentKind::ClaudeCli` factory arm + the orphaned `ext_u64`/`ext_usize`, `parse_kind`'s `"claude-cli"` arm,
+  the `ClaudeCli` enum variant + doc/string refs, and the `bridge-claude` dep — and rewired the 3 affected tests.
+- **Restore everything at once:** `git revert 15f89ac` (or `git revert bridge-claude-retired`) reinstates the whole
+  backend + the `ClaudeCli` seam arm + the tests in one step. Resolve any conflicts against current `main`.
+- **Extract just the crate files:** `git checkout 15f89ac^ -- crates/bridge-claude bin/a2a-bridge/tests/e2e_claude.rs`
+  (then re-add the `bridge-claude` dep in `bin/a2a-bridge/Cargo.toml` and the `AgentKind::ClaudeCli` factory arm in
+  `main.rs`).
+- **Pristine 3c crate** (as originally shipped, ~92% covered, fully dual-reviewed): the Increment-3c merge **`a5b6b2e`** —
+  `git show a5b6b2e:crates/bridge-claude/src/backend/mod.rs`, etc.
+- **Design rationale** (warm-pool, `invalidate_slot` identity teardown, reaper-vs-follow-up TOCTOU, deferred-init,
+  the `pending_terminal` stash): `docs/superpowers/specs/2026-05-31-a2a-bridge-v3c-claude-design.md` (rev3) +
+  `docs/superpowers/plans/2026-06-01-a2a-bridge-v3c.md`.
+
+When it would come back: if a future need requires the bridge to own Claude's process lifecycle (e.g. a custom warm-pool
+policy, non-ACP stream-json features, or fine CLI-flag control the `claude-agent-acp` allowlist blocks) that
+`claude-agent-acp` cannot serve.
