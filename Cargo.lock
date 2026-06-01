@@ -12,7 +12,6 @@ dependencies = [
  "bridge-a2a-inbound",
  "bridge-a2a-outbound",
  "bridge-acp",
- "bridge-claude",
  "bridge-core",
  "bridge-observ",
  "bridge-policy",
@@ -405,21 +404,6 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "bridge-claude"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "bridge-core",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tokio-test",
  "tracing",
 ]
 

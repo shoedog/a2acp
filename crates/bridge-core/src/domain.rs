@@ -24,14 +24,13 @@ pub enum Effort {
     Max,
 }
 
-/// Which adapter implementation backs an agent entry. Parsed from the TOML
-/// `kind` string in `bin/a2a-bridge/src/config.rs` (like `Effort`), defaulting
-/// to `Acp` for back-compat. `ClaudeCli` selects the warm Claude Code backend.
+/// Which adapter implementation backs an agent entry. Parsed from the TOML `kind`
+/// string in `bin/a2a-bridge/src/config.rs` (like `Effort`), defaulting to `Acp`.
+/// Single-variant today; a 2nd kind (B1 `ClaudeApi`) re-expands the seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentKind {
     #[default]
     Acp,
-    ClaudeCli,
 }
 
 /// A named bundle: which CLI adapter to launch + model/effort/mode configuration.
@@ -217,9 +216,9 @@ mod tests {
     fn agent_entry_carries_kind() {
         let e = AgentEntry {
             id: AgentId::parse("x").unwrap(),
-            cmd: "claude".into(),
+            cmd: "codex-acp".into(),
             args: vec![],
-            kind: AgentKind::ClaudeCli,
+            kind: AgentKind::Acp,
             model_provider: None,
             model: None,
             effort: None,
@@ -232,7 +231,7 @@ mod tests {
             version: None,
             extensions: Default::default(),
         };
-        assert_eq!(e.kind, AgentKind::ClaudeCli);
+        assert_eq!(e.kind, AgentKind::Acp);
     }
 
     #[test]

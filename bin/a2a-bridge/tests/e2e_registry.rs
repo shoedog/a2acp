@@ -60,6 +60,11 @@ const GEMINI_CMD: &str = "gemini";
 const GEMINI_MODEL: &str = "gemini-2.5-flash";
 const GEMINI_AUTH: &str = "oauth-personal";
 
+const CLAUDE_ID: &str = "claude";
+const CLAUDE_CMD: &str = "claude-agent-acp";
+// This dev slice pins Haiku (cheapest) to save cost; auth is ambient subscription.
+const CLAUDE_MODEL: &str = "haiku";
+
 // codex model + a valid mode (codex-acp issues a HARD `session/set_mode`; a
 // rejected mode fails session setup, so a Done proves the mode applied).
 const CODEX_MODEL: &str = "gpt-5.5";
@@ -159,6 +164,40 @@ fn three_agent_snapshot() -> RegistrySnapshot {
             ),
         ],
         allowed_cmds: vec![CODEX_CMD.into(), KIRO_CMD.into(), GEMINI_CMD.into()],
+    }
+}
+
+/// All FOUR real agents from one snapshot. Claude is appended LAST (index 3) so the
+/// existing indices the 2-/3-agent tests rely on are untouched.
+fn four_agent_snapshot() -> RegistrySnapshot {
+    RegistrySnapshot {
+        default: AgentId::parse(CODEX_ID).unwrap(),
+        entries: vec![
+            entry(
+                CODEX_ID,
+                CODEX_CMD,
+                &[],
+                Some(CODEX_MODEL),
+                Some(CODEX_MODE),
+                None,
+            ),
+            entry(KIRO_ID, KIRO_CMD, &["acp"], Some(KIRO_MODEL), None, None),
+            entry(
+                GEMINI_ID,
+                GEMINI_CMD,
+                &["--acp"],
+                Some(GEMINI_MODEL),
+                None,
+                Some(GEMINI_AUTH),
+            ),
+            entry(CLAUDE_ID, CLAUDE_CMD, &[], Some(CLAUDE_MODEL), None, None),
+        ],
+        allowed_cmds: vec![
+            CODEX_CMD.into(),
+            KIRO_CMD.into(),
+            GEMINI_CMD.into(),
+            CLAUDE_CMD.into(),
+        ],
     }
 }
 
@@ -405,6 +444,82 @@ async fn live_edit_changes_new_session_model() {
         b_stop, "cancelled",
         "edited-model kiro turn must not be cancelled"
     );
+}
+
+/// Drain one prompt turn on an already-resolved backend + session: returns the
+/// joined streamed text + the terminal stop reason. Panics on a real failure or a
+/// missing terminal Done (mirrors route_and_prompt's drain).
+async fn drain_one_turn(
+    backend: &std::sync::Arc<dyn AgentBackend>,
+    session: &SessionId,
+    prompt_text: &str,
+) -> (String, String) {
+    // Bound the whole prompt+drain (like route_and_prompt's ROUND_TRIP_TIMEOUT) so the
+    // ignored live gate FAILS bounded instead of hanging if a lifecycle step stalls.
+    tokio::time::timeout(ROUND_TRIP_TIMEOUT, async move {
+        let parts = vec![Part {
+            text: prompt_text.to_string(),
+        }];
+        let mut stream = backend
+            .prompt(session, parts)
+            .await
+            .unwrap_or_else(|e| panic!("prompt must return a stream: {e:?}"));
+        let mut texts = Vec::new();
+        loop {
+            match stream.next().await {
+                Some(Ok(Update::Text(t))) => texts.push(t),
+                Some(Ok(Update::Permission(_))) => {}
+                Some(Ok(Update::Done { stop_reason })) => return (texts.join(""), stop_reason),
+                Some(Err(e)) => panic!("turn surfaced a terminal error before Done: {e:?}"),
+                None => panic!("stream ended WITHOUT a terminal Update::Done"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("a single turn exceeded {ROUND_TRIP_TIMEOUT:?} (a lifecycle step hung)")
+    })
+}
+
+#[tokio::test]
+#[ignore = "needs claude-agent-acp on PATH + subscription-logged-in claude; makes real (Haiku) model calls"]
+async fn claude_warm_two_turns_via_acp() {
+    let registry = Arc::new(
+        Registry::new(four_agent_snapshot(), acp_spawn_fn())
+            .expect("four-agent registry must validate + build"),
+    );
+    // Resolve Claude ONCE; hold the lease across both turns so the warm ACP session persists.
+    let resolved = registry
+        .resolve(&AgentId::parse(CLAUDE_ID).unwrap())
+        .await
+        .expect("resolve(claude) must spawn claude-agent-acp (on PATH + subscription authed)");
+    let session = SessionId::parse("s-claude-warm").unwrap();
+    let eff = effective_config(&resolved.entry, None);
+    resolved
+        .backend
+        .configure_session(&session, &eff)
+        .await
+        .expect("configure_session must accept the claude eff (model=haiku)");
+
+    // Turn 1: plant the number.
+    let (_r1, _s1) = drain_one_turn(
+        &resolved.backend,
+        &session,
+        "Remember the number 7. Reply with just OK.",
+    )
+    .await;
+    // Turn 2: SAME session → warm ACP session retains context.
+    let (r2, s2) = drain_one_turn(
+        &resolved.backend,
+        &session,
+        "What number did I ask you to remember? Reply with just the number.",
+    )
+    .await;
+    assert!(
+        r2.contains('7'),
+        "warm 2nd turn must recall 7 from the SAME ACP session (cold would fail; question has no '7'); got r2={r2:?} s2={s2:?}"
+    );
+    drop(resolved);
 }
 
 /// A unique, created, absolute temp directory for an agent's session cwd.
