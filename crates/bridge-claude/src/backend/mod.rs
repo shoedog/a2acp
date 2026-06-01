@@ -61,6 +61,11 @@ impl ClaudeCliBackend {
         Self::live_count(&self.inner).await
     }
 
+    #[doc(hidden)]
+    pub async fn reap_now(&self) {
+        reaper::reap_pass_for_test(&self.inner).await
+    }
+
     /// Remove the map entry for `session` ONLY if its current value is the SAME
     /// Arc the caller holds (`Arc::ptr_eq`), then terminate that slot's proc. THE
     /// single teardown primitive (reap/LRU/cancel/turn-timeout/abandoned-turn).
