@@ -12,6 +12,7 @@ dependencies = [
  "bridge-a2a-inbound",
  "bridge-a2a-outbound",
  "bridge-acp",
+ "bridge-claude",
  "bridge-core",
  "bridge-observ",
  "bridge-policy",

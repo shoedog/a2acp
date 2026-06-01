@@ -19,6 +19,45 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex, OnceLock};
 use tower::ServiceExt;
 
+// ---- SSE payload helpers ----
+
+/// Extract all `data:` payloads from an SSE body (one per line starting with "data: ").
+fn sse_data_payloads(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|s| s.trim_end_matches('\r').to_owned())
+        .collect()
+}
+
+/// Extract and concatenate the agent's reply text from artifact parts only —
+/// deliberately excludes envelope fields (taskId, contextId, messageId, etc.)
+/// so that a UUID containing '7' cannot cause a false pass.
+///
+/// Parses every `data:` payload as an `a2a::StreamResponse`; for each
+/// `ArtifactUpdate` frame, collects every `Part` whose content is `Text`.
+fn sse_agent_text(body: &str) -> String {
+    sse_data_payloads(body)
+        .iter()
+        .filter_map(|payload| serde_json::from_str::<a2a::StreamResponse>(payload).ok())
+        .filter_map(|sr| {
+            if let a2a::StreamResponse::ArtifactUpdate(ev) = sr {
+                Some(ev.artifact.parts)
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .filter_map(|part| {
+            if let a2a::PartContent::Text(t) = part.content {
+                Some(t)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 // ---- python fake (self-contained; default behavior = remember the number) ----
 const FAKE_PY: &str = r#"#!/usr/bin/env python3
 import sys, json
@@ -162,7 +201,12 @@ async fn inbound_two_turns_same_task_reuse_warm_proc() {
         .unwrap();
     assert_eq!(r1.status(), StatusCode::OK);
     let b1 = body_string(r1).await;
-    assert!(b1.contains('7'), "turn1 produced the number: {b1}");
+    let reply1 = sse_agent_text(&b1);
+    assert!(
+        reply1.contains('7'),
+        "turn1 agent reply must contain '7' (got {:?}); full SSE: {b1}",
+        reply1
+    );
 
     // SYNCHRONIZE on the async BindingGuard eviction (session = "session-t-warm").
     wait_until(|| forgotten().lock().unwrap().contains("session-t-warm")).await;
@@ -177,8 +221,14 @@ async fn inbound_two_turns_same_task_reuse_warm_proc() {
         .unwrap();
     assert_eq!(r2.status(), StatusCode::OK);
     let b2 = body_string(r2).await;
+    let reply2 = sse_agent_text(&b2);
+    // Warm-continuity proof: a cold-respawned proc (no memory) replies "OK";
+    // a warm proc that retained context replies "7".  Both conditions are required
+    // so that a UUID-digit false-pass is structurally impossible.
     assert!(
-        b2.contains('7'),
-        "turn2 must reach the warm proc that remembers 7: {b2}"
+        reply2.contains('7') && !reply2.contains("OK"),
+        "turn2 agent reply must contain '7' and not contain 'OK' (warm proc, retained memory); \
+         got {:?}; full SSE: {b2}",
+        reply2
     );
 }
