@@ -12,6 +12,8 @@
 
 **Branch:** `feat/claude-acp-migration` off `main`.
 
+> **Plan rev2** — folds the dual plan review (Codex + Claude). Both verified the retirement blast radius is complete (no orphan beyond `ext_u64`/`ext_usize`) and resolved the seam question: **(High)** Task 4 now KEEPS the one-arm `match entry.kind { AgentKind::Acp => … }` (matches spec §4; a one-arm match over a single-variant enum is clippy-verified clean — the earlier "collapse the match" was wrong); **(Med)** `drain_one_turn` is wrapped in `ROUND_TRIP_TIMEOUT` so the live gate fails bounded; **(Med)** the corpus provenance reads the real `agentInfo.version` (+ pin install `@0.39.0`); **(Med)** Task 5 runs the THREE hard CI coverage gates (`--workspace`/`bridge-core`/`bridge-acp` `--fail-under-lines`) as blockers, not soft signals; **(Low)** the claude replay test tolerates a `PermissionOutcome`; **(Low)** the Haiku guarantee is enforced at the capture (`set_model→{}`), reconciled with the spec — the model isn't observable through the bridge (`Update::Done` carries only `stop_reason`), so the live gate can't assert it (a documented, low residual risk since `set_model` is probe-verified reliable).
+
 **Probe-pinned facts (used below):** `cmd="claude-agent-acp"`, `args=[]`, `auth_method=None`, `model="haiku"` (this dev slice). `session/set_model(haiku)` returns `{}` (success). The `session/prompt` result is `{"stopReason":"end_turn","usage":{...}}` — **no model id**; `usage_update` (dropped by `map_session_update`) carries `cost`. Session/update variants emitted: `available_commands_update`, `config_option_update`, `usage_update`, `agent_thought_chunk` (all → `None` in replay — only `agent_message_chunk` text maps).
 
 ---
@@ -90,21 +92,27 @@ async fn drain_one_turn(
     session: &SessionId,
     prompt_text: &str,
 ) -> (String, String) {
-    let parts = vec![Part { text: prompt_text.to_string() }];
-    let mut stream = backend
-        .prompt(session, parts)
-        .await
-        .unwrap_or_else(|e| panic!("prompt must return a stream: {e:?}"));
-    let mut texts = Vec::new();
-    loop {
-        match stream.next().await {
-            Some(Ok(Update::Text(t))) => texts.push(t),
-            Some(Ok(Update::Permission(_))) => {}
-            Some(Ok(Update::Done { stop_reason })) => return (texts.join(""), stop_reason),
-            Some(Err(e)) => panic!("turn surfaced a terminal error before Done: {e:?}"),
-            None => panic!("stream ended WITHOUT a terminal Update::Done"),
+    // Bound the whole prompt+drain (like route_and_prompt's ROUND_TRIP_TIMEOUT) so the
+    // ignored live gate FAILS bounded instead of hanging if a lifecycle step stalls.
+    tokio::time::timeout(ROUND_TRIP_TIMEOUT, async move {
+        let parts = vec![Part { text: prompt_text.to_string() }];
+        let mut stream = backend
+            .prompt(session, parts)
+            .await
+            .unwrap_or_else(|e| panic!("prompt must return a stream: {e:?}"));
+        let mut texts = Vec::new();
+        loop {
+            match stream.next().await {
+                Some(Ok(Update::Text(t))) => texts.push(t),
+                Some(Ok(Update::Permission(_))) => {}
+                Some(Ok(Update::Done { stop_reason })) => return (texts.join(""), stop_reason),
+                Some(Err(e)) => panic!("turn surfaced a terminal error before Done: {e:?}"),
+                None => panic!("stream ended WITHOUT a terminal Update::Done"),
+            }
         }
-    }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("a single turn exceeded {ROUND_TRIP_TIMEOUT:?} (a lifecycle step hung)"))
 }
 
 #[tokio::test]
@@ -170,7 +178,7 @@ git commit -m "test(e2e): register claude (kind=acp via claude-agent-acp) + warm
 - Create: `crates/bridge-acp/tests/corpus/claude-agent-acp.jsonl`
 - Create: `/tmp/caacp-capture.py` (throwaway)
 
-> A real captured round-trip the corpus DoD gate requires. The driver sets `model=haiku`, **verifies `session/set_model(haiku)` returned `{}` (the Haiku cost guarantee — set_model is otherwise best-effort)**, records the `usage_update` cost as Haiku evidence, and writes the frames. Prereq: `npm install -g @agentclientprotocol/claude-agent-acp` (or it npx-resolves); subscription-logged-in `claude`.
+> A real captured round-trip the corpus DoD gate requires. The driver sets `model=haiku`, **verifies `session/set_model(haiku)` returned `{}` (the Haiku cost guarantee — set_model is otherwise best-effort)**, records the `usage_update` cost as Haiku evidence, reads the real `agentInfo.version` into the provenance header (so the corpus version isn't a blind hard-code), and writes the frames. Prereq: **`npm install -g @agentclientprotocol/claude-agent-acp@0.39.0`** (pin the version; `npx -y @agentclientprotocol/claude-agent-acp@0.39.0` also works); subscription-logged-in `claude`.
 
 - [ ] **Step 1: Write the capture driver**
 
@@ -211,7 +219,9 @@ def wait(pred, t=90):
     return None
 
 send({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":False,"writeTextFile":False},"terminal":False}}})
-wait(lambda o: o.get("id") == 0)
+_init = wait(lambda o: o.get("id") == 0)
+acp_version = (_init or {}).get("result", {}).get("agentInfo", {}).get("version", "unknown")
+print("agentInfo.version:", acp_version)
 send({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}})
 sid = wait(lambda o: o.get("id") == 1)["result"]["sessionId"]
 # Set Haiku and VERIFY it was accepted ({}) — the cost guarantee.
@@ -229,7 +239,7 @@ for fr in frames:
     if u.get("sessionUpdate") == "usage_update" and "cost" in u:
         print("usage cost (Haiku-range expected):", json.dumps(u["cost"]))
 
-hdr = {"_provenance":"REAL-CAPTURE","agent":"claude-agent-acp","version":"0.39.0",
+hdr = {"_provenance":"REAL-CAPTURE","agent":"claude-agent-acp","version":acp_version,
        "cmd":"claude-agent-acp","model":"haiku","captured":"2026-06-01",
        "captured_by":"claude-agent-acp gate-closing capture harness"}
 with open("crates/bridge-acp/tests/corpus/claude-agent-acp.jsonl","w") as f:
@@ -289,7 +299,11 @@ fn claude_agent_acp_real_capture_replays_through_backend() {
         match replay(frame) {
             Some(ReplayOutcome::Update(Update::Text(t))) => { modeled += 1; texts.push(t); }
             Some(ReplayOutcome::Done(stop)) => { modeled += 1; done = Some(stop); }
-            Some(other) => panic!("unexpected modeled outcome from claude capture: {other:?}"),
+            // A Reply-PONG prompt with no fs caps should not trigger a reverse permission
+            // request, but tolerate one (auto-approved by decide_for_corpus) so a stray
+            // session/request_permission frame doesn't trip the panic arm — it doesn't
+            // affect the text/done assertions.
+            Some(ReplayOutcome::PermissionOutcome(_)) => {}
             None => {} // DROP: available_commands_update / config_option_update / usage_update / agent_thought_chunk + init/session-new results
         }
     }
@@ -337,7 +351,18 @@ git commit -m "test(corpus): replay claude-agent-acp real frames + add to the Do
 
 - [ ] **Step 1: Delete the consumers in `bin/a2a-bridge`**
 
-- `bin/a2a-bridge/src/main.rs`: delete the entire `AgentKind::ClaudeCli => { … }` arm (lines ~124-139), and the now-redundant `match`/`use bridge_core::domain::AgentKind;` wrapper — collapse to the `Acp` body directly (the factory no longer branches). Concretely, replace the `use AgentKind; match entry.kind { Acp => { <acp body> } ClaudeCli => {…} }` with just `<acp body>` (the `AcpConfig{…}` + `AcpBackend::spawn(…).with_policy(policy)` + `Ok(Arc::new(be) …)`).
+- `bin/a2a-bridge/src/main.rs`: delete ONLY the `AgentKind::ClaudeCli => { … }` arm (lines ~124-139). **KEEP the one-arm `match entry.kind { AgentKind::Acp => { <acp body> } }`** and the `use bridge_core::domain::AgentKind;` — the factory seam is retained per spec §4 (a one-arm match over a single-variant enum is review-verified clippy-clean under `-D warnings`; `match_single_binding` fires only on binding/wildcard patterns, not a unit-variant path). Do NOT collapse the match. Result:
+  ```rust
+  use bridge_core::domain::AgentKind;
+  match entry.kind {
+      AgentKind::Acp => {
+          let acp = AcpConfig { cwd, model: entry.model.clone(), mode: entry.mode.clone(),
+              auth_method: entry.auth_method.clone(), ..AcpConfig::default() };
+          let be = AcpBackend::spawn(&entry.cmd, &args_ref, acp).await?.with_policy(policy);
+          Ok(Arc::new(be) as Arc<dyn AgentBackend>)
+      }
+  }
+  ```
 - `bin/a2a-bridge/src/config.rs`: delete `ext_u64` and `ext_usize` (lines ~246-258) and any inline tests for them; in `parse_kind` delete the `"claude-cli" => AgentKind::ClaudeCli,` arm and change the error string to `"invalid kind: {other:?} (expected acp)"`; fix the `kind` field doc (config.rs:121) to drop `| "claude-cli"`.
 - `bin/a2a-bridge/Cargo.toml`: delete the `bridge-claude = { path = "../../crates/bridge-claude" }` line.
 - Delete the file `bin/a2a-bridge/tests/e2e_claude.rs`.
@@ -393,7 +418,7 @@ pub enum AgentKind {
 - [ ] **Step 4: Regenerate `Cargo.lock` + build the whole workspace**
 
 Run: `cargo build --workspace` (this drops `bridge-claude` from `Cargo.lock`).
-Expected: builds clean. If the `match entry.kind` collapse left an `unused import` (`AgentKind`) or `unreachable`/`single_binding` issue, fix it (the factory no longer needs the `match` or the `use AgentKind`).
+Expected: builds clean. The one-arm `match entry.kind { AgentKind::Acp => … }` + the `use AgentKind` are KEPT (the seam) and are clippy-clean — do NOT remove them.
 
 - [ ] **Step 5: Verify green + grep-clean**
 
@@ -431,10 +456,17 @@ the seam is kept for B1. See ADR-0006."
 Run: `cargo test -p a2a-bridge --test e2e_registry claude_warm_two_turns_via_acp -- --ignored --nocapture`
 Expected: PASS — turn 2 recalls `7` from the same warm ACP session via `claude-agent-acp` (Haiku). Requires `claude-agent-acp` on PATH (`npm install -g @agentclientprotocol/claude-agent-acp`) + subscription-logged-in `claude`. Record the result. If it fails at resolve with an auth error, confirm `claude` is logged in; do NOT pass `--hide-claude-auth`.
 
-- [ ] **Step 3: Final coverage re-measure**
+- [ ] **Step 3: Run the THREE HARD coverage gates (the exact CI commands — these BLOCK merge)**
 
-Run: `cargo llvm-cov clean --workspace && cargo llvm-cov --workspace --summary-only`
-Expected: judge against the gates (workspace ≥85%, bridge-core ≥90%). **Caveat:** deleting the ~92%-covered `bridge-claude` can move the workspace % — if it dips below 85%, that's a real signal (the remaining crates' average), report it; bridge-core ≥90% should hold (removing the `ClaudeCli` variant + retargeting the test removes lines).
+`.github/workflows/ci.yml` enforces three hard `--fail-under-lines` gates; run all three after a clean (a failure here is a merge blocker, NOT a soft signal):
+
+```bash
+cargo llvm-cov clean --workspace
+cargo llvm-cov --workspace     --fail-under-lines 85
+cargo llvm-cov --package bridge-core --fail-under-lines 90
+cargo llvm-cov --package bridge-acp  --fail-under-lines 90
+```
+Expected: all PASS. **Risk assessment (review):** `bridge-claude` was 92.17% — *below* the 92.83% workspace average — so deleting it nudges the workspace average UP, not below 85%; `bridge-core` (~98%) loses only the `ClaudeCli` variant + the retargeted test (lines removed, not uncovered); `bridge-acp` (~95%) only GAINS the new claude corpus test. So all three should hold comfortably. If any fails, that's a real blocker — report the number and add focused tests for the uncovered lines before finishing.
 
 - [ ] **Step 4: Commit + final holistic review + finish**
 
