@@ -3,4 +3,3 @@
 pub mod acp_backend;
 pub mod framing;
 pub mod replay;
-pub mod supervisor;

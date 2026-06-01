@@ -11,15 +11,22 @@ pub struct Supervised {
 }
 
 impl Supervised {
-    pub fn spawn(prog: &str, args: &[&str]) -> std::io::Result<Self> {
-        let child = Command::new(prog)
-            .args(args)
+    pub fn spawn(
+        prog: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<Self> {
+        let mut cmd = Command::new(prog);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0) // child becomes its own group leader (pgid == child pid)
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        let child = cmd.spawn()?;
         let pid = child.id().expect("child has a pid before wait");
         Ok(Self { child, pid })
     }
@@ -77,7 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_reaps_child_no_zombie() {
-        let child = Supervised::spawn("/bin/sh", &["-c", "sleep 30"]).unwrap();
+        let child = Supervised::spawn("/bin/sh", &["-c", "sleep 30"], None).unwrap();
         let pid = child.pid();
         assert!(proc_state(pid).is_some()); // alive
         child.terminate(Duration::from_millis(300)).await;
@@ -97,6 +104,7 @@ mod tests {
                 "-c",
                 "trap '' TERM; sleep 30 & echo $! > /tmp/a2a_desc_pid.$$; wait",
             ],
+            None,
         )
         .unwrap();
         let pid = child.pid();
@@ -127,6 +135,7 @@ mod tests {
         let child = Supervised::spawn(
             "/bin/sh",
             &["-c", "trap '' TERM; while :; do sleep 0.2; done"],
+            None,
         )
         .unwrap();
         let pid = child.pid();

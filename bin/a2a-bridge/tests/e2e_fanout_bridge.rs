@@ -38,12 +38,12 @@ use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
 use bridge_acp::{
     acp_backend::{AcpBackend, AcpConfig},
     replay::ReplayBackend,
-    supervisor::Supervised,
 };
 use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
 use bridge_core::ports::{DelegationPort, RouteDecision};
+use bridge_core::process::Supervised;
 use bridge_policy::auth::AlwaysGrant;
 use bridge_policy::permission::AutoPolicy;
 use bridge_store::sqlite::SqliteStore;
@@ -108,7 +108,7 @@ async fn bridge_a_fanout_through_bridge_b_to_kiro() {
     // Bridge B — real Kiro backend, no delegation (serves kiro-code).
     // ----------------------------------------------------------------
 
-    let supervised_b = Supervised::spawn("kiro-cli", &["acp"])
+    let supervised_b = Supervised::spawn("kiro-cli", &["acp"], None)
         .expect("kiro-cli must be on PATH and authenticated; run `kiro-cli whoami` first");
     let backend_b = Arc::new(
         AcpBackend::from_child(

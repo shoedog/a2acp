@@ -24,12 +24,24 @@ pub enum Effort {
     Max,
 }
 
+/// Which adapter implementation backs an agent entry. Parsed from the TOML
+/// `kind` string in `bin/a2a-bridge/src/config.rs` (like `Effort`), defaulting
+/// to `Acp` for back-compat. `ClaudeCli` selects the warm Claude Code backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentKind {
+    #[default]
+    Acp,
+    ClaudeCli,
+}
+
 /// A named bundle: which CLI adapter to launch + model/effort/mode configuration.
 #[derive(Debug, Clone)]
 pub struct AgentEntry {
     pub id: AgentId,
     pub cmd: String,
     pub args: Vec<String>,
+    /// Adapter kind (selects the backend factory arm). Default `Acp`.
+    pub kind: AgentKind,
     pub model_provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<Effort>,
@@ -197,11 +209,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_kind_defaults_to_acp() {
+        assert_eq!(AgentKind::default(), AgentKind::Acp);
+    }
+
+    #[test]
+    fn agent_entry_carries_kind() {
+        let e = AgentEntry {
+            id: AgentId::parse("x").unwrap(),
+            cmd: "claude".into(),
+            args: vec![],
+            kind: AgentKind::ClaudeCli,
+            model_provider: None,
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: None,
+            auth_method: None,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: Default::default(),
+        };
+        assert_eq!(e.kind, AgentKind::ClaudeCli);
+    }
+
+    #[test]
     fn effective_config_layers_override_over_entry() {
         let entry = AgentEntry {
             id: crate::ids::AgentId::parse("codex").unwrap(),
             cmd: "codex-acp".into(),
             args: vec![],
+            kind: AgentKind::Acp,
             model_provider: Some("openai".into()),
             model: Some("gpt-5.5".into()),
             effort: Some(Effort::High),

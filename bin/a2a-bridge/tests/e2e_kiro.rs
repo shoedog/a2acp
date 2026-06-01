@@ -21,14 +21,12 @@ use std::sync::Arc;
 mod common;
 
 use bridge_a2a_inbound::server::InboundServer;
-use bridge_acp::{
-    acp_backend::{AcpBackend, AcpConfig},
-    supervisor::Supervised,
-};
+use bridge_acp::acp_backend::{AcpBackend, AcpConfig};
 use bridge_core::domain::{RouteTarget, TaskMeta};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
 use bridge_core::ports::RouteDecision;
+use bridge_core::process::Supervised;
 use bridge_policy::auth::AlwaysGrant;
 use bridge_policy::permission::AutoPolicy;
 use bridge_store::sqlite::SqliteStore;
@@ -50,7 +48,7 @@ impl RouteDecision for E2eKiroRoute {
 #[tokio::test]
 async fn real_kiro_round_trip_returns_pong() {
     // 1. Spawn the real kiro-cli agent child process.
-    let supervised = Supervised::spawn("kiro-cli", &["acp"])
+    let supervised = Supervised::spawn("kiro-cli", &["acp"], None)
         .expect("kiro-cli must be on PATH and executable; run `kiro-cli whoami` first");
 
     let acp_config = AcpConfig {

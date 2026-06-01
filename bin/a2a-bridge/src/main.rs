@@ -103,20 +103,43 @@ async fn main() -> Result<(), BoxError> {
             };
             let args: Vec<String> = entry.args.clone();
             let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-            let acp = AcpConfig {
-                cwd,
-                model: entry.model.clone(),
-                mode: entry.mode.clone(),
-                auth_method: entry.auth_method.clone(),
-                // handshake_timeout / cancel_grace: reuse the codebase defaults.
-                ..AcpConfig::default()
-            };
-            let be = AcpBackend::spawn(&entry.cmd, &args_ref, acp)
-                .await?
-                // Thread the system policy into the backend so its reverse-permission
-                // decisions match the inbound server's policy (Task 5/6).
-                .with_policy(policy);
-            Ok(Arc::new(be) as Arc<dyn AgentBackend>)
+            use bridge_core::domain::AgentKind;
+            match entry.kind {
+                AgentKind::Acp => {
+                    let acp = AcpConfig {
+                        cwd,
+                        model: entry.model.clone(),
+                        mode: entry.mode.clone(),
+                        auth_method: entry.auth_method.clone(),
+                        // handshake_timeout / cancel_grace: reuse the codebase defaults.
+                        ..AcpConfig::default()
+                    };
+                    let be = AcpBackend::spawn(&entry.cmd, &args_ref, acp)
+                        .await?
+                        // Thread the system policy into the backend so its reverse-permission
+                        // decisions match the inbound server's policy (Task 5/6).
+                        .with_policy(policy);
+                    Ok(Arc::new(be) as Arc<dyn AgentBackend>)
+                }
+                AgentKind::ClaudeCli => {
+                    let _ = &policy;
+                    let claude_cfg = bridge_claude::ClaudeConfig {
+                        cwd,
+                        model: entry.model.clone(),
+                        extra_args: entry.args.clone(),
+                        idle_ttl: crate::config::ext_u64(&entry.extensions, "idle_ttl_secs")
+                            .map(std::time::Duration::from_secs)
+                            .unwrap_or(bridge_claude::config::DEFAULT_IDLE_TTL),
+                        max_warm: crate::config::ext_usize(&entry.extensions, "max_warm")
+                            .unwrap_or(bridge_claude::config::DEFAULT_MAX_WARM),
+                        max_sessions: crate::config::ext_usize(&entry.extensions, "max_sessions")
+                            .unwrap_or(bridge_claude::config::DEFAULT_MAX_SESSIONS),
+                        ..bridge_claude::ClaudeConfig::default()
+                    };
+                    let be = bridge_claude::ClaudeCliBackend::spawn(&entry.cmd, claude_cfg).await?;
+                    Ok(Arc::new(be) as Arc<dyn AgentBackend>)
+                }
+            }
         })
     });
 

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use bridge_core::domain::{AgentEntry, RegistrySnapshot};
+use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot};
 use bridge_core::ids::AgentId;
 use bridge_core::ports::{AgentBackend, AgentRegistry};
 use bridge_registry::registry::{Registry, SpawnFn};
@@ -24,6 +24,7 @@ pub fn single_agent_registry(id: &str, backend: Arc<dyn AgentBackend>) -> Arc<dy
         id: agent_id.clone(),
         cmd: "test-cmd".into(),
         args: vec![],
+        kind: AgentKind::Acp,
         model_provider: None,
         model: None,
         effort: None,

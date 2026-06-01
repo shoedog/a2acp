@@ -17,6 +17,7 @@ bridge-store = { path = "../../crates/bridge-store" }
 bridge-policy = { path = "../../crates/bridge-policy" }
 bridge-observ = { path = "../../crates/bridge-observ" }
 bridge-registry = { path = "../../crates/bridge-registry" }
+bridge-claude = { path = "../../crates/bridge-claude" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 axum = { workspace = true }
