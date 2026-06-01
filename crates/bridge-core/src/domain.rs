@@ -1,6 +1,7 @@
 // domain.rs — minimal shared domain value types (spec §5.2/§5.3).
 
-use crate::ids::CallerId;
+use crate::ids::{AgentId, CallerId};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Part {
@@ -13,9 +14,87 @@ pub struct Artifact;
 #[derive(Debug, Default, Clone)]
 pub struct PromptOutcome;
 
+/// Effort tier for agent execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+/// A named bundle: which CLI adapter to launch + model/effort/mode configuration.
+#[derive(Debug, Clone)]
+pub struct AgentEntry {
+    pub id: AgentId,
+    pub cmd: String,
+    pub args: Vec<String>,
+    pub model_provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub mode: Option<String>,
+    pub cwd: Option<String>,
+    pub auth_method: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub version: Option<String>,
+    pub extensions: BTreeMap<String, toml::Value>,
+}
+
+/// Per-request overrides that layer on top of an `AgentEntry`'s defaults.
+#[derive(Debug, Clone, Default)]
+pub struct AgentOverride {
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub mode: Option<String>,
+}
+
+/// Per-session config the backend applies at ACP mint.
+/// `model` is the agent-native id (NO `{provider}@{model}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveConfig {
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub mode: Option<String>,
+}
+
+/// Compute effective config by layering an optional override on top of an entry's defaults.
+/// Override fields take precedence when `Some`; `None` fields fall back to entry defaults.
+pub fn effective_config(entry: &AgentEntry, ov: Option<&AgentOverride>) -> EffectiveConfig {
+    let mut eff = EffectiveConfig {
+        model: entry.model.clone(),
+        effort: entry.effort,
+        mode: entry.mode.clone(),
+    };
+    if let Some(o) = ov {
+        if o.model.is_some() {
+            eff.model = o.model.clone();
+        }
+        if o.effort.is_some() {
+            eff.effort = o.effort;
+        }
+        if o.mode.is_some() {
+            eff.mode = o.mode.clone();
+        }
+    }
+    eff
+}
+
+/// Immutable snapshot of the registry state.
+#[derive(Debug, Clone)]
+pub struct RegistrySnapshot {
+    pub default: AgentId,
+    pub entries: Vec<AgentEntry>,
+    pub allowed_cmds: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskMeta {
     pub skill: Option<String>,
+    pub agent: Option<AgentId>,
+    pub overrides: Option<AgentOverride>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +193,43 @@ impl AuthContext {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_config_layers_override_over_entry() {
+        let entry = AgentEntry {
+            id: crate::ids::AgentId::parse("codex").unwrap(),
+            cmd: "codex-acp".into(),
+            args: vec![],
+            model_provider: Some("openai".into()),
+            model: Some("gpt-5.5".into()),
+            effort: Some(Effort::High),
+            mode: Some("read-only".into()),
+            cwd: None,
+            auth_method: None,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: Default::default(),
+        };
+        let ov = AgentOverride {
+            model: Some("gpt-5.4".into()),
+            effort: None,
+            mode: Some("auto".into()),
+        };
+        let eff = effective_config(&entry, Some(&ov));
+        assert_eq!(eff.model.as_deref(), Some("gpt-5.4")); // override wins
+        assert_eq!(eff.effort, Some(Effort::High)); // base kept (override None)
+        assert_eq!(eff.mode.as_deref(), Some("auto")); // override wins
+        let base = effective_config(&entry, None);
+        assert_eq!(base.model.as_deref(), Some("gpt-5.5")); // base when no override
+        assert_eq!(base.effort, Some(Effort::High));
+    }
+}
+
+#[cfg(test)]
 mod v25 {
     use super::*;
     use crate::ids::{AgentId, CallerId};
@@ -126,7 +242,8 @@ mod v25 {
     fn task_meta_skill() {
         assert_eq!(
             TaskMeta {
-                skill: Some("delegate".into())
+                skill: Some("delegate".into()),
+                ..Default::default()
             }
             .skill
             .as_deref(),

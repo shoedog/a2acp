@@ -5,6 +5,9 @@ use crate::{domain::*, error::BridgeError, ids::*};
 use futures::Stream;
 use std::pin::Pin;
 
+// Bring new domain types into scope for the registry/config-source traits.
+use crate::domain::{AgentEntry, RegistrySnapshot};
+
 /// Wire spelling of the ACP `StopReason::Cancelled` stop-reason string.
 ///
 /// Both the ACP adapter (`bridge-acp`) and the domain translator (`bridge-core`)
@@ -33,6 +36,22 @@ pub trait AgentBackend: Send + Sync {
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError>;
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError>;
+
+    /// Stash the per-session effective config; applied at lazy ACP mint. Default: no-op. [§4.4]
+    async fn configure_session(
+        &self,
+        _session: &SessionId,
+        _cfg: &crate::domain::EffectiveConfig,
+    ) -> Result<(), BridgeError> {
+        Ok(())
+    }
+    /// Drop per-session state (config stash, etc.) when a task/session ends. Default: no-op.
+    /// MUST be a trait method — the inbound binding eviction (T11) calls it through `Arc<dyn AgentBackend>`.
+    async fn forget_session(&self, _session: &SessionId) {}
+    /// Graceful async teardown (the registry drains leases before calling this). Default: no-op. [§5.4]
+    async fn retire(&self) -> Result<(), BridgeError> {
+        Ok(())
+    }
 }
 
 /// Inbound transport abstraction (e.g. A2A JSON-RPC over WebSocket).
@@ -102,6 +121,46 @@ pub trait PolicyEngine: Send + Sync {
 /// Sync auth middleware — validates an inbound request.
 pub trait AuthMiddleware: Send + Sync {
     fn authorize(&self, req: &InboundRequest) -> Result<AuthContext, BridgeError>;
+}
+
+// ─── Registry / config-source ports (Increment 3b §4.5) ──────────────────────
+
+/// Lease guard: while held, a registry slot's active-task count is incremented; decremented on drop. [§4.5]
+pub trait Lease: Send + Sync {}
+
+/// Result of resolving an agent: its entry config, the (lazily-spawned) backend, and a lease keeping the slot alive.
+pub struct Resolved {
+    pub entry: std::sync::Arc<AgentEntry>,
+    pub backend: std::sync::Arc<dyn AgentBackend>,
+    pub lease: Box<dyn Lease>,
+}
+
+#[async_trait::async_trait]
+pub trait AgentRegistry: Send + Sync {
+    /// Resolve (and lazily spawn) a backend for the given agent id. [§4.5]
+    async fn resolve(&self, id: &crate::ids::AgentId) -> Result<Resolved, BridgeError>;
+    /// Return the default agent id for this registry.
+    fn default_id(&self) -> crate::ids::AgentId;
+    /// Atomically reconcile the registry to the given snapshot. [§4.5]
+    async fn apply(&self, snapshot: RegistrySnapshot) -> Result<(), BridgeError>;
+    /// List all registered agent ids.
+    fn list(&self) -> Vec<crate::ids::AgentId>;
+}
+
+#[async_trait::async_trait]
+pub trait ConfigSource: Send + Sync {
+    /// Load the current registry snapshot from the config source.
+    async fn load(&self) -> Result<RegistrySnapshot, BridgeError>;
+    /// Return a stream of snapshots that fires whenever the source changes.
+    fn watch(&self) -> futures::stream::BoxStream<'static, RegistrySnapshot>;
+}
+
+#[async_trait::async_trait]
+pub trait ConfigStore: ConfigSource {
+    /// Upsert an agent entry (3b.2+ admin API write-back — defined now, impl'd later).
+    async fn upsert(&self, entry: AgentEntry) -> Result<(), BridgeError>;
+    /// Remove an agent entry by id.
+    async fn remove(&self, id: &crate::ids::AgentId) -> Result<(), BridgeError>;
 }
 
 #[cfg(test)]
@@ -293,5 +352,34 @@ mod tests {
         // Idempotent: setting again must not fail.
         st.set_fanout(&t).await.unwrap();
         assert!(st.is_fanout(&t).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn agentbackend_defaults_are_noops_and_object_safe() {
+        struct Fake;
+        #[async_trait::async_trait]
+        impl AgentBackend for Fake {
+            async fn prompt(
+                &self,
+                _: &crate::ids::SessionId,
+                _: Vec<crate::domain::Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                unreachable!()
+            }
+            async fn cancel(&self, _: &crate::ids::SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+        let f = Fake;
+        f.configure_session(
+            &crate::ids::SessionId::parse("s").unwrap(),
+            &crate::domain::EffectiveConfig::default(),
+        )
+        .await
+        .unwrap();
+        f.forget_session(&crate::ids::SessionId::parse("s").unwrap())
+            .await;
+        f.retire().await.unwrap();
+        let _obj: std::sync::Arc<dyn AgentBackend> = std::sync::Arc::new(Fake); // object-safe
     }
 }

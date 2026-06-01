@@ -18,6 +18,8 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_acp::{
     acp_backend::{AcpBackend, AcpConfig},
@@ -75,7 +77,7 @@ async fn real_kiro_round_trip_returns_pong() {
     let base_url = format!("http://{addr}");
 
     let server = Arc::new(InboundServer::new(
-        backend,
+        common::single_agent_registry("kiro", backend),
         store,
         policy,
         route,

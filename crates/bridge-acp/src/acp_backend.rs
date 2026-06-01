@@ -20,17 +20,20 @@ use agent_client_protocol::schema::{
     PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId as AgentSessionId, SessionNotification, SessionUpdate,
-    SetSessionModeRequest, SetSessionModelRequest, StopReason, TerminalOutputRequest,
-    TerminalOutputResponse, TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId as AgentSessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    SetSessionModelRequest, StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use bridge_core::domain::{PermissionDecision, PermissionRequest, SessionContext};
+use bridge_core::domain::{
+    EffectiveConfig, Effort, PermissionDecision, PermissionRequest, SessionContext,
+};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{
@@ -289,6 +292,18 @@ pub struct AcpBackend {
     /// it is dropped before any `session/new` await so the mint of one session
     /// never blocks lookups of another.
     sessions: Arc<Mutex<HashMap<SessionId, Arc<AgentSession>>>>,
+    /// Per-bridge-session effective config stash (Increment 3b). Dispatch (T10)
+    /// calls [`Self::configure_session`] to insert the effective `model`/`effort`/
+    /// `mode` for a session BEFORE its first prompt; [`Self::ensure_session`] reads
+    /// THIS map (keyed by the bridge `SessionId`) at lazy mint and applies the
+    /// values, so a live registry config edit affects new sessions with no respawn
+    /// and per-request overrides stay isolated per session. Behind a plain
+    /// `std::sync::Mutex` (only short, non-async insert/lookup/remove under it).
+    ///
+    /// FALLBACK: a session with NO stash entry (direct callers / the gated e2es that
+    /// don't go through `configure_session`) falls back to [`AcpConfig`]'s static
+    /// `model`/`mode`, preserving the pre-3b behavior.
+    session_cfg: Arc<StdMutex<HashMap<SessionId, EffectiveConfig>>>,
     /// Policy engine that decides reverse `session/request_permission` requests.
     /// Defaults to an internal auto-approve impl (the deployed 3a policy); a
     /// caller (Task 6's `main`) threads a concrete engine via [`Self::with_policy`].
@@ -389,6 +404,62 @@ impl AcpBackend {
         model_id: impl Into<String>,
     ) -> SetSessionModelRequest {
         SetSessionModelRequest::new(agent_id, model_id.into())
+    }
+
+    /// The `reasoning_effort` config-option id we set for adapters with a
+    /// structured effort knob (codex-acp). Exposed so a test can assert against the
+    /// SAME id the backend transmits.
+    const EFFORT_CONFIG_ID: &'static str = "reasoning_effort";
+
+    /// Map an [`Effort`] tier to codex-acp's `reasoning_effort` config-option value.
+    /// `Minimal→low`, `Max→xhigh`; the rest map 1:1. (codex-acp exposes
+    /// `low`/`medium`/`high`/`xhigh`; the bridge's `Minimal` folds to `low`.)
+    fn effort_value(effort: Effort) -> &'static str {
+        match effort {
+            Effort::Minimal | Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Max => "xhigh",
+        }
+    }
+
+    /// Build the best-effort `session/set_config_option` request that sets the
+    /// `reasoning_effort` option to the mapped [`Effort`] value. Exposed so the
+    /// wire/golden + effort tests can assert the serialized shape against the SAME
+    /// value the backend transmits.
+    #[must_use]
+    pub fn set_effort_request(
+        agent_id: AgentSessionId,
+        effort: Effort,
+    ) -> SetSessionConfigOptionRequest {
+        SetSessionConfigOptionRequest::new(
+            agent_id,
+            SessionConfigId::new(Self::EFFORT_CONFIG_ID),
+            SessionConfigValueId::new(Self::effort_value(effort)),
+        )
+    }
+
+    /// Apply `effort` to the freshly minted agent session, BEST-EFFORT (NON-FATAL),
+    /// mirroring `set_model`'s handling. For codex-acp this drives a
+    /// `session/set_config_option(reasoning_effort=<low|medium|high|xhigh>)`; an
+    /// adapter without a structured effort knob (kiro) errors on the unknown option,
+    /// which we LOG and IGNORE. Never propagates an error — effort is best-effort by
+    /// spec, so a failure here must not fail session setup.
+    async fn apply_effort(cx: &ConnectionTo<Agent>, agent_id: &AgentSessionId, effort: Effort) {
+        let req = Self::set_effort_request(agent_id.clone(), effort);
+        if let Err(e) = cx
+            .send_request::<SetSessionConfigOptionRequest>(req)
+            .block_task()
+            .await
+        {
+            tracing::warn!(
+                effort = ?effort,
+                error = ?e,
+                "session/set_config_option(reasoning_effort) failed; continuing with the \
+                 agent's default effort (effort is best-effort: e.g. an adapter without a \
+                 structured effort knob errors on the unknown option)"
+            );
+        }
     }
 
     /// **Production** constructor: spawn `cmd args` as a `Supervised` child
@@ -627,6 +698,7 @@ impl AcpBackend {
             supervised: Arc::new(StdMutex::new(None)),
             config: Some(config),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             policy,
         })
     }
@@ -783,11 +855,27 @@ impl AcpBackend {
             .as_ref()
             .map(|c| c.cwd.clone())
             .ok_or(BridgeError::AgentCrashed)?;
-        // Capture the configured mode/model up front (cloned `String`s) so the
-        // init closure can own them — session configuration now lives INSIDE the
-        // closure (see below), so its captures must be `'static`/move-safe.
-        let mode = self.config.as_ref().and_then(|c| c.mode.clone());
-        let model = self.config.as_ref().and_then(|c| c.model.clone());
+        // Resolve the per-session config (Increment 3b). Read the stash for THIS
+        // bridge key; if dispatch (T10) called `configure_session(key, ..)` before
+        // the prompt, that effective `model`/`effort`/`mode` drives the mint. If
+        // there's NO stash entry (direct callers / the gated e2es that don't go
+        // through `configure_session`), FALL BACK to `AcpConfig`'s static
+        // `model`/`mode` so the pre-3b behavior is preserved. Captured up front as
+        // owned values so the init closure (which must be `'static`/move-safe) owns
+        // them — session configuration lives INSIDE the closure (see below).
+        let stashed = self
+            .session_cfg
+            .lock()
+            .ok()
+            .and_then(|m| m.get(key).cloned());
+        let (mode, model, effort) = match stashed {
+            Some(cfg) => (cfg.mode, cfg.model, cfg.effort),
+            None => (
+                self.config.as_ref().and_then(|c| c.mode.clone()),
+                self.config.as_ref().and_then(|c| c.model.clone()),
+                None,
+            ),
+        };
 
         // Did THIS call mint the agent session? The init closure runs for at most
         // one caller (`OnceCell`); set the flag inside it so only the minter does
@@ -844,6 +932,16 @@ impl AcpBackend {
                              models:null)"
                         );
                     }
+                }
+
+                // (4) effort — BEST-EFFORT (NON-FATAL), mirroring set_model. For
+                // adapters with a structured effort knob (codex-acp) we map the
+                // `Effort` tier to the `reasoning_effort` config option via
+                // `session/set_config_option`; an agent that doesn't expose it (kiro)
+                // errors, which we LOG and ignore. Never fatal — effort is best-effort
+                // by spec; model/mode are the must-haves.
+                if let Some(effort) = effort {
+                    Self::apply_effort(cx, &id, effort).await;
                 }
 
                 Ok::<_, BridgeError>(id)
@@ -1246,6 +1344,49 @@ impl AgentBackend for AcpBackend {
         });
         Ok(())
     }
+
+    /// Stash the per-session effective config (Increment 3b). Dispatch (T10) calls
+    /// this BEFORE the first prompt for a session; [`Self::ensure_session`] reads
+    /// the stash at lazy mint (keyed by the bridge `SessionId`) and applies
+    /// `mode`/`model`/`effort`. Insert-or-replace, so a re-`configure_session` with
+    /// fresh effective config (e.g. after a live registry edit) takes effect on the
+    /// NEXT mint. Cheap + non-async under a plain `Mutex`.
+    async fn configure_session(
+        &self,
+        session: &SessionId,
+        cfg: &EffectiveConfig,
+    ) -> Result<(), BridgeError> {
+        if let Ok(mut m) = self.session_cfg.lock() {
+            m.insert(session.clone(), cfg.clone());
+        }
+        Ok(())
+    }
+
+    /// Drop the per-session config stash entry when a task/session ends (T11
+    /// inbound-binding eviction). A no-op if `session` was never configured. We
+    /// intentionally do NOT touch the agent-side `sessions` map here: the ACP
+    /// connection multiplexes all sessions and tearing the agent session down is
+    /// the retirement/`Drop` path's concern, not per-session config forgetting.
+    async fn forget_session(&self, session: &SessionId) {
+        if let Ok(mut m) = self.session_cfg.lock() {
+            m.remove(session);
+        }
+    }
+
+    /// Graceful async teardown of the agent process (Increment 3b §5.4). IDEMPOTENT
+    /// by construction: TAKE the `Supervised` child out of the shared slot (exactly
+    /// once — a concurrent/second caller sees `None`) and SIGTERM→SIGKILL it. Both
+    /// `resolve`'s race-loss path AND the registry retirement task may call this on
+    /// the same backend (T5 review), so the take-once makes the second call a clean
+    /// no-op. On the in-process `connect` path there is no child (`None`) → retire
+    /// is a clean no-op there too.
+    async fn retire(&self) -> Result<(), BridgeError> {
+        let sup = self.supervised.lock().ok().and_then(|mut g| g.take());
+        if let Some(sup) = sup {
+            sup.terminate(self.cancel_grace()).await;
+        }
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1436,6 +1577,7 @@ mod tests {
             supervised: Arc::new(StdMutex::new(Some(supervised))),
             config: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -1483,9 +1625,9 @@ mod tests {
     use agent_client_protocol::schema::{
         AuthenticateRequest, AuthenticateResponse, ContentChunk, NewSessionResponse,
         PermissionOption, PermissionOptionId, PromptRequest, PromptResponse,
-        RequestPermissionRequest, RequestPermissionResponse, SetSessionModeRequest,
-        SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
-        ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        RequestPermissionRequest, RequestPermissionResponse, SetSessionConfigOptionResponse,
+        SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
+        SetSessionModelResponse, StopReason, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
     };
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Notify;
@@ -1608,6 +1750,15 @@ mod tests {
         reject_authenticate: Arc<AtomicBool>,
         /// Auth methods the fake agent advertises in its `initialize` response.
         auth_methods: Arc<Mutex<Vec<AuthMethod>>>,
+
+        // ── Increment 3b: session/set_config_option (effort) ──────────────────
+        /// `(config_id, value_id)` pairs observed via `session/set_config_option`.
+        set_config_options: Arc<Mutex<Vec<(String, String)>>>,
+        /// Fires every time a `session/set_config_option` is recorded.
+        set_config_seen: Arc<Notify>,
+        /// When set, the `session/set_config_option` handler REJECTS with a JSON-RPC
+        /// error (modeling an adapter without a structured effort knob). NON-FATAL.
+        reject_set_config: Arc<AtomicBool>,
     }
 
     impl Recorder {
@@ -1645,6 +1796,9 @@ mod tests {
                 authenticates: Arc::new(Mutex::new(Vec::new())),
                 reject_authenticate: Arc::new(AtomicBool::new(false)),
                 auth_methods: Arc::new(Mutex::new(Vec::new())),
+                set_config_options: Arc::new(Mutex::new(Vec::new())),
+                set_config_seen: Arc::new(Notify::new()),
+                reject_set_config: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -1712,6 +1866,7 @@ mod tests {
             let r_new = rec.clone();
             let r_mode = rec.clone();
             let r_model = rec.clone();
+            let r_config = rec.clone();
             let r_prompt = rec.clone();
             let r_cancel = rec.clone();
             let _ = Agent
@@ -1784,6 +1939,30 @@ mod tests {
                                 responder.respond_with_internal_error("set_model unsupported")?;
                             } else {
                                 responder.respond(SetSessionModelResponse::new())?;
+                            }
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |req: SetSessionConfigOptionRequest,
+                          responder: agent_client_protocol::Responder<
+                        SetSessionConfigOptionResponse,
+                    >,
+                          _cx| {
+                        let r = r_config.clone();
+                        async move {
+                            r.set_config_options
+                                .lock()
+                                .await
+                                .push((req.config_id.0.to_string(), req.value.0.to_string()));
+                            r.set_config_seen.notify_one();
+                            if r.reject_set_config.load(Ordering::SeqCst) {
+                                responder
+                                    .respond_with_internal_error("config option unsupported")?;
+                            } else {
+                                responder.respond(SetSessionConfigOptionResponse::new(vec![]))?;
                             }
                             Ok(())
                         }
@@ -3195,5 +3374,262 @@ mod tests {
         }
         // The backend attempted the CONFIGURED method id (not the advertised one).
         assert_eq!(rec.authenticates.lock().await.as_slice(), &["apikey"]);
+    }
+
+    // ── Task 6 (Increment 3b): per-session config stash ───────────────────────
+
+    #[tokio::test]
+    async fn configure_session_applies_model_mode_at_mint() {
+        // `configure_session(S, cfg)` STASHES the per-session config; `ensure_session`
+        // (driven here directly, exactly as `prompt` does) reads the stash for S at
+        // mint and applies BOTH `session/set_mode(mode)` (hard) and
+        // `session/set_model(model)` (best-effort) for S's agent session — with NO
+        // model/mode baked into `AcpConfig` (proving the stash, not the static config,
+        // is what drove the configuration).
+        let rec = Recorder::new("agent-sess-CFG");
+        let be = connect_recording(rec.clone()).await; // test_config(): no model/mode
+        let key = bkey("bridge-CFG");
+
+        be.configure_session(
+            &key,
+            &EffectiveConfig {
+                model: Some("m".to_string()),
+                effort: None,
+                mode: Some("x".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.set_mode_seen.notified())
+            .await
+            .expect("set_mode must reach the agent after session/new");
+        tokio::time::timeout(Duration::from_secs(2), rec.set_model_seen.notified())
+            .await
+            .expect("set_model must reach the agent after session/new");
+        assert_eq!(
+            rec.set_modes.lock().await.as_slice(),
+            &["x"],
+            "stashed mode applied at mint"
+        );
+        assert_eq!(
+            rec.set_models.lock().await.as_slice(),
+            &["m"],
+            "stashed model applied at mint"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_session_config_is_isolated() {
+        // ONE backend, TWO bridge sessions, each configured with a DIFFERENT model.
+        // Minting each reads ITS OWN stash entry: the agent must see set_model("a")
+        // for S1 and set_model("b") for S2 — no bleed across sessions on the shared
+        // connection. (The fake mints the same agent id for both, which is fine: the
+        // stash is keyed by the BRIDGE SessionId, so the values stay separate.)
+        let rec = Recorder::new("agent-sess-ISO");
+        let be = connect_recording(rec.clone()).await;
+        let s1 = bkey("bridge-ISO-1");
+        let s2 = bkey("bridge-ISO-2");
+
+        be.configure_session(
+            &s1,
+            &EffectiveConfig {
+                model: Some("a".to_string()),
+                effort: None,
+                mode: None,
+            },
+        )
+        .await
+        .unwrap();
+        be.configure_session(
+            &s2,
+            &EffectiveConfig {
+                model: Some("b".to_string()),
+                effort: None,
+                mode: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&s1).await.unwrap();
+        be.ensure_session(&s2).await.unwrap();
+        // Two mints → two set_model calls. `ensure_session` only returns AFTER its
+        // mint closure (which sends + awaits the best-effort set_model reply) runs,
+        // so both calls have completed their set_model by here; assert on the
+        // recorded vec rather than the (single-permit) `Notify` to avoid coalescing.
+        let mut models = rec.set_models.lock().await.clone();
+        models.sort();
+        assert_eq!(
+            models.as_slice(),
+            &["a", "b"],
+            "each session applied its OWN stashed model — no bleed across sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_is_idempotent() {
+        // A long-lived child (`cat` blocks on stdin). `retire()` takes-once and
+        // terminates the agent PROCESS; a SECOND `retire()` finds `None` (take-once)
+        // and is a clean no-op (no panic, no double-kill).
+        let mut supervised = Supervised::spawn("/bin/cat", &[]).expect("spawn cat");
+        let pid = supervised.pid();
+        let child = supervised.child_mut();
+        let _stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed).unwrap();
+        let _stdout = child
+            .stdout
+            .take()
+            .ok_or(BridgeError::AgentCrashed)
+            .unwrap();
+
+        let backend = AcpBackend {
+            conn: None,
+            supervised: Arc::new(StdMutex::new(Some(supervised))),
+            config: None,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_cfg: Arc::new(StdMutex::new(HashMap::new())),
+            policy: Arc::new(StdMutex::new(
+                Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
+            )),
+        };
+
+        assert!(
+            unsafe { libc::kill(pid as i32, 0) } == 0,
+            "child alive pre-retire"
+        );
+
+        backend.retire().await.expect("first retire terminates");
+        // The take-once consumed the child; a second retire is a no-op.
+        backend
+            .retire()
+            .await
+            .expect("second retire is a clean no-op (take-once → None)");
+
+        // After the first retire the child is terminated (SIGTERM→reap); confirm the
+        // pid is no longer a live, signalable process we own.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        assert!(!alive, "child must be terminated after the first retire");
+    }
+
+    #[tokio::test]
+    async fn configure_session_applies_effort_at_mint() {
+        // A stashed `effort` drives a best-effort `session/set_config_option` with id
+        // `reasoning_effort` and the mapped value (`High → "high"`) at mint.
+        let rec = Recorder::new("agent-sess-EFFORT");
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-EFFORT");
+
+        be.configure_session(
+            &key,
+            &EffectiveConfig {
+                model: None,
+                effort: Some(Effort::High),
+                mode: None,
+            },
+        )
+        .await
+        .unwrap();
+        be.ensure_session(&key).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.set_config_seen.notified())
+            .await
+            .expect("set_config_option must reach the agent after session/new");
+        assert_eq!(
+            rec.set_config_options.lock().await.as_slice(),
+            &[("reasoning_effort".to_string(), "high".to_string())],
+            "stashed effort applied as reasoning_effort=high at mint"
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_error_is_non_fatal() {
+        // An adapter without a structured effort knob ERRORS the config option; this
+        // must be NON-FATAL (mirrors set_model): the session is still set up and a
+        // subsequent prompt still completes.
+        let rec = Recorder::new("agent-sess-EFFORTERR");
+        rec.reject_set_config.store(true, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-EFFORTERR");
+
+        be.configure_session(
+            &key,
+            &EffectiveConfig {
+                model: None,
+                effort: Some(Effort::Max),
+                mode: None,
+            },
+        )
+        .await
+        .unwrap();
+        be.ensure_session(&key).await.expect(
+            "a set_config_option error must NOT fail session setup (effort is best-effort)",
+        );
+        // The (erroring) agent still recorded the attempt with the Max→xhigh mapping.
+        assert_eq!(
+            rec.set_config_options.lock().await.as_slice(),
+            &[("reasoning_effort".to_string(), "xhigh".to_string())],
+        );
+        // A subsequent prompt still works (connection/session survived the error).
+        rec.set_updates(vec![ScriptedUpdate::Text("ok")]).await;
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "ok"));
+        assert!(
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_session_drops_stash_falls_back_to_static_config() {
+        // After `forget_session`, the stash entry is gone, so the NEXT mint falls
+        // back to `AcpConfig`'s static mode (here "static-mode") rather than the
+        // forgotten stashed mode. Uses two DIFFERENT bridge keys (a mint is once-per
+        // key), proving the fallback path for an unconfigured session.
+        let rec = Recorder::new("agent-sess-FORGET");
+        let be = connect_recording_with(rec.clone(), test_config_with_mode("static-mode")).await;
+        let configured = bkey("bridge-FORGET-cfg");
+        let forgotten = bkey("bridge-FORGET-gone");
+
+        // A configured session uses its stashed mode.
+        be.configure_session(
+            &configured,
+            &EffectiveConfig {
+                model: None,
+                effort: None,
+                mode: Some("stashed-mode".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        be.ensure_session(&configured).await.unwrap();
+
+        // Configure then FORGET a second session → its next mint has no stash entry
+        // and falls back to the static config mode.
+        be.configure_session(
+            &forgotten,
+            &EffectiveConfig {
+                model: None,
+                effort: None,
+                mode: Some("doomed-mode".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        be.forget_session(&forgotten).await;
+        be.ensure_session(&forgotten).await.unwrap();
+
+        let modes = rec.set_modes.lock().await.clone();
+        assert!(
+            modes.contains(&"stashed-mode".to_string()),
+            "configured session used its stashed mode, got {modes:?}"
+        );
+        assert!(
+            modes.contains(&"static-mode".to_string()),
+            "forgotten session fell back to the static config mode, got {modes:?}"
+        );
+        assert!(
+            !modes.contains(&"doomed-mode".to_string()),
+            "the forgotten stash entry must NOT drive set_mode, got {modes:?}"
+        );
     }
 }
