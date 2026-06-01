@@ -47,6 +47,8 @@ pub enum BridgeError {
     MessageTooLarge,
     #[error("agent crashed")]
     AgentCrashed,
+    #[error("agent overloaded")]
+    AgentOverloaded,
     #[error("upstream a2a error")]
     UpstreamA2aError,
     #[error("store failure")]
@@ -163,6 +165,21 @@ mod tests {
         assert_eq!(
             BridgeError::CancelTimeout.disposition(),
             A2aDisposition::SetState(A2aState::Canceled)
+        );
+    }
+
+    #[test]
+    fn agent_overloaded_displays() {
+        assert_eq!(BridgeError::AgentOverloaded.to_string(), "agent overloaded");
+    }
+
+    #[test]
+    fn agent_overloaded_is_failed_disposition() {
+        use crate::error::A2aDisposition::*;
+        use crate::error::A2aState as S;
+        assert_eq!(
+            BridgeError::AgentOverloaded.disposition(),
+            SetState(S::Failed)
         );
     }
 }
