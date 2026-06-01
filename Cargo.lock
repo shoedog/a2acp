@@ -408,6 +408,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-claude"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bridge-core",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "bridge-core"
 version = "0.1.0"
 dependencies = [
