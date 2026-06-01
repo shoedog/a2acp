@@ -54,6 +54,11 @@ const CODEX_ID: &str = "codex";
 const CODEX_CMD: &str = "codex-acp";
 const KIRO_ID: &str = "kiro";
 const KIRO_CMD: &str = "kiro-cli";
+const GEMINI_ID: &str = "gemini";
+const GEMINI_CMD: &str = "gemini";
+// gemini-cli starts in `default` mode (no hard set_mode); a concrete fast model.
+const GEMINI_MODEL: &str = "gemini-2.5-flash";
+const GEMINI_AUTH: &str = "oauth-personal";
 
 // codex model + a valid mode (codex-acp issues a HARD `session/set_mode`; a
 // rejected mode fails session setup, so a Done proves the mode applied).
@@ -121,10 +126,39 @@ fn two_agent_snapshot(kiro_model: &str) -> RegistrySnapshot {
                 &[],
                 Some(CODEX_MODEL),
                 Some(CODEX_MODE),
+                None,
             ),
-            entry(KIRO_ID, KIRO_CMD, &["acp"], Some(kiro_model), None),
+            entry(KIRO_ID, KIRO_CMD, &["acp"], Some(kiro_model), None, None),
         ],
         allowed_cmds: vec![CODEX_CMD.into(), KIRO_CMD.into()],
+    }
+}
+
+/// All THREE real agents from one snapshot. Gemini is appended LAST so that the
+/// existing `[codex(0), kiro(1)]` indices the 2-agent tests rely on are untouched.
+fn three_agent_snapshot() -> RegistrySnapshot {
+    RegistrySnapshot {
+        default: AgentId::parse(CODEX_ID).unwrap(),
+        entries: vec![
+            entry(
+                CODEX_ID,
+                CODEX_CMD,
+                &[],
+                Some(CODEX_MODEL),
+                Some(CODEX_MODE),
+                None,
+            ),
+            entry(KIRO_ID, KIRO_CMD, &["acp"], Some(KIRO_MODEL), None, None),
+            entry(
+                GEMINI_ID,
+                GEMINI_CMD,
+                &["--acp"],
+                Some(GEMINI_MODEL),
+                None,
+                Some(GEMINI_AUTH),
+            ),
+        ],
+        allowed_cmds: vec![CODEX_CMD.into(), KIRO_CMD.into(), GEMINI_CMD.into()],
     }
 }
 
@@ -134,6 +168,7 @@ fn entry(
     args: &[&str],
     model: Option<&str>,
     mode: Option<&str>,
+    auth_method: Option<&str>,
 ) -> AgentEntry {
     AgentEntry {
         id: AgentId::parse(id).unwrap(),
@@ -145,7 +180,7 @@ fn entry(
         effort: None,
         mode: mode.map(str::to_string),
         cwd: None,
-        auth_method: None,
+        auth_method: auth_method.map(str::to_string),
         name: None,
         description: None,
         tags: vec![],
@@ -249,6 +284,33 @@ async fn route_to_each_agent_by_id() {
         "kiro (routed by id) must answer PONG; got: {kiro_text:?}"
     );
     assert_ne!(kiro_stop, "cancelled", "kiro turn must not be cancelled");
+}
+
+/// THE 3-AGENT HEADLINE: one registry holding ALL THREE real agents — codex, kiro,
+/// AND gemini — each selected purely by id, each answering its own PONG prompt.
+/// Resolves the dead_code warnings on `three_agent_snapshot` + GEMINI_* constants
+/// introduced in Task 1.
+#[tokio::test]
+#[ignore = "needs codex-acp + kiro-cli + gemini on PATH, all authed; makes real model calls"]
+async fn route_to_each_of_three_agents_by_id() {
+    let registry = Arc::new(
+        Registry::new(three_agent_snapshot(), acp_spawn_fn())
+            .expect("three-agent registry must validate + build"),
+    );
+
+    for (id, label) in [
+        (CODEX_ID, "s-codex3"),
+        (KIRO_ID, "s-kiro3"),
+        (GEMINI_ID, "s-gemini3"),
+    ] {
+        let (text, stop) = route_and_prompt(&registry, id, label, None).await;
+        eprintln!("=== {id} (3-agent registry) text ===\n{text}\n=== stop: {stop} ===");
+        assert!(
+            text.to_ascii_uppercase().contains("PONG"),
+            "agent {id:?} must stream PONG from one 3-agent registry; got text={text:?} stop={stop:?}"
+        );
+        assert_ne!(stop, "cancelled", "{id} turn must not be cancelled");
+    }
 }
 
 /// A per-request `AgentOverride` layered via `effective_config` is accepted by the

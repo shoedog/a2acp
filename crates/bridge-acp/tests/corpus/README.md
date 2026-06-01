@@ -13,10 +13,11 @@ is a real conformance proof — not the v1 circular one.
 
 ## GATE STATUS (per agent)
 
-| agent      | real capture? | provenance                  |
-|------------|---------------|-----------------------------|
-| kiro-cli   | **YES — MET** | `REAL-CAPTURE` (v2.5.0)     |
-| codex-acp  | **YES — MET** | `REAL-CAPTURE` (v0.15.0)    |
+| agent      | real capture? | provenance                       |
+|------------|---------------|----------------------------------|
+| kiro-cli   | **YES — MET** | `REAL-CAPTURE` (v2.5.0)          |
+| codex-acp  | **YES — MET** | `REAL-CAPTURE` (v0.15.0)         |
+| gemini-cli | **YES — MET** | `REAL-CAPTURE (v0.41.2)`         |
 
 - **kiro-cli — GATE MET.** `kiro-cli.jsonl` is a real round-trip captured from
   `kiro-cli acp` 2.5.0 in this environment (initialize → session/new → session/prompt →
@@ -36,8 +37,23 @@ is a real conformance proof — not the v1 circular one.
   the live SDK dispatch drops it (parse-error → `send_error_notification`, connection
   continues), which the replay path mirrors.
 
+- **gemini-cli — GATE MET.** `gemini-cli.jsonl` is a real round-trip captured from
+  `gemini --acp` 0.41.2 (initialize → authenticate(oauth-personal)={} → session/new →
+  session/prompt → real `agent_message_chunk` → real `stopReason:end_turn` result). The
+  inbound frames replay correctly through `AcpBackend`, the single chunk equals `PONG`,
+  and the two extra `session/update` variants emitted by gemini are correctly DROPPED at
+  the map layer. Specifically: `available_commands_update` IS a modeled
+  `SessionUpdate::AvailableCommandsUpdate` variant in the SDK (distinct from codex's
+  genuinely-unmodeled `usage_update` which fails SDK deserialization entirely) — it
+  deserializes as `SessionNotification` but `AcpBackend::map_session_update` returns
+  `None` because it carries no assistant text. Gemini also emits a modeled
+  `agent_thought_chunk` reasoning frame (a `SessionUpdate::AgentThoughtChunk` variant)
+  that is likewise dropped at the map layer — it replays to `None`, never producing a
+  `Text` update. Both drops are guarded by the `gemini_available_commands_update_is_modeled_not_parse_error`
+  test and the `Some(other) => panic!` arm in `gemini_real_capture_replays_through_backend`.
+
 The `real_capture_corpus_present` test in `tests/corpus_replay.rs` scans every file for a
-`REAL-CAPTURE` provenance header. Both agents now have real captures, so it is a normal
-(non-ignored) test that PASSES. If any corpus is ever regressed back to provisional
+`REAL-CAPTURE` provenance header. All three agents now have real captures, so it is a
+normal (non-ignored) test that PASSES. If any corpus is ever regressed back to provisional
 scaffolding, the default `cargo test` run fails naming exactly which agent lost its real
 capture, so CI can never imply the gate is met when it isn't.
