@@ -12,6 +12,8 @@
 
 **Spec status:** brainstormed + dual-review folded. Tags `[probe]` = pinned by the Task-0 stream-json probe.
 
+> **Build addendum (2026-06-01, during implementation):** the gated real-`claude` e2e surfaced a design correction to §3.2/§4. Real `claude` 2.1.159 emits the `{"type":"system","subtype":"init",…}` line ONLY AFTER the first user message is written (not on startup), so the spec's "spawn/init handshake — block on init within a bound, else `AgentNotAuthenticated`" would hang forever (no message is written at spawn). **Shipped behavior: init capture is DEFERRED to the first turn.** `spawn_proc` returns as soon as the process + reader are started (no init gate); the reader captures `session_id` + sets an `init_seen` flag whenever init arrives (during turn 1). The auth signal is preserved but moves from spawn-time to first-turn-time: if the process closes stdout before ever emitting init (not-logged-in / immediate exit), the reader maps the first turn's EOF to `AgentNotAuthenticated` (cancel still takes precedence). A per-`SessionProc` `pending_terminal` stash lets a terminal routed before the first turn's channel exists be replayed once by `begin_turn` (so the first-turn auth failure is never lost). Validated LIVE against real `claude` (warm two-turn continuity through the full bridge, ~4s). `ClaudeConfig.init_timeout` is retained for schema stability but is now unused at spawn.
+
 ---
 
 ## 1. Why this shape (and an honest conductor framing)
