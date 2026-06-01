@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use bridge_core::domain::{AgentEntry, Effort, RegistrySnapshot};
+use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot};
 use bridge_core::ids::AgentId;
 
 /// Unified parse error covering TOML parse failures and missing env-var references.
@@ -179,6 +179,7 @@ impl RegistryConfig {
                 id,
                 cmd: a.cmd,
                 args: a.args,
+                kind: AgentKind::default(),
                 model_provider: a.model_provider,
                 model: a.model,
                 effort,

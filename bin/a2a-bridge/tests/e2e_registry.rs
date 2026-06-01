@@ -36,7 +36,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bridge_acp::acp_backend::{AcpBackend, AcpConfig};
-use bridge_core::domain::{effective_config, AgentEntry, AgentOverride, Part, RegistrySnapshot};
+use bridge_core::domain::{
+    effective_config, AgentEntry, AgentKind, AgentOverride, Part, RegistrySnapshot,
+};
 use bridge_core::ids::{AgentId, SessionId};
 use bridge_core::ports::{AgentBackend, AgentRegistry, PolicyEngine, Update};
 use bridge_policy::permission::AutoPolicy;
@@ -137,6 +139,7 @@ fn entry(
         id: AgentId::parse(id).unwrap(),
         cmd: cmd.into(),
         args: args.iter().map(|s| s.to_string()).collect(),
+        kind: AgentKind::Acp,
         model_provider: None,
         model: model.map(str::to_string),
         effort: None,

@@ -40,7 +40,9 @@ mod tests {
 
     use super::*;
     use bridge_core::domain::Part;
-    use bridge_core::domain::{AgentEntry, Effort, RegistrySnapshot, RouteTarget, TaskMeta};
+    use bridge_core::domain::{
+        AgentEntry, AgentKind, Effort, RegistrySnapshot, RouteTarget, TaskMeta,
+    };
     use bridge_core::error::BridgeError;
     use bridge_core::ids::AgentId;
     use bridge_core::ids::SessionId;
@@ -90,6 +92,7 @@ mod tests {
                     id: self.default.clone(),
                     cmd: "fake".into(),
                     args: vec![],
+                    kind: AgentKind::Acp,
                     model_provider: None,
                     model: None,
                     effort: None::<Effort>,

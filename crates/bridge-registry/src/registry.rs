@@ -310,7 +310,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bridge_core::domain::{Effort, RegistrySnapshot};
+    use bridge_core::domain::{AgentKind, Effort, RegistrySnapshot};
     use bridge_core::ids::SessionId;
     use bridge_core::ports::{BackendStream, Update};
     use std::collections::BTreeMap;
@@ -347,6 +347,7 @@ mod tests {
             id: AgentId::parse(id).unwrap(),
             cmd: "fake-cmd".into(),
             args: vec![],
+            kind: AgentKind::Acp,
             model_provider: None,
             model: None,
             effort: None::<Effort>,

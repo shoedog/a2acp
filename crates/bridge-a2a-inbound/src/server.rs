@@ -1589,7 +1589,7 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
 mod tests {
     use super::*;
     use bridge_core::domain::RouteTarget;
-    use bridge_core::domain::{AgentEntry, EffectiveConfig, RegistrySnapshot};
+    use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, RegistrySnapshot};
     use bridge_core::domain::{
         AuthContext, PeerTaskId, PendingRequest, PermissionDecision, PermissionRequest,
         SessionContext,
@@ -1680,6 +1680,7 @@ mod tests {
             id: AgentId::parse(id).unwrap(),
             cmd: "fake".into(),
             args: vec![],
+            kind: AgentKind::Acp,
             model_provider: None,
             model: None,
             effort: None,
