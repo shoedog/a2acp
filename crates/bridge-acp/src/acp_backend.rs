@@ -40,7 +40,7 @@ use bridge_core::ports::{
     AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED,
 };
 
-use crate::supervisor::Supervised;
+use bridge_core::process::Supervised;
 
 /// Default bound on the `initialize` handshake. A real agent that connects its
 /// stdio but never sends the initialize response would otherwise hang
@@ -469,7 +469,8 @@ impl AcpBackend {
     /// This is `Supervised` + `connect(ByteStreams)`: process lifecycle stays
     /// with `Supervised`; protocol drive is the shared `connect` core.
     pub async fn spawn(cmd: &str, args: &[&str], config: AcpConfig) -> Result<Self, BridgeError> {
-        let mut supervised = Supervised::spawn(cmd, args).map_err(|_| BridgeError::AgentCrashed)?;
+        let mut supervised =
+            Supervised::spawn(cmd, args, None).map_err(|_| BridgeError::AgentCrashed)?;
         let child = supervised.child_mut();
         let stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed)?;
         let stdout = child.stdout.take().ok_or(BridgeError::AgentCrashed)?;
@@ -1394,9 +1395,9 @@ impl AgentBackend for AcpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervisor::Supervised;
     use bridge_core::error::BridgeError;
     use bridge_core::ports::{AgentBackend, Update};
+    use bridge_core::process::Supervised;
     use futures::StreamExt;
     use std::time::Duration;
 
@@ -1561,7 +1562,7 @@ mod tests {
         // A long-lived child (`cat` blocks reading stdin), driven through the
         // exact `Supervised::spawn` + pipe-`take()` seam that `spawn` uses, then
         // held on the backend struct mirroring `spawn`'s end state.
-        let mut supervised = Supervised::spawn("/bin/cat", &[]).expect("spawn cat");
+        let mut supervised = Supervised::spawn("/bin/cat", &[], None).expect("spawn cat");
         let pid = supervised.pid();
         // Take the pipes exactly as `spawn` does (also exercises the I3 seam).
         let child = supervised.child_mut();
@@ -3473,7 +3474,7 @@ mod tests {
         // A long-lived child (`cat` blocks on stdin). `retire()` takes-once and
         // terminates the agent PROCESS; a SECOND `retire()` finds `None` (take-once)
         // and is a clean no-op (no panic, no double-kill).
-        let mut supervised = Supervised::spawn("/bin/cat", &[]).expect("spawn cat");
+        let mut supervised = Supervised::spawn("/bin/cat", &[], None).expect("spawn cat");
         let pid = supervised.pid();
         let child = supervised.child_mut();
         let _stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed).unwrap();

@@ -414,6 +414,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "futures",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",
