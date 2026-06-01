@@ -118,6 +118,9 @@ pub struct AgentEntryToml {
     pub cmd: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Parsed to `AgentKind` in `into_snapshot`; "acp" (default) | "claude-cli".
+    #[serde(default)]
+    pub kind: Option<String>,
     #[serde(default)]
     pub model_provider: Option<String>,
     #[serde(default)]
@@ -175,11 +178,15 @@ impl RegistryConfig {
         for a in self.agents {
             let id = AgentId::parse(a.id).map_err(|e| ConfigError::Registry(e.to_string()))?;
             let effort = a.effort.as_deref().map(parse_effort).transpose()?;
+            let kind = match a.kind.as_deref() {
+                Some(s) => parse_kind(s)?,
+                None => AgentKind::default(),
+            };
             entries.push(AgentEntry {
                 id,
                 cmd: a.cmd,
                 args: a.args,
-                kind: AgentKind::default(),
+                kind,
                 model_provider: a.model_provider,
                 model: a.model,
                 effort,
@@ -220,6 +227,34 @@ fn parse_effort(s: &str) -> Result<Effort, ConfigError> {
             )))
         }
     })
+}
+
+/// Parse the adapter-kind string into `AgentKind`. None → Acp (back-compat).
+fn parse_kind(s: &str) -> Result<AgentKind, ConfigError> {
+    Ok(match s {
+        "acp" => AgentKind::Acp,
+        "claude-cli" => AgentKind::ClaudeCli,
+        other => {
+            return Err(ConfigError::Registry(format!(
+                "invalid kind: {other:?} (expected acp/claude-cli)"
+            )))
+        }
+    })
+}
+
+/// Read a `u64` extension value (TOML integer), if present and valid.
+pub fn ext_u64(ext: &std::collections::BTreeMap<String, toml::Value>, key: &str) -> Option<u64> {
+    ext.get(key)
+        .and_then(|v| v.as_integer())
+        .and_then(|i| u64::try_from(i).ok())
+}
+
+/// Read a `usize` extension value.
+pub fn ext_usize(
+    ext: &std::collections::BTreeMap<String, toml::Value>,
+    key: &str,
+) -> Option<usize> {
+    ext_u64(ext, key).and_then(|n| usize::try_from(n).ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -621,5 +656,36 @@ addr="127.0.0.1:8080"
             .expect("watch must still emit after a transient parse error")
             .expect("stream not ended");
         assert_eq!(snap.default.as_str(), "kiro");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 13: kind parse + warm-pool extension getters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kind_parses_and_defaults_to_acp() {
+        // RegistryConfig::parse is the real entry point; `[server]` is required (it has
+        // no #[serde(default)]). Mirrors the existing config.rs test style.
+        let snap = RegistryConfig::parse(
+            "default=\"c\"\n[[agents]]\nid=\"c\"\ncmd=\"claude\"\nkind=\"claude-cli\"\n\
+             [[agents]]\nid=\"k\"\ncmd=\"kiro-cli\"\n[server]\n",
+        )
+        .unwrap()
+        .into_snapshot()
+        .unwrap();
+        let c = snap.entries.iter().find(|e| e.id.as_str() == "c").unwrap();
+        let k = snap.entries.iter().find(|e| e.id.as_str() == "k").unwrap();
+        assert_eq!(c.kind, bridge_core::domain::AgentKind::ClaudeCli);
+        assert_eq!(k.kind, bridge_core::domain::AgentKind::Acp); // default
+    }
+
+    #[test]
+    fn invalid_kind_is_config_error() {
+        let r = RegistryConfig::parse(
+            "default=\"c\"\n[[agents]]\nid=\"c\"\ncmd=\"claude\"\nkind=\"nope\"\n[server]\n",
+        )
+        .unwrap()
+        .into_snapshot();
+        assert!(r.is_err());
     }
 }
