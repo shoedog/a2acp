@@ -11,7 +11,13 @@ use bridge_core::ports::{AgentBackend, BackendStream, Update, STOP_REASON_CANCEL
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+
+/// A one-shot rendezvous a test installs to force the reap⇄follow-up TOCTOU window.
+struct RaceGate {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
 
 pub(crate) struct Inner {
     pub cmd: String,
@@ -23,6 +29,7 @@ pub(crate) struct Inner {
 pub struct ClaudeCliBackend {
     pub(crate) inner: Arc<Inner>,
     reaper: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    race_gate: StdMutex<Option<RaceGate>>,
 }
 
 impl ClaudeCliBackend {
@@ -38,6 +45,7 @@ impl ClaudeCliBackend {
         Ok(Self {
             inner,
             reaper: StdMutex::new(Some(reaper)),
+            race_gate: StdMutex::new(None),
         })
     }
 
@@ -63,6 +71,47 @@ impl ClaudeCliBackend {
     #[doc(hidden)]
     pub async fn reap_now(&self) {
         reaper::reap_pass_for_test(&self.inner).await
+    }
+
+    /// Park point between proc-clone and turn-lock acquire. In production the gate is
+    /// None → this is a single `Option` load and returns immediately (negligible). A
+    /// test arms a gate to interleave a reap into the window deterministically.
+    async fn race_park(&self) {
+        let gate = self.race_gate.lock().ok().and_then(|mut g| g.take()); // fires once
+        if let Some(g) = gate {
+            g.entered.notify_one(); // signal: prompt has reached the seam
+            g.release.notified().await; // wait for the test to release us
+        }
+    }
+
+    /// Test hook: arm the gate; returns (entered, release) Notifys.
+    #[doc(hidden)]
+    pub fn arm_race_gate(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        if let Ok(mut g) = self.race_gate.lock() {
+            *g = Some(RaceGate {
+                entered: entered.clone(),
+                release: release.clone(),
+            });
+        }
+        (entered, release)
+    }
+
+    /// Test hook: the reaper protocol scoped to one session (the parked prompt hasn't
+    /// taken the turn lock, so `try_lock` succeeds), passing the slot identity.
+    #[doc(hidden)]
+    pub async fn reap_now_force(&self, session: &SessionId) {
+        let slot = { self.inner.sessions.lock().await.get(session).cloned() };
+        if let Some(slot) = slot {
+            if let Some(proc) = slot.proc.get() {
+                if let Ok(g) = proc.turn_lock.try_lock() {
+                    proc.terminated.store(true, Ordering::SeqCst);
+                    Self::invalidate_slot(&self.inner, session, &slot).await;
+                    drop(g);
+                }
+            }
+        }
     }
 
     /// Remove the map entry for `session` ONLY if its current value is the SAME
@@ -176,6 +225,7 @@ impl AgentBackend for ClaudeCliBackend {
                     return Err(e);
                 }
             };
+            self.race_park().await; // unconditional seam (no-op in prod)
             let lock = Arc::clone(&proc.turn_lock).lock_owned().await;
             // Cancel that landed during setup: the SLOT-level latch survives the
             // no-proc-yet window, so check it FIRST (before terminated/respawn) and
