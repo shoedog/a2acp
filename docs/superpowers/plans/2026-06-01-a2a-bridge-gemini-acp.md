@@ -154,16 +154,18 @@ async fn route_to_each_of_three_agents_by_id() {
 
     for (id, label) in [(CODEX_ID, "s-codex3"), (KIRO_ID, "s-kiro3"), (GEMINI_ID, "s-gemini3")] {
         let (text, stop) = route_and_prompt(&registry, id, label, None).await;
+        // Match the existing route_to_each_agent_by_id assertion style (case/whitespace
+        // tolerant). route_and_prompt already PANICS if no terminal Done is reached, so
+        // PONG is the meaningful assertion (a `!stop.is_empty()` check would be tautological).
         assert!(
-            text.contains("PONG"),
+            text.to_uppercase().contains("PONG"),
             "agent {id:?} must stream PONG from one 3-agent registry; got text={text:?} stop={stop:?}"
         );
-        assert!(!stop.is_empty(), "agent {id:?} must reach a terminal Done");
     }
 }
 ```
 
-> Verify `route_and_prompt`'s exact signature/return against the file (it returns `(String /*text*/, String /*stop_reason*/)`; the existing `route_to_each_agent_by_id` is the reference call site). If `PONG_PROMPT` is the standard prompt the helper applies internally, follow the existing test's call shape exactly.
+> Verify `route_and_prompt`'s exact signature against the file (review-confirmed: returns `(String /*text*/, String /*stop_reason*/)` and applies `PONG_PROMPT` internally — so callers do NOT pass the prompt). Mirror the existing `route_to_each_agent_by_id` call shape AND its PONG-assertion style exactly (use whatever case/trim handling it uses; the `to_uppercase().contains("PONG")` above is the safe default if it differs).
 
 - [ ] **Step 2: Compile-check (cannot run live without all 3 agents in CI)**
 
@@ -234,8 +236,12 @@ def wait_for(pred, timeout=60):
         if pred(obj): return obj
     return None
 
+# Advertise the SAME client capabilities the production bridge does — NO fs, NO
+# terminal (AcpBackend::initialize_request advertises none, and the codex/kiro
+# corpora use this exact shape). This keeps the capture representative AND prevents
+# a hang: the harness does not answer fs/* reverse requests, so it must not invite them.
 send({"jsonrpc":"2.0","id":0,"method":"initialize",
-      "params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":True,"writeTextFile":True},"terminal":False}}})
+      "params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":False,"writeTextFile":False},"terminal":False}}})
 wait_for(lambda o: o.get("id") == 0)
 send({"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"oauth-personal"}})
 wait_for(lambda o: o.get("id") == 1)
@@ -264,17 +270,20 @@ for fr in frames:
         print("  recv", tag, json.dumps(ln)[:140])
 ```
 
-- [ ] **Step 2: Run the capture (from the repo root) and inspect**
+- [ ] **Step 2: Run the capture from the repo root and inspect**
 
-Run: `cd /Users/wesleyjinks/code/a2a-bridge && python3 /tmp/gemini-capture.py`
+The script writes to the relative path `crates/bridge-acp/tests/corpus/gemini-cli.jsonl`, so run it from the repo root:
+Run: `cd "$(git rev-parse --show-toplevel)" && python3 /tmp/gemini-capture.py`
 Expected: writes `crates/bridge-acp/tests/corpus/gemini-cli.jsonl` and prints the recv frames. Confirm the capture contains:
 - the `initialize` result (recv),
 - the `authenticate` `{}` result (recv),
 - the `session/new` result with `sessionId`/`modes`/`models` (recv),
 - at least one `session/update` `available_commands_update` (recv),
 - at least one `session/update` `agent_message_chunk` carrying the assistant text (recv),
-- the terminal `{"result":{"stopReason": "<X>"}}` (recv) — **record the actual `<X>`** (may be `end_turn` or something else).
-If the assistant text isn't `PONG` (Gemini may phrase differently), that's fine — Task 4 asserts against the **captured** text, not a fixed `PONG`. If NO `agent_message_chunk` or NO terminal result was captured, the turn didn't complete — increase the timeout / check `gemini` auth, and re-run.
+- the terminal `{"result":{"stopReason": "<X>"}}` (recv) — **record the actual `<X>`**.
+
+> **CRITICAL — the `stopReason` must be an SDK-modeled variant (review).** The corpus `replay()` helper hard-`.expect()`s `serde_json::from_value::<StopReason>(...)` — and the SDK `StopReason` models exactly **five** values: `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled`. If Gemini's captured `<X>` is **not** one of those five, this is a **real conformance issue, not a corpus detail**: the gemini `replay()` test would PANIC on the result frame, AND the live bridge's `session/prompt` result deserialization (same SDK `StopReason`) would also be affected — so **STOP and escalate** (it needs handling beyond this plan). In practice Gemini almost certainly emits `end_turn` (the universal default); the capture confirms it.
+> Likewise, if the assistant text isn't exactly `PONG` (Gemini may phrase/punctuate differently), record what it IS — Task 4 asserts against the **captured** text. If NO `agent_message_chunk` or NO terminal result was captured, the turn didn't complete — increase the timeout / check `gemini` auth, and re-run.
 
 - [ ] **Step 3: Commit the captured corpus**
 
@@ -293,7 +302,11 @@ git commit -m "test(corpus): capture real gemini-cli 0.41.2 ACP round-trip frame
 
 - [ ] **Step 1: Add the Gemini replay test (mirrors `kiro_real_capture_replays_through_backend`)**
 
-Add a test that replays gemini's recv frames through the SAME `replay()` helper, asserting the captured assistant text joins to the captured value and the result maps to the captured stop reason. **Fill `<TEXT>` and `<STOP>` from the Task-3 capture** (e.g. `"PONG"` / `"end_turn"` — use what the capture actually shows):
+**Derive `<TEXT>` and `<STOP>` by READING the committed `crates/bridge-acp/tests/corpus/gemini-cli.jsonl`** (it exists after Task 3 — do not rely on out-of-band notes):
+- `<TEXT>` = the concatenation of the `text` fields from the `recv` `session/update` frames whose `update.sessionUpdate == "agent_message_chunk"` (the assistant output — likely `"PONG"`).
+- `<STOP>` = the `result.stopReason` from the terminal `recv` result frame (likely `"end_turn"`; it MUST be one of the five SDK `StopReason` variants per Task 3, else Task 3 already escalated).
+
+Add a test that replays gemini's recv frames through the SAME `replay()` helper, asserting the captured assistant text joins to `<TEXT>` and the result maps to `<STOP>`:
 
 ```rust
 // ── gemini-cli: REAL capture (DoD gate MET) ──────────────────────────────────
@@ -334,9 +347,9 @@ fn gemini_real_capture_replays_through_backend() {
 The generic `replay()` collapses a deserialize-`Err` and a `map→None` into the same `None` (corpus_replay.rs ~line 115), so it cannot prove the variant is *modeled*. Add a targeted test that pulls gemini's captured `available_commands_update` frame and asserts it (a) deserializes as a `SessionNotification` (i.e. it IS modeled — `Ok`, not `Err`) and (b) maps to `None`:
 
 ```rust
+// `SessionNotification`/`Value` are already imported at the top of corpus_replay.rs.
 #[test]
 fn gemini_available_commands_update_is_modeled_not_parse_error() {
-    use agent_client_protocol::schema::SessionNotification;
     let corpus = load_corpus("gemini-cli");
     let frame = corpus
         .recv_frames()
@@ -419,4 +432,4 @@ Dispatch a final reviewer over the branch diff (focus: the `entry()` signature c
 
 **3. Type consistency:** `entry(...)` gains a 6th param `auth_method: Option<&str>`; ALL call sites updated (Task 1 Step 2 for the 2 existing, Step 4 for gemini). `three_agent_snapshot()`, `GEMINI_ID/CMD/MODEL/AUTH`, `route_and_prompt`, `load_corpus`/`replay`/`ReplayOutcome`/`AcpBackend::map_session_update`/`SessionNotification` all match the real source read during planning. The corpus jsonl format (`_provenance` header + `{"dir","line"}` frames) matches the codex/kiro files. ✅
 
-**One flagged dependency (not a gap):** Task 4's exact assertion values depend on Task 3's live capture (Gemini's actual streamed text + `stopReason`). This is intentional — the spec explicitly defers these to the capture (Gemini may not emit `"end_turn"`; `stop_reason_str` maps unknowns to `"unknown"`, non-fatal). The implementer fills them from the recorded capture in Task 3 Step 2.
+**One flagged dependency (not a gap):** Task 4's exact assertion values depend on Task 3's live capture (Gemini's actual streamed text + `stopReason`). The implementer derives them by **reading the committed `gemini-cli.jsonl`** (Task 4 Step 1) — self-contained, no out-of-band notes. **Correction (review):** an unknown `stopReason` is NOT "non-fatal" — the corpus `replay()` hard-`.expect()`s `StopReason` deserialization (5 modeled variants only), so a non-SDK `stopReason` would PANIC the replay (and affects the live prompt-result deser too). Task 3 therefore verifies the captured `stopReason` is one of the five and escalates otherwise — it is not silently coerced to `"unknown"`. (Gemini is expected to emit `end_turn`.)
