@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
+use tokio::sync::{mpsc, Mutex, OnceCell};
 
 /// Per-turn event routed from the reader to the active `prompt` stream.
 #[derive(Debug)]
@@ -35,8 +35,18 @@ pub struct SessionProc {
     /// True while a turn is in flight (set in `begin_turn`, cleared in `end_turn`).
     /// The reaper uses this to count IDLE procs only for the `max_warm` cap (§3.3).
     pub in_turn: AtomicBool,
+    /// Set by the reader when the Init event arrives (captured lazily during the
+    /// first turn — real `claude` emits init only after the first user message).
+    /// Used by the reader's EOF branch to distinguish "never authenticated"
+    /// (closed stdout before any init) from a crash mid-conversation.
+    pub init_seen: AtomicBool,
     /// The single active turn's sender (one turn at a time).
     turn_tx: StdMutex<Option<mpsc::UnboundedSender<TurnEvent>>>,
+    /// A terminal event (Done/Failed) routed by the reader while NO turn sender was
+    /// registered — e.g. the process closes stdout (EOF-before-init) in the window
+    /// between `spawn_proc` returning and the first `begin_turn`. Replayed into the
+    /// channel by the next `begin_turn` so the terminal is never lost to the race.
+    pending_terminal: StdMutex<Option<TurnEvent>>,
     supervised: StdMutex<Option<Supervised>>,
     pub claude_session_id: StdMutex<Option<String>>,
     pub last_used: StdMutex<Instant>,
@@ -68,9 +78,15 @@ impl SessionProc {
         Ok(())
     }
     /// Register the active turn's sender; returns the receiver the stream drains.
+    /// If the reader already routed a terminal event before any turn was registered
+    /// (the EOF-before-init race), replay it into this fresh channel.
     pub fn begin_turn(&self) -> mpsc::UnboundedReceiver<TurnEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.in_turn.store(true, Ordering::SeqCst);
+        let pending = self.pending_terminal.lock().ok().and_then(|mut g| g.take());
+        if let Some(ev) = pending {
+            let _ = tx.send(ev);
+        }
         if let Ok(mut g) = self.turn_tx.lock() {
             *g = Some(tx);
         }
@@ -99,6 +115,14 @@ impl SessionProc {
         if let Ok(g) = self.turn_tx.lock() {
             if let Some(tx) = g.as_ref() {
                 let _ = tx.send(ev);
+                return;
+            }
+        }
+        // No active turn sender (the spawn→first-turn window). Stash a terminal so
+        // `begin_turn` can replay it; non-terminal Text before any turn is dropped.
+        if matches!(ev, TurnEvent::Done { .. } | TurnEvent::Failed(_)) {
+            if let Ok(mut g) = self.pending_terminal.lock() {
+                *g = Some(ev);
             }
         }
     }
@@ -132,9 +156,12 @@ impl SessionSlot {
     }
 }
 
-/// Spawn one warm `claude` process and its reader task; await the init line
-/// (bounded by `init_timeout`) so we capture the session id and surface an
-/// auth/trust failure as a bounded error rather than a hang (§4).
+/// Spawn one warm `claude` process and its reader task and return immediately.
+/// Init is captured LAZILY: real `claude` (stream-json input mode) emits the
+/// `init` line only AFTER the first user message is written, so we no longer
+/// block on init at spawn. The reader captures the session id and sets
+/// `init_seen` whenever the Init event arrives (during the first turn); an
+/// EOF-before-init surfaces as `AgentNotAuthenticated` on that first turn (§4).
 pub async fn spawn_proc(cmd: &str, cfg: &ClaudeConfig) -> Result<Arc<SessionProc>, BridgeError> {
     let mut args: Vec<String> = vec![
         "--input-format".into(),
@@ -158,14 +185,15 @@ pub async fn spawn_proc(cmd: &str, cfg: &ClaudeConfig) -> Result<Arc<SessionProc
     let stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed)?;
     let stdout = child.stdout.take().ok_or(BridgeError::AgentCrashed)?;
 
-    let (init_tx, init_rx) = oneshot::channel::<String>();
     let proc = Arc::new(SessionProc {
         stdin: Mutex::new(stdin),
         turn_lock: Arc::new(Mutex::new(())),
         terminated: AtomicBool::new(false),
         cancel_requested: AtomicBool::new(false),
         in_turn: AtomicBool::new(false),
+        init_seen: AtomicBool::new(false),
         turn_tx: StdMutex::new(None),
+        pending_terminal: StdMutex::new(None),
         supervised: StdMutex::new(Some(sup)),
         claude_session_id: StdMutex::new(None),
         last_used: StdMutex::new(Instant::now()),
@@ -175,7 +203,6 @@ pub async fn spawn_proc(cmd: &str, cfg: &ClaudeConfig) -> Result<Arc<SessionProc
     let reader_proc = Arc::clone(&proc);
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
-        let mut init_tx = Some(init_tx);
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
@@ -183,11 +210,9 @@ pub async fn spawn_proc(cmd: &str, cfg: &ClaudeConfig) -> Result<Arc<SessionProc
                         match ev {
                             ClaudeEvent::Init { session_id } => {
                                 if let Ok(mut g) = reader_proc.claude_session_id.lock() {
-                                    *g = Some(session_id.clone());
+                                    *g = Some(session_id);
                                 }
-                                if let Some(tx) = init_tx.take() {
-                                    let _ = tx.send(session_id);
-                                }
+                                reader_proc.init_seen.store(true, Ordering::SeqCst);
                             }
                             ClaudeEvent::Text(t) => reader_proc.route(TurnEvent::Text(t)),
                             ClaudeEvent::ResultOk { stop_reason } => {
@@ -209,13 +234,17 @@ pub async fn spawn_proc(cmd: &str, cfg: &ClaudeConfig) -> Result<Arc<SessionProc
                     }
                 }
                 Ok(None) | Err(_) => {
-                    // EOF / read error. If a cancel is pending, the in-flight turn
-                    // is Canceled; otherwise it's a crash mid-turn.
+                    // EOF / read error. Cancel takes precedence (in-flight turn is
+                    // Canceled). Otherwise: if init was never seen, the process
+                    // closed stdout before ever emitting init (not logged in /
+                    // immediate exit) → AgentNotAuthenticated; else a crash mid-turn.
                     reader_proc.terminated.store(true, Ordering::SeqCst);
                     if reader_proc.cancel_requested.load(Ordering::SeqCst) {
                         reader_proc.route(TurnEvent::Done {
                             stop_reason: STOP_REASON_CANCELLED.into(),
                         });
+                    } else if !reader_proc.init_seen.load(Ordering::SeqCst) {
+                        reader_proc.route(TurnEvent::Failed(BridgeError::AgentNotAuthenticated));
                     } else {
                         reader_proc.route(TurnEvent::Failed(BridgeError::AgentCrashed));
                     }
@@ -225,17 +254,6 @@ pub async fn spawn_proc(cmd: &str, cfg: &ClaudeConfig) -> Result<Arc<SessionProc
         }
     });
 
-    // Bounded wait for the init line.
-    match tokio::time::timeout(cfg.init_timeout, init_rx).await {
-        Ok(Ok(_sid)) => Ok(proc),
-        // Channel dropped (reader hit EOF before init) → not authenticated / trust prompt / crash.
-        Ok(Err(_)) => {
-            proc.terminate(cfg.cancel_grace).await;
-            Err(BridgeError::AgentNotAuthenticated)
-        }
-        Err(_) => {
-            proc.terminate(cfg.cancel_grace).await;
-            Err(BridgeError::AgentNotAuthenticated)
-        }
-    }
+    // Return immediately; init is captured lazily during the first turn.
+    Ok(proc)
 }

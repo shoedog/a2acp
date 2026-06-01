@@ -12,12 +12,13 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// Behavior knobs for one spawned fake process.
 #[derive(Default, Clone)]
 pub struct FakeSpec {
-    pub no_init: bool,              // skip the init line → spawn_proc init-timeout path
+    pub no_init: bool,              // skip the init line → init never captured (lazy)
     pub hang: bool, // read the turn but never emit ANYTHING → turn-timeout / cancel→EOF
     pub stall: bool, // emit assistant text, then NO result → a STARTED, mid-flight turn
+    pub exit_before_init: bool, // exit(0) immediately, before init/read → EOF-before-init (not auth)
     pub result_err: Option<String>, // emit result subtype = this (e.g. "error_during_execution")
-    pub reply: Option<String>, // fixed assistant text; default = remembered number or "OK"
-    pub init_sid: String, // session id in the init line
+    pub reply: Option<String>,  // fixed assistant text; default = remembered number or "OK"
+    pub init_sid: String,       // session id in the init line
 }
 impl FakeSpec {
     pub fn new() -> Self {
@@ -37,6 +38,8 @@ def cfg():
     return {}
 c = cfg()
 out = sys.stdout
+if c.get("exit_before_init", False):
+    sys.exit(0)   # close stdout before init/read → models "not authenticated"/immediate exit
 if not c.get("no_init", False):
     out.write(json.dumps({"type":"system","subtype":"init","session_id":c.get("init_sid","fake-sid")})+"\n"); out.flush()
 memory = None
@@ -76,6 +79,7 @@ pub fn fake(name: &str, spec: FakeSpec) -> (String, ClaudeConfig) {
     let mut f = std::fs::File::create(&cfg_path).unwrap();
     let json = serde_json::json!({
         "no_init": spec.no_init, "hang": spec.hang, "stall": spec.stall,
+        "exit_before_init": spec.exit_before_init,
         "result_err": spec.result_err, "reply": spec.reply, "init_sid": spec.init_sid,
     });
     write!(f, "{json}").unwrap();

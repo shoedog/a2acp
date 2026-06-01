@@ -15,7 +15,8 @@ pub struct ClaudeConfig {
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub extra_args: Vec<String>, // perm/trust flags + entry.args
-    pub init_timeout: Duration,
+    pub init_timeout: Duration,  // retained; init is now captured lazily during the first turn
+
     pub turn_timeout: Duration,
     pub cancel_grace: Duration,
     pub idle_ttl: Duration,
