@@ -22,7 +22,6 @@ pub(crate) struct Inner {
 
 pub struct ClaudeCliBackend {
     pub(crate) inner: Arc<Inner>,
-    #[allow(dead_code)] // held to keep the reaper task alive; Task 11 will abort it in retire()
     reaper: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -320,8 +319,30 @@ impl AgentBackend for ClaudeCliBackend {
     }
 
     async fn retire(&self) -> Result<(), BridgeError> {
-        // Filled in Task 11.
+        // Stop the reaper, then terminate every warm proc. The registry has drained
+        // leases before calling this; the forced-retirement backstop (3b's 30s
+        // grace) may have in-flight turns — terminate unconditionally (§3.3).
+        if let Some(h) = self.reaper.lock().ok().and_then(|mut g| g.take()) {
+            h.abort();
+        }
+        let slots: Vec<(SessionId, Arc<SessionSlot>)> = {
+            let map = self.inner.sessions.lock().await;
+            map.iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
+        for (s, slot) in slots {
+            Self::invalidate_slot(&self.inner, &s, &slot).await; // identity-checked
+        }
         Ok(())
+    }
+}
+
+impl Drop for ClaudeCliBackend {
+    fn drop(&mut self) {
+        if let Some(h) = self.reaper.lock().ok().and_then(|mut g| g.take()) {
+            h.abort();
+        }
     }
 }
 
