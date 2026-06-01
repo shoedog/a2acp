@@ -246,6 +246,7 @@ impl AgentRegistry for Registry {
                     && c.args == e.args
                     && c.cwd == e.cwd
                     && c.auth_method == e.auth_method
+                    && c.kind == e.kind
             });
             match reuse {
                 // Config-only edit: keep the warm slot, swap only its entry config.
@@ -774,5 +775,27 @@ mod tests {
 
         reg.apply(snapshot(&["b"])).await.unwrap(); // removes "a"
         await_retired(&retired, 1).await;
+    }
+
+    #[tokio::test]
+    async fn kind_change_forces_fresh_slot() {
+        use bridge_core::domain::AgentKind;
+        let count = Arc::new(AtomicUsize::new(0));
+        // Snapshot 1: entry "a" with the default kind (Acp), cmd="fake-cmd".
+        let reg = Registry::new(snapshot(&["a"]), counting_spawn(count.clone(), 0)).unwrap();
+        let a = AgentId::parse("a").unwrap();
+        reg.resolve(&a).await.unwrap();
+        assert_eq!(count.load(SeqCst), 1, "first resolve mints the backend");
+
+        // Snapshot 2: SAME cmd/args/cwd/auth_method, only kind changes Acp → ClaudeCli.
+        let mut snap2 = snapshot(&["a"]);
+        snap2.entries[0].kind = AgentKind::ClaudeCli;
+        reg.apply(snap2).await.unwrap();
+        reg.resolve(&a).await.unwrap();
+        assert_eq!(
+            count.load(SeqCst),
+            2,
+            "a kind change forces a fresh slot → a NEW spawn (not warm-reused)"
+        );
     }
 }
