@@ -273,18 +273,85 @@ fn codex_real_capture_replays_pong_and_drops_unmodeled() {
     );
 }
 
+// ── gemini-cli: REAL capture (DoD gate MET) ──────────────────────────────────
+
+#[test]
+fn gemini_real_capture_replays_through_backend() {
+    let corpus = load_corpus("gemini-cli");
+    assert!(
+        corpus.is_real_capture(),
+        "gemini-cli corpus MUST be a REAL capture; provenance: {}",
+        corpus.provenance
+    );
+
+    let mut texts: Vec<String> = Vec::new();
+    let mut done: Option<String> = None;
+    let mut modeled = 0usize;
+    for frame in corpus.recv_frames() {
+        match replay(frame) {
+            Some(ReplayOutcome::Update(Update::Text(t))) => {
+                modeled += 1;
+                texts.push(t);
+            }
+            Some(ReplayOutcome::Done(stop)) => {
+                modeled += 1;
+                done = Some(stop);
+            }
+            Some(other) => panic!("unexpected modeled outcome from gemini capture: {other:?}"),
+            None => {} // tolerant DROP: available_commands_update + the init/session-new results
+        }
+    }
+    assert_eq!(
+        texts.concat(),
+        "PONG",
+        "the real gemini agent_message_chunk(s) must replay to the captured assistant text"
+    );
+    assert_eq!(
+        done.as_deref(),
+        Some("end_turn"),
+        "the real gemini prompt result must replay to the captured stop reason"
+    );
+    assert!(
+        modeled >= 2,
+        "at least one text chunk + the result must be modeled"
+    );
+}
+
+#[test]
+fn gemini_available_commands_update_is_modeled_not_parse_error() {
+    let corpus = load_corpus("gemini-cli");
+    let frame = corpus
+        .recv_frames()
+        .find(|f| {
+            f.get("method").and_then(Value::as_str) == Some("session/update")
+                && f.pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("available_commands_update")
+        })
+        .expect("gemini capture must contain an available_commands_update session/update frame");
+    let params = frame.get("params").cloned().unwrap();
+    let notif = serde_json::from_value::<SessionNotification>(params)
+        .expect("available_commands_update MUST deserialize (it is a MODELED SessionUpdate variant, \
+                 not an unknown tag) — this is the parse-vs-modeled distinction the generic replay collapses");
+    assert!(
+        AcpBackend::map_session_update(notif).is_none(),
+        "available_commands_update is modeled but carries no assistant text → maps to None (dropped at the map layer)"
+    );
+}
+
 // ── DoD GATE marker test ─────────────────────────────────────────────────────
 //
 // Scans EVERY corpus file for a REAL-CAPTURE provenance header and asserts every
-// known agent has one. Both kiro-cli (kiro-cli acp 2.5.0) and codex-acp
-// (zed-industries/codex-acp 0.15.0) now ship a real captured round-trip, so the
-// "unmet" set is empty and this test PASSES — the DoD gate is MET for every agent.
+// known agent has one. kiro-cli (kiro-cli acp 2.5.0), codex-acp
+// (zed-industries/codex-acp 0.15.0), and gemini-cli (gemini-cli 0.41.2) now ship
+// a real captured round-trip, so the "unmet" set is empty and this test PASSES —
+// the DoD gate is MET for every agent.
 // It is intentionally a normal (non-ignored) test now: should anyone regress a
 // corpus back to provisional scaffolding, the default `cargo test` run fails with
 // a message naming exactly which agent lost its real capture.
 #[test]
 fn real_capture_corpus_present() {
-    let agents = ["kiro-cli", "codex-acp"];
+    let agents = ["kiro-cli", "codex-acp", "gemini-cli"];
     let missing: Vec<&str> = agents
         .iter()
         .copied()
