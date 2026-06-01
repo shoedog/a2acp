@@ -13,11 +13,12 @@ is a real conformance proof — not the v1 circular one.
 
 ## GATE STATUS (per agent)
 
-| agent      | real capture? | provenance                       |
-|------------|---------------|----------------------------------|
-| kiro-cli   | **YES — MET** | `REAL-CAPTURE` (v2.5.0)          |
-| codex-acp  | **YES — MET** | `REAL-CAPTURE` (v0.15.0)         |
-| gemini-cli | **YES — MET** | `REAL-CAPTURE (v0.41.2)`         |
+| agent            | real capture? | provenance                        |
+|------------------|---------------|-----------------------------------|
+| kiro-cli         | **YES — MET** | `REAL-CAPTURE` (v2.5.0)           |
+| codex-acp        | **YES — MET** | `REAL-CAPTURE` (v0.15.0)          |
+| gemini-cli       | **YES — MET** | `REAL-CAPTURE (v0.41.2)`          |
+| claude-agent-acp | **YES — MET** | `REAL-CAPTURE (v0.39.0)`          |
 
 - **kiro-cli — GATE MET.** `kiro-cli.jsonl` is a real round-trip captured from
   `kiro-cli acp` 2.5.0 in this environment (initialize → session/new → session/prompt →
@@ -52,8 +53,17 @@ is a real conformance proof — not the v1 circular one.
   `Text` update. Both drops are guarded by the `gemini_available_commands_update_is_modeled_not_parse_error`
   test and the `Some(other) => panic!` arm in `gemini_real_capture_replays_through_backend`.
 
+- **claude-agent-acp — GATE MET.** `claude-agent-acp.jsonl` is a real round-trip captured
+  from `claude-agent-acp` 0.39.0 on the Pro/Max subscription (Haiku model, `session/set_model`
+  verified). The agent replied with a single `agent_message_chunk` chunk (`""` + `"PONG"` →
+  concat `"PONG"`) and terminated with `stopReason:end_turn`. The capture also emits several
+  unmodeled `session/update` variants — `available_commands_update`, `current_mode_update`,
+  `config_option_update`, `usage_update`, and `agent_thought_chunk` — all dropped at the map
+  layer (`map_session_update` returns `None`). The inbound frames replay correctly through
+  `AcpBackend`.
+
 The `real_capture_corpus_present` test in `tests/corpus_replay.rs` scans every file for a
-`REAL-CAPTURE` provenance header. All three agents now have real captures, so it is a
+`REAL-CAPTURE` provenance header. All four agents now have real captures, so it is a
 normal (non-ignored) test that PASSES. If any corpus is ever regressed back to provisional
 scaffolding, the default `cargo test` run fails naming exactly which agent lost its real
 capture, so CI can never imply the gate is met when it isn't.

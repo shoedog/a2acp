@@ -339,19 +339,67 @@ fn gemini_available_commands_update_is_modeled_not_parse_error() {
     );
 }
 
+// ── claude-agent-acp: REAL capture (DoD gate MET) ────────────────────────────
+#[test]
+fn claude_agent_acp_real_capture_replays_through_backend() {
+    let corpus = load_corpus("claude-agent-acp");
+    assert!(
+        corpus.is_real_capture(),
+        "claude-agent-acp corpus MUST be a REAL capture; provenance: {}",
+        corpus.provenance
+    );
+    let mut texts: Vec<String> = Vec::new();
+    let mut done: Option<String> = None;
+    let mut modeled = 0usize;
+    for frame in corpus.recv_frames() {
+        match replay(frame) {
+            Some(ReplayOutcome::Update(Update::Text(t))) => {
+                modeled += 1;
+                texts.push(t);
+            }
+            Some(ReplayOutcome::Done(stop)) => {
+                modeled += 1;
+                done = Some(stop);
+            }
+            // A Reply-PONG prompt with no fs caps should not trigger a reverse permission
+            // request, but tolerate one (auto-approved by decide_for_corpus) so a stray
+            // session/request_permission frame doesn't trip the panic arm — it doesn't
+            // affect the text/done assertions.
+            Some(ReplayOutcome::PermissionOutcome(_)) => {}
+            // Update::Permission / Update::Done are unexpected mid-stream — flag them.
+            Some(other) => panic!("unexpected modeled outcome from claude capture: {other:?}"),
+            None => {} // DROP: available_commands_update / config_option_update / usage_update / agent_thought_chunk + init/session-new results
+        }
+    }
+    assert_eq!(
+        texts.concat(),
+        "PONG",
+        "the real claude agent_message_chunk(s) must replay to the captured assistant text"
+    );
+    assert_eq!(
+        done.as_deref(),
+        Some("end_turn"),
+        "the real claude prompt result must replay to the captured stop reason"
+    );
+    assert!(
+        modeled >= 2,
+        "at least one text chunk + the result must be modeled"
+    );
+}
+
 // ── DoD GATE marker test ─────────────────────────────────────────────────────
 //
 // Scans EVERY corpus file for a REAL-CAPTURE provenance header and asserts every
 // known agent has one. kiro-cli (kiro-cli acp 2.5.0), codex-acp
-// (zed-industries/codex-acp 0.15.0), and gemini-cli (gemini-cli 0.41.2) now ship
-// a real captured round-trip, so the "unmet" set is empty and this test PASSES —
-// the DoD gate is MET for every agent.
+// (zed-industries/codex-acp 0.15.0), gemini-cli (gemini-cli 0.41.2), and
+// claude-agent-acp (claude-agent-acp 0.39.0) now ship a real captured round-trip,
+// so the "unmet" set is empty and this test PASSES — the DoD gate is MET for every agent.
 // It is intentionally a normal (non-ignored) test now: should anyone regress a
 // corpus back to provisional scaffolding, the default `cargo test` run fails with
 // a message naming exactly which agent lost its real capture.
 #[test]
 fn real_capture_corpus_present() {
-    let agents = ["kiro-cli", "codex-acp", "gemini-cli"];
+    let agents = ["kiro-cli", "codex-acp", "gemini-cli", "claude-agent-acp"];
     let missing: Vec<&str> = agents
         .iter()
         .copied()
