@@ -121,24 +121,6 @@ async fn main() -> Result<(), BoxError> {
                         .with_policy(policy);
                     Ok(Arc::new(be) as Arc<dyn AgentBackend>)
                 }
-                AgentKind::ClaudeCli => {
-                    let _ = &policy;
-                    let claude_cfg = bridge_claude::ClaudeConfig {
-                        cwd,
-                        model: entry.model.clone(),
-                        extra_args: entry.args.clone(),
-                        idle_ttl: crate::config::ext_u64(&entry.extensions, "idle_ttl_secs")
-                            .map(std::time::Duration::from_secs)
-                            .unwrap_or(bridge_claude::config::DEFAULT_IDLE_TTL),
-                        max_warm: crate::config::ext_usize(&entry.extensions, "max_warm")
-                            .unwrap_or(bridge_claude::config::DEFAULT_MAX_WARM),
-                        max_sessions: crate::config::ext_usize(&entry.extensions, "max_sessions")
-                            .unwrap_or(bridge_claude::config::DEFAULT_MAX_SESSIONS),
-                        ..bridge_claude::ClaudeConfig::default()
-                    };
-                    let be = bridge_claude::ClaudeCliBackend::spawn(&entry.cmd, claude_cfg).await?;
-                    Ok(Arc::new(be) as Arc<dyn AgentBackend>)
-                }
             }
         })
     });
