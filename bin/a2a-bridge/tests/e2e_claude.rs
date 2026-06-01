@@ -232,3 +232,55 @@ async fn inbound_two_turns_same_task_reuse_warm_proc() {
         reply2
     );
 }
+
+#[tokio::test]
+#[ignore = "requires logged-in `claude` CLI; run locally with --ignored"]
+async fn real_claude_two_turns_remembers_number() {
+    // Reuses the helpers defined in this file (build_router, streaming_req,
+    // body_string, wait_until, ForgetTracking, forgotten).
+    let real = Arc::new(
+        ClaudeCliBackend::spawn(
+            "claude",
+            ClaudeConfig {
+                cwd: std::path::PathBuf::from("."),
+                // --dangerously-skip-permissions bypasses the workspace-trust dialog and
+                // any per-tool permission prompts so the process starts non-interactively.
+                // init_timeout is extended from the 30s default to accommodate hook startup.
+                extra_args: vec!["--dangerously-skip-permissions".into()],
+                init_timeout: std::time::Duration::from_secs(120),
+                ..ClaudeConfig::default()
+            },
+        )
+        .await
+        .expect("claude must be installed + logged in"),
+    );
+    let be: Arc<dyn AgentBackend> = Arc::new(ForgetTracking(real));
+    let router = build_router(be);
+
+    let r1 = router
+        .clone()
+        .oneshot(streaming_req("t-real", "Remember the number 7. Reply OK."))
+        .await
+        .unwrap();
+    let b1 = body_string(r1).await;
+    let reply1 = sse_agent_text(&b1);
+    assert!(
+        !reply1.is_empty(),
+        "real claude turn1 must produce a reply: body={b1}"
+    );
+    wait_until(|| forgotten().lock().unwrap().contains("session-t-real")).await;
+
+    let r2 = router
+        .oneshot(streaming_req(
+            "t-real",
+            "What number did I ask you to remember? Reply with just the number.",
+        ))
+        .await
+        .unwrap();
+    let body2 = body_string(r2).await;
+    let reply2 = sse_agent_text(&body2);
+    assert!(
+        reply2.contains('7'),
+        "real claude turn2 must answer 7: reply={reply2:?} body={body2}"
+    );
+}
