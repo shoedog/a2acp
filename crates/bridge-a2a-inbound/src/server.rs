@@ -958,6 +958,47 @@ fn spawn_fanout_producer(
     });
 }
 
+/// SSE sink: forwards workflow events into the mpsc->SSE channel.
+struct SseSink {
+    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+}
+
+#[async_trait::async_trait]
+impl crate::workflow_sink::WorkflowSink for SseSink {
+    async fn node_started(&mut self, node: &str) {
+        let _ = self
+            .tx
+            .send(Ok(Event::status(format!("node {node} started"))))
+            .await;
+    }
+    async fn node_finished(&mut self, node: &str, ok: bool) {
+        let _ = self
+            .tx
+            .send(Ok(Event::status(format!(
+                "node {node} {}",
+                if ok { "ok" } else { "failed" }
+            ))))
+            .await;
+    }
+    async fn terminal(
+        &mut self,
+        outcome: bridge_workflow::executor::WorkflowOutcome,
+        output: String,
+    ) {
+        use bridge_workflow::executor::WorkflowOutcome;
+        let _ = self.tx.send(Ok(Event::artifact(output))).await;
+        let to = match outcome {
+            WorkflowOutcome::Completed => TaskOutcome::Completed,
+            WorkflowOutcome::Failed => TaskOutcome::Failed,
+            WorkflowOutcome::Canceled => TaskOutcome::Canceled,
+        };
+        let _ = self.tx.send(Ok(Event::terminal(to))).await;
+    }
+    async fn error(&mut self, err: BridgeError) {
+        let _ = self.tx.send(Err(err)).await;
+    }
+}
+
 /// Spawn the workflow producer (W1): run the routed workflow graph over the
 /// executor and forward its events into the same mpsc->SSE path. Each
 /// `WorkflowEvent::Node{Started,Finished}` becomes a Status frame; the
@@ -971,7 +1012,6 @@ fn spawn_workflow_producer(
     wf_id: bridge_core::ids::WorkflowId,
     tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
 ) {
-    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
     let srv = srv.clone();
     let task = routed.task;
     let parts = routed.parts.clone();
@@ -998,42 +1038,13 @@ fn spawn_workflow_producer(
             .lock()
             .await
             .insert(task.clone(), token.clone());
-        let mut stream = executor.run(graph, input, task.as_str().to_string(), token.clone());
-        let mut terminal_sent = false;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(WorkflowEvent::NodeStarted { node }) => {
-                    let _ = tx
-                        .send(Ok(Event::status(format!("node {} started", node.as_str()))))
-                        .await;
-                }
-                Ok(WorkflowEvent::NodeFinished { node, ok }) => {
-                    let _ = tx
-                        .send(Ok(Event::status(format!(
-                            "node {} {}",
-                            node.as_str(),
-                            if ok { "ok" } else { "failed" }
-                        ))))
-                        .await;
-                }
-                Ok(WorkflowEvent::Terminal { outcome, output }) => {
-                    let _ = tx.send(Ok(Event::artifact(output))).await;
-                    let to = match outcome {
-                        WorkflowOutcome::Completed => TaskOutcome::Completed,
-                        WorkflowOutcome::Failed => TaskOutcome::Failed,
-                        WorkflowOutcome::Canceled => TaskOutcome::Canceled,
-                    };
-                    let _ = tx.send(Ok(Event::terminal(to))).await;
-                    terminal_sent = true;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                }
-            }
-        }
+        let stream = executor.run(graph, input, task.as_str().to_string(), token);
+        let mut sink = SseSink { tx: tx.clone() };
+        let terminal_seen =
+            crate::workflow_sink::drain_workflow(stream, &mut sink).await;
         // The executor always emits a Terminal, but guard against an early stream
         // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
-        if !terminal_sent {
+        if !terminal_seen {
             let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
         }
         srv.workflow_cancels.lock().await.remove(&task);
