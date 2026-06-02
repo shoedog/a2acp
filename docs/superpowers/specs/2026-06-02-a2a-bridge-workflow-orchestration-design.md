@@ -49,14 +49,27 @@ pub struct WorkflowNode {
 TOML (parsed once at boot in `bin/a2a-bridge`; prompt bodies loaded from files):
 
 ```toml
+# NOTE: valid TOML = one key per line (the `;`-separated one-liner form is illegal TOML).
 [[workflows]]
 id = "code-review"
-  [[workflows.nodes]]
-  id = "codex";  agent = "codex";  prompt_file = "prompts/review-codex.md";  inputs = []
-  [[workflows.nodes]]
-  id = "claude"; agent = "claude"; prompt_file = "prompts/review-claude.md"; inputs = []
-  [[workflows.nodes]]
-  id = "synth";  agent = "claude"; prompt_file = "prompts/review-synth.md";  inputs = ["codex", "claude"]
+
+[[workflows.nodes]]
+id = "codex"
+agent = "codex"
+prompt_file = "prompts/review-codex.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "claude"
+agent = "claude"
+prompt_file = "prompts/review-claude.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "prompts/review-synth.md"
+inputs = ["codex", "claude"]
 ```
 
 ## 3. The executor (`bridge-workflow/src/executor.rs`)

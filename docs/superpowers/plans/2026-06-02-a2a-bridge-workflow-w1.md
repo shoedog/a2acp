@@ -10,7 +10,7 @@
 
 **Conventions (project standing rules):** subagent task commits do **NOT** add a `Co-Authored-By` trailer (only the ADR commit does, Task 11). Coverage measured **after** `cargo llvm-cov clean --workspace`. `~/code/a2a-local-bridge` is firewall-black-box. Every task ends green: `cargo build`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test` (touched crate).
 
-**Plan status — folds the spec's rev2 corrections:** the executor does NOT reuse `Translator::run` (its artifact is `last_text` → would drop content); cancellation is explicit (`backend.cancel` per in-flight node, not stream-drop); workflows load-once; triggers streaming-only.
+**Plan status — folds the spec's rev2 corrections + the PLAN dual review (Codex + Claude):** the executor does NOT reuse `Translator::run` (its artifact is `last_text` → would drop content); cancellation is explicit (`backend.cancel` per in-flight node, not stream-drop); workflows load-once; triggers streaming-only. **Plan-rev2 fixes folded:** valid one-key-per-line TOML (the `;`-separated form is illegal TOML); boot-time agent-resolvability check + fail-loud tests (DoD-5/9); UTF-8-safe single-pass template (not `byte as char`); full `spawn_workflow_producer` code + concrete cancel via an `InboundServer` `workflow_cancels: HashMap<TaskId, CancellationToken>` + a `cancel_task` arm; the `RouteTarget` ripple is only 2 match sites (`:454`/`:1042`) — the real ripple is the `.with_workflows` builder (avoids the `new` call-site break) + the `agent_card` signature; early-cancel before scheduling/resolve; session id `workflow-{wf}-{node}-{run_id}`. Reviewers verified non-issues: `tokio-util` `CancellationToken` compiles as-is; the executor `join_all`/borrow design is sound; both exhaustive `RouteTarget` matches are the only ones.
 
 ---
 
@@ -18,7 +18,7 @@
 
 **Phase A (Tasks 0-6) — the `bridge-workflow` crate + the two new ids.** This builds against the *current* `bridge-core` and never references `RouteTarget`, so it is immune to the Phase-B ripple. Each task leaves the touched crates green.
 
-**Phase B (Tasks 7-11) — wiring + the atomic ripple.** Adding `RouteTarget::Workflow` re-expands the enum and breaks **every exhaustive match on `RouteTarget`** at once (`server.rs:454`, `:1041`, plus `local_agent_id:271`, `if-let:1035`, `cancel_task`). There is **no compiling intermediate**, so the variant + all its arms + the producer + the `InboundServer` fields it needs land in **ONE atomic commit (Task 9)**. Config parsing (Task 7) and the crate (Phase A) are additive and precede it.
+**Phase B (Tasks 7-11) — wiring + the atomic ripple.** Adding `RouteTarget::Workflow` re-expands the enum and breaks the **two exhaustive `RouteTarget` matches** at once — `stream_message:454` and `unary_message:1042` (review-corrected: `local_agent_id:271` is a wildcard, `if-let:1035` is non-exhaustive, and `cancel_task` keys on store flags — none break). Together with the `spawn_workflow_producer` + the `InboundServer` workflow fields it needs, there is **no compiling intermediate**, so they land in **ONE atomic commit (Task 9)** (the `.with_workflows` builder + `agent_card` signature changes ride along). Config parsing (Task 7) and the crate (Phase A) are additive and precede it.
 
 ## File Structure
 
@@ -99,13 +99,11 @@ tokio-util = { workspace = true }
 futures.workspace = true
 async-stream.workspace = true
 tokio-stream.workspace = true
-serde.workspace = true
-tracing.workspace = true
-async-trait.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
 tokio-test = { workspace = true }
+async-trait.workspace = true   # fake backends in tests impl AgentBackend
 ```
 `src/lib.rs`:
 ```rust
@@ -307,31 +305,32 @@ mod tests {
 //! Single-pass `{{var}}` template rendering. One left-to-right scan: each `{{token}}`
 //! is replaced by `vars[token]` (or left verbatim if unknown). A substituted VALUE is
 //! never re-scanned, so an upstream output containing `{{x}}` cannot be re-expanded.
+//! UTF-8 safe: only ever slices/pushes `&str` (no `byte as char`), so multibyte prompt
+//! text (em-dashes, smart quotes, accents) is preserved.
 use std::collections::HashMap;
 
 pub fn render(template: &str, vars: &HashMap<&str, &str>) -> String {
     let mut out = String::with_capacity(template.len());
-    let bytes = template.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some(close) = template[i + 2..].find("}}") {
-                let token = &template[i + 2..i + 2 + close];
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);                  // verbatim prefix (str slice = UTF-8 safe)
+        let after = &rest[open + 2..];
+        match after.find("}}") {
+            Some(close) => {
+                let token = &after[..close];
                 match vars.get(token) {
-                    Some(v) => out.push_str(v),          // value is NOT re-scanned
-                    None => out.push_str(&template[i..i + 2 + close + 2]), // unknown: verbatim
+                    Some(v) => out.push_str(v),        // value is NOT re-scanned
+                    None => { out.push_str("{{"); out.push_str(token); out.push_str("}}"); } // unknown verbatim
                 }
-                i += 2 + close + 2;
-                continue;
+                rest = &after[close + 2..];
             }
+            None => { out.push_str("{{"); rest = after; } // a lone "{{" with no close → literal
         }
-        out.push(bytes[i] as char);
-        i += 1;
     }
+    out.push_str(rest);
     out
 }
 ```
-(Note: `bytes[i] as char` is safe for the ASCII branch bytes; the multibyte content passes through via `push_str` of `&str` slices. If clippy flags the `as char`, use `out.push(template[i..].chars().next().unwrap()); i += ch.len_utf8();` — but the `{{`/`}}` scan is ASCII-anchored so the simple form is correct for valid UTF-8 templates.)
 
 - [ ] **Step 4: Run → pass:** `cargo test -p bridge-workflow template::` → PASS (3 tests); clippy clean.
 
@@ -459,10 +458,11 @@ impl WorkflowExecutor {
     /// Run one node: render its prompt from `vars`, resolve+configure+prompt+drain, forget.
     /// Returns (text, ok). On any failure returns the error marker + ok=false (caller decides
     /// terminal vs degradation). Cancellation → Err(BridgeError) mapped by the caller.
-    async fn run_node(&self, node: &WorkflowNode, vars: &HashMap<&str, &str>, run_id: &str,
+    async fn run_node(&self, wf_id: &str, node: &WorkflowNode, vars: &HashMap<&str, &str>, run_id: &str,
                       cancel: &CancellationToken) -> (String, bool) {
+        if cancel.is_cancelled() { return (format!("[node {} canceled]", node.id.as_str()), false); } // before resolve (Codex-4)
         let rendered = render(&node.prompt_template, vars);
-        let session = match SessionId::parse(format!("workflow-{}-{}", node.id.as_str(), run_id)) {
+        let session = match SessionId::parse(format!("workflow-{}-{}-{}", wf_id, node.id.as_str(), run_id)) {
             Ok(s) => s, Err(_) => return (format!("[node {} failed: bad session id]", node.id.as_str()), false),
         };
         let resolved = match self.registry.resolve(&node.agent).await {
@@ -514,7 +514,7 @@ impl WorkflowExecutor {
                 for inp in &node.inputs {
                     if let Some((t, _)) = outputs.get(inp.as_str()) { vars.insert(inp.as_str(), t.as_str()); }
                 }
-                let (text, ok) = this.run_node(node, &vars, &run_id, &cancel).await;
+                let (text, ok) = this.run_node(graph.id.as_str(), node, &vars, &run_id, &cancel).await;
                 yield Ok(WorkflowEvent::NodeFinished { node: node.id.clone(), ok });
                 terminal_output = text.clone(); terminal_ok = ok;
                 outputs.insert(node.id.as_str().to_string(), (text, ok));
@@ -594,6 +594,7 @@ async fn fan_out_runs_concurrently() {
             let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
             let terminal_id = graph.terminal().map(|n| n.id.as_str().to_string()).unwrap_or_default();
             while done.len() < graph.nodes.len() {
+                if cancel.is_cancelled() { break; }   // stop scheduling downstream once canceled (Codex-4)
                 let ready: Vec<&WorkflowNode> = graph.nodes.iter()
                     .filter(|n| !done.contains(n.id.as_str())
                         && n.inputs.iter().all(|i| done.contains(i.as_str())))
@@ -607,9 +608,10 @@ async fn fan_out_runs_concurrently() {
                         if let Some((t, _)) = outputs.get(inp.as_str()) { owned.push((inp.as_str().into(), t.clone())); }
                     }
                     let node = (*n).clone(); let run_id = run_id.clone(); let cancel = cancel.clone(); let this = &this;
+                    let wf_id = graph.id.as_str().to_string();
                     async move {
                         let vars: HashMap<&str, &str> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                        let (text, ok) = this.run_node(&node, &vars, &run_id, &cancel).await;
+                        let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel).await;
                         (node.id.as_str().to_string(), text, ok)
                     }
                 });
@@ -746,28 +748,51 @@ Parse `[[workflows]]` (load each `prompt_file`'s contents) into validated `Workf
 - [ ] **Step 1: Add `bridge-workflow` dep** to `bin/a2a-bridge/Cargo.toml` `[dependencies]`: `bridge-workflow = { path = "../../crates/bridge-workflow" }`.
 
 - [ ] **Step 2: Write the failing test.** Add to `config.rs` tests (note `[server]` is required; prompt files via a `tempfile`):
+VALID TOML only — one key per line (NOT `;`-separated, which TOML rejects):
 ```rust
+const AGENTS_HEADER: &str = "default = \"codex\"\n[[agents]]\nid = \"codex\"\ncmd = \"codex-acp\"\n";
+const SERVER_FOOTER: &str = "[server]\naddr = \"127.0.0.1:8080\"\n";
+
 #[test]
 fn parses_workflows_and_loads_prompts() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("p.md"), "review {{input}}").unwrap();
-    let toml = format!(r#"
-default = "codex"
-[[agents]]
-id = "codex"
-cmd = "codex-acp"
-[[workflows]]
-id = "wf1"
-  [[workflows.nodes]]
-  id = "only"; agent = "codex"; prompt_file = "p.md"; inputs = []
-[server]
-addr = "127.0.0.1:8080"
-"#);
+    let toml = format!("{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+        [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}");
     let cfg = RegistryConfig::parse(&toml).unwrap();
-    let wfs = cfg.load_workflows(dir.path()).unwrap();   // base dir for relative prompt_file
+    let wfs = cfg.load_workflows(dir.path()).unwrap();   // base = the dir holding prompt files
     let g = wfs.get(&bridge_core::ids::WorkflowId::parse("wf1").unwrap()).unwrap();
     assert_eq!(g.nodes[0].prompt_template, "review {{input}}");
     g.validate().unwrap();
+}
+
+#[test]
+fn workflow_unknown_agent_rejected_at_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.md"), "x").unwrap();
+    let toml = format!("{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+        [[workflows.nodes]]\nid = \"only\"\nagent = \"ghost\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}");
+    assert!(RegistryConfig::parse(&toml).unwrap().load_workflows(dir.path()).is_err(),
+        "node agent must exist in [[agents]] at boot (DoD-5)");
+}
+
+#[test]
+fn workflow_missing_prompt_file_fails_loud() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = format!("{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+        [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"nope.md\"\ninputs = []\n{SERVER_FOOTER}");
+    assert!(RegistryConfig::parse(&toml).unwrap().load_workflows(dir.path()).is_err());
+}
+
+#[test]
+fn workflow_bad_dag_fails_loud() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.md"), "x").unwrap();
+    // two terminals (both inputs=[]) → NotSingleTerminal
+    let toml = format!("{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+        [[workflows.nodes]]\nid = \"a\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n\
+        [[workflows.nodes]]\nid = \"b\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}");
+    assert!(RegistryConfig::parse(&toml).unwrap().load_workflows(dir.path()).is_err());
 }
 ```
 (Add `tempfile` to `bin/a2a-bridge` `[dev-dependencies]` if absent.)
@@ -786,11 +811,16 @@ impl RegistryConfig {
     {
         use bridge_core::ids::{AgentId, NodeId, WorkflowId};
         use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+        // Boot-time agent-resolvability (DoD-5): every node.agent must be a declared [[agents]] id.
+        let agent_ids: std::collections::HashSet<&str> = self.agents.iter().map(|a| a.id.as_str()).collect();
         let mut map = std::collections::HashMap::new();
         for w in &self.workflows {
             let id = WorkflowId::parse(w.id.clone()).map_err(|e| ConfigError::Registry(format!("workflow id {:?}: {e:?}", w.id)))?;
             let mut nodes = Vec::with_capacity(w.nodes.len());
             for n in &w.nodes {
+                if !agent_ids.contains(n.agent.as_str()) {
+                    return Err(ConfigError::Registry(format!("workflow {} node {} references unknown agent {:?}", w.id, n.id, n.agent)));
+                }
                 let tpl = std::fs::read_to_string(base.join(&n.prompt_file))
                     .map_err(|e| ConfigError::Registry(format!("workflow {} node {} prompt_file {:?}: {e}", w.id, n.id, n.prompt_file)))?;
                 nodes.push(WorkflowNode {
@@ -838,43 +868,105 @@ git commit -m "feat(route): SkillRoute carries the boot workflow-id set"
 
 ---
 
-## Task 9: ATOMIC — `RouteTarget::Workflow` ripple + producer + wiring + card
+## Task 9: ATOMIC — `RouteTarget::Workflow` + `spawn_workflow_producer` + cancel + card
 
-**Files (ONE commit):** `crates/bridge-core/src/domain.rs`, `crates/bridge-a2a-inbound/src/server.rs`, `crates/bridge-a2a-inbound/src/card.rs`, `bin/a2a-bridge/src/route.rs`, `bin/a2a-bridge/src/main.rs`, `crates/bridge-a2a-inbound/Cargo.toml` (+ `bridge-workflow` dep).
+**Files (ONE commit):** `crates/bridge-core/src/domain.rs`, `crates/bridge-a2a-inbound/{src/server.rs, src/card.rs, Cargo.toml}`, `bin/a2a-bridge/src/{route.rs, main.rs}`, `Cargo.lock`.
 
-**Why atomic:** adding `RouteTarget::Workflow` breaks the exhaustive matches at `server.rs:454` and `:1041` simultaneously; `spawn_workflow_producer` needs `InboundServer` to hold the executor + workflow map; so the variant, all arms, the producer, and the field-wiring land together. Use the compiler as the checklist (`cargo build --workspace` → fix every error).
+**The REAL ripple (review-corrected — do NOT over-add arms):** adding `RouteTarget::Workflow` breaks exactly **two** exhaustive matches — `stream_message` (`:454`) and `unary_message` (`:1042`). **`local_agent_id:271` is a wildcard match, the `if-let:1035` is not exhaustive, and `cancel_task` branches on store flags (not `RouteTarget`) — none of these break; do NOT add `Workflow` arms there.** The bigger ripple is two *signature* changes, handled to minimize breakage:
+- **`InboundServer`:** add the workflow fields via a **`.with_workflows(...)` builder**, NOT new constructor args — so the existing `InboundServer::new` call sites (server.rs tests + main.rs) are **untouched**; only `main.rs` + the workflow test call `.with_workflows`.
+- **`agent_card`:** `agent_card(base_url)` → `agent_card(base_url, workflow_ids: &[&str])` — breaks `serve_card` (`server.rs:407`) + the card tests (`card.rs:~111/139/150`, incl. `assert_eq!(skills.len(), 3)` → `3 + workflow_ids.len()`). Update those.
 
-- [ ] **Step 1: Write the failing test** (the A2A streaming e2e — it won't compile until the ripple lands; that's the red). Outline in `crates/bridge-a2a-inbound/tests/` or `bin/a2a-bridge/tests/`:
-```rust
-// A streaming skill="code-review" task over a FAKE registry (codex/claude/synth fakes) →
-// assert: node Status events; final Artifact == synth output; terminal Completed;
-// AND a unary skill="code-review" send → InvalidRequest.
-```
-(Use the existing inbound test harness pattern — mirror an existing fanout e2e in `server.rs` tests / `bin/a2a-bridge/tests`.)
+- [ ] **Step 1: Write the failing producer test** (won't compile until the variant + fields land). Create `crates/bridge-a2a-inbound/tests/workflow_producer.rs`: build an `InboundServer` over a FAKE registry (a `codex`/`claude`/`synth` fake backend) + `.with_workflows(executor, map)` where the map holds a `code-review` graph; resolve a streaming `skill="code-review"` task through the server's streaming entry; collect the `Event`s; assert: ≥1 `Status` (node) event, a final `Artifact` == synth output, terminal `Completed`. (Mirror the harness of an existing **streaming fan-out** e2e in `server.rs` tests / `bin/a2a-bridge/tests` for the server construction + how to drive a streaming task; the fakes + the `.with_workflows` wiring + the assertions are the new part.)
 
-- [ ] **Step 2: `cargo build --workspace` → compile errors** (non-exhaustive matches). This is the checklist.
+- [ ] **Step 2: `cargo build --workspace` → the two match errors** (`:454`, `:1042`). The checklist.
 
-- [ ] **Step 3: Implement the ripple (all sites):**
-  1. **`bridge-core/src/domain.rs`** — `RouteTarget`: add `Workflow(crate::ids::WorkflowId)`.
+- [ ] **Step 3: Implement.**
+  1. **`domain.rs`** — `RouteTarget`: add `Workflow(crate::ids::WorkflowId)`.
   2. **`bridge-a2a-inbound/Cargo.toml`** — add `bridge-workflow = { path = "../bridge-workflow" }`.
-  3. **`InboundServer`** — add fields `executor: Arc<bridge_workflow::executor::WorkflowExecutor>` and `workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>`; thread them through the constructor.
-  4. **`server.rs:454` `stream_message` match** — add `RouteTarget::Workflow(id) => spawn_workflow_producer(&srv, routed, id, tx),`.
-  5. **`server.rs:1041` `unary_message` match** — add `RouteTarget::Workflow(_) => return bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "skill" }),` (streaming-only).
-  6. **`server.rs:271` `local_agent_id`** — handle `Workflow` explicitly (it has no single agent id; this helper is only called on `Local` paths, so `Workflow => unreachable!("workflow not a local target")` or restructure — verify the call sites).
-  7. **`server.rs:1035` `if let RouteTarget::Fanout`** — confirm the workflow case isn't mis-handled (the unary path rejects workflow in 5, so this pre-dispatch is fine; add a guard if needed).
-  8. **`cancel_task` (`:1294`)** — add handling so a workflow task latches `request_cancel` (already always called at `:1292`) and returns without the local-backend no-op (mark workflow tasks, or detect via a workflow-task set; the producer does the node cancels via `poll_cancel_requested`).
-  9. **`spawn_workflow_producer`** (new, mirror `spawn_fanout_producer`): build `input` from `routed`'s parts; `run_id = task.as_str()`; create a `CancellationToken`; spawn a task that `poll_cancel_requested(&store, &task).await` → `token.cancel()`; consume `executor.run(graph, input, run_id, token)` mapping `NodeStarted/NodeFinished` → `Event` Status (labeled by node id), `Terminal{Completed,output}` → Artifact + `Event::terminal(TaskOutcome::Completed)`, `Terminal{Failed,..}` → `Event::terminal(TaskOutcome::Failed)`, `Terminal{Canceled,..}` → `Event::terminal(TaskOutcome::Canceled)`; send each `Event` to `tx`. (`spawn_workflow_producer` looks up the graph by `id` from `srv.workflows`; an unknown id → terminal `Failed`.)
-  10. **`route.rs` `SkillRoute::route`** — add the precedence arm: `else if self.workflows.contains(skill) => RouteTarget::Workflow(WorkflowId::parse(skill)?)`.
-  11. **`card.rs:84`** — push one `AgentSkill` per workflow id into `skills` (the builder takes the workflow-id set).
-  12. **`main.rs`** — `cfg.load_workflows(config_dir)` → the map; build `WorkflowExecutor::new(registry.clone())`; pass both into `InboundServer::new(...)` and `SkillRoute::with_workflows(...)` and the card builder.
+  3. **`InboundServer` fields + builder:**
+```rust
+// new fields on InboundServer:
+executor: Option<std::sync::Arc<bridge_workflow::executor::WorkflowExecutor>>,
+workflows: std::sync::Arc<std::collections::HashMap<bridge_core::ids::WorkflowId, std::sync::Arc<bridge_workflow::graph::WorkflowGraph>>>,
+workflow_cancels: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<bridge_core::ids::TaskId, tokio_util::sync::CancellationToken>>>,
+// in `new`, initialize: executor: None, workflows: Arc::new(HashMap::new()),
+//   workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+#[must_use]
+pub fn with_workflows(
+    mut self,
+    executor: std::sync::Arc<bridge_workflow::executor::WorkflowExecutor>,
+    workflows: std::collections::HashMap<bridge_core::ids::WorkflowId, std::sync::Arc<bridge_workflow::graph::WorkflowGraph>>,
+) -> Self { self.executor = Some(executor); self.workflows = std::sync::Arc::new(workflows); self }
+```
+  4. **`server.rs:454` stream match** — `RouteTarget::Workflow(id) => spawn_workflow_producer(&srv, routed, id, tx),`.
+  5. **`server.rs:1042` unary match** — `RouteTarget::Workflow(_) => return bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "skill" }),` (streaming-only).
+  6. **`cancel_task` (`:1294`)** — BEFORE the `is_fanout` branch (after the always-`request_cancel` latch at `:1292`), add the concrete workflow cancel:
+```rust
+    if let Some(tok) = srv.workflow_cancels.lock().await.get(&task) {
+        tok.cancel(); // fires the executor's CancellationToken → backend.cancel per in-flight node
+        return ok_cancel_response(id); // the same OK response the other cancel arms return
+    }
+```
+  7. **`spawn_workflow_producer`** (new — FULL code):
+```rust
+fn spawn_workflow_producer(
+    srv: &Arc<InboundServer>,
+    routed: RoutedCall,
+    wf_id: bridge_core::ids::WorkflowId,
+    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+) {
+    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+    let srv = srv.clone();
+    let task = routed.task;
+    let parts = routed.parts.clone();
+    tokio::spawn(async move {
+        let (executor, graph) = match (&srv.executor, srv.workflows.get(&wf_id)) {
+            (Some(e), Some(g)) => (e.clone(), g.clone()),
+            _ => { let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await; return; }
+        };
+        let input: String = parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
+        // Cancel: register a token that cancel_task fires; remove on exit.
+        let token = tokio_util::sync::CancellationToken::new();
+        srv.workflow_cancels.lock().await.insert(task.clone(), token.clone());
+        let mut stream = executor.run(graph, input, task.as_str().to_string(), token.clone());
+        let mut terminal_sent = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(WorkflowEvent::NodeStarted { node }) =>
+                    { let _ = tx.send(Ok(Event::status(format!("node {} started", node.as_str())))).await; }
+                Ok(WorkflowEvent::NodeFinished { node, ok }) =>
+                    { let _ = tx.send(Ok(Event::status(format!("node {} {}", node.as_str(), if ok {"ok"} else {"failed"})))).await; }
+                Ok(WorkflowEvent::Terminal { outcome, output }) => {
+                    let _ = tx.send(Ok(Event::artifact(output))).await;
+                    let to = match outcome {
+                        WorkflowOutcome::Completed => TaskOutcome::Completed,
+                        WorkflowOutcome::Failed => TaskOutcome::Failed,
+                        WorkflowOutcome::Canceled => TaskOutcome::Canceled,
+                    };
+                    let _ = tx.send(Ok(Event::terminal(to))).await;
+                    terminal_sent = true;
+                }
+                Err(e) => { let _ = tx.send(Err(e)).await; }
+            }
+        }
+        if !terminal_sent { let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await; }
+        srv.workflow_cancels.lock().await.remove(&task);
+    });
+}
+```
+(Add `use futures::StreamExt;` if not already imported in `server.rs`. `Event::{status,artifact,terminal}` are the public constructors — the `Event` fields are private.)
+  8. **`route.rs` `SkillRoute::route`** — precedence arm: `else if self.workflows.contains(skill) => Ok(RouteTarget::Workflow(WorkflowId::parse(skill).map_err(|e| e)?))` (the strict id parse can't fail for a known-valid workflow id, but propagate to be safe).
+  9. **`card.rs`** — change `agent_card(base_url: &str, workflow_ids: &[&str])`; after the fixed skills, `for id in workflow_ids { skills.push(AgentSkill { id: id.to_string(), name: id.to_string(), description: format!("Run the {id} workflow."), tags: vec!["workflow".into()], ..default_skill_fields }); }`. Update `serve_card` (`server.rs:407`) to pass `&srv.workflows.keys().map(|k| k.as_str()).collect::<Vec<_>>()`; update the card tests' `skills.len()` asserts (now `3 + n`).
+  10. **`main.rs`** — `let base = config_path.parent().unwrap_or(std::path::Path::new("."));` `let wf_map = cfg.load_workflows(base)?;` (base = the **config file's parent dir** so relative `prompt_file`s resolve); `let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(registry.clone()));` build `SkillRoute::with_workflows(registry, wf_map.keys().map(|k| k.as_str().to_string()).collect())`; `InboundServer::new(...).with_workflows(executor, wf_map.clone())`; `agent_card(&base_url, &wf_map.keys().map(|k| k.as_str()).collect::<Vec<_>>())`.
 
-- [ ] **Step 4: Make the WHOLE workspace green:** `cargo build --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`. Fix every error the compiler names.
+- [ ] **Step 4: Make the WHOLE workspace green:** `cargo build --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`. Fix every error the compiler names (the e2e from Step 1 now compiles + passes).
 
 - [ ] **Step 5: ONE atomic commit:**
 ```bash
 git add crates/bridge-core/src/domain.rs crates/bridge-a2a-inbound/src/server.rs crates/bridge-a2a-inbound/src/card.rs \
-        crates/bridge-a2a-inbound/Cargo.toml bin/a2a-bridge/src/route.rs bin/a2a-bridge/src/main.rs Cargo.lock
-git commit -m "feat(workflow): RouteTarget::Workflow ripple + spawn_workflow_producer + card skills (atomic)"
+        crates/bridge-a2a-inbound/Cargo.toml crates/bridge-a2a-inbound/tests/workflow_producer.rs \
+        bin/a2a-bridge/src/route.rs bin/a2a-bridge/src/main.rs Cargo.lock
+git commit -m "feat(workflow): RouteTarget::Workflow + spawn_workflow_producer + concrete cancel + card skills (atomic)"
 ```
 
 ---
@@ -887,9 +979,11 @@ git commit -m "feat(workflow): RouteTarget::Workflow ripple + spawn_workflow_pro
 
 - [ ] **Step 2: The prompt files.** Create `prompts/review-codex.md`, `prompts/review-claude.md`, `prompts/review-synth.md`. Codex = blockers/correctness/regressions/test-gaps lens (`{{input}}`); Claude = architecture/seams/design lens (`{{input}}`); synth = merge `{{codex}}` + `{{claude}}` into one de-duplicated review weighted by the complementary roles (may reference `{{input}}`). Keep them focused.
 
-- [ ] **Step 3: The config entry.** Add the `code-review` `[[workflows]]` block (§2 of the spec) to the example/dev config the bridge loads.
+- [ ] **Step 3: The config entry — in a DEDICATED config, NOT the shared dev config.** Add the `code-review` `[[workflows]]` block (§2 of the spec, **valid one-key-per-line TOML**) to a **new example/fixture config** (e.g. `examples/a2a-bridge.workflows.toml`). Do NOT add it to the config the existing inbound/binary e2e tests load — that would change the Agent-Card skill count and break their `skills.len()` assertions (review Claude-m3).
 
-- [ ] **Step 4: The A2A streaming e2e + unary reject + terminal Failed** (the Task-9 Step-1 test, now compiling): assert node Status events, synth Artifact, terminal Completed, **synth prompt recorded BOTH reviews**; a unary `code-review` send → `InvalidRequest`; a terminal-node failure → `Failed`.
+- [ ] **Step 4: The A2A streaming e2e + unary reject + terminal Failed + cancel** (extends the Task-9 `workflow_producer.rs` harness with the real `code-review` graph/prompts): assert node Status events, synth Artifact, terminal Completed, **synth prompt recorded BOTH reviews**; a **unary** `code-review` send → `InvalidRequest`; a terminal-node failure (the synth fake errors) → `Failed`; a **cancel mid-run** (fire `workflow_cancels` / the cancel path) → terminal `Canceled` (the producer-level cancel test the executor-level DoD-7 doesn't cover — review Md2).
+
+- [ ] **Step 4b: DoD-2 / DoD-4 explicit tests** (review m2): in `bridge-workflow`, add a **pipeline** test (a→b→c chain; assert b's prompt contains a's output, c's contains b's) and a **`{{input}}`-to-fan-in** test (assert a fan-in node whose template uses `{{input}}` gets the workflow input substituted alongside its `{{upstream}}` values).
 
 - [ ] **Step 5: Verify + commit:** `cargo test --workspace` green; clippy clean.
 ```bash
