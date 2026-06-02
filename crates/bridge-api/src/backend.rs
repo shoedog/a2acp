@@ -1,6 +1,6 @@
 //! ApiBackend — the non-process OpenAI-compatible AgentBackend.
 use crate::config::ApiConfig;
-use crate::wire::{ChatRequest, Message, SseAccumulator};
+use crate::wire::{ChatRequest, Message, SseAccumulator, ToolCall};
 use bridge_core::domain::{EffectiveConfig, Part, PermissionDecision, PermissionRequest, SessionContext};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
@@ -86,6 +86,8 @@ impl AgentBackend for ApiBackend {
         let api_key = self.resolve_api_key();
         let do_stream = self.cfg.stream;
         let client = self.client.clone();
+        let policy = self.policy.clone();
+        let max_rounds = self.cfg.max_tool_rounds;
 
         // Cancel: reset for this fresh turn, THEN subscribe so a later send(true)
         // is observed as a change. `select!` on `changed()` fires even while parked
@@ -94,49 +96,62 @@ impl AgentBackend for ApiBackend {
         let _ = cancel_tx.send(false);
         let mut cancel_rx = cancel_tx.subscribe();
 
-        let messages: Vec<Message> = vec![Message::user(
+        let mut messages: Vec<Message> = vec![Message::user(
             parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n"),
         )];
 
         let stream = async_stream::try_stream! {
-            if *cancel_rx.borrow() {
-                yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
-            }
-            let req = ChatRequest { model: model.clone(), messages: messages.clone(),
-                tools: vec![crate::tool::tool_def()], stream: do_stream };
-            let mut builder = client.post(&url).json(&req);
-            if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
-            let resp = builder.send().await.map_err(|_| BridgeError::AgentCrashed)?;
-            if !resp.status().is_success() { Err(BridgeError::AgentCrashed)?; }
-
-            let mut acc = SseAccumulator::default();
-            let mut bytes = resp.bytes_stream();
-            let mut buf = String::new();
-            'read: loop {
-                let chunk = tokio::select! {
-                    biased;
-                    changed = cancel_rx.changed() => {
-                        if changed.is_ok() && *cancel_rx.borrow() {
-                            yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
-                        }
-                        continue 'read;
-                    }
-                    maybe = bytes.next() => match maybe { Some(c) => c, None => break 'read },
-                };
-                let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(nl) = buf.find('\n') {
-                    let line: String = buf.drain(..=nl).collect();
-                    match acc.push_sse_line(&line) {
-                        Ok(Some(text)) => { yield Update::Text(text); }
-                        Ok(None) => {}
-                        Err(_) => { Err(BridgeError::FrameError)?; } // ParseError → FrameError
-                    }
-                    if acc.is_done() { break 'read; }
+            for _round in 0..max_rounds {
+                if *cancel_rx.borrow() {
+                    yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
                 }
+                let req = ChatRequest { model: model.clone(), messages: messages.clone(),
+                    tools: vec![crate::tool::tool_def()], stream: do_stream };
+                let mut builder = client.post(&url).json(&req);
+                if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
+                let resp = builder.send().await.map_err(|_| BridgeError::AgentCrashed)?;
+                if !resp.status().is_success() { Err(BridgeError::AgentCrashed)?; }
+
+                let mut acc = SseAccumulator::default();
+                let mut bytes = resp.bytes_stream();
+                let mut buf = String::new();
+                'read: loop {
+                    let chunk = tokio::select! {
+                        biased;
+                        changed = cancel_rx.changed() => {
+                            if changed.is_ok() && *cancel_rx.borrow() {
+                                yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+                            }
+                            continue 'read;
+                        }
+                        maybe = bytes.next() => match maybe { Some(c) => c, None => break 'read },
+                    };
+                    let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(nl) = buf.find('\n') {
+                        let line: String = buf.drain(..=nl).collect();
+                        match acc.push_sse_line(&line) {
+                            Ok(Some(text)) => { yield Update::Text(text); }
+                            Ok(None) => {}
+                            Err(_) => { Err(BridgeError::FrameError)?; }
+                        }
+                        if acc.is_done() { break 'read; }
+                    }
+                }
+                let parsed = acc.finish();
+                if parsed.tool_calls.is_empty() {
+                    yield Update::Done { stop_reason: "stop".into() }; return;
+                }
+                // Tool round: decide each call SILENTLY via the injected policy.
+                // NO Update::Permission is yielded — the backend is the sole authority.
+                messages.push(Message::assistant_tool_calls(parsed.tool_calls.clone()));
+                for tc in &parsed.tool_calls {
+                    let result = decide_tool(&policy, tc);
+                    messages.push(Message::tool_result(tc.id.clone(), result));
+                }
+                // continue → re-POST with the appended tool results.
             }
-            let _parsed = acc.finish(); // Task 8 inspects tool_calls; text-only milestone ends here.
-            yield Update::Done { stop_reason: "stop".into() };
+            yield Update::Done { stop_reason: "max_tool_rounds".into() };
         };
         Ok(Box::pin(stream))
     }
@@ -154,6 +169,21 @@ impl AgentBackend for ApiBackend {
 
     async fn forget_session(&self, session: &SessionId) {
         if let Ok(mut map) = self.sessions.lock() { map.remove(session); }
+    }
+}
+
+/// Silent permission decision for one tool call → the `content` of its tool-result
+/// message. Approve runs the stub tool; Deny/abstain feed a refusal string.
+fn decide_tool(policy: &Arc<StdMutex<Arc<dyn PolicyEngine>>>, tc: &ToolCall) -> String {
+    let req = PermissionRequest::with_id(tc.id.clone(), /*interactive=*/ false);
+    let decision = policy.lock().ok().map(|p| p.decide(&req, &SessionContext));
+    match decision {
+        Some(Ok(PermissionDecision::Approve)) => {
+            if tc.function.name == crate::tool::TOOL_NAME { crate::tool::run_tool() }
+            else { format!("unknown tool: {}", tc.function.name) }
+        }
+        Some(Err(BridgeError::PermissionDenied)) => "permission denied: tool not executed".into(),
+        _ /* abstain / poisoned */ => "permission unavailable: tool not executed".into(),
     }
 }
 
