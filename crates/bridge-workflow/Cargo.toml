@@ -1,0 +1,18 @@
+[package]
+name = "bridge-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bridge-core = { path = "../bridge-core" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures.workspace = true
+async-stream.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = { workspace = true }
+async-trait.workspace = true

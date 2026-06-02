@@ -28,6 +28,27 @@ id_newtype!(SessionId);
 id_newtype!(CallerId);
 id_newtype!(AgentId);
 
+macro_rules! id_newtype_strict {
+    ($name:ident) => {
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+        pub struct $name(String);
+        impl $name {
+            /// Validated id: non-empty and `[a-z0-9_-]+` only. Stricter than the plain
+            /// id_newtype because these ids are interpolated into `{{<id>}}` template tokens.
+            pub fn parse(s: impl Into<String>) -> Result<Self, BridgeError> {
+                let s = s.into();
+                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-') {
+                    return Err(BridgeError::InvalidRequest { field: stringify!($name) });
+                }
+                Ok(Self(s))
+            }
+            pub fn as_str(&self) -> &str { &self.0 }
+        }
+    };
+}
+id_newtype_strict!(WorkflowId);
+id_newtype_strict!(NodeId);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +88,15 @@ mod tests {
         let mut s = HashSet::new();
         s.insert(TaskId::parse("x").unwrap());
         assert!(s.contains(&TaskId::parse("x").unwrap()));
+    }
+
+    #[test]
+    fn strict_ids_reject_non_charset() {
+        assert!(WorkflowId::parse("code-review").is_ok());
+        assert!(NodeId::parse("synth_1").is_ok());
+        assert!(WorkflowId::parse("").is_err());
+        assert!(NodeId::parse("has space").is_err());
+        assert!(NodeId::parse("br{{ace").is_err());
+        assert!(WorkflowId::parse("UPPER").is_err()); // lowercase only
     }
 }

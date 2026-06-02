@@ -502,6 +502,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-workflow"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bridge-core",
+ "futures",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tokio-util",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
