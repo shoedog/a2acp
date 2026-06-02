@@ -297,4 +297,39 @@ mod tests {
         let p = &synth_rec.prompts.lock().unwrap()[0];
         assert!(p.contains("[node codex failed:"), "marker reached synth: {p}");
     }
+
+    #[tokio::test]
+    async fn cancel_calls_backend_cancel_and_ends_canceled() {
+        // A backend whose prompt() stream NEVER yields Done (pending) → only the cancel path ends it.
+        struct Pending { rec: Arc<Rec> }
+        #[async_trait::async_trait]
+        impl AgentBackend for Pending {
+            async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+                Ok(Box::pin(futures::stream::pending())) // never yields
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> { *self.rec.cancels.lock().unwrap() += 1; Ok(()) }
+        }
+        let rec = Arc::new(Rec::default());
+        struct PReg { rec: Arc<Rec> }
+        #[async_trait::async_trait]
+        impl AgentRegistry for PReg {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                Ok(Resolved { entry: Arc::new(minimal_entry(id)),
+                    backend: Arc::new(Pending { rec: self.rec.clone() }), lease: Box::new(NoopLease) })
+            }
+            fn default_id(&self) -> AgentId { AgentId::parse("a").unwrap() }
+            async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> { Ok(()) }
+            fn list(&self) -> Vec<AgentId> { vec![] }
+        }
+        let token = CancellationToken::new();
+        let reg = Arc::new(PReg { rec: rec.clone() });
+        let ex = WorkflowExecutor::new(reg);
+        let t2 = token.clone();
+        tokio::spawn(async move { tokio::time::sleep(std::time::Duration::from_millis(20)).await; t2.cancel(); });
+        let evs: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(2),
+            ex.run(one_node_graph(), "x".into(), "r".into(), token).collect::<Vec<_>>()).await.unwrap();
+        assert!(matches!(evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal { outcome: WorkflowOutcome::Canceled, .. }));
+        assert_eq!(*rec.cancels.lock().unwrap(), 1, "backend.cancel was called for the in-flight node");
+    }
 }
