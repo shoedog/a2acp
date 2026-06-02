@@ -7,4 +7,5 @@ pub mod ports;
 pub mod process;
 pub mod session;
 pub mod task;
+pub mod task_store;
 pub mod translator;
