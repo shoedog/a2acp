@@ -112,33 +112,40 @@ impl AgentBackend for ApiBackend {
                 let resp = builder.send().await.map_err(|_| BridgeError::AgentCrashed)?;
                 if !resp.status().is_success() { Err(BridgeError::AgentCrashed)?; }
 
-                let mut acc = SseAccumulator::default();
-                let mut bytes = resp.bytes_stream();
-                let mut buf = String::new();
-                'read: loop {
-                    let chunk = tokio::select! {
-                        biased;
-                        changed = cancel_rx.changed() => {
-                            if changed.is_ok() && *cancel_rx.borrow() {
-                                yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+                let parsed = if do_stream {
+                    let mut acc = SseAccumulator::default();
+                    let mut bytes = resp.bytes_stream();
+                    let mut buf = String::new();
+                    'read: loop {
+                        let chunk = tokio::select! {
+                            biased;
+                            changed = cancel_rx.changed() => {
+                                if changed.is_ok() && *cancel_rx.borrow() {
+                                    yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+                                }
+                                continue 'read;
                             }
-                            continue 'read;
+                            maybe = bytes.next() => match maybe { Some(c) => c, None => break 'read },
+                        };
+                        let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
+                        buf.push_str(&String::from_utf8_lossy(&chunk));
+                        while let Some(nl) = buf.find('\n') {
+                            let line: String = buf.drain(..=nl).collect();
+                            match acc.push_sse_line(&line) {
+                                Ok(Some(text)) => { yield Update::Text(text); }
+                                Ok(None) => {}
+                                Err(_) => { Err(BridgeError::FrameError)?; }
+                            }
+                            if acc.is_done() { break 'read; }
                         }
-                        maybe = bytes.next() => match maybe { Some(c) => c, None => break 'read },
-                    };
-                    let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
-                    buf.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(nl) = buf.find('\n') {
-                        let line: String = buf.drain(..=nl).collect();
-                        match acc.push_sse_line(&line) {
-                            Ok(Some(text)) => { yield Update::Text(text); }
-                            Ok(None) => {}
-                            Err(_) => { Err(BridgeError::FrameError)?; }
-                        }
-                        if acc.is_done() { break 'read; }
                     }
-                }
-                let parsed = acc.finish();
+                    acc.finish()
+                } else {
+                    let body = resp.text().await.map_err(|_| BridgeError::AgentCrashed)?;
+                    let p = crate::wire::parse_nonstream(&body).map_err(|_| BridgeError::FrameError)?;
+                    if !p.text.is_empty() { yield Update::Text(p.text.clone()); }
+                    p
+                };
                 if parsed.tool_calls.is_empty() {
                     yield Update::Done { stop_reason: "stop".into() }; return;
                 }

@@ -204,6 +204,21 @@ async fn unknown_tool_feeds_unknown_result() {
 }
 
 #[tokio::test]
+async fn nonstream_mode_text_round_trip() {
+    let server = MockServer::start().await;
+    let body = r#"{"choices":[{"message":{"content":"plain text"},"finish_reason":"stop"}]}"#;
+    Mock::given(method("POST")).and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type","application/json").set_body_string(body))
+        .mount(&server).await;
+    let mut cfg = ApiConfig::new(format!("{}/v1", server.uri())); cfg.stream = false;
+    let be = ApiBackend::new(cfg);
+    let updates = drain(&be, &SessionId::parse("s9").unwrap()).await;
+    let text: String = updates.iter().filter_map(|u| if let Update::Text(t)=u {Some(t.clone())} else {None}).collect();
+    assert_eq!(text, "plain text");
+    assert!(matches!(updates.last(), Some(Update::Done{stop_reason}) if stop_reason=="stop"));
+}
+
+#[tokio::test]
 async fn max_tool_rounds_terminates() {
     let server = MockServer::start().await;
     let tool = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"get_current_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
