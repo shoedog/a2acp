@@ -224,6 +224,50 @@ mod stream_tests {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct NonStreamResponse { #[serde(default)] choices: Vec<NonStreamChoice> }
+#[derive(Debug, Deserialize)]
+struct NonStreamChoice { message: RespMessage }
+#[derive(Debug, Deserialize)]
+struct RespMessage {
+    #[serde(default)] content: Option<String>,
+    #[serde(default)] tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// Parse a non-streamed (`stream:false`) chat completion body. Returns
+/// `Err(ParseError)` on malformed JSON (mapped to `FrameError` by the backend).
+pub fn parse_nonstream(body: &str) -> Result<ParsedTurn, ParseError> {
+    let resp: NonStreamResponse = serde_json::from_str(body).map_err(|_| ParseError)?;
+    let mut out = ParsedTurn::default();
+    if let Some(choice) = resp.choices.into_iter().next() {
+        out.text = choice.message.content.unwrap_or_default();
+        out.tool_calls = choice.message.tool_calls.unwrap_or_default();
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod nonstream_tests {
+    use super::*;
+    #[test]
+    fn parses_message_tool_calls_shape() {
+        let body = r#"{"choices":[{"message":{"content":null,"tool_calls":[
+            {"id":"call_1","type":"function","function":{"name":"get_current_time","arguments":"{}"}}]},
+            "finish_reason":"tool_calls"}]}"#;
+        let out = parse_nonstream(body).unwrap();
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].id, "call_1");
+        assert!(out.text.is_empty());
+    }
+    #[test]
+    fn parses_plain_text_message() {
+        let body = r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}]}"#;
+        let out = parse_nonstream(body).unwrap();
+        assert_eq!(out.text, "hello");
+        assert!(out.tool_calls.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod request_tests {
     use super::*;
