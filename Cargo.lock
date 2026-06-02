@@ -18,6 +18,7 @@ dependencies = [
  "bridge-policy",
  "bridge-registry",
  "bridge-store",
+ "bridge-workflow",
  "futures",
  "notify",
  "reqwest",

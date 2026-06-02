@@ -101,6 +101,27 @@ pub struct RegistryConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub delegation: Option<DelegationConfig>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub workflows: Vec<WorkflowToml>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct WorkflowToml {
+    pub id: String,
+    #[serde(default)]
+    pub nodes: Vec<WorkflowNodeToml>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct WorkflowNodeToml {
+    pub id: String,
+    pub agent: String,
+    pub prompt_file: String,
+    #[serde(default)]
+    pub inputs: Vec<String>,
 }
 
 /// `[registry]` section — optional; controls which cmds are allowed.
@@ -166,6 +187,72 @@ impl RegistryConfig {
             d.auth = expand_env(&d.auth)?;
         }
         Ok(cfg)
+    }
+
+    /// Parse each `[[workflows]]` entry: load prompt files from `base`, cross-check
+    /// every `node.agent` against the declared `[[agents]]`, validate the DAG.
+    /// Any failure is loud (`Err(ConfigError::Registry(...))`).
+    #[allow(dead_code)]
+    pub fn load_workflows(
+        &self,
+        base: &std::path::Path,
+    ) -> Result<
+        std::collections::HashMap<
+            bridge_core::ids::WorkflowId,
+            std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
+        >,
+        ConfigError,
+    > {
+        use bridge_core::ids::{AgentId, NodeId, WorkflowId};
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+
+        let agent_ids: std::collections::HashSet<&str> =
+            self.agents.iter().map(|a| a.id.as_str()).collect();
+        let mut map = std::collections::HashMap::new();
+        for w in &self.workflows {
+            let id = WorkflowId::parse(w.id.clone())
+                .map_err(|e| ConfigError::Registry(format!("workflow id {:?}: {e:?}", w.id)))?;
+            let mut nodes = Vec::with_capacity(w.nodes.len());
+            for n in &w.nodes {
+                if !agent_ids.contains(n.agent.as_str()) {
+                    return Err(ConfigError::Registry(format!(
+                        "workflow {} node {} references unknown agent {:?}",
+                        w.id, n.id, n.agent
+                    )));
+                }
+                let tpl = std::fs::read_to_string(base.join(&n.prompt_file)).map_err(|e| {
+                    ConfigError::Registry(format!(
+                        "workflow {} node {} prompt_file {:?}: {e}",
+                        w.id, n.id, n.prompt_file
+                    ))
+                })?;
+                nodes.push(WorkflowNode {
+                    id: NodeId::parse(n.id.clone())
+                        .map_err(|e| ConfigError::Registry(format!("node id {:?}: {e:?}", n.id)))?,
+                    agent: AgentId::parse(n.agent.clone()).map_err(|e| {
+                        ConfigError::Registry(format!("node agent {:?}: {e:?}", n.agent))
+                    })?,
+                    prompt_template: tpl,
+                    inputs: n
+                        .inputs
+                        .iter()
+                        .map(|i| NodeId::parse(i.clone()))
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| {
+                            ConfigError::Registry(format!(
+                                "workflow {} input id: {e:?}",
+                                w.id
+                            ))
+                        })?,
+                });
+            }
+            let g = WorkflowGraph { id: id.clone(), nodes };
+            g.validate().map_err(|e| {
+                ConfigError::Registry(format!("workflow {} invalid: {e:?}", w.id))
+            })?;
+            map.insert(id, std::sync::Arc::new(g));
+        }
+        Ok(map)
     }
 
     /// Convert this parsed config into a `RegistrySnapshot` with typed domain values.
@@ -750,6 +837,73 @@ addr="127.0.0.1:8080"
         assert!(RegistryConfig::parse(toml)
             .unwrap()
             .into_snapshot()
+            .is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 7 (W1): [[workflows]] boot-load config
+    // -----------------------------------------------------------------------
+
+    const AGENTS_HEADER: &str =
+        "default = \"codex\"\n[[agents]]\nid = \"codex\"\ncmd = \"codex-acp\"\n";
+    const SERVER_FOOTER: &str = "[server]\naddr = \"127.0.0.1:8080\"\n";
+
+    #[test]
+    fn parses_workflows_and_loads_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.md"), "review {{input}}").unwrap();
+        let toml = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+            [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}"
+        );
+        let cfg = RegistryConfig::parse(&toml).unwrap();
+        let wfs = cfg.load_workflows(dir.path()).unwrap();
+        let g = wfs
+            .get(&bridge_core::ids::WorkflowId::parse("wf1").unwrap())
+            .unwrap();
+        assert_eq!(g.nodes[0].prompt_template, "review {{input}}");
+        g.validate().unwrap();
+    }
+
+    #[test]
+    fn workflow_unknown_agent_rejected_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.md"), "x").unwrap();
+        let toml = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+            [[workflows.nodes]]\nid = \"only\"\nagent = \"ghost\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}"
+        );
+        assert!(RegistryConfig::parse(&toml)
+            .unwrap()
+            .load_workflows(dir.path())
+            .is_err());
+    }
+
+    #[test]
+    fn workflow_missing_prompt_file_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+            [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"nope.md\"\ninputs = []\n{SERVER_FOOTER}"
+        );
+        assert!(RegistryConfig::parse(&toml)
+            .unwrap()
+            .load_workflows(dir.path())
+            .is_err());
+    }
+
+    #[test]
+    fn workflow_bad_dag_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.md"), "x").unwrap();
+        let toml = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+            [[workflows.nodes]]\nid = \"a\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n\
+            [[workflows.nodes]]\nid = \"b\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}"
+        );
+        assert!(RegistryConfig::parse(&toml)
+            .unwrap()
+            .load_workflows(dir.path())
             .is_err());
     }
 }
