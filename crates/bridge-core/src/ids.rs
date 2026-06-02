@@ -37,12 +37,20 @@ macro_rules! id_newtype_strict {
             /// id_newtype because these ids are interpolated into `{{<id>}}` template tokens.
             pub fn parse(s: impl Into<String>) -> Result<Self, BridgeError> {
                 let s = s.into();
-                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-') {
-                    return Err(BridgeError::InvalidRequest { field: stringify!($name) });
+                if s.is_empty()
+                    || !s.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                    })
+                {
+                    return Err(BridgeError::InvalidRequest {
+                        field: stringify!($name),
+                    });
                 }
                 Ok(Self(s))
             }
-            pub fn as_str(&self) -> &str { &self.0 }
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
         }
     };
 }

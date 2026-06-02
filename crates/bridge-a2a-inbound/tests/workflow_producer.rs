@@ -563,6 +563,144 @@ async fn unary_workflow_send_returns_invalid_request_error() {
     );
 }
 
+// ============================================================================
+// A2A-layer cancel wiring (DoD-7)
+// ============================================================================
+
+/// Backend whose `prompt()` returns a stream that never resolves — the ONLY
+/// terminator for any node running this backend is an external cancel.
+struct PendingBackend;
+
+#[async_trait]
+impl AgentBackend for PendingBackend {
+    async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        Ok(Box::pin(futures::stream::pending()))
+    }
+    async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+/// **DoD-7 — A2A-layer cancel wiring**: an inbound `CancelTask` JSON-RPC call
+/// must fire the workflow's `CancellationToken` (registered in
+/// `InboundServer.workflow_cancels`) causing the pending executor to yield
+/// `WorkflowOutcome::Canceled` and the SSE stream to terminate with a
+/// `TaskState::Canceled` status update — within a 2-second timeout.
+#[tokio::test]
+async fn cancel_task_fires_workflow_token_stream_ends_canceled() {
+    // ── build the server with all-pending backends ────────────────────────────
+    let pending: Arc<dyn AgentBackend> = Arc::new(PendingBackend);
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), pending.clone()),
+        ("claude".to_string(), pending.clone()),
+        ("synth".to_string(), pending.clone()),
+    ]
+    .into();
+    let srv = build_server_per_agent(backends);
+
+    // ── start the streaming task with a known, fixed task id ─────────────────
+    // `task_id_from_params` accepts a top-level `taskId` field — provide one so
+    // we don't have to parse the first SSE frame to discover the id.
+    const TASK_ID: &str = "task-wf-cancel-dod7";
+    let stream_req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/json")
+        .header(SVC_PARAM_VERSION, "1.0")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": methods::SEND_STREAMING_MESSAGE,
+                "params": {
+                    "taskId": TASK_ID,
+                    "message": {
+                        "text": "DIFF",
+                        "metadata": { "a2a-bridge.skill": "code-review" }
+                    }
+                }
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    // Call the handler: the Response is returned as soon as the SSE headers are
+    // committed.  The body is a lazy stream that only ends when the workflow
+    // terminates.  We collect it in a separate task so we can issue CancelTask
+    // while the body is being drained.
+    let resp = srv.clone().router().oneshot(stream_req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::OK,
+        "streaming request must succeed"
+    );
+    let body_handle = {
+        let body = resp.into_body();
+        tokio::spawn(async move { axum::body::to_bytes(body, usize::MAX).await.unwrap() })
+    };
+
+    // ── give the producer task time to register its cancel token ─────────────
+    // `spawn_workflow_producer` inserts the token in `workflow_cancels` before
+    // driving the stream.  A few cooperative yields are sufficient to let that
+    // spawned task run past the mutex-insert point.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    // ── issue CancelTask via the same shared InboundServer ───────────────────
+    let cancel_req = post_request(methods::CANCEL_TASK, json!({ "taskId": TASK_ID }));
+    let cancel_resp = srv.clone().router().oneshot(cancel_req).await.unwrap();
+    assert_eq!(
+        cancel_resp.status(),
+        axum::http::StatusCode::OK,
+        "CancelTask must return 200"
+    );
+    let cancel_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(cancel_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cancel_body["result"]["task"]["state"], "TASK_STATE_CANCELED",
+        "CancelTask result must report TASK_STATE_CANCELED: {cancel_body}"
+    );
+
+    // ── collect the SSE stream; must end with Canceled within the timeout ─────
+    let raw_bytes = tokio::time::timeout(std::time::Duration::from_secs(2), body_handle)
+        .await
+        .expect("SSE body must terminate within 2s after cancel (timeout = stream hung)")
+        .expect("body collection task must not panic");
+
+    let body = String::from_utf8(raw_bytes.to_vec()).unwrap();
+    let payloads = sse_data_payloads(&body);
+    assert!(
+        !payloads.is_empty(),
+        "SSE stream must emit at least one data frame before Canceled: {body}"
+    );
+
+    let responses: Vec<a2a::StreamResponse> = payloads
+        .iter()
+        .map(|p| {
+            serde_json::from_str(p)
+                .unwrap_or_else(|e| panic!("SSE payload must parse as StreamResponse: {e}: {p}"))
+        })
+        .collect();
+
+    // The final frame MUST be a terminal Canceled status — not Failed, not a hang.
+    let last = responses.last().unwrap();
+    assert!(
+        matches!(
+            last,
+            a2a::StreamResponse::StatusUpdate(e)
+                if e.status.state == a2a::TaskState::Canceled
+        ),
+        "final SSE frame must be terminal statusUpdate(Canceled) after CancelTask; \
+         got: {}",
+        payloads.last().unwrap()
+    );
+}
+
 /// **terminal_failed**: when the synth node errors, the A2A streaming task must end
 /// in a `Failed` terminal state (NOT a panic, NOT Completed).
 #[tokio::test]

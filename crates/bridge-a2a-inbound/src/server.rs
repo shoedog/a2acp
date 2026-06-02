@@ -163,7 +163,10 @@ pub struct InboundServer {
     /// task if present (workflow cancel path), mirroring the local/delegate latches.
     workflow_cancels: std::sync::Arc<
         tokio::sync::Mutex<
-            std::collections::HashMap<bridge_core::ids::TaskId, tokio_util::sync::CancellationToken>,
+            std::collections::HashMap<
+                bridge_core::ids::TaskId,
+                tokio_util::sync::CancellationToken,
+            >,
         >,
     >,
 }

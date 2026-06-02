@@ -17,8 +17,14 @@ pub struct SkillRoute {
 
 impl SkillRoute {
     /// Construct with the boot-time set of known workflow ids (the route arm reads this).
-    pub fn with_workflows(registry: Arc<dyn AgentRegistry>, workflows: std::collections::HashSet<String>) -> Self {
-        Self { registry, workflows }
+    pub fn with_workflows(
+        registry: Arc<dyn AgentRegistry>,
+        workflows: std::collections::HashSet<String>,
+    ) -> Self {
+        Self {
+            registry,
+            workflows,
+        }
     }
 
     /// True if `id` names a configured workflow.
@@ -135,7 +141,10 @@ mod tests {
     }
 
     fn skill_route_with_default(default_id: &str) -> SkillRoute {
-        SkillRoute::with_workflows(FakeRegistry::new(default_id), std::collections::HashSet::new())
+        SkillRoute::with_workflows(
+            FakeRegistry::new(default_id),
+            std::collections::HashSet::new(),
+        )
     }
 
     // ---- Task 9 route tests ----
@@ -192,7 +201,9 @@ mod tests {
     fn with_workflows_stores_and_reports_ids() {
         let r = SkillRoute::with_workflows(
             FakeRegistry::new("codex"),
-            ["code-review".to_string(), "triage".to_string()].into_iter().collect(),
+            ["code-review".to_string(), "triage".to_string()]
+                .into_iter()
+                .collect(),
         );
         assert!(r.knows_workflow("code-review"));
         assert!(r.knows_workflow("triage"));

@@ -235,17 +235,16 @@ impl RegistryConfig {
                         .map(|i| NodeId::parse(i.clone()))
                         .collect::<Result<_, _>>()
                         .map_err(|e| {
-                            ConfigError::Registry(format!(
-                                "workflow {} input id: {e:?}",
-                                w.id
-                            ))
+                            ConfigError::Registry(format!("workflow {} input id: {e:?}", w.id))
                         })?,
                 });
             }
-            let g = WorkflowGraph { id: id.clone(), nodes };
-            g.validate().map_err(|e| {
-                ConfigError::Registry(format!("workflow {} invalid: {e:?}", w.id))
-            })?;
+            let g = WorkflowGraph {
+                id: id.clone(),
+                nodes,
+            };
+            g.validate()
+                .map_err(|e| ConfigError::Registry(format!("workflow {} invalid: {e:?}", w.id)))?;
             map.insert(id, std::sync::Arc::new(g));
         }
         Ok(map)
