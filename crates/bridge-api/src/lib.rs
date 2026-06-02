@@ -4,3 +4,5 @@ pub mod backend;
 pub mod config;
 pub mod tool;
 pub mod wire;
+
+pub use config::ApiConfig;
