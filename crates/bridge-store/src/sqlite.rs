@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 /// and a per-task pending-request that is cleared atomically on first read.
 pub struct SqliteStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    // Held for the store's lifetime: an exclusive advisory lock on `<path>.lock`
+    // so only one `serve` owns a DB file (makes the boot sweep safe). `None` for
+    // in-memory stores.
+    _lock: Option<std::fs::File>,
 }
 
 impl SqliteStore {
@@ -20,6 +24,34 @@ impl SqliteStore {
         let conn = rusqlite::Connection::open_in_memory().map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            _lock: None,
+        };
+        store.create_schema()?;
+        Ok(store)
+    }
+
+    /// Open a file-backed DB, acquiring an exclusive advisory lock on `<path>.lock`.
+    /// A second `open` of the same path while the first is held returns an error —
+    /// this single-serve-per-DB guarantee is what makes the boot `sweep_interrupted`
+    /// safe (it can never flip a live serve's `Working` rows).
+    pub fn open(path: &std::path::Path) -> Result<Self, BridgeError> {
+        use fs2::FileExt;
+        let lock_path = {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(".lock");
+            std::path::PathBuf::from(p)
+        };
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|_| BridgeError::StoreFailure)?;
+        lock.try_lock_exclusive().map_err(|_| BridgeError::StoreFailure)?;
+        let conn = rusqlite::Connection::open(path).map_err(|_| BridgeError::StoreFailure)?;
+        let store = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            _lock: Some(lock),
         };
         store.create_schema()?;
         Ok(store)
@@ -311,5 +343,18 @@ mod tests {
         assert!(!s.is_fanout(&t).await.unwrap());
         s.set_fanout(&t).await.unwrap();
         assert!(s.is_fanout(&t).await.unwrap());
+    }
+
+    #[test]
+    fn second_open_same_path_fails_lock() {
+        let dir = std::env::temp_dir().join(format!("a2a-w3a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock-test.db");
+        let _first = SqliteStore::open(&path).expect("first open succeeds");
+        let second = SqliteStore::open(&path);
+        assert!(second.is_err(), "second open of a locked db must fail");
+        drop(_first);
+        assert!(SqliteStore::open(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
