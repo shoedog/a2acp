@@ -711,15 +711,25 @@ addr="127.0.0.1:8080"
 
     #[test]
     fn parse_kind_accepts_api() {
-        assert_eq!(parse_kind("api").unwrap(), bridge_core::domain::AgentKind::Api);
+        assert_eq!(
+            parse_kind("api").unwrap(),
+            bridge_core::domain::AgentKind::Api
+        );
         assert!(parse_kind("bogus").is_err());
     }
 
     #[test]
     fn api_entry_parses_without_cmd() {
         let toml = "default=\"ollama\"\n[[agents]]\nid=\"ollama\"\nkind=\"api\"\nbase_url=\"http://localhost:11434/v1\"\nmodel=\"qwen3.5:9b\"\n[server]\naddr=\"127.0.0.1:8080\"\n";
-        let snap = RegistryConfig::parse(toml).unwrap().into_snapshot().unwrap();
-        let e = snap.entries.iter().find(|e| e.id.as_str() == "ollama").unwrap();
+        let snap = RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+        let e = snap
+            .entries
+            .iter()
+            .find(|e| e.id.as_str() == "ollama")
+            .unwrap();
         assert!(e.cmd.is_none());
         assert_eq!(e.base_url.as_deref(), Some("http://localhost:11434/v1"));
         assert!(!snap.allowed_cmds.iter().any(|c| c.is_empty()));
@@ -728,12 +738,18 @@ addr="127.0.0.1:8080"
     #[test]
     fn api_entry_with_cmd_is_rejected() {
         let toml = "default=\"x\"\n[[agents]]\nid=\"x\"\nkind=\"api\"\nbase_url=\"http://h/v1\"\ncmd=\"nope\"\n[server]\naddr=\"127.0.0.1:8080\"\n";
-        assert!(RegistryConfig::parse(toml).unwrap().into_snapshot().is_err());
+        assert!(RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .is_err());
     }
 
     #[test]
     fn acp_entry_without_cmd_is_rejected() {
         let toml = "default=\"x\"\n[[agents]]\nid=\"x\"\nkind=\"acp\"\n[server]\naddr=\"127.0.0.1:8080\"\n";
-        assert!(RegistryConfig::parse(toml).unwrap().into_snapshot().is_err());
+        assert!(RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .is_err());
     }
 }

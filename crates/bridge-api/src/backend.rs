@@ -1,10 +1,14 @@
 //! ApiBackend — the non-process OpenAI-compatible AgentBackend.
 use crate::config::ApiConfig;
 use crate::wire::{ChatRequest, Message, SseAccumulator, ToolCall};
-use bridge_core::domain::{EffectiveConfig, Part, PermissionDecision, PermissionRequest, SessionContext};
+use bridge_core::domain::{
+    EffectiveConfig, Part, PermissionDecision, PermissionRequest, SessionContext,
+};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::ports::{AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED};
+use bridge_core::ports::{
+    AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED,
+};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -20,7 +24,10 @@ struct SessionState {
 }
 impl Default for SessionState {
     fn default() -> Self {
-        Self { model: None, cancel: watch::channel(false).0 }
+        Self {
+            model: None,
+            cancel: watch::channel(false).0,
+        }
     }
 }
 
@@ -34,7 +41,11 @@ pub struct ApiBackend {
 /// Default policy: approve everything (mirrors AcpBackend's default auto-approver).
 struct AutoApprove;
 impl PolicyEngine for AutoApprove {
-    fn decide(&self, _: &PermissionRequest, _: &SessionContext) -> Result<PermissionDecision, BridgeError> {
+    fn decide(
+        &self,
+        _: &PermissionRequest,
+        _: &SessionContext,
+    ) -> Result<PermissionDecision, BridgeError> {
         Ok(PermissionDecision::Approve)
     }
 }
@@ -55,13 +66,19 @@ impl ApiBackend {
 
     #[must_use]
     pub fn with_policy(self, policy: Arc<dyn PolicyEngine>) -> Self {
-        if let Ok(mut p) = self.policy.lock() { *p = policy; }
+        if let Ok(mut p) = self.policy.lock() {
+            *p = policy;
+        }
         self
     }
 
     /// Test/inspection helper: the stashed effective model for a session.
     pub fn session_model(&self, s: &SessionId) -> Option<String> {
-        self.sessions.lock().ok()?.get(s).and_then(|st| st.model.clone())
+        self.sessions
+            .lock()
+            .ok()?
+            .get(s)
+            .and_then(|st| st.model.clone())
     }
 
     /// The session's cancel sender (creating the slot if absent).
@@ -71,7 +88,10 @@ impl ApiBackend {
     }
 
     fn resolve_api_key(&self) -> Option<String> {
-        self.cfg.api_key_env.as_ref().and_then(|var| std::env::var(var).ok())
+        self.cfg
+            .api_key_env
+            .as_ref()
+            .and_then(|var| std::env::var(var).ok())
     }
     fn resolve_model(&self, s: &SessionId) -> Option<String> {
         self.session_model(s).or_else(|| self.cfg.model.clone())
@@ -80,8 +100,15 @@ impl ApiBackend {
 
 #[async_trait::async_trait]
 impl AgentBackend for ApiBackend {
-    async fn prompt(&self, session: &SessionId, parts: Vec<Part>) -> Result<BackendStream, BridgeError> {
-        let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
+    async fn prompt(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        let url = format!(
+            "{}/chat/completions",
+            self.cfg.base_url.trim_end_matches('/')
+        );
         let model = self.resolve_model(session);
         let api_key = self.resolve_api_key();
         let do_stream = self.cfg.stream;
@@ -97,7 +124,11 @@ impl AgentBackend for ApiBackend {
         let mut cancel_rx = cancel_tx.subscribe();
 
         let mut messages: Vec<Message> = vec![Message::user(
-            parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n"),
+            parts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
         )];
 
         let stream = async_stream::try_stream! {
@@ -185,14 +216,20 @@ impl AgentBackend for ApiBackend {
         Ok(())
     }
 
-    async fn configure_session(&self, session: &SessionId, cfg: &EffectiveConfig) -> Result<(), BridgeError> {
+    async fn configure_session(
+        &self,
+        session: &SessionId,
+        cfg: &EffectiveConfig,
+    ) -> Result<(), BridgeError> {
         let mut map = self.sessions.lock().expect("sessions lock");
         map.entry(session.clone()).or_default().model = cfg.model.clone();
         Ok(())
     }
 
     async fn forget_session(&self, session: &SessionId) {
-        if let Ok(mut map) = self.sessions.lock() { map.remove(session); }
+        if let Ok(mut map) = self.sessions.lock() {
+            map.remove(session);
+        }
     }
 }
 
@@ -214,15 +251,21 @@ fn decide_tool(policy: &Arc<StdMutex<Arc<dyn PolicyEngine>>>, tc: &ToolCall) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bridge_core::domain::{EffectiveConfig, PermissionDecision, PermissionRequest, SessionContext};
+    use bridge_core::domain::{
+        EffectiveConfig, PermissionDecision, PermissionRequest, SessionContext,
+    };
+    use bridge_core::error::BridgeError;
     use bridge_core::ids::SessionId;
     use bridge_core::ports::{AgentBackend, PolicyEngine};
-    use bridge_core::error::BridgeError;
     use std::sync::Arc;
 
     struct DenyAll;
     impl PolicyEngine for DenyAll {
-        fn decide(&self, _: &PermissionRequest, _: &SessionContext) -> Result<PermissionDecision, BridgeError> {
+        fn decide(
+            &self,
+            _: &PermissionRequest,
+            _: &SessionContext,
+        ) -> Result<PermissionDecision, BridgeError> {
             Err(BridgeError::PermissionDenied)
         }
     }
@@ -231,17 +274,27 @@ mod tests {
     async fn configure_session_stashes_model_and_object_safe() {
         let be = ApiBackend::new(crate::config::ApiConfig::new("http://127.0.0.1:1"));
         let s = SessionId::parse("s1").unwrap();
-        be.configure_session(&s, &EffectiveConfig { model: Some("haiku".into()), ..Default::default() })
-            .await.unwrap();
+        be.configure_session(
+            &s,
+            &EffectiveConfig {
+                model: Some("haiku".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(be.session_model(&s).as_deref(), Some("haiku"));
         be.forget_session(&s).await;
         assert!(be.session_model(&s).is_none());
-        let _obj: Arc<dyn AgentBackend> = Arc::new(ApiBackend::new(crate::config::ApiConfig::new("http://127.0.0.1:1")));
+        let _obj: Arc<dyn AgentBackend> = Arc::new(ApiBackend::new(crate::config::ApiConfig::new(
+            "http://127.0.0.1:1",
+        )));
     }
 
     #[tokio::test]
     async fn with_policy_swaps_engine() {
-        let be = ApiBackend::new(crate::config::ApiConfig::new("http://127.0.0.1:1")).with_policy(Arc::new(DenyAll));
+        let be = ApiBackend::new(crate::config::ApiConfig::new("http://127.0.0.1:1"))
+            .with_policy(Arc::new(DenyAll));
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         assert_send_sync(&be);
     }

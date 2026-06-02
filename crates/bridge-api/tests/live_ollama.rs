@@ -12,9 +12,14 @@ fn base_url() -> String {
 }
 
 async fn run(be: &ApiBackend, s: &SessionId, text: &str) -> Vec<Update> {
-    let mut st = be.prompt(s, vec![Part { text: text.into() }]).await.unwrap();
+    let mut st = be
+        .prompt(s, vec![Part { text: text.into() }])
+        .await
+        .unwrap();
     let mut out = Vec::new();
-    while let Some(i) = st.next().await { out.push(i.unwrap()); }
+    while let Some(i) = st.next().await {
+        out.push(i.unwrap());
+    }
     out
 }
 
@@ -28,15 +33,36 @@ async fn api_live_two_turns() {
 
     // Turn 1: plain text.
     let t1 = run(&be, &s, "Reply with a short greeting.").await;
-    let text1: String = t1.iter().filter_map(|u| if let Update::Text(t)=u {Some(t.clone())} else {None}).collect();
+    let text1: String = t1
+        .iter()
+        .filter_map(|u| {
+            if let Update::Text(t) = u {
+                Some(t.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     assert!(!text1.trim().is_empty(), "turn 1 produced text");
     assert!(matches!(t1.last(), Some(Update::Done { .. })));
 
     // Turn 2: force a tool call. The stub tool returns "2026-01-01T00:00:00Z"; if it ran
     // AND its result reached the follow-up completion, the model's answer references 2026.
     let t2 = run(&be, &s, "What is the current time? You MUST call the get_current_time tool, then state the time it returned.").await;
-    let text2: String = t2.iter().filter_map(|u| if let Update::Text(t)=u {Some(t.clone())} else {None}).collect();
+    let text2: String = t2
+        .iter()
+        .filter_map(|u| {
+            if let Update::Text(t) = u {
+                Some(t.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     assert!(matches!(t2.last(), Some(Update::Done { .. })));
     assert!(!t2.iter().any(|u| matches!(u, Update::Permission(_)))); // silent decision
-    assert!(text2.contains("2026"), "the stub tool's result reached the model's answer: {text2:?}");
+    assert!(
+        text2.contains("2026"),
+        "the stub tool's result reached the model's answer: {text2:?}"
+    );
 }

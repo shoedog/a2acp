@@ -26,14 +26,28 @@ pub struct Message {
 
 impl Message {
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: Some(text.into()), tool_calls: None, tool_call_id: None }
+        Self {
+            role: "user".into(),
+            content: Some(text.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
     pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
-        Self { role: "assistant".into(), content: None, tool_calls: Some(calls), tool_call_id: None }
+        Self {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(calls),
+            tool_call_id: None,
+        }
     }
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: Some(content.into()), tool_calls: None,
-            tool_call_id: Some(tool_call_id.into()) }
+        Self {
+            role: "tool".into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
     }
 }
 
@@ -44,7 +58,9 @@ pub struct ToolCall {
     pub kind: String,
     pub function: FunctionCall,
 }
-fn default_function() -> String { "function".into() }
+fn default_function() -> String {
+    "function".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FunctionCall {
@@ -62,31 +78,47 @@ pub struct ParseError;
 
 // ── Streamed response chunk shapes ──────────────────────────────────────────
 #[derive(Debug, Deserialize)]
-struct StreamChunk { #[serde(default)] choices: Vec<StreamChoice> }
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
-    #[serde(default)] delta: Delta,
-    #[serde(default)] finish_reason: Option<String>,
+    #[serde(default)]
+    delta: Delta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct Delta {
-    #[serde(default)] content: Option<String>,
-    #[serde(default)] tool_calls: Option<Vec<ToolCallFragment>>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallFragment>>,
 }
 #[derive(Debug, Deserialize)]
 struct ToolCallFragment {
-    #[serde(default)] index: Option<usize>,
-    #[serde(default)] id: Option<String>,
-    #[serde(default)] function: Option<FunctionFragment>,
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<FunctionFragment>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct FunctionFragment {
-    #[serde(default)] name: Option<String>,
-    #[serde(default)] arguments: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
-struct PartialToolCall { id: String, name: String, arguments: String }
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
 
 /// The result of consuming a (streamed or non-streamed) response.
 #[derive(Debug, Default)]
@@ -112,20 +144,34 @@ impl SseAccumulator {
     #[must_use = "a text delta may need surfacing as Update::Text"]
     pub fn push_sse_line(&mut self, line: &str) -> Result<Option<String>, ParseError> {
         let line = line.trim();
-        let Some(payload) = line.strip_prefix("data:") else { return Ok(None) };
+        let Some(payload) = line.strip_prefix("data:") else {
+            return Ok(None);
+        };
         let payload = payload.trim();
-        if payload.is_empty() { return Ok(None) }
-        if payload == "[DONE]" { self.done = true; return Ok(None) }
+        if payload.is_empty() {
+            return Ok(None);
+        }
+        if payload == "[DONE]" {
+            self.done = true;
+            return Ok(None);
+        }
         let chunk: StreamChunk = serde_json::from_str(payload).map_err(|_| ParseError)?;
         let mut emitted = None;
         for choice in chunk.choices {
             if let Some(c) = choice.delta.content {
-                if !c.is_empty() { self.text.push_str(&c); emitted = Some(c); }
+                if !c.is_empty() {
+                    self.text.push_str(&c);
+                    emitted = Some(c);
+                }
             }
             if let Some(frags) = choice.delta.tool_calls {
-                for f in frags { self.absorb_fragment(f); }
+                for f in frags {
+                    self.absorb_fragment(f);
+                }
             }
-            if choice.finish_reason.is_some() { self.done = true; }
+            if choice.finish_reason.is_some() {
+                self.done = true;
+            }
         }
         Ok(emitted)
     }
@@ -134,30 +180,56 @@ impl SseAccumulator {
         let key = match f.index {
             Some(i) => i,
             // No index: a new id starts a new slot, else append to the latest.
-            None if f.id.is_some() => { let k = self.next_pos; self.next_pos += 1; k }
+            None if f.id.is_some() => {
+                let k = self.next_pos;
+                self.next_pos += 1;
+                k
+            }
             None => self.next_pos.saturating_sub(1),
         };
-        if f.index.is_some() { self.next_pos = self.next_pos.max(key + 1); }
+        if f.index.is_some() {
+            self.next_pos = self.next_pos.max(key + 1);
+        }
         let slot = self.calls.entry(key).or_default();
-        if let Some(id) = f.id { slot.id = id; }
+        if let Some(id) = f.id {
+            slot.id = id;
+        }
         if let Some(func) = f.function {
-            if let Some(n) = func.name { slot.name = n; }
-            if let Some(a) = func.arguments { slot.arguments.push_str(&a); }
+            if let Some(n) = func.name {
+                slot.name = n;
+            }
+            if let Some(a) = func.arguments {
+                slot.arguments.push_str(&a);
+            }
         }
     }
 
-    pub fn is_done(&self) -> bool { self.done }
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
 
     pub fn finish(self) -> ParsedTurn {
-        let tool_calls = self.calls.into_values()
+        let tool_calls = self
+            .calls
+            .into_values()
             .filter(|p| !p.name.is_empty())
             .map(|p| ToolCall {
-                id: if p.id.is_empty() { "call_0".into() } else { p.id },
+                id: if p.id.is_empty() {
+                    "call_0".into()
+                } else {
+                    p.id
+                },
                 kind: "function".into(),
-                function: FunctionCall { name: p.name, arguments: p.arguments },
+                function: FunctionCall {
+                    name: p.name,
+                    arguments: p.arguments,
+                },
             })
             .collect();
-        ParsedTurn { text: self.text, tool_calls }
+        ParsedTurn {
+            text: self.text,
+            tool_calls,
+        }
     }
 }
 
@@ -166,17 +238,22 @@ mod stream_tests {
     use super::*;
 
     fn feed(acc: &mut SseAccumulator, lines: &[&str]) {
-        for l in lines { let _ = acc.push_sse_line(l); } // push_sse_line is #[must_use]
+        for l in lines {
+            let _ = acc.push_sse_line(l);
+        } // push_sse_line is #[must_use]
     }
 
     #[test]
     fn accumulates_text_deltas() {
         let mut acc = SseAccumulator::default();
-        feed(&mut acc, &[
-            r#"data: {"choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#,
-            r#"data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}"#,
-            "data: [DONE]",
-        ]);
+        feed(
+            &mut acc,
+            &[
+                r#"data: {"choices":[{"delta":{"content":"Hel"},"finish_reason":null}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}"#,
+                "data: [DONE]",
+            ],
+        );
         assert!(acc.is_done());
         let out = acc.finish();
         assert_eq!(out.text, "Hello");
@@ -186,10 +263,13 @@ mod stream_tests {
     #[test]
     fn assembles_indexed_tool_call_fragments() {
         let mut acc = SseAccumulator::default();
-        feed(&mut acc, &[
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_current_time","arguments":""}}]},"finish_reason":null}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
-        ]);
+        feed(
+            &mut acc,
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_current_time","arguments":""}}]},"finish_reason":null}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ],
+        );
         let out = acc.finish();
         assert_eq!(out.tool_calls.len(), 1);
         assert_eq!(out.tool_calls[0].id, "call_1");
@@ -201,18 +281,32 @@ mod stream_tests {
     fn tolerates_missing_index_and_stop_finish() {
         // ollama/ollama#7881: tool call with NO index, finishing "stop".
         let mut acc = SseAccumulator::default();
-        feed(&mut acc, &[
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c9","function":{"name":"get_current_time","arguments":"{}"}}]},"finish_reason":"stop"}]}"#,
-        ]);
+        feed(
+            &mut acc,
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c9","function":{"name":"get_current_time","arguments":"{}"}}]},"finish_reason":"stop"}]}"#,
+            ],
+        );
         let out = acc.finish();
-        assert_eq!(out.tool_calls.len(), 1, "tool call assembled despite no index + stop finish");
+        assert_eq!(
+            out.tool_calls.len(),
+            1,
+            "tool call assembled despite no index + stop finish"
+        );
         assert_eq!(out.tool_calls[0].id, "c9");
     }
 
     #[test]
     fn ignores_blank_and_non_data_lines() {
         let mut acc = SseAccumulator::default();
-        feed(&mut acc, &["", ": keep-alive", r#"data: {"choices":[{"delta":{"content":"x"}}]}"#]);
+        feed(
+            &mut acc,
+            &[
+                "",
+                ": keep-alive",
+                r#"data: {"choices":[{"delta":{"content":"x"}}]}"#,
+            ],
+        );
         assert_eq!(acc.finish().text, "x");
     }
 
@@ -225,13 +319,20 @@ mod stream_tests {
 }
 
 #[derive(Debug, Deserialize)]
-struct NonStreamResponse { #[serde(default)] choices: Vec<NonStreamChoice> }
+struct NonStreamResponse {
+    #[serde(default)]
+    choices: Vec<NonStreamChoice>,
+}
 #[derive(Debug, Deserialize)]
-struct NonStreamChoice { message: RespMessage }
+struct NonStreamChoice {
+    message: RespMessage,
+}
 #[derive(Debug, Deserialize)]
 struct RespMessage {
-    #[serde(default)] content: Option<String>,
-    #[serde(default)] tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// Parse a non-streamed (`stream:false`) chat completion body. Returns
@@ -288,8 +389,14 @@ mod request_tests {
     }
     #[test]
     fn assistant_tool_call_and_tool_result_messages_serialize() {
-        let tc = ToolCall { id: "call_1".into(), kind: "function".into(),
-            function: FunctionCall { name: "get_current_time".into(), arguments: "{}".into() } };
+        let tc = ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "get_current_time".into(),
+                arguments: "{}".into(),
+            },
+        };
         let asst = Message::assistant_tool_calls(vec![tc.clone()]);
         let result = Message::tool_result("call_1", "2026-01-01T00:00:00Z");
         let va = serde_json::to_value(&asst).unwrap();
