@@ -74,30 +74,40 @@ impl WorkflowExecutor {
     pub fn run(&self, graph: Arc<WorkflowGraph>, input: String, run_id: String, cancel: CancellationToken) -> WorkflowStream {
         let this = WorkflowExecutor { registry: self.registry.clone() };
         Box::pin(async_stream::stream! {
-            // Task 4 replaces this with parallel topo scheduling. Single-node milestone:
-            // run nodes in declaration order, each consuming `{{input}}` (+ any ready inputs).
             let mut outputs: HashMap<String, (String, bool)> = HashMap::new();
-            let mut terminal_output = String::new();
-            let mut terminal_ok = true;
-            for node in &graph.nodes {
-                yield Ok(WorkflowEvent::NodeStarted { node: node.id.clone() });
-                // Clone upstream outputs into owned strings so we can borrow `&str` from them
-                // across the `.await` in `run_node` without fighting the borrow checker.
-                let mut owned_vars: Vec<(String, String)> = vec![("input".to_string(), input.clone())];
-                for inp in &node.inputs {
-                    if let Some((t, _)) = outputs.get(inp.as_str()) {
-                        owned_vars.push((inp.as_str().to_string(), t.clone()));
+            let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let terminal_id = graph.terminal().map(|n| n.id.as_str().to_string()).unwrap_or_default();
+            while done.len() < graph.nodes.len() {
+                if cancel.is_cancelled() { break; }   // stop scheduling downstream once canceled
+                let ready: Vec<&WorkflowNode> = graph.nodes.iter()
+                    .filter(|n| !done.contains(n.id.as_str())
+                        && n.inputs.iter().all(|i| done.contains(i.as_str())))
+                    .collect();
+                if ready.is_empty() { break; } // validated acyclic, so unreachable
+                for n in &ready { yield Ok(WorkflowEvent::NodeStarted { node: n.id.clone() }); }
+                let futs = ready.iter().map(|n| {
+                    let mut owned: Vec<(String, String)> = vec![("input".into(), input.clone())];
+                    for inp in &n.inputs {
+                        if let Some((t, _)) = outputs.get(inp.as_str()) { owned.push((inp.as_str().into(), t.clone())); }
                     }
+                    let node = (*n).clone(); let run_id = run_id.clone(); let cancel = cancel.clone();
+                    let wf_id = graph.id.as_str().to_string(); let this = &this;
+                    async move {
+                        let vars: HashMap<&str, &str> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                        let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel).await;
+                        (node.id.as_str().to_string(), text, ok)
+                    }
+                });
+                for (id, text, ok) in futures::future::join_all(futs).await {
+                    yield Ok(WorkflowEvent::NodeFinished { node: NodeId::parse(&id).unwrap(), ok });
+                    done.insert(id.clone());
+                    outputs.insert(id, (text, ok));
                 }
-                let vars: HashMap<&str, &str> = owned_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                let (text, ok) = this.run_node(graph.id.as_str(), node, &vars, &run_id, &cancel).await;
-                yield Ok(WorkflowEvent::NodeFinished { node: node.id.clone(), ok });
-                terminal_output = text.clone(); terminal_ok = ok;
-                outputs.insert(node.id.as_str().to_string(), (text, ok));
             }
+            let (term_text, term_ok) = outputs.get(&terminal_id).cloned().unwrap_or_default();
             let outcome = if cancel.is_cancelled() { WorkflowOutcome::Canceled }
-                else if terminal_ok { WorkflowOutcome::Completed } else { WorkflowOutcome::Failed };
-            yield Ok(WorkflowEvent::Terminal { outcome, output: terminal_output });
+                else if term_ok { WorkflowOutcome::Completed } else { WorkflowOutcome::Failed };
+            yield Ok(WorkflowEvent::Terminal { outcome, output: term_text });
         })
     }
 }
@@ -167,5 +177,101 @@ mod tests {
         assert!(matches!(term, WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output } if output == "HELLO"));
         assert!(*rec.configured.lock().unwrap(), "configure_session called");
         assert_eq!(rec.prompts.lock().unwrap()[0], "echo DIFF", "template rendered with {{input}}");
+    }
+
+    fn review_graph() -> Arc<WorkflowGraph> {
+        let n = |id: &str, ag: &str, ins: &[&str], tpl: &str| WorkflowNode {
+            id: NodeId::parse(id).unwrap(), agent: AgentId::parse(ag).unwrap(),
+            prompt_template: tpl.into(), inputs: ins.iter().map(|i| NodeId::parse(*i).unwrap()).collect() };
+        Arc::new(WorkflowGraph { id: WorkflowId::parse("code-review").unwrap(), nodes: vec![
+            n("codex","codex",&[], "review {{input}}"),
+            n("claude","claude",&[], "review {{input}}"),
+            n("synth","synth",&["codex","claude"], "merge {{codex}} + {{claude}} for {{input}}"),
+        ]})
+    }
+
+    #[tokio::test]
+    async fn fan_in_synth_receives_both_reviews_and_input() {
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry { backends: [
+            ("codex".to_string(), mk("CODEX_REVIEW")),
+            ("claude".to_string(), mk("CLAUDE_REVIEW")),
+            ("synth".to_string(), mk("FINAL")),
+        ].into() });
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex.run(review_graph(), "DIFF".into(), "r".into(), CancellationToken::new()).collect::<Vec<_>>().await;
+        let last = evs.last().unwrap().as_ref().unwrap();
+        assert!(matches!(last, WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output } if output == "FINAL"));
+        let p = &synth_rec.prompts.lock().unwrap()[0];
+        assert!(p.contains("CODEX_REVIEW") && p.contains("CLAUDE_REVIEW") && p.contains("DIFF"),
+            "synth got both reviews + {{input}}: {p}");
+    }
+
+    #[tokio::test]
+    async fn fan_out_runs_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+        // Both fan-out legs must ENTER prompt() before either replies → only possible if run in parallel.
+        struct BarrierBackend { reply: String, barrier: Arc<Barrier> }
+        #[async_trait::async_trait]
+        impl AgentBackend for BarrierBackend {
+            async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+                self.barrier.wait().await; // deadlocks unless the other leg also reaches here
+                Ok(Box::pin(tokio_stream::iter(vec![
+                    Ok(Update::Text(self.reply.clone())), Ok(Update::Done { stop_reason: "end_turn".into() })])))
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> { Ok(()) }
+        }
+        // BReg hands out BarrierBackend only for the first 2 resolves (the fan-out nodes);
+        // node `t` (the terminal, resolved 3rd) gets a plain non-blocking backend so it
+        // doesn't deadlock on a single-party wait.
+        struct BReg { barrier: Arc<Barrier>, calls: Arc<AtomicUsize> }
+        #[async_trait::async_trait]
+        impl AgentRegistry for BReg {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let backend: Arc<dyn bridge_core::ports::AgentBackend> = if n < 2 {
+                    Arc::new(BarrierBackend { reply: id.as_str().to_uppercase(), barrier: self.barrier.clone() })
+                } else {
+                    Arc::new(FakeBackend { reply: id.as_str().to_uppercase(), rec: Arc::new(Rec::default()) })
+                };
+                Ok(Resolved { entry: Arc::new(minimal_entry(id)), backend, lease: Box::new(NoopLease) })
+            }
+            fn default_id(&self) -> AgentId { AgentId::parse("a").unwrap() }
+            async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> { Ok(()) }
+            fn list(&self) -> Vec<AgentId> { vec![] }
+        }
+        // two-node graph: a, b both inputs=[] (fan-out), plus a terminal t depending on both.
+        let g = Arc::new(WorkflowGraph { id: WorkflowId::parse("g").unwrap(), nodes: vec![
+            WorkflowNode { id: NodeId::parse("a").unwrap(), agent: AgentId::parse("a").unwrap(), prompt_template: "{{input}}".into(), inputs: vec![] },
+            WorkflowNode { id: NodeId::parse("b").unwrap(), agent: AgentId::parse("b").unwrap(), prompt_template: "{{input}}".into(), inputs: vec![] },
+            WorkflowNode { id: NodeId::parse("t").unwrap(), agent: AgentId::parse("a").unwrap(), prompt_template: "{{a}}{{b}}".into(), inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()] },
+        ]});
+        let reg = Arc::new(BReg { barrier: Arc::new(Barrier::new(2)), calls: Arc::new(AtomicUsize::new(0)) }); // a + b must rendezvous
+        let ex = WorkflowExecutor::new(reg);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(3),
+            ex.run(g, "x".into(), "r".into(), CancellationToken::new()).collect::<Vec<_>>()).await;
+        assert!(res.is_ok(), "fan-out legs ran concurrently (no deadlock/timeout)");
+    }
+
+    #[tokio::test]
+    async fn pipeline_threads_output_to_input() {
+        // a -> b -> c ; b sees a's output, c sees b's.
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry { backends: [
+            ("a".to_string(), mk("AOUT")), ("b".to_string(), mk("BOUT")), ("c".to_string(), mk("COUT")),
+        ].into() });
+        let b_rec = reg.backends.get("b").unwrap().1.clone();
+        let c_rec = reg.backends.get("c").unwrap().1.clone();
+        let g = Arc::new(WorkflowGraph { id: WorkflowId::parse("p").unwrap(), nodes: vec![
+            WorkflowNode { id: NodeId::parse("a").unwrap(), agent: AgentId::parse("a").unwrap(), prompt_template: "{{input}}".into(), inputs: vec![] },
+            WorkflowNode { id: NodeId::parse("b").unwrap(), agent: AgentId::parse("b").unwrap(), prompt_template: "got {{a}}".into(), inputs: vec![NodeId::parse("a").unwrap()] },
+            WorkflowNode { id: NodeId::parse("c").unwrap(), agent: AgentId::parse("c").unwrap(), prompt_template: "got {{b}}".into(), inputs: vec![NodeId::parse("b").unwrap()] },
+        ]});
+        let ex = WorkflowExecutor::new(reg);
+        let _ = ex.run(g, "x".into(), "r".into(), CancellationToken::new()).collect::<Vec<_>>().await;
+        assert_eq!(b_rec.prompts.lock().unwrap()[0], "got AOUT");
+        assert_eq!(c_rec.prompts.lock().unwrap()[0], "got BOUT");
     }
 }
