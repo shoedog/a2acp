@@ -17,6 +17,7 @@ bridge-store = { path = "../../crates/bridge-store" }
 bridge-policy = { path = "../../crates/bridge-policy" }
 bridge-observ = { path = "../../crates/bridge-observ" }
 bridge-registry = { path = "../../crates/bridge-registry" }
+bridge-api = { path = "../../crates/bridge-api" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 axum = { workspace = true }
@@ -42,5 +43,7 @@ bridge-policy = { path = "../../crates/bridge-policy" }
 bridge-a2a-inbound = { path = "../../crates/bridge-a2a-inbound" }
 bridge-core = { path = "../../crates/bridge-core" }
 bridge-registry = { path = "../../crates/bridge-registry" }
+bridge-api = { path = "../../crates/bridge-api" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 tempfile = "3"
+wiremock = "0.6"

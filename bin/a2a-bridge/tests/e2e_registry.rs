@@ -99,22 +99,35 @@ fn build_registry() -> (Arc<Registry>, RegistrySnapshot) {
 fn acp_spawn_fn() -> SpawnFn {
     Arc::new(move |entry: Arc<AgentEntry>| {
         Box::pin(async move {
-            // ACP §11A requires an absolute cwd: a per-entry isolated temp dir.
-            let cwd = unique_temp_dir(entry.id.as_str());
-            let args: Vec<String> = entry.args.clone();
-            let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-            let acp = AcpConfig {
-                cwd,
-                model: entry.model.clone(),
-                mode: entry.mode.clone(),
-                auth_method: entry.auth_method.clone(),
-                ..AcpConfig::default()
-            };
-            let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-            let be = AcpBackend::spawn(&entry.cmd, &args_ref, acp)
-                .await?
-                .with_policy(policy);
-            Ok(Arc::new(be) as Arc<dyn AgentBackend>)
+            match entry.kind {
+                AgentKind::Acp => {
+                    let cmd = entry.cmd.clone().expect("acp entry has cmd");
+                    // ACP §11A requires an absolute cwd: a per-entry isolated temp dir.
+                    let cwd = unique_temp_dir(entry.id.as_str());
+                    let args: Vec<String> = entry.args.clone();
+                    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let acp = AcpConfig {
+                        cwd,
+                        model: entry.model.clone(),
+                        mode: entry.mode.clone(),
+                        auth_method: entry.auth_method.clone(),
+                        ..AcpConfig::default()
+                    };
+                    let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
+                    let be = AcpBackend::spawn(&cmd, &args_ref, acp)
+                        .await?
+                        .with_policy(policy);
+                    Ok(Arc::new(be) as Arc<dyn AgentBackend>)
+                }
+                AgentKind::Api => {
+                    let mut cfg = bridge_api::ApiConfig::new(
+                        entry.base_url.clone().expect("api entry has base_url"),
+                    );
+                    cfg.model = entry.model.clone();
+                    Ok(std::sync::Arc::new(bridge_api::ApiBackend::new(cfg))
+                        as std::sync::Arc<dyn AgentBackend>)
+                }
+            }
         })
     })
 }
@@ -211,7 +224,9 @@ fn entry(
 ) -> AgentEntry {
     AgentEntry {
         id: AgentId::parse(id).unwrap(),
-        cmd: cmd.into(),
+        cmd: Some(cmd.into()),
+        base_url: None,
+        api_key_env: None,
         args: args.iter().map(|s| s.to_string()).collect(),
         kind: AgentKind::Acp,
         model_provider: None,
@@ -520,6 +535,105 @@ async fn claude_warm_two_turns_via_acp() {
         "warm 2nd turn must recall 7 from the SAME ACP session (cold would fail; question has no '7'); got r2={r2:?} s2={s2:?}"
     );
     drop(resolved);
+}
+
+/// DoD-8: a `kind="api"` entry wired through `Registry` resolves, spawns an
+/// `ApiBackend`, and correctly streams a turn — all without a real agent process.
+/// The backend is driven against a `wiremock` mock that returns one SSE chunk
+/// followed by `[DONE]`, exactly matching the OpenAI-compatible streaming shape.
+#[tokio::test]
+async fn api_entry_resolves_and_serves_through_registry() {
+    let server = wiremock::MockServer::start().await;
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let entry = AgentEntry {
+        id: AgentId::parse("ollama").unwrap(),
+        cmd: None,
+        args: vec![],
+        kind: AgentKind::Api,
+        base_url: Some(format!("{}/v1", server.uri())),
+        api_key_env: None,
+        model_provider: None,
+        model: None,
+        effort: None,
+        mode: None,
+        cwd: None,
+        auth_method: None,
+        name: None,
+        description: None,
+        tags: vec![],
+        version: None,
+        extensions: Default::default(),
+    };
+    let snap = RegistrySnapshot {
+        default: AgentId::parse("ollama").unwrap(),
+        entries: vec![entry],
+        allowed_cmds: vec![],
+    };
+    let reg = Registry::new(snap, acp_spawn_fn()).unwrap();
+    let resolved = reg
+        .resolve(&AgentId::parse("ollama").unwrap())
+        .await
+        .unwrap();
+    let mut st = resolved
+        .backend
+        .prompt(
+            &SessionId::parse("s1").unwrap(),
+            vec![Part { text: "hi".into() }],
+        )
+        .await
+        .unwrap();
+    let mut text = String::new();
+    let mut done = false;
+    while let Some(u) = st.next().await {
+        match u.unwrap() {
+            Update::Text(t) => text.push_str(&t),
+            Update::Done { .. } => done = true,
+            _ => {}
+        }
+    }
+    assert_eq!(text, "hi");
+    assert!(done);
+}
+
+/// DoD-8 (rejection path): `kind="api"` entries that also set `cmd` must be
+/// rejected at `Registry::new` time — the validator rejects them before any
+/// backend is spawned.
+#[tokio::test]
+async fn registry_rejects_api_entry_with_cmd() {
+    let bad = AgentEntry {
+        id: AgentId::parse("x").unwrap(),
+        cmd: Some("nope".into()),
+        args: vec![],
+        kind: AgentKind::Api,
+        base_url: Some("http://h/v1".into()),
+        api_key_env: None,
+        model_provider: None,
+        model: None,
+        effort: None,
+        mode: None,
+        cwd: None,
+        auth_method: None,
+        name: None,
+        description: None,
+        tags: vec![],
+        version: None,
+        extensions: Default::default(),
+    };
+    let snap = RegistrySnapshot {
+        default: AgentId::parse("x").unwrap(),
+        entries: vec![bad],
+        allowed_cmds: vec![],
+    };
+    assert!(Registry::new(snap, acp_spawn_fn()).is_err());
 }
 
 /// A unique, created, absolute temp directory for an agent's session cwd.

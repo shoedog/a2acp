@@ -115,7 +115,15 @@ pub struct RegistrySection {
 #[derive(Debug, serde::Deserialize)]
 pub struct AgentEntryToml {
     pub id: String,
-    pub cmd: String,
+    /// Required for `kind="acp"`; absent for non-process kinds (e.g. `Api`).
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// OpenAI-compatible base URL; required for `kind="api"`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// NAME of an env var holding a bearer token for `kind="api"` (never the secret).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     /// Parsed to `AgentKind` in `into_snapshot`; "acp" (default).
@@ -167,7 +175,7 @@ impl RegistryConfig {
         let allowed_cmds = match self.registry {
             Some(r) if !r.allowed_cmds.is_empty() => r.allowed_cmds,
             _ => {
-                let mut v: Vec<String> = self.agents.iter().map(|a| a.cmd.clone()).collect();
+                let mut v: Vec<String> = self.agents.iter().filter_map(|a| a.cmd.clone()).collect();
                 v.sort();
                 v.dedup();
                 v
@@ -182,9 +190,34 @@ impl RegistryConfig {
                 Some(s) => parse_kind(s)?,
                 None => AgentKind::default(),
             };
+            // Parse-shape guard: per-kind cmd/base_url requirements. Placed before
+            // `a.cmd`/`a.id` are moved into the constructed entry below.
+            match kind {
+                AgentKind::Acp if a.cmd.is_none() => {
+                    return Err(ConfigError::Registry(format!(
+                        "acp agent {:?} requires cmd",
+                        id.as_str()
+                    )))
+                }
+                AgentKind::Api if a.base_url.is_none() => {
+                    return Err(ConfigError::Registry(format!(
+                        "api agent {:?} requires base_url",
+                        id.as_str()
+                    )))
+                }
+                AgentKind::Api if a.cmd.is_some() => {
+                    return Err(ConfigError::Registry(format!(
+                        "api agent {:?} must not set cmd",
+                        id.as_str()
+                    )))
+                }
+                _ => {}
+            }
             entries.push(AgentEntry {
                 id,
                 cmd: a.cmd,
+                base_url: a.base_url,
+                api_key_env: a.api_key_env,
                 args: a.args,
                 kind,
                 model_provider: a.model_provider,
@@ -233,9 +266,10 @@ fn parse_effort(s: &str) -> Result<Effort, ConfigError> {
 fn parse_kind(s: &str) -> Result<AgentKind, ConfigError> {
     Ok(match s {
         "acp" => AgentKind::Acp,
+        "api" => AgentKind::Api,
         other => {
             return Err(ConfigError::Registry(format!(
-                "invalid kind: {other:?} (expected acp)"
+                "invalid kind: {other:?} (expected acp|api)"
             )))
         }
     })
@@ -669,5 +703,53 @@ addr="127.0.0.1:8080"
         .unwrap()
         .into_snapshot();
         assert!(r.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 15: surface-A ripple — kind="api", cmd optional, base_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_kind_accepts_api() {
+        assert_eq!(
+            parse_kind("api").unwrap(),
+            bridge_core::domain::AgentKind::Api
+        );
+        assert!(parse_kind("bogus").is_err());
+    }
+
+    #[test]
+    fn api_entry_parses_without_cmd() {
+        let toml = "default=\"ollama\"\n[[agents]]\nid=\"ollama\"\nkind=\"api\"\nbase_url=\"http://localhost:11434/v1\"\nmodel=\"qwen3.5:9b\"\n[server]\naddr=\"127.0.0.1:8080\"\n";
+        let snap = RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+        let e = snap
+            .entries
+            .iter()
+            .find(|e| e.id.as_str() == "ollama")
+            .unwrap();
+        assert!(e.cmd.is_none());
+        assert_eq!(e.base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert!(!snap.allowed_cmds.iter().any(|c| c.is_empty()));
+    }
+
+    #[test]
+    fn api_entry_with_cmd_is_rejected() {
+        let toml = "default=\"x\"\n[[agents]]\nid=\"x\"\nkind=\"api\"\nbase_url=\"http://h/v1\"\ncmd=\"nope\"\n[server]\naddr=\"127.0.0.1:8080\"\n";
+        assert!(RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .is_err());
+    }
+
+    #[test]
+    fn acp_entry_without_cmd_is_rejected() {
+        let toml = "default=\"x\"\n[[agents]]\nid=\"x\"\nkind=\"acp\"\n[server]\naddr=\"127.0.0.1:8080\"\n";
+        assert!(RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .is_err());
     }
 }

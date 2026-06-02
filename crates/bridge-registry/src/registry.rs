@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use futures::future::BoxFuture;
 use tokio::sync::{Notify, OnceCell};
 
-use bridge_core::domain::{AgentEntry, RegistrySnapshot};
+use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
 use bridge_core::ports::{AgentBackend, AgentRegistry, Lease, Resolved};
@@ -99,10 +99,31 @@ pub(crate) fn validate(snap: &RegistrySnapshot) -> Result<(), BridgeError> {
                 reason: format!("duplicate agent id: {}", e.id.as_str()),
             });
         }
-        if !snap.allowed_cmds.iter().any(|c| c == &e.cmd) {
-            return Err(BridgeError::ConfigInvalid {
-                reason: format!("cmd not allowed: {}", e.cmd),
-            });
+        match e.kind {
+            AgentKind::Acp => {
+                let Some(cmd) = e.cmd.as_deref() else {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: format!("acp agent {} requires cmd", e.id.as_str()),
+                    });
+                };
+                if !snap.allowed_cmds.iter().any(|c| c == cmd) {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: format!("cmd not allowed: {cmd}"),
+                    });
+                }
+            }
+            AgentKind::Api => {
+                if e.base_url.is_none() {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: format!("api agent {} requires base_url", e.id.as_str()),
+                    });
+                }
+                if e.cmd.is_some() {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: format!("api agent {} must not set cmd", e.id.as_str()),
+                    });
+                }
+            }
         }
     }
     if !snap.entries.iter().any(|e| e.id == snap.default) {
@@ -243,6 +264,7 @@ impl AgentRegistry for Registry {
             let reuse = old.slots.get(&id).filter(|cur| {
                 let c = cur.entry.load();
                 c.cmd == e.cmd
+                    && c.base_url == e.base_url
                     && c.args == e.args
                     && c.cwd == e.cwd
                     && c.auth_method == e.auth_method
@@ -346,7 +368,9 @@ mod tests {
     fn entry(id: &str) -> AgentEntry {
         AgentEntry {
             id: AgentId::parse(id).unwrap(),
-            cmd: "fake-cmd".into(),
+            cmd: Some("fake-cmd".into()),
+            base_url: None,
+            api_key_env: None,
             args: vec![],
             kind: AgentKind::Acp,
             model_provider: None,
@@ -389,6 +413,45 @@ mod tests {
             entries: ids.iter().map(|i| entry(i)).collect(),
             allowed_cmds: vec!["fake-cmd".into()],
         }
+    }
+
+    /// A single-entry `kind="api"` snapshot (no cmd, has base_url) — Task 15.
+    fn api_snap() -> RegistrySnapshot {
+        RegistrySnapshot {
+            default: AgentId::parse("ollama").unwrap(),
+            entries: vec![AgentEntry {
+                id: AgentId::parse("ollama").unwrap(),
+                cmd: None,
+                args: vec![],
+                kind: AgentKind::Api,
+                base_url: Some("http://h/v1".into()),
+                api_key_env: None,
+                model_provider: None,
+                model: None,
+                effort: None,
+                mode: None,
+                cwd: None,
+                auth_method: None,
+                name: None,
+                description: None,
+                tags: vec![],
+                version: None,
+                extensions: Default::default(),
+            }],
+            allowed_cmds: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_allows_api_entry_without_cmd() {
+        assert!(validate(&api_snap()).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_api_entry_missing_base_url() {
+        let mut s = api_snap();
+        s.entries[0].base_url = None;
+        assert!(validate(&s).is_err());
     }
 
     /// A SpawnFn that counts invocations and (optionally) fails the first N calls.
@@ -556,7 +619,7 @@ mod tests {
 
         // cmd change: new cmd → new slot. (allow the new cmd through validate)
         let mut snap = snapshot(&["a"]);
-        snap.entries[0].cmd = "other-cmd".into();
+        snap.entries[0].cmd = Some("other-cmd".into());
         snap.allowed_cmds = vec!["fake-cmd".into(), "other-cmd".into()];
         reg.apply(snap).await.unwrap();
 
@@ -576,6 +639,44 @@ mod tests {
             count.load(SeqCst),
             2,
             "resolve after a cmd change spawns a fresh backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_url_change_replaces_slot() {
+        // Task 15: an api-entry base_url change is part of the reuse-identity tuple,
+        // so (like a cmd change) it produces a NEW slot and retires the OLD instance.
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            api_snap(),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap();
+        let a = AgentId::parse("ollama").unwrap();
+
+        let _r = reg.resolve(&a).await.unwrap(); // spawns OLD backend (base_url=http://h/v1)
+        assert_eq!(count.load(SeqCst), 1);
+        let slot_before = reg.slot_arc(&a).unwrap();
+
+        // base_url change: new url → new slot.
+        let mut snap = api_snap();
+        snap.entries[0].base_url = Some("http://other/v1".into());
+        reg.apply(snap).await.unwrap();
+
+        let slot_after = reg.slot_arc(&a).unwrap();
+        assert!(
+            !Arc::ptr_eq(&slot_before, &slot_after),
+            "base_url change must produce a NEW slot instance"
+        );
+        drop(_r);
+        await_retired(&retired, 1).await;
+
+        let _r2 = reg.resolve(&a).await.unwrap();
+        assert_eq!(
+            count.load(SeqCst),
+            2,
+            "resolve after a base_url change spawns a fresh backend"
         );
     }
 
@@ -643,7 +744,7 @@ mod tests {
 
         // cmd not in allowed_cmds
         let mut bad_cmd = snapshot(&["a"]);
-        bad_cmd.entries[0].cmd = "evil".into();
+        bad_cmd.entries[0].cmd = Some("evil".into());
         match reg.apply(bad_cmd).await {
             Err(BridgeError::ConfigInvalid { reason }) => {
                 assert!(reason.contains("cmd not allowed"), "got: {reason}")

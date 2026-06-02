@@ -22,7 +22,9 @@ pub fn single_agent_registry(id: &str, backend: Arc<dyn AgentBackend>) -> Arc<dy
     let agent_id = AgentId::parse(id).unwrap();
     let entry = AgentEntry {
         id: agent_id.clone(),
-        cmd: "test-cmd".into(),
+        cmd: Some("test-cmd".into()),
+        base_url: None,
+        api_key_env: None,
         args: vec![],
         kind: AgentKind::Acp,
         model_provider: None,
