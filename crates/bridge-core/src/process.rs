@@ -26,8 +26,25 @@ impl Supervised {
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
         let pid = child.id().expect("child has a pid before wait");
+        // Drain the child's stderr on a detached task. stderr is piped (so it never
+        // interleaves with our own logs) but NOTHING else reads it: an agent that
+        // writes past the ~64KB pipe buffer blocks on its next stderr write and
+        // deadlocks its entire turn (observed live with a chatty ACP agent — the
+        // turn hung, then the process died as AgentCrashed). Reading to EOF keeps
+        // the pipe drained; lines surface at debug under `agent_stderr` so
+        // `RUST_LOG=agent_stderr=debug` shows agent diagnostics on demand.
+        if let Some(stderr) = child.stderr.take() {
+            let agent = prog.to_string();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "agent_stderr", %agent, "{line}");
+                }
+            });
+        }
         Ok(Self { child, pid })
     }
 
@@ -80,6 +97,39 @@ mod tests {
         } else {
             Some(s)
         }
+    }
+
+    #[tokio::test]
+    async fn chatty_stderr_does_not_deadlock_the_turn() {
+        // Regression: stderr was piped but never drained, so a child writing past
+        // the ~64KB pipe buffer blocked on its next stderr write and never produced
+        // stdout (a live ACP agent hung this way, then died as AgentCrashed). The
+        // child below writes ~320KB to stderr, THEN a sentinel to stdout. If stderr
+        // is undrained the stdout read hangs; with draining it returns "DONE".
+        use tokio::io::AsyncReadExt;
+        let mut sup = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 8000 ]; do \
+                 echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 1>&2; \
+                 i=$((i+1)); done; echo DONE",
+            ],
+            None,
+        )
+        .unwrap();
+        let mut out = sup.child_mut().stdout.take().unwrap();
+        let mut buf = String::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(10), out.read_to_string(&mut buf)).await;
+        assert!(
+            read.is_ok(),
+            "stdout read timed out — child blocked on an undrained stderr pipe"
+        );
+        assert!(
+            buf.contains("DONE"),
+            "child never finished; stdout was {buf:?}"
+        );
     }
 
     #[tokio::test]
