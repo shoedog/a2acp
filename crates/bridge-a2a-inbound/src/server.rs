@@ -169,6 +169,10 @@ pub struct InboundServer {
             >,
         >,
     >,
+    /// Durable task control-plane store (W3a). Defaults to an in-memory store;
+    /// replace with a persistent backend via [`InboundServer::with_task_store`].
+    #[allow(dead_code)] // consumed in Task 7 (detached runner)
+    task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
 }
 
 impl InboundServer {
@@ -199,6 +203,7 @@ impl InboundServer {
             executor: None,
             workflows: Arc::new(HashMap::new()),
             workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
         }
     }
 
@@ -216,6 +221,18 @@ impl InboundServer {
     ) -> Self {
         self.executor = Some(executor);
         self.workflows = std::sync::Arc::new(workflows);
+        self
+    }
+
+    /// Override the durable task store (W3a). Builder over [`InboundServer::new`]
+    /// so existing `new` call sites are untouched; the detached runner (Task 7)
+    /// uses this to wire a persistent SQLite store.
+    #[must_use]
+    pub fn with_task_store(
+        mut self,
+        task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+    ) -> Self {
+        self.task_store = task_store;
         self
     }
 
