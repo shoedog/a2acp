@@ -8,6 +8,11 @@ use std::sync::Arc;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+fn fixture_tool_sse() -> String {
+    let v: serde_json::Value = serde_json::from_str(include_str!("fixtures/ollama-openai-compat.json")).unwrap();
+    v["tool_turn_sse"].as_str().unwrap().to_string()
+}
+
 fn sse(body: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(body)
 }
@@ -40,14 +45,14 @@ async fn text_round_trip_yields_text_then_done_no_permission() {
 #[tokio::test]
 async fn tool_approve_path_executes_and_feeds_result() {
     let server = MockServer::start().await;
-    let call1 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_current_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    let call1 = fixture_tool_sse();
     let call2 = "data: {\"choices\":[{\"delta\":{\"content\":\"It is 2026.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
     // The follow-up (and only the follow-up) carries the tool result.
     Mock::given(method("POST")).and(path("/v1/chat/completions"))
         .and(body_string_contains("2026-01-01T00:00:00Z"))
         .respond_with(sse(call2)).up_to_n_times(1).mount(&server).await;
     Mock::given(method("POST")).and(path("/v1/chat/completions"))
-        .respond_with(sse(call1)).mount(&server).await;
+        .respond_with(sse(&call1)).mount(&server).await;
 
     let be = ApiBackend::new(ApiConfig::new(format!("{}/v1", server.uri()))); // default = auto-approve
     let updates = drain(&be, &SessionId::parse("s2").unwrap()).await;
@@ -84,12 +89,12 @@ impl PolicyEngine for Abstain {
 }
 
 async fn tool_then_text(server: &MockServer) {
-    let call1 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_current_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    let call1 = fixture_tool_sse();
     let call2 = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
     Mock::given(method("POST")).and(path("/v1/chat/completions"))
         .and(body_string_contains("\"role\":\"tool\""))
         .respond_with(sse(call2)).up_to_n_times(1).mount(server).await;
-    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(sse(call1)).mount(server).await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(sse(&call1)).mount(server).await;
 }
 
 #[tokio::test]
