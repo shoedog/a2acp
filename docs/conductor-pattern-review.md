@@ -4,6 +4,8 @@
 **Follows:** ADR-0008 (confirm greenfield; escalate via partial-adopt). This is the prioritized "what to unlock" list that ADR-0008 §Consequences created as a follow-on.
 **Sources:** the upstream ACP proxy-chains RFD (`agentclientprotocol.com/rfds/proxy-chains`); `agent-client-protocol-conductor` (crates.io / `symposium-acp`: `sacp` / `sacp-proxy` / `sacp-conductor`); the bridge's own analysis (`a2a-bridge-analysis.md` §8.1). The conductor is external/public — not under the `a2a-local-bridge` firewall, so read directly.
 
+> **Terminology — which "ACP"?** Throughout this doc, **"ACP" = Agent _Client_ Protocol (Zed)** — the editor↔agent protocol the conductor, the proxy-chains RFD, and `AcpBackend` all use. It is NOT Agent _Communication_ Protocol (IBM/BeeAI), which the bridge does not use. The conductor lives entirely in the Agent-Client-Protocol world. See **`docs/protocols.md`** for the full A2A / ACP / OpenAI-HTTP map.
+
 ---
 
 ## The one structural insight that drives every verdict
@@ -15,11 +17,27 @@ The conductor and the bridge **compose on different axes**:
 
 So most conductor patterns are **proxy-chain (vertical: shim one agent)**, while the bridge — and especially the leading re-trigger (self-hosting the dev/review workflow) — needs **orchestration (horizontal: many agents, one workflow)**. The two rarely overlap. Where a conductor idea *is* useful to the bridge, it ports as **in-process middleware**, never as the proxy-chain spine.
 
+## Middleware-chain ≠ brain-pipeline (why "ignore proxy-chains" does NOT mean "ignore agent pipelines")
+
+The most important clarification, because two very different things both *look* like "A → B → C":
+
+- **Conductor proxy-chain = a chain of MIDDLEWARE in front of ONE brain.** `Editor → Conductor → ctx-inject → tool-filter → Agent`. Every proxy forwards the *same* request/response stream bidirectionally; the proxies *augment/filter* the conversation; **a single terminal agent does all the reasoning.** The "chain" is middleware **depth**. Adopting this is what we IGNORE.
+
+- **Agent pipeline / DAG = a chain of BRAINS.** `gather-logs → analyze-logs → bug-analysis`: N *full agents* in sequence, each doing real work, **output → input**. Three reasoning agents, three stages, a data pipeline. Fan-in/rollup (`gather → [analyze-A, analyze-B] → rollup`) is the same family. This is **first-class, on the roadmap, and explicitly a documented re-trigger (ADR-0008 #1, "traverse N agents in a chain or DAG").**
+
+These are different axes, so the verdicts split cleanly:
+- **The conductor's *mechanism* (proxy-chains, hierarchical nesting / tree topologies of proxy chains) → IGNORE** — it's middleware-around-one-agent, the wrong tool for a chain of brains.
+- **The *capability* (agent pipelines, DAGs, fan-in/rollup) → BUILD, greenfield** — as an extension of the bridge's `fan-out` + `RouteTarget` (today: parallel fan-out; add: sequential pipeline + fan-in/rollup = the general workflow-DAG). This is the bridge's orchestration axis; the bridge's orchestrator already *is* the single hub, so you get the conductor's "no-direct-coupling" robustness for free, on your own primitives.
+
+**Why the conductor is the wrong tool even for the pipeline:** proxies forward a *stream*; they don't cleanly take "the previous agent's *result* as the next agent's *task prompt*" — that's a **task→task handoff** (A2A-level), exactly what `delegate`/`fan-out` already do. And the conductor has *one* terminal agent; a pipeline has *N*. You'd be fighting the abstraction.
+
+**Unifying insight:** the bridge wants a general **agent-orchestration / workflow-DAG layer** — fan-out (∥), pipeline (→), fan-in/rollup (∥→). Both leading use-cases are instances: **self-hosting reviews** = fan-out to [codex, claude] → fan-in/rollup; **log triage** = gather → analyze → bug-report pipeline. The self-hosting increment should therefore be designed as *"add a workflow-DAG orchestration capability,"* with reviews as the first instance and log-pipelines the obvious second — **greenfield, not a conductor adoption.**
+
 ## The map (through the self-hosting lens)
 
 | Conductor pattern | What it is | Bridge wants it? | Trigger | **Verdict** |
 |---|---|---|---|---|
-| **Proxy-chain composition** (the core: conductor-as-hub, `proxy/successor`, proxy isolation) | Insert shims between editor and one agent; present as one agent | The bridge's registry + fan-out + delegate already own its composition, on a different axis | re-trigger #1 (multi-hop) only | **IGNORE as architecture.** Do not adopt the proxy-chain spine; it answers a question the bridge isn't asking. |
+| **Proxy-chain composition** (the core: conductor-as-hub, `proxy/successor`, proxy isolation) | Insert shims between editor and one agent; present as one agent | The bridge's registry + fan-out + delegate already own its composition, on a different axis | re-trigger #1 | **IGNORE the *mechanism*.** Do not adopt the proxy-chain spine (middleware-around-one-agent). ⚠️ This is NOT "ignore agent pipelines" — the *capability* (chain-of-brains pipelines/DAGs) is BUILD-greenfield; see "Middleware-chain ≠ brain-pipeline" above. |
 | **Skill / plugin = on-demand instruction injection** | A proxy prepends instructions when a skill is invoked | Yes — the bridge already has "skills" (fan-out, delegate); reviews/research/dev are skills | **self-hosting (#5)** | **PORT-AS-PATTERN — MEDIUM, the most relevant.** Borrow the *shape* (a skill = request-shaper: prompt template + agent selection + output handling) as in-process middleware when building self-hosting. |
 | **Subagent coordination** (a proxy spawns/initiates sibling sessions) | One component drives sibling agents | Yes — this IS the self-hosting core | **self-hosting (#5)** | **EXTEND-EXISTING (greenfield).** Generalize fan-out to N registry entries + collect/compare. Port the *idea*, implement on the bridge's own fan-out/registry, NOT the conductor's proxy model. |
 | **Context-injection proxy** (prepend persistent session data/instructions) | Inject context before the agent sees it | Partially — the bridge already injects via prompt `parts`; a first-class pre-prompt injector (diff/spec/rubric) could help | self-hosting (#5) | **PORT-AS-PATTERN — LOW.** A small in-process "context injector" hook, only if self-hosting reviews need structured context beyond the prompt. |
@@ -27,13 +45,13 @@ So most conductor patterns are **proxy-chain (vertical: shim one agent)**, while
 | **Response-transformation proxy** (process/filter outputs) | Transform/filter agent output | The translator already maps/coalesces; structured-finding extraction belongs in the self-hosting workflow | self-hosting (#5) | **EXTEND-EXISTING — LOW.** Do it in the workflow/translator, not a proxy. |
 | **MCP bridging / IDE capability exposure** (stdio↔TCP MCP; diagnostics/fs/terminal) | Bridge MCP servers so agents get fs/tools | No, for now — the bridge is deliberately no-fs; self-hosting reviews are read-only | (fs-proxying decision, ADR-0006) | **IGNORE / revisit with the separate fs-proxying decision.** Not needed for self-hosting. |
 | **`peer` routing + peer-enumeration discovery** (upstream *proposed* future) | Route `proxy/successor` to a named peer; enumerate peers for discovery | Only if the bridge needs multi-agent routing/discovery beyond registry-by-id | re-trigger #1/#2 | **WATCH, don't build.** Let it land upstream first; the bridge's registry-by-id covers selection today. |
-| **Hierarchical nesting** (conductor-in-proxy-mode → trees) | Tree topologies of proxy chains | No use-case | re-trigger #1 | **IGNORE.** |
+| **Hierarchical nesting** (conductor-in-proxy-mode → trees) | Tree topologies of *proxy chains* | No use-case for nested proxy-trees | re-trigger #1 | **IGNORE the *mechanism*.** (Agent-level trees/DAGs — fan-out then rollup — are BUILD-greenfield orchestration, not nested proxy-chains; see above.) |
 | **Shared cross-agent context** (proxies maintain conversation-level state across agents) | Agents share one context within a task | No — for self-hosting reviews, agent **independence** is the value (Codex and Claude review the same input independently; see review-agent-roles) | re-trigger #3 | **IGNORE for now.** Don't couple the reviewers. |
 | **Proxy isolation / single-hub routing** | Internal conductor mechanism | N/A unless adopting the spine | — | **N/A.** |
 
 ## Headline conclusion (the "what to unlock" answer)
 
-1. **Do NOT adopt the conductor's proxy-chain spine** — its core composition axis is orthogonal to the bridge's. This reinforces ADR-0008.
+1. **Do NOT adopt the conductor's proxy-chain spine** — it's middleware-around-one-agent, orthogonal to the bridge's many-agents-into-a-workflow axis. **But agent pipelines/DAGs (chain-of-brains) ARE wanted** — built greenfield on `fan-out` + `RouteTarget`, never via the conductor's proxy mechanism. This reinforces ADR-0008.
 2. **The leading re-trigger (self-hosting) does NOT call for conductor adoption either** — it calls for **extending the bridge's own fan-out / registry / skill primitives** (subagent-coordination, response-handling), optionally borrowing **two in-process *shapes*** from the conductor:
    - **`skill = request-shaper`** (MEDIUM) — the cleanest borrow; shapes the review/research/dev request (prompt + agent + output handling).
    - **`context-injector` middleware** (LOW) — only if structured context-injection is needed.

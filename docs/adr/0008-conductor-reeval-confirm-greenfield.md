@@ -40,7 +40,7 @@ ADR-0005 §9 set the **explicit re-evaluation criteria** and required a second p
 
 Revisit this decision — and, per the chosen escalation, **lead with partial-adopt** — when any of these becomes concrete:
 
-1. **Proxy-chaining / multi-hop agent graphs** — a request must traverse N agents/proxies in a chain or DAG, not "pick one + optionally fan-out/delegate."
+1. **Multi-hop agent graphs (agent pipelines / DAGs / fan-in-rollup)** — a request must traverse N *agents* in a chain or DAG (e.g. `gather-logs → analyze-logs → bug-analysis`, or `gather → [analyze-A, analyze-B] → rollup`), not "pick one + optionally fan-out/delegate." **Note:** this is a **chain of brains** (each stage a full agent, output→input) — a *greenfield orchestration* extension of `fan-out`/`RouteTarget`, **NOT** the conductor's *proxy-chain* (which is a chain of middleware shims around ONE agent). See `docs/conductor-pattern-review.md` §"Middleware-chain ≠ brain-pipeline". This re-trigger favors **building greenfield orchestration**, not adopting the conductor.
 2. **Dynamic agent discovery** — agents register/deregister at runtime from a discovery source (vs. static registry entries / hot-reloaded config).
 3. **Shared cross-agent session/context** — multiple agents must share one session/context/memory within a task (vs. per-backend sessions).
 4. **Routing-policy complexity** — `bridge-policy` / `RouteDecision` starts to bloat with conditional routing, per-hop policy, or capability negotiation.
