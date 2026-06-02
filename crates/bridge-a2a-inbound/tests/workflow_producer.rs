@@ -235,7 +235,9 @@ fn build_workflow_server() -> Arc<InboundServer> {
         ]
         .into(),
     });
-    let executor = Arc::new(WorkflowExecutor::new(registry.clone() as Arc<dyn AgentRegistry>));
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>
+    ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
 
@@ -347,6 +349,285 @@ async fn streaming_workflow_emits_node_status_synth_artifact_and_completed() {
                 if e.status.state == a2a::TaskState::Completed
         ),
         "final frame must be terminal statusUpdate(Completed): {}",
+        payloads.last().unwrap()
+    );
+}
+
+// ============================================================================
+// Strengthened assertions (Task 10 Step 4)
+// ============================================================================
+
+/// A backend that records the full prompt text it receives AND replies with a fixed
+/// string.  Used by `synth_got_both_reviews` to verify the fan-in wiring.
+struct RecordingFakeBackend {
+    reply: String,
+    received: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentBackend for RecordingFakeBackend {
+    async fn prompt(&self, _s: &SessionId, parts: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        // Record the concatenated prompt text.
+        let text: String = parts.iter().map(|p| p.text.as_str()).collect();
+        self.received.lock().unwrap().push(text);
+        let updates = vec![
+            Ok(Update::Text(self.reply.clone())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(updates)))
+    }
+    async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+/// A backend that always returns an Err from `prompt()` (simulates a failed node).
+struct ErrorBackend;
+
+#[async_trait]
+impl AgentBackend for ErrorBackend {
+    async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        Err(BridgeError::UnknownAgent {
+            id: "synth-injected-error".into(),
+        })
+    }
+    async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+/// Per-agent backend dispatch: maps agent ids to pre-built `Arc<dyn AgentBackend>`.
+struct PerAgentRegistry {
+    backends: HashMap<String, Arc<dyn AgentBackend>>,
+}
+
+#[async_trait]
+impl AgentRegistry for PerAgentRegistry {
+    async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+        let backend = self
+            .backends
+            .get(id.as_str())
+            .cloned()
+            .ok_or(BridgeError::UnknownAgent {
+                id: id.as_str().into(),
+            })?;
+        Ok(Resolved {
+            entry: Arc::new(minimal_entry(id)),
+            backend,
+            lease: Box::new(NoopLease),
+        })
+    }
+    fn default_id(&self) -> AgentId {
+        AgentId::parse("codex").unwrap()
+    }
+    async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
+        Ok(())
+    }
+    fn list(&self) -> Vec<AgentId> {
+        self.backends
+            .keys()
+            .map(|k| AgentId::parse(k).unwrap())
+            .collect()
+    }
+}
+
+/// Build a server using a `PerAgentRegistry` with the supplied backends map.
+fn build_server_per_agent(backends: HashMap<String, Arc<dyn AgentBackend>>) -> Arc<InboundServer> {
+    let registry = Arc::new(PerAgentRegistry { backends });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map),
+    )
+}
+
+/// **synth_got_both_reviews**: the synth node's prompt must contain both the
+/// codex-fake output ("CODEX_REVIEW") and the claude-fake output ("CLAUDE_REVIEW").
+#[tokio::test]
+async fn synth_receives_both_fan_out_reviews() {
+    let synth_received = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        (
+            "codex".to_string(),
+            Arc::new(RecordingFakeBackend {
+                reply: "CODEX_REVIEW".into(),
+                received: Arc::new(std::sync::Mutex::new(vec![])),
+            }) as Arc<dyn AgentBackend>,
+        ),
+        (
+            "claude".to_string(),
+            Arc::new(RecordingFakeBackend {
+                reply: "CLAUDE_REVIEW".into(),
+                received: Arc::new(std::sync::Mutex::new(vec![])),
+            }) as Arc<dyn AgentBackend>,
+        ),
+        (
+            "synth".to_string(),
+            Arc::new(RecordingFakeBackend {
+                reply: "SYNTH_FINAL".into(),
+                received: Arc::clone(&synth_received),
+            }) as Arc<dyn AgentBackend>,
+        ),
+    ]
+    .into();
+
+    let srv = build_server_per_agent(backends);
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            json!({ "message": {
+                "text": "DIFF_CONTENT",
+                "metadata": { "a2a-bridge.skill": "code-review" }
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    // Drain the SSE stream (we only need the workflow to finish).
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        body.contains("SYNTH_FINAL"),
+        "synth output must appear: {body}"
+    );
+
+    // The synth backend must have received a prompt containing BOTH fan-out outputs.
+    let prompts = synth_received.lock().unwrap();
+    assert_eq!(prompts.len(), 1, "synth must be prompted exactly once");
+    let synth_prompt = &prompts[0];
+    assert!(
+        synth_prompt.contains("CODEX_REVIEW"),
+        "synth prompt must contain codex output; prompt: {synth_prompt}"
+    );
+    assert!(
+        synth_prompt.contains("CLAUDE_REVIEW"),
+        "synth prompt must contain claude output; prompt: {synth_prompt}"
+    );
+}
+
+/// **unary_reject**: a UNARY `skill="code-review"` must return a JSON-RPC
+/// `InvalidRequest` error — NOT start a workflow run, NOT panic.
+#[tokio::test]
+async fn unary_workflow_send_returns_invalid_request_error() {
+    let srv = build_workflow_server();
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::SEND_MESSAGE, // ← unary, not streaming
+            json!({ "message": {
+                "text": "DIFF",
+                "metadata": { "a2a-bridge.skill": "code-review" }
+            }}),
+        ))
+        .await
+        .unwrap();
+
+    // Must NOT be 500/panic; the server should reply 4xx or 200 with a JSON-RPC error.
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).expect("response must be valid JSON");
+
+    // A JSON-RPC error reply has `"error"` key with `"code"` == -32600.
+    let error = body
+        .get("error")
+        .expect("unary workflow must return a JSON-RPC error object");
+    let code = error
+        .get("code")
+        .and_then(|c| c.as_i64())
+        .expect("error must have a numeric code");
+    assert_eq!(
+        code, -32600,
+        "unary workflow send must return InvalidRequest (-32600), got: {body}"
+    );
+}
+
+/// **terminal_failed**: when the synth node errors, the A2A streaming task must end
+/// in a `Failed` terminal state (NOT a panic, NOT Completed).
+#[tokio::test]
+async fn workflow_with_failing_synth_ends_in_failed_state() {
+    // synth → ErrorBackend (prompt returns Err) → the node fails → workflow Failed.
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        (
+            "codex".to_string(),
+            Arc::new(RecordingFakeBackend {
+                reply: "CODEX_REVIEW".into(),
+                received: Arc::new(std::sync::Mutex::new(vec![])),
+            }) as Arc<dyn AgentBackend>,
+        ),
+        (
+            "claude".to_string(),
+            Arc::new(RecordingFakeBackend {
+                reply: "CLAUDE_REVIEW".into(),
+                received: Arc::new(std::sync::Mutex::new(vec![])),
+            }) as Arc<dyn AgentBackend>,
+        ),
+        (
+            "synth".to_string(),
+            Arc::new(ErrorBackend) as Arc<dyn AgentBackend>,
+        ),
+    ]
+    .into();
+
+    let srv = build_server_per_agent(backends);
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            json!({ "message": {
+                "text": "DIFF",
+                "metadata": { "a2a-bridge.skill": "code-review" }
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    let payloads = sse_data_payloads(&body);
+    assert!(!payloads.is_empty(), "no SSE payloads: {body}");
+
+    let responses: Vec<a2a::StreamResponse> = payloads
+        .iter()
+        .map(|p| {
+            serde_json::from_str(p)
+                .unwrap_or_else(|e| panic!("payload must parse as StreamResponse: {e}: {p}"))
+        })
+        .collect();
+
+    // The final frame must be a terminal Failed status.
+    let last = responses.last().unwrap();
+    assert!(
+        matches!(
+            last,
+            a2a::StreamResponse::StatusUpdate(e)
+                if e.status.state == a2a::TaskState::Failed
+        ),
+        "final frame must be terminal statusUpdate(Failed) when synth errors: {}",
         payloads.last().unwrap()
     );
 }

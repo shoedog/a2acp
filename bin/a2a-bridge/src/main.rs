@@ -10,6 +10,11 @@
 // subsequent `watch()` snapshot so on-disk edits hot-reload the live registry.
 //
 // Server listens on cfg.server.addr (default 127.0.0.1:8080).
+//
+// Subcommands:
+//   a2a-bridge                                           — serve (default)
+//   a2a-bridge run-workflow <id> --input <file>
+//             [--out <file>] [--config <path>]           — run a workflow offline
 
 mod config;
 mod route;
@@ -53,8 +58,222 @@ addr = "127.0.0.1:8080"
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+// ---------------------------------------------------------------------------
+// `run-workflow` subcommand
+// ---------------------------------------------------------------------------
+
+/// Parse `a2a-bridge run-workflow <id> --input <file> [--out <file>] [--config <path>]`
+/// from a raw args iterator (skipping the binary name at position 0 and the
+/// subcommand name at position 1).
+fn parse_run_workflow_args(
+    args: &[String],
+) -> Result<(String, PathBuf, Option<PathBuf>, PathBuf), BoxError> {
+    let mut iter = args.iter().peekable();
+    // Positional: workflow id
+    let workflow_id = iter
+        .next()
+        .cloned()
+        .ok_or("run-workflow: missing <workflow-id>")?;
+    let mut input: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut config: Option<PathBuf> = None;
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--input" => {
+                input = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or("run-workflow: --input requires a value")?,
+                ));
+            }
+            "--out" => {
+                out = Some(PathBuf::from(
+                    iter.next().ok_or("run-workflow: --out requires a value")?,
+                ));
+            }
+            "--config" => {
+                config = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or("run-workflow: --config requires a value")?,
+                ));
+            }
+            other => return Err(format!("run-workflow: unknown flag {other:?}").into()),
+        }
+    }
+    let input = input.ok_or("run-workflow: --input <file> is required")?;
+    let config = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
+    Ok((workflow_id, input, out, config))
+}
+
+/// Execute the `run-workflow` subcommand.
+/// Loads the config, resolves the workflow graph, runs the executor,
+/// prints NodeStarted/NodeFinished to stderr and the terminal output to stdout
+/// (or `--out <file>`).
+async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
+    bridge_observ::init();
+    let (workflow_id, input_path, out_path, config_path) = parse_run_workflow_args(args)?;
+
+    // Load config.
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("run-workflow: cannot read config {:?}: {e}", config_path))?;
+    let cfg = config::RegistryConfig::parse(&raw)
+        .map_err(|e| format!("run-workflow: config parse error: {e}"))?;
+
+    // Resolve prompt file base dir (same logic as `serve`).
+    let base = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let wf_map = cfg
+        .load_workflows(&base)
+        .map_err(|e| format!("run-workflow: workflow load error: {e}"))?;
+
+    // Resolve workflow id.
+    let wf_id = bridge_core::ids::WorkflowId::parse(workflow_id.clone())
+        .map_err(|e| format!("run-workflow: invalid workflow id {workflow_id:?}: {e:?}"))?;
+    let graph = wf_map
+        .get(&wf_id)
+        .cloned()
+        .ok_or_else(|| format!("run-workflow: unknown workflow {workflow_id:?}"))?;
+
+    // Build the registry + executor using the same SpawnFn the server uses.
+    let snapshot = cfg
+        .into_snapshot()
+        .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
+    let policy = Arc::new(bridge_policy::permission::AutoPolicy);
+    let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
+    let spawn: bridge_registry::registry::SpawnFn = Arc::new(move |entry: Arc<AgentEntry>| {
+        let policy = Arc::clone(&policy_for_spawn);
+        Box::pin(async move {
+            let cwd = match entry.cwd.clone() {
+                Some(c) => {
+                    let p = PathBuf::from(c);
+                    if p.is_absolute() {
+                        p
+                    } else {
+                        std::env::current_dir()
+                            .map_err(|e| BridgeError::ConfigInvalid {
+                                reason: format!("cwd: {e}"),
+                            })?
+                            .join(p)
+                    }
+                }
+                None => std::env::current_dir().map_err(|e| BridgeError::ConfigInvalid {
+                    reason: format!("cwd: {e}"),
+                })?,
+            };
+            let args: Vec<String> = entry.args.clone();
+            let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+            use bridge_core::domain::AgentKind;
+            match entry.kind {
+                AgentKind::Acp => {
+                    let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
+                        reason: format!("acp agent {} missing cmd", entry.id.as_str()),
+                    })?;
+                    let acp = bridge_acp::acp_backend::AcpConfig {
+                        cwd,
+                        model: entry.model.clone(),
+                        mode: entry.mode.clone(),
+                        auth_method: entry.auth_method.clone(),
+                        ..bridge_acp::acp_backend::AcpConfig::default()
+                    };
+                    let be = bridge_acp::acp_backend::AcpBackend::spawn(cmd, &args_ref, acp)
+                        .await?
+                        .with_policy(policy);
+                    Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+                }
+                AgentKind::Api => {
+                    let base_url = entry.base_url.clone().ok_or(BridgeError::ConfigInvalid {
+                        reason: format!("api agent {} missing base_url", entry.id.as_str()),
+                    })?;
+                    let mut api_cfg = bridge_api::ApiConfig::new(base_url);
+                    api_cfg.model = entry.model.clone();
+                    api_cfg.api_key_env = entry.api_key_env.clone();
+                    let be = bridge_api::ApiBackend::new(api_cfg).with_policy(policy);
+                    Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+                }
+            }
+        })
+    });
+    let registry = Arc::new(
+        bridge_registry::registry::Registry::new(snapshot, spawn)
+            .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
+    );
+    let executor = bridge_workflow::executor::WorkflowExecutor::new(
+        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
+    );
+
+    // Read input.
+    let input = std::fs::read_to_string(&input_path)
+        .map_err(|e| format!("run-workflow: cannot read input {:?}: {e}", input_path))?;
+
+    // Unique run id.
+    let run_id = format!(
+        "cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    );
+
+    // Run the workflow.
+    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+    use futures::StreamExt;
+    let mut stream = executor.run(
+        graph,
+        input,
+        run_id,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let mut output = String::new();
+    let mut ok = true;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(WorkflowEvent::NodeStarted { node }) => {
+                eprintln!("[workflow] node {} started", node.as_str());
+            }
+            Ok(WorkflowEvent::NodeFinished { node, ok: node_ok }) => {
+                eprintln!(
+                    "[workflow] node {} {}",
+                    node.as_str(),
+                    if node_ok { "ok" } else { "failed" }
+                );
+            }
+            Ok(WorkflowEvent::Terminal { outcome, output: o }) => {
+                output = o;
+                ok = matches!(outcome, WorkflowOutcome::Completed);
+            }
+            Err(e) => {
+                eprintln!("[workflow] error: {e:?}");
+                ok = false;
+            }
+        }
+    }
+
+    // Write output.
+    if let Some(out) = out_path {
+        std::fs::write(&out, &output)
+            .map_err(|e| format!("run-workflow: cannot write output {:?}: {e}", out))?;
+    } else {
+        print!("{output}");
+    }
+
+    if ok {
+        Ok(())
+    } else {
+        Err("run-workflow: workflow did not complete successfully".into())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    // Dispatch subcommands BEFORE the server path touches the filesystem.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(|s| s.as_str()) == Some("run-workflow") {
+        return run_workflow_cmd(&raw_args[2..]).await;
+    }
+
     // 1. Observability — install tracing subscriber (idempotent).
     bridge_observ::init();
 

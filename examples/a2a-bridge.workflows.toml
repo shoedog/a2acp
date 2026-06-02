@@ -1,0 +1,33 @@
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[[agents]]
+id = "claude"
+cmd = "claude-agent-acp"
+
+[[workflows]]
+id = "code-review"
+
+[[workflows.nodes]]
+id = "codex"
+agent = "codex"
+prompt_file = "../prompts/review-codex.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "claude"
+agent = "claude"
+prompt_file = "../prompts/review-claude.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-synth.md"
+inputs = ["codex", "claude"]
+
+[server]
+addr = "127.0.0.1:8080"
