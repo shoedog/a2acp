@@ -173,7 +173,6 @@ async fn main() -> Result<(), BoxError> {
 
     // 7. Build the remaining port Arc<dyn Trait> wrappers.
     let auth = Arc::new(AlwaysGrant);
-    let route = Arc::new(SkillRoute::new(Arc::clone(&registry) as _));
     let store = Arc::new(SqliteStore::open_in_memory()?);
 
     // Read the non-registry config sections (server addr, delegation) directly:
@@ -182,6 +181,24 @@ async fn main() -> Result<(), BoxError> {
     // working on the RegistryConfig path.
     let raw = std::fs::read_to_string(&config_path)?;
     let cfg = RegistryConfig::parse(&raw)?;
+
+    // 7a. Workflows (W1): load the [[workflows]] graphs (prompt files resolve
+    //     relative to the config file's directory), build a WorkflowExecutor over
+    //     the live registry, and wire both the route (skill->Workflow precedence)
+    //     and the inbound server (the streaming workflow producer) with them.
+    //     load_workflows fails loud (ConfigError) on a bad graph / missing prompt.
+    let base = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let wf_map = cfg.load_workflows(base)?;
+    let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+        Arc::clone(&registry) as _,
+    ));
+    let route = Arc::new(SkillRoute::with_workflows(
+        Arc::clone(&registry) as _,
+        wf_map.keys().map(|k| k.as_str().to_string()).collect(),
+    ));
 
     // Delegation port: real PeerDelegation when [delegation] is configured; StubDelegation otherwise.
     let delegation: Arc<dyn DelegationPort> = match &cfg.delegation {
@@ -198,16 +215,19 @@ async fn main() -> Result<(), BoxError> {
     // The inbound server holds the agent registry (3b): first-message LOCAL dispatch
     // resolves the routed agent id, applies its effective config, and binds the task.
     let base_url = format!("http://{}", cfg.server.addr);
-    let server = Arc::new(InboundServer::new(
-        Arc::clone(&registry) as _,
-        store,
-        policy,
-        route,
-        auth,
-        base_url,
-        delegation,
-        default_label.clone(),
-    ));
+    let server = Arc::new(
+        InboundServer::new(
+            Arc::clone(&registry) as _,
+            store,
+            policy,
+            route,
+            auth,
+            base_url,
+            delegation,
+            default_label.clone(),
+        )
+        .with_workflows(executor, wf_map.clone()),
+    );
     let router = server.router();
 
     // 9. Bind and serve.

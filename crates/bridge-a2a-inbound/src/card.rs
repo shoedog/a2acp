@@ -16,11 +16,11 @@ use bridge_core::error::BridgeError;
 /// Equals `a2a::VERSION` from the a2a-lf 0.3.0 crate (the A2A v1 wire protocol).
 pub const A2A_PINNED_VERSION: &str = VERSION;
 
-/// Build the AgentCard advertising two skills: the primary Kiro coding skill and
-/// a `delegate` skill for forwarding tasks to a configured remote A2A peer.
+/// Build the AgentCard advertising the fixed skills (Kiro coding, `delegate`,
+/// `fan-out`) plus one `workflow`-tagged skill per configured workflow id.
 ///
 /// The card exposes a single JSONRPC interface at `<base_url>`.
-pub fn agent_card(base_url: &str) -> AgentCard {
+pub fn agent_card(base_url: &str, workflow_ids: &[&str]) -> AgentCard {
     let kiro_skill = AgentSkill {
         id: "kiro-code".to_string(),
         name: "Kiro Code".to_string(),
@@ -65,6 +65,22 @@ pub fn agent_card(base_url: &str) -> AgentCard {
         security_requirements: None,
     };
 
+    let mut skills = vec![kiro_skill, delegate_skill, fanout_skill];
+    // One advertised skill per configured workflow id (W1): clients send
+    // `a2a-bridge.skill = "<id>"` to run that workflow as a streaming task.
+    for id in workflow_ids {
+        skills.push(AgentSkill {
+            id: (*id).to_string(),
+            name: (*id).to_string(),
+            description: format!("Run the {id} workflow."),
+            tags: vec!["workflow".to_string()],
+            examples: None,
+            input_modes: None,
+            output_modes: None,
+            security_requirements: None,
+        });
+    }
+
     AgentCard {
         name: "A2A-Bridge / Kiro".to_string(),
         description: "A2A bridge that routes agent tasks to the Kiro CLI coding agent.".to_string(),
@@ -78,7 +94,7 @@ pub fn agent_card(base_url: &str) -> AgentCard {
         },
         default_input_modes: vec!["text/plain".to_string()],
         default_output_modes: vec!["text/plain".to_string()],
-        skills: vec![kiro_skill, delegate_skill, fanout_skill],
+        skills,
         provider: None,
         documentation_url: None,
         icon_url: None,
@@ -108,7 +124,7 @@ mod tests {
 
     #[test]
     fn card_has_two_skills_and_pinned_version() {
-        let c = agent_card("http://localhost:8080");
+        let c = agent_card("http://localhost:8080", &[]);
         // Updated for Task 5a: three skills now (kiro-code, delegate, fan-out).
         assert!(c.skills.len() >= 2);
         assert!(c.skills.iter().any(|s| s.id == "kiro-code"));
@@ -136,7 +152,7 @@ mod tests {
 
     #[test]
     fn card_advertises_two_skills() {
-        let c = agent_card("http://localhost:8080");
+        let c = agent_card("http://localhost:8080", &[]);
         // Updated for Task 5a: three skills now.
         assert!(c.skills.len() >= 2);
         assert!(c.skills.iter().any(|s| s.id == "delegate"));
@@ -147,8 +163,22 @@ mod tests {
 
     #[test]
     fn card_has_three_skills_incl_fanout() {
-        let c = agent_card("http://x");
+        let c = agent_card("http://x", &[]);
         assert_eq!(c.skills.len(), 3);
         assert!(c.skills.iter().any(|s| s.id == "fan-out"));
+    }
+
+    // ---- Task 9 (W1): workflow skills appended ----
+
+    #[test]
+    fn card_appends_one_skill_per_workflow_id() {
+        let ids = ["code-review", "triage"];
+        let c = agent_card("http://x", &ids);
+        // 3 fixed skills + one per workflow id.
+        assert_eq!(c.skills.len(), 3 + ids.len());
+        let wf = c.skills.iter().find(|s| s.id == "code-review").unwrap();
+        assert!(wf.tags.iter().any(|t| t == "workflow"));
+        assert_eq!(wf.description, "Run the code-review workflow.");
+        assert!(c.skills.iter().any(|s| s.id == "triage"));
     }
 }

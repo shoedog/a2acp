@@ -145,6 +145,27 @@ pub struct InboundServer {
     /// supervisor covers disconnect/latch during the stream — so this is a GUARD,
     /// not a removed path.
     cancelled_peers: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The workflow executor (W1), wired via [`InboundServer::with_workflows`]. `None`
+    /// when no workflows are configured (the boot default), in which case a
+    /// `RouteTarget::Workflow` producer fails its task (no executor to run it).
+    executor: Option<std::sync::Arc<bridge_workflow::executor::WorkflowExecutor>>,
+    /// The boot-loaded workflow graphs, keyed by id. Empty by default; populated by
+    /// [`InboundServer::with_workflows`]. The producer looks up the routed
+    /// `WorkflowId` here to obtain the graph to run.
+    workflows: std::sync::Arc<
+        std::collections::HashMap<
+            bridge_core::ids::WorkflowId,
+            std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
+        >,
+    >,
+    /// Per-task workflow cancellation tokens, inserted when a workflow producer
+    /// starts and removed when it ends. `cancel_task` cancels the token for the
+    /// task if present (workflow cancel path), mirroring the local/delegate latches.
+    workflow_cancels: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<bridge_core::ids::TaskId, tokio_util::sync::CancellationToken>,
+        >,
+    >,
 }
 
 impl InboundServer {
@@ -172,7 +193,27 @@ impl InboundServer {
             delegation,
             local_source_label: local_source_label.into(),
             cancelled_peers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            executor: None,
+            workflows: Arc::new(HashMap::new()),
+            workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach the workflow executor and the boot-loaded workflow graphs (W1). Builder
+    /// over [`InboundServer::new`] so existing `new` call sites are untouched; `main`
+    /// chains `.with_workflows(executor, map)` after constructing the server.
+    #[must_use]
+    pub fn with_workflows(
+        mut self,
+        executor: std::sync::Arc<bridge_workflow::executor::WorkflowExecutor>,
+        workflows: std::collections::HashMap<
+            bridge_core::ids::WorkflowId,
+            std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
+        >,
+    ) -> Self {
+        self.executor = Some(executor);
+        self.workflows = std::sync::Arc::new(workflows);
+        self
     }
 
     /// Build the axum router, mounting the Agent Card and JSON-RPC endpoint.
@@ -404,7 +445,8 @@ async fn cancel_backend_for(
 
 /// `GET /.well-known/agent-card.json` -> the Agent Card as JSON.
 async fn serve_card(State(srv): State<Arc<InboundServer>>) -> Response {
-    Json(agent_card(&srv.base_url)).into_response()
+    let workflow_ids: Vec<&str> = srv.workflows.keys().map(|k| k.as_str()).collect();
+    Json(agent_card(&srv.base_url, &workflow_ids)).into_response()
 }
 
 /// `POST /` -> the JSON-RPC dispatch surface.
@@ -480,6 +522,12 @@ async fn stream_message(
         }
         RouteTarget::Delegate => spawn_delegate_producer(&srv, routed, tx),
         RouteTarget::Fanout => spawn_fanout_producer(&srv, routed, tx),
+        // Bind by ref + clone so `routed` stays whole for the producer (which
+        // consumes it for `task`/`parts`).
+        RouteTarget::Workflow(ref id) => {
+            let id = id.clone();
+            spawn_workflow_producer(&srv, routed, id, tx)
+        }
     }
 
     // Use the task id as the context id for now (consistent within a single stream).
@@ -907,6 +955,88 @@ fn spawn_fanout_producer(
     });
 }
 
+/// Spawn the workflow producer (W1): run the routed workflow graph over the
+/// executor and forward its events into the same mpsc->SSE path. Each
+/// `WorkflowEvent::Node{Started,Finished}` becomes a Status frame; the
+/// `Terminal` becomes an Artifact (the terminal node's output) followed by a
+/// terminal frame mapped from the workflow outcome. A per-task cancellation
+/// token is registered in `workflow_cancels` for the run's duration so
+/// `cancel_task` can preempt it, and removed on exit.
+fn spawn_workflow_producer(
+    srv: &Arc<InboundServer>,
+    routed: RoutedCall,
+    wf_id: bridge_core::ids::WorkflowId,
+    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+) {
+    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+    let srv = srv.clone();
+    let task = routed.task;
+    let parts = routed.parts.clone();
+    tokio::spawn(async move {
+        // Resolve the executor + graph; absent either → fail the task with a
+        // terminal Failed frame (no executor wired, or an unknown workflow id).
+        let (executor, graph) = match (&srv.executor, srv.workflows.get(&wf_id)) {
+            (Some(e), Some(g)) => (e.clone(), g.clone()),
+            _ => {
+                let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+                return;
+            }
+        };
+        // The workflow input is the concatenation of the request's text parts.
+        let input: String = parts
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Register the cancel token before driving the stream so an inbound
+        // CancelTask can never race the bind window.
+        let token = tokio_util::sync::CancellationToken::new();
+        srv.workflow_cancels
+            .lock()
+            .await
+            .insert(task.clone(), token.clone());
+        let mut stream = executor.run(graph, input, task.as_str().to_string(), token.clone());
+        let mut terminal_sent = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(WorkflowEvent::NodeStarted { node }) => {
+                    let _ = tx
+                        .send(Ok(Event::status(format!("node {} started", node.as_str()))))
+                        .await;
+                }
+                Ok(WorkflowEvent::NodeFinished { node, ok }) => {
+                    let _ = tx
+                        .send(Ok(Event::status(format!(
+                            "node {} {}",
+                            node.as_str(),
+                            if ok { "ok" } else { "failed" }
+                        ))))
+                        .await;
+                }
+                Ok(WorkflowEvent::Terminal { outcome, output }) => {
+                    let _ = tx.send(Ok(Event::artifact(output))).await;
+                    let to = match outcome {
+                        WorkflowOutcome::Completed => TaskOutcome::Completed,
+                        WorkflowOutcome::Failed => TaskOutcome::Failed,
+                        WorkflowOutcome::Canceled => TaskOutcome::Canceled,
+                    };
+                    let _ = tx.send(Ok(Event::terminal(to))).await;
+                    terminal_sent = true;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+            }
+        }
+        // The executor always emits a Terminal, but guard against an early stream
+        // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
+        if !terminal_sent {
+            let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+        }
+        srv.workflow_cancels.lock().await.remove(&task);
+    });
+}
+
 /// Background claimer: as each fan-out source's stream ENDS (its `*_done` flag
 /// flips true), claim that source's per-source guard key (`"{task}:kiro"` /
 /// `"{task}:peer"`). Claiming the key makes any later `try_win_*` for it return
@@ -1115,6 +1245,12 @@ async fn unary_message(
         }
         // Fanout handled above; this arm is unreachable.
         RouteTarget::Fanout => unreachable!("fanout handled by unary_fanout_message"),
+        // Workflows are streaming-only (their node-status frames are inherently a
+        // stream); reject a unary send with the same InvalidRequest shape the gate
+        // uses for a bad skill.
+        RouteTarget::Workflow(_) => {
+            return bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "skill" })
+        }
     };
 
     // Surface a terminal error if the pipeline failed/suspended.
@@ -1290,6 +1426,18 @@ async fn cancel_task(
     // is not yet known (the streaming supervisor's select! / peer-persist watcher
     // will apply the cancel once the id appears) and signals an in-flight stream.
     let _ = srv.store.request_cancel(&task).await;
+
+    // Workflow cancel: if this task is an in-flight workflow run, cancel its token
+    // (the producer's executor stream observes the token and ends Canceled) and
+    // return the same CANCELED response the other cancel arms return. Checked
+    // before the is_fanout branch — a workflow task is neither fan-out nor delegate.
+    if let Some(tok) = srv.workflow_cancels.lock().await.get(&task) {
+        tok.cancel();
+        return jsonrpc_ok(
+            id,
+            json!({ "task": { "id": task.as_str(), "state": "TASK_STATE_CANCELED" } }),
+        );
+    }
 
     // Decide cancel-both (fan-out) vs peer-only (plain delegate) vs local-only.
     // Cx1: a fan-out task has BOTH a Kiro session AND a peer, so the peer-only

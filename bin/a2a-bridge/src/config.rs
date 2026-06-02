@@ -102,12 +102,10 @@ pub struct RegistryConfig {
     #[serde(default)]
     pub delegation: Option<DelegationConfig>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub workflows: Vec<WorkflowToml>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
 pub struct WorkflowToml {
     pub id: String,
     #[serde(default)]
@@ -115,7 +113,6 @@ pub struct WorkflowToml {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
 pub struct WorkflowNodeToml {
     pub id: String,
     pub agent: String,
@@ -192,7 +189,6 @@ impl RegistryConfig {
     /// Parse each `[[workflows]]` entry: load prompt files from `base`, cross-check
     /// every `node.agent` against the declared `[[agents]]`, validate the DAG.
     /// Any failure is loud (`Err(ConfigError::Registry(...))`).
-    #[allow(dead_code)]
     pub fn load_workflows(
         &self,
         base: &std::path::Path,

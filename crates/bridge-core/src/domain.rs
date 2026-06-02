@@ -123,6 +123,7 @@ pub enum RouteTarget {
     Local(crate::ids::AgentId),
     Delegate,
     Fanout,
+    Workflow(crate::ids::WorkflowId),
 }
 
 // --- Types added by Task 4 ---

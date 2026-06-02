@@ -16,20 +16,12 @@ pub struct SkillRoute {
 }
 
 impl SkillRoute {
-    pub fn new(registry: Arc<dyn AgentRegistry>) -> Self {
-        Self { registry, workflows: std::collections::HashSet::new() }
-    }
-
-    /// Construct with the boot-time set of known workflow ids (Task 9's routing arm reads this).
-    // Task 9 will call this from main; allow until then.
-    #[allow(dead_code)]
+    /// Construct with the boot-time set of known workflow ids (the route arm reads this).
     pub fn with_workflows(registry: Arc<dyn AgentRegistry>, workflows: std::collections::HashSet<String>) -> Self {
         Self { registry, workflows }
     }
 
     /// True if `id` names a configured workflow.
-    // Task 9 will call this in the route arm; allow until then.
-    #[allow(dead_code)]
     pub fn knows_workflow(&self, id: &str) -> bool {
         self.workflows.contains(id)
     }
@@ -40,6 +32,11 @@ impl RouteDecision for SkillRoute {
         match meta.skill.as_deref() {
             Some("delegate") => Ok(RouteTarget::Delegate),
             Some("fan-out") => Ok(RouteTarget::Fanout),
+            // A skill naming a configured workflow routes to that workflow. Checked
+            // before the Local fallback so a `skill="code-review"` runs the DAG.
+            Some(s) if self.knows_workflow(s) => Ok(RouteTarget::Workflow(
+                bridge_core::ids::WorkflowId::parse(s)?,
+            )),
             _ => Ok(RouteTarget::Local(
                 meta.agent
                     .clone()
@@ -138,7 +135,7 @@ mod tests {
     }
 
     fn skill_route_with_default(default_id: &str) -> SkillRoute {
-        SkillRoute::new(FakeRegistry::new(default_id))
+        SkillRoute::with_workflows(FakeRegistry::new(default_id), std::collections::HashSet::new())
     }
 
     // ---- Task 9 route tests ----
