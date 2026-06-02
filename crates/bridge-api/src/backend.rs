@@ -1,9 +1,11 @@
 //! ApiBackend — the non-process OpenAI-compatible AgentBackend.
 use crate::config::ApiConfig;
+use crate::wire::{ChatRequest, Message, SseAccumulator};
 use bridge_core::domain::{EffectiveConfig, Part, PermissionDecision, PermissionRequest, SessionContext};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::ports::{AgentBackend, BackendStream, PolicyEngine};
+use bridge_core::ports::{AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED};
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::watch;
@@ -23,10 +25,7 @@ impl Default for SessionState {
 }
 
 pub struct ApiBackend {
-    // Used in Task 7 (turn loop); suppressed until then.
-    #[allow(dead_code)]
     cfg: ApiConfig,
-    #[allow(dead_code)]
     client: reqwest::Client,
     policy: Arc<StdMutex<Arc<dyn PolicyEngine>>>,
     sessions: Arc<StdMutex<HashMap<SessionId, SessionState>>>,
@@ -70,17 +69,79 @@ impl ApiBackend {
         let mut map = self.sessions.lock().expect("sessions lock");
         map.entry(s.clone()).or_default().cancel.clone()
     }
+
+    fn resolve_api_key(&self) -> Option<String> {
+        self.cfg.api_key_env.as_ref().and_then(|var| std::env::var(var).ok())
+    }
+    fn resolve_model(&self, s: &SessionId) -> Option<String> {
+        self.session_model(s).or_else(|| self.cfg.model.clone())
+    }
 }
 
 #[async_trait::async_trait]
 impl AgentBackend for ApiBackend {
-    async fn prompt(&self, _session: &SessionId, _parts: Vec<Part>) -> Result<BackendStream, BridgeError> {
-        // Filled in Task 7.
-        Err(BridgeError::AgentCrashed)
+    async fn prompt(&self, session: &SessionId, parts: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
+        let model = self.resolve_model(session);
+        let api_key = self.resolve_api_key();
+        let do_stream = self.cfg.stream;
+        let client = self.client.clone();
+
+        // Cancel: reset for this fresh turn, THEN subscribe so a later send(true)
+        // is observed as a change. `select!` on `changed()` fires even while parked
+        // awaiting the next SSE chunk.
+        let cancel_tx = self.session_cancel(session);
+        let _ = cancel_tx.send(false);
+        let mut cancel_rx = cancel_tx.subscribe();
+
+        let messages: Vec<Message> = vec![Message::user(
+            parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n"),
+        )];
+
+        let stream = async_stream::try_stream! {
+            if *cancel_rx.borrow() {
+                yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+            }
+            let req = ChatRequest { model: model.clone(), messages: messages.clone(),
+                tools: vec![crate::tool::tool_def()], stream: do_stream };
+            let mut builder = client.post(&url).json(&req);
+            if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
+            let resp = builder.send().await.map_err(|_| BridgeError::AgentCrashed)?;
+            if !resp.status().is_success() { Err(BridgeError::AgentCrashed)?; }
+
+            let mut acc = SseAccumulator::default();
+            let mut bytes = resp.bytes_stream();
+            let mut buf = String::new();
+            'read: loop {
+                let chunk = tokio::select! {
+                    biased;
+                    changed = cancel_rx.changed() => {
+                        if changed.is_ok() && *cancel_rx.borrow() {
+                            yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+                        }
+                        continue 'read;
+                    }
+                    maybe = bytes.next() => match maybe { Some(c) => c, None => break 'read },
+                };
+                let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(nl) = buf.find('\n') {
+                    let line: String = buf.drain(..=nl).collect();
+                    match acc.push_sse_line(&line) {
+                        Ok(Some(text)) => { yield Update::Text(text); }
+                        Ok(None) => {}
+                        Err(_) => { Err(BridgeError::FrameError)?; } // ParseError → FrameError
+                    }
+                    if acc.is_done() { break 'read; }
+                }
+            }
+            let _parsed = acc.finish(); // Task 8 inspects tool_calls; text-only milestone ends here.
+            yield Update::Done { stop_reason: "stop".into() };
+        };
+        Ok(Box::pin(stream))
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        // send(true) errors only if there are no receivers (no in-flight turn) — ignore.
         let _ = self.session_cancel(session).send(true);
         Ok(())
     }
