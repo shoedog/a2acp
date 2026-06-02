@@ -45,6 +45,19 @@ So the project tagline "**A2A ↔ ACP bridge**" expands to "**Agent2Agent ↔ Ag
 - **North = A2A only** (Agent2Agent). Both directions: inbound server + outbound client.
 - **South = two kinds**: ACP (Agent Client Protocol) for spawned CLI agents, OR OpenAI-compatible HTTP for API agents. Selected per registry entry by `kind` (`AgentKind::Acp` | `AgentKind::Api`).
 
+## Roles — who is "Client", who is "Agent" (and why A2A north, not just remote ACP)
+
+This is the subtlety behind most "ACP" confusion. **In Agent Client Protocol, "Client" = the editor/IDE — the *driving* side** (it initializes, opens sessions, sends prompts, answers permission requests); the **Agent** is the coding agent, which runs as the Client's child process. The docs say "Client = code editor/IDE" because Zed's first consumers were editors.
+
+- **The bridge is a _headless_ ACP Client (an editor-substitute) on the south side.** It plays the editor role to the CLI agents — spawns them, drives sessions, handles their permission requests. It is **not** an IDE; "Client" is a **role**, not a product. (`acpx`, `claude-agent-acp`, etc. are non-editor ACP clients too.)
+- **The bridge is an A2A _Agent_ on the north side.** A2A is a *symmetric* agent-to-agent protocol: an A2A Agent publishes an **Agent Card** and accepts task delegations from A2A Clients/peers; the bridge also acts as an A2A **Client** outbound (`delegate`/fan-out).
+
+**The role inversion is the crux:** the same process is an **A2A Agent northbound** and an **ACP Client (editor) southbound** — it re-presents "the ACP agents it drives" as "A2A agents it serves."
+
+**"But ACP is 'suitable for remote' — so why A2A at all?"** ACP's remote support is about **transport** (editor and agent on different machines; the spec describes HTTP/WebSocket, though local stdio is the canonical model). It does **not** change ACP's **role model**, which stays *"one Client (editor) drives one Agent."* A2A is a different *model*: peer agents, Agent-Card **discovery/capability advertisement**, task lifecycle, multi-agent delegation. The north protocol is dictated by **what the callers speak** — remote **A2A agents** invoking a coding agent as a *peer task*. If the callers were ACP editors, you wouldn't need a bridge (they'd be ACP clients to the agents directly). **So the bridge translates between two role *models* (A2A peer-delegation ↔ ACP editor-drives-agent), not merely between local and remote transport.**
+
+**Conductor parallel (and one more reason it's not a fork base):** the conductor presents a proxy-chain *"as a single ACP agent to the editor"* — its north interface is **ACP (editor-facing)**. The bridge presents its registry *as A2A agent(s) via an Agent Card to remote callers* — its north is **A2A**. Same "present-as-one" trick, **different north protocol** — so adopting the conductor would mean replacing its entire north surface anyway (see `conductor-pattern-review.md`).
+
 ## What we do NOT use
 
 - **Agent _Communication_ Protocol (IBM/BeeAI)** — a *different* protocol that unfortunately shares the "ACP" abbreviation. The bridge does not implement or speak it. (If a future need arises to bridge to Agent Communication Protocol peers, it would be a new **south-side backend kind** or a new **north-side transport** — and it must be named in full to avoid the collision.)
