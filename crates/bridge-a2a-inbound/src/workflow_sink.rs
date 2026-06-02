@@ -40,11 +40,78 @@ pub(crate) async fn drain_workflow<S: WorkflowSink>(
 }
 
 /// Unix-ms timestamp (server-side; `bridge-core` forbids `Date::now`, the server does not).
-#[allow(dead_code)]
 pub(crate) fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+use bridge_core::ids::TaskId;
+use bridge_core::task_store::{TaskRecordStatus, TaskStore};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+/// Detached sink: ignores intermediate node events (W3a has no history) and
+/// captures the terminal mapping for the runner to persist.
+pub(crate) struct TaskStoreSink {
+    terminal: Option<(TaskRecordStatus, Option<String>, Option<String>)>,
+}
+
+impl TaskStoreSink {
+    pub(crate) fn new() -> Self {
+        Self { terminal: None }
+    }
+    /// The captured terminal mapping (status, result, error), or None if no
+    /// terminal arrived.
+    pub(crate) fn take(self) -> Option<(TaskRecordStatus, Option<String>, Option<String>)> {
+        self.terminal
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkflowSink for TaskStoreSink {
+    async fn terminal(&mut self, outcome: WorkflowOutcome, output: String) {
+        self.terminal = Some(match outcome {
+            WorkflowOutcome::Completed => (TaskRecordStatus::Completed, Some(output), None),
+            WorkflowOutcome::Failed => (TaskRecordStatus::Failed, None, Some(output)),
+            WorkflowOutcome::Canceled => (TaskRecordStatus::Canceled, None, None),
+        });
+    }
+}
+
+/// Drop guard: if the runner exits without finalizing (early return, error, or
+/// **panic**), write `Failed` and remove the cancel token. Within a serve lifetime
+/// a `Working` row is then orphaned only if `set_terminal` itself fails to write
+/// (the named §8 gap); the boot sweep is the cross-restart backstop.
+pub(crate) struct Finalizer {
+    pub(crate) store: Arc<dyn TaskStore>,
+    pub(crate) task: TaskId,
+    pub(crate) cancels: Arc<Mutex<std::collections::HashMap<TaskId, CancellationToken>>>,
+    pub(crate) done: bool,
+}
+
+impl Drop for Finalizer {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let store = self.store.clone();
+        let task = self.task.clone();
+        let cancels = self.cancels.clone();
+        tokio::spawn(async move {
+            let _ = store
+                .set_terminal(
+                    &task,
+                    TaskRecordStatus::Failed,
+                    None,
+                    Some("runner ended without terminal"),
+                    now_ms(),
+                )
+                .await;
+            cancels.lock().await.remove(&task);
+        });
+    }
 }

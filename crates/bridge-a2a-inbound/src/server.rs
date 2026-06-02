@@ -171,7 +171,6 @@ pub struct InboundServer {
     >,
     /// Durable task control-plane store (W3a). Defaults to an in-memory store;
     /// replace with a persistent backend via [`InboundServer::with_task_store`].
-    #[allow(dead_code)] // consumed in Task 7 (detached runner)
     task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
 }
 
@@ -1066,6 +1065,102 @@ fn spawn_workflow_producer(
         }
         srv.workflow_cancels.lock().await.remove(&task);
     });
+}
+
+/// Mint a fresh unique task id for a detached submit (SDK UUIDv7). NOT
+/// `task_id_from_params`, which returns the fixed `"task-1"` stub.
+#[allow(dead_code)] // wired in Task 8 (message/send detached)
+fn new_detached_task_id() -> TaskId {
+    TaskId::parse(a2a::new_task_id()).expect("new_task_id is non-empty")
+}
+
+/// Spawn the finalizer-guarded background runner for a detached workflow. Returns
+/// the JoinHandle so callers/tests can await completion. The caller MUST have
+/// already `create`d the Working row and registered the token in `workflow_cancels`.
+fn spawn_detached_workflow(
+    srv: &Arc<InboundServer>,
+    task: TaskId,
+    text_parts: Vec<String>,
+    wf_id: bridge_core::ids::WorkflowId,
+    token: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let srv = srv.clone();
+    tokio::spawn(async move {
+        let mut fin = crate::workflow_sink::Finalizer {
+            store: srv.task_store.clone(),
+            task: task.clone(),
+            cancels: srv.workflow_cancels.clone(),
+            done: false,
+        };
+        let (executor, graph) = match (&srv.executor, srv.workflows.get(&wf_id)) {
+            (Some(e), Some(g)) => (e.clone(), g.clone()),
+            _ => {
+                let _ = srv
+                    .task_store
+                    .set_terminal(
+                        &task,
+                        bridge_core::task_store::TaskRecordStatus::Failed,
+                        None,
+                        Some("no executor / unknown workflow"),
+                        crate::workflow_sink::now_ms(),
+                    )
+                    .await;
+                fin.done = true;
+                srv.workflow_cancels.lock().await.remove(&task);
+                return;
+            }
+        };
+        let input = text_parts.join("\n");
+        let stream = executor.run(graph, input, task.as_str().to_string(), token);
+        let mut sink = crate::workflow_sink::TaskStoreSink::new();
+        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink).await;
+        let now = crate::workflow_sink::now_ms();
+        if terminal_seen {
+            if let Some((status, result, error)) = sink.take() {
+                let _ = srv
+                    .task_store
+                    .set_terminal(&task, status, result.as_deref(), error.as_deref(), now)
+                    .await;
+            }
+        } else {
+            let _ = srv
+                .task_store
+                .set_terminal(
+                    &task,
+                    bridge_core::task_store::TaskRecordStatus::Failed,
+                    None,
+                    Some("workflow ended without terminal"),
+                    now,
+                )
+                .await;
+        }
+        fin.done = true;
+        srv.workflow_cancels.lock().await.remove(&task);
+    })
+}
+
+/// Test-only seam: spawn the runner with a fresh token.
+#[doc(hidden)]
+pub fn spawn_detached_workflow_for_test(
+    srv: &Arc<InboundServer>,
+    task: TaskId,
+    text_parts: Vec<String>,
+    wf_id: bridge_core::ids::WorkflowId,
+) -> tokio::task::JoinHandle<()> {
+    let token = tokio_util::sync::CancellationToken::new();
+    spawn_detached_workflow(srv, task, text_parts, wf_id, token)
+}
+
+/// Test-only seam that takes an explicit token (so a cancel test can fire it).
+#[doc(hidden)]
+pub fn spawn_detached_workflow_with_token_for_test(
+    srv: &Arc<InboundServer>,
+    task: TaskId,
+    text_parts: Vec<String>,
+    wf_id: bridge_core::ids::WorkflowId,
+    token: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    spawn_detached_workflow(srv, task, text_parts, wf_id, token)
 }
 
 /// Background claimer: as each fan-out source's stream ENDS (its `*_done` flag

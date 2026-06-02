@@ -256,6 +256,71 @@ fn build_workflow_server() -> Arc<InboundServer> {
     )
 }
 
+fn build_workflow_server_with_task_store(
+    store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+) -> Arc<InboundServer> {
+    let registry = Arc::new(FakeRegistry {
+        replies: [
+            ("codex".to_string(), "CODEX_REVIEW".to_string()),
+            ("claude".to_string(), "CLAUDE_REVIEW".to_string()),
+            ("synth".to_string(), "SYNTH_FINAL".to_string()),
+        ]
+        .into(),
+    });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_task_store(store),
+    )
+}
+
+#[tokio::test]
+async fn detached_runner_persists_completed_result() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let task = TaskId::parse("detached-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .await
+        .unwrap();
+    let handle = bridge_a2a_inbound::server::spawn_detached_workflow_for_test(
+        &srv,
+        task.clone(),
+        vec!["DIFF".to_string()],
+        bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+    );
+    handle.await.unwrap();
+    let got = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(got.status, TaskRecordStatus::Completed);
+    assert_eq!(got.result.as_deref(), Some("SYNTH_FINAL"));
+}
+
 fn jsonrpc_body(method: &str, params: Value) -> axum::body::Body {
     axum::body::Body::from(
         serde_json::to_vec(&json!({
