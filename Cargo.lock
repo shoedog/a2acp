@@ -12,6 +12,7 @@ dependencies = [
  "bridge-a2a-inbound",
  "bridge-a2a-outbound",
  "bridge-acp",
+ "bridge-api",
  "bridge-core",
  "bridge-observ",
  "bridge-policy",
@@ -28,6 +29,7 @@ dependencies = [
  "toml 0.8.23",
  "tower",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

@@ -106,6 +106,9 @@ async fn main() -> Result<(), BoxError> {
             use bridge_core::domain::AgentKind;
             match entry.kind {
                 AgentKind::Acp => {
+                    let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
+                        reason: format!("acp agent {} missing cmd", entry.id.as_str()),
+                    })?;
                     let acp = AcpConfig {
                         cwd,
                         model: entry.model.clone(),
@@ -114,11 +117,21 @@ async fn main() -> Result<(), BoxError> {
                         // handshake_timeout / cancel_grace: reuse the codebase defaults.
                         ..AcpConfig::default()
                     };
-                    let be = AcpBackend::spawn(&entry.cmd, &args_ref, acp)
+                    let be = AcpBackend::spawn(cmd, &args_ref, acp)
                         .await?
                         // Thread the system policy into the backend so its reverse-permission
                         // decisions match the inbound server's policy (Task 5/6).
                         .with_policy(policy);
+                    Ok(Arc::new(be) as Arc<dyn AgentBackend>)
+                }
+                AgentKind::Api => {
+                    let base_url = entry.base_url.clone().ok_or(BridgeError::ConfigInvalid {
+                        reason: format!("api agent {} missing base_url", entry.id.as_str()),
+                    })?;
+                    let mut cfg = bridge_api::ApiConfig::new(base_url);
+                    cfg.model = entry.model.clone();
+                    cfg.api_key_env = entry.api_key_env.clone();
+                    let be = bridge_api::ApiBackend::new(cfg).with_policy(policy);
                     Ok(Arc::new(be) as Arc<dyn AgentBackend>)
                 }
             }

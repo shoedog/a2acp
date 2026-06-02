@@ -31,13 +31,20 @@ pub enum Effort {
 pub enum AgentKind {
     #[default]
     Acp,
+    /// Non-process OpenAI-compatible HTTP backend (bridge-api).
+    Api,
 }
 
 /// A named bundle: which CLI adapter to launch + model/effort/mode configuration.
 #[derive(Debug, Clone)]
 pub struct AgentEntry {
     pub id: AgentId,
-    pub cmd: String,
+    /// Process command for `kind="acp"`; `None` for non-process kinds (e.g. `Api`).
+    pub cmd: Option<String>,
+    /// OpenAI-compatible base URL for `kind="api"`; `None` for process kinds.
+    pub base_url: Option<String>,
+    /// NAME of the env var holding the bearer token for `kind="api"` (never the secret).
+    pub api_key_env: Option<String>,
     pub args: Vec<String>,
     /// Adapter kind (selects the backend factory arm). Default `Acp`.
     pub kind: AgentKind,
@@ -213,10 +220,38 @@ mod tests {
     }
 
     #[test]
+    fn agent_entry_cmd_is_optional_and_has_url_fields() {
+        let e = AgentEntry {
+            id: AgentId::parse("ollama").unwrap(),
+            cmd: None,
+            args: vec![],
+            kind: AgentKind::Api,
+            base_url: Some("http://localhost:11434/v1".into()),
+            api_key_env: None,
+            model_provider: None,
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: None,
+            auth_method: None,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: Default::default(),
+        };
+        assert!(e.cmd.is_none());
+        assert_eq!(e.base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(e.kind, AgentKind::Api);
+    }
+
+    #[test]
     fn agent_entry_carries_kind() {
         let e = AgentEntry {
             id: AgentId::parse("x").unwrap(),
-            cmd: "codex-acp".into(),
+            cmd: Some("codex-acp".into()),
+            base_url: None,
+            api_key_env: None,
             args: vec![],
             kind: AgentKind::Acp,
             model_provider: None,
@@ -238,7 +273,9 @@ mod tests {
     fn effective_config_layers_override_over_entry() {
         let entry = AgentEntry {
             id: crate::ids::AgentId::parse("codex").unwrap(),
-            cmd: "codex-acp".into(),
+            cmd: Some("codex-acp".into()),
+            base_url: None,
+            api_key_env: None,
             args: vec![],
             kind: AgentKind::Acp,
             model_provider: Some("openai".into()),

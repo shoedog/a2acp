@@ -90,7 +90,9 @@ mod tests {
             Ok(Resolved {
                 entry: Arc::new(AgentEntry {
                     id: self.default.clone(),
-                    cmd: "fake".into(),
+                    cmd: Some("fake".into()),
+                    base_url: None,
+                    api_key_env: None,
                     args: vec![],
                     kind: AgentKind::Acp,
                     model_provider: None,

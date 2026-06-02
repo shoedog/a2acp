@@ -99,22 +99,35 @@ fn build_registry() -> (Arc<Registry>, RegistrySnapshot) {
 fn acp_spawn_fn() -> SpawnFn {
     Arc::new(move |entry: Arc<AgentEntry>| {
         Box::pin(async move {
-            // ACP §11A requires an absolute cwd: a per-entry isolated temp dir.
-            let cwd = unique_temp_dir(entry.id.as_str());
-            let args: Vec<String> = entry.args.clone();
-            let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-            let acp = AcpConfig {
-                cwd,
-                model: entry.model.clone(),
-                mode: entry.mode.clone(),
-                auth_method: entry.auth_method.clone(),
-                ..AcpConfig::default()
-            };
-            let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-            let be = AcpBackend::spawn(&entry.cmd, &args_ref, acp)
-                .await?
-                .with_policy(policy);
-            Ok(Arc::new(be) as Arc<dyn AgentBackend>)
+            match entry.kind {
+                AgentKind::Acp => {
+                    let cmd = entry.cmd.clone().expect("acp entry has cmd");
+                    // ACP §11A requires an absolute cwd: a per-entry isolated temp dir.
+                    let cwd = unique_temp_dir(entry.id.as_str());
+                    let args: Vec<String> = entry.args.clone();
+                    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let acp = AcpConfig {
+                        cwd,
+                        model: entry.model.clone(),
+                        mode: entry.mode.clone(),
+                        auth_method: entry.auth_method.clone(),
+                        ..AcpConfig::default()
+                    };
+                    let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
+                    let be = AcpBackend::spawn(&cmd, &args_ref, acp)
+                        .await?
+                        .with_policy(policy);
+                    Ok(Arc::new(be) as Arc<dyn AgentBackend>)
+                }
+                AgentKind::Api => {
+                    let mut cfg = bridge_api::ApiConfig::new(
+                        entry.base_url.clone().expect("api entry has base_url"),
+                    );
+                    cfg.model = entry.model.clone();
+                    Ok(std::sync::Arc::new(bridge_api::ApiBackend::new(cfg))
+                        as std::sync::Arc<dyn AgentBackend>)
+                }
+            }
         })
     })
 }
@@ -211,7 +224,9 @@ fn entry(
 ) -> AgentEntry {
     AgentEntry {
         id: AgentId::parse(id).unwrap(),
-        cmd: cmd.into(),
+        cmd: Some(cmd.into()),
+        base_url: None,
+        api_key_env: None,
         args: args.iter().map(|s| s.to_string()).collect(),
         kind: AgentKind::Acp,
         model_provider: None,
