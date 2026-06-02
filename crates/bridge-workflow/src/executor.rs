@@ -274,4 +274,27 @@ mod tests {
         assert_eq!(b_rec.prompts.lock().unwrap()[0], "got AOUT");
         assert_eq!(c_rec.prompts.lock().unwrap()[0], "got BOUT");
     }
+
+    #[tokio::test]
+    async fn failed_fan_out_leg_marker_reaches_synth_and_run_completes() {
+        // No "codex" backend registered → the codex node's resolve fails → error marker;
+        // claude + synth still run (graceful degradation).
+        let reg = Arc::new(FakeRegistry { backends: [
+            ("claude".to_string(), ("CLAUDE_REVIEW".to_string(), Arc::new(Rec::default()))),
+            ("synth".to_string(),  ("FINAL".to_string(),         Arc::new(Rec::default()))),
+            // NOTE: no "codex" → resolve fails for the codex node
+        ].into() });
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex.run(review_graph(), "DIFF".into(), "r".into(), CancellationToken::new()).collect::<Vec<_>>().await;
+        // run COMPLETES (terminal synth ok) — graceful degradation
+        assert!(matches!(evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, .. }));
+        // a NodeFinished{ok:false} was emitted for codex
+        assert!(evs.iter().any(|e| matches!(e.as_ref().unwrap(),
+            WorkflowEvent::NodeFinished { node, ok: false } if node.as_str() == "codex")));
+        // the EXACT failure marker reached synth's prompt
+        let p = &synth_rec.prompts.lock().unwrap()[0];
+        assert!(p.contains("[node codex failed:"), "marker reached synth: {p}");
+    }
 }
