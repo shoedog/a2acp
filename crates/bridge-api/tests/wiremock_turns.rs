@@ -1,8 +1,10 @@
 use bridge_api::{ApiBackend, ApiConfig};
-use bridge_core::domain::Part;
+use bridge_core::domain::{Part, PermissionDecision, PermissionRequest, SessionContext};
+use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::ports::{AgentBackend, Update};
+use bridge_core::ports::{AgentBackend, PolicyEngine, Update};
 use futures::StreamExt;
+use std::sync::Arc;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -66,4 +68,49 @@ async fn tool_approve_path_executes_and_feeds_result() {
     assert_eq!(msgs[2]["role"], "tool");
     assert_eq!(msgs[2]["tool_call_id"], "call_1");
     assert_eq!(msgs[2]["content"], "2026-01-01T00:00:00Z");
+}
+
+struct Deny;
+impl PolicyEngine for Deny {
+    fn decide(&self, _: &PermissionRequest, _: &SessionContext) -> Result<PermissionDecision, BridgeError> {
+        Err(BridgeError::PermissionDenied)
+    }
+}
+struct Abstain;
+impl PolicyEngine for Abstain {
+    fn decide(&self, _: &PermissionRequest, _: &SessionContext) -> Result<PermissionDecision, BridgeError> {
+        Err(BridgeError::FrameError) // any non-PermissionDenied Err = abstain
+    }
+}
+
+async fn tool_then_text(server: &MockServer) {
+    let call1 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_current_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    let call2 = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST")).and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(sse(call2)).up_to_n_times(1).mount(server).await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(sse(call1)).mount(server).await;
+}
+
+#[tokio::test]
+async fn deny_arm_feeds_denial_and_does_not_run_tool() {
+    let server = MockServer::start().await;
+    tool_then_text(&server).await;
+    let be = ApiBackend::new(ApiConfig::new(format!("{}/v1", server.uri()))).with_policy(Arc::new(Deny));
+    let _ = drain(&be, &SessionId::parse("s3").unwrap()).await;
+    let reqs = server.received_requests().await.unwrap();
+    let second = String::from_utf8_lossy(&reqs[1].body);
+    assert!(second.contains("permission denied: tool not executed"));
+    assert!(!second.contains("2026-01-01T00:00:00Z"), "stub tool MUST NOT have run");
+}
+
+#[tokio::test]
+async fn abstain_arm_feeds_refusal() {
+    let server = MockServer::start().await;
+    tool_then_text(&server).await;
+    let be = ApiBackend::new(ApiConfig::new(format!("{}/v1", server.uri()))).with_policy(Arc::new(Abstain));
+    let _ = drain(&be, &SessionId::parse("s4").unwrap()).await;
+    let reqs = server.received_requests().await.unwrap();
+    let second = String::from_utf8_lossy(&reqs[1].body);
+    assert!(second.contains("permission unavailable: tool not executed"));
 }
