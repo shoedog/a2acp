@@ -69,7 +69,17 @@ impl SqliteStore {
                 peer_task_id TEXT,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
                 fanout INTEGER NOT NULL DEFAULT 0
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                id         TEXT PRIMARY KEY,
+                workflow   TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                result     TEXT,
+                error      TEXT,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_ms);",
         )
         .map_err(|_| BridgeError::StoreFailure)
     }
@@ -252,12 +262,189 @@ impl SessionStore for SqliteStore {
     }
 }
 
+#[async_trait::async_trait]
+impl bridge_core::task_store::TaskStore for SqliteStore {
+    async fn create(
+        &self,
+        rec: &bridge_core::task_store::TaskRecord,
+    ) -> Result<(), BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                rec.id.as_str(),
+                rec.workflow,
+                rec.status.as_str(),
+                rec.result,
+                rec.error,
+                rec.created_ms,
+                rec.updated_ms
+            ],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(())
+    }
+
+    async fn set_terminal(
+        &self,
+        id: &TaskId,
+        status: bridge_core::task_store::TaskRecordStatus,
+        result: Option<&str>,
+        error: Option<&str>,
+        updated_ms: i64,
+    ) -> Result<(), BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE tasks SET status=?2, result=?3, error=?4, updated_ms=?5 WHERE id=?1",
+                rusqlite::params![id.as_str(), status.as_str(), result, error, updated_ms],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if n == 0 {
+            return Err(BridgeError::StoreFailure);
+        }
+        Ok(())
+    }
+
+    async fn get(
+        &self,
+        id: &TaskId,
+    ) -> Result<Option<bridge_core::task_store::TaskRecord>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workflow, status, result, error, created_ms, updated_ms
+                 FROM tasks WHERE id=?1",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![id.as_str()])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        match rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(row_to_task(row)?)),
+        }
+    }
+
+    async fn list(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workflow, status, result, error, created_ms, updated_ms
+                 FROM tasks ORDER BY updated_ms DESC LIMIT ?1",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![limit as i64])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            out.push(row_to_task(row)?);
+        }
+        Ok(out)
+    }
+
+    async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE tasks SET status='interrupted', error='interrupted (serve restarted)', updated_ms=?1
+                 WHERE status='working'",
+                rusqlite::params![updated_ms],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(n as u64)
+    }
+}
+
+fn row_to_task(
+    row: &rusqlite::Row,
+) -> Result<bridge_core::task_store::TaskRecord, BridgeError> {
+    use bridge_core::task_store::{TaskRecord, TaskRecordStatus};
+    let id: String = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+    let workflow: String = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
+    let status_s: String = row.get(2).map_err(|_| BridgeError::StoreFailure)?;
+    let result: Option<String> = row.get(3).map_err(|_| BridgeError::StoreFailure)?;
+    let error: Option<String> = row.get(4).map_err(|_| BridgeError::StoreFailure)?;
+    let created_ms: i64 = row.get(5).map_err(|_| BridgeError::StoreFailure)?;
+    let updated_ms: i64 = row.get(6).map_err(|_| BridgeError::StoreFailure)?;
+    Ok(TaskRecord {
+        id: TaskId::parse(id).map_err(|_| BridgeError::StoreFailure)?,
+        workflow,
+        status: TaskRecordStatus::parse(&status_s).ok_or(BridgeError::StoreFailure)?,
+        result,
+        error,
+        created_ms,
+        updated_ms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bridge_core::domain::{PeerTaskId, PendingKind, PendingRequest};
     use bridge_core::ids::{SessionId, TaskId};
     use bridge_core::ports::SessionStore;
+    use bridge_core::task_store::{TaskRecord, TaskRecordStatus, TaskStore};
+
+    fn trec(id: &str, ms: i64) -> TaskRecord {
+        TaskRecord {
+            id: TaskId::parse(id).unwrap(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: ms,
+            updated_ms: ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn task_create_get_set_terminal_inmemory() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let id = TaskId::parse("t1").unwrap();
+        s.create(&trec("t1", 1)).await.unwrap();
+        assert_eq!(s.get(&id).await.unwrap().unwrap().status, TaskRecordStatus::Working);
+        s.set_terminal(&id, TaskRecordStatus::Completed, Some("SYNTH"), None, 9).await.unwrap();
+        let got = s.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskRecordStatus::Completed);
+        assert_eq!(got.result.as_deref(), Some("SYNTH"));
+        assert!(s.create(&trec("t1", 2)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn task_durable_across_reopen() {
+        let dir = std::env::temp_dir().join(format!("a2a-w3a-dur-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dur.db");
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            let id = TaskId::parse("keep").unwrap();
+            s.create(&trec("keep", 1)).await.unwrap();
+            s.set_terminal(&id, TaskRecordStatus::Completed, Some("R"), None, 2).await.unwrap();
+        }
+        let s2 = SqliteStore::open(&path).unwrap();
+        let got = s2.get(&TaskId::parse("keep").unwrap()).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskRecordStatus::Completed);
+        assert_eq!(got.result.as_deref(), Some("R"));
+        drop(s2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn task_sweep_and_list_inmemory() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.create(&trec("a", 1)).await.unwrap();
+        s.create(&trec("b", 3)).await.unwrap();
+        assert_eq!(s.list(10).await.unwrap()[0].id.as_str(), "b");
+        let n = s.sweep_interrupted(99).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(s.get(&TaskId::parse("a").unwrap()).await.unwrap().unwrap().status, TaskRecordStatus::Interrupted);
+    }
 
     #[tokio::test]
     async fn peer_task_roundtrips() {
