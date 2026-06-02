@@ -29,5 +29,50 @@ agent = "claude"
 prompt_file = "../prompts/review-synth.md"
 inputs = ["codex", "claude"]
 
+# spec-review: rigor (completeness/ambiguity) + soundness (design) -> synth.
+# Feed a design spec as the input; agents do not explore, so inline all context.
+[[workflows]]
+id = "spec-review"
+
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/spec-review-synth.md"
+inputs = ["rigor", "soundness"]
+
+# plan-review: executability (compile/ordering/ripple) + coverage (spec/decomposition) -> synth.
+[[workflows]]
+id = "plan-review"
+
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/plan-review-synth.md"
+inputs = ["exec", "coverage"]
+
 [server]
 addr = "127.0.0.1:8080"
