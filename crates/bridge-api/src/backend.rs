@@ -139,6 +139,16 @@ impl AgentBackend for ApiBackend {
                             if acc.is_done() { break 'read; }
                         }
                     }
+                    // Flush a trailing line that arrived without a newline at EOF — but
+                    // ONLY if no terminal was seen (otherwise `buf` is post-[DONE] noise,
+                    // and a chunk-split partial "[DON" would falsely FrameError).
+                    if !acc.is_done() && !buf.trim().is_empty() {
+                        match acc.push_sse_line(&buf) {
+                            Ok(Some(text)) => { yield Update::Text(text); }
+                            Ok(None) => {}
+                            Err(_) => { Err(BridgeError::FrameError)?; }
+                        }
+                    }
                     acc.finish()
                 } else {
                     let body = resp.text().await.map_err(|_| BridgeError::AgentCrashed)?;
@@ -164,7 +174,14 @@ impl AgentBackend for ApiBackend {
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        let _ = self.session_cancel(session).send(true);
+        // Only signal an EXISTING slot — never mint a new one (a forgotten session
+        // has no in-flight turn to cancel; minting a fresh channel here would lose
+        // the signal vs the running turn's receiver).
+        if let Ok(map) = self.sessions.lock() {
+            if let Some(st) = map.get(session) {
+                let _ = st.cancel.send(true);
+            }
+        }
         Ok(())
     }
 
