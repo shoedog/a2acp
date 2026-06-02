@@ -14,6 +14,8 @@
 - `~/code/a2a-local-bridge` is firewall-black-box; do not read its source.
 - Every task ends green: `cargo build`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test` (the touched crate).
 
+**Plan status — Revision 2 (Codex + Claude dual review folded):** Both blockers fixed — (B1) the Phase-B surface-A ripple is now a **single atomic green commit** (Task 15), since no ordering keeps the workspace compiling mid-change; (B2/Task-0) re-exports are added by each type's defining task, not against empty placeholder modules. Majors folded: `push_sse_line`/`parse_nonstream` return a real `ParseError` (not `Result<_,()>` → no `clippy::result_unit_err`); cancel is a `watch`+`tokio::select!` signal so it fires during a stall (not an `AtomicBool` polled only between chunks); test TOMLs include the **required `[server]`** and use `cargo test -p a2a-bridge` (bin-only, no `--lib`); `AgentEntryToml` fields get `#[serde(default)]`; DoD-2/3/7 use exact-JSON / 2-request / tool-ran assertions; placeholders (`api_snap`, the e2e body) are now complete code; coverage tests (bearer-auth, unknown-tool, max-rounds, abstain, malformed, stream:false) carry the 90% floor. Reviewers confirmed the Phase-A design correct (trait/type signatures, `SessionStore` 10-method `FakeStore`, `Send`-safe `async_stream` loop, and that the silent backend makes DoD-1/3 hold by construction).
+
 ---
 
 ## File Structure
@@ -93,12 +95,12 @@ pub mod backend;
 pub mod config;
 pub mod tool;
 pub mod wire;
-
-pub use backend::ApiBackend;
-pub use config::ApiConfig;
+// NOTE: re-exports (`pub use config::ApiConfig;`, `pub use backend::ApiBackend;`)
+// are added by the tasks that DEFINE those types (Task 2, Task 6). Adding them now
+// would fail to compile against the empty placeholder modules (review: Codex-B1).
 ```
 
-(Modules are created in later tasks; declare them now as empty files so the crate builds — create `src/config.rs`, `src/wire.rs`, `src/tool.rs`, `src/backend.rs` each containing only a `// placeholder` line for this step, replaced in their tasks.)
+Create `src/config.rs`, `src/wire.rs`, `src/tool.rs`, `src/backend.rs` each containing a single `// placeholder` line. An empty/comment-only `.rs` is a valid empty module, so `pub mod …;` + no re-exports compiles cleanly.
 
 - [ ] **Step 4: Verify it builds**
 
@@ -260,15 +262,22 @@ impl ApiConfig {
 }
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [ ] **Step 4: Add the re-export**
 
-Run: `cargo test -p bridge-api config::`
-Expected: PASS.
+`ApiConfig` now exists, so add to `crates/bridge-api/src/lib.rs` (Codex-B1):
+```rust
+pub use config::ApiConfig;
+```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Run to verify it passes**
+
+Run: `cargo test -p bridge-api config::` then `cargo build -p bridge-api`
+Expected: PASS + builds.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add crates/bridge-api/src/config.rs
+git add crates/bridge-api/src/config.rs crates/bridge-api/src/lib.rs
 git commit -m "feat(api): ApiConfig with sane defaults"
 ```
 
@@ -413,7 +422,7 @@ mod stream_tests {
     use super::*;
 
     fn feed(acc: &mut SseAccumulator, lines: &[&str]) {
-        for l in lines { acc.push_sse_line(l); }
+        for l in lines { let _ = acc.push_sse_line(l); } // push_sse_line is #[must_use]
     }
 
     #[test]
@@ -483,6 +492,12 @@ Append to `crates/bridge-api/src/wire.rs` (below the request types, above the te
 ```rust
 use std::collections::BTreeMap;
 
+/// Parse error for the wire layer. A real type (NOT `()`), so `pub fn` returning
+/// `Result<_, ParseError>` does not trip `clippy::result_unit_err` under `-D warnings`
+/// (review: Claude). The backend maps it to `BridgeError::FrameError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseError;
+
 // ── Streamed response chunk shapes ──────────────────────────────────────────
 #[derive(Debug, Deserialize)]
 struct StreamChunk { #[serde(default)] choices: Vec<StreamChoice> }
@@ -527,20 +542,19 @@ pub struct SseAccumulator {
     calls: BTreeMap<usize, PartialToolCall>,
     next_pos: usize,
     done: bool,
-    /// Bytes deltas the caller should emit as Update::Text as they arrive.
-    pending_text: Vec<String>,
 }
 
 impl SseAccumulator {
     /// Feed one raw SSE line (e.g. `data: {...}` or `data: [DONE]`). Returns the
-    /// text delta (if any) to surface immediately, or Err on malformed JSON.
-    pub fn push_sse_line(&mut self, line: &str) -> Result<Option<String>, ()> {
+    /// text delta (if any) to surface immediately, or `Err(ParseError)` on malformed JSON.
+    #[must_use = "a text delta may need surfacing as Update::Text"]
+    pub fn push_sse_line(&mut self, line: &str) -> Result<Option<String>, ParseError> {
         let line = line.trim();
         let Some(payload) = line.strip_prefix("data:") else { return Ok(None) };
         let payload = payload.trim();
         if payload.is_empty() { return Ok(None) }
         if payload == "[DONE]" { self.done = true; return Ok(None) }
-        let chunk: StreamChunk = serde_json::from_str(payload).map_err(|_| ())?;
+        let chunk: StreamChunk = serde_json::from_str(payload).map_err(|_| ParseError)?;
         let mut emitted = None;
         for choice in chunk.choices {
             if let Some(c) = choice.delta.content {
@@ -586,12 +600,10 @@ impl SseAccumulator {
 }
 ```
 
-(`pending_text` is declared for symmetry with the backend's streaming use; the backend surfaces deltas from `push_sse_line`'s return value, so remove `pending_text` if clippy flags it as unused — the field is not required by these tests.)
-
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p bridge-api wire::stream_tests`
-Expected: PASS (5 tests). If clippy later flags `pending_text` as dead, delete that field + its initializer.
+Run: `cargo test -p bridge-api wire::stream_tests` then `cargo clippy -p bridge-api --all-targets -- -D warnings`
+Expected: PASS (5 tests) + clippy clean (no `result_unit_err`, no dead-code).
 
 - [ ] **Step 5: Commit**
 
@@ -655,10 +667,10 @@ struct RespMessage {
     #[serde(default)] tool_calls: Option<Vec<ToolCall>>,
 }
 
-/// Parse a non-streamed (`stream:false`) chat completion body. Returns Err on
-/// malformed JSON (mapped to FrameError by the backend).
-pub fn parse_nonstream(body: &str) -> Result<ParsedTurn, ()> {
-    let resp: NonStreamResponse = serde_json::from_str(body).map_err(|_| ())?;
+/// Parse a non-streamed (`stream:false`) chat completion body. Returns
+/// `Err(ParseError)` on malformed JSON (mapped to `FrameError` by the backend).
+pub fn parse_nonstream(body: &str) -> Result<ParsedTurn, ParseError> {
+    let resp: NonStreamResponse = serde_json::from_str(body).map_err(|_| ParseError)?;
     let mut out = ParsedTurn::default();
     if let Some(choice) = resp.choices.into_iter().next() {
         out.text = choice.message.content.unwrap_or_default();
@@ -745,13 +757,21 @@ use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{AgentBackend, BackendStream, PolicyEngine};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::watch;
 
-#[derive(Default)]
+/// Per-session state: the stashed effective model + a `watch` channel used as the
+/// cancel signal. A `watch` (level-triggered, version-counted) lets the turn loop
+/// `select!` on cancellation even while parked awaiting the next SSE chunk — an
+/// `AtomicBool` polled only between chunks cannot cancel during a stall (review: Codex-B4).
 struct SessionState {
     model: Option<String>,
-    cancel: Arc<AtomicBool>,
+    cancel: watch::Sender<bool>,
+}
+impl Default for SessionState {
+    fn default() -> Self {
+        Self { model: None, cancel: watch::channel(false).0 }
+    }
 }
 
 pub struct ApiBackend {
@@ -794,7 +814,8 @@ impl ApiBackend {
         self.sessions.lock().ok()?.get(s).and_then(|st| st.model.clone())
     }
 
-    fn cancel_latch(&self, s: &SessionId) -> Arc<AtomicBool> {
+    /// The session's cancel sender (creating the slot if absent).
+    fn session_cancel(&self, s: &SessionId) -> watch::Sender<bool> {
         let mut map = self.sessions.lock().expect("sessions lock");
         map.entry(s.clone()).or_default().cancel.clone()
     }
@@ -808,7 +829,8 @@ impl AgentBackend for ApiBackend {
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        self.cancel_latch(session).store(true, Ordering::SeqCst);
+        // send(true) errors only if there are no receivers (no in-flight turn) — ignore.
+        let _ = self.session_cancel(session).send(true);
         Ok(())
     }
 
@@ -824,6 +846,13 @@ impl AgentBackend for ApiBackend {
 }
 ```
 
+- [ ] **Step 3b: Add the `ApiBackend` re-export**
+
+`ApiBackend` now exists — add to `crates/bridge-api/src/lib.rs` (Codex-B1):
+```rust
+pub use backend::ApiBackend;
+```
+
 > `Update` and `STOP_REASON_CANCELLED` are deliberately NOT imported in this task — `prompt` is a stub here, so importing them would trip `-D warnings`. Task 7 adds them to the `use bridge_core::ports::{…}` line when it implements the turn loop.
 
 - [ ] **Step 4: Run to verify it passes**
@@ -834,7 +863,7 @@ Expected: PASS + clippy clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bridge-api/src/backend.rs
+git add crates/bridge-api/src/backend.rs crates/bridge-api/src/lib.rs
 git commit -m "feat(api): ApiBackend skeleton (configure_session/cancel/policy)"
 ```
 
@@ -846,7 +875,7 @@ git commit -m "feat(api): ApiBackend skeleton (configure_session/cancel/policy)"
 - Modify: `crates/bridge-api/src/backend.rs`
 - Create: `crates/bridge-api/tests/wiremock_turns.rs`
 
-Implement `prompt()` for the no-tool case: POST, stream-parse, emit `Text` deltas + `Done`. The stream polls the cancel latch each chunk.
+Implement `prompt()` for the no-tool case (a SINGLE round; Task 8 wraps it in the bounded tool loop): POST, stream-parse, emit `Text` deltas + `Done`. The read loop uses `tokio::select!` on the cancel watch receiver so a mid-stream cancel fires even while parked awaiting the next chunk.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -897,9 +926,9 @@ Expected: FAIL — `prompt` returns `AgentCrashed`.
 
 - [ ] **Step 3: Implement**
 
-In `crates/bridge-api/src/backend.rs`: (1) extend the ports import to `use bridge_core::ports::{AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED};`; (2) add the `use` lines below; (3) replace the entire Task-6 `impl AgentBackend for ApiBackend` block (the one whose `prompt` returns `Err(AgentCrashed)`) with the full one below. Full `prompt` + helpers:
+In `crates/bridge-api/src/backend.rs`: (1) extend the ports import to `use bridge_core::ports::{AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED};`; (2) add the `use` lines below; (3) replace the entire Task-6 `impl AgentBackend for ApiBackend` block (the one whose `prompt` returns `Err(AgentCrashed)`) with the full one below. (`policy`/`max_tool_rounds` are intentionally not captured yet — Task 8 adds them with the tool loop, avoiding unused-variable warnings.)
 ```rust
-use crate::wire::{ChatRequest, Message, SseAccumulator, ToolCall};
+use crate::wire::{ChatRequest, Message, SseAccumulator};
 use futures::StreamExt;
 
 impl ApiBackend {
@@ -917,66 +946,65 @@ impl AgentBackend for ApiBackend {
         let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
         let model = self.resolve_model(session);
         let api_key = self.resolve_api_key();
-        let cancel = self.cancel_latch(session);
-        cancel.store(false, Ordering::SeqCst); // fresh turn
+        let do_stream = self.cfg.stream;
         let client = self.client.clone();
-        let policy = self.policy.clone();
-        let max_rounds = self.cfg.max_tool_rounds;
 
-        let mut messages: Vec<Message> = vec![Message::user(
+        // Cancel: reset for this fresh turn, THEN subscribe so a later send(true)
+        // is observed as a change. `select!` on `changed()` fires even while parked
+        // awaiting the next SSE chunk (review: Codex-B4).
+        let cancel_tx = self.session_cancel(session);
+        let _ = cancel_tx.send(false);
+        let mut cancel_rx = cancel_tx.subscribe();
+
+        let messages: Vec<Message> = vec![Message::user(
             parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n"),
         )];
 
         let stream = async_stream::try_stream! {
-            for _round in 0..max_rounds {
-                if cancel.load(Ordering::SeqCst) {
-                    yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() };
-                    return;
-                }
-                let req = ChatRequest { model: model.clone(), messages: messages.clone(),
-                    tools: vec![crate::tool::tool_def()], stream: true };
-                let mut builder = client.post(&url).json(&req);
-                if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
-                let resp = builder.send().await.map_err(|_| BridgeError::AgentCrashed)?;
-                if !resp.status().is_success() { Err(BridgeError::AgentCrashed)?; }
-
-                let mut acc = SseAccumulator::default();
-                let mut bytes = resp.bytes_stream();
-                let mut buf = String::new();
-                'read: while let Some(chunk) = bytes.next().await {
-                    if cancel.load(Ordering::SeqCst) {
-                        yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() };
-                        return;
-                    }
-                    let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
-                    buf.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(nl) = buf.find('\n') {
-                        let line: String = buf.drain(..=nl).collect();
-                        match acc.push_sse_line(&line) {
-                            Ok(Some(text)) => { yield Update::Text(text); }
-                            Ok(None) => {}
-                            Err(()) => { Err(BridgeError::FrameError)?; }
-                        }
-                        if acc.is_done() { break 'read; }
-                    }
-                }
-                let parsed = acc.finish();
-                if parsed.tool_calls.is_empty() {
-                    yield Update::Done { stop_reason: "stop".into() };
-                    return;
-                }
-                // Tool round — Task 8 fills this. For now (text-only milestone) end.
-                let _ = (&policy, &messages); // silence until Task 8
-                yield Update::Done { stop_reason: "stop".into() };
-                return;
+            if *cancel_rx.borrow() {
+                yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
             }
-            yield Update::Done { stop_reason: "max_tool_rounds".into() };
+            let req = ChatRequest { model: model.clone(), messages: messages.clone(),
+                tools: vec![crate::tool::tool_def()], stream: do_stream };
+            let mut builder = client.post(&url).json(&req);
+            if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
+            let resp = builder.send().await.map_err(|_| BridgeError::AgentCrashed)?;
+            if !resp.status().is_success() { Err(BridgeError::AgentCrashed)?; }
+
+            let mut acc = SseAccumulator::default();
+            let mut bytes = resp.bytes_stream();
+            let mut buf = String::new();
+            'read: loop {
+                let chunk = tokio::select! {
+                    biased;
+                    changed = cancel_rx.changed() => {
+                        if changed.is_ok() && *cancel_rx.borrow() {
+                            yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+                        }
+                        continue 'read;
+                    }
+                    maybe = bytes.next() => match maybe { Some(c) => c, None => break 'read },
+                };
+                let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(nl) = buf.find('\n') {
+                    let line: String = buf.drain(..=nl).collect();
+                    match acc.push_sse_line(&line) {
+                        Ok(Some(text)) => { yield Update::Text(text); }
+                        Ok(None) => {}
+                        Err(_) => { Err(BridgeError::FrameError)?; } // ParseError → FrameError
+                    }
+                    if acc.is_done() { break 'read; }
+                }
+            }
+            let _parsed = acc.finish(); // Task 8 inspects tool_calls; text-only milestone ends here.
+            yield Update::Done { stop_reason: "stop".into() };
         };
         Ok(Box::pin(stream))
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        self.cancel_latch(session).store(true, Ordering::SeqCst);
+        let _ = self.session_cancel(session).send(true);
         Ok(())
     }
     async fn configure_session(&self, session: &SessionId, cfg: &EffectiveConfig) -> Result<(), BridgeError> {
@@ -990,7 +1018,7 @@ impl AgentBackend for ApiBackend {
 }
 ```
 
-(Replace the whole Task-6 `impl AgentBackend` block with this one — there is exactly one `impl AgentBackend for ApiBackend`.)
+(Replace the whole Task-6 `impl AgentBackend` block — there is exactly one `impl AgentBackend for ApiBackend`.)
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -1043,14 +1071,21 @@ async fn tool_approve_path_executes_and_feeds_result() {
     assert!(matches!(updates.last(), Some(Update::Done { stop_reason }) if stop_reason == "stop"));
     assert!(!updates.iter().any(|u| matches!(u, Update::Permission(_))));
 
-    // Falsifiable: the follow-up request carried the EXACT tool-result message.
+    // EXACTLY two requests; the follow-up carries the PRECISE assistant + tool messages
+    // (parsed JSON, not substring — review Codex-5, guarding UUID-'7'-style false-pass).
     let reqs = server.received_requests().await.unwrap();
-    let second = String::from_utf8_lossy(&reqs[1].body);
-    assert!(second.contains("\"role\":\"tool\""));
-    assert!(second.contains("\"tool_call_id\":\"call_1\""));
-    assert!(second.contains("2026-01-01T00:00:00Z"));
+    assert_eq!(reqs.len(), 2, "one tool round → exactly two completions");
+    let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(msgs[2]["role"], "tool");
+    assert_eq!(msgs[2]["tool_call_id"], "call_1");
+    assert_eq!(msgs[2]["content"], "2026-01-01T00:00:00Z");
 }
 ```
+(`serde_json` is already a `bridge-api` dependency, so it's available to the integration test.)
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -1059,20 +1094,69 @@ Expected: FAIL — the placeholder ends after one round, no follow-up / no tool 
 
 - [ ] **Step 3: Implement**
 
-In `crates/bridge-api/src/backend.rs`, replace the placeholder tool branch (the `// Tool round — Task 8 fills this` block) with:
+Task 7 left `prompt()` doing a SINGLE round. This task: (1) adds `ToolCall` to the wire import — `use crate::wire::{ChatRequest, Message, SseAccumulator, ToolCall};`; (2) captures the policy + bound at the top of `prompt()` (right after `let client = self.client.clone();`):
 ```rust
+        let policy = self.policy.clone();
+        let max_rounds = self.cfg.max_tool_rounds;
+```
+and makes `messages` mutable (`let mut messages`); (3) replaces the entire Task-7 `async_stream::try_stream! { … }` body with the bounded loop below (the per-round POST+read is unchanged from Task 7; what's new is the surrounding `for` loop, the tool branch, and the post-loop `max_tool_rounds`):
+```rust
+        let stream = async_stream::try_stream! {
+            for _round in 0..max_rounds {
+                if *cancel_rx.borrow() {
+                    yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+                }
+                let req = ChatRequest { model: model.clone(), messages: messages.clone(),
+                    tools: vec![crate::tool::tool_def()], stream: do_stream };
+                let mut builder = client.post(&url).json(&req);
+                if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
+                let resp = builder.send().await.map_err(|_| BridgeError::AgentCrashed)?;
+                if !resp.status().is_success() { Err(BridgeError::AgentCrashed)?; }
+
+                let mut acc = SseAccumulator::default();
+                let mut bytes = resp.bytes_stream();
+                let mut buf = String::new();
+                'read: loop {
+                    let chunk = tokio::select! {
+                        biased;
+                        changed = cancel_rx.changed() => {
+                            if changed.is_ok() && *cancel_rx.borrow() {
+                                yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+                            }
+                            continue 'read;
+                        }
+                        maybe = bytes.next() => match maybe { Some(c) => c, None => break 'read },
+                    };
+                    let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(nl) = buf.find('\n') {
+                        let line: String = buf.drain(..=nl).collect();
+                        match acc.push_sse_line(&line) {
+                            Ok(Some(text)) => { yield Update::Text(text); }
+                            Ok(None) => {}
+                            Err(_) => { Err(BridgeError::FrameError)?; }
+                        }
+                        if acc.is_done() { break 'read; }
+                    }
+                }
+                let parsed = acc.finish();
+                if parsed.tool_calls.is_empty() {
+                    yield Update::Done { stop_reason: "stop".into() }; return;
+                }
                 // Tool round: decide each call SILENTLY via the injected policy.
-                // We yield NO Update::Permission — the backend is the sole authority
-                // (mirrors AcpBackend::decide_permission; see spec §4.3).
+                // NO Update::Permission is yielded — the backend is the sole authority
+                // (mirrors AcpBackend::decide_permission; spec §4.3).
                 messages.push(Message::assistant_tool_calls(parsed.tool_calls.clone()));
                 for tc in &parsed.tool_calls {
                     let result = decide_tool(&policy, tc);
                     messages.push(Message::tool_result(tc.id.clone(), result));
                 }
-                // loop: re-POST with the appended tool results.
+                // continue → re-POST with the appended tool results.
+            }
+            yield Update::Done { stop_reason: "max_tool_rounds".into() };
+        };
 ```
-
-Add the free function `decide_tool` at module level in `backend.rs` (below the `impl AgentBackend`):
+(4) add the free function `decide_tool` at module level in `backend.rs` (below the `impl AgentBackend`):
 ```rust
 /// Silent permission decision for one tool call → the `content` of its tool-result
 /// message. Approve runs the stub tool; Deny/abstain feed a refusal string.
@@ -1089,8 +1173,6 @@ fn decide_tool(policy: &Arc<StdMutex<Arc<dyn PolicyEngine>>>, tc: &ToolCall) -> 
     }
 }
 ```
-
-Remove the now-unused `let _ = (&policy, &messages);` line.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -1194,21 +1276,27 @@ Append to `crates/bridge-api/tests/wiremock_turns.rs`:
 use std::time::Duration;
 
 #[tokio::test]
-async fn mid_stream_cancel_ends_with_cancelled() {
+async fn cancel_during_inflight_ends_with_cancelled_and_preempts() {
+    // wiremock cannot partial-stream-then-stall, so we delay the whole response and
+    // cancel while the turn is parked in `select!` awaiting the first chunk. The
+    // `watch`+`select!` design (Codex-B4) wakes on the cancel and yields `cancelled`
+    // BEFORE the delayed body is processed — asserted by the absence of any Text.
+    // (A raw-TCP one-chunk-then-stall server would additionally prove sub-delay
+    // promptness; omitted to avoid hand-rolling a TCP mock.)
     let server = MockServer::start().await;
-    // Slow body: a chunk, then a long delay before the terminal — cancel mid-flight.
-    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
     Mock::given(method("POST")).and(path("/v1/chat/completions"))
-        .respond_with(sse(body).set_delay(Duration::from_millis(50))).mount(&server).await;
+        .respond_with(sse(body).set_delay(Duration::from_millis(100))).mount(&server).await;
 
     let be = Arc::new(ApiBackend::new(ApiConfig::new(format!("{}/v1", server.uri()))));
     let s = SessionId::parse("s5").unwrap();
     let be2 = be.clone(); let s2 = s.clone();
     let mut st = be.prompt(&s, vec![Part { text: "hi".into() }]).await.unwrap();
     tokio::spawn(async move { tokio::time::sleep(Duration::from_millis(10)).await; be2.cancel(&s2).await.unwrap(); });
-    let mut last = None;
-    while let Some(item) = st.next().await { last = Some(item.unwrap()); }
-    assert!(matches!(last, Some(Update::Done { stop_reason }) if stop_reason == "cancelled"));
+    let mut updates = Vec::new();
+    while let Some(item) = st.next().await { updates.push(item.unwrap()); }
+    assert!(matches!(updates.last(), Some(Update::Done { stop_reason }) if stop_reason == "cancelled"));
+    assert!(!updates.iter().any(|u| matches!(u, Update::Text(_))), "cancel preempted the chunk");
 }
 
 #[tokio::test]
@@ -1241,7 +1329,7 @@ async fn malformed_sse_is_frame_error() {
 Run: `cargo test -p bridge-api --test wiremock_turns`
 Expected: PASS. (The cancel-poll-inside-loop, `AgentCrashed`, and `FrameError` paths were implemented in Task 7. If `connection-refused` coverage is wanted too, add a test pointing at `ApiConfig::new("http://127.0.0.1:1/v1")` asserting `AgentCrashed`.)
 
-- [ ] **Step 3: Add the connection-refused case + commit**
+- [ ] **Step 3: Add connection-refused + coverage tests (review: Claude — reach the 90% floor deterministically)**
 
 Append:
 ```rust
@@ -1253,11 +1341,57 @@ async fn connection_refused_is_agent_crashed() {
     while let Some(item) = st.next().await { if let Err(e) = item { err = Some(e); } }
     assert!(matches!(err, Some(bridge_core::error::BridgeError::AgentCrashed)));
 }
+
+#[tokio::test]
+async fn bearer_auth_header_sent_when_api_key_env_set() {
+    use wiremock::matchers::header_exists;
+    std::env::set_var("BRIDGE_API_TEST_KEY", "secret-token");
+    let server = MockServer::start().await;
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).and(header_exists("authorization"))
+        .respond_with(sse(body)).mount(&server).await;
+    let mut cfg = ApiConfig::new(format!("{}/v1", server.uri()));
+    cfg.api_key_env = Some("BRIDGE_API_TEST_KEY".into());
+    let be = ApiBackend::new(cfg);
+    let _ = drain(&be, &SessionId::parse("sb".into()).unwrap()).await;
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs[0].headers.get("authorization").unwrap(), "Bearer secret-token");
+    std::env::remove_var("BRIDGE_API_TEST_KEY");
+}
+
+#[tokio::test]
+async fn unknown_tool_feeds_unknown_result() {
+    let server = MockServer::start().await;
+    let call1 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"frobnicate\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    let call2 = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    use wiremock::matchers::body_string_contains;
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(sse(call2)).up_to_n_times(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(sse(call1)).mount(&server).await;
+    let be = ApiBackend::new(ApiConfig::new(format!("{}/v1", server.uri())));
+    let _ = drain(&be, &SessionId::parse("su").unwrap()).await;
+    let reqs = server.received_requests().await.unwrap();
+    let second = String::from_utf8_lossy(&reqs[1].body);
+    assert!(second.contains("unknown tool: frobnicate"));
+}
+
+#[tokio::test]
+async fn max_tool_rounds_terminates() {
+    // A stub that ALWAYS returns a tool_call → the loop hits max_tool_rounds.
+    let server = MockServer::start().await;
+    let tool = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"get_current_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST")).and(path("/v1/chat/completions")).respond_with(sse(tool)).mount(&server).await;
+    let mut cfg = ApiConfig::new(format!("{}/v1", server.uri())); cfg.max_tool_rounds = 2;
+    let be = ApiBackend::new(cfg);
+    let updates = drain(&be, &SessionId::parse("sm").unwrap()).await;
+    assert!(matches!(updates.last(), Some(Update::Done { stop_reason }) if stop_reason == "max_tool_rounds"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2, "bounded at max_tool_rounds");
+}
 ```
 Run: `cargo test -p bridge-api --test wiremock_turns` → PASS.
 ```bash
 git add crates/bridge-api/tests/wiremock_turns.rs
-git commit -m "test(api): mid-stream cancel + HTTP/frame errors (DoD-4/5/5b)"
+git commit -m "test(api): mid-stream cancel, HTTP/frame errors, bearer/unknown-tool/max-rounds (DoD-4/5/5b)"
 ```
 
 ---
@@ -1297,23 +1431,23 @@ Expected: FAIL — backend always streams (`stream:true`), the JSON body isn't S
 
 - [ ] **Step 3: Implement**
 
-In `prompt()`'s loop, branch at the POST on `self.cfg.stream`. Capture `let do_stream = self.cfg.stream;` before the `async_stream!` block, then inside the loop replace the response-reading section with:
+`do_stream` is already captured (Task 7). In the per-round body from Task 8, replace the section from `let mut acc = SseAccumulator::default();` through `let parsed = acc.finish();` with a `do_stream` branch — the streamed arm keeps the exact `select!` read loop from Task 8; the non-streamed arm is a single `resp.text()` parsed by `parse_nonstream`:
 ```rust
-                let req = ChatRequest { model: model.clone(), messages: messages.clone(),
-                    tools: vec![crate::tool::tool_def()], stream: do_stream };
-                let mut builder = client.post(&url).json(&req);
-                if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
-                let resp = builder.send().await.map_err(|_| BridgeError::AgentCrashed)?;
-                if !resp.status().is_success() { Err(BridgeError::AgentCrashed)?; }
-
                 let parsed = if do_stream {
                     let mut acc = SseAccumulator::default();
                     let mut bytes = resp.bytes_stream();
                     let mut buf = String::new();
-                    'read: while let Some(chunk) = bytes.next().await {
-                        if cancel.load(Ordering::SeqCst) {
-                            yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
-                        }
+                    'read: loop {
+                        let chunk = tokio::select! {
+                            biased;
+                            changed = cancel_rx.changed() => {
+                                if changed.is_ok() && *cancel_rx.borrow() {
+                                    yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+                                }
+                                continue 'read;
+                            }
+                            maybe = bytes.next() => match maybe { Some(c) => c, None => break 'read },
+                        };
                         let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
                         buf.push_str(&String::from_utf8_lossy(&chunk));
                         while let Some(nl) = buf.find('\n') {
@@ -1321,7 +1455,7 @@ In `prompt()`'s loop, branch at the POST on `self.cfg.stream`. Capture `let do_s
                             match acc.push_sse_line(&line) {
                                 Ok(Some(text)) => { yield Update::Text(text); }
                                 Ok(None) => {}
-                                Err(()) => { Err(BridgeError::FrameError)?; }
+                                Err(_) => { Err(BridgeError::FrameError)?; }
                             }
                             if acc.is_done() { break 'read; }
                         }
@@ -1329,12 +1463,11 @@ In `prompt()`'s loop, branch at the POST on `self.cfg.stream`. Capture `let do_s
                     acc.finish()
                 } else {
                     let body = resp.text().await.map_err(|_| BridgeError::AgentCrashed)?;
-                    let parsed = crate::wire::parse_nonstream(&body).map_err(|_| BridgeError::FrameError)?;
-                    if !parsed.text.is_empty() { yield Update::Text(parsed.text.clone()); }
-                    parsed
+                    let p = crate::wire::parse_nonstream(&body).map_err(|_| BridgeError::FrameError)?;
+                    if !p.text.is_empty() { yield Update::Text(p.text.clone()); }
+                    p
                 };
 ```
-(Remove the old streaming-only block this replaces.)
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -1422,12 +1555,16 @@ async fn deny_through_translator_does_not_suspend() {
         .run(&backend, &store, &policy, &task, &session, vec![Part { text: "what time is it".into() }])
         .collect().await;
 
-    // 1) The run COMPLETED — it did NOT yield PermissionRequired (no suspend).
+    // 1) The run COMPLETED — every event Ok (NO PermissionRequired suspend).
     assert!(events.iter().all(|e| e.is_ok()), "translator must not error/suspend: {events:?}");
-    // 2) No pending permission was persisted.
+    // 2) No pending permission persisted.
     assert!(store.take_pending(&task).await.unwrap().is_none(), "no pending — backend decided silently");
-    // 3) The deny reached the model as a tool result; the stub tool did not run.
+    // 3) EXACTLY two completions — a tool round + one follow-up. With the default
+    //    max_tool_rounds=4, a loop-to-bail would have made 4 requests; 2 proves the
+    //    turn reached a normal `stop` terminal, not a max_tool_rounds bail (review: Codex-6).
     let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2, "tool round + one follow-up = two completions");
+    // 4) The deny reached the model as a tool result; the stub tool did NOT run.
     let second = String::from_utf8_lossy(&reqs[1].body);
     assert!(second.contains("permission denied: tool not executed"));
     assert!(!second.contains("2026-01-01T00:00:00Z"));
@@ -1526,9 +1663,16 @@ This requires `SseAccumulator` to be reachable as `bridge_api::wire::SseAccumula
 Run: `cargo test -p bridge-api --test corpus_replay`
 Expected: PASS (3 tests).
 
-- [ ] **Step 4: Refactor the wiremock tests to source bodies from the fixture (DoD-6 single-source)**
+- [ ] **Step 4: Source the TOOL stub body from the fixture (DoD-6 single-source)**
 
-In `tests/wiremock_turns.rs`, replace the inline `text_round_trip` SSE body literal with the fixture's `text_turn_sse`, and the tool-call body with `tool_turn_sse` (load via a small `fixture()` helper duplicated or shared through a `mod common`). Run `cargo test -p bridge-api` → PASS.
+To make the fixture the real source of stub bodies (not decorative — review Claude/Codex), have the tool-path tests load the **tool** body from the fixture. Add to `tests/wiremock_turns.rs` a helper:
+```rust
+fn fixture_tool_sse() -> String {
+    let v: serde_json::Value = serde_json::from_str(include_str!("fixtures/ollama-openai-compat.json")).unwrap();
+    v["tool_turn_sse"].as_str().unwrap().to_string()
+}
+```
+and replace the inline `call1` literal in `tool_approve_path_executes_and_feeds_result` (and the `tool_then_text` helper used by deny/abstain) with `fixture_tool_sse()`. Those tests assert on the tool-call **id/result** (`call_1`, the stub result), which the fixture's `tool_turn_sse` provides — so no assertion drift. Leave DoD-1's `text_round_trip` inline (it specifically tests multi-delta text accumulation, which the single-delta fixture text would not exercise). Run `cargo test -p bridge-api` → PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1582,11 +1726,15 @@ async fn api_live_two_turns() {
     assert!(!text1.trim().is_empty(), "turn 1 produced text");
     assert!(matches!(t1.last(), Some(Update::Done { .. })));
 
-    // Turn 2: force a tool call.
-    let t2 = run(&be, &s, "What time is it? You MUST call the get_current_time tool.").await;
+    // Turn 2: force a tool call. The stub tool returns "2026-01-01T00:00:00Z";
+    // if it actually ran AND its result reached the follow-up completion, the
+    // model's final answer references 2026 (review Codex-5: prove the tool ran,
+    // not just that the turn ended).
+    let t2 = run(&be, &s, "What is the current time? You MUST call the get_current_time tool, then state the time it returned.").await;
+    let text2: String = t2.iter().filter_map(|u| if let Update::Text(t)=u {Some(t.clone())} else {None}).collect();
     assert!(matches!(t2.last(), Some(Update::Done { .. })));
-    // No Permission is ever emitted (silent decision).
-    assert!(!t2.iter().any(|u| matches!(u, Update::Permission(_))));
+    assert!(!t2.iter().any(|u| matches!(u, Update::Permission(_)))); // silent decision
+    assert!(text2.contains("2026"), "the stub tool's result reached the model's answer: {text2:?}");
 }
 ```
 
@@ -1608,25 +1756,21 @@ git commit -m "test(api): gated live Ollama 2-turn smoke (DoD-7)"
 
 ---
 
-## Task 15: Domain ripple — `cmd: Option`, `base_url`, `api_key_env` (Phase B begins)
+## Task 15: Surface-A ripple — ONE atomic green commit (Phase B)
 
-**Files:**
-- Modify: `crates/bridge-core/src/domain.rs`
-- Modify: `bin/a2a-bridge/src/route.rs:95`, `crates/bridge-a2a-inbound/src/server.rs:1683`
+**Why atomic (review: both — Codex-B2 / Claude-B1):** changing `AgentEntry.cmd: String → Option<String>` and adding `AgentKind::Api` breaks ~10 sites at once (`main.rs:107` non-exhaustive `match`; `registry::validate`'s `e.cmd`/`format!`; the `cmd` consumers in `main.rs`/`config.rs`; the e2e spawn factory; several `AgentEntry` literals). There is **no ordering that keeps the workspace compiling between these edits** — so they land in a SINGLE commit. The backend crate (Phase A) is already built and depends on none of this, so this is the only big-bang step.
 
-- [ ] **Step 1: Write the failing test**
+**Files (all in one commit):** `crates/bridge-core/src/domain.rs`, `bin/a2a-bridge/src/route.rs`, `crates/bridge-a2a-inbound/src/server.rs`, `bin/a2a-bridge/src/config.rs`, `crates/bridge-registry/src/registry.rs`, `bin/a2a-bridge/src/main.rs`, `bin/a2a-bridge/Cargo.toml`, `bin/a2a-bridge/tests/e2e_registry.rs`, `bin/a2a-bridge/tests/common/mod.rs`.
 
-In `crates/bridge-core/src/domain.rs` add to the `tests` module:
+- [ ] **Step 1: Write the new tests (they won't compile until Step 2 — that IS the red)**
+
+(a) `crates/bridge-core/src/domain.rs` tests:
 ```rust
 #[test]
 fn agent_entry_cmd_is_optional_and_has_url_fields() {
     let e = AgentEntry {
-        id: AgentId::parse("ollama").unwrap(),
-        cmd: None,
-        args: vec![],
-        kind: AgentKind::Api,
-        base_url: Some("http://localhost:11434/v1".into()),
-        api_key_env: None,
+        id: AgentId::parse("ollama").unwrap(), cmd: None, args: vec![], kind: AgentKind::Api,
+        base_url: Some("http://localhost:11434/v1".into()), api_key_env: None,
         model_provider: None, model: None, effort: None, mode: None, cwd: None,
         auth_method: None, name: None, description: None, tags: vec![], version: None,
         extensions: Default::default(),
@@ -1636,67 +1780,13 @@ fn agent_entry_cmd_is_optional_and_has_url_fields() {
     assert_eq!(e.kind, AgentKind::Api);
 }
 ```
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `cargo test -p bridge-core domain::`
-Expected: FAIL to compile — `cmd` expects `String`, `base_url`/`api_key_env`/`AgentKind::Api` don't exist.
-
-- [ ] **Step 3: Implement**
-
-In `domain.rs`: add the enum variant and change the struct:
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AgentKind {
-    #[default]
-    Acp,
-    /// Non-process OpenAI-compatible HTTP backend (bridge-api).
-    Api,
-}
-```
-In `AgentEntry`:
-```rust
-    pub cmd: Option<String>,
-    pub args: Vec<String>,
-    pub kind: AgentKind,
-    /// Non-process backends (kind="api"): the OpenAI-compatible base URL.
-    pub base_url: Option<String>,
-    /// kind="api": NAME of an env var holding a bearer token (never the secret).
-    pub api_key_env: Option<String>,
-```
-Fix the two existing `AgentEntry` literals in `domain.rs` tests (`agent_entry_carries_kind`, `effective_config_layers_override_over_entry`): set `cmd: Some("…".into())`, add `base_url: None, api_key_env: None`.
-
-In `bin/a2a-bridge/src/route.rs:95` and `crates/bridge-a2a-inbound/src/server.rs:1683`, update those `AgentEntry { … }` literals: `cmd: Some("…".into()), base_url: None, api_key_env: None`.
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `cargo build --workspace` (find every literal the compiler flags) then `cargo test -p bridge-core domain::`
-Expected: build surfaces remaining literals (fix each: `cmd: Some(..)`, add the two `None` fields); test PASSES. Note: `crates/bridge-registry`, `bin/a2a-bridge/src/config.rs`, `main.rs`, e2e/common will still fail to build — fixed in Tasks 16-20. To keep THIS task green, scope the test run to bridge-core: `cargo test -p bridge-core`.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/bridge-core/src/domain.rs bin/a2a-bridge/src/route.rs crates/bridge-a2a-inbound/src/server.rs
-git commit -m "feat(core): AgentKind::Api + AgentEntry cmd:Option + base_url/api_key_env"
-```
-
----
-
-## Task 16: Config parsing — `parse_kind`, TOML struct, `into_snapshot`, validation
-
-**Files:**
-- Modify: `bin/a2a-bridge/src/config.rs`
-
-- [ ] **Step 1: Write the failing tests**
-
-Add to `config.rs` tests:
+(b) `bin/a2a-bridge/src/config.rs` tests (note: `[server]` is REQUIRED — `RegistryConfig.server` has no `#[serde(default)]`):
 ```rust
 #[test]
 fn parse_kind_accepts_api() {
     assert_eq!(parse_kind("api").unwrap(), bridge_core::domain::AgentKind::Api);
     assert!(parse_kind("bogus").is_err());
 }
-
 #[test]
 fn api_entry_parses_without_cmd() {
     let toml = r#"
@@ -1706,51 +1796,65 @@ id = "ollama"
 kind = "api"
 base_url = "http://localhost:11434/v1"
 model = "qwen3.5:9b"
+[server]
+addr = "127.0.0.1:8080"
 "#;
     let snap = RegistryConfig::parse(toml).unwrap().into_snapshot().unwrap();
     let e = snap.entries.iter().find(|e| e.id.as_str() == "ollama").unwrap();
     assert!(e.cmd.is_none());
     assert_eq!(e.base_url.as_deref(), Some("http://localhost:11434/v1"));
-    // allowed_cmds union skips the None cmd:
-    assert!(snap.allowed_cmds.is_empty() || !snap.allowed_cmds.iter().any(|c| c.is_empty()));
+    assert!(!snap.allowed_cmds.iter().any(|c| c.is_empty()), "None cmd skipped in union");
 }
-
 #[test]
 fn api_entry_with_cmd_is_rejected() {
-    let toml = r#"
-default = "x"
-[[agents]]
-id = "x"
-kind = "api"
-base_url = "http://h/v1"
-cmd = "should-not-be-here"
-"#;
+    let toml = "default=\"x\"\n[[agents]]\nid=\"x\"\nkind=\"api\"\nbase_url=\"http://h/v1\"\ncmd=\"nope\"\n[server]\naddr=\"127.0.0.1:8080\"\n";
     assert!(RegistryConfig::parse(toml).unwrap().into_snapshot().is_err());
 }
-
 #[test]
 fn acp_entry_without_cmd_is_rejected() {
-    let toml = r#"
-default = "x"
-[[agents]]
-id = "x"
-kind = "acp"
-"#;
+    let toml = "default=\"x\"\n[[agents]]\nid=\"x\"\nkind=\"acp\"\n[server]\naddr=\"127.0.0.1:8080\"\n";
     assert!(RegistryConfig::parse(toml).unwrap().into_snapshot().is_err());
 }
 ```
-(Match `RegistryConfig::parse` to the actual constructor name in `config.rs`.)
+(c) `crates/bridge-registry/src/registry.rs` tests (add an `api_snap()` helper + a `base_url_change_replaces_slot` cloned from the existing `cmd_change_replaces_slot`):
+```rust
+fn api_snap() -> RegistrySnapshot {
+    RegistrySnapshot {
+        default: AgentId::parse("ollama").unwrap(),
+        entries: vec![AgentEntry {
+            id: AgentId::parse("ollama").unwrap(), cmd: None, args: vec![], kind: AgentKind::Api,
+            base_url: Some("http://h/v1".into()), api_key_env: None,
+            model_provider: None, model: None, effort: None, mode: None, cwd: None,
+            auth_method: None, name: None, description: None, tags: vec![], version: None,
+            extensions: Default::default(),
+        }],
+        allowed_cmds: vec![],
+    }
+}
+#[test] fn validate_allows_api_entry_without_cmd() { assert!(validate(&api_snap()).is_ok()); }
+#[test] fn validate_rejects_api_entry_missing_base_url() {
+    let mut s = api_snap(); s.entries[0].base_url = None; assert!(validate(&s).is_err());
+}
+```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run to confirm it does NOT compile yet**
 
-Run: `cargo test -p a2a-bridge --lib config::`
-Expected: FAIL — `parse_kind("api")` errors; TOML `cmd`/`base_url` types mismatch.
+Run: `cargo build --workspace`
+Expected: compile errors (the type/enum changes are not yet made). This is the "failing test" for an atomic type-change ripple.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement the full ripple (all files, one commit)**
 
-In `config.rs`:
-- The raw TOML agent struct: `cmd: Option<String>` (was `String`); add `pub base_url: Option<String>`, `pub api_key_env: Option<String>`.
-- `parse_kind`:
+**`crates/bridge-core/src/domain.rs`:**
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentKind { #[default] Acp, /// non-process OpenAI-compatible HTTP backend
+    Api }
+```
+In `AgentEntry`: `pub cmd: Option<String>,` and add `pub base_url: Option<String>,` + `pub api_key_env: Option<String>,`. Fix the two `AgentEntry` literals in `domain.rs` tests (`cmd: Some("…".into()), base_url: None, api_key_env: None`).
+
+**`bin/a2a-bridge/src/route.rs:95`, `crates/bridge-a2a-inbound/src/server.rs:1683`:** update each `AgentEntry { … }` literal: `cmd: Some("…".into()), base_url: None, api_key_env: None`.
+
+**`bin/a2a-bridge/src/config.rs`** — the raw TOML struct `AgentEntryToml`: change `pub cmd: String` → `#[serde(default)] pub cmd: Option<String>` (the `#[serde(default)]` is REQUIRED — without it TOML parse fails before the kind check, review Claude); add `#[serde(default)] pub base_url: Option<String>` and `#[serde(default)] pub api_key_env: Option<String>`. `parse_kind`:
 ```rust
 fn parse_kind(s: &str) -> Result<AgentKind, ConfigError> {
     Ok(match s {
@@ -1760,76 +1864,21 @@ fn parse_kind(s: &str) -> Result<AgentKind, ConfigError> {
     })
 }
 ```
-- `into_snapshot`: the `allowed_cmds` default union → `self.agents.iter().filter_map(|a| a.cmd.clone())`; assign `base_url: a.base_url`, `api_key_env: a.api_key_env`, `cmd: a.cmd` onto each `AgentEntry`. After building each entry, the parse-shape check:
+In `into_snapshot`: allowed_cmds default union → `self.agents.iter().filter_map(|a| a.cmd.clone())`; in the `for a in self.agents` loop, AFTER `let kind = …` and BEFORE `let id = AgentId::parse(a.id)…` (so `a.id`/`a.cmd`/`a.base_url` are still owned), add the parse-shape guard:
 ```rust
-match kind {
-    AgentKind::Acp if a_cmd.is_none() =>
-        return Err(ConfigError::Registry(format!("acp agent {:?} requires cmd", id.as_str()))),
-    AgentKind::Api if a_base_url.is_none() =>
-        return Err(ConfigError::Registry(format!("api agent {:?} requires base_url", id.as_str()))),
-    AgentKind::Api if a_cmd.is_some() =>
-        return Err(ConfigError::Registry(format!("api agent {:?} must not set cmd", id.as_str()))),
-    _ => {}
-}
+        match kind {
+            AgentKind::Acp if a.cmd.is_none() =>
+                return Err(ConfigError::Registry(format!("acp agent {:?} requires cmd", a.id))),
+            AgentKind::Api if a.base_url.is_none() =>
+                return Err(ConfigError::Registry(format!("api agent {:?} requires base_url", a.id))),
+            AgentKind::Api if a.cmd.is_some() =>
+                return Err(ConfigError::Registry(format!("api agent {:?} must not set cmd", a.id))),
+            _ => {}
+        }
 ```
-(bind `a_cmd`/`a_base_url` before the entry is moved.)
+and on the `AgentEntry { … }` it builds, set `cmd: a.cmd, base_url: a.base_url, api_key_env: a.api_key_env`.
 
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `cargo test -p a2a-bridge --lib config::`
-Expected: PASS (4 new tests + existing).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add bin/a2a-bridge/src/config.rs
-git commit -m "feat(config): parse kind=api, optional cmd, base_url validation"
-```
-
----
-
-## Task 17: `registry::validate` fix + reuse-identity + tests
-
-**Files:**
-- Modify: `crates/bridge-registry/src/registry.rs`
-
-- [ ] **Step 1: Write the failing test**
-
-Add to `registry.rs` tests (mirror the existing `cmd_change_replaces_slot` test for the new one — locate it first):
-```rust
-#[test]
-fn validate_allows_api_entry_without_cmd() {
-    let snap = RegistrySnapshot {
-        default: AgentId::parse("ollama").unwrap(),
-        entries: vec![AgentEntry {
-            id: AgentId::parse("ollama").unwrap(), cmd: None, args: vec![], kind: AgentKind::Api,
-            base_url: Some("http://h/v1".into()), api_key_env: None,
-            model_provider: None, model: None, effort: None, mode: None, cwd: None,
-            auth_method: None, name: None, description: None, tags: vec![], version: None,
-            extensions: Default::default(),
-        }],
-        allowed_cmds: vec![], // no cmds — must NOT reject the api entry
-    };
-    assert!(validate(&snap).is_ok());
-}
-
-#[test]
-fn validate_rejects_api_entry_missing_base_url() {
-    let mut snap = api_snap();          // helper building the above
-    snap.entries[0].base_url = None;
-    assert!(validate(&snap).is_err());
-}
-```
-(Add an `api_snap()` helper in the test module returning the valid snapshot above. Also add a `base_url_change_replaces_slot` test cloned from `cmd_change_replaces_slot`, mutating `base_url` instead of `cmd` and asserting the slot Arc changes.)
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `cargo test -p bridge-registry`
-Expected: FAIL to compile — `e.cmd` is now `Option`, `format!("{}", e.cmd)` has no `Display`; the api entry would be rejected.
-
-- [ ] **Step 3: Implement**
-
-In `validate` (`registry.rs:~94`):
+**`crates/bridge-registry/src/registry.rs`** — `validate` (`:~94`), replace the per-entry body:
 ```rust
     for e in &snap.entries {
         if !seen.insert(e.id.clone()) {
@@ -1851,55 +1900,22 @@ In `validate` (`registry.rs:~94`):
                 if e.cmd.is_some() {
                     return Err(BridgeError::ConfigInvalid { reason: format!("api agent {} must not set cmd", e.id.as_str()) });
                 }
-                // No allowed_cmds gate — a non-process backend has no command to allow.
             }
         }
     }
 ```
-Reuse-identity (`:~245`): add `&& c.base_url == e.base_url` to the boolean tuple. Fix the test-only `.cmd = "…".into()` mutations at `:559`/`:646` → `cmd = Some("…".into())`, and the literal at `:349` (+ `base_url: None, api_key_env: None`).
+Reuse-identity (`:~245`): add `&& c.base_url == e.base_url` to the tuple. Fix the test-only literal at `:349` (`cmd: Some(..), base_url: None, api_key_env: None`) and the `.cmd = "…".into()` mutations at `:559`/`:646` → `cmd = Some("…".into())`. Add the `api_snap`/validate tests + `base_url_change_replaces_slot` from Step 1.
 
-- [ ] **Step 4: Run to verify it passes**
+**`bin/a2a-bridge/Cargo.toml`:** add `bridge-api = { path = "../../crates/bridge-api" }` to `[dependencies]`, and to `[dev-dependencies]` add `bridge-api = { path = "../../crates/bridge-api" }` and `wiremock = "0.6"` (the dev-dep is used by Task 16's e2e).
 
-Run: `cargo test -p bridge-registry`
-Expected: PASS (incl. `base_url_change_replaces_slot`).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/bridge-registry/src/registry.rs
-git commit -m "feat(registry): validate kind-invariant + skip allowed-cmds for api; base_url in reuse identity"
-```
-
----
-
-## Task 18: Factory `Api` arm + bin dependency
-
-**Files:**
-- Modify: `bin/a2a-bridge/Cargo.toml`
-- Modify: `bin/a2a-bridge/src/main.rs`
-
-- [ ] **Step 1: Add the dep**
-
-`bin/a2a-bridge/Cargo.toml` `[dependencies]`: add
-```toml
-bridge-api = { path = "../../crates/bridge-api" }
-```
-
-- [ ] **Step 2: Implement the factory arms**
-
-In `main.rs` factory `match entry.kind` (`:107`), update the Acp arm to require `cmd` and add the Api arm:
+**`bin/a2a-bridge/src/main.rs`** — factory `match entry.kind` (`:107`):
 ```rust
                 AgentKind::Acp => {
                     let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
                         reason: format!("acp agent {} missing cmd", entry.id.as_str()),
                     })?;
-                    let acp = AcpConfig {
-                        cwd,
-                        model: entry.model.clone(),
-                        mode: entry.mode.clone(),
-                        auth_method: entry.auth_method.clone(),
-                        ..AcpConfig::default()
-                    };
+                    let acp = AcpConfig { cwd, model: entry.model.clone(), mode: entry.mode.clone(),
+                        auth_method: entry.auth_method.clone(), ..AcpConfig::default() };
                     let be = AcpBackend::spawn(cmd, &args_ref, acp).await?.with_policy(policy);
                     Ok(Arc::new(be) as Arc<dyn AgentBackend>)
                 }
@@ -1914,80 +1930,126 @@ In `main.rs` factory `match entry.kind` (`:107`), update the Acp arm to require 
                     Ok(Arc::new(be) as Arc<dyn AgentBackend>)
                 }
 ```
-(`AcpBackend::spawn(cmd, …)` now takes `cmd: &str` from the `as_deref()` — verify the existing signature accepts `&str`; the prior call passed `&entry.cmd` where `entry.cmd: String` derefs to `&str`, so this is unchanged.)
 
-- [ ] **Step 3: Run to verify**
-
-Run: `cargo build -p a2a-bridge` then `cargo test -p a2a-bridge`
-Expected: compiles; existing tests pass (the `cwd` var is still used by the Acp arm — no unused warning).
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add bin/a2a-bridge/Cargo.toml bin/a2a-bridge/src/main.rs Cargo.lock
-git commit -m "feat(bin): factory Api arm builds ApiBackend; Acp arm requires cmd"
-```
-
----
-
-## Task 19: Kind-aware e2e factory + `kind="api"` e2e (DoD-8)
-
-**Files:**
-- Modify: `bin/a2a-bridge/tests/e2e_registry.rs`, `bin/a2a-bridge/tests/common/mod.rs`
-
-- [ ] **Step 1: Make the test spawn factory kind-aware**
-
-In `tests/e2e_registry.rs:~114` the spawn closure calls `AcpBackend::spawn(&entry.cmd, …)`. Update it:
+**`bin/a2a-bridge/tests/e2e_registry.rs`** — make the `acp_spawn_fn()` closure (`:~99-114`) kind-aware (so an `api` entry spawns a real `ApiBackend`):
 ```rust
         match entry.kind {
-            bridge_core::domain::AgentKind::Acp => {
+            AgentKind::Acp => {
                 let cmd = entry.cmd.clone().expect("acp entry has cmd");
-                // ...existing AcpBackend::spawn(&cmd, ...) path...
+                // ...existing absolute-cwd + AcpBackend::spawn(&cmd, &args_ref, acp) path,
+                //    just sourcing `cmd` from the Option instead of `&entry.cmd`...
             }
-            bridge_core::domain::AgentKind::Api => {
+            AgentKind::Api => {
                 let mut cfg = bridge_api::ApiConfig::new(entry.base_url.clone().expect("api entry has base_url"));
                 cfg.model = entry.model.clone();
                 Ok(std::sync::Arc::new(bridge_api::ApiBackend::new(cfg)) as std::sync::Arc<dyn AgentBackend>)
             }
         }
 ```
-Add `bridge-api` to `bin/a2a-bridge/Cargo.toml` `[dev-dependencies]`. Fix the `AgentEntry` literals at `tests/e2e_registry.rs:211` and `tests/common/mod.rs:23` (`cmd: Some(..)`, `base_url`/`api_key_env`).
+Fix the `AgentEntry` literals at `tests/e2e_registry.rs:211` and `tests/common/mod.rs:23` (`cmd: Some(..), base_url: None, api_key_env: None`).
 
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 4: Verify the WHOLE workspace is green**
 
-Add to `tests/e2e_registry.rs` (use a `wiremock` server as the api endpoint; add `wiremock` to bin dev-deps):
-```rust
-#[tokio::test]
-async fn api_entry_resolves_and_serves_through_registry() {
-    let server = wiremock::MockServer::start().await;
-    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(wiremock::ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(sse))
-        .mount(&server).await;
-    // Build a snapshot with one kind="api" entry pointed at the mock, resolve via Registry,
-    // run one prompt turn through the resolved backend, assert "hi" + Done.
-    // (Mirror the existing multi-agent snapshot helper; append the api entry.)
-}
+Run:
+```bash
+cargo build --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
-(Fill the body using the file's existing snapshot+registry helpers — `four_agent_snapshot()`/resolve pattern — appending the api entry and pointing `base_url` at `format!("{}/v1", server.uri())`.)
+Expected: all three clean. (This is the single point where the ripple is integrated; from here every later task is additive.)
 
-Also add validation-rejection assertions: a snapshot with an api entry that sets `cmd` → `Registry::new` errors; an api entry missing `base_url` → errors.
-
-- [ ] **Step 3: Run to verify it fails, then passes**
-
-Run: `cargo test -p a2a-bridge --test e2e_registry api_entry`
-Expected: PASS after wiring.
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit (one atomic commit)**
 
 ```bash
-git add bin/a2a-bridge/tests/e2e_registry.rs bin/a2a-bridge/tests/common/mod.rs bin/a2a-bridge/Cargo.toml Cargo.lock
-git commit -m "test(e2e): kind-aware spawn factory + api entry through Registry (DoD-8)"
+git add crates/bridge-core/src/domain.rs bin/a2a-bridge/src/route.rs crates/bridge-a2a-inbound/src/server.rs \
+        bin/a2a-bridge/src/config.rs crates/bridge-registry/src/registry.rs bin/a2a-bridge/src/main.rs \
+        bin/a2a-bridge/Cargo.toml bin/a2a-bridge/tests/e2e_registry.rs bin/a2a-bridge/tests/common/mod.rs Cargo.lock
+git commit -m "feat(core): surface-A ripple — AgentKind::Api, cmd:Option, base_url; wire the api factory arm"
 ```
 
 ---
 
-## Task 20: CI coverage floor + full green sweep
+## Task 16: `kind="api"` e2e through the Registry (DoD-8)
+
+**Files:**
+- Modify: `bin/a2a-bridge/tests/e2e_registry.rs`
+
+The kind-aware spawn factory + literals + bin dev-deps landed in Task 15. This task adds the end-to-end test that an `api` entry resolves through `Registry` and serves a turn, plus the validation-rejection paths.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `tests/e2e_registry.rs`. Reuse the file's existing snapshot helper shape (e.g. `four_agent_snapshot()`); append one `api` entry pointed at a `wiremock` server. Full test:
+```rust
+#[tokio::test]
+async fn api_entry_resolves_and_serves_through_registry() {
+    use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
+    use bridge_core::ids::{AgentId, SessionId};
+    use bridge_core::ports::Update;
+    use futures::StreamExt;
+
+    let server = wiremock::MockServer::start().await;
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream").set_body_string(sse))
+        .mount(&server).await;
+
+    let mk = |id: &str, base: String| AgentEntry {
+        id: AgentId::parse(id).unwrap(), cmd: None, args: vec![], kind: AgentKind::Api,
+        base_url: Some(base), api_key_env: None,
+        model_provider: None, model: None, effort: None, mode: None, cwd: None,
+        auth_method: None, name: None, description: None, tags: vec![], version: None,
+        extensions: Default::default(),
+    };
+    let snap = RegistrySnapshot {
+        default: AgentId::parse("ollama").unwrap(),
+        entries: vec![mk("ollama", format!("{}/v1", server.uri()))],
+        allowed_cmds: vec![],
+    };
+    let reg = Registry::new(snap, acp_spawn_fn()).unwrap();
+    let resolved = reg.resolve(&AgentId::parse("ollama").unwrap()).await.unwrap();
+    let mut st = resolved.backend.prompt(&SessionId::parse("s1").unwrap(),
+        vec![Part { text: "hi".into() }]).await.unwrap();
+    let mut text = String::new();
+    let mut done = false;
+    while let Some(u) = st.next().await {
+        match u.unwrap() { Update::Text(t) => text.push_str(&t), Update::Done { .. } => done = true, _ => {} }
+    }
+    assert_eq!(text, "hi");
+    assert!(done);
+}
+
+#[test]
+fn registry_rejects_api_entry_with_cmd() {
+    use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot};
+    use bridge_core::ids::AgentId;
+    let bad = AgentEntry {
+        id: AgentId::parse("x").unwrap(), cmd: Some("nope".into()), args: vec![], kind: AgentKind::Api,
+        base_url: Some("http://h/v1".into()), api_key_env: None,
+        model_provider: None, model: None, effort: None, mode: None, cwd: None,
+        auth_method: None, name: None, description: None, tags: vec![], version: None,
+        extensions: Default::default(),
+    };
+    let snap = RegistrySnapshot { default: AgentId::parse("x").unwrap(), entries: vec![bad], allowed_cmds: vec![] };
+    assert!(Registry::new(snap, acp_spawn_fn()).is_err());
+}
+```
+
+- [ ] **Step 2: Run to verify it fails, then passes**
+
+Run: `cargo test -p a2a-bridge --test e2e_registry api_entry` then `registry_rejects_api`
+Expected: PASS (the kind-aware factory from Task 15 serves the api entry; `Registry::new` rejects the bad one).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add bin/a2a-bridge/tests/e2e_registry.rs
+git commit -m "test(e2e): api entry resolves+serves through Registry; validate rejections (DoD-8)"
+```
+
+---
+
+## Task 17: CI coverage floor + full green sweep
 
 **Files:**
 - Modify: `.github/workflows/ci.yml`
@@ -2002,24 +2064,22 @@ After the `bridge-acp` coverage step (`ci.yml:57`):
 
 - [ ] **Step 2: Verify coverage locally (after clean)**
 
-Run:
 ```bash
 cargo llvm-cov clean --workspace
 cargo llvm-cov --package bridge-api --fail-under-lines 90
 cargo llvm-cov --package bridge-core --fail-under-lines 90
 cargo llvm-cov --workspace --fail-under-lines 85
 ```
-Expected: all three pass. If `bridge-api` < 90, add offline tests for the uncovered arms (the live test is `#[ignore]` and adds no coverage). If `bridge-core` dropped below 90 from the domain change, add a domain test.
+Expected: all pass. If `bridge-api` < 90, add offline tests for the uncovered arms (the `#[ignore]` live test adds no coverage — the bearer-auth / unknown-tool / max-rounds / abstain / malformed / stream:false tests from Tasks 9-11 are what carry the floor). If `bridge-core` dropped below 90, add a domain test.
 
 - [ ] **Step 3: Full quality sweep**
 
-Run:
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
-Expected: fmt clean, clippy clean, all tests green.
+Expected: fmt clean, clippy clean, all green.
 
 - [ ] **Step 4: Commit**
 
@@ -2030,14 +2090,14 @@ git commit -m "ci: bridge-api 90% line-coverage floor"
 
 ---
 
-## Task 21: ADR-0007
+## Task 18: ADR-0007
 
 **Files:**
 - Create: `docs/adr/0007-api-backend.md`
 
 - [ ] **Step 1: Write the ADR**
 
-Create `docs/adr/0007-api-backend.md` recording: the non-process OpenAI-compatible API backend (`kind="api"`); the surface-A ripple (`cmd→Option`, `registry::validate`, factory) and surface-B evidence (the `PolicyEngine` port absorbs a client-side function-calling permission model unchanged, decided silently); the **refined conductor finding** (the `Update::Permission`/translator suspend path is NOT reusable for non-interactive client-side denials — it keys on policy `Err`, not `interactive`, and the backend has no resume — so per-tool/non-interactive permission needs port enrichment) + tool-blindness; that this is the cheap/free B1 replacement and the conductor re-eval stays parked, now with two backend kinds (ACP process + API non-process) as evidence.
+Create `docs/adr/0007-api-backend.md` recording: the non-process OpenAI-compatible API backend (`kind="api"`); the surface-A ripple (`cmd→Option`, the `registry::validate` kind-invariant, the factory arm) and surface-B evidence (the `PolicyEngine` port absorbs a client-side function-calling permission model unchanged, decided **silently**); the **refined conductor finding** (the `Update::Permission`/translator suspend path is NOT reusable for non-interactive client-side denials — it keys on policy `Err`, not `interactive`, and the backend has no resume — so per-tool/non-interactive permission needs port enrichment) + tool-blindness; that this is the cheap/free B1 replacement and the conductor re-eval stays parked, now with **two backend kinds** (ACP process + API non-process) as evidence.
 
 - [ ] **Step 2: Commit (controller doc — trailer REQUIRED)**
 
@@ -2053,7 +2113,7 @@ EOF
 
 ---
 
-## Task 22: Final verification
+## Task 19: Final verification
 
 - [ ] **Step 1: Clean coverage + full suite**
 
@@ -2069,7 +2129,7 @@ cargo test --workspace
 ```
 Expected: all green.
 
-- [ ] **Step 2: Confirm DoD checklist** (spec §6): DoD-1..8 each map to a passing test; DoD-7 is `#[ignore]` (run manually if Ollama available). The backend yields only `Text`/`Done` (grep `Update::Permission` in `bridge-api/src` → zero hits).
+- [ ] **Step 2: Confirm DoD checklist** (spec §6): DoD-1..8 each map to a passing test; DoD-7 is `#[ignore]` (run manually if Ollama available). The backend yields only `Text`/`Done` — grep `Update::Permission` in `crates/bridge-api/src` → **zero hits**.
 
 - [ ] **Step 3: Hand back to the controller** for the holistic review + merge (finishing-a-development-branch).
 
@@ -2077,6 +2137,7 @@ Expected: all green.
 
 ## Self-Review notes (controller)
 
-- **Spec coverage:** §2 → Tasks 15-16; §3 → Tasks 15-19; §4.1 → Tasks 2/6/7/11; §4.2 → Tasks 7/8/11; §4.3 (silent) → Tasks 8/9/12; §4.5 tool → Task 1; §4.6 cancel/error → Tasks 7/10; §5 → Tasks 4/5; §6 DoD-1..8 → Tasks 7/8/12/10/10/13/14/19; coverage → Task 20; ADR → Task 21. No gap.
-- **Ordering:** the crate (Phase A, Tasks 0-14) builds against the *current* bridge-core (it never references `AgentKind`), so the domain ripple (Phase B, Tasks 15-19) can't break it. Phase B keeps each task's touched crate green by scoping test runs; the workspace is green again by Task 18.
-- **TDD throughout; one logical change per commit; no `Co-Authored-By` on subagent commits (Task 21 controller doc excepted).**
+- **Spec coverage:** §2 → Task 15; §3 → Tasks 15-16; §4.1 → Tasks 2/6/7/11; §4.2 → Tasks 7/8/11; §4.3 (silent) → Tasks 8/9/12; §4.5 tool → Task 1; §4.6 cancel/error → Tasks 7/10; §5 → Tasks 4/5; §6 DoD-1..8 → Tasks 7/8/12/10/10/13/14/16; coverage → Task 17; ADR → Task 18. No gap.
+- **Green-per-task (review-fixed):** Phase A (Tasks 0-14) builds against the *current* `bridge-core` (it never references `AgentKind`), so it is immune to Phase B. The surface-A ripple is a **single atomic commit** (Task 15) — there is no compiling intermediate, so it is not split. Every other task leaves `cargo build/clippy/test --workspace` green.
+- **Rev2 fold:** Codex+Claude plan review — both blockers (atomic ripple, Task-0 re-export) + majors (`result_unit_err`, `[server]`/test-command, `serde(default)`, DoD-4 `watch`+`select!` cancel, exact-JSON assertions, placeholders→complete code, coverage tests) folded; see the rev2 header.
+- **TDD throughout; one logical change per commit; no `Co-Authored-By` on subagent commits (Task 18 controller doc excepted).**
