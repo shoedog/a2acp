@@ -12,11 +12,26 @@ use bridge_core::ports::{AgentRegistry, RouteDecision};
 /// the agent specified by `meta.agent`, or the registry default.
 pub struct SkillRoute {
     registry: Arc<dyn AgentRegistry>,
+    workflows: std::collections::HashSet<String>,
 }
 
 impl SkillRoute {
     pub fn new(registry: Arc<dyn AgentRegistry>) -> Self {
-        Self { registry }
+        Self { registry, workflows: std::collections::HashSet::new() }
+    }
+
+    /// Construct with the boot-time set of known workflow ids (Task 9's routing arm reads this).
+    // Task 9 will call this from main; allow until then.
+    #[allow(dead_code)]
+    pub fn with_workflows(registry: Arc<dyn AgentRegistry>, workflows: std::collections::HashSet<String>) -> Self {
+        Self { registry, workflows }
+    }
+
+    /// True if `id` names a configured workflow.
+    // Task 9 will call this in the route arm; allow until then.
+    #[allow(dead_code)]
+    pub fn knows_workflow(&self, id: &str) -> bool {
+        self.workflows.contains(id)
     }
 }
 
@@ -174,5 +189,18 @@ mod tests {
             .unwrap(),
             RouteTarget::Fanout
         ));
+    }
+
+    #[test]
+    fn with_workflows_stores_and_reports_ids() {
+        let r = SkillRoute::with_workflows(
+            FakeRegistry::new("codex"),
+            ["code-review".to_string(), "triage".to_string()].into_iter().collect(),
+        );
+        assert!(r.knows_workflow("code-review"));
+        assert!(r.knows_workflow("triage"));
+        assert!(!r.knows_workflow("nope"));
+        // a SkillRoute::new(...) (no workflows) knows none
+        assert!(!skill_route_with_default("codex").knows_workflow("code-review"));
     }
 }
