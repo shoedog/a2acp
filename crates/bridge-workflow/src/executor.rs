@@ -37,14 +37,33 @@ impl WorkflowExecutor {
         let session = match SessionId::parse(format!("workflow-{}-{}-{}", wf_id, node.id.as_str(), run_id)) {
             Ok(s) => s, Err(_) => return (format!("[node {} failed: bad session id]", node.id.as_str()), false),
         };
-        let resolved = match self.registry.resolve(&node.agent).await {
-            Ok(r) => r, Err(e) => return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false),
+        // resolve, with cancel
+        let resolved = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return (format!("[node {} canceled]", node.id.as_str()), false),
+            r = self.registry.resolve(&node.agent) => match r {
+                Ok(r) => r,
+                Err(e) => return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false),
+            },
         };
         let eff = effective_config(&resolved.entry, None);
-        let _ = resolved.backend.configure_session(&session, &eff).await;
-        let mut stream = match resolved.backend.prompt(&session, vec![Part { text: rendered }]).await {
-            Ok(s) => s, Err(e) => { resolved.backend.forget_session(&session).await;
-                return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false); }
+        let _ = resolved.backend.configure_session(&session, &eff).await; // best-effort (no-op default)
+        if cancel.is_cancelled() {
+            resolved.backend.forget_session(&session).await;
+            return (format!("[node {} canceled]", node.id.as_str()), false);
+        }
+        // prompt, with cancel
+        let mut stream = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                resolved.backend.forget_session(&session).await;
+                return (format!("[node {} canceled]", node.id.as_str()), false);
+            }
+            s = resolved.backend.prompt(&session, vec![Part { text: rendered }]) => match s {
+                Ok(s) => s,
+                Err(e) => { resolved.backend.forget_session(&session).await;
+                    return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false); }
+            },
         };
         let mut text = String::new();
         let mut ok = true;
@@ -95,18 +114,19 @@ impl WorkflowExecutor {
                     async move {
                         let vars: HashMap<&str, &str> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                         let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel).await;
-                        (node.id.as_str().to_string(), text, ok)
+                        (node.id.clone(), text, ok)
                     }
                 });
-                for (id, text, ok) in futures::future::join_all(futs).await {
-                    yield Ok(WorkflowEvent::NodeFinished { node: NodeId::parse(&id).unwrap(), ok });
-                    done.insert(id.clone());
-                    outputs.insert(id, (text, ok));
+                for (node_id, text, ok) in futures::future::join_all(futs).await {
+                    yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok });
+                    done.insert(node_id.as_str().to_string());
+                    outputs.insert(node_id.as_str().to_string(), (text, ok));
                 }
             }
             let (term_text, term_ok) = outputs.get(&terminal_id).cloned().unwrap_or_default();
-            let outcome = if cancel.is_cancelled() { WorkflowOutcome::Canceled }
-                else if term_ok { WorkflowOutcome::Completed } else { WorkflowOutcome::Failed };
+            let outcome = if term_ok { WorkflowOutcome::Completed }
+                else if cancel.is_cancelled() { WorkflowOutcome::Canceled }
+                else { WorkflowOutcome::Failed };
             yield Ok(WorkflowEvent::Terminal { outcome, output: term_text });
         })
     }
@@ -331,5 +351,38 @@ mod tests {
         assert!(matches!(evs.last().unwrap().as_ref().unwrap(),
             WorkflowEvent::Terminal { outcome: WorkflowOutcome::Canceled, .. }));
         assert_eq!(*rec.cancels.lock().unwrap(), 1, "backend.cancel was called for the in-flight node");
+    }
+
+    #[tokio::test]
+    async fn cancel_during_slow_prompt_ends_canceled_promptly() {
+        struct SlowPrompt;
+        #[async_trait::async_trait]
+        impl AgentBackend for SlowPrompt {
+            async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await; // long setup
+                Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done { stop_reason: "end_turn".into() })])))
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> { Ok(()) }
+        }
+        struct SReg;
+        #[async_trait::async_trait]
+        impl AgentRegistry for SReg {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                Ok(Resolved { entry: Arc::new(minimal_entry(id)), backend: Arc::new(SlowPrompt), lease: Box::new(NoopLease) })
+            }
+            fn default_id(&self) -> AgentId { AgentId::parse("a").unwrap() }
+            async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> { Ok(()) }
+            fn list(&self) -> Vec<AgentId> { vec![] }
+        }
+        let token = CancellationToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move { tokio::time::sleep(std::time::Duration::from_millis(20)).await; t2.cancel(); });
+        let ex = WorkflowExecutor::new(Arc::new(SReg));
+        // Must finish well under the 10s prompt sleep → the cancel preempted setup.
+        let evs = tokio::time::timeout(std::time::Duration::from_secs(2),
+            ex.run(one_node_graph(), "x".into(), "r".into(), token).collect::<Vec<_>>()).await
+            .expect("cancel preempts the slow prompt setup");
+        assert!(matches!(evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal { outcome: WorkflowOutcome::Canceled, .. }));
     }
 }
