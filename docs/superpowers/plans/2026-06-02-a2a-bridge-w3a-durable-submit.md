@@ -12,10 +12,14 @@
 
 **Branch:** `feat/w3a-durable-submit` off `main`.
 
-**Spec deviations discovered during planning (grounded against the code):**
-- `a2a::new_task_id()` does not exist → mint with `uuid::Uuid::new_v4()`.
-- The SDK has no list-tasks method → `tasks/list` is a bridge-defined `const LIST_TASKS: &str = "tasks/list"`.
-- `task_id_from_params` returns a fixed `"task-1"` for no-id sends (confirmed) → detached path must NOT use it for id minting.
+**Status:** rev2 — dual-reviewed (Codex gpt-5.5 executability + Claude opus-4.8 architecture); blockers + coverage gaps folded in (SDK constants, CLI fix, gated-test fix, Failed/Canceled/sweep tests, Agent Card task).
+
+**Grounding notes (corrected after the plan dual review read the `a2a-lf 0.3.0` crate):**
+- `a2a::new_task_id()` **DOES exist** (UUIDv7; `a2a::TaskId` is a `String` alias) → mint with `TaskId::parse(a2a::new_task_id())`. **No `uuid` dep.**
+- `a2a::methods::LIST_TASKS` **DOES exist** (`"ListTasks"`, with `ListTasksRequest`/`Response`) → use it; do **NOT** invent a `tasks/list` constant.
+- **All** A2A dispatch + the CLI use the SDK constants `a2a::methods::{SEND_MESSAGE, GET_TASK, CANCEL_TASK, LIST_TASKS}` (the server matches these CamelCase values, e.g. `"SendMessage"`); the version header is `a2a::SVC_PARAM_VERSION` (`"A2A-Version"`, value `"1.0"`). The Task 15 CLI MUST use these, not slash-style strings.
+- `a2a::TaskStatus.message` is `Option<a2a::Message>` (NOT `Option<String>`) → `get_task` sets `message: None` and surfaces the error text via an artifact.
+- `task_id_from_params` returns a fixed `"task-1"` for no-id sends (confirmed) → the detached path mints its own id, never that.
 
 ---
 
@@ -847,15 +851,9 @@ git commit -m "refactor(inbound): drain workflow over a WorkflowSink; streaming 
 - Modify: `crates/bridge-a2a-inbound/Cargo.toml`
 - Modify: `crates/bridge-a2a-inbound/src/server.rs`
 
-- [ ] **Step 1: Add deps (`uuid`); confirm NO `bridge-store`**
+- [ ] **Step 1: Confirm deps (no new dep needed); confirm NO `bridge-store`**
 
-In `crates/bridge-a2a-inbound/Cargo.toml` `[dependencies]`, add:
-
-```toml
-uuid = { version = "1", features = ["v4"] }
-```
-
-Confirm `bridge-store` is **not** listed (DoD-1). `bridge-core` is already a dep.
+No new dependency is required — `a2a` (for `new_task_id`/`methods`/`Task`) and `bridge-core` are already deps of `bridge-a2a-inbound`. **Do NOT add `uuid`.** Confirm `bridge-store` is **not** listed in `[dependencies]` (DoD-1) — the in-memory default must come from `bridge-core::task_store::MemoryTaskStore`.
 
 - [ ] **Step 2: Add the field + builder + default**
 
@@ -944,8 +942,9 @@ impl WorkflowSink for TaskStoreSink {
 }
 
 /// Drop guard: if the runner exits without finalizing (early return, error, or
-/// **panic**), write `Failed` and remove the cancel token, so a `Working` row is
-/// never permanently orphaned within a serve lifetime.
+/// **panic**), write `Failed` and remove the cancel token. Within a serve lifetime
+/// a `Working` row is then orphaned only if `set_terminal` itself fails to write
+/// (the named §8 gap); the boot sweep is the cross-restart backstop.
 pub(crate) struct Finalizer {
     pub(crate) store: Arc<dyn TaskStore>,
     pub(crate) task: TaskId,
@@ -1067,10 +1066,10 @@ Expected: FAIL — `spawn_detached_workflow_for_test` not found.
 In `crates/bridge-a2a-inbound/src/server.rs`, add:
 
 ```rust
-/// Mint a fresh unique task id for a detached submit. (NOT `task_id_from_params`,
-/// which returns the fixed `"task-1"` stub — unusable as a unique PK.)
+/// Mint a fresh unique task id for a detached submit (SDK UUIDv7). NOT
+/// `task_id_from_params`, which returns the fixed `"task-1"` stub.
 fn new_detached_task_id() -> TaskId {
-    TaskId::parse(uuid::Uuid::new_v4().to_string()).expect("uuid is non-empty")
+    TaskId::parse(a2a::new_task_id()).expect("new_task_id is non-empty")
 }
 
 /// Spawn the finalizer-guarded background runner for a detached workflow. Returns
@@ -1150,6 +1149,18 @@ pub fn spawn_detached_workflow_for_test(
     wf_id: bridge_core::ids::WorkflowId,
 ) -> tokio::task::JoinHandle<()> {
     let token = tokio_util::sync::CancellationToken::new();
+    spawn_detached_workflow(srv, task, text_parts, wf_id, token)
+}
+
+/// Test-only seam that takes an explicit token (so a cancel test can fire it).
+#[doc(hidden)]
+pub fn spawn_detached_workflow_with_token_for_test(
+    srv: &Arc<InboundServer>,
+    task: TaskId,
+    text_parts: Vec<String>,
+    wf_id: bridge_core::ids::WorkflowId,
+    token: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     spawn_detached_workflow(srv, task, text_parts, wf_id, token)
 }
 ```
@@ -1367,7 +1378,7 @@ async fn get_task(
         let t = a2a::Task {
             id: rec.id.as_str().to_owned(),
             context_id: rec.id.as_str().to_owned(),
-            status: a2a::TaskStatus { state, message: rec.error.clone(), timestamp: None },
+            status: a2a::TaskStatus { state, message: None, timestamp: None },
             artifacts,
             history: None,
             metadata: None,
@@ -1393,12 +1404,16 @@ fn task_record_to_a2a(
         TaskRecordStatus::Canceled => a2a::TaskState::Canceled,
         TaskRecordStatus::Interrupted => a2a::TaskState::Failed,
     };
-    let artifacts = rec.result.as_ref().map(|r| {
+    // Surface the result (success) or the error text (failed/interrupted) as the
+    // artifact — `TaskStatus.message` is `Option<a2a::Message>` and we keep it None,
+    // so the error must reach the wire via the artifact.
+    let payload = rec.result.clone().or_else(|| rec.error.clone());
+    let artifacts = payload.map(|r| {
         vec![a2a::Artifact {
             artifact_id: a2a::new_artifact_id(),
             name: None,
             description: None,
-            parts: vec![a2a::Part::text(r.clone())],
+            parts: vec![a2a::Part::text(r)],
             metadata: None,
             extensions: None,
         }]
@@ -1407,7 +1422,7 @@ fn task_record_to_a2a(
 }
 ```
 
-NOTE: the `a2a::TaskStatus.message` field is typed in the SDK — if it is not `Option<String>` but `Option<a2a::Message>`, set `message: None` and instead append the error to the artifact. Confirm the field type against `a2a::TaskStatus` and adjust (the failing-task error must surface SOMEWHERE the CLI can print). The `a2a::Artifact`/`Part::text` shape is copied from the existing builder (server.rs:1366).
+(The `a2a::Artifact`/`Part::text` shape is copied from the existing builder, server.rs:1366. `TaskStatus.message` is `Option<a2a::Message>` — confirmed by the plan review — so it stays `None`.)
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -1565,7 +1580,7 @@ async fn tasks_list_returns_recent_newest_first() {
     }
     let resp = srv
         .router()
-        .oneshot(post_request("tasks/list", json!({ "limit": 10 })))
+        .oneshot(post_request(methods::LIST_TASKS, json!({ "limit": 10 })))
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(
@@ -1582,19 +1597,12 @@ async fn tasks_list_returns_recent_newest_first() {
 Run: `cargo test -p a2a-bridge --test workflow_producer tasks_list_returns_recent_newest_first`
 Expected: FAIL — `tasks/list` → method not found.
 
-- [ ] **Step 3: Add the `LIST_TASKS` const, dispatch arm, and handler**
+- [ ] **Step 3: Add the dispatch arm + handler (use the SDK `methods::LIST_TASKS`)**
 
-In `server.rs`, near the top (after the `use a2a::{methods, ...}`), add:
-
-```rust
-/// Bridge-defined list method (the a2a-lf 0.3.0 SDK has no list-tasks method).
-const LIST_TASKS: &str = "tasks/list";
-```
-
-In the dispatch match (server.rs:466-475), add an arm before the `""` arm:
+In the dispatch match (server.rs:466-475), add an arm before the `""` arm (the `methods` import already exists):
 
 ```rust
-    m if m == LIST_TASKS => list_tasks(srv, headers, id, params).await,
+    m if m == methods::LIST_TASKS => list_tasks(srv, headers, id, params).await,
 ```
 
 Add the handler:
@@ -1647,7 +1655,10 @@ async fn submit_returns_working_before_completion_then_completes() {
     use bridge_core::task_store::{MemoryTaskStore, TaskRecordStatus, TaskStore};
     use std::sync::Arc;
     let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
-    let gate = Arc::new(tokio::sync::Notify::new());
+    // Gate = (released flag, Notify). A bare Notify is WRONG: notify_waiters()
+    // only wakes already-parked waiters, but the synth node parks AFTER the
+    // notify and would never release. The flag makes late waiters re-check and proceed.
+    let gate = Arc::new((std::sync::atomic::AtomicBool::new(false), tokio::sync::Notify::new()));
     let srv = build_gated_workflow_server(store.clone(), gate.clone());
 
     let resp = srv
@@ -1667,8 +1678,9 @@ async fn submit_returns_working_before_completion_then_completes() {
     let tid = bridge_core::ids::TaskId::parse(&id).unwrap();
     // Still Working while gated.
     assert_eq!(store.get(&tid).await.unwrap().unwrap().status, TaskRecordStatus::Working);
-    // Release the gate; await completion deterministically.
-    gate.notify_waiters();
+    // Release the gate (set flag THEN wake) so late-parking nodes (synth) also proceed.
+    gate.0.store(true, std::sync::atomic::Ordering::Release);
+    gate.1.notify_waiters();
     // Poll the store until terminal (bounded).
     for _ in 0..200 {
         if store.get(&tid).await.unwrap().unwrap().status.is_terminal() { break; }
@@ -1678,7 +1690,7 @@ async fn submit_returns_working_before_completion_then_completes() {
 }
 ```
 
-Implement `build_gated_workflow_server(store, gate)` mirroring `build_workflow_server_with_task_store` but with a `GatedRegistry` whose backends `gate.notified().await` once before replying (model on the existing `FakeRegistry`/fake backend in this test file; reuse `review_graph()`).
+Implement `build_gated_workflow_server(store, gate)` mirroring `build_workflow_server_with_task_store` but with a `GatedRegistry` whose backends, before replying, **loop**: `while !gate.0.load(Ordering::Acquire) { gate.1.notified().await }` — re-checking the flag so a node that parks AFTER the release still proceeds. `gate: Arc<(AtomicBool, Notify)>`. (Model on the existing `FakeRegistry`/fake backend in this test file; reuse `review_graph()`.)
 
 - [ ] **Step 6: Run to verify pass**
 
@@ -1692,10 +1704,12 @@ git add crates/bridge-a2a-inbound/src/server.rs crates/bridge-a2a-inbound/tests/
 git commit -m "feat(inbound): tasks/list method + deterministic gated submit-returns-Working test"
 ```
 
-### Task 12: runner-panic finalizer test
+### Task 12: detached terminal coverage — Failed, Canceled, swept-Interrupted, + panic finalizer
 
 **Files:**
 - Test: `crates/bridge-a2a-inbound/tests/workflow_producer.rs`
+
+Covers DoD-7 (Completed already in Task 7; add **Failed** + **Canceled** detached terminal records) and DoD-10 (boot sweep → `tasks/get` returns A2A `failed` + reason), plus the panic finalizer.
 
 - [ ] **Step 1: Write the failing/should-pass test**
 
@@ -1747,11 +1761,139 @@ Implement `build_panicking_workflow_server(store)` with a registry whose backend
 Run: `cargo test -p a2a-bridge --test workflow_producer runner_panic_finalizes_failed_no_orphan`
 Expected: PASS (terminal, not orphaned).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Failed + Canceled detached terminal records (DoD-7)**
+
+Append two tests. **Failed:** a registry whose terminal (`synth`) node FAILS makes the executor yield `Terminal{Failed}` → the runner writes `Failed` with the marker as `error`:
+
+```rust
+#[tokio::test]
+async fn detached_runner_persists_failed_on_node_failure() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_failing_synth_workflow_server(store.clone()); // synth node errors
+    let task = TaskId::parse("fail-1").unwrap();
+    store.create(&TaskRecord { id: task.clone(), workflow: "code-review".into(),
+        status: TaskRecordStatus::Working, result: None, error: None, created_ms: 1, updated_ms: 1 })
+        .await.unwrap();
+    bridge_a2a_inbound::server::spawn_detached_workflow_for_test(
+        &srv, task.clone(), vec!["DIFF".into()],
+        bridge_core::ids::WorkflowId::parse("code-review").unwrap()).await.unwrap();
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(rec.status, TaskRecordStatus::Failed);
+    assert!(rec.error.is_some(), "failed record carries the marker text");
+}
+```
+
+**Canceled:** reuse the gated registry (Task 11) so the workflow parks; fire the registered token; the runner writes `Canceled`:
+
+```rust
+#[tokio::test]
+async fn detached_runner_persists_canceled_on_token_fire() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let gate = Arc::new((std::sync::atomic::AtomicBool::new(false), tokio::sync::Notify::new()));
+    let srv = build_gated_workflow_server(store.clone(), gate.clone());
+    let task = TaskId::parse("cxl-1").unwrap();
+    store.create(&TaskRecord { id: task.clone(), workflow: "code-review".into(),
+        status: TaskRecordStatus::Working, result: None, error: None, created_ms: 1, updated_ms: 1 })
+        .await.unwrap();
+    let token = tokio_util::sync::CancellationToken::new();
+    srv.workflow_cancels.lock().await.insert(task.clone(), token.clone());
+    let handle = bridge_a2a_inbound::server::spawn_detached_workflow_with_token_for_test(
+        &srv, task.clone(), vec!["DIFF".into()],
+        bridge_core::ids::WorkflowId::parse("code-review").unwrap(), token.clone());
+    token.cancel(); // cancel while gated
+    let _ = handle.await;
+    assert_eq!(store.get(&task).await.unwrap().unwrap().status, TaskRecordStatus::Canceled);
+}
+```
+
+Add `build_failing_synth_workflow_server` (a registry whose `synth` backend returns an error/`Update::Done{stop_reason:"error"}`) and a `spawn_detached_workflow_with_token_for_test` seam that takes an explicit token (a one-line wrapper over `spawn_detached_workflow`). Run: `cargo test -p a2a-bridge --test workflow_producer detached_runner_persists_failed_on_node_failure detached_runner_persists_canceled_on_token_fire` → PASS.
+
+- [ ] **Step 4: Swept-Interrupted → tasks/get reports failed (DoD-10)**
+
+```rust
+#[tokio::test]
+async fn swept_interrupted_reports_failed_over_wire() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let id = TaskId::parse("swept-1").unwrap();
+    store.create(&TaskRecord { id: id.clone(), workflow: "code-review".into(),
+        status: TaskRecordStatus::Working, result: None, error: None, created_ms: 1, updated_ms: 1 })
+        .await.unwrap();
+    store.sweep_interrupted(9).await.unwrap(); // simulate a prior serve's crash + this boot's sweep
+    let resp = srv.router().oneshot(post_request(methods::GET_TASK, json!({ "taskId": "swept-1" }))).await.unwrap();
+    let body: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let state = body["result"]["task"]["status"]["state"].as_str().or_else(|| body["result"]["task"]["state"].as_str());
+    assert_eq!(state, Some("TASK_STATE_FAILED"), "interrupted -> failed at the wire: {body}");
+    assert!(body.to_string().contains("interrupted"), "reason carried: {body}");
+}
+```
+
+Run: `cargo test -p a2a-bridge --test workflow_producer swept_interrupted_reports_failed_over_wire` → PASS.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add crates/bridge-a2a-inbound/tests/workflow_producer.rs
-git commit -m "test(inbound): runner panic/abnormal exit finalizes terminal (no orphan Working)"
+git commit -m "test(inbound): detached Failed/Canceled/swept-Interrupted terminal coverage + panic finalizer"
+```
+
+### Task 12c: Agent Card advertises detached submit (spec §6)
+
+**Files:**
+- Modify: `crates/bridge-a2a-inbound/src/card.rs` (the `agent_card(base_url, workflow_ids)` builder, advertises one `AgentSkill` per workflow)
+- Modify: `crates/bridge-a2a-inbound/src/server.rs` (`serve_card`, server.rs:451, only if the signature changes)
+- Test: `crates/bridge-a2a-inbound/tests/` (a card test, or extend an existing one)
+
+**Why:** spec §6 — "advertise detached submit in the Agent Card so the bifurcation (stream=live / send=detached) is discoverable." Today's card lists a skill per workflow with no async marker.
+
+- [ ] **Step 1: Write the failing test**
+
+Assert the workflow skills in the card carry a "detached"/async marker:
+
+```rust
+#[test]
+fn agent_card_marks_workflow_skills_detached() {
+    let card = bridge_a2a_inbound::card::agent_card("http://x", &["code-review"]);
+    let skill = card.skills.iter().find(|s| s.id == "code-review").expect("workflow skill");
+    // The skill is discoverable as detached/async (tag or description marker).
+    let marked = skill.tags.as_ref().map(|t| t.iter().any(|x| x == "detached")).unwrap_or(false)
+        || skill.description.as_deref().unwrap_or("").to_lowercase().contains("detached");
+    assert!(marked, "workflow skill must advertise detached submit");
+}
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p a2a-bridge agent_card_marks_workflow_skills_detached`
+Expected: FAIL — no marker today.
+
+- [ ] **Step 3: Mark workflow skills in `agent_card`**
+
+In `card.rs`, where each workflow `AgentSkill` is built, add a `detached` tag (or, if `AgentSkill` has no `tags`, append "(detached: returns a working task; poll tasks/get)" to its `description`). Confirm the `AgentSkill` field that exists (`tags: Option<Vec<String>>` vs `description: Option<String>`) and use it. Example (tags variant):
+
+```rust
+        tags: Some(vec!["workflow".into(), "detached".into()]),
+```
+
+- [ ] **Step 4: Run to verify pass + existing card tests green**
+
+Run: `cargo test -p a2a-bridge`
+Expected: the new test passes; existing card/serve_card tests still pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/bridge-a2a-inbound/src/card.rs crates/bridge-a2a-inbound/src/server.rs crates/bridge-a2a-inbound/tests/
+git commit -m "feat(inbound): Agent Card advertises detached submit on workflow skills"
 ```
 
 ---
@@ -1796,7 +1938,7 @@ path = "/tmp/x.db"
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib store_cfg_tests`
+Run: `cargo test -p a2a-bridge store_cfg_tests` (the bin crate has no lib target, so no `--lib`)
 Expected: FAIL — no `store` field.
 
 - [ ] **Step 3: Add `StoreConfig` + field**
@@ -1819,7 +1961,7 @@ Add to `RegistryConfig`:
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cargo test -p a2a-bridge --lib store_cfg_tests`
+Run: `cargo test -p a2a-bridge store_cfg_tests` (the bin crate has no lib target, so no `--lib`)
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -1841,6 +1983,7 @@ In `main.rs`, where `serve` constructs the store + `InboundServer` (around line 
 ```rust
     // W3a: durable task store. File-backed when [store] path is set (acquires the
     // single-serve lock + runs the boot sweep); else in-memory (ephemeral).
+    use bridge_core::task_store::TaskStore; // bring sweep_interrupted into scope
     let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> =
         match cfg.store.as_ref().map(|s| s.path.clone()) {
             Some(path) => {
@@ -1913,7 +2056,7 @@ async fn rpc_call(url: &str, method: &str, params: serde_json::Value) -> Result<
     let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let resp = reqwest::Client::new()
         .post(url)
-        .header("X-A2A-Version", "1.0") // SVC_PARAM_VERSION header name; confirm constant
+        .header(a2a::SVC_PARAM_VERSION, "1.0") // "A2A-Version" — MUST match the server's version gate
         .json(&body)
         .send()
         .await
@@ -1928,7 +2071,7 @@ async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
     let text = std::fs::read_to_string(input_path)?;
     let params = serde_json::json!({ "message": { "text": text, "metadata": { "a2a-bridge.skill": skill } } });
-    let v = rpc_call(url, "message/send", params).await?;
+    let v = rpc_call(url, a2a::methods::SEND_MESSAGE, params).await?;
     if let Some(err) = v.get("error") {
         return Err(format!("submit failed: {err}").into());
     }
@@ -1943,19 +2086,19 @@ async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
     match sub {
         "get" => {
             let id = args.get(1).cloned().ok_or("task get: missing <id>")?;
-            let v = rpc_call(url, "tasks/get", serde_json::json!({ "taskId": id })).await?;
+            let v = rpc_call(url, a2a::methods::GET_TASK, serde_json::json!({ "taskId": id })).await?;
             println!("{}", serde_json::to_string_pretty(&v["result"]["task"])?);
         }
         "list" => {
             let limit: u64 = flag(args, "--limit").and_then(|s| s.parse().ok()).unwrap_or(50);
-            let v = rpc_call(url, "tasks/list", serde_json::json!({ "limit": limit })).await?;
+            let v = rpc_call(url, a2a::methods::LIST_TASKS, serde_json::json!({ "limit": limit })).await?;
             for t in v["result"]["tasks"].as_array().cloned().unwrap_or_default() {
                 println!("{}\t{}\t{}", t["id"].as_str().unwrap_or("?"), t["state"].as_str().unwrap_or("?"), t["workflow"].as_str().unwrap_or("?"));
             }
         }
         "cancel" => {
             let id = args.get(1).cloned().ok_or("task cancel: missing <id>")?;
-            let v = rpc_call(url, "tasks/cancel", serde_json::json!({ "taskId": id })).await?;
+            let v = rpc_call(url, a2a::methods::CANCEL_TASK, serde_json::json!({ "taskId": id })).await?;
             println!("{}", serde_json::to_string_pretty(&v["result"]["task"])?);
         }
         other => return Err(format!("task: unknown subcommand {other:?}").into()),
@@ -1964,12 +2107,22 @@ async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
 }
 ```
 
-NOTE: confirm the version header NAME/value the server requires (`SVC_PARAM_VERSION` from the `a2a` crate — see `post_request` in tests which sets `SVC_PARAM_VERSION` to `"1.0"`). Use the same header key. Ensure `reqwest` is a dep of `bin/a2a-bridge` (add `reqwest = { version = "0.12", features = ["json"] }` if missing).
+**Deps (REQUIRED — these are currently `[dev-dependencies]` only in `bin/a2a-bridge/Cargo.toml`):** move/add to `[dependencies]`:
+
+```toml
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"
+a2a = ... # same version/spec as the workspace uses for a2a-lf (for methods::* + SVC_PARAM_VERSION)
+```
+
+The CLI MUST use `a2a::methods::{SEND_MESSAGE, GET_TASK, CANCEL_TASK, LIST_TASKS}` and the `a2a::SVC_PARAM_VERSION` header (already wired above) — the server dispatch (server.rs:466) matches those exact CamelCase constants and gates on that header, so slash-style strings or `X-A2A-Version` would 404 every verb.
 
 - [ ] **Step 3: Verify build + a unit test for `flag`/arg parsing**
 
-Add a small test for `flag` parsing; Run: `cargo build -p a2a-bridge`.
-Expected: builds clean.
+Because the CLI now references the SAME `a2a::methods::*` + `a2a::SVC_PARAM_VERSION` constants the server dispatches on (server.rs:466 + the version gate), the method-name/header mismatch the review flagged is impossible by construction — there is no literal string to drift. Add a small `#[cfg(test)] mod` in `main.rs` testing `flag()` parsing (e.g. `flag(&["--url".into(), "u".into()], "--url") == Some("u")`, and missing flag → `None`). The CLI↔serve round-trip itself is exercised by the Task 17 live gate.
+
+Run: `cargo build -p a2a-bridge && cargo test -p a2a-bridge flag`
+Expected: builds clean; flag test passes.
 
 - [ ] **Step 4: Commit**
 
@@ -2041,7 +2194,7 @@ Kill + restart `serve` with the same `[store] path`; `task get <task-id>` still 
 
 - [ ] **Step 1: Write ADR-0010**
 
-Record: the decision (durable detached submit, result-durable slice); the components (TaskStore port + MemoryTaskStore in core; SqliteStore file-backed + single-serve lock; detached runner over a shared WorkflowSink; canonical a2a::Task; bridge-defined tasks/list); the dual-review corrections (unique uuid id-gen since `a2a::new_task_id` doesn't exist; non-clobbering create; MemoryTaskStore crate-boundary; TaskStore-aware cancel; finalizer guard; no SDK ListTasks so a bridge `tasks/list`); the live-gate result from Task 17; and the W3b follow-ons (history needs an additive `NodeFinished{output}`; resume). End the commit with the controller trailer.
+Record: the decision (durable detached submit, result-durable slice); the components (TaskStore port + MemoryTaskStore in core; SqliteStore file-backed + single-serve lock; detached runner over a shared WorkflowSink; canonical `a2a::Task`; SDK `methods::LIST_TASKS`); the spec+plan dual-review corrections (`a2a::new_task_id()` and `methods::LIST_TASKS` DO exist — use them, no `uuid` dep, no invented method; `TaskStatus.message` is `Option<a2a::Message>`; non-clobbering create; MemoryTaskStore crate-boundary; TaskStore-aware cancel; finalizer guard; CLI uses SDK method/header constants on both ends; Agent Card advertises detached submit); the live-gate result from Task 17; and the W3b follow-ons (history needs an additive `NodeFinished{output}`; resume). End the commit with the controller trailer.
 
 - [ ] **Step 2: Commit**
 
@@ -2064,11 +2217,12 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 | 4 (file-backed reopen durability) | 4 |
 | 5 (with_task_store; new untouched; build green) | 6 |
 | 6 (send returns working without blocking — deterministic) | 8, 11 (gated test) |
-| 7 (terminal records Completed/Failed/Canceled; panic→Failed) | 7, 12 |
+| 7 (terminal records Completed/Failed/Canceled; panic→terminal) | 7 (Completed), 12 (Failed/Canceled/panic) |
 | 8 (tasks/get canonical a2a::Task + artifact; non-workflow unchanged) | 9 |
 | 9 (cancel TaskStore-aware) | 10 |
-| 10 (boot sweep → Interrupted → get reports failed) | 4 (store), 14 (boot), 9 (wire) |
-| 11 (CLI submit/get/list/cancel; serve-down UX) | 15 |
+| 10 (boot sweep → Interrupted → get reports failed) | 4 (store sweep), 14 (boot), 12 Step 4 (wire test) |
+| 11 (CLI submit/get/list/cancel via SDK methods; serve-down UX) | 15, 17 (live) |
+| spec §6 (Agent Card advertises detached submit) | 12c |
 | 12 (store path: durable across restart; unset → memory) | 13, 14, 17 |
 | 13 (rewrite the InvalidRequest test; nothing left red) | 8 |
 | 14 (gated live) | 17 |
@@ -2079,6 +2233,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Notes for the implementer
 - **Atomicity:** Task 8 changes server behavior AND rewrites the test in one commit — never split (leaves the tree red otherwise).
 - **Firewall:** `~/code/a2a-local-bridge` is black-box only; design from the bridge's ports + A2A semantics. `~/code/agent-knowledge` is readable.
-- **`a2a::TaskState::Working` / `a2a::TaskStatus.message` types:** confirm the exact SDK variant/field types when you reach Tasks 8-9; adjust the construction to whatever serializes to `TASK_STATE_WORKING` and lets the error text reach the wire. These are the two spots most likely to need a small shape tweak.
-- **Session-store vs task-store DB:** keep the task store on its own `[store] path` for W3a to avoid a single-serve self-lock conflict with the existing session store construction (Task 14 note).
+- **SDK shapes (confirmed by the plan review against a2a-lf 0.3.0):** `a2a::TaskState::Working` serializes to `"TASK_STATE_WORKING"`; `a2a::TaskStatus.message` is `Option<a2a::Message>` (kept `None`; error surfaces via artifact); `a2a::new_task_id()` and `a2a::methods::LIST_TASKS` exist; `SVC_PARAM_VERSION = "A2A-Version"`. Use the SDK constants on BOTH the server and the CLI (no slash-style strings).
+- **Session-store vs task-store DB:** the session store is `open_in_memory()` only today (main.rs:395), so the task store's `[store] path` cannot self-conflict with it — the single-serve lock is safe. Keep them independent for W3a.
+- **Test registries:** Tasks 11/12 need three fakes mirroring the existing in-file `FakeRegistry`/fake backend: a `GatedRegistry` (backends loop on `!gate.0.load()` then `gate.1.notified().await`), a `build_failing_synth_workflow_server` (synth backend errors), and the panic variant. Build them from the existing fake pattern in `workflow_producer.rs`.
 - Controller doc commits (this plan, ADR-0010) carry the `Co-Authored-By: Claude Opus 4.8 (1M context)` trailer; subagent task commits do NOT.
