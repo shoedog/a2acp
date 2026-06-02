@@ -58,3 +58,6 @@ jobs:
 
       - name: Coverage — bridge-api (≥90% line coverage)
         run: cargo llvm-cov --package bridge-api --fail-under-lines 90
+
+      - name: Coverage — bridge-workflow (≥90% line coverage)
+        run: cargo llvm-cov --package bridge-workflow --fail-under-lines 90
