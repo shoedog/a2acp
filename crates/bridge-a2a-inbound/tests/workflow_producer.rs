@@ -306,6 +306,9 @@ async fn detached_runner_persists_completed_result() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         })
         .await
         .unwrap();
@@ -932,6 +935,9 @@ async fn tasks_get_returns_completed_with_artifact() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         })
         .await
         .unwrap();
@@ -987,6 +993,9 @@ async fn cancel_terminal_detached_returns_true_state_not_recancel() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         })
         .await
         .unwrap();
@@ -1040,6 +1049,9 @@ async fn cancel_working_no_token_flips_to_canceled() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         })
         .await
         .unwrap();
@@ -1090,6 +1102,9 @@ async fn tasks_list_returns_recent_newest_first() {
                 error: None,
                 created_ms: ms,
                 updated_ms: ms,
+                input: String::new(),
+                workflow_spec_json: None,
+                resume_attempts: 0,
             })
             .await
             .unwrap();
@@ -1430,6 +1445,9 @@ async fn runner_panic_finalizes_failed_no_orphan() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         })
         .await
         .unwrap();
@@ -1485,6 +1503,9 @@ async fn detached_runner_persists_failed_on_node_failure() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         })
         .await
         .unwrap();
@@ -1533,6 +1554,9 @@ async fn detached_runner_persists_canceled_on_token_fire() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         })
         .await
         .unwrap();
@@ -1576,6 +1600,9 @@ async fn swept_interrupted_reports_failed_over_wire() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         })
         .await
         .unwrap();

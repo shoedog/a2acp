@@ -367,6 +367,35 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         Ok(n > 0)
     }
+    async fn put_node_checkpoint(
+        &self,
+        _task: &TaskId,
+        _node: &bridge_core::ids::NodeId,
+        _output: &str,
+        _ok: bool,
+        _ts: i64,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure) // TODO(Task 5): real impl
+    }
+    async fn node_checkpoints(
+        &self,
+        _task: &TaskId,
+    ) -> Result<Vec<(bridge_core::ids::NodeId, String, bool)>, BridgeError> {
+        Err(BridgeError::StoreFailure) // TODO(Task 5): real impl
+    }
+    async fn claim_resume_attempt(
+        &self,
+        _task: &TaskId,
+        _cap: u32,
+        _now_ms: i64,
+    ) -> Result<bridge_core::task_store::ResumeClaim, BridgeError> {
+        Err(BridgeError::StoreFailure) // TODO(Task 5): real impl
+    }
+    async fn working_tasks(
+        &self,
+    ) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+        Err(BridgeError::StoreFailure) // TODO(Task 5): real impl
+    }
 }
 
 fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecord, BridgeError> {
@@ -386,6 +415,9 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
         error,
         created_ms,
         updated_ms,
+        input: String::new(),           // TODO(Task 5): read from real column
+        workflow_spec_json: None,        // TODO(Task 5): read from real column
+        resume_attempts: 0,              // TODO(Task 5): read from real column
     })
 }
 
@@ -406,6 +438,9 @@ mod tests {
             error: None,
             created_ms: ms,
             updated_ms: ms,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         }
     }
 

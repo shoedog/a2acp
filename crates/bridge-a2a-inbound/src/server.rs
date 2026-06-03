@@ -1408,6 +1408,9 @@ async fn unary_message(
                 error: None,
                 created_ms: now,
                 updated_ms: now,
+                input: String::new(),        // Task 8 will wire the real input text
+                workflow_spec_json: None,    // Task 8 will snapshot the spec here
+                resume_attempts: 0,
             };
             if srv.task_store.create(&rec).await.is_err() {
                 return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
