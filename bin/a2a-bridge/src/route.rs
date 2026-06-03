@@ -118,6 +118,7 @@ mod tests {
                     effort: None::<Effort>,
                     mode: None,
                     cwd: None,
+                    session_cwd: None,
                     auth_method: None,
                     name: None,
                     description: None,

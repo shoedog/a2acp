@@ -61,6 +61,11 @@ pub struct TaskRecord {
     pub workflow_spec_json: Option<String>,
     /// Number of resume attempts consumed so far; used by `claim_resume_attempt`.
     pub resume_attempts: u32,
+    /// Per-request working directory at detached-submit time (Task 8/9 of the
+    /// session_cwd increment). `None` means no cwd override was requested. Stored
+    /// in its OWN `tasks` column (NOT in the `workflow_spec_json` envelope) so it
+    /// is independently accessible without deserializing the snapshot.
+    pub session_cwd: Option<String>,
 }
 
 /// Outcome of a `claim_resume_attempt` call.
@@ -291,6 +296,7 @@ mod tests {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         }
     }
 
@@ -397,6 +403,7 @@ mod tests {
             input: "DIFF".into(),
             workflow_spec_json: Some("{\"v\":1}".into()),
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -453,5 +460,33 @@ mod tests {
             .put_node_checkpoint(&unknown, &NodeId::parse("node-a").unwrap(), "OUT", true, 1)
             .await;
         assert!(result.is_err(), "expected Err for unknown task id");
+    }
+
+    #[tokio::test]
+    async fn session_cwd_roundtrip() {
+        // A TaskRecord with session_cwd=Some("/req") must survive create→get intact.
+        let s = MemoryTaskStore::new();
+        let id = TaskId::parse("cwd-1").unwrap();
+        s.create(&TaskRecord {
+            id: id.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: Some("/req".to_string()),
+        })
+        .await
+        .unwrap();
+        let got = s.get(&id).await.unwrap().unwrap();
+        assert_eq!(
+            got.session_cwd.as_deref(),
+            Some("/req"),
+            "session_cwd must survive create→get"
+        );
     }
 }

@@ -37,11 +37,11 @@ pub trait AgentBackend: Send + Sync {
     ) -> Result<BackendStream, BridgeError>;
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError>;
 
-    /// Stash the per-session effective config; applied at lazy ACP mint. Default: no-op. [§4.4]
+    /// Stash the per-session spec (config + cwd); applied at lazy ACP mint. Default: no-op. [§4.4]
     async fn configure_session(
         &self,
         _session: &SessionId,
-        _cfg: &crate::domain::EffectiveConfig,
+        _spec: &crate::domain::SessionSpec,
     ) -> Result<(), BridgeError> {
         Ok(())
     }
@@ -373,7 +373,7 @@ mod tests {
         let f = Fake;
         f.configure_session(
             &crate::ids::SessionId::parse("s").unwrap(),
-            &crate::domain::EffectiveConfig::default(),
+            &crate::domain::SessionSpec::from_config(crate::domain::EffectiveConfig::default()),
         )
         .await
         .unwrap();

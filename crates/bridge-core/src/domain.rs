@@ -53,6 +53,10 @@ pub struct AgentEntry {
     pub effort: Option<Effort>,
     pub mode: Option<String>,
     pub cwd: Option<String>,
+    /// Static ACP session cwd for this agent (the working directory set at session mint).
+    /// Resolution chain at mint: `session_cwd` → `cwd` → `"."`.
+    /// This is NOT a host-process cwd — the host child has no cwd (Supervised gets None).
+    pub session_cwd: Option<String>,
     pub auth_method: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -76,6 +80,24 @@ pub struct EffectiveConfig {
     pub model: Option<String>,
     pub effort: Option<Effort>,
     pub mode: Option<String>,
+}
+
+/// Per-session stash carried through `configure_session` → `ensure_session`.
+///
+/// `config` holds model/mode/effort (what the LLM is configured with).
+/// `cwd` holds the session working directory (a session *location*, not LLM config).
+/// They are separate so future increments can set cwd independently of model config.
+#[derive(Debug, Clone)]
+pub struct SessionSpec {
+    pub config: EffectiveConfig,
+    pub cwd: Option<crate::session_cwd::SessionCwd>,
+}
+
+impl SessionSpec {
+    /// Convenience constructor for call sites that only carry config (cwd is `None`).
+    pub fn from_config(config: EffectiveConfig) -> Self {
+        Self { config, cwd: None }
+    }
 }
 
 /// Compute effective config by layering an optional override on top of an entry's defaults.
@@ -234,6 +256,7 @@ mod tests {
             effort: None,
             mode: None,
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,
@@ -260,6 +283,7 @@ mod tests {
             effort: None,
             mode: None,
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,
@@ -284,6 +308,7 @@ mod tests {
             effort: Some(Effort::High),
             mode: Some("read-only".into()),
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,

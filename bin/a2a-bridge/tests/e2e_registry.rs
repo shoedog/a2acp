@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use bridge_acp::acp_backend::{AcpBackend, AcpConfig};
 use bridge_core::domain::{
-    effective_config, AgentEntry, AgentKind, AgentOverride, Part, RegistrySnapshot,
+    effective_config, AgentEntry, AgentKind, AgentOverride, Part, RegistrySnapshot, SessionSpec,
 };
 use bridge_core::ids::{AgentId, SessionId};
 use bridge_core::ports::{AgentBackend, AgentRegistry, PolicyEngine, Update};
@@ -234,6 +234,7 @@ fn entry(
         effort: None,
         mode: mode.map(str::to_string),
         cwd: None,
+        session_cwd: None,
         auth_method: auth_method.map(str::to_string),
         name: None,
         description: None,
@@ -271,7 +272,7 @@ async fn route_and_prompt(
         let eff = effective_config(&resolved.entry, ov);
         resolved
             .backend
-            .configure_session(&session, &eff)
+            .configure_session(&session, &SessionSpec::from_config(eff.clone()))
             .await
             .unwrap_or_else(|e| panic!("configure_session({id:?}) must accept eff={eff:?}: {e:?}"));
 
@@ -512,7 +513,7 @@ async fn claude_warm_two_turns_via_acp() {
     let eff = effective_config(&resolved.entry, None);
     resolved
         .backend
-        .configure_session(&session, &eff)
+        .configure_session(&session, &SessionSpec::from_config(eff))
         .await
         .expect("configure_session must accept the claude eff (model=haiku)");
 
@@ -566,6 +567,7 @@ async fn api_entry_resolves_and_serves_through_registry() {
         effort: None,
         mode: None,
         cwd: None,
+        session_cwd: None,
         auth_method: None,
         name: None,
         description: None,
@@ -621,6 +623,7 @@ async fn registry_rejects_api_entry_with_cmd() {
         effort: None,
         mode: None,
         cwd: None,
+        session_cwd: None,
         auth_method: None,
         name: None,
         description: None,

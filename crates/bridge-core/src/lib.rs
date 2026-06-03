@@ -6,6 +6,9 @@ pub mod ids;
 pub mod ports;
 pub mod process;
 pub mod session;
+pub mod session_cwd;
 pub mod task;
 pub mod task_store;
 pub mod translator;
+
+pub use session_cwd::SessionCwd;

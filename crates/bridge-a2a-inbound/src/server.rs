@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use a2a::{methods, SVC_PARAM_VERSION};
 use bridge_core::domain::{
     effective_config, AgentOverride, AuthContext, EffectiveConfig, InboundRequest, Part,
-    PeerTaskId, RouteTarget, TaskMeta,
+    PeerTaskId, RouteTarget, SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
 use bridge_core::ids::{AgentId, SessionId, TaskId};
@@ -44,6 +44,7 @@ use bridge_core::ports::{
     RouteDecision, SessionStore,
 };
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
+use bridge_core::SessionCwd;
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
 use crate::fanout::{self, Source};
@@ -172,6 +173,11 @@ pub struct InboundServer {
     /// Durable task control-plane store (W3a). Defaults to an in-memory store;
     /// replace with a persistent backend via [`InboundServer::with_task_store`].
     task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+    /// Global root path that gates which per-request session cwds are permitted
+    /// (session_cwd increment). `None` → no global root restriction.
+    /// Wired from `allowed_cwd_root` in the top-level config via
+    /// [`InboundServer::with_allowed_cwd_root`].
+    pub allowed_cwd_root: Option<String>,
 }
 
 impl InboundServer {
@@ -203,6 +209,7 @@ impl InboundServer {
             workflows: Arc::new(HashMap::new()),
             workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            allowed_cwd_root: None,
         }
     }
 
@@ -232,6 +239,15 @@ impl InboundServer {
         task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
     ) -> Self {
         self.task_store = task_store;
+        self
+    }
+
+    /// Set the global root path that gates per-request session cwds (session_cwd increment).
+    /// Builder over [`InboundServer::new`]; wired from `allowed_cwd_root` in the top-level
+    /// config. `None` (the default) → no global root restriction.
+    #[must_use]
+    pub fn with_allowed_cwd_root(mut self, root: Option<String>) -> Self {
+        self.allowed_cwd_root = root;
         self
     }
 
@@ -272,6 +288,11 @@ impl InboundServer {
         let task_meta = task_meta_from_params(params)?;
         let target = self.route.route(&task_meta)?;
 
+        // 3b. Parse + validate the per-request cwd (a2a-bridge.cwd).  Validation
+        //     must happen BEFORE task/session ids are derived so a malformed request
+        //     is rejected before any state is created.
+        let session_cwd = session_cwd_from_params(params, self.allowed_cwd_root.as_deref())?;
+
         // 4. Derive task/session ids from params (best-effort; v1 stubs allowed).
         let task = task_id_from_params(params)?;
         let session = SessionId::parse(format!("session-{}", task.as_str()))
@@ -285,6 +306,7 @@ impl InboundServer {
             // Per-request overrides ride along so LOCAL dispatch can compute the
             // effective config (entry defaults layered with these) before the prompt.
             overrides: task_meta.overrides,
+            session_cwd,
         })
     }
 }
@@ -323,6 +345,11 @@ struct RoutedCall {
     /// [`effective_config`] before `configure_session`. The selected `AgentId`
     /// itself is carried by `target` (`RouteTarget::Local(id)`).
     overrides: Option<AgentOverride>,
+    /// Per-request working directory parsed from `a2a-bridge.cwd`.
+    /// Distinct from `AgentOverride` so it reaches both single-agent and workflow
+    /// dispatch (AgentOverride is dropped for workflows). `None` when absent.
+    /// Applied by Tasks 6 (single-agent) and 7 (workflow).
+    session_cwd: Option<SessionCwd>,
 }
 
 /// Extract the resolved `AgentId` from a `RouteTarget::Local`, falling back to the
@@ -364,18 +391,27 @@ async fn resolve_configure_bind(
     task: &TaskId,
     session: &SessionId,
     overrides: Option<&AgentOverride>,
+    session_cwd: Option<SessionCwd>,
 ) -> Result<LocalDispatch, BridgeError> {
     // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
-    // route/resolve/recompute. Re-stash the bound effective config (harmless
-    // idempotent overwrite; per T6 it only affects a not-yet-minted session, never
-    // retroactively re-configures a live one), then prompt the bound backend.
+    // route/resolve/recompute. Re-stash the bound effective config with the per-request
+    // cwd (harmless idempotent overwrite; it only affects a not-yet-minted session,
+    // never retroactively re-configures a live one), then prompt the bound backend.
     {
         let bindings = srv.bindings.lock().await;
         if let Some(binding) = bindings.get(task) {
             let backend = binding.backend.clone();
             let eff = binding.eff.clone();
             drop(bindings);
-            backend.configure_session(session, &eff).await?;
+            backend
+                .configure_session(
+                    session,
+                    &SessionSpec {
+                        config: eff,
+                        cwd: session_cwd,
+                    },
+                )
+                .await?;
             return Ok(LocalDispatch {
                 backend,
                 guard: None,
@@ -385,7 +421,16 @@ async fn resolve_configure_bind(
     // First message: resolve, configure, bind, and hand back an eviction guard.
     let resolved = srv.registry.resolve(agent_id).await?;
     let eff = effective_config(&resolved.entry, overrides);
-    resolved.backend.configure_session(session, &eff).await?;
+    resolved
+        .backend
+        .configure_session(
+            session,
+            &SessionSpec {
+                config: eff.clone(),
+                cwd: session_cwd,
+            },
+        )
+        .await?;
     let backend = resolved.backend.clone();
     srv.bindings.lock().await.insert(
         task.clone(),
@@ -419,10 +464,20 @@ async fn resolve_for_fanout(
     _task: &TaskId,
     session: &SessionId,
     overrides: Option<&AgentOverride>,
+    session_cwd: Option<SessionCwd>,
 ) -> Result<(Arc<dyn AgentBackend>, Box<dyn Lease>), BridgeError> {
     let resolved = srv.registry.resolve(agent_id).await?;
     let eff = effective_config(&resolved.entry, overrides);
-    resolved.backend.configure_session(session, &eff).await?;
+    resolved
+        .backend
+        .configure_session(
+            session,
+            &SessionSpec {
+                config: eff,
+                cwd: session_cwd,
+            },
+        )
+        .await?;
     Ok((resolved.backend, resolved.lease))
 }
 
@@ -528,6 +583,7 @@ async fn stream_message(
                 &routed.task,
                 &routed.session,
                 routed.overrides.as_ref(),
+                routed.session_cwd.clone(),
             )
             .await
             {
@@ -864,6 +920,7 @@ fn spawn_fanout_producer(
     let parts = routed.parts.clone();
     let auth = routed.auth;
     let overrides = routed.overrides;
+    let session_cwd = routed.session_cwd;
 
     tokio::spawn(async move {
         // Mark this task as a fan-out task so Task 6 (cancel_task) can distinguish
@@ -877,7 +934,16 @@ fn spawn_fanout_producer(
         //    task exits. A resolve/configure failure makes the local source a single
         //    labeled error frame (the coordinator's terminal still covers completion).
         let (kiro_source, kiro_backend, _lease): (Source, Option<Arc<dyn AgentBackend>>, _) =
-            match resolve_for_fanout(&srv, &agent_id, &task, &session, overrides.as_ref()).await {
+            match resolve_for_fanout(
+                &srv,
+                &agent_id,
+                &task,
+                &session,
+                overrides.as_ref(),
+                session_cwd,
+            )
+            .await
+            {
                 Ok((backend, lease)) => {
                     let src = local_kiro_source(
                         local_source_label,
@@ -1064,7 +1130,11 @@ fn spawn_workflow_producer(
             .lock()
             .await
             .insert(task.clone(), token.clone());
-        let stream = executor.run(graph, input, task.as_str().to_string(), token);
+        let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
+            session_cwd: routed.session_cwd.clone(),
+        };
+        let stream =
+            executor.run_with_context(graph, input, task.as_str().to_string(), token, wf_ctx);
         let mut sink = SseSink { tx: tx.clone() };
         // SseSink never errors (sends are best-effort); on a hypothetical error
         // treat it as no-terminal so the existing no-terminal fallback fires.
@@ -1096,6 +1166,7 @@ fn new_detached_task_id() -> TaskId {
 /// resume: `"{task}-resume-{n}"`), and a `seed` of already-completed node outputs
 /// (fresh submit: empty; boot resume: checkpoints from the store). With an empty
 /// seed, `run_from` is behaviorally identical to `run`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_detached_workflow(
     srv: &Arc<InboundServer>,
     task: TaskId,
@@ -1104,6 +1175,7 @@ fn spawn_detached_workflow(
     run_id: String,
     token: tokio_util::sync::CancellationToken,
     seed: std::collections::HashMap<String, (String, bool)>,
+    ctx: bridge_workflow::executor::WorkflowRunContext,
 ) -> tokio::task::JoinHandle<()> {
     let srv = srv.clone();
     tokio::spawn(async move {
@@ -1131,7 +1203,7 @@ fn spawn_detached_workflow(
                 return;
             }
         };
-        let stream = executor.run_from(graph, input, run_id, token, seed);
+        let stream = executor.run_from_with_context(graph, input, run_id, token, seed, ctx);
         let mut sink =
             crate::workflow_sink::TaskStoreSink::new(srv.task_store.clone(), task.clone());
         let now = crate::workflow_sink::now_ms();
@@ -1202,6 +1274,7 @@ pub fn spawn_detached_workflow_for_test(
         run_id,
         token,
         std::collections::HashMap::new(),
+        bridge_workflow::executor::WorkflowRunContext::default(),
     )
 }
 
@@ -1231,6 +1304,7 @@ pub fn spawn_detached_workflow_with_token_for_test(
         run_id,
         token,
         std::collections::HashMap::new(),
+        bridge_workflow::executor::WorkflowRunContext::default(),
     )
 }
 
@@ -1432,6 +1506,35 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                 continue;
             }
             Ok(ResumeClaim::Resumable { attempt }) => {
+                // Re-validate the persisted session_cwd before spawning: never trust
+                // the stored string blindly. A corrupt/invalid stored cwd is not
+                // resumable — interrupt BEFORE registering the cancel token or spawning
+                // so no orphaned token/runner is left behind.
+                let ctx = match wt.session_cwd.as_deref() {
+                    Some(s) => match bridge_core::SessionCwd::parse(s) {
+                        Ok(c) => bridge_workflow::executor::WorkflowRunContext {
+                            session_cwd: Some(c),
+                        },
+                        Err(_) => {
+                            let _ = srv
+                                .task_store
+                                .set_terminal(
+                                    &task,
+                                    TaskRecordStatus::Interrupted,
+                                    None,
+                                    Some("not resumable: unreadable session cwd"),
+                                    crate::workflow_sink::now_ms(),
+                                )
+                                .await;
+                            tracing::info!(
+                                task = task.as_str(),
+                                "resume scan: interrupted (unreadable session cwd)"
+                            );
+                            continue;
+                        }
+                    },
+                    None => bridge_workflow::executor::WorkflowRunContext::default(),
+                };
                 // Register a fresh cancel token BEFORE spawning so a concurrent
                 // tasks/cancel during resume can find and fire it.
                 let token = tokio_util::sync::CancellationToken::new();
@@ -1451,6 +1554,7 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     run_id.clone(),
                     token,
                     seed,
+                    ctx,
                 ));
                 tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
             }
@@ -1607,6 +1711,7 @@ async fn unary_message(
                 &routed.task,
                 &routed.session,
                 routed.overrides.as_ref(),
+                routed.session_cwd.clone(),
             )
             .await
             {
@@ -1705,6 +1810,7 @@ async fn unary_message(
                 input: input.clone(),
                 workflow_spec_json,
                 resume_attempts: 0,
+                session_cwd: routed.session_cwd.as_ref().map(|c| c.as_str().to_string()),
             };
             if srv.task_store.create(&rec).await.is_err() {
                 return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
@@ -1740,6 +1846,9 @@ async fn unary_message(
                 task.as_str().to_string(),
                 token,
                 std::collections::HashMap::new(),
+                bridge_workflow::executor::WorkflowRunContext {
+                    session_cwd: routed.session_cwd.clone(),
+                },
             ));
             let working = a2a::Task {
                 id: task.as_str().to_owned(),
@@ -1806,6 +1915,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
         &routed.task,
         &routed.session,
         routed.overrides.as_ref(),
+        routed.session_cwd.clone(),
     )
     .await
     {
@@ -2272,6 +2382,41 @@ fn parse_effort_meta(s: &str) -> Result<bridge_core::domain::Effort, BridgeError
     }
 }
 
+/// Extract and validate the per-request `a2a-bridge.cwd` from `message.metadata`.
+///
+/// - Absent key → `Ok(None)`.
+/// - Present key → structural validation via [`SessionCwd::parse`]; an invalid path
+///   returns `BridgeError::InvalidRequest { field: "a2a-bridge.cwd" }`.
+/// - If `allowed_root` is `Some(root)`: the cwd must satisfy `cwd.is_under(root)`;
+///   a cwd outside the root also returns `InvalidRequest`.
+///
+/// Tested directly by unit tests; called by `gate()` before minting a task id.
+fn session_cwd_from_params(
+    params: &Value,
+    allowed_root: Option<&str>,
+) -> Result<Option<SessionCwd>, BridgeError> {
+    let raw = params
+        .get("message")
+        .and_then(|m| m.get("metadata"))
+        .and_then(|md| md.get("a2a-bridge.cwd"))
+        .and_then(|v| v.as_str());
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let cwd = SessionCwd::parse(s)?;
+    if let Some(root_str) = allowed_root {
+        let root = SessionCwd::parse(root_str).map_err(|_| BridgeError::InvalidRequest {
+            field: "a2a-bridge.cwd",
+        })?;
+        if !cwd.is_under(&root) {
+            return Err(BridgeError::InvalidRequest {
+                field: "a2a-bridge.cwd",
+            });
+        }
+    }
+    Ok(Some(cwd))
+}
+
 /// Extract `TaskMeta` from JSON-RPC params.
 ///
 /// Reads from `params.message.metadata`:
@@ -2386,7 +2531,7 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
 mod tests {
     use super::*;
     use bridge_core::domain::RouteTarget;
-    use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, RegistrySnapshot};
+    use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot, SessionSpec};
     use bridge_core::domain::{
         AuthContext, PeerTaskId, PendingRequest, PermissionDecision, PermissionRequest,
         SessionContext,
@@ -2485,6 +2630,7 @@ mod tests {
             effort: None,
             mode: None,
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,
@@ -4363,10 +4509,12 @@ mod tests {
     struct RecordingBackend {
         id: String,
         prompted: AtomicBool,
-        configured: Arc<Mutex<Option<EffectiveConfig>>>,
+        /// Records the full `SessionSpec` from the most recent `configure_session` call,
+        /// so tests can assert both `spec.config` (model/effort/mode) and `spec.cwd`.
+        configured: Arc<Mutex<Option<SessionSpec>>>,
     }
     impl RecordingBackend {
-        fn new(id: &str) -> (Arc<Self>, Arc<Mutex<Option<EffectiveConfig>>>) {
+        fn new(id: &str) -> (Arc<Self>, Arc<Mutex<Option<SessionSpec>>>) {
             let configured = Arc::new(Mutex::new(None));
             (
                 Arc::new(Self {
@@ -4400,9 +4548,9 @@ mod tests {
         async fn configure_session(
             &self,
             _session: &SessionId,
-            cfg: &EffectiveConfig,
+            spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
-            *self.configured.lock().unwrap() = Some(cfg.clone());
+            *self.configured.lock().unwrap() = Some(spec.clone());
             Ok(())
         }
     }
@@ -4423,11 +4571,21 @@ mod tests {
     /// `resolve` increments the agent's counter (handing out a `CountingLease` that
     /// decrements on drop) so a test can assert eviction released the lease, and
     /// `apply` can REMOVE an agent so a follow-up that re-resolved it would fail —
-    /// proving the follow-up uses the BOUND Arc instead.
+    /// proving the follow-up uses the BOUND Arc instead. `resolve_calls` counts how
+    /// many times `resolve` has been called per agent (monotonic, never decremented)
+    /// so warm-reuse tests can prove a backend is never re-resolved/re-spawned.
     struct CountingRegistry {
         default: AgentId,
         inner: tokio::sync::Mutex<CountingRegistryInner>,
         leases: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
+        /// Monotonically-increasing count of `resolve()` calls per agent key.
+        resolve_calls: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
+        /// Counts how many times a NEW backend instance was "spawned" for an agent.
+        /// In this test registry the backend is pre-built, so `spawn_counts` increments
+        /// only on the very first `resolve()` call for each agent and stays at 1 for all
+        /// subsequent calls (modelling warm-process reuse). A real CWD-keyed-spawn
+        /// regression would require a new backend per CWD → this counter would reach 2.
+        spawn_counts: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
     }
     struct CountingRegistryInner {
         entries: std::collections::HashMap<String, AgentEntry>,
@@ -4438,9 +4596,19 @@ mod tests {
             let mut entries = std::collections::HashMap::new();
             let mut backends = std::collections::HashMap::new();
             let mut leases = std::collections::HashMap::new();
+            let mut resolve_calls = std::collections::HashMap::new();
+            let mut spawn_counts = std::collections::HashMap::new();
             for (entry, backend) in agents {
                 let key = entry.id.as_str().to_owned();
                 leases.insert(
+                    key.clone(),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                );
+                resolve_calls.insert(
+                    key.clone(),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                );
+                spawn_counts.insert(
                     key.clone(),
                     Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 );
@@ -4451,11 +4619,31 @@ mod tests {
                 default: AgentId::parse(default).unwrap(),
                 inner: tokio::sync::Mutex::new(CountingRegistryInner { entries, backends }),
                 leases,
+                resolve_calls,
+                spawn_counts,
             })
         }
         /// The current live-lease count for an agent (0 once all its leases dropped).
         fn lease_count(&self, id: &str) -> usize {
             self.leases
+                .get(id)
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0)
+        }
+        /// Total number of `resolve()` calls ever made for `id` (monotonic — never
+        /// decrements). Use this to prove a backend is NOT re-resolved across requests.
+        fn resolve_call_count(&self, id: &str) -> usize {
+            self.resolve_calls
+                .get(id)
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0)
+        }
+        /// How many times the backend for `id` was "spawned" (i.e. first activated).
+        /// Stays at 1 across all warm-reuse resolves. Guards against CWD-keyed-spawn
+        /// regressions: if per-request cwd were threaded into the spawn key, a second
+        /// distinct cwd would produce a second backend → this count would reach 2.
+        fn spawn_count(&self, id: &str) -> usize {
+            self.spawn_counts
                 .get(id)
                 .map(|c| c.load(Ordering::SeqCst))
                 .unwrap_or(0)
@@ -4470,6 +4658,16 @@ mod tests {
                 (Some(entry), Some(backend)) => {
                     let count = self.leases.get(key).expect("agent has a lease counter");
                     count.fetch_add(1, Ordering::SeqCst);
+                    if let Some(rc) = self.resolve_calls.get(key) {
+                        // Increment spawn_counts only on the first ever resolve (the
+                        // backend "comes alive" once; subsequent resolves are warm reuse).
+                        let prev = rc.fetch_add(1, Ordering::SeqCst);
+                        if prev == 0 {
+                            if let Some(sc) = self.spawn_counts.get(key) {
+                                sc.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    }
                     Ok(Resolved {
                         entry: Arc::new(entry.clone()),
                         backend: backend.clone(),
@@ -4742,13 +4940,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let _ = body_string(resp).await;
 
-        let cfg = a_cfg
+        let spec = a_cfg
             .lock()
             .unwrap()
             .clone()
             .expect("configure_session ran");
         assert_eq!(
-            cfg.model.as_deref(),
+            spec.config.model.as_deref(),
             Some("override-m"),
             "the per-request model override must reach configure_session"
         );
@@ -4776,13 +4974,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let _ = body_string(resp).await;
 
-        let cfg = a_cfg
+        let spec = a_cfg
             .lock()
             .unwrap()
             .clone()
             .expect("configure_session ran");
         assert_eq!(
-            cfg.model.as_deref(),
+            spec.config.model.as_deref(),
             Some("base-m"),
             "the entry's base model must flow even with no override"
         );
@@ -5054,6 +5252,221 @@ mod tests {
             registry.lease_count("a"),
             0,
             "the RAII guard must release the lease on early disconnect"
+        );
+    }
+
+    // ---- Task 5 (session_cwd increment): parse + validate a2a-bridge.cwd ----
+
+    #[test]
+    fn cwd_metadata_parsed() {
+        // Present + valid absolute path → Some(SessionCwd) matching the value.
+        let p = serde_json::json!({
+            "message": {
+                "metadata": {
+                    "a2a-bridge.cwd": "/abs/repo"
+                }
+            }
+        });
+        let cwd = session_cwd_from_params(&p, None)
+            .expect("valid absolute cwd must parse OK")
+            .expect("present cwd key must return Some");
+        assert_eq!(
+            cwd,
+            bridge_core::SessionCwd::parse("/abs/repo").unwrap(),
+            "parsed SessionCwd must equal the expected value"
+        );
+        // Absent key → None (no behavior change for callers that omit it).
+        let p_absent = serde_json::json!({ "message": { "text": "hi" } });
+        assert!(
+            session_cwd_from_params(&p_absent, None)
+                .expect("absent cwd must not error")
+                .is_none(),
+            "absent a2a-bridge.cwd must yield None"
+        );
+    }
+
+    #[test]
+    fn cwd_relative_rejected() {
+        // A relative path must be rejected before reaching the backend.
+        let p = serde_json::json!({
+            "message": {
+                "metadata": {
+                    "a2a-bridge.cwd": "rel/path"
+                }
+            }
+        });
+        match session_cwd_from_params(&p, None) {
+            Err(BridgeError::InvalidRequest { field: "a2a-bridge.cwd" }) => {}
+            other => panic!(
+                "relative cwd must return InvalidRequest{{field:\"a2a-bridge.cwd\"}}, got: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn cwd_allowed_root_enforced() {
+        let mk = |cwd: &str| {
+            serde_json::json!({
+                "message": {
+                    "metadata": { "a2a-bridge.cwd": cwd }
+                }
+            })
+        };
+
+        // /work/r is under /work → accepted.
+        assert!(
+            session_cwd_from_params(&mk("/work/r"), Some("/work"))
+                .expect("/work/r under /work must be OK")
+                .is_some(),
+            "/work/r must be accepted when root=/work"
+        );
+
+        // /other is NOT under /work → rejected.
+        match session_cwd_from_params(&mk("/other"), Some("/work")) {
+            Err(BridgeError::InvalidRequest { field: "a2a-bridge.cwd" }) => {}
+            other => panic!(
+                "/other outside /work must return InvalidRequest{{field:\"a2a-bridge.cwd\"}}, got: {other:?}"
+            ),
+        }
+
+        // /work-evil is not under /work (component-wise check must not match str prefix).
+        match session_cwd_from_params(&mk("/work-evil"), Some("/work")) {
+            Err(BridgeError::InvalidRequest {
+                field: "a2a-bridge.cwd",
+            }) => {}
+            other => panic!(
+                "/work-evil must be rejected (component-wise, not str-prefix), got: {other:?}"
+            ),
+        }
+    }
+
+    // ---- Task 6: single-agent dispatch applies per-request cwd + warm-reuse ----
+
+    /// Build params for a unary SendMessage selecting `agent`, with optional model
+    /// override and optional per-request cwd (Task 6 dispatch tests).
+    fn agent_params_cwd(agent: &str, model: Option<&str>, cwd: Option<&str>) -> Value {
+        agent_params_cwd_task(agent, model, cwd, None)
+    }
+
+    /// Like `agent_params_cwd` but also injects an explicit `taskId` into the params
+    /// so the request bypasses the "task-1" fallback and hits its own binding slot.
+    /// Pass distinct task ids to prevent two requests from sharing the binding cache.
+    fn agent_params_cwd_task(
+        agent: &str,
+        model: Option<&str>,
+        cwd: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Value {
+        let mut md = json!({ "a2a-bridge.agent": agent });
+        if let Some(m) = model {
+            md["a2a-bridge.model"] = json!(m);
+        }
+        if let Some(c) = cwd {
+            md["a2a-bridge.cwd"] = json!(c);
+        }
+        let mut params = json!({ "message": { "text": "go", "metadata": md } });
+        if let Some(tid) = task_id {
+            params["taskId"] = json!(tid);
+        }
+        params
+    }
+
+    #[tokio::test]
+    async fn single_agent_dispatch_applies_cwd() {
+        // A unary message/send with `a2a-bridge.cwd="/req"` must cause
+        // `configure_session` to receive a `SessionSpec` where `cwd ==
+        // Some(SessionCwd::parse("/req"))`. This proves the per-request cwd flows
+        // from `RoutedCall.session_cwd` all the way into the backend mint call.
+        let (a, a_spec) = RecordingBackend::new("a");
+        let registry =
+            FakeRegistry::with_entries("a", vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)]);
+        let srv = build_registry(registry, "a");
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params_cwd("a", None, Some("/req")),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        let spec = a_spec
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("configure_session must have run");
+        assert_eq!(
+            spec.cwd,
+            Some(bridge_core::SessionCwd::parse("/req").unwrap()),
+            "per-request cwd must reach configure_session as spec.cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_request_cwd_does_not_respawn() {
+        // Two sequential unary sends to the SAME agent, each carrying a DIFFERENT
+        // `a2a-bridge.cwd`, and each carrying a DISTINCT `taskId` so neither request
+        // hits the other's binding cache — both independently exercise the full
+        // resolve path through the registry.
+        //
+        // The invariant: the backend is "spawned" (first-activated) exactly ONCE.
+        // Both requests see the same warm process slot even though the cwd differs,
+        // because `session_cwd` is a mint-time session param, NOT part of the
+        // backend's spawn/identity key.
+        //
+        // Regression guard: if per-request cwd were (wrongly) threaded into the
+        // spawn key, a second distinct cwd would require a second backend instance →
+        // `spawn_count` would reach 2, failing this assertion.
+        let a = TrackingBackend::new("a", /*idle*/ false);
+        let registry =
+            CountingRegistry::new("a", vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)]);
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_registry_store(registry.clone(), store, "a");
+
+        // Request 1: task-a, cwd=/repo-a.  Goes through the full resolve path
+        // (no prior binding) and activates the backend for the first time.
+        let resp1 = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params_cwd_task("a", None, Some("/repo-a"), Some("task-a")),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let _ = body_string(resp1).await;
+
+        // Request 2: task-b, cwd=/repo-b — a DIFFERENT task id and a DIFFERENT cwd.
+        // Because the task id differs, this request has no binding cache entry and
+        // also goes through the full resolve path.  The backend must be REUSED, not
+        // re-spawned, proving cwd is not part of the spawn identity key.
+        let resp2 = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params_cwd_task("a", None, Some("/repo-b"), Some("task-b")),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let _ = body_string(resp2).await;
+
+        // Both requests went through resolve() (2 calls total — one per new task).
+        assert_eq!(
+            registry.resolve_call_count("a"),
+            2,
+            "each distinct task must go through resolve() independently"
+        );
+        // But the backend was only ever spawned ONCE — the second resolve reused the
+        // warm process slot.  Would be 2 if cwd were (wrongly) a spawn key.
+        assert_eq!(
+            registry.spawn_count("a"),
+            1,
+            "changing a2a-bridge.cwd must NOT spawn a new backend; \
+             the warm process is shared across distinct cwds (only the ACP session mint differs)"
         );
     }
 }

@@ -136,6 +136,7 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         ("workflow_spec_json", "TEXT"),
         ("resume_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("last_resume_ms", "INTEGER"),
+        ("session_cwd", "TEXT"),
     ];
     for (col, def) in additive {
         if !existing.contains(col) {
@@ -328,8 +329,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms,
-                               input, workflow_spec_json, resume_attempts)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                               input, workflow_spec_json, resume_attempts, session_cwd)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 rec.id.as_str(),
                 rec.workflow,
@@ -340,7 +341,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 rec.updated_ms,
                 rec.input,
                 rec.workflow_spec_json,
-                rec.resume_attempts as i64
+                rec.resume_attempts as i64,
+                rec.session_cwd
             ],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
@@ -376,7 +378,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts
+                        input, workflow_spec_json, resume_attempts, session_cwd
                  FROM tasks WHERE id=?1",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -397,7 +399,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts
+                        input, workflow_spec_json, resume_attempts, session_cwd
                  FROM tasks ORDER BY updated_ms DESC LIMIT ?1",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -514,7 +516,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts
+                        input, workflow_spec_json, resume_attempts, session_cwd
                  FROM tasks WHERE status='working'",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -539,6 +541,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
     let input: Option<String> = row.get(7).map_err(|_| BridgeError::StoreFailure)?;
     let workflow_spec_json: Option<String> = row.get(8).map_err(|_| BridgeError::StoreFailure)?;
     let resume_attempts: Option<i64> = row.get(9).map_err(|_| BridgeError::StoreFailure)?;
+    let session_cwd: Option<String> = row.get(10).map_err(|_| BridgeError::StoreFailure)?;
     Ok(TaskRecord {
         id: TaskId::parse(id).map_err(|_| BridgeError::StoreFailure)?,
         workflow,
@@ -550,6 +553,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
         input: input.unwrap_or_default(),
         workflow_spec_json,
         resume_attempts: resume_attempts.unwrap_or(0) as u32,
+        session_cwd,
     })
 }
 
@@ -573,6 +577,7 @@ mod tests {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         }
     }
 
@@ -751,6 +756,7 @@ mod tests {
             input: "DIFF".into(),
             workflow_spec_json: Some("{\"v\":1}".into()),
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -769,6 +775,34 @@ mod tests {
             ResumeClaim::Exhausted
         ));
         assert_eq!(s.working_tasks().await.unwrap()[0].input, "DIFF");
+    }
+
+    #[tokio::test]
+    async fn session_cwd_sqlite_roundtrip() {
+        // A TaskRecord with session_cwd=Some("/req") must survive create→get via SQLite.
+        let s = SqliteStore::open_in_memory().unwrap();
+        let id = TaskId::parse("cwd-sq-1").unwrap();
+        s.create(&TaskRecord {
+            id: id.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: Some("/req".to_string()),
+        })
+        .await
+        .unwrap();
+        let got = s.get(&id).await.unwrap().unwrap();
+        assert_eq!(
+            got.session_cwd.as_deref(),
+            Some("/req"),
+            "session_cwd must survive SQLite create→get"
+        );
     }
 
     #[tokio::test]
@@ -798,6 +832,7 @@ mod tests {
                 .unwrap();
             assert_eq!(got.status, TaskRecordStatus::Working);
             assert_eq!(got.input, ""); // default for migrated row
+            assert_eq!(got.session_cwd, None); // NULL for migrated old row
             use bridge_core::ids::NodeId;
             let old = TaskId::parse("old").unwrap();
             s.put_node_checkpoint(&old, &NodeId::parse("n").unwrap(), "o", true, 2)

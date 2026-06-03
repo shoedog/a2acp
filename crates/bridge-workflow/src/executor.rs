@@ -2,15 +2,24 @@
 //! → prompt → concatenate Update::Text (NOT the translator's last_text). Cancel via token.
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::template::render;
-use bridge_core::domain::{effective_config, Part};
+use bridge_core::domain::{effective_config, Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::ports::{AgentRegistry, Update, STOP_REASON_CANCELLED};
+use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// Per-request context forwarded opaquely through the executor to each node's
+/// `configure_session` call. The scheduler/topo logic MUST NOT read this — it
+/// is only consumed at the `SessionSpec` build site in `run_node`.
+#[derive(Default, Clone)]
+pub struct WorkflowRunContext {
+    pub session_cwd: Option<SessionCwd>,
+}
 
 /// Uniform future type used in the per-run `FuturesUnordered` pool.
 /// Each fan-out node is boxed to this type so `FuturesUnordered` can hold
@@ -62,6 +71,7 @@ impl WorkflowExecutor {
         vars: &HashMap<&str, &str>,
         run_id: &str,
         cancel: &CancellationToken,
+        ctx: &WorkflowRunContext,
     ) -> (String, bool) {
         if cancel.is_cancelled() {
             return (format!("[node {} canceled]", node.id.as_str()), false);
@@ -91,7 +101,16 @@ impl WorkflowExecutor {
             },
         };
         let eff = effective_config(&resolved.entry, None);
-        let _ = resolved.backend.configure_session(&session, &eff).await; // best-effort (no-op default)
+        let _ = resolved
+            .backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: eff,
+                    cwd: ctx.session_cwd.clone(),
+                },
+            )
+            .await; // best-effort (no-op default)
         if cancel.is_cancelled() {
             resolved.backend.forget_session(&session).await;
             return (format!("[node {} canceled]", node.id.as_str()), false);
@@ -135,7 +154,7 @@ impl WorkflowExecutor {
     }
 
     /// Run a workflow from scratch (no prior checkpoints).
-    /// Thin wrapper over [`run_from`](Self::run_from) with an empty seed.
+    /// Thin wrapper over [`run_from`](Self::run_from) with an empty seed and default context.
     pub fn run(
         &self,
         graph: Arc<WorkflowGraph>,
@@ -143,12 +162,25 @@ impl WorkflowExecutor {
         run_id: String,
         cancel: CancellationToken,
     ) -> WorkflowStream {
-        self.run_from(graph, input, run_id, cancel, HashMap::new())
+        self.run_with_context(graph, input, run_id, cancel, WorkflowRunContext::default())
+    }
+
+    /// Run a workflow from scratch with an explicit per-request context.
+    /// Thin wrapper over [`run_from_with_context`](Self::run_from_with_context) with an empty seed.
+    pub fn run_with_context(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        ctx: WorkflowRunContext,
+    ) -> WorkflowStream {
+        self.run_from_with_context(graph, input, run_id, cancel, HashMap::new(), ctx)
     }
 
     /// Resume a workflow from a pre-loaded seed of already-completed node outputs.
     /// Seeded nodes are treated as done; only un-seeded nodes actually run.
-    /// `run()` is a thin wrapper over this with an empty seed.
+    /// `run()` is a thin wrapper over this with an empty seed and default context.
     ///
     /// Each seed entry is `(output_text, ok)`, matching the `NodeFinished` payload.
     ///
@@ -163,6 +195,28 @@ impl WorkflowExecutor {
         run_id: String,
         cancel: CancellationToken,
         seed: HashMap<String, (String, bool)>,
+    ) -> WorkflowStream {
+        self.run_from_with_context(
+            graph,
+            input,
+            run_id,
+            cancel,
+            seed,
+            WorkflowRunContext::default(),
+        )
+    }
+
+    /// Resume a workflow from a pre-loaded seed with an explicit per-request context.
+    /// The context is forwarded opaquely to each node's `configure_session` call
+    /// (via `SessionSpec.cwd`). The scheduling/topo logic does NOT read it.
+    pub fn run_from_with_context(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: HashMap<String, (String, bool)>,
+        ctx: WorkflowRunContext,
     ) -> WorkflowStream {
         let this = WorkflowExecutor {
             registry: self.registry.clone(),
@@ -208,6 +262,9 @@ impl WorkflowExecutor {
 
             // Push every not-done/not-scheduled node whose inputs are all done.
             // Returns the node ids newly scheduled (so the caller can emit NodeStarted).
+            // NOTE: `ctx` is captured by clone into each node future (forwarded opaquely,
+            // like `run_id`/`cancel`). The topo/scheduling logic above does NOT read it —
+            // executor purity is preserved.
             macro_rules! schedule_ready {
                 () => {{
                     let mut started: Vec<NodeId> = Vec::new();
@@ -230,11 +287,12 @@ impl WorkflowExecutor {
                                 let run_id = run_id.clone();
                                 let cancel = cancel.clone();
                                 let wf_id = graph.id.as_str().to_string();
+                                let ctx = ctx.clone();
                                 let this = &this;
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
                                         owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                                    let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel).await;
+                                    let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel, &ctx).await;
                                     (node.id.clone(), text, ok)
                                 }) as NodeFut);
                             }
@@ -276,7 +334,7 @@ impl WorkflowExecutor {
 mod tests {
     use super::*;
     use crate::graph::{WorkflowGraph, WorkflowNode};
-    use bridge_core::domain::{EffectiveConfig, Part, RegistrySnapshot};
+    use bridge_core::domain::{Part, RegistrySnapshot, SessionSpec};
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, NodeId, SessionId, WorkflowId};
     use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
@@ -321,7 +379,7 @@ mod tests {
         async fn configure_session(
             &self,
             _s: &SessionId,
-            _c: &EffectiveConfig,
+            _spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
             *self.rec.configured.lock().unwrap() = true;
             Ok(())
@@ -342,6 +400,7 @@ mod tests {
             effort: None,
             mode: None,
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,
@@ -1231,6 +1290,165 @@ mod tests {
             matches!(err, BridgeError::ConfigInvalid { reason } if reason.contains("unknown node")),
             "expected ConfigInvalid about unknown node, got: {err:?}"
         );
+    }
+
+    // ── WorkflowRunContext / cwd threading tests ────────────────────────────
+
+    /// Recording backend that captures the `SessionSpec.cwd` from each
+    /// `configure_session` call. Used to verify `WorkflowRunContext` is
+    /// forwarded to EVERY node.
+    #[derive(Default)]
+    struct CwdRec {
+        cwds: Mutex<Vec<Option<SessionCwd>>>,
+    }
+    struct CwdCapBackend {
+        reply: String,
+        rec: Arc<CwdRec>,
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for CwdCapBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates = vec![
+                Ok(Update::Text(self.reply.clone())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn configure_session(
+            &self,
+            _s: &SessionId,
+            spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            self.rec.cwds.lock().unwrap().push(spec.cwd.clone());
+            Ok(())
+        }
+    }
+    struct CwdCapRegistry {
+        rec: Arc<CwdRec>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRegistry for CwdCapRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            Ok(Resolved {
+                entry: Arc::new(minimal_entry(id)),
+                backend: Arc::new(CwdCapBackend {
+                    reply: "OK".into(),
+                    rec: self.rec.clone(),
+                }),
+                lease: Box::new(NoopLease),
+            })
+        }
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("a").unwrap()
+        }
+        async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    /// `run_from_with_context` with `session_cwd = Some("/req")` → EVERY node's
+    /// `configure_session` receives `spec.cwd == Some("/req")`.
+    #[tokio::test]
+    async fn run_from_with_context_cwd_set_reaches_every_node() {
+        let rec = Arc::new(CwdRec::default());
+        let reg = Arc::new(CwdCapRegistry { rec: rec.clone() });
+        let ex = WorkflowExecutor::new(reg);
+        let ctx = WorkflowRunContext {
+            session_cwd: Some(SessionCwd::parse("/req").unwrap()),
+        };
+        let _evs: Vec<_> = ex
+            .run_from_with_context(
+                review_graph(), // 3 nodes: codex, claude, synth
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+                HashMap::new(),
+                ctx,
+            )
+            .collect::<Vec<_>>()
+            .await;
+        let cwds = rec.cwds.lock().unwrap();
+        assert_eq!(cwds.len(), 3, "all 3 nodes must call configure_session");
+        for cwd in cwds.iter() {
+            assert_eq!(
+                cwd.as_ref().map(|c| c.as_str()),
+                Some("/req"),
+                "every node must receive cwd=/req, got {:?}",
+                cwd
+            );
+        }
+    }
+
+    /// `run_from_with_context` with `WorkflowRunContext::default()` (None cwd) →
+    /// every node's `configure_session` receives `spec.cwd == None`.
+    #[tokio::test]
+    async fn run_from_with_context_cwd_none_every_node() {
+        let rec = Arc::new(CwdRec::default());
+        let reg = Arc::new(CwdCapRegistry { rec: rec.clone() });
+        let ex = WorkflowExecutor::new(reg);
+        let _evs: Vec<_> = ex
+            .run_from_with_context(
+                review_graph(),
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+                HashMap::new(),
+                WorkflowRunContext::default(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        let cwds = rec.cwds.lock().unwrap();
+        assert_eq!(cwds.len(), 3, "all 3 nodes must call configure_session");
+        for cwd in cwds.iter() {
+            assert!(
+                cwd.is_none(),
+                "every node must receive cwd=None, got {:?}",
+                cwd
+            );
+        }
+    }
+
+    /// `run_with_context` (scratch, no seed) propagates cwd to every node.
+    #[tokio::test]
+    async fn run_with_context_cwd_set_reaches_every_node() {
+        let rec = Arc::new(CwdRec::default());
+        let reg = Arc::new(CwdCapRegistry { rec: rec.clone() });
+        let ex = WorkflowExecutor::new(reg);
+        let ctx = WorkflowRunContext {
+            session_cwd: Some(SessionCwd::parse("/req2").unwrap()),
+        };
+        let _evs: Vec<_> = ex
+            .run_with_context(
+                review_graph(),
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect::<Vec<_>>()
+            .await;
+        let cwds = rec.cwds.lock().unwrap();
+        assert_eq!(cwds.len(), 3, "all 3 nodes must call configure_session");
+        for cwd in cwds.iter() {
+            assert_eq!(
+                cwd.as_ref().map(|c| c.as_str()),
+                Some("/req2"),
+                "every node must receive cwd=/req2, got {:?}",
+                cwd
+            );
+        }
     }
 
     /// Seed contains a non-root node (b, which depends on a) but NOT its upstream (a).
