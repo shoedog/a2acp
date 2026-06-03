@@ -1935,3 +1935,398 @@ async fn detached_runner_checkpoint_write_failure_fails_task() {
         rec.status
     );
 }
+
+// ============================================================================
+// Task 10a: resume_working_tasks boot routine
+// ============================================================================
+
+/// Backend that records (into a SHARED set) the node id it was prompted for, then
+/// replies with a fixed text + Done. The recorded node id is the AGENT id carried at
+/// construction — in `review_graph` node id == agent id (codex/claude/synth), so the
+/// shared set is exactly "which nodes were prompted during the resume run".
+struct ResumeRecordingBackend {
+    node: String,
+    reply: String,
+    prompted: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentBackend for ResumeRecordingBackend {
+    async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        self.prompted.lock().unwrap().push(self.node.clone());
+        let updates = vec![
+            Ok(Update::Text(self.reply.clone())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(updates)))
+    }
+    async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+/// Registry resolving codex/claude/synth to a recording backend that pushes the
+/// resolved node/agent id into a shared prompted-set when prompted.
+struct ResumeRecordingRegistry {
+    prompted: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentRegistry for ResumeRecordingRegistry {
+    async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+        let node = id.as_str().to_string();
+        let reply = match node.as_str() {
+            "codex" => "CODEX_REVIEW",
+            "claude" => "CLAUDE_REVIEW",
+            "synth" => "SYNTH_FINAL",
+            _ => "OUT",
+        }
+        .to_string();
+        Ok(Resolved {
+            entry: Arc::new(minimal_entry(id)),
+            backend: Arc::new(ResumeRecordingBackend {
+                node,
+                reply,
+                prompted: self.prompted.clone(),
+            }),
+            lease: Box::new(NoopLease),
+        })
+    }
+    fn default_id(&self) -> AgentId {
+        AgentId::parse("codex").unwrap()
+    }
+    async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
+        Ok(())
+    }
+    fn list(&self) -> Vec<AgentId> {
+        vec![
+            AgentId::parse("codex").unwrap(),
+            AgentId::parse("claude").unwrap(),
+            AgentId::parse("synth").unwrap(),
+        ]
+    }
+}
+
+/// Build a server over a recording registry + the given task store, with the review
+/// graph registered. Returns the server and the shared prompted-set so the resume
+/// happy-path test can assert which nodes were re-prompted.
+fn build_recording_resume_server(
+    store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+) -> (Arc<InboundServer>, Arc<std::sync::Mutex<Vec<String>>>) {
+    let prompted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let registry = Arc::new(ResumeRecordingRegistry {
+        prompted: prompted.clone(),
+    });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    let srv = Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_task_store(store),
+    );
+    (srv, prompted)
+}
+
+/// `{"v":<v>,"graph":<review_graph>}` snapshot string — the exact envelope shape the
+/// detached-submit path persists (see the `RouteTarget::Workflow` arm of
+/// `unary_message`). `v=1` is the live version; `v=2` exercises the forward-compat door.
+fn review_snapshot(v: u32) -> String {
+    serde_json::json!({ "v": v, "graph": &*review_graph() }).to_string()
+}
+
+/// Poll the store until the task reaches a terminal status (any non-Working), or panic
+/// after a bounded number of cooperative yields. The boot resume runner is DETACHED (no
+/// JoinHandle is returned), so the happy-path assertion must wait for the background run
+/// to finalize rather than asserting immediately after `resume_working_tasks` returns.
+async fn poll_to_terminal(
+    store: &std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+    task: &bridge_core::ids::TaskId,
+) -> bridge_core::task_store::TaskRecord {
+    use bridge_core::task_store::TaskRecordStatus;
+    for _ in 0..2000 {
+        if let Some(rec) = store.get(task).await.unwrap() {
+            if rec.status != TaskRecordStatus::Working {
+                return rec;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("task {} never reached a terminal status", task.as_str());
+}
+
+/// **resume_runs_only_pending_nodes**: a `Working` task whose snapshot is the review
+/// graph (codex,claude→synth) with a checkpoint for `codex` ONLY. After resume, `codex`
+/// must NOT be re-prompted (its output is seeded), `claude` AND `synth` ARE prompted,
+/// and the task finalizes `Completed`.
+#[tokio::test]
+async fn resume_runs_only_pending_nodes() {
+    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, prompted) = build_recording_resume_server(store.clone());
+    let task = TaskId::parse("resume-pending-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some(review_snapshot(1)),
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+    // codex already finished before the crash → its checkpoint is the resume seed.
+    store
+        .put_node_checkpoint(&task, &NodeId::parse("codex").unwrap(), "CODEX_DONE", true, 2)
+        .await
+        .unwrap();
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    let rec = poll_to_terminal(&store, &task).await;
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Completed,
+        "resumed task must finalize Completed; got {:?}",
+        rec.status
+    );
+    let nodes = prompted.lock().unwrap().clone();
+    assert!(
+        !nodes.iter().any(|n| n == "codex"),
+        "codex was checkpointed (seeded) → must NOT be re-prompted; prompted: {nodes:?}"
+    );
+    assert!(
+        nodes.iter().any(|n| n == "claude"),
+        "claude was un-checkpointed → must be prompted; prompted: {nodes:?}"
+    );
+    assert!(
+        nodes.iter().any(|n| n == "synth"),
+        "synth was un-checkpointed → must be prompted; prompted: {nodes:?}"
+    );
+    // One resume attempt was consumed.
+    assert_eq!(rec.resume_attempts, 1, "exactly one resume attempt consumed");
+}
+
+/// **resume_no_snapshot_interrupts**: a `Working` task with no workflow snapshot cannot
+/// be reconstructed → Interrupted.
+#[tokio::test]
+async fn resume_no_snapshot_interrupts() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, _prompted) = build_recording_resume_server(store.clone());
+    let task = TaskId::parse("resume-no-snap").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(rec.status, TaskRecordStatus::Interrupted);
+}
+
+/// **resume_unparseable_snapshot_interrupts**: a snapshot that isn't valid JSON → Interrupted.
+#[tokio::test]
+async fn resume_unparseable_snapshot_interrupts() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, _prompted) = build_recording_resume_server(store.clone());
+    let task = TaskId::parse("resume-bad-json").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some("not json".into()),
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(rec.status, TaskRecordStatus::Interrupted);
+}
+
+/// **resume_unknown_version_interrupts**: a structurally valid snapshot whose envelope
+/// version is unknown (`v=2`) → Interrupted (the forward-compat door, NOT a panic).
+#[tokio::test]
+async fn resume_unknown_version_interrupts() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, _prompted) = build_recording_resume_server(store.clone());
+    let task = TaskId::parse("resume-v2").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            // Valid graph, but an unknown schema version.
+            workflow_spec_json: Some(review_snapshot(2)),
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(rec.status, TaskRecordStatus::Interrupted);
+}
+
+/// **resume_cap_exhausted_interrupts**: a `Working` task whose `resume_attempts` is
+/// already at `cap` → `claim_resume_attempt` returns Exhausted → Interrupted (the
+/// poison-pill guard).
+#[tokio::test]
+async fn resume_cap_exhausted_interrupts() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let cap = 3u32;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, prompted) = build_recording_resume_server(store.clone());
+    let task = TaskId::parse("resume-exhausted").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some(review_snapshot(1)),
+            resume_attempts: cap, // already at the cap
+        })
+        .await
+        .unwrap();
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, cap).await;
+
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(rec.status, TaskRecordStatus::Interrupted);
+    // Cap was exhausted → no resume run was spawned → no node was prompted.
+    assert!(
+        prompted.lock().unwrap().is_empty(),
+        "an exhausted-cap task must not run any node"
+    );
+}
+
+/// **resume_terminal_checkpoint_short_circuits**: a `Working` task whose snapshot is the
+/// review graph and which HAS a checkpoint for the TERMINAL node `synth` → the workflow
+/// had actually finished before the crash. Finalize DIRECTLY to Completed (result =
+/// SYNTH_FINAL), with NO backend prompted and NO resume attempt consumed.
+#[tokio::test]
+async fn resume_terminal_checkpoint_short_circuits() {
+    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, prompted) = build_recording_resume_server(store.clone());
+    let task = TaskId::parse("resume-short-circuit").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some(review_snapshot(1)),
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+    // Pre-write checkpoints for all upstream nodes AND the terminal node — the terminal
+    // output was produced but the row was never flipped (the W3a §8 write-failure gap).
+    store
+        .put_node_checkpoint(&task, &NodeId::parse("codex").unwrap(), "CODEX_DONE", true, 2)
+        .await
+        .unwrap();
+    store
+        .put_node_checkpoint(&task, &NodeId::parse("claude").unwrap(), "CLAUDE_DONE", true, 2)
+        .await
+        .unwrap();
+    store
+        .put_node_checkpoint(&task, &NodeId::parse("synth").unwrap(), "SYNTH_FINAL", true, 3)
+        .await
+        .unwrap();
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Completed,
+        "terminal checkpoint present → finalize Completed without re-run"
+    );
+    assert_eq!(rec.result.as_deref(), Some("SYNTH_FINAL"));
+    // No backend was prompted — the short-circuit re-runs nothing.
+    assert!(
+        prompted.lock().unwrap().is_empty(),
+        "short-circuit must not prompt any backend"
+    );
+    // No resume attempt was consumed.
+    assert_eq!(
+        rec.resume_attempts, 0,
+        "short-circuit must NOT consume a resume attempt"
+    );
+}

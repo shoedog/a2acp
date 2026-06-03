@@ -1218,6 +1218,206 @@ pub fn spawn_detached_workflow_with_token_for_test(
     spawn_detached_workflow(srv, task, input, graph, run_id, token, std::collections::HashMap::new())
 }
 
+/// The persisted workflow-spec snapshot envelope (mirrors the `{"v":1,"graph":...}`
+/// written at detached-submit time — see the `RouteTarget::Workflow` arm of
+/// `unary_message`). The `v` field is the forward-compat door: an unknown version
+/// fails to match `v == 1` in the resume routine and the task is marked
+/// `Interrupted` rather than mis-deserialized. `graph` deserializes into the exact
+/// `WorkflowGraph` that was running at submit time (NOT the live on-disk spec, which
+/// may have changed since).
+#[derive(serde::Deserialize)]
+struct WorkflowSpecEnvelope {
+    v: u32,
+    graph: bridge_workflow::graph::WorkflowGraph,
+}
+
+/// Boot-time crash-resume scan (W3b Task 10a). Replaces the W3a behavior of sweeping
+/// every `Working` row to `Interrupted`: instead, for each `Working` task this either
+/// (a) **short-circuits** it to terminal if its terminal node already has a checkpoint
+/// (the W3a §8 write-failure gap — the terminal output was produced but the row wasn't
+/// flipped), (b) **resumes** it by re-running only the un-checkpointed nodes (seeding
+/// `run_from` with the stored checkpoints, consuming one resume attempt), or
+/// (c) marks it `Interrupted` if it cannot be resumed (no/unreadable snapshot, unknown
+/// schema version, or the resume-attempt cap is exhausted — the poison-pill guard).
+///
+/// Resilience policy: a top-level `working_tasks()` failure logs and returns (the boot
+/// scan is best-effort — a store that can't be read at boot must not abort `serve`).
+/// A per-task store error logs and continues to the NEXT task, so one bad row never
+/// aborts the whole scan.
+///
+/// Detachment: a resumed task is spawned via [`spawn_detached_workflow`] (no JoinHandle
+/// is awaited here) and runs in the background, exactly like a fresh detached submit.
+/// The cancel token is registered in `workflow_cancels` BEFORE the spawn so a
+/// concurrent `tasks/cancel` arriving during resume can find and fire it.
+pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
+    use bridge_core::task_store::{ResumeClaim, TaskRecordStatus};
+
+    let working = match srv.task_store.working_tasks().await {
+        Ok(w) => w,
+        Err(e) => {
+            // A store that can't even be scanned at boot is logged and the scan is
+            // skipped — `serve` still comes up (best-effort resume).
+            tracing::warn!(error = ?e, "resume scan: working_tasks() failed; skipping boot resume");
+            return;
+        }
+    };
+
+    for wt in working {
+        let task = wt.id.clone();
+
+        // (1) No snapshot → cannot reconstruct the graph that was running. Interrupt.
+        let Some(spec_json) = wt.workflow_spec_json.as_deref() else {
+            if let Err(e) = srv
+                .task_store
+                .set_terminal(
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: no workflow snapshot"),
+                    crate::workflow_sink::now_ms(),
+                )
+                .await
+            {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-snapshot) failed");
+            }
+            continue;
+        };
+
+        // (2) Parse the envelope. Unparseable JSON, an unknown `v`, or a `graph` that
+        //     won't deserialize into a `WorkflowGraph` all mean "not resumable". The
+        //     version check is the forward-compat door (unknown version → Interrupted,
+        //     never a panic).
+        let graph = match serde_json::from_str::<WorkflowSpecEnvelope>(spec_json) {
+            Ok(env) if env.v == 1 => env.graph,
+            _ => {
+                if let Err(e) = srv
+                    .task_store
+                    .set_terminal(
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("not resumable: unreadable workflow snapshot"),
+                        crate::workflow_sink::now_ms(),
+                    )
+                    .await
+                {
+                    tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/unreadable) failed");
+                }
+                continue;
+            }
+        };
+
+        // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok).
+        let cps = match srv.task_store.node_checkpoints(&task).await {
+            Ok(cps) => cps,
+            Err(e) => {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: node_checkpoints() failed; skipping task");
+                continue;
+            }
+        };
+        let seed: std::collections::HashMap<String, (String, bool)> = cps
+            .iter()
+            .map(|(node, output, ok)| (node.as_str().to_string(), (output.clone(), *ok)))
+            .collect();
+
+        // (4) Terminal short-circuit: if the graph's terminal node already has a
+        //     checkpoint, the workflow had actually FINISHED before the crash (its
+        //     terminal output was produced but the row wasn't flipped — the W3a §8
+        //     write-failure gap). Finalize DIRECTLY from the checkpoint, with NO
+        //     re-run and WITHOUT consuming a resume attempt. Completed carries the
+        //     output as `result`; Failed carries it as `error` (mirrors
+        //     `TaskStoreSink::terminal` / `spawn_detached_workflow`'s finalize).
+        let terminal_id = match graph.terminal() {
+            Some(n) => n.id.as_str().to_string(),
+            None => {
+                // A snapshot that validate()'d at submit time always has exactly one
+                // terminal; a malformed snapshot with no terminal is not resumable.
+                if let Err(e) = srv
+                    .task_store
+                    .set_terminal(
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("not resumable: unreadable workflow snapshot"),
+                        crate::workflow_sink::now_ms(),
+                    )
+                    .await
+                {
+                    tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-terminal) failed");
+                }
+                continue;
+            }
+        };
+        if let Some((output, ok)) = seed.get(&terminal_id) {
+            let (status, result, error) = if *ok {
+                (TaskRecordStatus::Completed, Some(output.as_str()), None)
+            } else {
+                (TaskRecordStatus::Failed, None, Some(output.as_str()))
+            };
+            if let Err(e) = srv
+                .task_store
+                .set_terminal(&task, status, result, error, crate::workflow_sink::now_ms())
+                .await
+            {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(short-circuit) failed");
+            }
+            continue;
+        }
+
+        // (5) Otherwise claim a resume attempt (atomic; increments resume_attempts).
+        match srv
+            .task_store
+            .claim_resume_attempt(&task, cap, crate::workflow_sink::now_ms())
+            .await
+        {
+            Ok(ResumeClaim::Exhausted) => {
+                // Poison-pill guard: a task that keeps crashing the server is marked
+                // Interrupted after `cap` attempts instead of looping forever.
+                if let Err(e) = srv
+                    .task_store
+                    .set_terminal(
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("resume attempt cap exceeded"),
+                        crate::workflow_sink::now_ms(),
+                    )
+                    .await
+                {
+                    tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/cap) failed");
+                }
+                continue;
+            }
+            Ok(ResumeClaim::Resumable { attempt }) => {
+                // Register a fresh cancel token BEFORE spawning so a concurrent
+                // tasks/cancel during resume can find and fire it.
+                let token = tokio_util::sync::CancellationToken::new();
+                srv.workflow_cancels
+                    .lock()
+                    .await
+                    .insert(task.clone(), token.clone());
+                let run_id = format!("{}-resume-{}", task.as_str(), attempt);
+                // Detached: the runner re-runs only the un-checkpointed nodes
+                // (run_from skips the seeded ones) and writes their checkpoints + the
+                // terminal as usual. No JoinHandle is awaited here.
+                drop(spawn_detached_workflow(
+                    srv,
+                    task.clone(),
+                    wt.input.clone(),
+                    std::sync::Arc::new(graph),
+                    run_id,
+                    token,
+                    seed,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: claim_resume_attempt() failed; skipping task");
+                continue;
+            }
+        }
+    }
+}
+
 /// Background claimer: as each fan-out source's stream ENDS (its `*_done` flag
 /// flips true), claim that source's per-source guard key (`"{task}:kiro"` /
 /// `"{task}:peer"`). Claiming the key makes any later `try_win_*` for it return
