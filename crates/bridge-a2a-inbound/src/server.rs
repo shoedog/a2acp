@@ -1090,12 +1090,21 @@ fn new_detached_task_id() -> TaskId {
 /// Spawn the finalizer-guarded background runner for a detached workflow. Returns
 /// the JoinHandle so callers/tests can await completion. The caller MUST have
 /// already `create`d the Working row and registered the token in `workflow_cancels`.
+///
+/// The caller supplies the already-resolved `graph` (fresh submit: resolved from
+/// `srv.workflows` at submit time; boot resume: deserialized from the stored spec),
+/// the `input` string (pre-joined text), the `run_id` (fresh submit: task id; boot
+/// resume: `"{task}-resume-{n}"`), and a `seed` of already-completed node outputs
+/// (fresh submit: empty; boot resume: checkpoints from the store). With an empty
+/// seed, `run_from` is behaviorally identical to `run`.
 fn spawn_detached_workflow(
     srv: &Arc<InboundServer>,
     task: TaskId,
-    text_parts: Vec<String>,
-    wf_id: bridge_core::ids::WorkflowId,
+    input: String,
+    graph: std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
+    run_id: String,
     token: tokio_util::sync::CancellationToken,
+    seed: std::collections::HashMap<String, (String, bool)>,
 ) -> tokio::task::JoinHandle<()> {
     let srv = srv.clone();
     tokio::spawn(async move {
@@ -1105,16 +1114,16 @@ fn spawn_detached_workflow(
             cancels: srv.workflow_cancels.clone(),
             done: false,
         };
-        let (executor, graph) = match (&srv.executor, srv.workflows.get(&wf_id)) {
-            (Some(e), Some(g)) => (e.clone(), g.clone()),
-            _ => {
+        let executor = match &srv.executor {
+            Some(e) => e.clone(),
+            None => {
                 let _ = srv
                     .task_store
                     .set_terminal(
                         &task,
                         bridge_core::task_store::TaskRecordStatus::Failed,
                         None,
-                        Some("no executor / unknown workflow"),
+                        Some("no executor wired"),
                         crate::workflow_sink::now_ms(),
                     )
                     .await;
@@ -1123,8 +1132,7 @@ fn spawn_detached_workflow(
                 return;
             }
         };
-        let input = text_parts.join("\n");
-        let stream = executor.run(graph, input, task.as_str().to_string(), token);
+        let stream = executor.run_from(graph, input, run_id, token, seed);
         let mut sink = crate::workflow_sink::TaskStoreSink::new(srv.task_store.clone(), task.clone());
         let now = crate::workflow_sink::now_ms();
         match crate::workflow_sink::drain_workflow(stream, &mut sink).await {
@@ -1168,7 +1176,9 @@ fn spawn_detached_workflow(
     })
 }
 
-/// Test-only seam: spawn the runner with a fresh token.
+/// Test-only seam: spawn the runner with a fresh token and an empty seed.
+/// Resolves the graph from the server's `workflows` map (the graph must already be
+/// registered). `run_id` is set to the task id (matching the fresh-submit path).
 #[doc(hidden)]
 pub fn spawn_detached_workflow_for_test(
     srv: &Arc<InboundServer>,
@@ -1177,10 +1187,19 @@ pub fn spawn_detached_workflow_for_test(
     wf_id: bridge_core::ids::WorkflowId,
 ) -> tokio::task::JoinHandle<()> {
     let token = tokio_util::sync::CancellationToken::new();
-    spawn_detached_workflow(srv, task, text_parts, wf_id, token)
+    let graph = srv
+        .workflows
+        .get(&wf_id)
+        .cloned()
+        .expect("workflow must be registered in the test server");
+    let input = text_parts.join("\n");
+    let run_id = task.as_str().to_string();
+    spawn_detached_workflow(srv, task, input, graph, run_id, token, std::collections::HashMap::new())
 }
 
 /// Test-only seam that takes an explicit token (so a cancel test can fire it).
+/// Resolves the graph from the server's `workflows` map (the graph must already be
+/// registered). `run_id` is set to the task id (matching the fresh-submit path).
 #[doc(hidden)]
 pub fn spawn_detached_workflow_with_token_for_test(
     srv: &Arc<InboundServer>,
@@ -1189,7 +1208,14 @@ pub fn spawn_detached_workflow_with_token_for_test(
     wf_id: bridge_core::ids::WorkflowId,
     token: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_detached_workflow(srv, task, text_parts, wf_id, token)
+    let graph = srv
+        .workflows
+        .get(&wf_id)
+        .cloned()
+        .expect("workflow must be registered in the test server");
+    let input = text_parts.join("\n");
+    let run_id = task.as_str().to_string();
+    spawn_detached_workflow(srv, task, input, graph, run_id, token, std::collections::HashMap::new())
 }
 
 /// Background claimer: as each fan-out source's stream ENDS (its `*_done` flag
@@ -1405,19 +1431,19 @@ async fn unary_message(
         RouteTarget::Workflow(ref wf_id) => {
             let task = new_detached_task_id();
             let now = crate::workflow_sink::now_ms();
-            // Hoist text_parts before `create` so the persisted `input` is
-            // byte-identical to what `spawn_detached_workflow` joins as the runner's
-            // input (`text_parts.join("\n")`). Both the record and the spawn use the
-            // same derivation.
-            let text_parts: Vec<String> = routed.parts.iter().map(|p| p.text.clone()).collect();
-            let input = text_parts.join("\n");
-            // Snapshot the resolved graph at submit time. If the wf_id is unknown the
-            // snapshot is None (the runner will fail the task when it also can't find
-            // the graph). The `{"v":1,"graph":...}` envelope lets the boot resume
+            // Pre-join the input text so the persisted `input` is byte-identical to
+            // what the runner receives. Both the record and the spawn use the same value.
+            let input: String = routed.parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
+            // Resolve the graph at submit time. If the wf_id is unknown, the graph is
+            // None and the record persists without a spec snapshot (the runner will
+            // fail when it also can't find the graph — but since the wf_id was
+            // validated by the route decision, this is always Some in practice).
+            let graph = srv.workflows.get(wf_id).cloned();
+            // Snapshot the resolved graph at submit time.
+            // The `{"v":1,"graph":...}` envelope lets the boot resume
             // routine detect an unknown schema version (treat as unparseable).
-            let workflow_spec_json = srv
-                .workflows
-                .get(wf_id)
+            let workflow_spec_json = graph
+                .as_ref()
                 .map(|g| serde_json::json!({ "v": 1, "graph": &**g }).to_string());
             let rec = bridge_core::task_store::TaskRecord {
                 id: task.clone(),
@@ -1427,13 +1453,31 @@ async fn unary_message(
                 error: None,
                 created_ms: now,
                 updated_ms: now,
-                input,
+                input: input.clone(),
                 workflow_spec_json,
                 resume_attempts: 0,
             };
             if srv.task_store.create(&rec).await.is_err() {
                 return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
             }
+            // If the graph is not registered (should not happen for a routed workflow,
+            // but guard defensively), mark the task Failed and return early.
+            let graph = match graph {
+                Some(g) => g,
+                None => {
+                    let _ = srv
+                        .task_store
+                        .set_terminal(
+                            &task,
+                            bridge_core::task_store::TaskRecordStatus::Failed,
+                            None,
+                            Some("unknown workflow"),
+                            now,
+                        )
+                        .await;
+                    return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
+                }
+            };
             let token = tokio_util::sync::CancellationToken::new();
             srv.workflow_cancels
                 .lock()
@@ -1442,9 +1486,11 @@ async fn unary_message(
             drop(spawn_detached_workflow(
                 &srv,
                 task.clone(),
-                text_parts,
-                wf_id.clone(),
+                input,
+                graph,
+                task.as_str().to_string(),
                 token,
+                std::collections::HashMap::new(),
             ));
             let working = a2a::Task {
                 id: task.as_str().to_owned(),
