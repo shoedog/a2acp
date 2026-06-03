@@ -6,10 +6,17 @@ use bridge_core::domain::{effective_config, Part};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::ports::{AgentRegistry, Update, STOP_REASON_CANCELLED};
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// Uniform future type used in the per-run `FuturesUnordered` pool.
+/// Each fan-out node is boxed to this type so `FuturesUnordered` can hold
+/// futures of different async-block monomorphisations in one collection.
+type NodeFut<'a> =
+    std::pin::Pin<Box<dyn futures::Future<Output = (NodeId, String, bool)> + Send + 'a>>;
 
 pub struct WorkflowExecutor {
     registry: Arc<dyn AgentRegistry>,
@@ -139,18 +146,15 @@ impl WorkflowExecutor {
         };
         Box::pin(async_stream::stream! {
             let mut outputs: HashMap<String, (String, bool)> = HashMap::new();
-            let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut done: HashSet<String> = HashSet::new();
             let terminal_id = graph.terminal().map(|n| n.id.as_str().to_string()).unwrap_or_default();
 
-            use futures::stream::FuturesUnordered;
             // Box the per-node future to one uniform type: the `schedule_ready!`
             // macro expands at two textual sites and each bare `async move {}`
             // would otherwise be a *distinct* anonymous type, which a monomorphic
             // `FuturesUnordered<Fut>` cannot hold.
-            type NodeFut<'a> =
-                std::pin::Pin<Box<dyn futures::Future<Output = (NodeId, String, bool)> + Send + 'a>>;
             let mut inflight: FuturesUnordered<NodeFut> = FuturesUnordered::new();
-            let mut scheduled: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut scheduled: HashSet<String> = HashSet::new();
             let mut stop_scheduling = false; // set on cancel: drain in-flight, schedule nothing new
 
             // Push every not-done/not-scheduled node whose inputs are all done.
@@ -843,11 +847,14 @@ mod tests {
         // Two parallel nodes: a (fast) + b (slow). Completion-driven scheduling must
         // yield a's NodeFinished BEFORE b's — an ordering join_all did NOT guarantee
         // (join_all yields in ready-batch iteration order regardless of finish time).
+        use std::sync::atomic::{AtomicBool, Ordering as AO};
         use tokio::sync::Notify;
         struct TimedBackend {
             reply: String,
-            // None → reply immediately; Some → wait on the Notify before replying.
+            // None → reply immediately; Some(gate) → wait on gate before replying.
             gate: Option<Arc<Notify>>,
+            // When `a` starts its prompt, signal the releaser task (None for non-a nodes).
+            a_done: Option<(Arc<Notify>, Arc<AtomicBool>)>,
         }
         #[async_trait::async_trait]
         impl AgentBackend for TimedBackend {
@@ -858,6 +865,14 @@ mod tests {
             ) -> Result<BackendStream, BridgeError> {
                 if let Some(g) = &self.gate {
                     g.notified().await; // park until released
+                }
+                // After returning from prompt(), the stream is a synchronous iter, so
+                // run_node for this node will finish as soon as the executor polls it.
+                // Signal the releaser that `a` has completed its prompt (and is therefore
+                // done, since the iter stream yields synchronously).
+                if let Some((notify, flag)) = &self.a_done {
+                    flag.store(true, AO::SeqCst);
+                    notify.notify_one();
                 }
                 Ok(Box::pin(tokio_stream::iter(vec![
                     Ok(Update::Text(self.reply.clone())),
@@ -871,15 +886,24 @@ mod tests {
             }
         }
         let slow_gate = Arc::new(Notify::new());
+        let a_done_notify = Arc::new(Notify::new());
+        let a_done_flag = Arc::new(AtomicBool::new(false));
         struct TReg {
             slow_gate: Arc<Notify>,
+            a_done_notify: Arc<Notify>,
+            a_done_flag: Arc<AtomicBool>,
         }
         #[async_trait::async_trait]
         impl AgentRegistry for TReg {
             async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
-                // "b" is the slow leg (gated); everything else replies immediately.
+                // "b" is the slow leg (gated); "a" gets the a_done signal; "t" is plain.
                 let gate = if id.as_str() == "b" {
                     Some(self.slow_gate.clone())
+                } else {
+                    None
+                };
+                let a_done = if id.as_str() == "a" {
+                    Some((self.a_done_notify.clone(), self.a_done_flag.clone()))
                 } else {
                     None
                 };
@@ -888,6 +912,7 @@ mod tests {
                     backend: Arc::new(TimedBackend {
                         reply: id.as_str().to_uppercase(),
                         gate,
+                        a_done,
                     }),
                     lease: Box::new(NoopLease),
                 })
@@ -928,13 +953,19 @@ mod tests {
         });
         let reg = Arc::new(TReg {
             slow_gate: slow_gate.clone(),
+            a_done_notify: a_done_notify.clone(),
+            a_done_flag: a_done_flag.clone(),
         });
         let ex = WorkflowExecutor::new(reg);
 
-        // Release the slow leg only AFTER a brief delay, so `a` finishes first.
+        // Release the slow leg only AFTER `a` has signalled completion — causal ordering,
+        // no wall-clock dependency. Guard against the notify firing before the waiter
+        // starts (mirror the cancel_drains_inflight pattern).
         let g2 = slow_gate.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if !a_done_flag.load(AO::SeqCst) {
+                a_done_notify.notified().await;
+            }
             g2.notify_waiters();
         });
 
