@@ -591,15 +591,20 @@ async fn synth_receives_both_fan_out_reviews() {
     );
 }
 
-/// **unary_reject**: a UNARY `skill="code-review"` must return a JSON-RPC
-/// `InvalidRequest` error — NOT start a workflow run, NOT panic.
+/// **unary detached submit**: a UNARY `skill="code-review"` now returns a
+/// canonical `a2a::Task` with state `working` IMMEDIATELY and persists a Working
+/// row — it no longer rejects with InvalidRequest.
 #[tokio::test]
-async fn unary_workflow_send_returns_invalid_request_error() {
-    let srv = build_workflow_server();
+async fn unary_workflow_send_returns_working_task() {
+    use bridge_core::task_store::{MemoryTaskStore, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
     let resp = srv
         .router()
         .oneshot(post_request(
-            methods::SEND_MESSAGE, // ← unary, not streaming
+            methods::SEND_MESSAGE,
             json!({ "message": {
                 "text": "DIFF",
                 "metadata": { "a2a-bridge.skill": "code-review" }
@@ -608,24 +613,20 @@ async fn unary_workflow_send_returns_invalid_request_error() {
         .await
         .unwrap();
 
-    // Must NOT be 500/panic; the server should reply 4xx or 200 with a JSON-RPC error.
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).expect("valid JSON");
+    assert!(body.get("error").is_none(), "must not be an error: {body}");
+    let task = &body["result"]["task"];
+    let id = task["id"].as_str().expect("task id present");
+    assert_ne!(id, "task-1", "detached submit must mint a unique id");
+    let state = task["status"]["state"].as_str().or_else(|| task["state"].as_str());
+    assert_eq!(state, Some("TASK_STATE_WORKING"), "state must be working: {body}");
+    let rec = store
+        .get(&bridge_core::ids::TaskId::parse(id).unwrap())
         .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(&body_bytes).expect("response must be valid JSON");
-
-    // A JSON-RPC error reply has `"error"` key with `"code"` == -32600.
-    let error = body
-        .get("error")
-        .expect("unary workflow must return a JSON-RPC error object");
-    let code = error
-        .get("code")
-        .and_then(|c| c.as_i64())
-        .expect("error must have a numeric code");
-    assert_eq!(
-        code, -32600,
-        "unary workflow send must return InvalidRequest (-32600), got: {body}"
-    );
+        .unwrap()
+        .expect("row created");
+    assert_eq!(rec.status, bridge_core::task_store::TaskRecordStatus::Working);
 }
 
 // ============================================================================

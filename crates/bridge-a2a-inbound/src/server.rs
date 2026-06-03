@@ -1069,7 +1069,6 @@ fn spawn_workflow_producer(
 
 /// Mint a fresh unique task id for a detached submit (SDK UUIDv7). NOT
 /// `task_id_from_params`, which returns the fixed `"task-1"` stub.
-#[allow(dead_code)] // wired in Task 8 (message/send detached)
 fn new_detached_task_id() -> TaskId {
     TaskId::parse(a2a::new_task_id()).expect("new_task_id is non-empty")
 }
@@ -1371,11 +1370,41 @@ async fn unary_message(
         }
         // Fanout handled above; this arm is unreachable.
         RouteTarget::Fanout => unreachable!("fanout handled by unary_fanout_message"),
-        // Workflows are streaming-only (their node-status frames are inherently a
-        // stream); reject a unary send with the same InvalidRequest shape the gate
-        // uses for a bad skill.
-        RouteTarget::Workflow(_) => {
-            return bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "skill" })
+        // Detached submit: mint a unique id, persist Working, register the
+        // cancel token, spawn the runner, and return a working Task NOW.
+        RouteTarget::Workflow(ref wf_id) => {
+            let task = new_detached_task_id();
+            let now = crate::workflow_sink::now_ms();
+            let rec = bridge_core::task_store::TaskRecord {
+                id: task.clone(),
+                workflow: wf_id.as_str().to_string(),
+                status: bridge_core::task_store::TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: now,
+                updated_ms: now,
+            };
+            if srv.task_store.create(&rec).await.is_err() {
+                return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
+            }
+            let token = tokio_util::sync::CancellationToken::new();
+            srv.workflow_cancels.lock().await.insert(task.clone(), token.clone());
+            let text_parts: Vec<String> =
+                routed.parts.iter().map(|p| p.text.clone()).collect();
+            drop(spawn_detached_workflow(&srv, task.clone(), text_parts, wf_id.clone(), token));
+            let working = a2a::Task {
+                id: task.as_str().to_owned(),
+                context_id: task.as_str().to_owned(),
+                status: a2a::TaskStatus {
+                    state: a2a::TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            };
+            return jsonrpc_ok(id, json!({ "task": working }));
         }
     };
 
