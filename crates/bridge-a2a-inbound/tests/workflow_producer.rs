@@ -17,7 +17,8 @@ use tower::ServiceExt;
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_core::domain::{
     AgentEntry, AgentKind, AuthContext, InboundRequest, Part, PeerTaskId, PendingRequest,
-    PermissionDecision, PermissionRequest, RegistrySnapshot, RouteTarget, SessionContext, TaskMeta,
+    PermissionDecision, PermissionRequest, RegistrySnapshot, RouteTarget, SessionContext, SessionSpec,
+    TaskMeta,
 };
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{AgentId, CallerId, NodeId, SessionId, TaskId, WorkflowId};
@@ -2677,4 +2678,215 @@ async fn resume_then_cancel_mid_run_finalizes_canceled() {
          received prompts: {:?}",
         codex_prompted.lock().unwrap()
     );
+}
+
+// ============================================================================
+// Task 7: WorkflowRunContext — per-request cwd threads to every node
+// ============================================================================
+
+/// Backend that captures the `SessionSpec.cwd` from `configure_session`.
+struct CwdCapBackend {
+    reply: String,
+    cwds: Arc<std::sync::Mutex<Vec<Option<bridge_core::SessionCwd>>>>,
+}
+
+#[async_trait]
+impl AgentBackend for CwdCapBackend {
+    async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        let updates = vec![
+            Ok(Update::Text(self.reply.clone())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(updates)))
+    }
+    async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+    async fn configure_session(
+        &self,
+        _s: &SessionId,
+        spec: &SessionSpec,
+    ) -> Result<(), BridgeError> {
+        self.cwds.lock().unwrap().push(spec.cwd.clone());
+        Ok(())
+    }
+}
+
+/// Build a server where every agent uses a `CwdCapBackend` sharing a single `cwds` vec.
+fn build_cwd_cap_server(
+    cwds: Arc<std::sync::Mutex<Vec<Option<bridge_core::SessionCwd>>>>,
+) -> Arc<InboundServer> {
+    let mk = |reply: &str| -> Arc<dyn AgentBackend> {
+        Arc::new(CwdCapBackend {
+            reply: reply.to_string(),
+            cwds: cwds.clone(),
+        })
+    };
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), mk("CODEX")),
+        ("claude".to_string(), mk("CLAUDE")),
+        ("synth".to_string(), mk("FINAL")),
+    ]
+    .into();
+    let registry = Arc::new(PerAgentRegistry { backends });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>,
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map),
+    )
+}
+
+/// STREAMING path: `message/stream` with `a2a-bridge.cwd="/req"` must cause every
+/// workflow node's `configure_session` to receive `spec.cwd == Some("/req")`.
+/// This is the rev1 miss — `spawn_workflow_producer` was calling `executor.run`
+/// (default ctx) instead of `run_with_context`. This test proves the fix.
+#[tokio::test]
+async fn streaming_workflow_threads_cwd_to_every_node() {
+    let cwds: Arc<std::sync::Mutex<Vec<Option<bridge_core::SessionCwd>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let srv = build_cwd_cap_server(cwds.clone());
+
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            json!({ "message": {
+                "text": "DIFF",
+                "metadata": {
+                    "a2a-bridge.skill": "code-review",
+                    "a2a-bridge.cwd": "/req"
+                }
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    // Drain the SSE stream to ensure the workflow completes.
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        body.contains("FINAL"),
+        "workflow must complete: {body}"
+    );
+
+    let captured = cwds.lock().unwrap();
+    assert_eq!(captured.len(), 3, "all 3 nodes must call configure_session; got {:?}", &*captured);
+    for cwd in captured.iter() {
+        assert_eq!(
+            cwd.as_ref().map(|c| c.as_str()),
+            Some("/req"),
+            "every node must receive cwd=/req (streaming path), got {:?}",
+            cwd
+        );
+    }
+}
+
+/// DETACHED path: `message/send` with `a2a-bridge.cwd="/req"` must cause every
+/// workflow node's `configure_session` to receive `spec.cwd == Some("/req")`.
+#[tokio::test]
+async fn detached_workflow_threads_cwd_to_every_node() {
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecordStatus, TaskStore};
+
+    let cwds: Arc<std::sync::Mutex<Vec<Option<bridge_core::SessionCwd>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+
+    let mk = |reply: &str| -> Arc<dyn AgentBackend> {
+        Arc::new(CwdCapBackend {
+            reply: reply.to_string(),
+            cwds: cwds.clone(),
+        })
+    };
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), mk("CODEX")),
+        ("claude".to_string(), mk("CLAUDE")),
+        ("synth".to_string(), mk("FINAL")),
+    ]
+    .into();
+    let registry = Arc::new(PerAgentRegistry { backends });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>,
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    let srv: Arc<InboundServer> = Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_task_store(store.clone()),
+    );
+
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::SEND_MESSAGE,
+            json!({ "message": {
+                "text": "DIFF",
+                "metadata": {
+                    "a2a-bridge.skill": "code-review",
+                    "a2a-bridge.cwd": "/req"
+                }
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    // The detached submit returns immediately with a Working task; drain the body.
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let task_id = body["result"]["task"]["id"]
+        .as_str()
+        .expect("response must carry task.id")
+        .to_string();
+    let task = bridge_core::ids::TaskId::parse(task_id).unwrap();
+
+    // Poll until terminal (mirrors poll_to_terminal in existing tests).
+    let rec = poll_to_terminal(&store, &task).await;
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Completed,
+        "detached workflow must complete; got {:?}",
+        rec.status
+    );
+
+    let captured = cwds.lock().unwrap();
+    assert_eq!(captured.len(), 3, "all 3 nodes must call configure_session; got {:?}", &*captured);
+    for cwd in captured.iter() {
+        assert_eq!(
+            cwd.as_ref().map(|c| c.as_str()),
+            Some("/req"),
+            "every node must receive cwd=/req (detached path), got {:?}",
+            cwd
+        );
+    }
 }

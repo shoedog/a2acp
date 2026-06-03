@@ -1104,7 +1104,10 @@ fn spawn_workflow_producer(
             .lock()
             .await
             .insert(task.clone(), token.clone());
-        let stream = executor.run(graph, input, task.as_str().to_string(), token);
+        let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
+            session_cwd: routed.session_cwd.clone(),
+        };
+        let stream = executor.run_with_context(graph, input, task.as_str().to_string(), token, wf_ctx);
         let mut sink = SseSink { tx: tx.clone() };
         // SseSink never errors (sends are best-effort); on a hypothetical error
         // treat it as no-terminal so the existing no-terminal fallback fires.
@@ -1136,6 +1139,7 @@ fn new_detached_task_id() -> TaskId {
 /// resume: `"{task}-resume-{n}"`), and a `seed` of already-completed node outputs
 /// (fresh submit: empty; boot resume: checkpoints from the store). With an empty
 /// seed, `run_from` is behaviorally identical to `run`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_detached_workflow(
     srv: &Arc<InboundServer>,
     task: TaskId,
@@ -1144,6 +1148,7 @@ fn spawn_detached_workflow(
     run_id: String,
     token: tokio_util::sync::CancellationToken,
     seed: std::collections::HashMap<String, (String, bool)>,
+    ctx: bridge_workflow::executor::WorkflowRunContext,
 ) -> tokio::task::JoinHandle<()> {
     let srv = srv.clone();
     tokio::spawn(async move {
@@ -1171,7 +1176,7 @@ fn spawn_detached_workflow(
                 return;
             }
         };
-        let stream = executor.run_from(graph, input, run_id, token, seed);
+        let stream = executor.run_from_with_context(graph, input, run_id, token, seed, ctx);
         let mut sink =
             crate::workflow_sink::TaskStoreSink::new(srv.task_store.clone(), task.clone());
         let now = crate::workflow_sink::now_ms();
@@ -1242,6 +1247,7 @@ pub fn spawn_detached_workflow_for_test(
         run_id,
         token,
         std::collections::HashMap::new(),
+        bridge_workflow::executor::WorkflowRunContext::default(),
     )
 }
 
@@ -1271,6 +1277,7 @@ pub fn spawn_detached_workflow_with_token_for_test(
         run_id,
         token,
         std::collections::HashMap::new(),
+        bridge_workflow::executor::WorkflowRunContext::default(),
     )
 }
 
@@ -1491,6 +1498,8 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     run_id.clone(),
                     token,
                     seed,
+                    // Task 9 restores persisted session_cwd; default for now.
+                    bridge_workflow::executor::WorkflowRunContext::default(),
                 ));
                 tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
             }
@@ -1781,6 +1790,9 @@ async fn unary_message(
                 task.as_str().to_string(),
                 token,
                 std::collections::HashMap::new(),
+                bridge_workflow::executor::WorkflowRunContext {
+                    session_cwd: routed.session_cwd.clone(),
+                },
             ));
             let working = a2a::Task {
                 id: task.as_str().to_owned(),
