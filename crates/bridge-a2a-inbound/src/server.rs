@@ -1144,7 +1144,8 @@ fn spawn_detached_workflow(
                         .await;
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!(task = task.as_str(), error = ?e, "drain_workflow sink error; marking task Failed");
                 let _ = srv
                     .task_store
                     .set_terminal(
