@@ -2,13 +2,13 @@
 use bridge_core::ids::{AgentId, NodeId, WorkflowId};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowGraph {
     pub id: WorkflowId,
     pub nodes: Vec<WorkflowNode>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowNode {
     pub id: NodeId,
     pub agent: AgentId,
@@ -164,5 +164,22 @@ mod tests {
             nodes: vec![node("a", "x", &[]), node("a", "x", &[])],
         };
         assert!(matches!(g.validate(), Err(WorkflowError::DuplicateNode(_))));
+    }
+
+    #[test]
+    fn graph_serde_roundtrip() {
+        let g = WorkflowGraph {
+            id: WorkflowId::parse("wf").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("a").unwrap(),
+                agent: AgentId::parse("x").unwrap(),
+                prompt_template: "t {{input}}".into(),
+                inputs: vec![],
+            }],
+        };
+        let s = serde_json::to_string(&g).unwrap();
+        let g2: WorkflowGraph = serde_json::from_str(&s).unwrap();
+        assert_eq!(g2.nodes.len(), 1);
+        assert_eq!(g2.nodes[0].id.as_str(), "a");
     }
 }
