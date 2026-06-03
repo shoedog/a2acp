@@ -48,6 +48,12 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct StoreConfig {
+    #[allow(dead_code)] // consumed in Task 14 (serve wiring)
+    pub path: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct DelegationConfig {
     pub peer_url: String,
     pub auth: String,
@@ -101,6 +107,9 @@ pub struct RegistryConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub delegation: Option<DelegationConfig>,
+    #[serde(default)]
+    #[allow(dead_code)] // consumed in Task 14 (serve wiring)
+    pub store: Option<StoreConfig>,
     #[serde(default)]
     pub workflows: Vec<WorkflowToml>,
 }
@@ -900,5 +909,30 @@ addr="127.0.0.1:8080"
             .unwrap()
             .load_workflows(dir.path())
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod store_cfg_tests {
+    use super::*;
+
+    #[test]
+    fn store_path_parses_when_present() {
+        let toml = r#"
+default = "codex"
+[server]
+addr = "127.0.0.1:8080"
+[store]
+path = "/tmp/x.db"
+"#;
+        let cfg = RegistryConfig::parse(toml).unwrap();
+        assert_eq!(cfg.store.unwrap().path, "/tmp/x.db");
+    }
+
+    #[test]
+    fn store_absent_is_none() {
+        let toml = "default = \"codex\"\n[server]\naddr = \"127.0.0.1:8080\"\n";
+        let cfg = RegistryConfig::parse(toml).unwrap();
+        assert!(cfg.store.is_none());
     }
 }
