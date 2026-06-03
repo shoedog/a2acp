@@ -15,6 +15,11 @@
 //   a2a-bridge                                           — serve (default)
 //   a2a-bridge run-workflow <id> --input <file>
 //             [--out <file>] [--config <path>]           — run a workflow offline
+//   a2a-bridge submit <skill> --input <file> [--url <url>]
+//                                                        — submit a detached task
+//   a2a-bridge task get <id> [--url <url>]               — get task by id
+//   a2a-bridge task list [--limit <n>] [--url <url>]     — list tasks
+//   a2a-bridge task cancel <id> [--url <url>]            — cancel task by id
 
 mod config;
 mod route;
@@ -266,12 +271,133 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A2A client helpers: submit + task get/list/cancel
+// ---------------------------------------------------------------------------
+
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+}
+
+async fn rpc_call(
+    url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, BoxError> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params
+    });
+    let resp = reqwest::Client::new()
+        .post(url)
+        .header(a2a::SVC_PARAM_VERSION, "1.0")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            format!("cannot reach serve at {url} — is `a2a-bridge serve` running? ({e})")
+        })?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("bad response: {e}"))?;
+    Ok(v)
+}
+
+async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
+    let skill = args.first().cloned().ok_or("submit: missing <skill>")?;
+    let input_path = flag(args, "--input").ok_or("submit: --input <file> required")?;
+    let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
+    let text = std::fs::read_to_string(input_path)?;
+    let params = serde_json::json!({
+        "message": {
+            "text": text,
+            "metadata": { "a2a-bridge.skill": skill }
+        }
+    });
+    let v = rpc_call(url, a2a::methods::SEND_MESSAGE, params).await?;
+    if let Some(err) = v.get("error") {
+        return Err(format!("submit failed: {err}").into());
+    }
+    let id = v["result"]["task"]["id"]
+        .as_str()
+        .ok_or("no task id in response")?;
+    println!("{id}");
+    Ok(())
+}
+
+async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
+    let sub = args
+        .first()
+        .map(|s| s.as_str())
+        .ok_or("task: missing subcommand (get|list|cancel)")?;
+    let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
+    match sub {
+        "get" => {
+            let id = args.get(1).cloned().ok_or("task get: missing <id>")?;
+            let v = rpc_call(
+                url,
+                a2a::methods::GET_TASK,
+                serde_json::json!({ "taskId": id }),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&v["result"]["task"])?);
+        }
+        "list" => {
+            let limit: u64 = flag(args, "--limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50);
+            let v = rpc_call(
+                url,
+                a2a::methods::LIST_TASKS,
+                serde_json::json!({ "limit": limit }),
+            )
+            .await?;
+            for t in v["result"]["tasks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
+                println!(
+                    "{}\t{}\t{}",
+                    t["id"].as_str().unwrap_or("?"),
+                    t["state"].as_str().unwrap_or("?"),
+                    t["workflow"].as_str().unwrap_or("?")
+                );
+            }
+        }
+        "cancel" => {
+            let id = args.get(1).cloned().ok_or("task cancel: missing <id>")?;
+            let v = rpc_call(
+                url,
+                a2a::methods::CANCEL_TASK,
+                serde_json::json!({ "taskId": id }),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&v["result"]["task"])?);
+        }
+        other => return Err(format!("task: unknown subcommand {other:?}").into()),
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     // Dispatch subcommands BEFORE the server path touches the filesystem.
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.get(1).map(|s| s.as_str()) == Some("run-workflow") {
         return run_workflow_cmd(&raw_args[2..]).await;
+    }
+    if raw_args.get(1).map(|s| s.as_str()) == Some("submit") {
+        return submit_cmd(&raw_args[2..]).await;
+    }
+    if raw_args.get(1).map(|s| s.as_str()) == Some("task") {
+        return task_cmd(&raw_args[2..]).await;
     }
 
     // 1. Observability — install tracing subscriber (idempotent).
@@ -476,4 +602,20 @@ async fn main() -> Result<(), BoxError> {
     axum::serve(listener, router).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn flag_parses_value_and_missing() {
+        let a = vec![
+            "--url".to_string(),
+            "http://x".to_string(),
+            "code-review".to_string(),
+        ];
+        assert_eq!(flag(&a, "--url"), Some("http://x"));
+        assert_eq!(flag(&a, "--nope"), None);
+    }
 }
