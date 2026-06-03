@@ -238,7 +238,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             Ok(WorkflowEvent::NodeStarted { node }) => {
                 eprintln!("[workflow] node {} started", node.as_str());
             }
-            Ok(WorkflowEvent::NodeFinished { node, ok: node_ok }) => {
+            Ok(WorkflowEvent::NodeFinished { node, ok: node_ok, .. }) => {
                 eprintln!(
                     "[workflow] node {} {}",
                     node.as_str(),

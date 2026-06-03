@@ -26,7 +26,8 @@ pub(crate) async fn drain_workflow<S: WorkflowSink>(
     while let Some(item) = stream.next().await {
         match item {
             Ok(WorkflowEvent::NodeStarted { node }) => sink.node_started(node.as_str()).await,
-            Ok(WorkflowEvent::NodeFinished { node, ok }) => {
+            Ok(WorkflowEvent::NodeFinished { node, ok, output }) => {
+                let _ = output;
                 sink.node_finished(node.as_str(), ok).await
             }
             Ok(WorkflowEvent::Terminal { outcome, output }) => {

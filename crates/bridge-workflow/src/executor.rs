@@ -30,6 +30,7 @@ pub enum WorkflowEvent {
     NodeFinished {
         node: NodeId,
         ok: bool,
+        output: String,
     },
     Terminal {
         outcome: WorkflowOutcome,
@@ -162,7 +163,7 @@ impl WorkflowExecutor {
                     }
                 });
                 for (node_id, text, ok) in futures::future::join_all(futs).await {
-                    yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok });
+                    yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok, output: text.clone() });
                     done.insert(node_id.as_str().to_string());
                     outputs.insert(node_id.as_str().to_string(), (text, ok));
                 }
@@ -573,7 +574,7 @@ mod tests {
         ));
         // a NodeFinished{ok:false} was emitted for codex
         assert!(evs.iter().any(|e| matches!(e.as_ref().unwrap(),
-            WorkflowEvent::NodeFinished { node, ok: false } if node.as_str() == "codex")));
+            WorkflowEvent::NodeFinished { node, ok: false, .. } if node.as_str() == "codex")));
         // the EXACT failure marker reached synth's prompt
         let p = &synth_rec.prompts.lock().unwrap()[0];
         assert!(
