@@ -4512,6 +4512,12 @@ mod tests {
         leases: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
         /// Monotonically-increasing count of `resolve()` calls per agent key.
         resolve_calls: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
+        /// Counts how many times a NEW backend instance was "spawned" for an agent.
+        /// In this test registry the backend is pre-built, so `spawn_counts` increments
+        /// only on the very first `resolve()` call for each agent and stays at 1 for all
+        /// subsequent calls (modelling warm-process reuse). A real CWD-keyed-spawn
+        /// regression would require a new backend per CWD → this counter would reach 2.
+        spawn_counts: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
     }
     struct CountingRegistryInner {
         entries: std::collections::HashMap<String, AgentEntry>,
@@ -4523,6 +4529,7 @@ mod tests {
             let mut backends = std::collections::HashMap::new();
             let mut leases = std::collections::HashMap::new();
             let mut resolve_calls = std::collections::HashMap::new();
+            let mut spawn_counts = std::collections::HashMap::new();
             for (entry, backend) in agents {
                 let key = entry.id.as_str().to_owned();
                 leases.insert(
@@ -4530,6 +4537,10 @@ mod tests {
                     Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 );
                 resolve_calls.insert(
+                    key.clone(),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                );
+                spawn_counts.insert(
                     key.clone(),
                     Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 );
@@ -4541,6 +4552,7 @@ mod tests {
                 inner: tokio::sync::Mutex::new(CountingRegistryInner { entries, backends }),
                 leases,
                 resolve_calls,
+                spawn_counts,
             })
         }
         /// The current live-lease count for an agent (0 once all its leases dropped).
@@ -4558,6 +4570,16 @@ mod tests {
                 .map(|c| c.load(Ordering::SeqCst))
                 .unwrap_or(0)
         }
+        /// How many times the backend for `id` was "spawned" (i.e. first activated).
+        /// Stays at 1 across all warm-reuse resolves. Guards against CWD-keyed-spawn
+        /// regressions: if per-request cwd were threaded into the spawn key, a second
+        /// distinct cwd would produce a second backend → this count would reach 2.
+        fn spawn_count(&self, id: &str) -> usize {
+            self.spawn_counts
+                .get(id)
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0)
+        }
     }
     #[async_trait::async_trait]
     impl AgentRegistry for CountingRegistry {
@@ -4569,7 +4591,14 @@ mod tests {
                     let count = self.leases.get(key).expect("agent has a lease counter");
                     count.fetch_add(1, Ordering::SeqCst);
                     if let Some(rc) = self.resolve_calls.get(key) {
-                        rc.fetch_add(1, Ordering::SeqCst);
+                        // Increment spawn_counts only on the first ever resolve (the
+                        // backend "comes alive" once; subsequent resolves are warm reuse).
+                        let prev = rc.fetch_add(1, Ordering::SeqCst);
+                        if prev == 0 {
+                            if let Some(sc) = self.spawn_counts.get(key) {
+                                sc.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
                     }
                     Ok(Resolved {
                         entry: Arc::new(entry.clone()),
@@ -5246,6 +5275,18 @@ mod tests {
     /// Build params for a unary SendMessage selecting `agent`, with optional model
     /// override and optional per-request cwd (Task 6 dispatch tests).
     fn agent_params_cwd(agent: &str, model: Option<&str>, cwd: Option<&str>) -> Value {
+        agent_params_cwd_task(agent, model, cwd, None)
+    }
+
+    /// Like `agent_params_cwd` but also injects an explicit `taskId` into the params
+    /// so the request bypasses the "task-1" fallback and hits its own binding slot.
+    /// Pass distinct task ids to prevent two requests from sharing the binding cache.
+    fn agent_params_cwd_task(
+        agent: &str,
+        model: Option<&str>,
+        cwd: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Value {
         let mut md = json!({ "a2a-bridge.agent": agent });
         if let Some(m) = model {
             md["a2a-bridge.model"] = json!(m);
@@ -5253,7 +5294,11 @@ mod tests {
         if let Some(c) = cwd {
             md["a2a-bridge.cwd"] = json!(c);
         }
-        json!({ "message": { "text": "go", "metadata": md } })
+        let mut params = json!({ "message": { "text": "go", "metadata": md } });
+        if let Some(tid) = task_id {
+            params["taskId"] = json!(tid);
+        }
+        params
     }
 
     #[tokio::test]
@@ -5294,12 +5339,19 @@ mod tests {
 
     #[tokio::test]
     async fn per_request_cwd_does_not_respawn() {
-        // Two sequential unary sends to the SAME agent with DIFFERENT
-        // `a2a-bridge.cwd` values must reuse the SAME backend process slot (i.e.
-        // `registry.resolve()` is called exactly ONCE — the backend is warm, only
-        // the ACP session mint differs per request). The registry reuse comparison
-        // MUST NOT include `session_cwd` (Task 2 confirmed this), so changing the
-        // cwd cannot cause a cold-backend spawn.
+        // Two sequential unary sends to the SAME agent, each carrying a DIFFERENT
+        // `a2a-bridge.cwd`, and each carrying a DISTINCT `taskId` so neither request
+        // hits the other's binding cache — both independently exercise the full
+        // resolve path through the registry.
+        //
+        // The invariant: the backend is "spawned" (first-activated) exactly ONCE.
+        // Both requests see the same warm process slot even though the cwd differs,
+        // because `session_cwd` is a mint-time session param, NOT part of the
+        // backend's spawn/identity key.
+        //
+        // Regression guard: if per-request cwd were (wrongly) threaded into the
+        // spawn key, a second distinct cwd would require a second backend instance →
+        // `spawn_count` would reach 2, failing this assertion.
         let a = TrackingBackend::new("a", /*idle*/ false);
         let registry = CountingRegistry::new(
             "a",
@@ -5308,11 +5360,12 @@ mod tests {
         let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
         let srv = build_registry_store(registry.clone(), store, "a");
 
-        // First request: cwd="/repo/a".
+        // Request 1: task-a, cwd=/repo-a.  Goes through the full resolve path
+        // (no prior binding) and activates the backend for the first time.
         let resp1 = router(srv.clone())
             .oneshot(post_request(
                 methods::SEND_MESSAGE,
-                agent_params_cwd("a", None, Some("/repo/a")),
+                agent_params_cwd_task("a", None, Some("/repo-a"), Some("task-a")),
                 "1.0",
             ))
             .await
@@ -5320,11 +5373,14 @@ mod tests {
         assert_eq!(resp1.status(), StatusCode::OK);
         let _ = body_string(resp1).await;
 
-        // Second request: cwd="/repo/b" (different path, same agent).
+        // Request 2: task-b, cwd=/repo-b — a DIFFERENT task id and a DIFFERENT cwd.
+        // Because the task id differs, this request has no binding cache entry and
+        // also goes through the full resolve path.  The backend must be REUSED, not
+        // re-spawned, proving cwd is not part of the spawn identity key.
         let resp2 = router(srv.clone())
             .oneshot(post_request(
                 methods::SEND_MESSAGE,
-                agent_params_cwd("a", None, Some("/repo/b")),
+                agent_params_cwd_task("a", None, Some("/repo-b"), Some("task-b")),
                 "1.0",
             ))
             .await
@@ -5332,14 +5388,19 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::OK);
         let _ = body_string(resp2).await;
 
-        // The registry must have been resolved exactly ONCE across both requests.
-        // A second resolve would mean the bridge re-spawned a new backend process
-        // for each cwd — the performance bug the warm-reuse property guards against.
+        // Both requests went through resolve() (2 calls total — one per new task).
         assert_eq!(
             registry.resolve_call_count("a"),
+            2,
+            "each distinct task must go through resolve() independently"
+        );
+        // But the backend was only ever spawned ONCE — the second resolve reused the
+        // warm process slot.  Would be 2 if cwd were (wrongly) a spawn key.
+        assert_eq!(
+            registry.spawn_count("a"),
             1,
-            "changing a2a-bridge.cwd must NOT cause a second backend resolve/spawn; \
-             the warm process is shared, only the ACP session mint differs"
+            "changing a2a-bridge.cwd must NOT spawn a new backend; \
+             the warm process is shared across distinct cwds (only the ACP session mint differs)"
         );
     }
 }
