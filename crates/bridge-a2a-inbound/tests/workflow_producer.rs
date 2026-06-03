@@ -767,6 +767,51 @@ async fn cancel_task_fires_workflow_token_stream_ends_canceled() {
     );
 }
 
+/// **tasks/get canonical**: `GET_TASK` on a completed durable task must return a
+/// canonical `a2a::Task` with state `TASK_STATE_COMPLETED` and an artifact
+/// carrying the result payload.
+#[tokio::test]
+async fn tasks_get_returns_completed_with_artifact() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let id = TaskId::parse("g1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: id.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .set_terminal(&id, TaskRecordStatus::Completed, Some("THE_RESULT"), None, 2)
+        .await
+        .unwrap();
+
+    let resp = srv
+        .router()
+        .oneshot(post_request(methods::GET_TASK, json!({ "taskId": "g1" })))
+        .await
+        .unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let task = &body["result"]["task"];
+    let state = task["status"]["state"].as_str().or_else(|| task["state"].as_str());
+    assert_eq!(state, Some("TASK_STATE_COMPLETED"), "{body}");
+    assert!(
+        body.to_string().contains("THE_RESULT"),
+        "completed task must carry the result: {body}"
+    );
+}
+
 /// **terminal_failed**: when the synth node errors, the A2A streaming task must end
 /// in a `Failed` terminal state (NOT a panic, NOT Completed).
 #[tokio::test]

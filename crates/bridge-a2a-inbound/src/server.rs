@@ -1690,6 +1690,20 @@ async fn get_task(
         Ok(t) => t,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
+    // Durable task row first (detached workflows).
+    if let Ok(Some(rec)) = srv.task_store.get(&task).await {
+        let (state, artifacts) = task_record_to_a2a(&rec);
+        let t = a2a::Task {
+            id: rec.id.as_str().to_owned(),
+            context_id: rec.id.as_str().to_owned(),
+            status: a2a::TaskStatus { state, message: None, timestamp: None },
+            artifacts,
+            history: None,
+            metadata: None,
+        };
+        return jsonrpc_ok(id, json!({ "task": t }));
+    }
+    // Fallback: session-mapping heuristic (non-workflow tasks; unchanged).
     let known = matches!(srv.store.session_for(&task).await, Ok(Some(_)));
     let state = if known {
         "TASK_STATE_WORKING"
@@ -1700,6 +1714,34 @@ async fn get_task(
         id,
         json!({ "task": { "id": task.as_str(), "state": state } }),
     )
+}
+
+/// Map a durable `TaskRecord` to (A2A state, artifacts). `Interrupted` collapses
+/// to `failed` at the wire (reason in the artifact).
+fn task_record_to_a2a(
+    rec: &bridge_core::task_store::TaskRecord,
+) -> (a2a::TaskState, Option<Vec<a2a::Artifact>>) {
+    use bridge_core::task_store::TaskRecordStatus;
+    let state = match rec.status {
+        TaskRecordStatus::Working => a2a::TaskState::Working,
+        TaskRecordStatus::Completed => a2a::TaskState::Completed,
+        TaskRecordStatus::Failed => a2a::TaskState::Failed,
+        TaskRecordStatus::Canceled => a2a::TaskState::Canceled,
+        TaskRecordStatus::Interrupted => a2a::TaskState::Failed,
+    };
+    // Surface the result (success) or the error text (failed/interrupted) as the artifact.
+    let payload = rec.result.clone().or_else(|| rec.error.clone());
+    let artifacts = payload.map(|r| {
+        vec![a2a::Artifact {
+            artifact_id: a2a::new_artifact_id(),
+            name: None,
+            description: None,
+            parts: vec![a2a::Part::text(r)],
+            metadata: None,
+            extensions: None,
+        }]
+    });
+    (state, artifacts)
 }
 
 // ---- JSON-RPC helpers ----
