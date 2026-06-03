@@ -166,7 +166,10 @@ mod tests {
         let s = MemoryTaskStore::new();
         let id = TaskId::parse("t-a").unwrap();
         s.create(&rec("t-a", 10)).await.unwrap();
-        assert_eq!(s.get(&id).await.unwrap().unwrap().status, TaskRecordStatus::Working);
+        assert_eq!(
+            s.get(&id).await.unwrap().unwrap().status,
+            TaskRecordStatus::Working
+        );
         s.set_terminal(&id, TaskRecordStatus::Completed, Some("OUT"), None, 20)
             .await
             .unwrap();
@@ -205,9 +208,16 @@ mod tests {
         let n = s.sweep_interrupted(99).await.unwrap();
         assert_eq!(n, 1);
         assert_eq!(
-            s.get(&TaskId::parse("w").unwrap()).await.unwrap().unwrap().status,
+            s.get(&TaskId::parse("w").unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             TaskRecordStatus::Interrupted
         );
-        assert_eq!(s.get(&done).await.unwrap().unwrap().status, TaskRecordStatus::Completed);
+        assert_eq!(
+            s.get(&done).await.unwrap().unwrap().status,
+            TaskRecordStatus::Completed
+        );
     }
 }

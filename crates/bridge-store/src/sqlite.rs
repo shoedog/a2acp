@@ -47,7 +47,8 @@ impl SqliteStore {
             .truncate(false)
             .open(&lock_path)
             .map_err(|_| BridgeError::StoreFailure)?;
-        lock.try_lock_exclusive().map_err(|_| BridgeError::StoreFailure)?;
+        lock.try_lock_exclusive()
+            .map_err(|_| BridgeError::StoreFailure)?;
         let conn = rusqlite::Connection::open(path).map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -264,10 +265,7 @@ impl SessionStore for SqliteStore {
 
 #[async_trait::async_trait]
 impl bridge_core::task_store::TaskStore for SqliteStore {
-    async fn create(
-        &self,
-        rec: &bridge_core::task_store::TaskRecord,
-    ) -> Result<(), BridgeError> {
+    async fn create(&self, rec: &bridge_core::task_store::TaskRecord) -> Result<(), BridgeError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms)
@@ -361,9 +359,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     }
 }
 
-fn row_to_task(
-    row: &rusqlite::Row,
-) -> Result<bridge_core::task_store::TaskRecord, BridgeError> {
+fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecord, BridgeError> {
     use bridge_core::task_store::{TaskRecord, TaskRecordStatus};
     let id: String = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
     let workflow: String = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
@@ -408,8 +404,13 @@ mod tests {
         let s = SqliteStore::open_in_memory().unwrap();
         let id = TaskId::parse("t1").unwrap();
         s.create(&trec("t1", 1)).await.unwrap();
-        assert_eq!(s.get(&id).await.unwrap().unwrap().status, TaskRecordStatus::Working);
-        s.set_terminal(&id, TaskRecordStatus::Completed, Some("SYNTH"), None, 9).await.unwrap();
+        assert_eq!(
+            s.get(&id).await.unwrap().unwrap().status,
+            TaskRecordStatus::Working
+        );
+        s.set_terminal(&id, TaskRecordStatus::Completed, Some("SYNTH"), None, 9)
+            .await
+            .unwrap();
         let got = s.get(&id).await.unwrap().unwrap();
         assert_eq!(got.status, TaskRecordStatus::Completed);
         assert_eq!(got.result.as_deref(), Some("SYNTH"));
@@ -425,10 +426,16 @@ mod tests {
             let s = SqliteStore::open(&path).unwrap();
             let id = TaskId::parse("keep").unwrap();
             s.create(&trec("keep", 1)).await.unwrap();
-            s.set_terminal(&id, TaskRecordStatus::Completed, Some("R"), None, 2).await.unwrap();
+            s.set_terminal(&id, TaskRecordStatus::Completed, Some("R"), None, 2)
+                .await
+                .unwrap();
         }
         let s2 = SqliteStore::open(&path).unwrap();
-        let got = s2.get(&TaskId::parse("keep").unwrap()).await.unwrap().unwrap();
+        let got = s2
+            .get(&TaskId::parse("keep").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.status, TaskRecordStatus::Completed);
         assert_eq!(got.result.as_deref(), Some("R"));
         drop(s2);
@@ -443,7 +450,14 @@ mod tests {
         assert_eq!(s.list(10).await.unwrap()[0].id.as_str(), "b");
         let n = s.sweep_interrupted(99).await.unwrap();
         assert_eq!(n, 2);
-        assert_eq!(s.get(&TaskId::parse("a").unwrap()).await.unwrap().unwrap().status, TaskRecordStatus::Interrupted);
+        assert_eq!(
+            s.get(&TaskId::parse("a").unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskRecordStatus::Interrupted
+        );
     }
 
     #[tokio::test]

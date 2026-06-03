@@ -358,11 +358,7 @@ async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
                 serde_json::json!({ "limit": limit }),
             )
             .await?;
-            for t in v["result"]["tasks"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-            {
+            for t in v["result"]["tasks"].as_array().cloned().unwrap_or_default() {
                 println!(
                     "{}\t{}\t{}",
                     t["id"].as_str().unwrap_or("?"),

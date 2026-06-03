@@ -613,20 +613,31 @@ async fn unary_workflow_send_returns_working_task() {
         .await
         .unwrap();
 
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&body_bytes).expect("valid JSON");
     assert!(body.get("error").is_none(), "must not be an error: {body}");
     let task = &body["result"]["task"];
     let id = task["id"].as_str().expect("task id present");
     assert_ne!(id, "task-1", "detached submit must mint a unique id");
-    let state = task["status"]["state"].as_str().or_else(|| task["state"].as_str());
-    assert_eq!(state, Some("TASK_STATE_WORKING"), "state must be working: {body}");
+    let state = task["status"]["state"]
+        .as_str()
+        .or_else(|| task["state"].as_str());
+    assert_eq!(
+        state,
+        Some("TASK_STATE_WORKING"),
+        "state must be working: {body}"
+    );
     let rec = store
         .get(&bridge_core::ids::TaskId::parse(id).unwrap())
         .await
         .unwrap()
         .expect("row created");
-    assert_eq!(rec.status, bridge_core::task_store::TaskRecordStatus::Working);
+    assert_eq!(
+        rec.status,
+        bridge_core::task_store::TaskRecordStatus::Working
+    );
 }
 
 // ============================================================================
@@ -792,7 +803,13 @@ async fn tasks_get_returns_completed_with_artifact() {
         .await
         .unwrap();
     store
-        .set_terminal(&id, TaskRecordStatus::Completed, Some("THE_RESULT"), None, 2)
+        .set_terminal(
+            &id,
+            TaskRecordStatus::Completed,
+            Some("THE_RESULT"),
+            None,
+            2,
+        )
         .await
         .unwrap();
 
@@ -801,10 +818,14 @@ async fn tasks_get_returns_completed_with_artifact() {
         .oneshot(post_request(methods::GET_TASK, json!({ "taskId": "g1" })))
         .await
         .unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     let task = &body["result"]["task"];
-    let state = task["status"]["state"].as_str().or_else(|| task["state"].as_str());
+    let state = task["status"]["state"]
+        .as_str()
+        .or_else(|| task["state"].as_str());
     assert_eq!(state, Some("TASK_STATE_COMPLETED"), "{body}");
     assert!(
         body.to_string().contains("THE_RESULT"),
@@ -843,18 +864,26 @@ async fn cancel_terminal_detached_returns_true_state_not_recancel() {
 
     let resp = srv
         .router()
-        .oneshot(post_request(methods::CANCEL_TASK, json!({ "taskId": "c1" })))
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": "c1" }),
+        ))
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
     )
     .unwrap();
     let state = body["result"]["task"]["state"]
         .as_str()
         .or_else(|| body["result"]["task"]["status"]["state"].as_str());
     assert_eq!(state, Some("TASK_STATE_COMPLETED"), "{body}");
-    assert_eq!(store.get(&id).await.unwrap().unwrap().status, TaskRecordStatus::Completed);
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().status,
+        TaskRecordStatus::Completed
+    );
 }
 
 // ============================================================================
@@ -889,11 +918,17 @@ async fn tasks_list_returns_recent_newest_first() {
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
     )
     .unwrap();
     let tasks = body["result"]["tasks"].as_array().expect("tasks array");
-    assert_eq!(tasks[0]["id"].as_str(), Some("l-new"), "newest-first: {body}");
+    assert_eq!(
+        tasks[0]["id"].as_str(),
+        Some("l-new"),
+        "newest-first: {body}"
+    );
 }
 
 /// A backend that blocks on a gate (AtomicBool + Notify) before yielding its reply.
@@ -961,7 +996,7 @@ fn build_gated_workflow_server(
 ) -> Arc<InboundServer> {
     let registry = Arc::new(GatedRegistry { gate });
     let executor = Arc::new(WorkflowExecutor::new(
-        registry.clone() as Arc<dyn AgentRegistry>,
+        registry.clone() as Arc<dyn AgentRegistry>
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
@@ -986,7 +1021,10 @@ async fn submit_returns_working_before_completion_then_completes() {
     use bridge_core::task_store::{MemoryTaskStore, TaskRecordStatus, TaskStore};
     use std::sync::Arc;
     let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
-    let gate = Arc::new((std::sync::atomic::AtomicBool::new(false), tokio::sync::Notify::new()));
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
     let srv = build_gated_workflow_server(store.clone(), gate.clone());
 
     let resp = srv
@@ -999,21 +1037,31 @@ async fn submit_returns_working_before_completion_then_completes() {
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
     )
     .unwrap();
     let id = body["result"]["task"]["id"].as_str().unwrap().to_string();
     let tid = bridge_core::ids::TaskId::parse(&id).unwrap();
     // Still Working while gated.
-    assert_eq!(store.get(&tid).await.unwrap().unwrap().status, TaskRecordStatus::Working);
+    assert_eq!(
+        store.get(&tid).await.unwrap().unwrap().status,
+        TaskRecordStatus::Working
+    );
     // Release the gate (set flag THEN wake) so late-parking nodes (synth) also proceed.
     gate.0.store(true, std::sync::atomic::Ordering::Release);
     gate.1.notify_waiters();
     for _ in 0..200 {
-        if store.get(&tid).await.unwrap().unwrap().status.is_terminal() { break; }
+        if store.get(&tid).await.unwrap().unwrap().status.is_terminal() {
+            break;
+        }
         tokio::task::yield_now().await;
     }
-    assert_eq!(store.get(&tid).await.unwrap().unwrap().status, TaskRecordStatus::Completed);
+    assert_eq!(
+        store.get(&tid).await.unwrap().unwrap().status,
+        TaskRecordStatus::Completed
+    );
 }
 
 /// **terminal_failed**: when the synth node errors, the A2A streaming task must end
@@ -1104,7 +1152,7 @@ fn build_failing_synth_workflow_server(
     .into();
     let registry = Arc::new(PerAgentRegistry { backends });
     let executor = Arc::new(WorkflowExecutor::new(
-        registry.clone() as Arc<dyn AgentRegistry>,
+        registry.clone() as Arc<dyn AgentRegistry>
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
@@ -1152,7 +1200,7 @@ fn build_panicking_workflow_server(
     .into();
     let registry = Arc::new(PerAgentRegistry { backends });
     let executor = Arc::new(WorkflowExecutor::new(
-        registry.clone() as Arc<dyn AgentRegistry>,
+        registry.clone() as Arc<dyn AgentRegistry>
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
@@ -1210,9 +1258,16 @@ async fn runner_panic_finalizes_failed_no_orphan() {
         bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
     );
     let _ = handle.await; // Err(JoinError{panic}) — swallow it
-    // The Finalizer spawns a secondary task; give it time to write the row.
+                          // The Finalizer spawns a secondary task; give it time to write the row.
     for _ in 0..200 {
-        if store.get(&task).await.unwrap().unwrap().status.is_terminal() {
+        if store
+            .get(&task)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_terminal()
+        {
             break;
         }
         tokio::task::yield_now().await;
@@ -1261,7 +1316,10 @@ async fn detached_runner_persists_failed_on_node_failure() {
     .unwrap();
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(rec.status, TaskRecordStatus::Failed);
-    assert!(rec.error.is_some(), "failed record must carry an error marker");
+    assert!(
+        rec.error.is_some(),
+        "failed record must carry an error marker"
+    );
 }
 
 /// **DoD-7 — detached Canceled**: firing the token while the gated backend is
