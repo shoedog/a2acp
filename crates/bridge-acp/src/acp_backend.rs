@@ -232,6 +232,14 @@ struct AgentSession {
     /// The agent-minted session id, set exactly once by the `session/new` that
     /// `ensure_session` drives. `OnceCell` guarantees single init under races.
     agent_id: OnceCell<AgentSessionId>,
+    /// The cwd string that was ACTUALLY passed to `session/new` when this session
+    /// was minted. Set inside the same `get_or_try_init` closure as `agent_id`
+    /// (so it is always set iff the session exists) and used by the immutability
+    /// guard: if a later `configure_session` stashes a DIFFERENT cwd for an
+    /// already-minted session, `ensure_session` returns `InvalidStateTransition`
+    /// rather than silently re-using the old cwd. ACP §11A: a session's cwd is
+    /// fixed at `session/new` time.
+    minted_cwd: OnceCell<String>,
     /// Per-session turn lock. Held for the duration of a prompt turn so turns on
     /// one agent session run strictly sequentially. `Arc<Mutex<()>>` (not a bare
     /// field) so `prompt` can take an OWNED guard (`lock_owned`) and move it into
@@ -258,6 +266,7 @@ impl AgentSession {
     fn new() -> Self {
         Self {
             agent_id: OnceCell::new(),
+            minted_cwd: OnceCell::new(),
             turn_lock: Arc::new(Mutex::new(())),
             cancel_requested: AtomicBool::new(false),
             turn_kill: Arc::new(StdMutex::new(None)),
@@ -852,24 +861,32 @@ impl AcpBackend {
     async fn ensure_session(&self, key: &SessionId) -> Result<AgentSessionId, BridgeError> {
         let entry = self.session_entry(key).await;
         let cx = self.cx()?;
-        let cwd = self
-            .config
-            .as_ref()
-            .map(|c| c.cwd.clone())
-            .ok_or(BridgeError::AgentCrashed)?;
-        // Resolve the per-session config (Increment 3b). Read the stash for THIS
-        // bridge key; if dispatch (T10) called `configure_session(key, ..)` before
-        // the prompt, that effective `model`/`effort`/`mode` drives the mint. If
-        // there's NO stash entry (direct callers / the gated e2es that don't go
-        // through `configure_session`), FALL BACK to `AcpConfig`'s static
-        // `model`/`mode` so the pre-3b behavior is preserved. Captured up front as
-        // owned values so the init closure (which must be `'static`/move-safe) owns
-        // them — session configuration lives INSIDE the closure (see below).
+        // Resolve the per-session config (Increment 3b / session-cwd). Read the
+        // stash for THIS bridge key; if dispatch (T10) called `configure_session(key,
+        // ..)` before the prompt, that effective `model`/`effort`/`mode`/`cwd` drives
+        // the mint. If there's NO stash entry (direct callers / the gated e2es that
+        // don't go through `configure_session`), FALL BACK to `AcpConfig`'s static
+        // `model`/`mode`/`cwd` so the pre-3b behavior is preserved. Captured up front
+        // as owned values so the init closure (which must be `'static`/move-safe)
+        // owns them — session configuration lives INSIDE the closure (see below).
         let stashed = self
             .session_cfg
             .lock()
             .ok()
             .and_then(|m| m.get(key).cloned());
+        // Desired cwd for this mint: stashed SessionSpec.cwd → static AcpConfig.cwd.
+        // Neither present → AgentCrashed (no config at all; constructor guarantees
+        // this can't happen on the normal spawn/connect paths).
+        let desired_cwd: String = stashed
+            .as_ref()
+            .and_then(|s| s.cwd.as_ref())
+            .map(|c| c.as_str().to_string())
+            .or_else(|| {
+                self.config
+                    .as_ref()
+                    .map(|c| c.cwd.to_string_lossy().into_owned())
+            })
+            .ok_or(BridgeError::AgentCrashed)?;
         let (mode, model, effort) = match stashed {
             Some(spec) => (spec.config.mode, spec.config.model, spec.config.effort),
             None => (
@@ -883,12 +900,13 @@ impl AcpBackend {
         // one caller (`OnceCell`); set the flag inside it so only the minter does
         // the post-init latch drain below.
         let mut newly_minted = false;
+        let cwd_for_mint = desired_cwd.clone();
         let id = entry
             .agent_id
             .get_or_try_init(|| async {
                 newly_minted = true;
                 // (1) session/new — mint the agent session id.
-                let req = Self::new_session_request(cwd);
+                let req = Self::new_session_request(PathBuf::from(&cwd_for_mint));
                 let resp = cx
                     .send_request(req)
                     .block_task()
@@ -946,9 +964,30 @@ impl AcpBackend {
                     Self::apply_effort(cx, &id, effort).await;
                 }
 
+                // (5) Record the cwd that was actually used to mint this session so
+                // the immutability guard below can compare future requests against
+                // what the agent was ACTUALLY given at session/new (ACP §11A).
+                // `set` on a `OnceCell` can only fail if already set (impossible here
+                // since we are inside the init closure); ignore the result.
+                let _ = entry.minted_cwd.set(cwd_for_mint);
+
                 Ok::<_, BridgeError>(id)
             })
             .await?;
+
+        // Immutability guard (ACP §11A): a session's cwd is fixed at `session/new`.
+        // If this call did NOT mint the session (it already existed) but the desired
+        // cwd differs from the recorded minted cwd, the caller is trying to reuse a
+        // warm session for a DIFFERENT repo — error rather than silently operating in
+        // the wrong directory. Matching cwd (same session recycled for the same repo)
+        // is fine and does not error.
+        if !newly_minted {
+            if let Some(minted) = entry.minted_cwd.get() {
+                if *minted != desired_cwd {
+                    return Err(BridgeError::InvalidStateTransition);
+                }
+            }
+        }
 
         // Post-init cancel-latch drain — runs only on the minting call, and only
         // AFTER `get_or_try_init` returned, i.e. once the id is observable to a
@@ -1400,6 +1439,7 @@ mod tests {
     use bridge_core::error::BridgeError;
     use bridge_core::ports::{AgentBackend, Update};
     use bridge_core::process::Supervised;
+    use bridge_core::SessionCwd;
     use futures::StreamExt;
     use std::time::Duration;
 
@@ -1762,6 +1802,12 @@ mod tests {
         /// When set, the `session/set_config_option` handler REJECTS with a JSON-RPC
         /// error (modeling an adapter without a structured effort knob). NON-FATAL.
         reject_set_config: Arc<AtomicBool>,
+
+        // ── Task 4 (session-cwd): record the cwd the client sent at session/new ─
+        /// The `cwd` from the most recent `session/new` request (as a lossy string).
+        /// Tests assert against this to verify `ensure_session` passed the correct
+        /// cwd down to the wire (stashed SessionSpec.cwd vs static AcpConfig.cwd).
+        new_session_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     }
 
     impl Recorder {
@@ -1802,6 +1848,7 @@ mod tests {
                 set_config_options: Arc::new(Mutex::new(Vec::new())),
                 set_config_seen: Arc::new(Notify::new()),
                 reject_set_config: Arc::new(AtomicBool::new(false)),
+                new_session_cwd: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1973,12 +2020,15 @@ mod tests {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
-                    move |_req: NewSessionRequest,
+                    move |req: NewSessionRequest,
                           responder: agent_client_protocol::Responder<NewSessionResponse>,
                           _cx| {
                         let r = r_new.clone();
                         async move {
                             r.new_session_calls.fetch_add(1, Ordering::SeqCst);
+                            // Record the cwd the client sent so Task-4 tests can
+                            // assert the correct cwd reached the wire.
+                            *r.new_session_cwd.lock().await = Some(req.cwd);
                             // Signal entry BEFORE awaiting the gate so a driver can
                             // deterministically know the mint is in flight (no sleep).
                             r.new_session_started.notify_one();
@@ -3633,6 +3683,142 @@ mod tests {
         assert!(
             !modes.contains(&"doomed-mode".to_string()),
             "the forgotten stash entry must NOT drive set_mode, got {modes:?}"
+        );
+    }
+
+    // ── Task 4 (session-cwd): per-session cwd at mint + immutability guard ────
+
+    #[tokio::test]
+    async fn mint_uses_stashed_cwd() {
+        // `configure_session` with a stashed `SessionSpec.cwd` → `ensure_session`
+        // passes THAT cwd to `session/new`, NOT the static `AcpConfig.cwd` (/tmp).
+        let rec = Recorder::new("agent-sess-SCWD");
+        let be = connect_recording(rec.clone()).await; // static cwd = /tmp
+        let key = bkey("bridge-SCWD");
+
+        be.configure_session(
+            &key,
+            &SessionSpec {
+                config: EffectiveConfig {
+                    model: None,
+                    effort: None,
+                    mode: None,
+                },
+                cwd: Some(SessionCwd::parse("/req").unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key).await.unwrap();
+
+        // The recording agent stashes the cwd from each session/new; assert it
+        // received the stashed /req, NOT the static /tmp.
+        let recorded = rec.new_session_cwd.lock().await.clone();
+        assert_eq!(
+            recorded.as_deref(),
+            Some(std::path::Path::new("/req")),
+            "ensure_session must pass the stashed SessionSpec.cwd (/req) to session/new, \
+             not the static AcpConfig.cwd (/tmp); got {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_falls_back_to_static_cwd() {
+        // `configure_session` with `cwd: None` → `ensure_session` falls back to
+        // the static `AcpConfig.cwd` (/tmp from `test_config()`).
+        let rec = Recorder::new("agent-sess-SCWDSTATIC");
+        let be = connect_recording(rec.clone()).await; // static cwd = /tmp
+        let key = bkey("bridge-SCWDSTATIC");
+
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: None,
+                effort: None,
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key).await.unwrap();
+
+        let recorded = rec.new_session_cwd.lock().await.clone();
+        assert_eq!(
+            recorded.as_deref(),
+            Some(std::path::Path::new("/tmp")),
+            "with no stashed cwd, ensure_session must use the static AcpConfig.cwd (/tmp); \
+             got {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cwd_immutable_after_mint() {
+        // Once a session is minted with cwd /a, a subsequent `configure_session`
+        // stashing cwd /b and then calling `ensure_session` again must return
+        // `InvalidStateTransition` — NOT silently reuse the warm /a session for /b.
+        let rec = Recorder::new("agent-sess-SCWDIMM");
+        // Use a custom config so the static cwd is /a (drives the first mint).
+        let cfg = AcpConfig {
+            cwd: std::path::PathBuf::from("/a"),
+            ..AcpConfig::default()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-SCWDIMM");
+
+        // First mint: configure with cwd /a (explicit, same as static — proving
+        // the recorded cwd is what was ACTUALLY passed, not re-derived).
+        be.configure_session(
+            &key,
+            &SessionSpec {
+                config: EffectiveConfig {
+                    model: None,
+                    effort: None,
+                    mode: None,
+                },
+                cwd: Some(SessionCwd::parse("/a").unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+        be.ensure_session(&key).await.unwrap(); // mints the session with /a
+
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            1,
+            "session was minted exactly once"
+        );
+
+        // Now try to reuse the warm session for cwd /b — must error.
+        be.configure_session(
+            &key,
+            &SessionSpec {
+                config: EffectiveConfig {
+                    model: None,
+                    effort: None,
+                    mode: None,
+                },
+                cwd: Some(SessionCwd::parse("/b").unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = be.ensure_session(&key).await.expect_err(
+            "ensure_session on an already-minted session with a DIFFERENT cwd must return an error",
+        );
+        assert_eq!(
+            err,
+            BridgeError::InvalidStateTransition,
+            "cwd-conflict on a warm session must map to InvalidStateTransition (ACP §11A)"
+        );
+
+        // The session was NOT re-minted (still exactly one session/new).
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            1,
+            "no additional session/new must be sent on the immutability guard path"
         );
     }
 }
