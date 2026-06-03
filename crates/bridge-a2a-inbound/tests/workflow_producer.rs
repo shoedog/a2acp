@@ -2910,6 +2910,171 @@ async fn detached_workflow_threads_cwd_to_every_node() {
     }
 }
 
+// ============================================================================
+// Task 9: boot resume re-validates + restores session_cwd
+// ============================================================================
+
+/// Build a server with a `CwdCapBackend` for every agent AND a wired task store.
+/// The `cwds` vec captures every `configure_session` call so the test can assert
+/// the cwd threaded to the resumed nodes. The server also wires the recording
+/// resume graph (review_graph) so it can be deserialized from the snapshot.
+fn build_cwd_cap_resume_server(
+    store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+    cwds: Arc<std::sync::Mutex<Vec<Option<bridge_core::SessionCwd>>>>,
+) -> Arc<InboundServer> {
+    let mk = |reply: &str| -> Arc<dyn AgentBackend> {
+        Arc::new(CwdCapBackend {
+            reply: reply.to_string(),
+            cwds: cwds.clone(),
+        })
+    };
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), mk("CODEX")),
+        ("claude".to_string(), mk("CLAUDE")),
+        ("synth".to_string(), mk("FINAL")),
+    ]
+    .into();
+    let registry = Arc::new(PerAgentRegistry { backends });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>,
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_task_store(store),
+    )
+}
+
+/// **resume_restores_session_cwd**: a `Working` task persisted with
+/// `session_cwd = Some("/req")` + a valid review-graph snapshot + a `codex`-only
+/// checkpoint. After `resume_working_tasks`, the resumed runner must dispatch all
+/// un-checkpointed nodes with `SessionSpec.cwd == Some("/req")`.
+#[tokio::test]
+async fn resume_restores_session_cwd() {
+    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let cwds: Arc<std::sync::Mutex<Vec<Option<bridge_core::SessionCwd>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let srv = build_cwd_cap_resume_server(store.clone(), cwds.clone());
+    let task = TaskId::parse("resume-cwd-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some(review_snapshot(1)),
+            resume_attempts: 0,
+            session_cwd: Some("/req".into()),
+        })
+        .await
+        .unwrap();
+    // codex already finished before the crash → its checkpoint is the resume seed.
+    store
+        .put_node_checkpoint(
+            &task,
+            &NodeId::parse("codex").unwrap(),
+            "CODEX_DONE",
+            true,
+            2,
+        )
+        .await
+        .unwrap();
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    let rec = poll_to_terminal(&store, &task).await;
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Completed,
+        "resumed task must finalize Completed; got {:?}",
+        rec.status
+    );
+
+    // The resumed nodes (claude + synth) must each receive cwd = Some("/req").
+    let captured = cwds.lock().unwrap().clone();
+    assert!(
+        !captured.is_empty(),
+        "at least one configure_session call expected; got none"
+    );
+    for cwd in &captured {
+        assert_eq!(
+            cwd.as_ref().map(|c| c.as_str()),
+            Some("/req"),
+            "every resumed node must receive cwd=/req; got {:?}",
+            cwd
+        );
+    }
+}
+
+/// **resume_corrupt_session_cwd_interrupts**: a `Working` task whose persisted
+/// `session_cwd` is a relative path (rejected by `SessionCwd::parse`) + a valid
+/// workflow snapshot. `resume_working_tasks` must mark it `Interrupted` ("unreadable
+/// session cwd") and must NOT spawn a runner (no configure_session / prompt calls).
+#[tokio::test]
+async fn resume_corrupt_session_cwd_interrupts() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let cwds: Arc<std::sync::Mutex<Vec<Option<bridge_core::SessionCwd>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let srv = build_cwd_cap_resume_server(store.clone(), cwds.clone());
+    let task = TaskId::parse("resume-cwd-corrupt").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some(review_snapshot(1)),
+            resume_attempts: 0,
+            // Relative path — SessionCwd::parse rejects this.
+            session_cwd: Some("relative-or-bad".into()),
+        })
+        .await
+        .unwrap();
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Interrupted,
+        "corrupt session_cwd must interrupt the task; got {:?}",
+        rec.status
+    );
+    // No runner was spawned — no configure_session call was made.
+    assert!(
+        cwds.lock().unwrap().is_empty(),
+        "no node must be prompted when session_cwd is corrupt; got: {:?}",
+        cwds.lock().unwrap()
+    );
+}
+
 /// **detached_submit_persists_session_cwd**: a `message/send` with
 /// `a2a-bridge.cwd="/req"` must persist `session_cwd=Some("/req")` in the
 /// `TaskRecord` (Task 8 of the session_cwd increment).

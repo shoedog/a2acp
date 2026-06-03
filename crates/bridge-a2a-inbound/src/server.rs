@@ -1479,6 +1479,32 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                 continue;
             }
             Ok(ResumeClaim::Resumable { attempt }) => {
+                // Re-validate the persisted session_cwd before spawning: never trust
+                // the stored string blindly. A corrupt/invalid stored cwd is not
+                // resumable — interrupt BEFORE registering the cancel token or spawning
+                // so no orphaned token/runner is left behind.
+                let ctx = match wt.session_cwd.as_deref() {
+                    Some(s) => match bridge_core::SessionCwd::parse(s) {
+                        Ok(c) => bridge_workflow::executor::WorkflowRunContext {
+                            session_cwd: Some(c),
+                        },
+                        Err(_) => {
+                            let _ = srv
+                                .task_store
+                                .set_terminal(
+                                    &task,
+                                    TaskRecordStatus::Interrupted,
+                                    None,
+                                    Some("not resumable: unreadable session cwd"),
+                                    crate::workflow_sink::now_ms(),
+                                )
+                                .await;
+                            tracing::info!(task = task.as_str(), "resume scan: interrupted (unreadable session cwd)");
+                            continue;
+                        }
+                    },
+                    None => bridge_workflow::executor::WorkflowRunContext::default(),
+                };
                 // Register a fresh cancel token BEFORE spawning so a concurrent
                 // tasks/cancel during resume can find and fire it.
                 let token = tokio_util::sync::CancellationToken::new();
@@ -1498,8 +1524,7 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     run_id.clone(),
                     token,
                     seed,
-                    // Task 9 restores persisted session_cwd; default for now.
-                    bridge_workflow::executor::WorkflowRunContext::default(),
+                    ctx,
                 ));
                 tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
             }
