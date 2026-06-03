@@ -486,6 +486,7 @@ async fn jsonrpc(
         m if m == methods::SEND_MESSAGE => unary_message(srv, headers, id, params).await,
         m if m == methods::CANCEL_TASK => cancel_task(srv, headers, id, params).await,
         m if m == methods::GET_TASK => get_task(srv, headers, id, params).await,
+        m if m == methods::LIST_TASKS => list_tasks(srv, headers, id, params).await,
         "" => jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "missing method"),
         _ => jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "method not found"),
     }
@@ -1750,6 +1751,32 @@ async fn get_task(
         id,
         json!({ "task": { "id": task.as_str(), "state": state } }),
     )
+}
+
+async fn list_tasks(
+    srv: Arc<InboundServer>,
+    _headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    match srv.task_store.list(limit).await {
+        Ok(recs) => {
+            let tasks: Vec<Value> = recs
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.id.as_str(),
+                        "workflow": r.workflow,
+                        "state": r.status.as_str(),
+                        "updated_ms": r.updated_ms,
+                    })
+                })
+                .collect();
+            jsonrpc_ok(id, json!({ "tasks": tasks }))
+        }
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    }
 }
 
 /// Map a durable `TaskRecord` to (A2A state, artifacts). `Interrupted` collapses

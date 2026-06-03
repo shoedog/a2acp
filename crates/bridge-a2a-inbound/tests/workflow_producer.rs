@@ -857,6 +857,165 @@ async fn cancel_terminal_detached_returns_true_state_not_recancel() {
     assert_eq!(store.get(&id).await.unwrap().unwrap().status, TaskRecordStatus::Completed);
 }
 
+// ============================================================================
+// Task 11: tasks/list + gated submit test
+// ============================================================================
+
+#[tokio::test]
+async fn tasks_list_returns_recent_newest_first() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    for (id, ms) in [("l-old", 1i64), ("l-new", 5i64)] {
+        store
+            .create(&TaskRecord {
+                id: TaskId::parse(id).unwrap(),
+                workflow: "code-review".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: ms,
+                updated_ms: ms,
+            })
+            .await
+            .unwrap();
+    }
+    let resp = srv
+        .router()
+        .oneshot(post_request(methods::LIST_TASKS, json!({ "limit": 10 })))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let tasks = body["result"]["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks[0]["id"].as_str(), Some("l-new"), "newest-first: {body}");
+}
+
+/// A backend that blocks on a gate (AtomicBool + Notify) before yielding its reply.
+struct GatedBackend {
+    reply: String,
+    gate: Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>,
+}
+
+#[async_trait]
+impl AgentBackend for GatedBackend {
+    async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        while !self.gate.0.load(std::sync::atomic::Ordering::Acquire) {
+            self.gate.1.notified().await;
+        }
+        let reply = self.reply.clone();
+        let updates = vec![
+            Ok(Update::Text(reply)),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(updates)))
+    }
+    async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+/// Registry where every agent uses a GatedBackend with the shared gate.
+struct GatedRegistry {
+    gate: Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>,
+}
+
+#[async_trait]
+impl AgentRegistry for GatedRegistry {
+    async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+        let reply = format!("{}_REPLY", id.as_str().to_uppercase());
+        Ok(Resolved {
+            entry: Arc::new(minimal_entry(id)),
+            backend: Arc::new(GatedBackend {
+                reply,
+                gate: self.gate.clone(),
+            }),
+            lease: Box::new(NoopLease),
+        })
+    }
+    fn default_id(&self) -> AgentId {
+        AgentId::parse("codex").unwrap()
+    }
+    async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
+        Ok(())
+    }
+    fn list(&self) -> Vec<AgentId> {
+        vec![
+            AgentId::parse("codex").unwrap(),
+            AgentId::parse("claude").unwrap(),
+            AgentId::parse("synth").unwrap(),
+        ]
+    }
+}
+
+fn build_gated_workflow_server(
+    store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+    gate: Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>,
+) -> Arc<InboundServer> {
+    let registry = Arc::new(GatedRegistry { gate });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>,
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_task_store(store),
+    )
+}
+
+#[tokio::test]
+async fn submit_returns_working_before_completion_then_completes() {
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let gate = Arc::new((std::sync::atomic::AtomicBool::new(false), tokio::sync::Notify::new()));
+    let srv = build_gated_workflow_server(store.clone(), gate.clone());
+
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::SEND_MESSAGE,
+            json!({ "message": { "text": "DIFF",
+                "metadata": { "a2a-bridge.skill": "code-review" } } }),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let id = body["result"]["task"]["id"].as_str().unwrap().to_string();
+    let tid = bridge_core::ids::TaskId::parse(&id).unwrap();
+    // Still Working while gated.
+    assert_eq!(store.get(&tid).await.unwrap().unwrap().status, TaskRecordStatus::Working);
+    // Release the gate (set flag THEN wake) so late-parking nodes (synth) also proceed.
+    gate.0.store(true, std::sync::atomic::Ordering::Release);
+    gate.1.notify_waiters();
+    for _ in 0..200 {
+        if store.get(&tid).await.unwrap().unwrap().status.is_terminal() { break; }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(store.get(&tid).await.unwrap().unwrap().status, TaskRecordStatus::Completed);
+}
+
 /// **terminal_failed**: when the synth node errors, the A2A streaming task must end
 /// in a `Failed` terminal state (NOT a panic, NOT Completed).
 #[tokio::test]
