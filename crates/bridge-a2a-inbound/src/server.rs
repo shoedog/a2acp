@@ -982,13 +982,14 @@ struct SseSink {
 
 #[async_trait::async_trait]
 impl crate::workflow_sink::WorkflowSink for SseSink {
-    async fn node_started(&mut self, node: &str) {
+    async fn node_started(&mut self, node: &str) -> Result<(), BridgeError> {
         let _ = self
             .tx
             .send(Ok(Event::status(format!("node {node} started"))))
             .await;
+        Ok(())
     }
-    async fn node_finished(&mut self, node: &str, ok: bool) {
+    async fn node_finished(&mut self, node: &str, ok: bool) -> Result<(), BridgeError> {
         let _ = self
             .tx
             .send(Ok(Event::status(format!(
@@ -996,12 +997,13 @@ impl crate::workflow_sink::WorkflowSink for SseSink {
                 if ok { "ok" } else { "failed" }
             ))))
             .await;
+        Ok(())
     }
     async fn terminal(
         &mut self,
         outcome: bridge_workflow::executor::WorkflowOutcome,
         output: String,
-    ) {
+    ) -> Result<(), BridgeError> {
         use bridge_workflow::executor::WorkflowOutcome;
         let _ = self.tx.send(Ok(Event::artifact(output))).await;
         let to = match outcome {
@@ -1010,9 +1012,11 @@ impl crate::workflow_sink::WorkflowSink for SseSink {
             WorkflowOutcome::Canceled => TaskOutcome::Canceled,
         };
         let _ = self.tx.send(Ok(Event::terminal(to))).await;
+        Ok(())
     }
-    async fn error(&mut self, err: BridgeError) {
+    async fn error(&mut self, err: BridgeError) -> Result<(), BridgeError> {
         let _ = self.tx.send(Err(err)).await;
+        Ok(())
     }
 }
 
@@ -1057,7 +1061,12 @@ fn spawn_workflow_producer(
             .insert(task.clone(), token.clone());
         let stream = executor.run(graph, input, task.as_str().to_string(), token);
         let mut sink = SseSink { tx: tx.clone() };
-        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink).await;
+        // SseSink never errors (sends are best-effort); on a hypothetical error
+        // treat it as no-terminal so the existing no-terminal fallback fires.
+        let terminal_seen =
+            crate::workflow_sink::drain_workflow(stream, &mut sink)
+                .await
+                .unwrap_or(false);
         // The executor always emits a Terminal, but guard against an early stream
         // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
         if !terminal_seen {
@@ -1112,26 +1121,41 @@ fn spawn_detached_workflow(
         let input = text_parts.join("\n");
         let stream = executor.run(graph, input, task.as_str().to_string(), token);
         let mut sink = crate::workflow_sink::TaskStoreSink::new();
-        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink).await;
         let now = crate::workflow_sink::now_ms();
-        if terminal_seen {
-            if let Some((status, result, error)) = sink.take() {
+        match crate::workflow_sink::drain_workflow(stream, &mut sink).await {
+            Ok(terminal_seen) => {
+                if terminal_seen {
+                    if let Some((status, result, error)) = sink.take() {
+                        let _ = srv
+                            .task_store
+                            .set_terminal(&task, status, result.as_deref(), error.as_deref(), now)
+                            .await;
+                    }
+                } else {
+                    let _ = srv
+                        .task_store
+                        .set_terminal(
+                            &task,
+                            bridge_core::task_store::TaskRecordStatus::Failed,
+                            None,
+                            Some("workflow ended without terminal"),
+                            now,
+                        )
+                        .await;
+                }
+            }
+            Err(_) => {
                 let _ = srv
                     .task_store
-                    .set_terminal(&task, status, result.as_deref(), error.as_deref(), now)
+                    .set_terminal(
+                        &task,
+                        bridge_core::task_store::TaskRecordStatus::Failed,
+                        None,
+                        Some("checkpoint write failed"),
+                        now,
+                    )
                     .await;
             }
-        } else {
-            let _ = srv
-                .task_store
-                .set_terminal(
-                    &task,
-                    bridge_core::task_store::TaskRecordStatus::Failed,
-                    None,
-                    Some("workflow ended without terminal"),
-                    now,
-                )
-                .await;
         }
         fin.done = true;
         srv.workflow_cancels.lock().await.remove(&task);
