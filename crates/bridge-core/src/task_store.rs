@@ -99,6 +99,7 @@ pub trait TaskStore: Send + Sync {
     async fn cancel_if_working(&self, id: &TaskId, updated_ms: i64) -> Result<bool, BridgeError>;
     /// Upsert a per-node output checkpoint for crash-resume. The `(task, node)` pair
     /// is the key; repeated writes for the same node overwrite.
+    /// The task id must already exist; writing a checkpoint for an unknown task returns an error.
     async fn put_node_checkpoint(
         &self,
         task: &TaskId,
@@ -216,6 +217,13 @@ impl TaskStore for MemoryTaskStore {
         ok: bool,
         ts: i64,
     ) -> Result<(), BridgeError> {
+        // The task must exist — matches the SQLite FK (foreign_keys=ON) contract.
+        {
+            let inner = self.inner.lock().unwrap();
+            if !inner.contains_key(task.as_str()) {
+                return Err(BridgeError::StoreFailure);
+            }
+        } // drop inner guard before locking checkpoints to avoid lock-order deadlock
         let mut g = self.checkpoints.lock().unwrap();
         g.insert(
             (task.as_str().to_string(), node.as_str().to_string()),
@@ -249,7 +257,7 @@ impl TaskStore for MemoryTaskStore {
             return Ok(ResumeClaim::Exhausted);
         }
         row.resume_attempts += 1;
-        row.updated_ms = now_ms;
+        row.updated_ms = now_ms; // last_resume_ms folded into updated_ms for the in-memory store; Task 5 adds the real column
         Ok(ResumeClaim::Resumable {
             attempt: row.resume_attempts,
         })
@@ -410,5 +418,15 @@ mod tests {
         let wt = s.working_tasks().await.unwrap();
         assert_eq!(wt.len(), 1);
         assert_eq!(wt[0].input, "DIFF");
+    }
+
+    #[tokio::test]
+    async fn put_checkpoint_unknown_task_errors() {
+        let s = MemoryTaskStore::new();
+        let unknown = TaskId::parse("does-not-exist").unwrap();
+        let result = s
+            .put_node_checkpoint(&unknown, &NodeId::parse("node-a").unwrap(), "OUT", true, 1)
+            .await;
+        assert!(result.is_err(), "expected Err for unknown task id");
     }
 }
