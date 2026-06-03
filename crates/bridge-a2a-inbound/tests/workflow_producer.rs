@@ -1812,6 +1812,84 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
     }
 }
 
+// ============================================================================
+// Task 8: submit persists input + versioned workflow_spec_json
+// ============================================================================
+
+/// **detached_submit_persists_input_and_spec**: a UNARY `skill="code-review"` submit
+/// must persist the submitted text as `record.input` AND a versioned JSON snapshot of
+/// the resolved workflow graph as `record.workflow_spec_json`.
+///
+/// Assertions:
+/// - `record.input` equals the submitted text `"DIFF"`.
+/// - `record.workflow_spec_json` is `Some(s)` where `s` contains `"\"v\":1"` (the
+///   version tag) AND the node ids "codex", "claude", "synth" (the resolved graph).
+#[tokio::test]
+async fn detached_submit_persists_input_and_spec() {
+    use bridge_core::task_store::{MemoryTaskStore, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::SEND_MESSAGE,
+            serde_json::json!({ "message": {
+                "text": "DIFF",
+                "metadata": { "a2a-bridge.skill": "code-review" }
+            }}),
+        ))
+        .await
+        .unwrap();
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid JSON");
+    assert!(body.get("error").is_none(), "must not be an error: {body}");
+
+    let task_id_str = body["result"]["task"]["id"]
+        .as_str()
+        .expect("task id present")
+        .to_string();
+    let task_id = bridge_core::ids::TaskId::parse(&task_id_str).unwrap();
+
+    let rec = store
+        .get(&task_id)
+        .await
+        .unwrap()
+        .expect("TaskRecord must exist");
+
+    // The persisted input must equal the submitted text.
+    assert_eq!(
+        rec.input, "DIFF",
+        "record.input must equal the submitted text"
+    );
+
+    // The workflow_spec_json must be Some and contain the version tag + node ids.
+    let spec_json = rec
+        .workflow_spec_json
+        .as_deref()
+        .expect("workflow_spec_json must be Some");
+    assert!(
+        spec_json.contains("\"v\":1"),
+        "spec must contain version tag {{\"v\":1}}; got: {spec_json}"
+    );
+    assert!(
+        spec_json.contains("codex"),
+        "spec must contain node id 'codex'; got: {spec_json}"
+    );
+    assert!(
+        spec_json.contains("claude"),
+        "spec must contain node id 'claude'; got: {spec_json}"
+    );
+    assert!(
+        spec_json.contains("synth"),
+        "spec must contain node id 'synth'; got: {spec_json}"
+    );
+}
+
 /// **detached_runner_checkpoint_write_failure_fails_task**: when `put_node_checkpoint`
 /// returns `Err`, the fallible `drain_workflow` propagates the error, causing the
 /// detached runner to mark the task `Failed` (via the `Err(e)` arm in

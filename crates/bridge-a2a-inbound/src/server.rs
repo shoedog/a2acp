@@ -1405,6 +1405,20 @@ async fn unary_message(
         RouteTarget::Workflow(ref wf_id) => {
             let task = new_detached_task_id();
             let now = crate::workflow_sink::now_ms();
+            // Hoist text_parts before `create` so the persisted `input` is
+            // byte-identical to what `spawn_detached_workflow` joins as the runner's
+            // input (`text_parts.join("\n")`). Both the record and the spawn use the
+            // same derivation.
+            let text_parts: Vec<String> = routed.parts.iter().map(|p| p.text.clone()).collect();
+            let input = text_parts.join("\n");
+            // Snapshot the resolved graph at submit time. If the wf_id is unknown the
+            // snapshot is None (the runner will fail the task when it also can't find
+            // the graph). The `{"v":1,"graph":...}` envelope lets the boot resume
+            // routine detect an unknown schema version (treat as unparseable).
+            let workflow_spec_json = srv
+                .workflows
+                .get(wf_id)
+                .map(|g| serde_json::json!({ "v": 1, "graph": &**g }).to_string());
             let rec = bridge_core::task_store::TaskRecord {
                 id: task.clone(),
                 workflow: wf_id.as_str().to_string(),
@@ -1413,8 +1427,8 @@ async fn unary_message(
                 error: None,
                 created_ms: now,
                 updated_ms: now,
-                input: String::new(),        // Task 8 will wire the real input text
-                workflow_spec_json: None,    // Task 8 will snapshot the spec here
+                input,
+                workflow_spec_json,
                 resume_attempts: 0,
             };
             if srv.task_store.create(&rec).await.is_err() {
@@ -1425,7 +1439,6 @@ async fn unary_message(
                 .lock()
                 .await
                 .insert(task.clone(), token.clone());
-            let text_parts: Vec<String> = routed.parts.iter().map(|p| p.text.clone()).collect();
             drop(spawn_detached_workflow(
                 &srv,
                 task.clone(),
