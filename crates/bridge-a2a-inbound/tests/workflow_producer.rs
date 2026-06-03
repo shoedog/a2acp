@@ -2480,3 +2480,200 @@ async fn resume_terminal_checkpoint_short_circuits() {
         "short-circuit must NOT consume a resume attempt"
     );
 }
+
+// ============================================================================
+// W3b Task 10a follow-up: cancel during a RESUMED run
+// ============================================================================
+
+/// Registry where every agent resolves to a `PendingBackend`, EXCEPT `codex` which
+/// resolves to a `RecordingFakeBackend`. Because the resume seed already has a
+/// `codex` checkpoint, `run_from` skips codex entirely — the `RecordingFakeBackend`
+/// for `codex` is never called — proving the seeded node is not re-prompted.
+/// `claude` and `synth` receive `PendingBackend` so the resumed run stays in-flight
+/// long enough for the cancel to fire.
+struct PendingResumeRegistry {
+    codex_prompted: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentRegistry for PendingResumeRegistry {
+    async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+        let backend: Arc<dyn AgentBackend> = if id.as_str() == "codex" {
+            // Seeded by the checkpoint → this backend must NEVER be called.
+            let prompted = self.codex_prompted.clone();
+            Arc::new(RecordingFakeBackend {
+                reply: "CODEX_REVIEW".into(),
+                received: prompted,
+            })
+        } else {
+            // claude / synth: block forever so the resumed run stays in-flight.
+            Arc::new(PendingBackend)
+        };
+        Ok(Resolved {
+            entry: Arc::new(minimal_entry(id)),
+            backend,
+            lease: Box::new(NoopLease),
+        })
+    }
+    fn default_id(&self) -> AgentId {
+        AgentId::parse("codex").unwrap()
+    }
+    async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
+        Ok(())
+    }
+    fn list(&self) -> Vec<AgentId> {
+        vec![
+            AgentId::parse("codex").unwrap(),
+            AgentId::parse("claude").unwrap(),
+            AgentId::parse("synth").unwrap(),
+        ]
+    }
+}
+
+/// Build a server whose registry blocks on `claude` and `synth` (PendingBackend)
+/// while `codex` uses a recording backend (fast, but will never be called because
+/// it is seeded in the checkpoint). Returns the server and the shared prompted-set
+/// so the test can assert codex was not re-prompted.
+fn build_pending_resume_server(
+    store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+) -> (Arc<InboundServer>, Arc<std::sync::Mutex<Vec<String>>>) {
+    let codex_prompted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let registry = Arc::new(PendingResumeRegistry {
+        codex_prompted: codex_prompted.clone(),
+    });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    let srv = Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_task_store(store),
+    );
+    (srv, codex_prompted)
+}
+
+/// **resume_then_cancel_mid_run_finalizes_canceled**: prove that the
+/// `CancellationToken` registered by `resume_working_tasks` in `workflow_cancels`
+/// is the one that cancels the resumed run, and that the resumed run finalizes
+/// cleanly as `Canceled` (no orphan, no double-finalize).
+///
+/// Shape:
+/// 1. Seed a `Working` task with the review-graph snapshot + a `codex` checkpoint
+///    only — so the resume will re-run `claude` + `synth`, both of which block
+///    on a `PendingBackend`.
+/// 2. Call `resume_working_tasks(&srv, 3)` — this registers the cancel token in
+///    `workflow_cancels` and spawns the detached runner, which blocks on
+///    `PendingBackend::prompt`.
+/// 3. Fire the cancel via the real `tasks/cancel` JSON-RPC path — the handler
+///    finds the `Working` row in `task_store`, looks up the token in
+///    `workflow_cancels`, and fires it. The executor's `select!` in `run_node`
+///    observes the cancellation and yields `WorkflowOutcome::Canceled`.
+/// 4. `poll_to_terminal` → assert final status is `Canceled`.
+/// 5. Assert `codex` was NOT re-prompted (its checkpoint was the seed; `run_from`
+///    skips seeded nodes entirely).
+#[tokio::test]
+async fn resume_then_cancel_mid_run_finalizes_canceled() {
+    use a2a::methods;
+    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, codex_prompted) = build_pending_resume_server(store.clone());
+
+    // ── 1. Seed a Working task with the review snapshot + codex checkpoint ──
+    let task = TaskId::parse("resume-cancel-mid-run").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some(review_snapshot(1)),
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+    // codex already finished before the crash → seeded; claude + synth are pending.
+    store
+        .put_node_checkpoint(
+            &task,
+            &NodeId::parse("codex").unwrap(),
+            "CODEX_DONE",
+            true,
+            2,
+        )
+        .await
+        .unwrap();
+
+    // ── 2. resume_working_tasks: registers token in workflow_cancels + spawns runner
+    //    The runner's claude/synth backends block on PendingBackend::prompt. After
+    //    resume_working_tasks returns, the token is already inserted (the insert
+    //    happens synchronously before spawn_detached_workflow is called).
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    // Yield a few times so the spawned runner can get scheduled and reach the
+    // PendingBackend.prompt() await point — making the cancel observable in the
+    // executor's select!. (Even if it hasn't reached the await yet, the token
+    // fires first and the select! picks it up immediately when it does poll.)
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    // ── 3. Fire the cancel via the real tasks/cancel JSON-RPC path ──────────
+    // The handler reads the Working row from task_store, finds the token in
+    // workflow_cancels, and cancels it. This is identical to the pattern used
+    // in cancel_task_fires_workflow_token_stream_ends_canceled.
+    let cancel_resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            serde_json::json!({ "taskId": "resume-cancel-mid-run" }),
+        ))
+        .await
+        .unwrap();
+    let cancel_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(cancel_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    // The cancel_task handler must have found and fired the token.
+    assert!(
+        cancel_body.get("error").is_none(),
+        "tasks/cancel must succeed: {cancel_body}"
+    );
+
+    // ── 4. poll_to_terminal: wait for the spawned runner to write Canceled ──
+    let rec = poll_to_terminal(&store, &task).await;
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Canceled,
+        "resumed run must finalize Canceled after token fire; got {:?}",
+        rec.status
+    );
+
+    // ── 5. codex must NOT have been re-prompted (it was seeded) ──────────────
+    assert!(
+        codex_prompted.lock().unwrap().is_empty(),
+        "codex was checkpointed (seeded) → run_from must not re-prompt it; \
+         received prompts: {:?}",
+        codex_prompted.lock().unwrap()
+    );
+}

@@ -260,7 +260,7 @@ impl TaskStore for MemoryTaskStore {
             return Ok(ResumeClaim::Exhausted);
         }
         row.resume_attempts += 1;
-        row.updated_ms = now_ms; // last_resume_ms folded into updated_ms for the in-memory store; Task 5 adds the real column
+        row.updated_ms = now_ms; // last_resume_ms is folded into updated_ms for the in-memory store; the SQLite store has the dedicated column.
         Ok(ResumeClaim::Resumable {
             attempt: row.resume_attempts,
         })
