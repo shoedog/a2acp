@@ -1084,3 +1084,291 @@ async fn workflow_with_failing_synth_ends_in_failed_state() {
         payloads.last().unwrap()
     );
 }
+
+// ============================================================================
+// Task 12: detached Failed / Canceled / swept-Interrupted / panic-finalizer
+// ============================================================================
+
+/// Build a server whose registry uses `ErrorBackend` for EVERY agent (including
+/// the terminal `synth` node). When synth fails the executor yields
+/// `WorkflowOutcome::Failed`, which the runner persists as `TaskRecordStatus::Failed`.
+fn build_failing_synth_workflow_server(
+    store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+) -> Arc<InboundServer> {
+    let err: Arc<dyn AgentBackend> = Arc::new(ErrorBackend);
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), err.clone()),
+        ("claude".to_string(), err.clone()),
+        ("synth".to_string(), err.clone()),
+    ]
+    .into();
+    let registry = Arc::new(PerAgentRegistry { backends });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>,
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_task_store(store),
+    )
+}
+
+/// A backend whose `prompt()` panics. Because the executor wraps the `prompt()` call
+/// in a `tokio::select!` inside the spawned task, the panic propagates through the
+/// executor and unwinds the spawned task, triggering the `Finalizer` drop guard.
+struct PanickingBackend;
+
+#[async_trait]
+impl AgentBackend for PanickingBackend {
+    async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        panic!("boom: injected panic for finalizer test");
+    }
+    async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+/// Build a server where every node uses a panicking backend.
+fn build_panicking_workflow_server(
+    store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+) -> Arc<InboundServer> {
+    let panic_be: Arc<dyn AgentBackend> = Arc::new(PanickingBackend);
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), panic_be.clone()),
+        ("claude".to_string(), panic_be.clone()),
+        ("synth".to_string(), panic_be.clone()),
+    ]
+    .into();
+    let registry = Arc::new(PerAgentRegistry { backends });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>,
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_task_store(store),
+    )
+}
+
+/// **DoD-7 — panic finalizer**: when the spawned runner panics (backend panics
+/// through the executor), the `Finalizer` drop-guard must write a terminal row so
+/// the task is never left in `Working`.
+///
+/// NOTE: The `tokio::select! { biased; _ = cancel.cancelled() => … s = backend.prompt(…) => … }`
+/// in `run_node` does NOT wrap the prompt future in a catch-panic boundary. A panic
+/// inside `prompt()` propagates as an unwind through the spawned async block, which
+/// triggers `Finalizer::drop`. The drop guard spawns a secondary task to call
+/// `set_terminal(Failed, …)`. We wait up to 200 yields for that secondary task to
+/// complete. The join handle returns `Err(JoinError{panic})` — we swallow it with
+/// `let _ = handle.await`.
+#[tokio::test]
+async fn runner_panic_finalizes_failed_no_orphan() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_panicking_workflow_server(store.clone());
+    let task = TaskId::parse("panic-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .await
+        .unwrap();
+    let handle = bridge_a2a_inbound::server::spawn_detached_workflow_for_test(
+        &srv,
+        task.clone(),
+        vec!["DIFF".to_string()],
+        bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+    );
+    let _ = handle.await; // Err(JoinError{panic}) — swallow it
+    // The Finalizer spawns a secondary task; give it time to write the row.
+    for _ in 0..200 {
+        if store.get(&task).await.unwrap().unwrap().status.is_terminal() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert!(
+        rec.status.is_terminal(),
+        "panic must finalize via drop-guard, not orphan Working; got: {:?}",
+        rec.status
+    );
+}
+
+/// **DoD-7 — detached Failed**: when the terminal `synth` node errors, the detached
+/// runner must persist `TaskRecordStatus::Failed` with a non-empty error marker.
+///
+/// The executor yields `WorkflowOutcome::Failed` when `term_ok=false && !cancelled`.
+/// All three nodes use `ErrorBackend` (prompt returns Err), so codex, claude, and
+/// synth all fail. The terminal node is `synth`; its `ok=false` drives `Failed`.
+#[tokio::test]
+async fn detached_runner_persists_failed_on_node_failure() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_failing_synth_workflow_server(store.clone());
+    let task = TaskId::parse("fail-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .await
+        .unwrap();
+    bridge_a2a_inbound::server::spawn_detached_workflow_for_test(
+        &srv,
+        task.clone(),
+        vec!["DIFF".into()],
+        bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+    )
+    .await
+    .unwrap();
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(rec.status, TaskRecordStatus::Failed);
+    assert!(rec.error.is_some(), "failed record must carry an error marker");
+}
+
+/// **DoD-7 — detached Canceled**: firing the token while the gated backend is
+/// parked causes the executor to take the `cancel.cancelled()` branch in
+/// `run_node`'s `select!`, set `term_ok=false`, and since `cancel.is_cancelled()`
+/// is true the outcome is `WorkflowOutcome::Canceled`. The runner persists
+/// `TaskRecordStatus::Canceled`.
+///
+/// NOTE: `workflow_cancels` is a private field; the token is wired directly via
+/// `spawn_detached_workflow_with_token_for_test` — no explicit map insert needed.
+#[tokio::test]
+async fn detached_runner_persists_canceled_on_token_fire() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let srv = build_gated_workflow_server(store.clone(), gate.clone());
+    let task = TaskId::parse("cxl-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .await
+        .unwrap();
+    let token = tokio_util::sync::CancellationToken::new();
+    // Pass the token directly to the seam; the executor observes it via select!.
+    let handle = bridge_a2a_inbound::server::spawn_detached_workflow_with_token_for_test(
+        &srv,
+        task.clone(),
+        vec!["DIFF".into()],
+        bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+        token.clone(),
+    );
+    // Cancel while the gated backend is parked on notified().await.
+    token.cancel();
+    let _ = handle.await;
+    assert_eq!(
+        store.get(&task).await.unwrap().unwrap().status,
+        TaskRecordStatus::Canceled,
+        "detached runner must persist Canceled when token fires while gated"
+    );
+}
+
+/// **DoD-10 — swept-Interrupted → tasks/get failed**: a `Working` row that was swept
+/// to `Interrupted` (simulating an interrupted previous server run) must appear as
+/// `TASK_STATE_FAILED` at the wire (A2A has no `Interrupted` state). The reason text
+/// must be included so callers can distinguish it from a regular failure.
+#[tokio::test]
+async fn swept_interrupted_reports_failed_over_wire() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let id = TaskId::parse("swept-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: id.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .await
+        .unwrap();
+    // Sweep flips Working → Interrupted (simulates a prior crash / server restart).
+    store.sweep_interrupted(9).await.unwrap();
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::GET_TASK,
+            json!({ "taskId": "swept-1" }),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let state = body["result"]["task"]["status"]["state"]
+        .as_str()
+        .or_else(|| body["result"]["task"]["state"].as_str());
+    assert_eq!(
+        state,
+        Some("TASK_STATE_FAILED"),
+        "interrupted → failed at the wire: {body}"
+    );
+    // DoD-10: the reason MUST reach the wire so callers can distinguish a
+    // restart-interruption from a regular failure. `sweep_interrupted` sets
+    // error="interrupted (serve restarted)", which `task_record_to_a2a` surfaces
+    // as the artifact text.
+    assert!(
+        body.to_string().contains("interrupted"),
+        "swept task must carry the interrupted reason: {body}"
+    );
+}
