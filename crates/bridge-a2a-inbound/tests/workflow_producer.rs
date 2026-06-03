@@ -1688,7 +1688,7 @@ async fn detached_runner_checkpoints_each_node() {
 
     // Every node must have a checkpoint row.
     let mut checkpoints = store.node_checkpoints(&task).await.unwrap();
-    // Sort by node id for deterministic comparison.
+    // stable debug output (lookup below is map-based, order doesn't affect correctness)
     checkpoints.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
     assert_eq!(
         checkpoints.len(),

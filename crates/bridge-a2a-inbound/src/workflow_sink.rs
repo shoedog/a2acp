@@ -7,7 +7,7 @@ use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome, WorkflowStream};
 use futures::StreamExt;
 
 /// A sink consumes the workflow's events. Intermediate node events are optional
-/// (the detached sink ignores them in W3a); `terminal` is the meaningful one.
+/// (the detached sink persists each node_finished as a checkpoint in W3b); terminal is also required.
 #[async_trait::async_trait]
 pub(crate) trait WorkflowSink: Send {
     async fn node_started(&mut self, _node: &str) -> Result<(), BridgeError> {
@@ -92,13 +92,15 @@ impl TaskStoreSink {
 
 #[async_trait::async_trait]
 impl WorkflowSink for TaskStoreSink {
+    /// Persist a checkpoint for `node`; a write failure propagates as `Err`,
+    /// which aborts drain_workflow and causes the runner to mark the task Failed.
     async fn node_finished(
         &mut self,
         node: &str,
         ok: bool,
         output: &str,
     ) -> Result<(), BridgeError> {
-        let node_id = bridge_core::ids::NodeId::parse(node).map_err(|_| BridgeError::StoreFailure)?;
+        let node_id = bridge_core::ids::NodeId::parse(node)?;
         self.store
             .put_node_checkpoint(&self.task, &node_id, output, ok, now_ms())
             .await
