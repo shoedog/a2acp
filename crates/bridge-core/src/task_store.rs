@@ -3,7 +3,7 @@
 //! responsibility. Timestamps are passed IN — the core forbids `Date::now`.
 
 use crate::error::BridgeError;
-use crate::ids::TaskId;
+use crate::ids::{NodeId, TaskId};
 
 /// Durable status of a detached task. `Interrupted` is distinct from `Failed`
 /// (a crash mid-run, swept on the next boot) so triage can tell them apart; the
@@ -54,6 +54,22 @@ pub struct TaskRecord {
     pub error: Option<String>,
     pub created_ms: i64,
     pub updated_ms: i64,
+    /// The raw input text submitted with this task (needed for crash-resume replay).
+    pub input: String,
+    /// JSON-serialized workflow spec snapshot at submit time (crash-resume needs the
+    /// exact graph that was running, not the live on-disk spec which may have changed).
+    pub workflow_spec_json: Option<String>,
+    /// Number of resume attempts consumed so far; used by `claim_resume_attempt`.
+    pub resume_attempts: u32,
+}
+
+/// Outcome of a `claim_resume_attempt` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeClaim {
+    /// The attempt was granted; `attempt` is the new (incremented) count.
+    Resumable { attempt: u32 },
+    /// The cap has been reached; this task must be marked `Interrupted` instead.
+    Exhausted,
 }
 
 #[async_trait::async_trait]
@@ -81,10 +97,43 @@ pub trait TaskStore: Send + Sync {
     /// "no token" cancel must NOT unconditionally overwrite a terminal the runner
     /// just wrote — this conditional update no-ops on an already-terminal row.
     async fn cancel_if_working(&self, id: &TaskId, updated_ms: i64) -> Result<bool, BridgeError>;
+    /// Persist a per-node output checkpoint for crash-resume.
+    /// Each (task, node) is written at most once: a second write for the same
+    /// pair is an error. The SQLite impl enforces this via the (task_id, node_id)
+    /// primary key; the in-memory impl matches. The task id must already exist;
+    /// writing a checkpoint for an unknown task returns an error.
+    async fn put_node_checkpoint(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        output: &str,
+        ok: bool,
+        ts: i64,
+    ) -> Result<(), BridgeError>;
+    /// Return all node checkpoints for a task as `(node_id, output, ok)` tuples.
+    async fn node_checkpoints(
+        &self,
+        task: &TaskId,
+    ) -> Result<Vec<(NodeId, String, bool)>, BridgeError>;
+    /// Atomic poison-pill guard: if `resume_attempts < cap`, increments
+    /// `resume_attempts` and returns `Resumable { attempt: new_count }`.
+    /// If already `>= cap`, returns `Exhausted` without modifying the row.
+    /// Missing task id returns an error.
+    async fn claim_resume_attempt(
+        &self,
+        task: &TaskId,
+        cap: u32,
+        now_ms: i64,
+    ) -> Result<ResumeClaim, BridgeError>;
+    /// Return all rows whose status is `Working` (for the boot-time resume scan).
+    async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError>;
 }
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// `(output, ok, ts)` stored per `(task_id, node_id)` checkpoint key.
+type CheckpointValue = (String, bool, i64);
 
 /// In-memory `TaskStore` (the default when no DB path is configured). Production
 /// use, not just a test fake — lives in `bridge-core` so `bridge-a2a-inbound`
@@ -92,6 +141,8 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub struct MemoryTaskStore {
     inner: Mutex<HashMap<String, TaskRecord>>,
+    /// Key: (task_id, node_id) → (output, ok, ts)
+    checkpoints: Mutex<HashMap<(String, String), CheckpointValue>>,
 }
 
 impl MemoryTaskStore {
@@ -160,11 +211,73 @@ impl TaskStore for MemoryTaskStore {
             _ => Ok(false), // missing or already terminal — do not clobber
         }
     }
+    async fn put_node_checkpoint(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        output: &str,
+        ok: bool,
+        ts: i64,
+    ) -> Result<(), BridgeError> {
+        // The task must exist — matches the SQLite FK (foreign_keys=ON) contract.
+        {
+            let inner = self.inner.lock().unwrap();
+            if !inner.contains_key(task.as_str()) {
+                return Err(BridgeError::StoreFailure);
+            }
+        } // drop inner guard before locking checkpoints to avoid lock-order deadlock
+        let mut g = self.checkpoints.lock().unwrap();
+        let key = (task.as_str().to_string(), node.as_str().to_string());
+        if g.contains_key(&key) {
+            return Err(BridgeError::StoreFailure);
+        }
+        g.insert(key, (output.to_string(), ok, ts));
+        Ok(())
+    }
+    async fn node_checkpoints(
+        &self,
+        task: &TaskId,
+    ) -> Result<Vec<(NodeId, String, bool)>, BridgeError> {
+        let g = self.checkpoints.lock().unwrap();
+        let mut out = Vec::new();
+        for ((tid, nid), (output, ok, _ts)) in g.iter() {
+            if tid == task.as_str() {
+                let node = NodeId::parse(nid).map_err(|_| BridgeError::StoreFailure)?;
+                out.push((node, output.clone(), *ok));
+            }
+        }
+        Ok(out)
+    }
+    async fn claim_resume_attempt(
+        &self,
+        task: &TaskId,
+        cap: u32,
+        now_ms: i64,
+    ) -> Result<ResumeClaim, BridgeError> {
+        let mut g = self.inner.lock().unwrap();
+        let row = g.get_mut(task.as_str()).ok_or(BridgeError::StoreFailure)?;
+        if row.resume_attempts >= cap {
+            return Ok(ResumeClaim::Exhausted);
+        }
+        row.resume_attempts += 1;
+        row.updated_ms = now_ms; // last_resume_ms is folded into updated_ms for the in-memory store; the SQLite store has the dedicated column.
+        Ok(ResumeClaim::Resumable {
+            attempt: row.resume_attempts,
+        })
+    }
+    async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError> {
+        let g = self.inner.lock().unwrap();
+        Ok(g.values()
+            .filter(|r| r.status == TaskRecordStatus::Working)
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::NodeId;
 
     fn rec(id: &str, ms: i64) -> TaskRecord {
         TaskRecord {
@@ -175,6 +288,9 @@ mod tests {
             error: None,
             created_ms: ms,
             updated_ms: ms,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         }
     }
 
@@ -264,5 +380,78 @@ mod tests {
             .cancel_if_working(&TaskId::parse("nope").unwrap(), 9)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn node_checkpoints_roundtrip_and_claim() {
+        let s = MemoryTaskStore::new();
+        let t = TaskId::parse("t").unwrap();
+        s.create(&TaskRecord {
+            id: t.clone(),
+            workflow: "wf".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some("{\"v\":1}".into()),
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+        s.put_node_checkpoint(&t, &NodeId::parse("codex").unwrap(), "OUT", true, 2)
+            .await
+            .unwrap();
+        let cps = s.node_checkpoints(&t).await.unwrap();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].1, "OUT");
+        assert!(matches!(
+            s.claim_resume_attempt(&t, 2, 9).await.unwrap(),
+            ResumeClaim::Resumable { attempt: 1 }
+        ));
+        assert!(matches!(
+            s.claim_resume_attempt(&t, 2, 9).await.unwrap(),
+            ResumeClaim::Resumable { attempt: 2 }
+        ));
+        assert!(matches!(
+            s.claim_resume_attempt(&t, 2, 9).await.unwrap(),
+            ResumeClaim::Exhausted
+        ));
+        let wt = s.working_tasks().await.unwrap();
+        assert_eq!(wt.len(), 1);
+        assert_eq!(wt[0].input, "DIFF");
+    }
+
+    #[tokio::test]
+    async fn put_checkpoint_duplicate_node_errors() {
+        let s = MemoryTaskStore::new();
+        let t = TaskId::parse("t-dup").unwrap();
+        s.create(&rec("t-dup", 1)).await.unwrap();
+        let node = NodeId::parse("codex").unwrap();
+        // First write succeeds.
+        s.put_node_checkpoint(&t, &node, "OUT1", true, 10)
+            .await
+            .unwrap();
+        // Second write for the same (task, node) must be an error (write-once).
+        let res = s.put_node_checkpoint(&t, &node, "OUT2", true, 20).await;
+        assert!(
+            res.is_err(),
+            "expected Err on duplicate (task, node) checkpoint write"
+        );
+        // The original checkpoint is unchanged.
+        let cps = s.node_checkpoints(&t).await.unwrap();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].1, "OUT1");
+    }
+
+    #[tokio::test]
+    async fn put_checkpoint_unknown_task_errors() {
+        let s = MemoryTaskStore::new();
+        let unknown = TaskId::parse("does-not-exist").unwrap();
+        let result = s
+            .put_node_checkpoint(&unknown, &NodeId::parse("node-a").unwrap(), "OUT", true, 1)
+            .await;
+        assert!(result.is_err(), "expected Err for unknown task id");
     }
 }

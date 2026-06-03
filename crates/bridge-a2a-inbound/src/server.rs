@@ -982,13 +982,19 @@ struct SseSink {
 
 #[async_trait::async_trait]
 impl crate::workflow_sink::WorkflowSink for SseSink {
-    async fn node_started(&mut self, node: &str) {
+    async fn node_started(&mut self, node: &str) -> Result<(), BridgeError> {
         let _ = self
             .tx
             .send(Ok(Event::status(format!("node {node} started"))))
             .await;
+        Ok(())
     }
-    async fn node_finished(&mut self, node: &str, ok: bool) {
+    async fn node_finished(
+        &mut self,
+        node: &str,
+        ok: bool,
+        _output: &str,
+    ) -> Result<(), BridgeError> {
         let _ = self
             .tx
             .send(Ok(Event::status(format!(
@@ -996,12 +1002,13 @@ impl crate::workflow_sink::WorkflowSink for SseSink {
                 if ok { "ok" } else { "failed" }
             ))))
             .await;
+        Ok(())
     }
     async fn terminal(
         &mut self,
         outcome: bridge_workflow::executor::WorkflowOutcome,
         output: String,
-    ) {
+    ) -> Result<(), BridgeError> {
         use bridge_workflow::executor::WorkflowOutcome;
         let _ = self.tx.send(Ok(Event::artifact(output))).await;
         let to = match outcome {
@@ -1010,9 +1017,11 @@ impl crate::workflow_sink::WorkflowSink for SseSink {
             WorkflowOutcome::Canceled => TaskOutcome::Canceled,
         };
         let _ = self.tx.send(Ok(Event::terminal(to))).await;
+        Ok(())
     }
-    async fn error(&mut self, err: BridgeError) {
+    async fn error(&mut self, err: BridgeError) -> Result<(), BridgeError> {
         let _ = self.tx.send(Err(err)).await;
+        Ok(())
     }
 }
 
@@ -1057,7 +1066,11 @@ fn spawn_workflow_producer(
             .insert(task.clone(), token.clone());
         let stream = executor.run(graph, input, task.as_str().to_string(), token);
         let mut sink = SseSink { tx: tx.clone() };
-        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink).await;
+        // SseSink never errors (sends are best-effort); on a hypothetical error
+        // treat it as no-terminal so the existing no-terminal fallback fires.
+        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink)
+            .await
+            .unwrap_or(false);
         // The executor always emits a Terminal, but guard against an early stream
         // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
         if !terminal_seen {
@@ -1076,12 +1089,21 @@ fn new_detached_task_id() -> TaskId {
 /// Spawn the finalizer-guarded background runner for a detached workflow. Returns
 /// the JoinHandle so callers/tests can await completion. The caller MUST have
 /// already `create`d the Working row and registered the token in `workflow_cancels`.
+///
+/// The caller supplies the already-resolved `graph` (fresh submit: resolved from
+/// `srv.workflows` at submit time; boot resume: deserialized from the stored spec),
+/// the `input` string (pre-joined text), the `run_id` (fresh submit: task id; boot
+/// resume: `"{task}-resume-{n}"`), and a `seed` of already-completed node outputs
+/// (fresh submit: empty; boot resume: checkpoints from the store). With an empty
+/// seed, `run_from` is behaviorally identical to `run`.
 fn spawn_detached_workflow(
     srv: &Arc<InboundServer>,
     task: TaskId,
-    text_parts: Vec<String>,
-    wf_id: bridge_core::ids::WorkflowId,
+    input: String,
+    graph: std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
+    run_id: String,
     token: tokio_util::sync::CancellationToken,
+    seed: std::collections::HashMap<String, (String, bool)>,
 ) -> tokio::task::JoinHandle<()> {
     let srv = srv.clone();
     tokio::spawn(async move {
@@ -1091,16 +1113,16 @@ fn spawn_detached_workflow(
             cancels: srv.workflow_cancels.clone(),
             done: false,
         };
-        let (executor, graph) = match (&srv.executor, srv.workflows.get(&wf_id)) {
-            (Some(e), Some(g)) => (e.clone(), g.clone()),
-            _ => {
+        let executor = match &srv.executor {
+            Some(e) => e.clone(),
+            None => {
                 let _ = srv
                     .task_store
                     .set_terminal(
                         &task,
                         bridge_core::task_store::TaskRecordStatus::Failed,
                         None,
-                        Some("no executor / unknown workflow"),
+                        Some("no executor wired"),
                         crate::workflow_sink::now_ms(),
                     )
                     .await;
@@ -1109,36 +1131,54 @@ fn spawn_detached_workflow(
                 return;
             }
         };
-        let input = text_parts.join("\n");
-        let stream = executor.run(graph, input, task.as_str().to_string(), token);
-        let mut sink = crate::workflow_sink::TaskStoreSink::new();
-        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink).await;
+        let stream = executor.run_from(graph, input, run_id, token, seed);
+        let mut sink =
+            crate::workflow_sink::TaskStoreSink::new(srv.task_store.clone(), task.clone());
         let now = crate::workflow_sink::now_ms();
-        if terminal_seen {
-            if let Some((status, result, error)) = sink.take() {
+        match crate::workflow_sink::drain_workflow(stream, &mut sink).await {
+            Ok(terminal_seen) => {
+                if terminal_seen {
+                    if let Some((status, result, error)) = sink.take() {
+                        let _ = srv
+                            .task_store
+                            .set_terminal(&task, status, result.as_deref(), error.as_deref(), now)
+                            .await;
+                    }
+                } else {
+                    let _ = srv
+                        .task_store
+                        .set_terminal(
+                            &task,
+                            bridge_core::task_store::TaskRecordStatus::Failed,
+                            None,
+                            Some("workflow ended without terminal"),
+                            now,
+                        )
+                        .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(task = task.as_str(), error = ?e, "drain_workflow sink error; marking task Failed");
                 let _ = srv
                     .task_store
-                    .set_terminal(&task, status, result.as_deref(), error.as_deref(), now)
+                    .set_terminal(
+                        &task,
+                        bridge_core::task_store::TaskRecordStatus::Failed,
+                        None,
+                        Some("checkpoint write failed"),
+                        now,
+                    )
                     .await;
             }
-        } else {
-            let _ = srv
-                .task_store
-                .set_terminal(
-                    &task,
-                    bridge_core::task_store::TaskRecordStatus::Failed,
-                    None,
-                    Some("workflow ended without terminal"),
-                    now,
-                )
-                .await;
         }
         fin.done = true;
         srv.workflow_cancels.lock().await.remove(&task);
     })
 }
 
-/// Test-only seam: spawn the runner with a fresh token.
+/// Test-only seam: spawn the runner with a fresh token and an empty seed.
+/// Resolves the graph from the server's `workflows` map (the graph must already be
+/// registered). `run_id` is set to the task id (matching the fresh-submit path).
 #[doc(hidden)]
 pub fn spawn_detached_workflow_for_test(
     srv: &Arc<InboundServer>,
@@ -1147,10 +1187,27 @@ pub fn spawn_detached_workflow_for_test(
     wf_id: bridge_core::ids::WorkflowId,
 ) -> tokio::task::JoinHandle<()> {
     let token = tokio_util::sync::CancellationToken::new();
-    spawn_detached_workflow(srv, task, text_parts, wf_id, token)
+    let graph = srv
+        .workflows
+        .get(&wf_id)
+        .cloned()
+        .expect("workflow must be registered in the test server");
+    let input = text_parts.join("\n");
+    let run_id = task.as_str().to_string();
+    spawn_detached_workflow(
+        srv,
+        task,
+        input,
+        graph,
+        run_id,
+        token,
+        std::collections::HashMap::new(),
+    )
 }
 
 /// Test-only seam that takes an explicit token (so a cancel test can fire it).
+/// Resolves the graph from the server's `workflows` map (the graph must already be
+/// registered). `run_id` is set to the task id (matching the fresh-submit path).
 #[doc(hidden)]
 pub fn spawn_detached_workflow_with_token_for_test(
     srv: &Arc<InboundServer>,
@@ -1159,7 +1216,250 @@ pub fn spawn_detached_workflow_with_token_for_test(
     wf_id: bridge_core::ids::WorkflowId,
     token: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_detached_workflow(srv, task, text_parts, wf_id, token)
+    let graph = srv
+        .workflows
+        .get(&wf_id)
+        .cloned()
+        .expect("workflow must be registered in the test server");
+    let input = text_parts.join("\n");
+    let run_id = task.as_str().to_string();
+    spawn_detached_workflow(
+        srv,
+        task,
+        input,
+        graph,
+        run_id,
+        token,
+        std::collections::HashMap::new(),
+    )
+}
+
+/// The only snapshot schema version this server can resume. The forward-compat door:
+/// a snapshot whose `v` field does not match this const is treated as unreadable and
+/// the task is marked `Interrupted` rather than mis-deserialized.
+const SUPPORTED_SNAPSHOT_VERSION: u32 = 1;
+
+/// The persisted workflow-spec snapshot envelope (mirrors the `{"v":1,"graph":...}`
+/// written at detached-submit time — see the `RouteTarget::Workflow` arm of
+/// `unary_message`). The `v` field is the forward-compat door: an unknown version
+/// fails to match `SUPPORTED_SNAPSHOT_VERSION` in the resume routine and the task is
+/// marked `Interrupted` rather than mis-deserialized. `graph` deserializes into the
+/// exact `WorkflowGraph` that was running at submit time (NOT the live on-disk spec,
+/// which may have changed since).
+#[derive(serde::Deserialize)]
+struct WorkflowSpecEnvelope {
+    v: u32,
+    graph: bridge_workflow::graph::WorkflowGraph,
+}
+
+/// Boot-time crash-resume scan (W3b Task 10a). Replaces the W3a behavior of sweeping
+/// every `Working` row to `Interrupted`: instead, for each `Working` task this either
+/// (a) **short-circuits** it to terminal if its terminal node already has a checkpoint
+/// (the W3a §8 write-failure gap — the terminal output was produced but the row wasn't
+/// flipped), (b) **resumes** it by re-running only the un-checkpointed nodes (seeding
+/// `run_from` with the stored checkpoints, consuming one resume attempt), or
+/// (c) marks it `Interrupted` if it cannot be resumed (no/unreadable snapshot, unknown
+/// schema version, or the resume-attempt cap is exhausted — the poison-pill guard).
+///
+/// Resilience policy: a top-level `working_tasks()` failure logs and returns (the boot
+/// scan is best-effort — a store that can't be read at boot must not abort `serve`).
+/// A per-task store error logs and continues to the NEXT task, so one bad row never
+/// aborts the whole scan.
+///
+/// Detachment: a resumed task is spawned via [`spawn_detached_workflow`] (no JoinHandle
+/// is awaited here) and runs in the background, exactly like a fresh detached submit.
+/// The cancel token is registered in `workflow_cancels` BEFORE the spawn so a
+/// concurrent `tasks/cancel` arriving during resume can find and fire it.
+pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
+    use bridge_core::task_store::{ResumeClaim, TaskRecordStatus};
+
+    let working = match srv.task_store.working_tasks().await {
+        Ok(w) => w,
+        Err(e) => {
+            // A store that can't even be scanned at boot is logged and the scan is
+            // skipped — `serve` still comes up (best-effort resume).
+            tracing::warn!(error = ?e, "resume scan: working_tasks() failed; skipping boot resume");
+            return;
+        }
+    };
+
+    for wt in working {
+        let task = wt.id.clone();
+
+        // (1) No snapshot → cannot reconstruct the graph that was running. Interrupt.
+        let Some(spec_json) = wt.workflow_spec_json.as_deref() else {
+            if let Err(e) = srv
+                .task_store
+                .set_terminal(
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: no workflow snapshot"),
+                    crate::workflow_sink::now_ms(),
+                )
+                .await
+            {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-snapshot) failed");
+            } else {
+                tracing::info!(
+                    task = task.as_str(),
+                    "resume scan: interrupted (no workflow snapshot)"
+                );
+            }
+            continue;
+        };
+
+        // (2) Parse the envelope. Unparseable JSON, an unknown `v`, or a `graph` that
+        //     won't deserialize into a `WorkflowGraph` all mean "not resumable". The
+        //     version check is the forward-compat door (unknown version → Interrupted,
+        //     never a panic).
+        let graph = match serde_json::from_str::<WorkflowSpecEnvelope>(spec_json) {
+            Ok(env) if env.v == SUPPORTED_SNAPSHOT_VERSION => env.graph,
+            _ => {
+                if let Err(e) = srv
+                    .task_store
+                    .set_terminal(
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("not resumable: unreadable workflow snapshot"),
+                        crate::workflow_sink::now_ms(),
+                    )
+                    .await
+                {
+                    tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/unreadable) failed");
+                } else {
+                    tracing::info!(
+                        task = task.as_str(),
+                        "resume scan: interrupted (unreadable workflow snapshot)"
+                    );
+                }
+                continue;
+            }
+        };
+
+        // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok).
+        let cps = match srv.task_store.node_checkpoints(&task).await {
+            Ok(cps) => cps,
+            Err(e) => {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: node_checkpoints() failed; skipping task");
+                continue;
+            }
+        };
+        let seed: std::collections::HashMap<String, (String, bool)> = cps
+            .iter()
+            .map(|(node, output, ok)| (node.as_str().to_string(), (output.clone(), *ok)))
+            .collect();
+
+        // (4) Terminal short-circuit: if the graph's terminal node already has a
+        //     checkpoint, the workflow had actually FINISHED before the crash (its
+        //     terminal output was produced but the row wasn't flipped — the W3a §8
+        //     write-failure gap). Finalize DIRECTLY from the checkpoint, with NO
+        //     re-run and WITHOUT consuming a resume attempt. Completed carries the
+        //     output as `result`; Failed carries it as `error` (mirrors
+        //     `TaskStoreSink::terminal` / `spawn_detached_workflow`'s finalize).
+        let terminal_id = match graph.terminal() {
+            Some(n) => n.id.as_str().to_string(),
+            None => {
+                // A snapshot that validate()'d at submit time always has exactly one
+                // terminal; a malformed snapshot with no terminal is not resumable.
+                if let Err(e) = srv
+                    .task_store
+                    .set_terminal(
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("not resumable: workflow snapshot has no terminal node"),
+                        crate::workflow_sink::now_ms(),
+                    )
+                    .await
+                {
+                    tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-terminal) failed");
+                } else {
+                    tracing::info!(
+                        task = task.as_str(),
+                        "resume scan: interrupted (unreadable workflow snapshot)"
+                    );
+                }
+                continue;
+            }
+        };
+        if let Some((output, ok)) = seed.get(&terminal_id) {
+            let (status, result, error) = if *ok {
+                (TaskRecordStatus::Completed, Some(output.as_str()), None)
+            } else {
+                (TaskRecordStatus::Failed, None, Some(output.as_str()))
+            };
+            if let Err(e) = srv
+                .task_store
+                .set_terminal(&task, status, result, error, crate::workflow_sink::now_ms())
+                .await
+            {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(short-circuit) failed");
+            } else {
+                tracing::info!(task = task.as_str(), status = ?status, "resume scan: short-circuited to terminal");
+            }
+            continue;
+        }
+
+        // (5) Otherwise claim a resume attempt (atomic; increments resume_attempts).
+        match srv
+            .task_store
+            .claim_resume_attempt(&task, cap, crate::workflow_sink::now_ms())
+            .await
+        {
+            Ok(ResumeClaim::Exhausted) => {
+                // Poison-pill guard: a task that keeps crashing the server is marked
+                // Interrupted after `cap` attempts instead of looping forever.
+                if let Err(e) = srv
+                    .task_store
+                    .set_terminal(
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("resume attempt cap exceeded"),
+                        crate::workflow_sink::now_ms(),
+                    )
+                    .await
+                {
+                    tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/cap) failed");
+                } else {
+                    tracing::info!(
+                        task = task.as_str(),
+                        "resume scan: interrupted (resume attempt cap exceeded)"
+                    );
+                }
+                continue;
+            }
+            Ok(ResumeClaim::Resumable { attempt }) => {
+                // Register a fresh cancel token BEFORE spawning so a concurrent
+                // tasks/cancel during resume can find and fire it.
+                let token = tokio_util::sync::CancellationToken::new();
+                srv.workflow_cancels
+                    .lock()
+                    .await
+                    .insert(task.clone(), token.clone());
+                let run_id = format!("{}-resume-{}", task.as_str(), attempt);
+                // Detached: the runner re-runs only the un-checkpointed nodes
+                // (run_from skips the seeded ones) and writes their checkpoints + the
+                // terminal as usual. No JoinHandle is awaited here.
+                drop(spawn_detached_workflow(
+                    srv,
+                    task.clone(),
+                    wt.input.clone(),
+                    std::sync::Arc::new(graph),
+                    run_id.clone(),
+                    token,
+                    seed,
+                ));
+                tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
+            }
+            Err(e) => {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: claim_resume_attempt() failed; skipping task");
+                continue;
+            }
+        }
+    }
 }
 
 /// Background claimer: as each fan-out source's stream ENDS (its `*_done` flag
@@ -1375,6 +1675,25 @@ async fn unary_message(
         RouteTarget::Workflow(ref wf_id) => {
             let task = new_detached_task_id();
             let now = crate::workflow_sink::now_ms();
+            // Pre-join the input text so the persisted `input` is byte-identical to
+            // what the runner receives. Both the record and the spawn use the same value.
+            let input: String = routed
+                .parts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Resolve the graph at submit time. If the wf_id is unknown, the graph is
+            // None and the record persists without a spec snapshot (the runner will
+            // fail when it also can't find the graph — but since the wf_id was
+            // validated by the route decision, this is always Some in practice).
+            let graph = srv.workflows.get(wf_id).cloned();
+            // Snapshot the resolved graph at submit time.
+            // The `{"v":1,"graph":...}` envelope lets the boot resume
+            // routine detect an unknown schema version (treat as unparseable).
+            let workflow_spec_json = graph
+                .as_ref()
+                .map(|g| serde_json::json!({ "v": 1, "graph": &**g }).to_string());
             let rec = bridge_core::task_store::TaskRecord {
                 id: task.clone(),
                 workflow: wf_id.as_str().to_string(),
@@ -1383,22 +1702,44 @@ async fn unary_message(
                 error: None,
                 created_ms: now,
                 updated_ms: now,
+                input: input.clone(),
+                workflow_spec_json,
+                resume_attempts: 0,
             };
             if srv.task_store.create(&rec).await.is_err() {
                 return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
             }
+            // If the graph is not registered (should not happen for a routed workflow,
+            // but guard defensively), mark the task Failed and return early.
+            let graph = match graph {
+                Some(g) => g,
+                None => {
+                    let _ = srv
+                        .task_store
+                        .set_terminal(
+                            &task,
+                            bridge_core::task_store::TaskRecordStatus::Failed,
+                            None,
+                            Some("unknown workflow"),
+                            now,
+                        )
+                        .await;
+                    return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
+                }
+            };
             let token = tokio_util::sync::CancellationToken::new();
             srv.workflow_cancels
                 .lock()
                 .await
                 .insert(task.clone(), token.clone());
-            let text_parts: Vec<String> = routed.parts.iter().map(|p| p.text.clone()).collect();
             drop(spawn_detached_workflow(
                 &srv,
                 task.clone(),
-                text_parts,
-                wf_id.clone(),
+                input,
+                graph,
+                task.as_str().to_string(),
                 token,
+                std::collections::HashMap::new(),
             ));
             let working = a2a::Task {
                 id: task.as_str().to_owned(),

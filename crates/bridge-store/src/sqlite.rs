@@ -3,9 +3,11 @@
 use bridge_core::{
     domain::{PeerTaskId, PendingKind, PendingRequest},
     error::BridgeError,
-    ids::{SessionId, TaskId},
+    ids::{NodeId, SessionId, TaskId},
     ports::SessionStore,
 };
+use rusqlite::OptionalExtension;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// SQLite-backed [`SessionStore`] that persists `task_id ↔ session_id` mappings
@@ -22,6 +24,8 @@ impl SqliteStore {
     /// Open an in-memory database (suitable for tests).
     pub fn open_in_memory() -> Result<Self, BridgeError> {
         let conn = rusqlite::Connection::open_in_memory().map_err(|_| BridgeError::StoreFailure)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             _lock: None,
@@ -50,12 +54,33 @@ impl SqliteStore {
         lock.try_lock_exclusive()
             .map_err(|_| BridgeError::StoreFailure)?;
         let conn = rusqlite::Connection::open(path).map_err(|_| BridgeError::StoreFailure)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             _lock: Some(lock),
         };
         store.create_schema()?;
         Ok(store)
+    }
+
+    /// Test helper: check if PRAGMA foreign_keys is enabled on this connection.
+    #[cfg(test)]
+    fn foreign_keys_on(&self) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let flag: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        Ok(flag != 0)
+    }
+
+    /// Test helper: delete a task row directly (used to verify ON DELETE CASCADE).
+    #[cfg(test)]
+    fn delete_for_test(&self, task: &TaskId) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM tasks WHERE id=?1",
+            rusqlite::params![task.as_str()],
+        )?;
+        Ok(())
     }
 
     fn create_schema(&self) -> Result<(), BridgeError> {
@@ -80,10 +105,44 @@ impl SqliteStore {
                 created_ms INTEGER NOT NULL,
                 updated_ms INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_ms);",
+            CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_ms);
+            CREATE TABLE IF NOT EXISTS task_node_checkpoints (
+                task_id   TEXT NOT NULL,
+                node_id   TEXT NOT NULL,
+                output    TEXT NOT NULL,
+                ok        INTEGER NOT NULL,
+                ts        INTEGER NOT NULL,
+                PRIMARY KEY (task_id, node_id),
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );",
         )
-        .map_err(|_| BridgeError::StoreFailure)
+        .map_err(|_| BridgeError::StoreFailure)?;
+        migrate_tasks_columns(&conn).map_err(|_| BridgeError::StoreFailure)
     }
+}
+
+/// Idempotently add the W3b additive columns to the `tasks` table.
+/// Reads existing columns via `PRAGMA table_info`, then issues `ALTER TABLE ADD COLUMN`
+/// only for columns that are missing. Safe to call on both fresh and old databases.
+fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    // Collect existing column names.
+    let mut stmt = conn.prepare("PRAGMA table_info(tasks)")?;
+    let existing: HashSet<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let additive = [
+        ("input", "TEXT NOT NULL DEFAULT ''"),
+        ("workflow_spec_json", "TEXT"),
+        ("resume_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_resume_ms", "INTEGER"),
+    ];
+    for (col, def) in additive {
+        if !existing.contains(col) {
+            conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {col} {def};"))?;
+        }
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -268,8 +327,9 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     async fn create(&self, rec: &bridge_core::task_store::TaskRecord) -> Result<(), BridgeError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms,
+                               input, workflow_spec_json, resume_attempts)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 rec.id.as_str(),
                 rec.workflow,
@@ -277,7 +337,10 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 rec.result,
                 rec.error,
                 rec.created_ms,
-                rec.updated_ms
+                rec.updated_ms,
+                rec.input,
+                rec.workflow_spec_json,
+                rec.resume_attempts as i64
             ],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
@@ -312,7 +375,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, workflow, status, result, error, created_ms, updated_ms
+                "SELECT id, workflow, status, result, error, created_ms, updated_ms,
+                        input, workflow_spec_json, resume_attempts
                  FROM tasks WHERE id=?1",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -332,7 +396,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, workflow, status, result, error, created_ms, updated_ms
+                "SELECT id, workflow, status, result, error, created_ms, updated_ms,
+                        input, workflow_spec_json, resume_attempts
                  FROM tasks ORDER BY updated_ms DESC LIMIT ?1",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -367,6 +432,99 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         Ok(n > 0)
     }
+    async fn put_node_checkpoint(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        output: &str,
+        ok: bool,
+        ts: i64,
+    ) -> Result<(), BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_node_checkpoints(task_id, node_id, output, ok, ts)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![task.as_str(), node.as_str(), output, ok as i64, ts],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(())
+    }
+
+    async fn node_checkpoints(
+        &self,
+        task: &TaskId,
+    ) -> Result<Vec<(NodeId, String, bool)>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT node_id, output, ok FROM task_node_checkpoints WHERE task_id=?1")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![task.as_str()])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            let node_s: String = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+            let output: String = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
+            let ok_i: i64 = row.get(2).map_err(|_| BridgeError::StoreFailure)?;
+            let node = NodeId::parse(node_s).map_err(|_| BridgeError::StoreFailure)?;
+            out.push((node, output, ok_i != 0));
+        }
+        Ok(out)
+    }
+
+    async fn claim_resume_attempt(
+        &self,
+        task: &TaskId,
+        cap: u32,
+        now_ms: i64,
+    ) -> Result<bridge_core::task_store::ResumeClaim, BridgeError> {
+        use bridge_core::task_store::ResumeClaim;
+        let conn = self.conn.lock().unwrap();
+        // unchecked_transaction takes &self — safe to use through the MutexGuard.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT resume_attempts FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let current = current.ok_or(BridgeError::StoreFailure)?;
+        if current >= cap as i64 {
+            tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+            return Ok(ResumeClaim::Exhausted);
+        }
+        let new_val = current + 1;
+        tx.execute(
+            "UPDATE tasks SET resume_attempts=?1, last_resume_ms=?2 WHERE id=?3",
+            rusqlite::params![new_val, now_ms, task.as_str()],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+        Ok(ResumeClaim::Resumable {
+            attempt: new_val as u32,
+        })
+    }
+
+    async fn working_tasks(&self) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workflow, status, result, error, created_ms, updated_ms,
+                        input, workflow_spec_json, resume_attempts
+                 FROM tasks WHERE status='working'",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt.query([]).map_err(|_| BridgeError::StoreFailure)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            out.push(row_to_task(row)?);
+        }
+        Ok(out)
+    }
 }
 
 fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecord, BridgeError> {
@@ -378,6 +536,9 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
     let error: Option<String> = row.get(4).map_err(|_| BridgeError::StoreFailure)?;
     let created_ms: i64 = row.get(5).map_err(|_| BridgeError::StoreFailure)?;
     let updated_ms: i64 = row.get(6).map_err(|_| BridgeError::StoreFailure)?;
+    let input: Option<String> = row.get(7).map_err(|_| BridgeError::StoreFailure)?;
+    let workflow_spec_json: Option<String> = row.get(8).map_err(|_| BridgeError::StoreFailure)?;
+    let resume_attempts: Option<i64> = row.get(9).map_err(|_| BridgeError::StoreFailure)?;
     Ok(TaskRecord {
         id: TaskId::parse(id).map_err(|_| BridgeError::StoreFailure)?,
         workflow,
@@ -386,6 +547,9 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
         error,
         created_ms,
         updated_ms,
+        input: input.unwrap_or_default(),
+        workflow_spec_json,
+        resume_attempts: resume_attempts.unwrap_or(0) as u32,
     })
 }
 
@@ -406,6 +570,9 @@ mod tests {
             error: None,
             created_ms: ms,
             updated_ms: ms,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
         }
     }
 
@@ -566,6 +733,87 @@ mod tests {
         assert!(second.is_err(), "second open of a locked db must fail");
         drop(_first);
         assert!(SqliteStore::open(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn w3b_schema_and_checkpoints() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let t = TaskId::parse("t").unwrap();
+        s.create(&TaskRecord {
+            id: t.clone(),
+            workflow: "wf".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some("{\"v\":1}".into()),
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+        use bridge_core::ids::NodeId;
+        use bridge_core::task_store::ResumeClaim;
+        s.put_node_checkpoint(&t, &NodeId::parse("codex").unwrap(), "OUT", true, 2)
+            .await
+            .unwrap();
+        assert_eq!(s.node_checkpoints(&t).await.unwrap()[0].1, "OUT");
+        assert!(matches!(
+            s.claim_resume_attempt(&t, 1, 9).await.unwrap(),
+            ResumeClaim::Resumable { attempt: 1 }
+        ));
+        assert!(matches!(
+            s.claim_resume_attempt(&t, 1, 9).await.unwrap(),
+            ResumeClaim::Exhausted
+        ));
+        assert_eq!(s.working_tasks().await.unwrap()[0].input, "DIFF");
+    }
+
+    #[tokio::test]
+    async fn migration_on_old_schema_db_with_cascade_and_fk() {
+        // Old DB with only the ORIGINAL tasks table; insert a row; reopen TWICE with new code →
+        // columns added (idempotent), row intact, foreign_keys ON, ON DELETE CASCADE works.
+        let dir = std::env::temp_dir().join(format!("a2a-w3b-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.db");
+        {
+            use rusqlite::Connection;
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("CREATE TABLE tasks(id TEXT PRIMARY KEY, workflow TEXT NOT NULL, status TEXT NOT NULL, result TEXT, error TEXT, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);").unwrap();
+            c.execute(
+                "INSERT INTO tasks(id,workflow,status,created_ms,updated_ms) VALUES('old','wf','working',1,1)",
+                [],
+            )
+            .unwrap();
+        }
+        // First reopen: migrates.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            let got = s
+                .get(&TaskId::parse("old").unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got.status, TaskRecordStatus::Working);
+            assert_eq!(got.input, ""); // default for migrated row
+            use bridge_core::ids::NodeId;
+            let old = TaskId::parse("old").unwrap();
+            s.put_node_checkpoint(&old, &NodeId::parse("n").unwrap(), "o", true, 2)
+                .await
+                .unwrap();
+            assert_eq!(s.node_checkpoints(&old).await.unwrap().len(), 1);
+        }
+        // Second reopen: migration idempotent (no duplicate-column error), foreign_keys ON, cascade.
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            assert!(s.foreign_keys_on().unwrap()); // test helper
+            let old = TaskId::parse("old").unwrap();
+            // delete the parent task → checkpoint cascades away
+            s.delete_for_test(&old).unwrap(); // test helper: DELETE FROM tasks WHERE id=?
+            assert_eq!(s.node_checkpoints(&old).await.unwrap().len(), 0);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

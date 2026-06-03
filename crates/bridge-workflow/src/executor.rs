@@ -6,10 +6,17 @@ use bridge_core::domain::{effective_config, Part};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::ports::{AgentRegistry, Update, STOP_REASON_CANCELLED};
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// Uniform future type used in the per-run `FuturesUnordered` pool.
+/// Each fan-out node is boxed to this type so `FuturesUnordered` can hold
+/// futures of different async-block monomorphisations in one collection.
+type NodeFut<'a> =
+    std::pin::Pin<Box<dyn futures::Future<Output = (NodeId, String, bool)> + Send + 'a>>;
 
 pub struct WorkflowExecutor {
     registry: Arc<dyn AgentRegistry>,
@@ -30,6 +37,7 @@ pub enum WorkflowEvent {
     NodeFinished {
         node: NodeId,
         ok: bool,
+        output: String,
     },
     Terminal {
         outcome: WorkflowOutcome,
@@ -126,6 +134,8 @@ impl WorkflowExecutor {
         (text, ok)
     }
 
+    /// Run a workflow from scratch (no prior checkpoints).
+    /// Thin wrapper over [`run_from`](Self::run_from) with an empty seed.
     pub fn run(
         &self,
         graph: Arc<WorkflowGraph>,
@@ -133,38 +143,124 @@ impl WorkflowExecutor {
         run_id: String,
         cancel: CancellationToken,
     ) -> WorkflowStream {
+        self.run_from(graph, input, run_id, cancel, HashMap::new())
+    }
+
+    /// Resume a workflow from a pre-loaded seed of already-completed node outputs.
+    /// Seeded nodes are treated as done; only un-seeded nodes actually run.
+    /// `run()` is a thin wrapper over this with an empty seed.
+    ///
+    /// Each seed entry is `(output_text, ok)`, matching the `NodeFinished` payload.
+    ///
+    /// # Errors (streamed)
+    /// - `BridgeError::ConfigInvalid` if a seed key is not in `graph.nodes`.
+    /// - `BridgeError::ConfigInvalid` if the seed is not closed under `inputs`
+    ///   (a non-root seeded node's upstream is missing from the seed).
+    pub fn run_from(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: HashMap<String, (String, bool)>,
+    ) -> WorkflowStream {
         let this = WorkflowExecutor {
             registry: self.registry.clone(),
         };
         Box::pin(async_stream::stream! {
-            let mut outputs: HashMap<String, (String, bool)> = HashMap::new();
-            let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // --- Seed validation ---
+            // 1. Every seed key must name a real node.
+            let node_ids: HashSet<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
+            for key in seed.keys() {
+                if !node_ids.contains(key.as_str()) {
+                    yield Err(BridgeError::ConfigInvalid {
+                        reason: "resume seed references unknown node".into(),
+                    });
+                    return;
+                }
+            }
+            // 2. The seed must be closed under inputs: for every seeded non-root node,
+            //    all of its declared inputs must also be in the seed.
+            for node in graph.nodes.iter() {
+                if seed.contains_key(node.id.as_str()) {
+                    for inp in &node.inputs {
+                        if !seed.contains_key(inp.as_str()) {
+                            yield Err(BridgeError::ConfigInvalid {
+                                reason: "resume seed is not closed under inputs".into(),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let mut outputs: HashMap<String, (String, bool)> = seed;
+            let mut done: HashSet<String> = outputs.keys().cloned().collect();
             let terminal_id = graph.terminal().map(|n| n.id.as_str().to_string()).unwrap_or_default();
-            while done.len() < graph.nodes.len() {
-                if cancel.is_cancelled() { break; }   // stop scheduling downstream once canceled
-                let ready: Vec<&WorkflowNode> = graph.nodes.iter()
-                    .filter(|n| !done.contains(n.id.as_str())
-                        && n.inputs.iter().all(|i| done.contains(i.as_str())))
-                    .collect();
-                if ready.is_empty() { break; } // validated acyclic, so unreachable
-                for n in &ready { yield Ok(WorkflowEvent::NodeStarted { node: n.id.clone() }); }
-                let futs = ready.iter().map(|n| {
-                    let mut owned: Vec<(String, String)> = vec![("input".into(), input.clone())];
-                    for inp in &n.inputs {
-                        if let Some((t, _)) = outputs.get(inp.as_str()) { owned.push((inp.as_str().into(), t.clone())); }
+
+            // Box the per-node future to one uniform type: the `schedule_ready!`
+            // macro expands at two textual sites and each bare `async move {}`
+            // would otherwise be a *distinct* anonymous type, which a monomorphic
+            // `FuturesUnordered<Fut>` cannot hold.
+            let mut inflight: FuturesUnordered<NodeFut> = FuturesUnordered::new();
+            let mut scheduled: HashSet<String> = HashSet::new();
+            let mut stop_scheduling = false; // set on cancel: drain in-flight, schedule nothing new
+
+            // Push every not-done/not-scheduled node whose inputs are all done.
+            // Returns the node ids newly scheduled (so the caller can emit NodeStarted).
+            macro_rules! schedule_ready {
+                () => {{
+                    let mut started: Vec<NodeId> = Vec::new();
+                    if !stop_scheduling {
+                        for n in graph.nodes.iter() {
+                            let id = n.id.as_str();
+                            if done.contains(id) || scheduled.contains(id) {
+                                continue;
+                            }
+                            if n.inputs.iter().all(|i| done.contains(i.as_str())) {
+                                scheduled.insert(id.to_string());
+                                started.push(n.id.clone());
+                                let mut owned: Vec<(String, String)> = vec![("input".into(), input.clone())];
+                                for inp in &n.inputs {
+                                    if let Some((t, _)) = outputs.get(inp.as_str()) {
+                                        owned.push((inp.as_str().into(), t.clone()));
+                                    }
+                                }
+                                let node = n.clone();
+                                let run_id = run_id.clone();
+                                let cancel = cancel.clone();
+                                let wf_id = graph.id.as_str().to_string();
+                                let this = &this;
+                                inflight.push(Box::pin(async move {
+                                    let vars: HashMap<&str, &str> =
+                                        owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                                    let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel).await;
+                                    (node.id.clone(), text, ok)
+                                }) as NodeFut);
+                            }
+                        }
                     }
-                    let node = (*n).clone(); let run_id = run_id.clone(); let cancel = cancel.clone();
-                    let wf_id = graph.id.as_str().to_string(); let this = &this;
-                    async move {
-                        let vars: HashMap<&str, &str> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                        let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel).await;
-                        (node.id.clone(), text, ok)
-                    }
-                });
-                for (node_id, text, ok) in futures::future::join_all(futs).await {
-                    yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok });
-                    done.insert(node_id.as_str().to_string());
-                    outputs.insert(node_id.as_str().to_string(), (text, ok));
+                    started
+                }};
+            }
+
+            for node in schedule_ready!() {
+                yield Ok(WorkflowEvent::NodeStarted { node });
+            }
+            while let Some((node_id, text, ok)) = inflight.next().await {
+                yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok, output: text.clone() });
+                done.insert(node_id.as_str().to_string());
+                outputs.insert(node_id.as_str().to_string(), (text, ok));
+                if cancel.is_cancelled() {
+                    // Stop scheduling NEW nodes, but keep draining so every already-in-flight
+                    // sibling completes its run_node cancel branch (backend.cancel() +
+                    // forget_session()). Do NOT `break` — that drops in-flight futures
+                    // mid-cleanup → stranded ACP sessions (dual-review blocker).
+                    stop_scheduling = true;
+                    continue;
+                }
+                for node in schedule_ready!() {
+                    yield Ok(WorkflowEvent::NodeStarted { node });
                 }
             }
             let (term_text, term_ok) = outputs.get(&terminal_id).cloned().unwrap_or_default();
@@ -573,7 +669,7 @@ mod tests {
         ));
         // a NodeFinished{ok:false} was emitted for codex
         assert!(evs.iter().any(|e| matches!(e.as_ref().unwrap(),
-            WorkflowEvent::NodeFinished { node, ok: false } if node.as_str() == "codex")));
+            WorkflowEvent::NodeFinished { node, ok: false, .. } if node.as_str() == "codex")));
         // the EXACT failure marker reached synth's prompt
         let p = &synth_rec.prompts.lock().unwrap()[0];
         assert!(
@@ -657,6 +753,301 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_drains_inflight() {
+        // TWO fan-out legs, both genuinely in-flight (their prompt stream is pending),
+        // when the token fires. Each leg's run_node cancel branch must run
+        // backend.cancel() AND forget_session() — proving the FuturesUnordered drains
+        // (not `break`s) after the first post-cancel completion. A `break` would drop
+        // the second leg's future mid-cleanup → its counter never reaches 2.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        // Shared observability: cleanups counts cancel()+forget_session() calls;
+        // entered counts prompt() entries; both_in_flight wakes the driver once
+        // both legs have parked on their pending stream.
+        struct Shared {
+            cleanups: AtomicUsize,
+            entered: AtomicUsize,
+            both_in_flight: Notify,
+        }
+        struct CancelObservingBackend {
+            shared: Arc<Shared>,
+        }
+        #[async_trait::async_trait]
+        impl AgentBackend for CancelObservingBackend {
+            async fn prompt(
+                &self,
+                _s: &SessionId,
+                _p: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                // Mark this leg as in-flight; once both legs are here, wake the driver.
+                if self.shared.entered.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                    self.shared.both_in_flight.notify_one();
+                }
+                // Pending stream → the node parks in run_node's select! until cancel.
+                Ok(Box::pin(futures::stream::pending()))
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                self.shared.cleanups.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn forget_session(&self, _s: &SessionId) {
+                self.shared.cleanups.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct CReg {
+            shared: Arc<Shared>,
+        }
+        #[async_trait::async_trait]
+        impl AgentRegistry for CReg {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                Ok(Resolved {
+                    entry: Arc::new(minimal_entry(id)),
+                    backend: Arc::new(CancelObservingBackend {
+                        shared: self.shared.clone(),
+                    }),
+                    lease: Box::new(NoopLease),
+                })
+            }
+            fn default_id(&self) -> AgentId {
+                AgentId::parse("a").unwrap()
+            }
+            async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+                Ok(())
+            }
+            fn list(&self) -> Vec<AgentId> {
+                vec![]
+            }
+        }
+        // Two fan-out legs (a, b — no inputs) + terminal t depending on both. Cancel
+        // fires while a and b are in-flight, so t is never scheduled.
+        let g = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("g").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("a").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("b").unwrap(),
+                    agent: AgentId::parse("b").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("t").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{a}}{{b}}".into(),
+                    inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
+                },
+            ],
+        });
+        let shared = Arc::new(Shared {
+            cleanups: AtomicUsize::new(0),
+            entered: AtomicUsize::new(0),
+            both_in_flight: Notify::new(),
+        });
+        let reg = Arc::new(CReg {
+            shared: shared.clone(),
+        });
+        let ex = WorkflowExecutor::new(reg);
+        let token = CancellationToken::new();
+
+        // Wait for both legs to be in-flight, then cancel.
+        let t2 = token.clone();
+        let s2 = shared.clone();
+        tokio::spawn(async move {
+            // notify_one before any waiter is dropped; re-check the counter to avoid races.
+            if s2.entered.load(Ordering::SeqCst) < 2 {
+                s2.both_in_flight.notified().await;
+            }
+            t2.cancel();
+        });
+
+        let evs: Vec<_> = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ex.run(g, "x".into(), "r".into(), token).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("drain must complete after cancel (a `break` would also finish, but leak cleanup)");
+
+        assert!(matches!(
+            evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Canceled,
+                ..
+            }
+        ));
+        // BOTH legs must have run cancel()+forget_session() = 4 total cleanup calls.
+        // A `break` after the first post-cancel completion drops the second leg's
+        // future, aborting its cleanup → count would be 2, not 4.
+        assert_eq!(
+            shared.cleanups.load(Ordering::SeqCst),
+            4,
+            "both in-flight legs must run cancel()+forget_session() (drain, not break)"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_order() {
+        // Two parallel nodes: a (fast) + b (slow). Completion-driven scheduling must
+        // yield a's NodeFinished BEFORE b's — an ordering join_all did NOT guarantee
+        // (join_all yields in ready-batch iteration order regardless of finish time).
+        use std::sync::atomic::{AtomicBool, Ordering as AO};
+        use tokio::sync::Notify;
+        struct TimedBackend {
+            reply: String,
+            // None → reply immediately; Some(gate) → wait on gate before replying.
+            gate: Option<Arc<Notify>>,
+            // When `a` starts its prompt, signal the releaser task (None for non-a nodes).
+            a_done: Option<(Arc<Notify>, Arc<AtomicBool>)>,
+        }
+        #[async_trait::async_trait]
+        impl AgentBackend for TimedBackend {
+            async fn prompt(
+                &self,
+                _s: &SessionId,
+                _p: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                if let Some(g) = &self.gate {
+                    g.notified().await; // park until released
+                }
+                // After returning from prompt(), the stream is a synchronous iter, so
+                // run_node for this node will finish as soon as the executor polls it.
+                // Signal the releaser that `a` has completed its prompt (and is therefore
+                // done, since the iter stream yields synchronously).
+                if let Some((notify, flag)) = &self.a_done {
+                    flag.store(true, AO::SeqCst);
+                    notify.notify_one();
+                }
+                Ok(Box::pin(tokio_stream::iter(vec![
+                    Ok(Update::Text(self.reply.clone())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ])))
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+        let slow_gate = Arc::new(Notify::new());
+        let a_done_notify = Arc::new(Notify::new());
+        let a_done_flag = Arc::new(AtomicBool::new(false));
+        struct TReg {
+            slow_gate: Arc<Notify>,
+            a_done_notify: Arc<Notify>,
+            a_done_flag: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl AgentRegistry for TReg {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                // "b" is the slow leg (gated); "a" gets the a_done signal; "t" is plain.
+                let gate = if id.as_str() == "b" {
+                    Some(self.slow_gate.clone())
+                } else {
+                    None
+                };
+                let a_done = if id.as_str() == "a" {
+                    Some((self.a_done_notify.clone(), self.a_done_flag.clone()))
+                } else {
+                    None
+                };
+                Ok(Resolved {
+                    entry: Arc::new(minimal_entry(id)),
+                    backend: Arc::new(TimedBackend {
+                        reply: id.as_str().to_uppercase(),
+                        gate,
+                        a_done,
+                    }),
+                    lease: Box::new(NoopLease),
+                })
+            }
+            fn default_id(&self) -> AgentId {
+                AgentId::parse("a").unwrap()
+            }
+            async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+                Ok(())
+            }
+            fn list(&self) -> Vec<AgentId> {
+                vec![]
+            }
+        }
+        // a, b parallel (no inputs); terminal t depends on both so the run completes.
+        let g = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("g").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("a").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("b").unwrap(),
+                    agent: AgentId::parse("b").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("t").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{a}}{{b}}".into(),
+                    inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
+                },
+            ],
+        });
+        let reg = Arc::new(TReg {
+            slow_gate: slow_gate.clone(),
+            a_done_notify: a_done_notify.clone(),
+            a_done_flag: a_done_flag.clone(),
+        });
+        let ex = WorkflowExecutor::new(reg);
+
+        // Release the slow leg only AFTER `a` has signalled completion — causal ordering,
+        // no wall-clock dependency. Guard against the notify firing before the waiter
+        // starts (mirror the cancel_drains_inflight pattern).
+        let g2 = slow_gate.clone();
+        tokio::spawn(async move {
+            if !a_done_flag.load(AO::SeqCst) {
+                a_done_notify.notified().await;
+            }
+            g2.notify_waiters();
+        });
+
+        let evs: Vec<_> = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ex.run(g, "x".into(), "r".into(), CancellationToken::new())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("run must complete")
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+        // Collect the order of NodeFinished ids for the two parallel legs.
+        let finished_order: Vec<&str> = evs
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::NodeFinished { node, .. }
+                    if node.as_str() == "a" || node.as_str() == "b" =>
+                {
+                    Some(node.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finished_order,
+            vec!["a", "b"],
+            "fast leg 'a' must finish before slow leg 'b' (completion-driven order)"
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_during_slow_prompt_ends_canceled_promptly() {
         struct SlowPrompt;
         #[async_trait::async_trait]
@@ -717,5 +1108,187 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── run_from tests ──────────────────────────────────────────────────────
+
+    /// A 3-node fan-in (codex + claude → synth). Seed {codex, claude} as done;
+    /// assert only `synth` is actually prompted, run completes, and `synth`'s
+    /// prompt contains the seeded outputs.
+    #[tokio::test]
+    async fn run_from_skips_seeded_runs_rest() {
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry {
+            backends: [
+                ("codex".to_string(), mk("CODEX_SEEDED_IGNORED")),
+                ("claude".to_string(), mk("CLAUDE_SEEDED_IGNORED")),
+                ("synth".to_string(), mk("SYNTH_FINAL")),
+            ]
+            .into(),
+        });
+        let codex_rec = reg.backends.get("codex").unwrap().1.clone();
+        let claude_rec = reg.backends.get("claude").unwrap().1.clone();
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+
+        let seed: HashMap<String, (String, bool)> = [
+            ("codex".to_string(), ("OUTA".to_string(), true)),
+            ("claude".to_string(), ("OUTB".to_string(), true)),
+        ]
+        .into();
+
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_from(
+                review_graph(),
+                "DIFF".into(),
+                "resume1".into(),
+                CancellationToken::new(),
+                seed,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        // Run must complete successfully.
+        let last = evs.last().unwrap().as_ref().unwrap();
+        assert!(
+            matches!(last, WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output } if output == "SYNTH_FINAL"),
+            "terminal should be Completed/SYNTH_FINAL, got: {last:?}"
+        );
+
+        // codex and claude must NOT have been prompted (they were seeded).
+        assert!(
+            codex_rec.prompts.lock().unwrap().is_empty(),
+            "codex was seeded; its backend must not be prompted"
+        );
+        assert!(
+            claude_rec.prompts.lock().unwrap().is_empty(),
+            "claude was seeded; its backend must not be prompted"
+        );
+
+        // synth MUST have been prompted exactly once, and its prompt must contain
+        // the seeded outputs OUTA and OUTB (passed as template vars).
+        let synth_prompts = synth_rec.prompts.lock().unwrap();
+        assert_eq!(
+            synth_prompts.len(),
+            1,
+            "synth should be prompted exactly once"
+        );
+        let p = &synth_prompts[0];
+        assert!(
+            p.contains("OUTA") && p.contains("OUTB"),
+            "synth prompt must contain seeded outputs OUTA and OUTB: {p}"
+        );
+
+        // Exactly ONE NodeStarted (synth) and ONE NodeFinished (synth) emitted.
+        let started: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e.as_ref().unwrap() {
+                WorkflowEvent::NodeStarted { node } => Some(node.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec!["synth"], "only synth should be started");
+
+        // Exactly ONE NodeFinished (synth) emitted — symmetry with NodeStarted.
+        let finished: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e.as_ref().unwrap() {
+                WorkflowEvent::NodeFinished { node, .. } => Some(node.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished, vec!["synth"], "only synth should be finished");
+    }
+
+    /// Seed contains a node id not present in the graph → stream yields ConfigInvalid.
+    #[tokio::test]
+    async fn run_from_unknown_seed_node_errors() {
+        let reg = Arc::new(FakeRegistry {
+            backends: [(
+                "codex".to_string(),
+                ("X".to_string(), Arc::new(Rec::default())),
+            )]
+            .into(),
+        });
+        let seed: HashMap<String, (String, bool)> =
+            [("ghost_node".to_string(), ("OUT".to_string(), true))].into();
+
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_from(
+                one_node_graph(),
+                "inp".into(),
+                "r".into(),
+                CancellationToken::new(),
+                seed,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(evs.len(), 1, "should yield exactly one error event");
+        let err = evs[0].as_ref().unwrap_err();
+        assert!(
+            matches!(err, BridgeError::ConfigInvalid { reason } if reason.contains("unknown node")),
+            "expected ConfigInvalid about unknown node, got: {err:?}"
+        );
+    }
+
+    /// Seed contains a non-root node (b, which depends on a) but NOT its upstream (a).
+    /// This violates the closure invariant → stream yields ConfigInvalid.
+    ///
+    /// Graph: a → b → c  (pipeline_threads_output_to_input shape)
+    #[tokio::test]
+    async fn run_from_seed_not_closed_errors() {
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry {
+            backends: [
+                ("a".to_string(), mk("AOUT")),
+                ("b".to_string(), mk("BOUT")),
+                ("c".to_string(), mk("COUT")),
+            ]
+            .into(),
+        });
+
+        // Graph: a → b → c
+        let g = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("p").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("a").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("b").unwrap(),
+                    agent: AgentId::parse("b").unwrap(),
+                    prompt_template: "got {{a}}".into(),
+                    inputs: vec![NodeId::parse("a").unwrap()],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("c").unwrap(),
+                    agent: AgentId::parse("c").unwrap(),
+                    prompt_template: "got {{b}}".into(),
+                    inputs: vec![NodeId::parse("b").unwrap()],
+                },
+            ],
+        });
+
+        // Seed only `b` without its upstream `a` → closure violation.
+        let seed: HashMap<String, (String, bool)> =
+            [("b".to_string(), ("BOUT".to_string(), true))].into();
+
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_from(g, "inp".into(), "r".into(), CancellationToken::new(), seed)
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(evs.len(), 1, "should yield exactly one error event");
+        let err = evs[0].as_ref().unwrap_err();
+        assert!(
+            matches!(err, BridgeError::ConfigInvalid { reason } if reason.contains("closed under inputs")),
+            "expected ConfigInvalid about closure, got: {err:?}"
+        );
     }
 }
