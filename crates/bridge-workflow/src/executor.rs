@@ -150,6 +150,8 @@ impl WorkflowExecutor {
     /// Seeded nodes are treated as done; only un-seeded nodes actually run.
     /// `run()` is a thin wrapper over this with an empty seed.
     ///
+    /// Each seed entry is `(output_text, ok)`, matching the `NodeFinished` payload.
+    ///
     /// # Errors (streamed)
     /// - `BridgeError::ConfigInvalid` if a seed key is not in `graph.nodes`.
     /// - `BridgeError::ConfigInvalid` if the seed is not closed under `inputs`
@@ -168,8 +170,9 @@ impl WorkflowExecutor {
         Box::pin(async_stream::stream! {
             // --- Seed validation ---
             // 1. Every seed key must name a real node.
+            let node_ids: HashSet<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
             for key in seed.keys() {
-                if !graph.nodes.iter().any(|n| n.id.as_str() == key.as_str()) {
+                if !node_ids.contains(key.as_str()) {
                     yield Err(BridgeError::ConfigInvalid {
                         reason: "resume seed references unknown node".into(),
                     });
@@ -1180,6 +1183,16 @@ mod tests {
             })
             .collect();
         assert_eq!(started, vec!["synth"], "only synth should be started");
+
+        // Exactly ONE NodeFinished (synth) emitted — symmetry with NodeStarted.
+        let finished: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e.as_ref().unwrap() {
+                WorkflowEvent::NodeFinished { node, .. } => Some(node.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished, vec!["synth"], "only synth should be finished");
     }
 
     /// Seed contains a node id not present in the graph → stream yields ConfigInvalid.
