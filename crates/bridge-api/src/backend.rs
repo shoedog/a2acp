@@ -1,9 +1,7 @@
 //! ApiBackend — the non-process OpenAI-compatible AgentBackend.
 use crate::config::ApiConfig;
 use crate::wire::{ChatRequest, Message, SseAccumulator, ToolCall};
-use bridge_core::domain::{
-    EffectiveConfig, Part, PermissionDecision, PermissionRequest, SessionContext,
-};
+use bridge_core::domain::{Part, PermissionDecision, PermissionRequest, SessionContext, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{
@@ -219,10 +217,10 @@ impl AgentBackend for ApiBackend {
     async fn configure_session(
         &self,
         session: &SessionId,
-        cfg: &EffectiveConfig,
+        spec: &SessionSpec,
     ) -> Result<(), BridgeError> {
         let mut map = self.sessions.lock().expect("sessions lock");
-        map.entry(session.clone()).or_default().model = cfg.model.clone();
+        map.entry(session.clone()).or_default().model = spec.config.model.clone();
         Ok(())
     }
 
@@ -252,7 +250,7 @@ fn decide_tool(policy: &Arc<StdMutex<Arc<dyn PolicyEngine>>>, tc: &ToolCall) -> 
 mod tests {
     use super::*;
     use bridge_core::domain::{
-        EffectiveConfig, PermissionDecision, PermissionRequest, SessionContext,
+        EffectiveConfig, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
     };
     use bridge_core::error::BridgeError;
     use bridge_core::ids::SessionId;
@@ -276,10 +274,10 @@ mod tests {
         let s = SessionId::parse("s1").unwrap();
         be.configure_session(
             &s,
-            &EffectiveConfig {
+            &SessionSpec::from_config(EffectiveConfig {
                 model: Some("haiku".into()),
                 ..Default::default()
-            },
+            }),
         )
         .await
         .unwrap();

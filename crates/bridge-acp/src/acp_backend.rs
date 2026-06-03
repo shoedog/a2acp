@@ -32,7 +32,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use bridge_core::domain::{
-    EffectiveConfig, Effort, PermissionDecision, PermissionRequest, SessionContext,
+    Effort, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
 };
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
@@ -292,18 +292,19 @@ pub struct AcpBackend {
     /// it is dropped before any `session/new` await so the mint of one session
     /// never blocks lookups of another.
     sessions: Arc<Mutex<HashMap<SessionId, Arc<AgentSession>>>>,
-    /// Per-bridge-session effective config stash (Increment 3b). Dispatch (T10)
-    /// calls [`Self::configure_session`] to insert the effective `model`/`effort`/
-    /// `mode` for a session BEFORE its first prompt; [`Self::ensure_session`] reads
-    /// THIS map (keyed by the bridge `SessionId`) at lazy mint and applies the
-    /// values, so a live registry config edit affects new sessions with no respawn
-    /// and per-request overrides stay isolated per session. Behind a plain
-    /// `std::sync::Mutex` (only short, non-async insert/lookup/remove under it).
+    /// Per-bridge-session spec stash (Increment 3b/session-cwd). Dispatch (T10)
+    /// calls [`Self::configure_session`] to insert the `SessionSpec` (effective
+    /// `model`/`effort`/`mode` + `cwd`) for a session BEFORE its first prompt;
+    /// [`Self::ensure_session`] reads THIS map (keyed by the bridge `SessionId`) at
+    /// lazy mint and applies the values, so a live registry config edit affects new
+    /// sessions with no respawn and per-request overrides stay isolated per session.
+    /// Behind a plain `std::sync::Mutex` (only short, non-async insert/lookup/remove
+    /// under it).
     ///
     /// FALLBACK: a session with NO stash entry (direct callers / the gated e2es that
     /// don't go through `configure_session`) falls back to [`AcpConfig`]'s static
     /// `model`/`mode`, preserving the pre-3b behavior.
-    session_cfg: Arc<StdMutex<HashMap<SessionId, EffectiveConfig>>>,
+    session_cfg: Arc<StdMutex<HashMap<SessionId, SessionSpec>>>,
     /// Policy engine that decides reverse `session/request_permission` requests.
     /// Defaults to an internal auto-approve impl (the deployed 3a policy); a
     /// caller (Task 6's `main`) threads a concrete engine via [`Self::with_policy`].
@@ -870,7 +871,7 @@ impl AcpBackend {
             .ok()
             .and_then(|m| m.get(key).cloned());
         let (mode, model, effort) = match stashed {
-            Some(cfg) => (cfg.mode, cfg.model, cfg.effort),
+            Some(spec) => (spec.config.mode, spec.config.model, spec.config.effort),
             None => (
                 self.config.as_ref().and_then(|c| c.mode.clone()),
                 self.config.as_ref().and_then(|c| c.model.clone()),
@@ -1346,19 +1347,19 @@ impl AgentBackend for AcpBackend {
         Ok(())
     }
 
-    /// Stash the per-session effective config (Increment 3b). Dispatch (T10) calls
+    /// Stash the per-session spec (Increment 3b/session-cwd). Dispatch (T10) calls
     /// this BEFORE the first prompt for a session; [`Self::ensure_session`] reads
     /// the stash at lazy mint (keyed by the bridge `SessionId`) and applies
-    /// `mode`/`model`/`effort`. Insert-or-replace, so a re-`configure_session` with
-    /// fresh effective config (e.g. after a live registry edit) takes effect on the
-    /// NEXT mint. Cheap + non-async under a plain `Mutex`.
+    /// `mode`/`model`/`effort` from `spec.config`. Insert-or-replace, so a
+    /// re-`configure_session` with fresh spec (e.g. after a live registry edit) takes
+    /// effect on the NEXT mint. Cheap + non-async under a plain `Mutex`.
     async fn configure_session(
         &self,
         session: &SessionId,
-        cfg: &EffectiveConfig,
+        spec: &SessionSpec,
     ) -> Result<(), BridgeError> {
         if let Ok(mut m) = self.session_cfg.lock() {
-            m.insert(session.clone(), cfg.clone());
+            m.insert(session.clone(), spec.clone());
         }
         Ok(())
     }
@@ -1395,6 +1396,7 @@ impl AgentBackend for AcpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_core::domain::EffectiveConfig;
     use bridge_core::error::BridgeError;
     use bridge_core::ports::{AgentBackend, Update};
     use bridge_core::process::Supervised;
@@ -3393,11 +3395,11 @@ mod tests {
 
         be.configure_session(
             &key,
-            &EffectiveConfig {
+            &SessionSpec::from_config(EffectiveConfig {
                 model: Some("m".to_string()),
                 effort: None,
                 mode: Some("x".to_string()),
-            },
+            }),
         )
         .await
         .unwrap();
@@ -3435,21 +3437,21 @@ mod tests {
 
         be.configure_session(
             &s1,
-            &EffectiveConfig {
+            &SessionSpec::from_config(EffectiveConfig {
                 model: Some("a".to_string()),
                 effort: None,
                 mode: None,
-            },
+            }),
         )
         .await
         .unwrap();
         be.configure_session(
             &s2,
-            &EffectiveConfig {
+            &SessionSpec::from_config(EffectiveConfig {
                 model: Some("b".to_string()),
                 effort: None,
                 mode: None,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -3524,11 +3526,11 @@ mod tests {
 
         be.configure_session(
             &key,
-            &EffectiveConfig {
+            &SessionSpec::from_config(EffectiveConfig {
                 model: None,
                 effort: Some(Effort::High),
                 mode: None,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -3555,11 +3557,11 @@ mod tests {
 
         be.configure_session(
             &key,
-            &EffectiveConfig {
+            &SessionSpec::from_config(EffectiveConfig {
                 model: None,
                 effort: Some(Effort::Max),
                 mode: None,
-            },
+            }),
         )
         .await
         .unwrap();
@@ -3594,11 +3596,11 @@ mod tests {
         // A configured session uses its stashed mode.
         be.configure_session(
             &configured,
-            &EffectiveConfig {
+            &SessionSpec::from_config(EffectiveConfig {
                 model: None,
                 effort: None,
                 mode: Some("stashed-mode".to_string()),
-            },
+            }),
         )
         .await
         .unwrap();
@@ -3608,11 +3610,11 @@ mod tests {
         // and falls back to the static config mode.
         be.configure_session(
             &forgotten,
-            &EffectiveConfig {
+            &SessionSpec::from_config(EffectiveConfig {
                 model: None,
                 effort: None,
                 mode: Some("doomed-mode".to_string()),
-            },
+            }),
         )
         .await
         .unwrap();

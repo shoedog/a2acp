@@ -2,7 +2,7 @@
 //! → prompt → concatenate Update::Text (NOT the translator's last_text). Cancel via token.
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::template::render;
-use bridge_core::domain::{effective_config, Part};
+use bridge_core::domain::{effective_config, Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::ports::{AgentRegistry, Update, STOP_REASON_CANCELLED};
@@ -91,7 +91,10 @@ impl WorkflowExecutor {
             },
         };
         let eff = effective_config(&resolved.entry, None);
-        let _ = resolved.backend.configure_session(&session, &eff).await; // best-effort (no-op default)
+        let _ = resolved
+            .backend
+            .configure_session(&session, &SessionSpec::from_config(eff))
+            .await; // best-effort (no-op default)
         if cancel.is_cancelled() {
             resolved.backend.forget_session(&session).await;
             return (format!("[node {} canceled]", node.id.as_str()), false);
@@ -276,7 +279,7 @@ impl WorkflowExecutor {
 mod tests {
     use super::*;
     use crate::graph::{WorkflowGraph, WorkflowNode};
-    use bridge_core::domain::{EffectiveConfig, Part, RegistrySnapshot};
+    use bridge_core::domain::{Part, RegistrySnapshot, SessionSpec};
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, NodeId, SessionId, WorkflowId};
     use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
@@ -321,7 +324,7 @@ mod tests {
         async fn configure_session(
             &self,
             _s: &SessionId,
-            _c: &EffectiveConfig,
+            _spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
             *self.rec.configured.lock().unwrap() = true;
             Ok(())

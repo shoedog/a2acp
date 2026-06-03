@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use a2a::{methods, SVC_PARAM_VERSION};
 use bridge_core::domain::{
     effective_config, AgentOverride, AuthContext, EffectiveConfig, InboundRequest, Part,
-    PeerTaskId, RouteTarget, TaskMeta,
+    PeerTaskId, RouteTarget, SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
 use bridge_core::ids::{AgentId, SessionId, TaskId};
@@ -390,7 +390,9 @@ async fn resolve_configure_bind(
             let backend = binding.backend.clone();
             let eff = binding.eff.clone();
             drop(bindings);
-            backend.configure_session(session, &eff).await?;
+            backend
+                .configure_session(session, &SessionSpec::from_config(eff))
+                .await?;
             return Ok(LocalDispatch {
                 backend,
                 guard: None,
@@ -400,7 +402,10 @@ async fn resolve_configure_bind(
     // First message: resolve, configure, bind, and hand back an eviction guard.
     let resolved = srv.registry.resolve(agent_id).await?;
     let eff = effective_config(&resolved.entry, overrides);
-    resolved.backend.configure_session(session, &eff).await?;
+    resolved
+        .backend
+        .configure_session(session, &SessionSpec::from_config(eff.clone()))
+        .await?;
     let backend = resolved.backend.clone();
     srv.bindings.lock().await.insert(
         task.clone(),
@@ -437,7 +442,10 @@ async fn resolve_for_fanout(
 ) -> Result<(Arc<dyn AgentBackend>, Box<dyn Lease>), BridgeError> {
     let resolved = srv.registry.resolve(agent_id).await?;
     let eff = effective_config(&resolved.entry, overrides);
-    resolved.backend.configure_session(session, &eff).await?;
+    resolved
+        .backend
+        .configure_session(session, &SessionSpec::from_config(eff))
+        .await?;
     Ok((resolved.backend, resolved.lease))
 }
 
@@ -2401,7 +2409,7 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
 mod tests {
     use super::*;
     use bridge_core::domain::RouteTarget;
-    use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, RegistrySnapshot};
+    use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, RegistrySnapshot, SessionSpec};
     use bridge_core::domain::{
         AuthContext, PeerTaskId, PendingRequest, PermissionDecision, PermissionRequest,
         SessionContext,
@@ -4416,9 +4424,9 @@ mod tests {
         async fn configure_session(
             &self,
             _session: &SessionId,
-            cfg: &EffectiveConfig,
+            spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
-            *self.configured.lock().unwrap() = Some(cfg.clone());
+            *self.configured.lock().unwrap() = Some(spec.config.clone());
             Ok(())
         }
     }

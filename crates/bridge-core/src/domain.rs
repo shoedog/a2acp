@@ -82,6 +82,24 @@ pub struct EffectiveConfig {
     pub mode: Option<String>,
 }
 
+/// Per-session stash carried through `configure_session` → `ensure_session`.
+///
+/// `config` holds model/mode/effort (what the LLM is configured with).
+/// `cwd` holds the session working directory (a session *location*, not LLM config).
+/// They are separate so future increments can set cwd independently of model config.
+#[derive(Debug, Clone)]
+pub struct SessionSpec {
+    pub config: EffectiveConfig,
+    pub cwd: Option<crate::session_cwd::SessionCwd>,
+}
+
+impl SessionSpec {
+    /// Convenience constructor for call sites that only carry config (cwd is `None`).
+    pub fn from_config(config: EffectiveConfig) -> Self {
+        Self { config, cwd: None }
+    }
+}
+
 /// Compute effective config by layering an optional override on top of an entry's defaults.
 /// Override fields take precedence when `Some`; `None` fields fall back to entry defaults.
 pub fn effective_config(entry: &AgentEntry, ov: Option<&AgentOverride>) -> EffectiveConfig {
