@@ -134,6 +134,8 @@ impl WorkflowExecutor {
         (text, ok)
     }
 
+    /// Run a workflow from scratch (no prior checkpoints).
+    /// Thin wrapper over [`run_from`](Self::run_from) with an empty seed.
     pub fn run(
         &self,
         graph: Arc<WorkflowGraph>,
@@ -141,12 +143,56 @@ impl WorkflowExecutor {
         run_id: String,
         cancel: CancellationToken,
     ) -> WorkflowStream {
+        self.run_from(graph, input, run_id, cancel, HashMap::new())
+    }
+
+    /// Resume a workflow from a pre-loaded seed of already-completed node outputs.
+    /// Seeded nodes are treated as done; only un-seeded nodes actually run.
+    /// `run()` is a thin wrapper over this with an empty seed.
+    ///
+    /// # Errors (streamed)
+    /// - `BridgeError::ConfigInvalid` if a seed key is not in `graph.nodes`.
+    /// - `BridgeError::ConfigInvalid` if the seed is not closed under `inputs`
+    ///   (a non-root seeded node's upstream is missing from the seed).
+    pub fn run_from(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: HashMap<String, (String, bool)>,
+    ) -> WorkflowStream {
         let this = WorkflowExecutor {
             registry: self.registry.clone(),
         };
         Box::pin(async_stream::stream! {
-            let mut outputs: HashMap<String, (String, bool)> = HashMap::new();
-            let mut done: HashSet<String> = HashSet::new();
+            // --- Seed validation ---
+            // 1. Every seed key must name a real node.
+            for key in seed.keys() {
+                if !graph.nodes.iter().any(|n| n.id.as_str() == key.as_str()) {
+                    yield Err(BridgeError::ConfigInvalid {
+                        reason: "resume seed references unknown node".into(),
+                    });
+                    return;
+                }
+            }
+            // 2. The seed must be closed under inputs: for every seeded non-root node,
+            //    all of its declared inputs must also be in the seed.
+            for node in graph.nodes.iter() {
+                if seed.contains_key(node.id.as_str()) {
+                    for inp in &node.inputs {
+                        if !seed.contains_key(inp.as_str()) {
+                            yield Err(BridgeError::ConfigInvalid {
+                                reason: "resume seed is not closed under inputs".into(),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let mut outputs: HashMap<String, (String, bool)> = seed;
+            let mut done: HashSet<String> = outputs.keys().cloned().collect();
             let terminal_id = graph.terminal().map(|n| n.id.as_str().to_string()).unwrap_or_default();
 
             // Box the per-node future to one uniform type: the `schedule_ready!`
@@ -1058,5 +1104,175 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── run_from tests ──────────────────────────────────────────────────────
+
+    /// A 3-node fan-in (codex + claude → synth). Seed {codex, claude} as done;
+    /// assert only `synth` is actually prompted, run completes, and `synth`'s
+    /// prompt contains the seeded outputs.
+    #[tokio::test]
+    async fn run_from_skips_seeded_runs_rest() {
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry {
+            backends: [
+                ("codex".to_string(), mk("CODEX_SEEDED_IGNORED")),
+                ("claude".to_string(), mk("CLAUDE_SEEDED_IGNORED")),
+                ("synth".to_string(), mk("SYNTH_FINAL")),
+            ]
+            .into(),
+        });
+        let codex_rec = reg.backends.get("codex").unwrap().1.clone();
+        let claude_rec = reg.backends.get("claude").unwrap().1.clone();
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+
+        let seed: HashMap<String, (String, bool)> = [
+            ("codex".to_string(), ("OUTA".to_string(), true)),
+            ("claude".to_string(), ("OUTB".to_string(), true)),
+        ]
+        .into();
+
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_from(
+                review_graph(),
+                "DIFF".into(),
+                "resume1".into(),
+                CancellationToken::new(),
+                seed,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        // Run must complete successfully.
+        let last = evs.last().unwrap().as_ref().unwrap();
+        assert!(
+            matches!(last, WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output } if output == "SYNTH_FINAL"),
+            "terminal should be Completed/SYNTH_FINAL, got: {last:?}"
+        );
+
+        // codex and claude must NOT have been prompted (they were seeded).
+        assert!(
+            codex_rec.prompts.lock().unwrap().is_empty(),
+            "codex was seeded; its backend must not be prompted"
+        );
+        assert!(
+            claude_rec.prompts.lock().unwrap().is_empty(),
+            "claude was seeded; its backend must not be prompted"
+        );
+
+        // synth MUST have been prompted exactly once, and its prompt must contain
+        // the seeded outputs OUTA and OUTB (passed as template vars).
+        let synth_prompts = synth_rec.prompts.lock().unwrap();
+        assert_eq!(synth_prompts.len(), 1, "synth should be prompted exactly once");
+        let p = &synth_prompts[0];
+        assert!(
+            p.contains("OUTA") && p.contains("OUTB"),
+            "synth prompt must contain seeded outputs OUTA and OUTB: {p}"
+        );
+
+        // Exactly ONE NodeStarted (synth) and ONE NodeFinished (synth) emitted.
+        let started: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e.as_ref().unwrap() {
+                WorkflowEvent::NodeStarted { node } => Some(node.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec!["synth"], "only synth should be started");
+    }
+
+    /// Seed contains a node id not present in the graph → stream yields ConfigInvalid.
+    #[tokio::test]
+    async fn run_from_unknown_seed_node_errors() {
+        let reg = Arc::new(FakeRegistry {
+            backends: [("codex".to_string(), ("X".to_string(), Arc::new(Rec::default())))].into(),
+        });
+        let seed: HashMap<String, (String, bool)> =
+            [("ghost_node".to_string(), ("OUT".to_string(), true))].into();
+
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_from(
+                one_node_graph(),
+                "inp".into(),
+                "r".into(),
+                CancellationToken::new(),
+                seed,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(evs.len(), 1, "should yield exactly one error event");
+        let err = evs[0].as_ref().unwrap_err();
+        assert!(
+            matches!(err, BridgeError::ConfigInvalid { reason } if reason.contains("unknown node")),
+            "expected ConfigInvalid about unknown node, got: {err:?}"
+        );
+    }
+
+    /// Seed contains a non-root node (b, which depends on a) but NOT its upstream (a).
+    /// This violates the closure invariant → stream yields ConfigInvalid.
+    ///
+    /// Graph: a → b → c  (pipeline_threads_output_to_input shape)
+    #[tokio::test]
+    async fn run_from_seed_not_closed_errors() {
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry {
+            backends: [
+                ("a".to_string(), mk("AOUT")),
+                ("b".to_string(), mk("BOUT")),
+                ("c".to_string(), mk("COUT")),
+            ]
+            .into(),
+        });
+
+        // Graph: a → b → c
+        let g = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("p").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("a").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("b").unwrap(),
+                    agent: AgentId::parse("b").unwrap(),
+                    prompt_template: "got {{a}}".into(),
+                    inputs: vec![NodeId::parse("a").unwrap()],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("c").unwrap(),
+                    agent: AgentId::parse("c").unwrap(),
+                    prompt_template: "got {{b}}".into(),
+                    inputs: vec![NodeId::parse("b").unwrap()],
+                },
+            ],
+        });
+
+        // Seed only `b` without its upstream `a` → closure violation.
+        let seed: HashMap<String, (String, bool)> =
+            [("b".to_string(), ("BOUT".to_string(), true))].into();
+
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_from(
+                g,
+                "inp".into(),
+                "r".into(),
+                CancellationToken::new(),
+                seed,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(evs.len(), 1, "should yield exactly one error event");
+        let err = evs[0].as_ref().unwrap_err();
+        assert!(
+            matches!(err, BridgeError::ConfigInvalid { reason } if reason.contains("closed under inputs")),
+            "expected ConfigInvalid about closure, got: {err:?}"
+        );
     }
 }
