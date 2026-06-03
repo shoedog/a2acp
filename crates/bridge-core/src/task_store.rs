@@ -75,6 +75,12 @@ pub trait TaskStore: Send + Sync {
     async fn list(&self, limit: usize) -> Result<Vec<TaskRecord>, BridgeError>;
     /// Flip every `Working` row to `Interrupted`; returns the count flipped.
     async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError>;
+    /// Atomically cancel a row ONLY if it is still `Working`; returns `true` if it
+    /// flipped. This is the single-writer guard for `tasks/cancel`'s no-token path:
+    /// the runner removes its cancel token only AFTER writing the terminal row, so a
+    /// "no token" cancel must NOT unconditionally overwrite a terminal the runner
+    /// just wrote — this conditional update no-ops on an already-terminal row.
+    async fn cancel_if_working(&self, id: &TaskId, updated_ms: i64) -> Result<bool, BridgeError>;
 }
 
 use std::collections::HashMap;
@@ -142,6 +148,17 @@ impl TaskStore for MemoryTaskStore {
             }
         }
         Ok(n)
+    }
+    async fn cancel_if_working(&self, id: &TaskId, updated_ms: i64) -> Result<bool, BridgeError> {
+        let mut g = self.inner.lock().unwrap();
+        match g.get_mut(id.as_str()) {
+            Some(row) if row.status == TaskRecordStatus::Working => {
+                row.status = TaskRecordStatus::Canceled;
+                row.updated_ms = updated_ms;
+                Ok(true)
+            }
+            _ => Ok(false), // missing or already terminal — do not clobber
+        }
     }
 }
 
@@ -219,5 +236,33 @@ mod tests {
             s.get(&done).await.unwrap().unwrap().status,
             TaskRecordStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_if_working_guards_against_clobber() {
+        let s = MemoryTaskStore::new();
+        // Working row → flips to Canceled, returns true.
+        let w = TaskId::parse("w").unwrap();
+        s.create(&rec("w", 1)).await.unwrap();
+        assert!(s.cancel_if_working(&w, 7).await.unwrap());
+        assert_eq!(
+            s.get(&w).await.unwrap().unwrap().status,
+            TaskRecordStatus::Canceled
+        );
+        // Already-terminal row → no-op, returns false, result preserved (the M1 race guard).
+        let c = TaskId::parse("c").unwrap();
+        s.create(&rec("c", 1)).await.unwrap();
+        s.set_terminal(&c, TaskRecordStatus::Completed, Some("KEEP"), None, 2)
+            .await
+            .unwrap();
+        assert!(!s.cancel_if_working(&c, 9).await.unwrap());
+        let got = s.get(&c).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskRecordStatus::Completed);
+        assert_eq!(got.result.as_deref(), Some("KEEP"));
+        // Missing row → false.
+        assert!(!s
+            .cancel_if_working(&TaskId::parse("nope").unwrap(), 9)
+            .await
+            .unwrap());
     }
 }

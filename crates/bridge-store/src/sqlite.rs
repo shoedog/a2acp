@@ -357,6 +357,16 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         Ok(n as u64)
     }
+    async fn cancel_if_working(&self, id: &TaskId, updated_ms: i64) -> Result<bool, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE tasks SET status='canceled', updated_ms=?1 WHERE id=?2 AND status='working'",
+                rusqlite::params![updated_ms, id.as_str()],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(n > 0)
+    }
 }
 
 fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecord, BridgeError> {

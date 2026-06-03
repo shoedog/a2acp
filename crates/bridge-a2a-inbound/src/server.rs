@@ -1605,8 +1605,8 @@ async fn cancel_task(
                 json!({ "task": { "id": task.as_str(), "state": wire } }),
             );
         }
-        // Working: fire the token if present (runner writes Canceled); else write Canceled
-        // directly. Scope the guard so it is NOT held across the set_terminal().await.
+        // Working: fire the token if a live runner owns it (the runner observes the
+        // token and writes Canceled). Scope the guard so it is NOT held across an await.
         let fired = {
             let guard = srv.workflow_cancels.lock().await;
             match guard.get(&task) {
@@ -1617,17 +1617,37 @@ async fn cancel_task(
                 None => false,
             }
         };
-        if !fired {
-            let _ = srv
-                .task_store
-                .set_terminal(
-                    &task,
-                    TaskRecordStatus::Canceled,
-                    None,
-                    None,
-                    crate::workflow_sink::now_ms(),
-                )
-                .await;
+        if fired {
+            return jsonrpc_ok(
+                id,
+                json!({ "task": { "id": task.as_str(), "state": "TASK_STATE_CANCELED" } }),
+            );
+        }
+        // No live token. The runner removes its token only AFTER writing the terminal
+        // row, so "no token" usually means it already finished — flip ONLY if still
+        // Working (atomic guard against clobbering that just-written terminal).
+        let flipped = srv
+            .task_store
+            .cancel_if_working(&task, crate::workflow_sink::now_ms())
+            .await
+            .unwrap_or(false);
+        if flipped {
+            return jsonrpc_ok(
+                id,
+                json!({ "task": { "id": task.as_str(), "state": "TASK_STATE_CANCELED" } }),
+            );
+        }
+        // The runner finished between our read and here — report its true terminal state.
+        if let Ok(Some(rec2)) = srv.task_store.get(&task).await {
+            let wire = match rec2.status {
+                TaskRecordStatus::Completed => "TASK_STATE_COMPLETED",
+                TaskRecordStatus::Canceled => "TASK_STATE_CANCELED",
+                _ => "TASK_STATE_FAILED",
+            };
+            return jsonrpc_ok(
+                id,
+                json!({ "task": { "id": task.as_str(), "state": wire } }),
+            );
         }
         return jsonrpc_ok(
             id,

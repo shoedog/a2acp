@@ -886,6 +886,55 @@ async fn cancel_terminal_detached_returns_true_state_not_recancel() {
     );
 }
 
+/// A Working row with NO registered cancel token (a stuck task, or one whose
+/// runner just removed its token) → cancel flips it to Canceled via the atomic
+/// `cancel_if_working` guard (no unconditional clobber).
+#[tokio::test]
+async fn cancel_working_no_token_flips_to_canceled() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let id = TaskId::parse("cw1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: id.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .await
+        .unwrap();
+    // No token registered in workflow_cancels.
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": "cw1" }),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let state = body["result"]["task"]["state"]
+        .as_str()
+        .or_else(|| body["result"]["task"]["status"]["state"].as_str());
+    assert_eq!(state, Some("TASK_STATE_CANCELED"), "{body}");
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().status,
+        TaskRecordStatus::Canceled
+    );
+}
+
 // ============================================================================
 // Task 11: tasks/list + gated submit test
 // ============================================================================
