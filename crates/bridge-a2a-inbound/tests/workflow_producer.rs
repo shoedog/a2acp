@@ -2267,6 +2267,143 @@ async fn resume_cap_exhausted_interrupts() {
     );
 }
 
+/// **resume_poison_task_terminates_at_cap** (Task 11 — DoD-9): prove that the
+/// `claim_resume_attempt` + `resume_working_tasks` pair forms a **terminating**
+/// poison-pill guard. A "poison" task is one whose resumed run never reaches the
+/// terminal node, so on every boot `resume_working_tasks` would try to resume it
+/// again — the cap must stop that.
+///
+/// Strategy B (chosen over A because `MemoryTaskStore` has no "reset to Working"
+/// helper, making Strategy A's simulated-crash loop awkward):
+///
+/// 1. Drive the counter by calling `claim_resume_attempt` directly in a **bounded**
+///    loop (capped at `cap+5` to catch any infinite-loop regression fast), asserting
+///    the exact `Resumable{1}`, `Resumable{2}`, ..., `Resumable{cap}` sequence and
+///    then `Exhausted` — proving the counter is monotone and terminates after exactly
+///    `cap` claims.
+/// 2. With `resume_attempts == cap` and the row still `Working`, call
+///    `resume_working_tasks(&srv, cap)` and assert the task is now `Interrupted` (the
+///    Exhausted → Interrupted transition) and that `resume_attempts` stopped at `cap`
+///    (no further increments).
+///
+/// This guarantees: (a) the loop TERMINATES (bounded-iteration guard panics if it
+/// doesn't), and (b) `resume_working_tasks` converts a cap-exhausted poison task to
+/// `Interrupted` rather than resuming it again.
+#[tokio::test]
+async fn resume_poison_task_terminates_at_cap() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, ResumeClaim, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let cap = 3u32;
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, prompted) = build_recording_resume_server(store.clone());
+
+    let task = TaskId::parse("poison-cap-1").unwrap();
+    // Seed: Working, valid snapshot (no terminal checkpoint) — a task that would
+    // loop forever if the cap didn't exist.
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            // Valid snapshot with NO terminal-node checkpoint → the short-circuit
+            // never fires, so every boot would try to run the workflow again.
+            workflow_spec_json: Some(review_snapshot(1)),
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+
+    // ── Step 1: drive the counter and assert the exact Resumable{1..cap} → Exhausted
+    // sequence. The outer bound (`cap + 5`) means a broken cap that never exhausts
+    // will panic here rather than loop forever.
+    let mut resumable_count = 0u32;
+    let mut saw_exhausted = false;
+    for iteration in 0..(cap + 5) {
+        let claim = store
+            .claim_resume_attempt(&task, cap, 100)
+            .await
+            .unwrap();
+        match claim {
+            ResumeClaim::Resumable { attempt } => {
+                resumable_count += 1;
+                assert_eq!(
+                    attempt, resumable_count,
+                    "Resumable attempt counter must increment monotonically: \
+                     expected {resumable_count}, got {attempt}"
+                );
+                assert!(
+                    resumable_count <= cap,
+                    "received more than {cap} Resumable claims before Exhausted \
+                     (iteration {iteration}): broken cap!"
+                );
+            }
+            ResumeClaim::Exhausted => {
+                saw_exhausted = true;
+                // Confirm we got exactly `cap` Resumable claims before Exhausted.
+                assert_eq!(
+                    resumable_count, cap,
+                    "expected exactly {cap} Resumable claims before Exhausted, \
+                     got {resumable_count}"
+                );
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_exhausted,
+        "cap was never exhausted after {} iterations — broken poison-cap guard! \
+         The loop MUST terminate.",
+        cap + 5
+    );
+
+    // The row must still be Working (claim_resume_attempt only increments the counter,
+    // it does NOT change the status).
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Working,
+        "claim_resume_attempt must not change the status; expected Working"
+    );
+    assert_eq!(
+        rec.resume_attempts, cap,
+        "resume_attempts must equal cap after exhaustion"
+    );
+
+    // ── Step 2: call resume_working_tasks — it must detect Exhausted and flip to
+    // Interrupted WITHOUT spawning a runner (no node is prompted).
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, cap).await;
+
+    let final_rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(
+        final_rec.status,
+        TaskRecordStatus::Interrupted,
+        "resume_working_tasks must mark a cap-exhausted poison task Interrupted; \
+         got {:?}",
+        final_rec.status
+    );
+    // The counter must NOT have incremented beyond cap.
+    assert_eq!(
+        final_rec.resume_attempts, cap,
+        "resume_attempts must remain at cap after the Exhausted → Interrupted transition; \
+         got {}",
+        final_rec.resume_attempts
+    );
+    // No backend was prompted — the poison task was never resumed.
+    assert!(
+        prompted.lock().unwrap().is_empty(),
+        "a cap-exhausted poison task must not prompt any backend; \
+         prompted: {:?}",
+        prompted.lock().unwrap()
+    );
+}
+
 /// **resume_terminal_checkpoint_short_circuits**: a `Working` task whose snapshot is the
 /// review graph and which HAS a checkpoint for the TERMINAL node `synth` → the workflow
 /// had actually finished before the crash. Finalize DIRECTLY to Completed (result =
