@@ -39,6 +39,7 @@ use bridge_core::domain::{
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
 use bridge_core::ids::{AgentId, SessionId, TaskId};
+use bridge_core::SessionCwd;
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
     RouteDecision, SessionStore,
@@ -287,6 +288,12 @@ impl InboundServer {
         let task_meta = task_meta_from_params(params)?;
         let target = self.route.route(&task_meta)?;
 
+        // 3b. Parse + validate the per-request cwd (a2a-bridge.cwd).  Validation
+        //     must happen BEFORE task/session ids are derived so a malformed request
+        //     is rejected before any state is created.
+        let session_cwd =
+            session_cwd_from_params(params, self.allowed_cwd_root.as_deref())?;
+
         // 4. Derive task/session ids from params (best-effort; v1 stubs allowed).
         let task = task_id_from_params(params)?;
         let session = SessionId::parse(format!("session-{}", task.as_str()))
@@ -300,6 +307,7 @@ impl InboundServer {
             // Per-request overrides ride along so LOCAL dispatch can compute the
             // effective config (entry defaults layered with these) before the prompt.
             overrides: task_meta.overrides,
+            session_cwd,
         })
     }
 }
@@ -338,6 +346,12 @@ struct RoutedCall {
     /// [`effective_config`] before `configure_session`. The selected `AgentId`
     /// itself is carried by `target` (`RouteTarget::Local(id)`).
     overrides: Option<AgentOverride>,
+    /// Per-request working directory parsed from `a2a-bridge.cwd`.
+    /// Distinct from `AgentOverride` so it reaches both single-agent and workflow
+    /// dispatch (AgentOverride is dropped for workflows). `None` when absent.
+    /// Applied by Tasks 6 (single-agent) and 7 (workflow).
+    #[allow(dead_code)]
+    session_cwd: Option<SessionCwd>,
 }
 
 /// Extract the resolved `AgentId` from a `RouteTarget::Local`, falling back to the
@@ -2293,6 +2307,41 @@ fn parse_effort_meta(s: &str) -> Result<bridge_core::domain::Effort, BridgeError
         "max" => Ok(Effort::Max),
         _ => Err(BridgeError::InvalidRequest { field: "effort" }),
     }
+}
+
+/// Extract and validate the per-request `a2a-bridge.cwd` from `message.metadata`.
+///
+/// - Absent key → `Ok(None)`.
+/// - Present key → structural validation via [`SessionCwd::parse`]; an invalid path
+///   returns `BridgeError::InvalidRequest { field: "a2a-bridge.cwd" }`.
+/// - If `allowed_root` is `Some(root)`: the cwd must satisfy `cwd.is_under(root)`;
+///   a cwd outside the root also returns `InvalidRequest`.
+///
+/// Tested directly by unit tests; called by `gate()` before minting a task id.
+fn session_cwd_from_params(
+    params: &Value,
+    allowed_root: Option<&str>,
+) -> Result<Option<SessionCwd>, BridgeError> {
+    let raw = params
+        .get("message")
+        .and_then(|m| m.get("metadata"))
+        .and_then(|md| md.get("a2a-bridge.cwd"))
+        .and_then(|v| v.as_str());
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let cwd = SessionCwd::parse(s)?;
+    if let Some(root_str) = allowed_root {
+        let root = SessionCwd::parse(root_str).map_err(|_| BridgeError::InvalidRequest {
+            field: "a2a-bridge.cwd",
+        })?;
+        if !cwd.is_under(&root) {
+            return Err(BridgeError::InvalidRequest {
+                field: "a2a-bridge.cwd",
+            });
+        }
+    }
+    Ok(Some(cwd))
 }
 
 /// Extract `TaskMeta` from JSON-RPC params.
@@ -5079,5 +5128,88 @@ mod tests {
             0,
             "the RAII guard must release the lease on early disconnect"
         );
+    }
+
+    // ---- Task 5 (session_cwd increment): parse + validate a2a-bridge.cwd ----
+
+    #[test]
+    fn cwd_metadata_parsed() {
+        // Present + valid absolute path → Some(SessionCwd) matching the value.
+        let p = serde_json::json!({
+            "message": {
+                "metadata": {
+                    "a2a-bridge.cwd": "/abs/repo"
+                }
+            }
+        });
+        let cwd = session_cwd_from_params(&p, None)
+            .expect("valid absolute cwd must parse OK")
+            .expect("present cwd key must return Some");
+        assert_eq!(
+            cwd,
+            bridge_core::SessionCwd::parse("/abs/repo").unwrap(),
+            "parsed SessionCwd must equal the expected value"
+        );
+        // Absent key → None (no behavior change for callers that omit it).
+        let p_absent = serde_json::json!({ "message": { "text": "hi" } });
+        assert!(
+            session_cwd_from_params(&p_absent, None)
+                .expect("absent cwd must not error")
+                .is_none(),
+            "absent a2a-bridge.cwd must yield None"
+        );
+    }
+
+    #[test]
+    fn cwd_relative_rejected() {
+        // A relative path must be rejected before reaching the backend.
+        let p = serde_json::json!({
+            "message": {
+                "metadata": {
+                    "a2a-bridge.cwd": "rel/path"
+                }
+            }
+        });
+        match session_cwd_from_params(&p, None) {
+            Err(BridgeError::InvalidRequest { field: "a2a-bridge.cwd" }) => {}
+            other => panic!(
+                "relative cwd must return InvalidRequest{{field:\"a2a-bridge.cwd\"}}, got: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn cwd_allowed_root_enforced() {
+        let mk = |cwd: &str| {
+            serde_json::json!({
+                "message": {
+                    "metadata": { "a2a-bridge.cwd": cwd }
+                }
+            })
+        };
+
+        // /work/r is under /work → accepted.
+        assert!(
+            session_cwd_from_params(&mk("/work/r"), Some("/work"))
+                .expect("/work/r under /work must be OK")
+                .is_some(),
+            "/work/r must be accepted when root=/work"
+        );
+
+        // /other is NOT under /work → rejected.
+        match session_cwd_from_params(&mk("/other"), Some("/work")) {
+            Err(BridgeError::InvalidRequest { field: "a2a-bridge.cwd" }) => {}
+            other => panic!(
+                "/other outside /work must return InvalidRequest{{field:\"a2a-bridge.cwd\"}}, got: {other:?}"
+            ),
+        }
+
+        // /work-evil is not under /work (component-wise check must not match str prefix).
+        match session_cwd_from_params(&mk("/work-evil"), Some("/work")) {
+            Err(BridgeError::InvalidRequest { field: "a2a-bridge.cwd" }) => {}
+            other => panic!(
+                "/work-evil must be rejected (component-wise, not str-prefix), got: {other:?}"
+            ),
+        }
     }
 }
