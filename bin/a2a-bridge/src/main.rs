@@ -551,9 +551,16 @@ async fn main() -> Result<(), BoxError> {
         None => Arc::new(StubDelegation),
     };
 
-    // W3a: durable task store. File-backed when [store] path is set (acquires the
-    // single-serve lock + runs the boot sweep); else in-memory (ephemeral).
-    use bridge_core::task_store::TaskStore; // bring sweep_interrupted into scope
+    // W3b: durable task store. File-backed when [store] path is set (acquires the
+    // single-serve lock via SqliteStore::open); else in-memory (ephemeral).
+    // sweep_interrupted is REPLACED by resume_working_tasks for the file-backed path:
+    // the resume routine decides per-task whether to re-run or interrupt based on the
+    // workflow snapshot + attempt cap, rather than unconditionally sweeping all Working rows.
+    let resume_cap = cfg
+        .store
+        .as_ref()
+        .and_then(|s| s.resume_attempt_cap)
+        .unwrap_or(3);
     let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> = match cfg
         .store
         .as_ref()
@@ -564,19 +571,12 @@ async fn main() -> Result<(), BoxError> {
                 SqliteStore::open(std::path::Path::new(&path))
                     .map_err(|e| format!("serve: cannot open task store {path:?}: {e:?}"))?,
             );
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            if let Err(e) = s.sweep_interrupted(now).await {
-                tracing::error!(error = ?e, "boot sweep_interrupted failed; stale Working rows may persist");
-            }
             s as std::sync::Arc<dyn bridge_core::task_store::TaskStore>
         }
         None => std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
     };
 
-    // 8. Construct the inbound server and build its axum router.
+    // 8. Construct the inbound server.
     //    InboundServer::new(registry, store, policy, route, auth, base_url, delegation, local_source_label)
     // The inbound server holds the agent registry (3b): first-message LOCAL dispatch
     // resolves the routed agent id, applies its effective config, and binds the task.
@@ -595,6 +595,13 @@ async fn main() -> Result<(), BoxError> {
         .with_workflows(executor, wf_map.clone())
         .with_task_store(task_store),
     );
+
+    // 8b. Resume in-flight detached workflows from their checkpoints BEFORE accepting
+    //     new requests. Boot order: open store → build server → resume → bind listener.
+    //     For the in-memory/no-path branch the store is always empty so this is a no-op.
+    bridge_a2a_inbound::server::resume_working_tasks(&server, resume_cap).await;
+
+    // 8c. Build the axum router (consumes one Arc ref; hold a clone above for resume).
     let router = server.router();
 
     // 9. Bind and serve.

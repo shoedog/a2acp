@@ -50,6 +50,8 @@ pub struct ServerConfig {
 #[derive(Debug, serde::Deserialize)]
 pub struct StoreConfig {
     pub path: String,
+    #[serde(default)]
+    pub resume_attempt_cap: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -932,5 +934,22 @@ path = "/tmp/x.db"
         let toml = "default = \"codex\"\n[server]\naddr = \"127.0.0.1:8080\"\n";
         let cfg = RegistryConfig::parse(toml).unwrap();
         assert!(cfg.store.is_none());
+    }
+
+    #[test]
+    fn store_resume_attempt_cap_parses_and_defaults() {
+        // present: resume_attempt_cap=5 round-trips to Some(5).
+        let cfg: RegistryConfig = RegistryConfig::parse(
+            "default = \"codex\"\n[server]\naddr = \"127.0.0.1:8080\"\n[store]\npath = \"x.db\"\nresume_attempt_cap = 5\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.store.as_ref().unwrap().resume_attempt_cap, Some(5));
+
+        // absent → None (the .unwrap_or(3) default is applied at the call site).
+        let cfg2: RegistryConfig = RegistryConfig::parse(
+            "default = \"codex\"\n[server]\naddr = \"127.0.0.1:8080\"\n[store]\npath = \"x.db\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg2.store.as_ref().unwrap().resume_attempt_cap, None);
     }
 }
