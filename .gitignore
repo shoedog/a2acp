@@ -10,3 +10,8 @@
 # Editor / OS
 .DS_Store
 *.swp
+
+# Runtime config + durable task store (W3a)
+/a2a-bridge.toml
+*.db
+*.db.lock

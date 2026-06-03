@@ -295,7 +295,7 @@ async fn rpc_call(
     });
     let resp = reqwest::Client::new()
         .post(url)
-        .header(a2a::SVC_PARAM_VERSION, "1.0")
+        .header(a2a::SVC_PARAM_VERSION, a2a::VERSION)
         .json(&body)
         .send()
         .await
@@ -554,22 +554,27 @@ async fn main() -> Result<(), BoxError> {
     // W3a: durable task store. File-backed when [store] path is set (acquires the
     // single-serve lock + runs the boot sweep); else in-memory (ephemeral).
     use bridge_core::task_store::TaskStore; // bring sweep_interrupted into scope
-    let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> =
-        match cfg.store.as_ref().map(|s| s.path.clone()) {
-            Some(path) => {
-                let s = std::sync::Arc::new(
-                    SqliteStore::open(std::path::Path::new(&path))
-                        .map_err(|e| format!("serve: cannot open task store {path:?}: {e:?}"))?,
-                );
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let _ = s.sweep_interrupted(now).await;
-                s as std::sync::Arc<dyn bridge_core::task_store::TaskStore>
+    let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> = match cfg
+        .store
+        .as_ref()
+        .map(|s| s.path.clone())
+    {
+        Some(path) => {
+            let s = std::sync::Arc::new(
+                SqliteStore::open(std::path::Path::new(&path))
+                    .map_err(|e| format!("serve: cannot open task store {path:?}: {e:?}"))?,
+            );
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if let Err(e) = s.sweep_interrupted(now).await {
+                tracing::error!(error = ?e, "boot sweep_interrupted failed; stale Working rows may persist");
             }
-            None => std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
-        };
+            s as std::sync::Arc<dyn bridge_core::task_store::TaskStore>
+        }
+        None => std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+    };
 
     // 8. Construct the inbound server and build its axum router.
     //    InboundServer::new(registry, store, policy, route, auth, base_url, delegation, local_source_label)
