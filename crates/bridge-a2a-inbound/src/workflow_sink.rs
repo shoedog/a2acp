@@ -13,7 +13,12 @@ pub(crate) trait WorkflowSink: Send {
     async fn node_started(&mut self, _node: &str) -> Result<(), BridgeError> {
         Ok(())
     }
-    async fn node_finished(&mut self, _node: &str, _ok: bool) -> Result<(), BridgeError> {
+    async fn node_finished(
+        &mut self,
+        _node: &str,
+        _ok: bool,
+        _output: &str,
+    ) -> Result<(), BridgeError> {
         Ok(())
     }
     async fn terminal(&mut self, outcome: WorkflowOutcome, output: String)
@@ -35,8 +40,7 @@ pub(crate) async fn drain_workflow<S: WorkflowSink>(
         match item {
             Ok(WorkflowEvent::NodeStarted { node }) => sink.node_started(node.as_str()).await?,
             Ok(WorkflowEvent::NodeFinished { node, ok, output }) => {
-                let _ = output;
-                sink.node_finished(node.as_str(), ok).await?
+                sink.node_finished(node.as_str(), ok, &output).await?
             }
             Ok(WorkflowEvent::Terminal { outcome, output }) => {
                 sink.terminal(outcome, output).await?;
@@ -63,15 +67,21 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// Detached sink: ignores intermediate node events (W3a has no history) and
-/// captures the terminal mapping for the runner to persist.
+/// Detached sink: persists a per-node checkpoint on each `NodeFinished` (W3b Task 7)
+/// and captures the terminal mapping for the runner to persist.
 pub(crate) struct TaskStoreSink {
+    store: Arc<dyn TaskStore>,
+    task: TaskId,
     terminal: Option<(TaskRecordStatus, Option<String>, Option<String>)>,
 }
 
 impl TaskStoreSink {
-    pub(crate) fn new() -> Self {
-        Self { terminal: None }
+    pub(crate) fn new(store: Arc<dyn TaskStore>, task: TaskId) -> Self {
+        Self {
+            store,
+            task,
+            terminal: None,
+        }
     }
     /// The captured terminal mapping (status, result, error), or None if no
     /// terminal arrived.
@@ -82,6 +92,17 @@ impl TaskStoreSink {
 
 #[async_trait::async_trait]
 impl WorkflowSink for TaskStoreSink {
+    async fn node_finished(
+        &mut self,
+        node: &str,
+        ok: bool,
+        output: &str,
+    ) -> Result<(), BridgeError> {
+        let node_id = bridge_core::ids::NodeId::parse(node).map_err(|_| BridgeError::StoreFailure)?;
+        self.store
+            .put_node_checkpoint(&self.task, &node_id, output, ok, now_ms())
+            .await
+    }
     async fn terminal(
         &mut self,
         outcome: WorkflowOutcome,
@@ -175,7 +196,12 @@ mod sink_tests {
             self.log.push("node_started");
             Ok(())
         }
-        async fn node_finished(&mut self, _node: &str, _ok: bool) -> Result<(), BridgeError> {
+        async fn node_finished(
+            &mut self,
+            _node: &str,
+            _ok: bool,
+            _output: &str,
+        ) -> Result<(), BridgeError> {
             self.log.push("node_finished");
             Ok(())
         }

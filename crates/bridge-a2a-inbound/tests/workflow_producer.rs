@@ -25,6 +25,7 @@ use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, BackendStream, Delegation, DelegationPort, Lease,
     PolicyEngine, Resolved, RouteDecision, SessionStore, Update,
 };
+use bridge_core::task_store::MemoryTaskStore;
 use bridge_workflow::executor::WorkflowExecutor;
 use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
 
@@ -1637,5 +1638,222 @@ async fn swept_interrupted_reports_failed_over_wire() {
     assert!(
         body.to_string().contains("interrupted"),
         "swept task must carry the interrupted reason: {body}"
+    );
+}
+
+// ============================================================================
+// Task 7: TaskStoreSink checkpoints each finished node (W3b)
+// ============================================================================
+
+/// **detached_runner_checkpoints_each_node**: drive a 3-node `code-review` workflow
+/// through the detached runner backed by a real `MemoryTaskStore`. After the run
+/// completes, assert `store.node_checkpoints(&task)` has one row per node with the
+/// correct `(node_id, output, ok)`.  The `FakeBackend` replies per agent:
+///   codex → "CODEX_REVIEW", claude → "CLAUDE_REVIEW", synth → "SYNTH_FINAL".
+#[tokio::test]
+async fn detached_runner_checkpoints_each_node() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let task = TaskId::parse("chk-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+    let handle = bridge_a2a_inbound::server::spawn_detached_workflow_for_test(
+        &srv,
+        task.clone(),
+        vec!["DIFF".to_string()],
+        bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+    );
+    handle.await.unwrap();
+
+    // Task must complete.
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(rec.status, TaskRecordStatus::Completed);
+
+    // Every node must have a checkpoint row.
+    let mut checkpoints = store.node_checkpoints(&task).await.unwrap();
+    // Sort by node id for deterministic comparison.
+    checkpoints.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    assert_eq!(
+        checkpoints.len(),
+        3,
+        "expected 3 node checkpoints (codex, claude, synth); got: {checkpoints:?}"
+    );
+
+    // Build an expected map.
+    let expected: std::collections::HashMap<&str, (&str, bool)> = [
+        ("codex", ("CODEX_REVIEW", true)),
+        ("claude", ("CLAUDE_REVIEW", true)),
+        ("synth", ("SYNTH_FINAL", true)),
+    ]
+    .into();
+
+    for (node_id, output, ok) in &checkpoints {
+        let (exp_output, exp_ok) = expected
+            .get(node_id.as_str())
+            .unwrap_or_else(|| panic!("unexpected checkpoint node: {}", node_id.as_str()));
+        assert_eq!(
+            output.as_str(),
+            *exp_output,
+            "node {} output mismatch",
+            node_id.as_str()
+        );
+        assert_eq!(
+            ok, exp_ok,
+            "node {} ok mismatch",
+            node_id.as_str()
+        );
+    }
+}
+
+/// A `TaskStore` wrapper that delegates everything to an inner `MemoryTaskStore`
+/// EXCEPT `put_node_checkpoint`, which always returns `Err(BridgeError::StoreFailure)`.
+/// Used to verify that a checkpoint write failure aborts the drain and causes the
+/// detached runner to mark the task `Failed`.
+struct FailingCheckpointStore {
+    inner: MemoryTaskStore,
+}
+
+impl FailingCheckpointStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryTaskStore::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
+    async fn create(
+        &self,
+        rec: &bridge_core::task_store::TaskRecord,
+    ) -> Result<(), BridgeError> {
+        self.inner.create(rec).await
+    }
+    async fn set_terminal(
+        &self,
+        id: &TaskId,
+        status: bridge_core::task_store::TaskRecordStatus,
+        result: Option<&str>,
+        error: Option<&str>,
+        updated_ms: i64,
+    ) -> Result<(), BridgeError> {
+        self.inner
+            .set_terminal(id, status, result, error, updated_ms)
+            .await
+    }
+    async fn get(
+        &self,
+        id: &TaskId,
+    ) -> Result<Option<bridge_core::task_store::TaskRecord>, BridgeError> {
+        self.inner.get(id).await
+    }
+    async fn list(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+        self.inner.list(limit).await
+    }
+    async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError> {
+        self.inner.sweep_interrupted(updated_ms).await
+    }
+    async fn cancel_if_working(
+        &self,
+        id: &TaskId,
+        updated_ms: i64,
+    ) -> Result<bool, BridgeError> {
+        self.inner.cancel_if_working(id, updated_ms).await
+    }
+    async fn put_node_checkpoint(
+        &self,
+        _task: &TaskId,
+        _node: &bridge_core::ids::NodeId,
+        _output: &str,
+        _ok: bool,
+        _ts: i64,
+    ) -> Result<(), BridgeError> {
+        // Always fail — simulates a DB write error.
+        Err(BridgeError::StoreFailure)
+    }
+    async fn node_checkpoints(
+        &self,
+        task: &TaskId,
+    ) -> Result<Vec<(bridge_core::ids::NodeId, String, bool)>, BridgeError> {
+        self.inner.node_checkpoints(task).await
+    }
+    async fn claim_resume_attempt(
+        &self,
+        task: &TaskId,
+        cap: u32,
+        now_ms: i64,
+    ) -> Result<bridge_core::task_store::ResumeClaim, BridgeError> {
+        self.inner.claim_resume_attempt(task, cap, now_ms).await
+    }
+    async fn working_tasks(
+        &self,
+    ) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+        self.inner.working_tasks().await
+    }
+}
+
+/// **detached_runner_checkpoint_write_failure_fails_task**: when `put_node_checkpoint`
+/// returns `Err`, the fallible `drain_workflow` propagates the error, causing the
+/// detached runner to mark the task `Failed` (via the `Err(e)` arm in
+/// `spawn_detached_workflow`).
+#[tokio::test]
+async fn detached_runner_checkpoint_write_failure_fails_task() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(FailingCheckpointStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let task = TaskId::parse("chk-fail-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+        })
+        .await
+        .unwrap();
+    let handle = bridge_a2a_inbound::server::spawn_detached_workflow_for_test(
+        &srv,
+        task.clone(),
+        vec!["DIFF".to_string()],
+        bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+    );
+    handle.await.unwrap();
+
+    // The checkpoint write failure must have aborted the drain → task is Failed.
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Failed,
+        "checkpoint write failure must mark the task Failed; got: {:?}",
+        rec.status
     );
 }

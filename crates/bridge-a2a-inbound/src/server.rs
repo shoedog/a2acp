@@ -989,7 +989,12 @@ impl crate::workflow_sink::WorkflowSink for SseSink {
             .await;
         Ok(())
     }
-    async fn node_finished(&mut self, node: &str, ok: bool) -> Result<(), BridgeError> {
+    async fn node_finished(
+        &mut self,
+        node: &str,
+        ok: bool,
+        _output: &str,
+    ) -> Result<(), BridgeError> {
         let _ = self
             .tx
             .send(Ok(Event::status(format!(
@@ -1120,7 +1125,7 @@ fn spawn_detached_workflow(
         };
         let input = text_parts.join("\n");
         let stream = executor.run(graph, input, task.as_str().to_string(), token);
-        let mut sink = crate::workflow_sink::TaskStoreSink::new();
+        let mut sink = crate::workflow_sink::TaskStoreSink::new(srv.task_store.clone(), task.clone());
         let now = crate::workflow_sink::now_ms();
         match crate::workflow_sink::drain_workflow(stream, &mut sink).await {
             Ok(terminal_seen) => {
