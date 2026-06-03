@@ -172,6 +172,11 @@ pub struct InboundServer {
     /// Durable task control-plane store (W3a). Defaults to an in-memory store;
     /// replace with a persistent backend via [`InboundServer::with_task_store`].
     task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+    /// Global root path that gates which per-request session cwds are permitted
+    /// (session_cwd increment). `None` → no global root restriction.
+    /// Wired from `allowed_cwd_root` in the top-level config via
+    /// [`InboundServer::with_allowed_cwd_root`].
+    pub allowed_cwd_root: Option<String>,
 }
 
 impl InboundServer {
@@ -203,6 +208,7 @@ impl InboundServer {
             workflows: Arc::new(HashMap::new()),
             workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            allowed_cwd_root: None,
         }
     }
 
@@ -232,6 +238,15 @@ impl InboundServer {
         task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
     ) -> Self {
         self.task_store = task_store;
+        self
+    }
+
+    /// Set the global root path that gates per-request session cwds (session_cwd increment).
+    /// Builder over [`InboundServer::new`]; wired from `allowed_cwd_root` in the top-level
+    /// config. `None` (the default) → no global root restriction.
+    #[must_use]
+    pub fn with_allowed_cwd_root(mut self, root: Option<String>) -> Self {
+        self.allowed_cwd_root = root;
         self
     }
 
@@ -2485,6 +2500,7 @@ mod tests {
             effort: None,
             mode: None,
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,

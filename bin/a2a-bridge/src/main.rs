@@ -63,6 +63,13 @@ addr = "127.0.0.1:8080"
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Resolve the static (config-time) ACP session cwd for an agent entry.
+/// Resolution chain: `session_cwd` → `cwd` → `"."`.
+/// The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
+fn resolve_static_session_cwd(session_cwd: Option<&str>, cwd: Option<&str>) -> String {
+    session_cwd.or(cwd).unwrap_or(".").to_string()
+}
+
 // ---------------------------------------------------------------------------
 // `run-workflow` subcommand
 // ---------------------------------------------------------------------------
@@ -150,22 +157,23 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let spawn: bridge_registry::registry::SpawnFn = Arc::new(move |entry: Arc<AgentEntry>| {
         let policy = Arc::clone(&policy_for_spawn);
         Box::pin(async move {
-            let cwd = match entry.cwd.clone() {
-                Some(c) => {
-                    let p = PathBuf::from(c);
-                    if p.is_absolute() {
-                        p
-                    } else {
-                        std::env::current_dir()
-                            .map_err(|e| BridgeError::ConfigInvalid {
-                                reason: format!("cwd: {e}"),
-                            })?
-                            .join(p)
-                    }
+            // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
+            // Resolution chain: session_cwd → cwd → "."; then absolutize relative values.
+            let resolved = resolve_static_session_cwd(
+                entry.session_cwd.as_deref(),
+                entry.cwd.as_deref(),
+            );
+            let cwd = {
+                let p = PathBuf::from(&resolved);
+                if p.is_absolute() {
+                    p
+                } else {
+                    std::env::current_dir()
+                        .map_err(|e| BridgeError::ConfigInvalid {
+                            reason: format!("cwd: {e}"),
+                        })?
+                        .join(p)
                 }
-                None => std::env::current_dir().map_err(|e| BridgeError::ConfigInvalid {
-                    reason: format!("cwd: {e}"),
-                })?,
             };
             let args: Vec<String> = entry.args.clone();
             let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -424,25 +432,24 @@ async fn main() -> Result<(), BoxError> {
     let spawn: SpawnFn = Arc::new(move |entry: Arc<AgentEntry>| {
         let policy = Arc::clone(&policy_for_spawn);
         Box::pin(async move {
-            // Absolute working directory (ACP §11A). A relative configured value
-            // is joined onto current_dir() to become absolute; an absolute one is
-            // used as-is; absent falls back to the bridge's current directory.
-            let cwd = match entry.cwd.clone() {
-                Some(c) => {
-                    let p = PathBuf::from(c);
-                    if p.is_absolute() {
-                        p
-                    } else {
-                        std::env::current_dir()
-                            .map_err(|e| BridgeError::ConfigInvalid {
-                                reason: format!("cwd: {e}"),
-                            })?
-                            .join(p)
-                    }
+            // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
+            // Resolution chain: session_cwd → cwd → ".". A relative resolved value is joined
+            // onto current_dir() to become absolute; an absolute one is used as-is (ACP §11A).
+            let resolved = resolve_static_session_cwd(
+                entry.session_cwd.as_deref(),
+                entry.cwd.as_deref(),
+            );
+            let cwd = {
+                let p = PathBuf::from(&resolved);
+                if p.is_absolute() {
+                    p
+                } else {
+                    std::env::current_dir()
+                        .map_err(|e| BridgeError::ConfigInvalid {
+                            reason: format!("cwd: {e}"),
+                        })?
+                        .join(p)
                 }
-                None => std::env::current_dir().map_err(|e| BridgeError::ConfigInvalid {
-                    reason: format!("cwd: {e}"),
-                })?,
             };
             let args: Vec<String> = entry.args.clone();
             let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -592,7 +599,8 @@ async fn main() -> Result<(), BoxError> {
             default_label.clone(),
         )
         .with_workflows(executor, wf_map.clone())
-        .with_task_store(task_store),
+        .with_task_store(task_store)
+        .with_allowed_cwd_root(cfg.allowed_cwd_root.clone()),
     );
 
     // 8b. Resume in-flight detached workflows from their checkpoints BEFORE accepting
@@ -624,5 +632,12 @@ mod cli_tests {
         ];
         assert_eq!(flag(&a, "--url"), Some("http://x"));
         assert_eq!(flag(&a, "--nope"), None);
+    }
+
+    #[test]
+    fn resolve_static_session_cwd_chain() {
+        assert_eq!(resolve_static_session_cwd(Some("/s"), Some("/c")), "/s"); // session_cwd wins
+        assert_eq!(resolve_static_session_cwd(None, Some("/c")), "/c"); // falls to cwd
+        assert_eq!(resolve_static_session_cwd(None, None), "."); // default
     }
 }

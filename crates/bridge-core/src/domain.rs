@@ -53,6 +53,10 @@ pub struct AgentEntry {
     pub effort: Option<Effort>,
     pub mode: Option<String>,
     pub cwd: Option<String>,
+    /// Static ACP session cwd for this agent (the working directory set at session mint).
+    /// Resolution chain at mint: `session_cwd` → `cwd` → `"."`.
+    /// This is NOT a host-process cwd — the host child has no cwd (Supervised gets None).
+    pub session_cwd: Option<String>,
     pub auth_method: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -234,6 +238,7 @@ mod tests {
             effort: None,
             mode: None,
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,
@@ -260,6 +265,7 @@ mod tests {
             effort: None,
             mode: None,
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,
@@ -284,6 +290,7 @@ mod tests {
             effort: Some(Effort::High),
             mode: Some("read-only".into()),
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,

@@ -112,6 +112,10 @@ pub struct RegistryConfig {
     pub store: Option<StoreConfig>,
     #[serde(default)]
     pub workflows: Vec<WorkflowToml>,
+    /// Global root path that gates which per-request cwds are allowed (later tasks).
+    /// Absent → no global root restriction.
+    #[serde(default)]
+    pub allowed_cwd_root: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -167,6 +171,10 @@ pub struct AgentEntryToml {
     pub mode: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Static ACP session cwd for this agent (distinct from any host process cwd).
+    /// When absent falls back to `cwd` then `"."` at mint time.
+    #[serde(default)]
+    pub session_cwd: Option<String>,
     #[serde(default)]
     pub auth_method: Option<String>,
     #[serde(default)]
@@ -316,6 +324,7 @@ impl RegistryConfig {
                 effort,
                 mode: a.mode,
                 cwd: a.cwd,
+                session_cwd: a.session_cwd,
                 auth_method: a.auth_method,
                 name: a.name,
                 description: a.description,
@@ -909,6 +918,27 @@ addr="127.0.0.1:8080"
             .unwrap()
             .load_workflows(dir.path())
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_cwd_cfg_tests {
+    use super::*;
+
+    #[test]
+    fn agent_session_cwd_and_allowed_root_parse() {
+        let cfg: RegistryConfig = RegistryConfig::parse(
+            "default=\"a\"\nallowed_cwd_root=\"/work\"\n[[agents]]\nid=\"a\"\ncmd=\"x\"\ncwd=\"/host\"\nsession_cwd=\"/work/r\"\n[server]\naddr=\"127.0.0.1:8080\"\n",
+        ).unwrap();
+        let a = cfg.agents.iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(a.cwd.as_deref(), Some("/host"));
+        assert_eq!(a.session_cwd.as_deref(), Some("/work/r"));
+        assert_eq!(cfg.allowed_cwd_root.as_deref(), Some("/work"));
+        let cfg2: RegistryConfig = RegistryConfig::parse(
+            "default=\"a\"\n[[agents]]\nid=\"a\"\ncmd=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n",
+        ).unwrap();
+        assert_eq!(cfg2.agents[0].session_cwd, None);
+        assert_eq!(cfg2.allowed_cwd_root, None);
     }
 }
 

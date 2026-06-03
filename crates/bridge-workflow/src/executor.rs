@@ -342,6 +342,7 @@ mod tests {
             effort: None,
             mode: None,
             cwd: None,
+            session_cwd: None,
             auth_method: None,
             name: None,
             description: None,

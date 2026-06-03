@@ -47,6 +47,7 @@ fn minimal_entry(id: &AgentId) -> AgentEntry {
         effort: None,
         mode: None,
         cwd: None,
+        session_cwd: None,
         auth_method: None,
         name: None,
         description: None,
