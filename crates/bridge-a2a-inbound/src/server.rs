@@ -1057,8 +1057,7 @@ fn spawn_workflow_producer(
             .insert(task.clone(), token.clone());
         let stream = executor.run(graph, input, task.as_str().to_string(), token);
         let mut sink = SseSink { tx: tx.clone() };
-        let terminal_seen =
-            crate::workflow_sink::drain_workflow(stream, &mut sink).await;
+        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink).await;
         // The executor always emits a Terminal, but guard against an early stream
         // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
         if !terminal_seen {
@@ -1389,10 +1388,18 @@ async fn unary_message(
                 return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
             }
             let token = tokio_util::sync::CancellationToken::new();
-            srv.workflow_cancels.lock().await.insert(task.clone(), token.clone());
-            let text_parts: Vec<String> =
-                routed.parts.iter().map(|p| p.text.clone()).collect();
-            drop(spawn_detached_workflow(&srv, task.clone(), text_parts, wf_id.clone(), token));
+            srv.workflow_cancels
+                .lock()
+                .await
+                .insert(task.clone(), token.clone());
+            let text_parts: Vec<String> = routed.parts.iter().map(|p| p.text.clone()).collect();
+            drop(spawn_detached_workflow(
+                &srv,
+                task.clone(),
+                text_parts,
+                wf_id.clone(),
+                token,
+            ));
             let working = a2a::Task {
                 id: task.as_str().to_owned(),
                 context_id: task.as_str().to_owned(),
@@ -1593,7 +1600,10 @@ async fn cancel_task(
                 TaskRecordStatus::Canceled => "TASK_STATE_CANCELED",
                 _ => "TASK_STATE_FAILED", // Failed | Interrupted
             };
-            return jsonrpc_ok(id, json!({ "task": { "id": task.as_str(), "state": wire } }));
+            return jsonrpc_ok(
+                id,
+                json!({ "task": { "id": task.as_str(), "state": wire } }),
+            );
         }
         // Working: fire the token if present (runner writes Canceled); else write Canceled
         // directly. Scope the guard so it is NOT held across the set_terminal().await.
@@ -1610,7 +1620,13 @@ async fn cancel_task(
         if !fired {
             let _ = srv
                 .task_store
-                .set_terminal(&task, TaskRecordStatus::Canceled, None, None, crate::workflow_sink::now_ms())
+                .set_terminal(
+                    &task,
+                    TaskRecordStatus::Canceled,
+                    None,
+                    None,
+                    crate::workflow_sink::now_ms(),
+                )
                 .await;
         }
         return jsonrpc_ok(
@@ -1728,17 +1744,29 @@ async fn get_task(
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
     // Durable task row first (detached workflows).
-    if let Ok(Some(rec)) = srv.task_store.get(&task).await {
-        let (state, artifacts) = task_record_to_a2a(&rec);
-        let t = a2a::Task {
-            id: rec.id.as_str().to_owned(),
-            context_id: rec.id.as_str().to_owned(),
-            status: a2a::TaskStatus { state, message: None, timestamp: None },
-            artifacts,
-            history: None,
-            metadata: None,
-        };
-        return jsonrpc_ok(id, json!({ "task": t }));
+    match srv.task_store.get(&task).await {
+        Ok(Some(rec)) => {
+            let (state, artifacts) = task_record_to_a2a(&rec);
+            let t = a2a::Task {
+                id: rec.id.as_str().to_owned(),
+                context_id: rec.id.as_str().to_owned(),
+                status: a2a::TaskStatus {
+                    state,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts,
+                history: None,
+                metadata: None,
+            };
+            return jsonrpc_ok(id, json!({ "task": t }));
+        }
+        Ok(None) => {} // not a detached task — fall through to the heuristic
+        Err(e) => {
+            // A store read failure degrades to the heuristic; surface it so a
+            // persistent failure isn't silently reported as SUBMITTED.
+            tracing::warn!(task = task.as_str(), error = ?e, "task_store.get failed in get_task");
+        }
     }
     // Fallback: session-mapping heuristic (non-workflow tasks; unchanged).
     let known = matches!(srv.store.session_for(&task).await, Ok(Some(_)));
