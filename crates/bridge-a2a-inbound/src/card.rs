@@ -72,8 +72,10 @@ pub fn agent_card(base_url: &str, workflow_ids: &[&str]) -> AgentCard {
         skills.push(AgentSkill {
             id: (*id).to_string(),
             name: (*id).to_string(),
-            description: format!("Run the {id} workflow."),
-            tags: vec!["workflow".to_string()],
+            description: format!(
+                "Run the {id} workflow (detached: returns a working task; poll tasks/get)."
+            ),
+            tags: vec!["workflow".to_string(), "detached".to_string()],
             examples: None,
             input_modes: None,
             output_modes: None,
@@ -178,7 +180,33 @@ mod tests {
         assert_eq!(c.skills.len(), 3 + ids.len());
         let wf = c.skills.iter().find(|s| s.id == "code-review").unwrap();
         assert!(wf.tags.iter().any(|t| t == "workflow"));
-        assert_eq!(wf.description, "Run the code-review workflow.");
+        assert!(wf.description.to_lowercase().contains("detached"));
         assert!(c.skills.iter().any(|s| s.id == "triage"));
+    }
+
+    // ---- Task 12c: workflow skills advertise detached submit ----
+
+    #[test]
+    fn agent_card_marks_workflow_skills_detached() {
+        let card = agent_card("http://x", &["code-review"]);
+        let skill = card
+            .skills
+            .iter()
+            .find(|s| s.id == "code-review")
+            .expect("workflow skill");
+        let marked = skill.tags.iter().any(|x| x == "detached")
+            || skill.description.to_lowercase().contains("detached");
+        assert!(marked, "workflow skill must advertise detached submit");
+    }
+
+    #[test]
+    fn base_skills_are_not_marked_detached() {
+        let card = agent_card("http://x", &["code-review"]);
+        for id in &["kiro-code", "delegate", "fan-out"] {
+            let skill = card.skills.iter().find(|s| s.id == *id).unwrap();
+            let marked = skill.tags.iter().any(|x| x == "detached")
+                || skill.description.to_lowercase().contains("detached");
+            assert!(!marked, "base skill '{id}' must NOT be marked detached");
+        }
     }
 }
