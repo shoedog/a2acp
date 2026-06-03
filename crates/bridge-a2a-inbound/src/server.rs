@@ -1218,13 +1218,18 @@ pub fn spawn_detached_workflow_with_token_for_test(
     spawn_detached_workflow(srv, task, input, graph, run_id, token, std::collections::HashMap::new())
 }
 
+/// The only snapshot schema version this server can resume. The forward-compat door:
+/// a snapshot whose `v` field does not match this const is treated as unreadable and
+/// the task is marked `Interrupted` rather than mis-deserialized.
+const SUPPORTED_SNAPSHOT_VERSION: u32 = 1;
+
 /// The persisted workflow-spec snapshot envelope (mirrors the `{"v":1,"graph":...}`
 /// written at detached-submit time — see the `RouteTarget::Workflow` arm of
 /// `unary_message`). The `v` field is the forward-compat door: an unknown version
-/// fails to match `v == 1` in the resume routine and the task is marked
-/// `Interrupted` rather than mis-deserialized. `graph` deserializes into the exact
-/// `WorkflowGraph` that was running at submit time (NOT the live on-disk spec, which
-/// may have changed since).
+/// fails to match `SUPPORTED_SNAPSHOT_VERSION` in the resume routine and the task is
+/// marked `Interrupted` rather than mis-deserialized. `graph` deserializes into the
+/// exact `WorkflowGraph` that was running at submit time (NOT the live on-disk spec,
+/// which may have changed since).
 #[derive(serde::Deserialize)]
 struct WorkflowSpecEnvelope {
     v: u32,
@@ -1279,6 +1284,8 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                 .await
             {
                 tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-snapshot) failed");
+            } else {
+                tracing::info!(task = task.as_str(), "resume scan: interrupted (no workflow snapshot)");
             }
             continue;
         };
@@ -1288,7 +1295,7 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
         //     version check is the forward-compat door (unknown version → Interrupted,
         //     never a panic).
         let graph = match serde_json::from_str::<WorkflowSpecEnvelope>(spec_json) {
-            Ok(env) if env.v == 1 => env.graph,
+            Ok(env) if env.v == SUPPORTED_SNAPSHOT_VERSION => env.graph,
             _ => {
                 if let Err(e) = srv
                     .task_store
@@ -1302,6 +1309,8 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     .await
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/unreadable) failed");
+                } else {
+                    tracing::info!(task = task.as_str(), "resume scan: interrupted (unreadable workflow snapshot)");
                 }
                 continue;
             }
@@ -1338,12 +1347,14 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                         &task,
                         TaskRecordStatus::Interrupted,
                         None,
-                        Some("not resumable: unreadable workflow snapshot"),
+                        Some("not resumable: workflow snapshot has no terminal node"),
                         crate::workflow_sink::now_ms(),
                     )
                     .await
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-terminal) failed");
+                } else {
+                    tracing::info!(task = task.as_str(), "resume scan: interrupted (unreadable workflow snapshot)");
                 }
                 continue;
             }
@@ -1360,6 +1371,8 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                 .await
             {
                 tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(short-circuit) failed");
+            } else {
+                tracing::info!(task = task.as_str(), status = ?status, "resume scan: short-circuited to terminal");
             }
             continue;
         }
@@ -1385,6 +1398,8 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     .await
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/cap) failed");
+                } else {
+                    tracing::info!(task = task.as_str(), "resume scan: interrupted (resume attempt cap exceeded)");
                 }
                 continue;
             }
@@ -1405,10 +1420,11 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     task.clone(),
                     wt.input.clone(),
                     std::sync::Arc::new(graph),
-                    run_id,
+                    run_id.clone(),
                     token,
                     seed,
                 ));
+                tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
             }
             Err(e) => {
                 tracing::warn!(task = task.as_str(), error = ?e, "resume scan: claim_resume_attempt() failed; skipping task");
