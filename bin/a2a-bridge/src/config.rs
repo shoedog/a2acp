@@ -936,7 +936,8 @@ mod session_cwd_cfg_tests {
         assert_eq!(cfg.allowed_cwd_root.as_deref(), Some("/work"));
         let cfg2: RegistryConfig = RegistryConfig::parse(
             "default=\"a\"\n[[agents]]\nid=\"a\"\ncmd=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(cfg2.agents[0].session_cwd, None);
         assert_eq!(cfg2.allowed_cwd_root, None);
     }

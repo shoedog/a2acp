@@ -17,8 +17,8 @@ use tower::ServiceExt;
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_core::domain::{
     AgentEntry, AgentKind, AuthContext, InboundRequest, Part, PeerTaskId, PendingRequest,
-    PermissionDecision, PermissionRequest, RegistrySnapshot, RouteTarget, SessionContext, SessionSpec,
-    TaskMeta,
+    PermissionDecision, PermissionRequest, RegistrySnapshot, RouteTarget, SessionContext,
+    SessionSpec, TaskMeta,
 };
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{AgentId, CallerId, NodeId, SessionId, TaskId, WorkflowId};
@@ -1112,7 +1112,7 @@ async fn tasks_list_returns_recent_newest_first() {
                 input: String::new(),
                 workflow_spec_json: None,
                 resume_attempts: 0,
-            session_cwd: None,
+                session_cwd: None,
             })
             .await
             .unwrap();
@@ -2751,7 +2751,7 @@ fn build_cwd_cap_server(
     .into();
     let registry = Arc::new(PerAgentRegistry { backends });
     let executor = Arc::new(WorkflowExecutor::new(
-        registry.clone() as Arc<dyn AgentRegistry>,
+        registry.clone() as Arc<dyn AgentRegistry>
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
@@ -2801,13 +2801,15 @@ async fn streaming_workflow_threads_cwd_to_every_node() {
         .await
         .unwrap();
     let body = String::from_utf8(bytes.to_vec()).unwrap();
-    assert!(
-        body.contains("FINAL"),
-        "workflow must complete: {body}"
-    );
+    assert!(body.contains("FINAL"), "workflow must complete: {body}");
 
     let captured = cwds.lock().unwrap();
-    assert_eq!(captured.len(), 3, "all 3 nodes must call configure_session; got {:?}", &*captured);
+    assert_eq!(
+        captured.len(),
+        3,
+        "all 3 nodes must call configure_session; got {:?}",
+        &*captured
+    );
     for cwd in captured.iter() {
         assert_eq!(
             cwd.as_ref().map(|c| c.as_str()),
@@ -2843,7 +2845,7 @@ async fn detached_workflow_threads_cwd_to_every_node() {
     .into();
     let registry = Arc::new(PerAgentRegistry { backends });
     let executor = Arc::new(WorkflowExecutor::new(
-        registry.clone() as Arc<dyn AgentRegistry>,
+        registry.clone() as Arc<dyn AgentRegistry>
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
@@ -2899,7 +2901,12 @@ async fn detached_workflow_threads_cwd_to_every_node() {
     );
 
     let captured = cwds.lock().unwrap();
-    assert_eq!(captured.len(), 3, "all 3 nodes must call configure_session; got {:?}", &*captured);
+    assert_eq!(
+        captured.len(),
+        3,
+        "all 3 nodes must call configure_session; got {:?}",
+        &*captured
+    );
     for cwd in captured.iter() {
         assert_eq!(
             cwd.as_ref().map(|c| c.as_str()),
@@ -2936,7 +2943,7 @@ fn build_cwd_cap_resume_server(
     .into();
     let registry = Arc::new(PerAgentRegistry { backends });
     let executor = Arc::new(WorkflowExecutor::new(
-        registry.clone() as Arc<dyn AgentRegistry>,
+        registry.clone() as Arc<dyn AgentRegistry>
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());

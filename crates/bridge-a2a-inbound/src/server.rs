@@ -39,12 +39,12 @@ use bridge_core::domain::{
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
 use bridge_core::ids::{AgentId, SessionId, TaskId};
-use bridge_core::SessionCwd;
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
     RouteDecision, SessionStore,
 };
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
+use bridge_core::SessionCwd;
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
 use crate::fanout::{self, Source};
@@ -291,8 +291,7 @@ impl InboundServer {
         // 3b. Parse + validate the per-request cwd (a2a-bridge.cwd).  Validation
         //     must happen BEFORE task/session ids are derived so a malformed request
         //     is rejected before any state is created.
-        let session_cwd =
-            session_cwd_from_params(params, self.allowed_cwd_root.as_deref())?;
+        let session_cwd = session_cwd_from_params(params, self.allowed_cwd_root.as_deref())?;
 
         // 4. Derive task/session ids from params (best-effort; v1 stubs allowed).
         let task = task_id_from_params(params)?;
@@ -405,7 +404,13 @@ async fn resolve_configure_bind(
             let eff = binding.eff.clone();
             drop(bindings);
             backend
-                .configure_session(session, &SessionSpec { config: eff, cwd: session_cwd })
+                .configure_session(
+                    session,
+                    &SessionSpec {
+                        config: eff,
+                        cwd: session_cwd,
+                    },
+                )
                 .await?;
             return Ok(LocalDispatch {
                 backend,
@@ -418,7 +423,13 @@ async fn resolve_configure_bind(
     let eff = effective_config(&resolved.entry, overrides);
     resolved
         .backend
-        .configure_session(session, &SessionSpec { config: eff.clone(), cwd: session_cwd })
+        .configure_session(
+            session,
+            &SessionSpec {
+                config: eff.clone(),
+                cwd: session_cwd,
+            },
+        )
         .await?;
     let backend = resolved.backend.clone();
     srv.bindings.lock().await.insert(
@@ -459,7 +470,13 @@ async fn resolve_for_fanout(
     let eff = effective_config(&resolved.entry, overrides);
     resolved
         .backend
-        .configure_session(session, &SessionSpec { config: eff, cwd: session_cwd })
+        .configure_session(
+            session,
+            &SessionSpec {
+                config: eff,
+                cwd: session_cwd,
+            },
+        )
         .await?;
     Ok((resolved.backend, resolved.lease))
 }
@@ -917,7 +934,16 @@ fn spawn_fanout_producer(
         //    task exits. A resolve/configure failure makes the local source a single
         //    labeled error frame (the coordinator's terminal still covers completion).
         let (kiro_source, kiro_backend, _lease): (Source, Option<Arc<dyn AgentBackend>>, _) =
-            match resolve_for_fanout(&srv, &agent_id, &task, &session, overrides.as_ref(), session_cwd).await {
+            match resolve_for_fanout(
+                &srv,
+                &agent_id,
+                &task,
+                &session,
+                overrides.as_ref(),
+                session_cwd,
+            )
+            .await
+            {
                 Ok((backend, lease)) => {
                     let src = local_kiro_source(
                         local_source_label,
@@ -1107,7 +1133,8 @@ fn spawn_workflow_producer(
         let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
             session_cwd: routed.session_cwd.clone(),
         };
-        let stream = executor.run_with_context(graph, input, task.as_str().to_string(), token, wf_ctx);
+        let stream =
+            executor.run_with_context(graph, input, task.as_str().to_string(), token, wf_ctx);
         let mut sink = SseSink { tx: tx.clone() };
         // SseSink never errors (sends are best-effort); on a hypothetical error
         // treat it as no-terminal so the existing no-terminal fallback fires.
@@ -1499,7 +1526,10 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                                     crate::workflow_sink::now_ms(),
                                 )
                                 .await;
-                            tracing::info!(task = task.as_str(), "resume scan: interrupted (unreadable session cwd)");
+                            tracing::info!(
+                                task = task.as_str(),
+                                "resume scan: interrupted (unreadable session cwd)"
+                            );
                             continue;
                         }
                     },
@@ -5301,7 +5331,9 @@ mod tests {
 
         // /work-evil is not under /work (component-wise check must not match str prefix).
         match session_cwd_from_params(&mk("/work-evil"), Some("/work")) {
-            Err(BridgeError::InvalidRequest { field: "a2a-bridge.cwd" }) => {}
+            Err(BridgeError::InvalidRequest {
+                field: "a2a-bridge.cwd",
+            }) => {}
             other => panic!(
                 "/work-evil must be rejected (component-wise, not str-prefix), got: {other:?}"
             ),
@@ -5346,10 +5378,8 @@ mod tests {
         // Some(SessionCwd::parse("/req"))`. This proves the per-request cwd flows
         // from `RoutedCall.session_cwd` all the way into the backend mint call.
         let (a, a_spec) = RecordingBackend::new("a");
-        let registry = FakeRegistry::with_entries(
-            "a",
-            vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)],
-        );
+        let registry =
+            FakeRegistry::with_entries("a", vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)]);
         let srv = build_registry(registry, "a");
 
         let resp = router(srv)
@@ -5391,10 +5421,8 @@ mod tests {
         // spawn key, a second distinct cwd would require a second backend instance →
         // `spawn_count` would reach 2, failing this assertion.
         let a = TrackingBackend::new("a", /*idle*/ false);
-        let registry = CountingRegistry::new(
-            "a",
-            vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)],
-        );
+        let registry =
+            CountingRegistry::new("a", vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)]);
         let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
         let srv = build_registry_store(registry.clone(), store, "a");
 

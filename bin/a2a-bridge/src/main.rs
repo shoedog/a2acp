@@ -159,10 +159,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         Box::pin(async move {
             // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
             // Resolution chain: session_cwd → cwd → "."; then absolutize relative values.
-            let resolved = resolve_static_session_cwd(
-                entry.session_cwd.as_deref(),
-                entry.cwd.as_deref(),
-            );
+            let resolved =
+                resolve_static_session_cwd(entry.session_cwd.as_deref(), entry.cwd.as_deref());
             let cwd = {
                 let p = PathBuf::from(&resolved);
                 if p.is_absolute() {
@@ -435,10 +433,8 @@ async fn main() -> Result<(), BoxError> {
             // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
             // Resolution chain: session_cwd → cwd → ".". A relative resolved value is joined
             // onto current_dir() to become absolute; an absolute one is used as-is (ACP §11A).
-            let resolved = resolve_static_session_cwd(
-                entry.session_cwd.as_deref(),
-                entry.cwd.as_deref(),
-            );
+            let resolved =
+                resolve_static_session_cwd(entry.session_cwd.as_deref(), entry.cwd.as_deref());
             let cwd = {
                 let p = PathBuf::from(&resolved);
                 if p.is_absolute() {

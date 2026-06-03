@@ -196,7 +196,14 @@ impl WorkflowExecutor {
         cancel: CancellationToken,
         seed: HashMap<String, (String, bool)>,
     ) -> WorkflowStream {
-        self.run_from_with_context(graph, input, run_id, cancel, seed, WorkflowRunContext::default())
+        self.run_from_with_context(
+            graph,
+            input,
+            run_id,
+            cancel,
+            seed,
+            WorkflowRunContext::default(),
+        )
     }
 
     /// Resume a workflow from a pre-loaded seed with an explicit per-request context.
@@ -1405,7 +1412,11 @@ mod tests {
         let cwds = rec.cwds.lock().unwrap();
         assert_eq!(cwds.len(), 3, "all 3 nodes must call configure_session");
         for cwd in cwds.iter() {
-            assert!(cwd.is_none(), "every node must receive cwd=None, got {:?}", cwd);
+            assert!(
+                cwd.is_none(),
+                "every node must receive cwd=None, got {:?}",
+                cwd
+            );
         }
     }
 

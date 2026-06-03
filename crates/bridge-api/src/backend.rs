@@ -1,7 +1,9 @@
 //! ApiBackend — the non-process OpenAI-compatible AgentBackend.
 use crate::config::ApiConfig;
 use crate::wire::{ChatRequest, Message, SseAccumulator, ToolCall};
-use bridge_core::domain::{Part, PermissionDecision, PermissionRequest, SessionContext, SessionSpec};
+use bridge_core::domain::{
+    Part, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
+};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{
