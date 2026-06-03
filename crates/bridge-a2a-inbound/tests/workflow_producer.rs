@@ -419,6 +419,139 @@ async fn streaming_workflow_emits_node_status_synth_artifact_and_completed() {
 }
 
 // ============================================================================
+// Write-ahead barrier (W3b Task 1b, DoD-1)
+// ============================================================================
+
+/// A backend that records, into a SHARED set, every node-session it was prompted
+/// for. The session id encodes the node id (`workflow-<wf>-<node>-<run>`), so the
+/// test can tell which nodes have been prompted so far.
+struct BarrierRecordingBackend {
+    reply: String,
+    /// Shared across all agents: the set of node ids prompted so far.
+    prompted: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentBackend for BarrierRecordingBackend {
+    async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        // session = "workflow-<wf>-<node>-<run>"; pull the node segment out.
+        let sid = s.as_str();
+        let node = sid
+            .strip_prefix("workflow-")
+            .and_then(|rest| rest.strip_prefix("pipe-"))
+            .and_then(|rest| rest.split('-').next())
+            .unwrap_or(sid)
+            .to_string();
+        self.prompted.lock().unwrap().push(node);
+        let updates = vec![
+            Ok(Update::Text(self.reply.clone())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(updates)))
+    }
+    async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+struct BarrierRegistry {
+    prompted: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentRegistry for BarrierRegistry {
+    async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+        Ok(Resolved {
+            entry: Arc::new(minimal_entry(id)),
+            backend: Arc::new(BarrierRecordingBackend {
+                reply: format!("{}_OUT", id.as_str().to_uppercase()),
+                prompted: self.prompted.clone(),
+            }),
+            lease: Box::new(NoopLease),
+        })
+    }
+    fn default_id(&self) -> AgentId {
+        AgentId::parse("a").unwrap()
+    }
+    async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
+        Ok(())
+    }
+    fn list(&self) -> Vec<AgentId> {
+        vec![AgentId::parse("a").unwrap(), AgentId::parse("b").unwrap()]
+    }
+}
+
+/// **DoD-1 — write-ahead barrier**: in a 2-node pipeline a→b (b depends on a), the
+/// downstream node `b` must NOT be prompted before `a`'s `NodeFinished` has been
+/// handled by the consumer. This mirrors `drain_workflow`'s contract: it awaits the
+/// sink's `node_finished` BEFORE pulling the next stream item, and `async_stream`'s
+/// `yield` suspends the executor until that next pull — so `b`'s future is only
+/// pushed AFTER the consumer returns from handling `a`'s NodeFinished.
+///
+/// `drain_workflow`/`WorkflowSink` are `pub(crate)`, so this drives the public
+/// executor stream directly and snapshots the prompted-set at the exact `NodeFinished{a}`
+/// handling point — the same suspension boundary the real drain relies on.
+#[tokio::test]
+async fn write_ahead_barrier() {
+    use bridge_workflow::executor::WorkflowEvent;
+    use futures::StreamExt;
+    use tokio_util::sync::CancellationToken;
+
+    let prompted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let registry = Arc::new(BarrierRegistry {
+        prompted: prompted.clone(),
+    });
+    let executor = WorkflowExecutor::new(registry as Arc<dyn AgentRegistry>);
+
+    // Pipeline a -> b ; b depends on a (terminal). wf id "pipe" matches the backend's
+    // session-prefix parse above.
+    let graph = Arc::new(WorkflowGraph {
+        id: WorkflowId::parse("pipe").unwrap(),
+        nodes: vec![
+            WorkflowNode {
+                id: NodeId::parse("a").unwrap(),
+                agent: AgentId::parse("a").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+            },
+            WorkflowNode {
+                id: NodeId::parse("b").unwrap(),
+                agent: AgentId::parse("b").unwrap(),
+                prompt_template: "got {{a}}".into(),
+                inputs: vec![NodeId::parse("a").unwrap()],
+            },
+        ],
+    });
+
+    let mut stream = executor.run(graph, "DIFF".into(), "r".into(), CancellationToken::new());
+    let mut saw_a_finished = false;
+    while let Some(item) = stream.next().await {
+        if let Ok(WorkflowEvent::NodeFinished { node, .. }) = &item {
+            if node.as_str() == "a" {
+                saw_a_finished = true;
+                // At the instant a's NodeFinished is handled, b must NOT have been
+                // prompted yet — the executor is suspended at the yield and hasn't
+                // scheduled b. (If the barrier were broken, b's prompt would already
+                // be recorded here.)
+                let snapshot = prompted.lock().unwrap().clone();
+                assert!(
+                    !snapshot.iter().any(|n| n == "b"),
+                    "write-ahead barrier violated: b was prompted before a's NodeFinished was handled; prompted so far: {snapshot:?}"
+                );
+            }
+        }
+    }
+    assert!(saw_a_finished, "a's NodeFinished was never observed");
+    // Sanity: b WAS eventually prompted (the pipeline actually ran to completion).
+    assert!(
+        prompted.lock().unwrap().iter().any(|n| n == "b"),
+        "b should have been prompted by the end of the run"
+    );
+}
+
+// ============================================================================
 // Strengthened assertions (Task 10 Step 4)
 // ============================================================================
 
