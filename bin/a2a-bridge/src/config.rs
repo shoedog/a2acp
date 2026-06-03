@@ -49,7 +49,6 @@ pub struct ServerConfig {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct StoreConfig {
-    #[allow(dead_code)] // consumed in Task 14 (serve wiring)
     pub path: String,
 }
 
@@ -108,7 +107,6 @@ pub struct RegistryConfig {
     #[serde(default)]
     pub delegation: Option<DelegationConfig>,
     #[serde(default)]
-    #[allow(dead_code)] // consumed in Task 14 (serve wiring)
     pub store: Option<StoreConfig>,
     #[serde(default)]
     pub workflows: Vec<WorkflowToml>,
