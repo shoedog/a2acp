@@ -350,7 +350,6 @@ struct RoutedCall {
     /// Distinct from `AgentOverride` so it reaches both single-agent and workflow
     /// dispatch (AgentOverride is dropped for workflows). `None` when absent.
     /// Applied by Tasks 6 (single-agent) and 7 (workflow).
-    #[allow(dead_code)]
     session_cwd: Option<SessionCwd>,
 }
 
@@ -393,11 +392,12 @@ async fn resolve_configure_bind(
     task: &TaskId,
     session: &SessionId,
     overrides: Option<&AgentOverride>,
+    session_cwd: Option<SessionCwd>,
 ) -> Result<LocalDispatch, BridgeError> {
     // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
-    // route/resolve/recompute. Re-stash the bound effective config (harmless
-    // idempotent overwrite; per T6 it only affects a not-yet-minted session, never
-    // retroactively re-configures a live one), then prompt the bound backend.
+    // route/resolve/recompute. Re-stash the bound effective config with the per-request
+    // cwd (harmless idempotent overwrite; it only affects a not-yet-minted session,
+    // never retroactively re-configures a live one), then prompt the bound backend.
     {
         let bindings = srv.bindings.lock().await;
         if let Some(binding) = bindings.get(task) {
@@ -405,7 +405,7 @@ async fn resolve_configure_bind(
             let eff = binding.eff.clone();
             drop(bindings);
             backend
-                .configure_session(session, &SessionSpec::from_config(eff))
+                .configure_session(session, &SessionSpec { config: eff, cwd: session_cwd })
                 .await?;
             return Ok(LocalDispatch {
                 backend,
@@ -418,7 +418,7 @@ async fn resolve_configure_bind(
     let eff = effective_config(&resolved.entry, overrides);
     resolved
         .backend
-        .configure_session(session, &SessionSpec::from_config(eff.clone()))
+        .configure_session(session, &SessionSpec { config: eff.clone(), cwd: session_cwd })
         .await?;
     let backend = resolved.backend.clone();
     srv.bindings.lock().await.insert(
@@ -453,12 +453,13 @@ async fn resolve_for_fanout(
     _task: &TaskId,
     session: &SessionId,
     overrides: Option<&AgentOverride>,
+    session_cwd: Option<SessionCwd>,
 ) -> Result<(Arc<dyn AgentBackend>, Box<dyn Lease>), BridgeError> {
     let resolved = srv.registry.resolve(agent_id).await?;
     let eff = effective_config(&resolved.entry, overrides);
     resolved
         .backend
-        .configure_session(session, &SessionSpec::from_config(eff))
+        .configure_session(session, &SessionSpec { config: eff, cwd: session_cwd })
         .await?;
     Ok((resolved.backend, resolved.lease))
 }
@@ -565,6 +566,7 @@ async fn stream_message(
                 &routed.task,
                 &routed.session,
                 routed.overrides.as_ref(),
+                routed.session_cwd.clone(),
             )
             .await
             {
@@ -901,6 +903,7 @@ fn spawn_fanout_producer(
     let parts = routed.parts.clone();
     let auth = routed.auth;
     let overrides = routed.overrides;
+    let session_cwd = routed.session_cwd;
 
     tokio::spawn(async move {
         // Mark this task as a fan-out task so Task 6 (cancel_task) can distinguish
@@ -914,7 +917,7 @@ fn spawn_fanout_producer(
         //    task exits. A resolve/configure failure makes the local source a single
         //    labeled error frame (the coordinator's terminal still covers completion).
         let (kiro_source, kiro_backend, _lease): (Source, Option<Arc<dyn AgentBackend>>, _) =
-            match resolve_for_fanout(&srv, &agent_id, &task, &session, overrides.as_ref()).await {
+            match resolve_for_fanout(&srv, &agent_id, &task, &session, overrides.as_ref(), session_cwd).await {
                 Ok((backend, lease)) => {
                     let src = local_kiro_source(
                         local_source_label,
@@ -1644,6 +1647,7 @@ async fn unary_message(
                 &routed.task,
                 &routed.session,
                 routed.overrides.as_ref(),
+                routed.session_cwd.clone(),
             )
             .await
             {
@@ -1843,6 +1847,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
         &routed.task,
         &routed.session,
         routed.overrides.as_ref(),
+        routed.session_cwd.clone(),
     )
     .await
     {
@@ -2458,7 +2463,7 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
 mod tests {
     use super::*;
     use bridge_core::domain::RouteTarget;
-    use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, RegistrySnapshot, SessionSpec};
+    use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot, SessionSpec};
     use bridge_core::domain::{
         AuthContext, PeerTaskId, PendingRequest, PermissionDecision, PermissionRequest,
         SessionContext,
@@ -4436,10 +4441,12 @@ mod tests {
     struct RecordingBackend {
         id: String,
         prompted: AtomicBool,
-        configured: Arc<Mutex<Option<EffectiveConfig>>>,
+        /// Records the full `SessionSpec` from the most recent `configure_session` call,
+        /// so tests can assert both `spec.config` (model/effort/mode) and `spec.cwd`.
+        configured: Arc<Mutex<Option<SessionSpec>>>,
     }
     impl RecordingBackend {
-        fn new(id: &str) -> (Arc<Self>, Arc<Mutex<Option<EffectiveConfig>>>) {
+        fn new(id: &str) -> (Arc<Self>, Arc<Mutex<Option<SessionSpec>>>) {
             let configured = Arc::new(Mutex::new(None));
             (
                 Arc::new(Self {
@@ -4475,7 +4482,7 @@ mod tests {
             _session: &SessionId,
             spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
-            *self.configured.lock().unwrap() = Some(spec.config.clone());
+            *self.configured.lock().unwrap() = Some(spec.clone());
             Ok(())
         }
     }
@@ -4496,11 +4503,15 @@ mod tests {
     /// `resolve` increments the agent's counter (handing out a `CountingLease` that
     /// decrements on drop) so a test can assert eviction released the lease, and
     /// `apply` can REMOVE an agent so a follow-up that re-resolved it would fail —
-    /// proving the follow-up uses the BOUND Arc instead.
+    /// proving the follow-up uses the BOUND Arc instead. `resolve_calls` counts how
+    /// many times `resolve` has been called per agent (monotonic, never decremented)
+    /// so warm-reuse tests can prove a backend is never re-resolved/re-spawned.
     struct CountingRegistry {
         default: AgentId,
         inner: tokio::sync::Mutex<CountingRegistryInner>,
         leases: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
+        /// Monotonically-increasing count of `resolve()` calls per agent key.
+        resolve_calls: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
     }
     struct CountingRegistryInner {
         entries: std::collections::HashMap<String, AgentEntry>,
@@ -4511,9 +4522,14 @@ mod tests {
             let mut entries = std::collections::HashMap::new();
             let mut backends = std::collections::HashMap::new();
             let mut leases = std::collections::HashMap::new();
+            let mut resolve_calls = std::collections::HashMap::new();
             for (entry, backend) in agents {
                 let key = entry.id.as_str().to_owned();
                 leases.insert(
+                    key.clone(),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                );
+                resolve_calls.insert(
                     key.clone(),
                     Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 );
@@ -4524,11 +4540,20 @@ mod tests {
                 default: AgentId::parse(default).unwrap(),
                 inner: tokio::sync::Mutex::new(CountingRegistryInner { entries, backends }),
                 leases,
+                resolve_calls,
             })
         }
         /// The current live-lease count for an agent (0 once all its leases dropped).
         fn lease_count(&self, id: &str) -> usize {
             self.leases
+                .get(id)
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0)
+        }
+        /// Total number of `resolve()` calls ever made for `id` (monotonic — never
+        /// decrements). Use this to prove a backend is NOT re-resolved across requests.
+        fn resolve_call_count(&self, id: &str) -> usize {
+            self.resolve_calls
                 .get(id)
                 .map(|c| c.load(Ordering::SeqCst))
                 .unwrap_or(0)
@@ -4543,6 +4568,9 @@ mod tests {
                 (Some(entry), Some(backend)) => {
                     let count = self.leases.get(key).expect("agent has a lease counter");
                     count.fetch_add(1, Ordering::SeqCst);
+                    if let Some(rc) = self.resolve_calls.get(key) {
+                        rc.fetch_add(1, Ordering::SeqCst);
+                    }
                     Ok(Resolved {
                         entry: Arc::new(entry.clone()),
                         backend: backend.clone(),
@@ -4815,13 +4843,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let _ = body_string(resp).await;
 
-        let cfg = a_cfg
+        let spec = a_cfg
             .lock()
             .unwrap()
             .clone()
             .expect("configure_session ran");
         assert_eq!(
-            cfg.model.as_deref(),
+            spec.config.model.as_deref(),
             Some("override-m"),
             "the per-request model override must reach configure_session"
         );
@@ -4849,13 +4877,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let _ = body_string(resp).await;
 
-        let cfg = a_cfg
+        let spec = a_cfg
             .lock()
             .unwrap()
             .clone()
             .expect("configure_session ran");
         assert_eq!(
-            cfg.model.as_deref(),
+            spec.config.model.as_deref(),
             Some("base-m"),
             "the entry's base model must flow even with no override"
         );
@@ -5211,5 +5239,107 @@ mod tests {
                 "/work-evil must be rejected (component-wise, not str-prefix), got: {other:?}"
             ),
         }
+    }
+
+    // ---- Task 6: single-agent dispatch applies per-request cwd + warm-reuse ----
+
+    /// Build params for a unary SendMessage selecting `agent`, with optional model
+    /// override and optional per-request cwd (Task 6 dispatch tests).
+    fn agent_params_cwd(agent: &str, model: Option<&str>, cwd: Option<&str>) -> Value {
+        let mut md = json!({ "a2a-bridge.agent": agent });
+        if let Some(m) = model {
+            md["a2a-bridge.model"] = json!(m);
+        }
+        if let Some(c) = cwd {
+            md["a2a-bridge.cwd"] = json!(c);
+        }
+        json!({ "message": { "text": "go", "metadata": md } })
+    }
+
+    #[tokio::test]
+    async fn single_agent_dispatch_applies_cwd() {
+        // A unary message/send with `a2a-bridge.cwd="/req"` must cause
+        // `configure_session` to receive a `SessionSpec` where `cwd ==
+        // Some(SessionCwd::parse("/req"))`. This proves the per-request cwd flows
+        // from `RoutedCall.session_cwd` all the way into the backend mint call.
+        let (a, a_spec) = RecordingBackend::new("a");
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)],
+        );
+        let srv = build_registry(registry, "a");
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params_cwd("a", None, Some("/req")),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        let spec = a_spec
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("configure_session must have run");
+        assert_eq!(
+            spec.cwd,
+            Some(bridge_core::SessionCwd::parse("/req").unwrap()),
+            "per-request cwd must reach configure_session as spec.cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_request_cwd_does_not_respawn() {
+        // Two sequential unary sends to the SAME agent with DIFFERENT
+        // `a2a-bridge.cwd` values must reuse the SAME backend process slot (i.e.
+        // `registry.resolve()` is called exactly ONCE — the backend is warm, only
+        // the ACP session mint differs per request). The registry reuse comparison
+        // MUST NOT include `session_cwd` (Task 2 confirmed this), so changing the
+        // cwd cannot cause a cold-backend spawn.
+        let a = TrackingBackend::new("a", /*idle*/ false);
+        let registry = CountingRegistry::new(
+            "a",
+            vec![(bare_entry("a"), a as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_registry_store(registry.clone(), store, "a");
+
+        // First request: cwd="/repo/a".
+        let resp1 = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params_cwd("a", None, Some("/repo/a")),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let _ = body_string(resp1).await;
+
+        // Second request: cwd="/repo/b" (different path, same agent).
+        let resp2 = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                agent_params_cwd("a", None, Some("/repo/b")),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let _ = body_string(resp2).await;
+
+        // The registry must have been resolved exactly ONCE across both requests.
+        // A second resolve would mean the bridge re-spawned a new backend process
+        // for each cwd — the performance bug the warm-reuse property guards against.
+        assert_eq!(
+            registry.resolve_call_count("a"),
+            1,
+            "changing a2a-bridge.cwd must NOT cause a second backend resolve/spawn; \
+             the warm process is shared, only the ACP session mint differs"
+        );
     }
 }
