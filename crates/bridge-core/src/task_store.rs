@@ -97,9 +97,11 @@ pub trait TaskStore: Send + Sync {
     /// "no token" cancel must NOT unconditionally overwrite a terminal the runner
     /// just wrote — this conditional update no-ops on an already-terminal row.
     async fn cancel_if_working(&self, id: &TaskId, updated_ms: i64) -> Result<bool, BridgeError>;
-    /// Upsert a per-node output checkpoint for crash-resume. The `(task, node)` pair
-    /// is the key; repeated writes for the same node overwrite.
-    /// The task id must already exist; writing a checkpoint for an unknown task returns an error.
+    /// Persist a per-node output checkpoint for crash-resume.
+    /// Each (task, node) is written at most once: a second write for the same
+    /// pair is an error. The SQLite impl enforces this via the (task_id, node_id)
+    /// primary key; the in-memory impl matches. The task id must already exist;
+    /// writing a checkpoint for an unknown task returns an error.
     async fn put_node_checkpoint(
         &self,
         task: &TaskId,
@@ -225,10 +227,11 @@ impl TaskStore for MemoryTaskStore {
             }
         } // drop inner guard before locking checkpoints to avoid lock-order deadlock
         let mut g = self.checkpoints.lock().unwrap();
-        g.insert(
-            (task.as_str().to_string(), node.as_str().to_string()),
-            (output.to_string(), ok, ts),
-        );
+        let key = (task.as_str().to_string(), node.as_str().to_string());
+        if g.contains_key(&key) {
+            return Err(BridgeError::StoreFailure);
+        }
+        g.insert(key, (output.to_string(), ok, ts));
         Ok(())
     }
     async fn node_checkpoints(
@@ -418,6 +421,28 @@ mod tests {
         let wt = s.working_tasks().await.unwrap();
         assert_eq!(wt.len(), 1);
         assert_eq!(wt[0].input, "DIFF");
+    }
+
+    #[tokio::test]
+    async fn put_checkpoint_duplicate_node_errors() {
+        let s = MemoryTaskStore::new();
+        let t = TaskId::parse("t-dup").unwrap();
+        s.create(&rec("t-dup", 1)).await.unwrap();
+        let node = NodeId::parse("codex").unwrap();
+        // First write succeeds.
+        s.put_node_checkpoint(&t, &node, "OUT1", true, 10)
+            .await
+            .unwrap();
+        // Second write for the same (task, node) must be an error (write-once).
+        let res = s.put_node_checkpoint(&t, &node, "OUT2", true, 20).await;
+        assert!(
+            res.is_err(),
+            "expected Err on duplicate (task, node) checkpoint write"
+        );
+        // The original checkpoint is unchanged.
+        let cps = s.node_checkpoints(&t).await.unwrap();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].1, "OUT1");
     }
 
     #[tokio::test]
