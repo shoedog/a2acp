@@ -868,8 +868,7 @@ mod tests {
 
         let evs: Vec<_> = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            ex.run(g, "x".into(), "r".into(), token)
-                .collect::<Vec<_>>(),
+            ex.run(g, "x".into(), "r".into(), token).collect::<Vec<_>>(),
         )
         .await
         .expect("drain must complete after cancel (a `break` would also finish, but leak cleanup)");
@@ -1033,7 +1032,9 @@ mod tests {
         let finished_order: Vec<&str> = evs
             .iter()
             .filter_map(|e| match e {
-                WorkflowEvent::NodeFinished { node, .. } if node.as_str() == "a" || node.as_str() == "b" => {
+                WorkflowEvent::NodeFinished { node, .. }
+                    if node.as_str() == "a" || node.as_str() == "b" =>
+                {
                     Some(node.as_str())
                 }
                 _ => None,
@@ -1167,7 +1168,11 @@ mod tests {
         // synth MUST have been prompted exactly once, and its prompt must contain
         // the seeded outputs OUTA and OUTB (passed as template vars).
         let synth_prompts = synth_rec.prompts.lock().unwrap();
-        assert_eq!(synth_prompts.len(), 1, "synth should be prompted exactly once");
+        assert_eq!(
+            synth_prompts.len(),
+            1,
+            "synth should be prompted exactly once"
+        );
         let p = &synth_prompts[0];
         assert!(
             p.contains("OUTA") && p.contains("OUTB"),
@@ -1199,7 +1204,11 @@ mod tests {
     #[tokio::test]
     async fn run_from_unknown_seed_node_errors() {
         let reg = Arc::new(FakeRegistry {
-            backends: [("codex".to_string(), ("X".to_string(), Arc::new(Rec::default())))].into(),
+            backends: [(
+                "codex".to_string(),
+                ("X".to_string(), Arc::new(Rec::default())),
+            )]
+            .into(),
         });
         let seed: HashMap<String, (String, bool)> =
             [("ghost_node".to_string(), ("OUT".to_string(), true))].into();
@@ -1271,13 +1280,7 @@ mod tests {
 
         let ex = WorkflowExecutor::new(reg);
         let evs: Vec<_> = ex
-            .run_from(
-                g,
-                "inp".into(),
-                "r".into(),
-                CancellationToken::new(),
-                seed,
-            )
+            .run_from(g, "inp".into(), "r".into(), CancellationToken::new(), seed)
             .collect::<Vec<_>>()
             .await;
 

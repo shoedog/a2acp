@@ -68,8 +68,7 @@ impl SqliteStore {
     #[cfg(test)]
     fn foreign_keys_on(&self) -> rusqlite::Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let flag: i64 =
-            conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        let flag: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
         Ok(flag != 0)
     }
 
@@ -77,7 +76,10 @@ impl SqliteStore {
     #[cfg(test)]
     fn delete_for_test(&self, task: &TaskId) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM tasks WHERE id=?1", rusqlite::params![task.as_str()])?;
+        conn.execute(
+            "DELETE FROM tasks WHERE id=?1",
+            rusqlite::params![task.as_str()],
+        )?;
         Ok(())
     }
 
@@ -442,13 +444,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         conn.execute(
             "INSERT INTO task_node_checkpoints(task_id, node_id, output, ok, ts)
              VALUES(?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                task.as_str(),
-                node.as_str(),
-                output,
-                ok as i64,
-                ts
-            ],
+            rusqlite::params![task.as_str(), node.as_str(), output, ok as i64, ts],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
         Ok(())
@@ -460,9 +456,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     ) -> Result<Vec<(NodeId, String, bool)>, BridgeError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT node_id, output, ok FROM task_node_checkpoints WHERE task_id=?1",
-            )
+            .prepare("SELECT node_id, output, ok FROM task_node_checkpoints WHERE task_id=?1")
             .map_err(|_| BridgeError::StoreFailure)?;
         let mut rows = stmt
             .query(rusqlite::params![task.as_str()])
@@ -515,9 +509,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         })
     }
 
-    async fn working_tasks(
-        &self,
-    ) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+    async fn working_tasks(&self) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
@@ -526,9 +518,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                  FROM tasks WHERE status='working'",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt.query([]).map_err(|_| BridgeError::StoreFailure)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
             out.push(row_to_task(row)?);

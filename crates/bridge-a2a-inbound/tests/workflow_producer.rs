@@ -1714,11 +1714,7 @@ async fn detached_runner_checkpoints_each_node() {
             "node {} output mismatch",
             node_id.as_str()
         );
-        assert_eq!(
-            ok, exp_ok,
-            "node {} ok mismatch",
-            node_id.as_str()
-        );
+        assert_eq!(ok, exp_ok, "node {} ok mismatch", node_id.as_str());
     }
 }
 
@@ -1740,10 +1736,7 @@ impl FailingCheckpointStore {
 
 #[async_trait]
 impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
-    async fn create(
-        &self,
-        rec: &bridge_core::task_store::TaskRecord,
-    ) -> Result<(), BridgeError> {
+    async fn create(&self, rec: &bridge_core::task_store::TaskRecord) -> Result<(), BridgeError> {
         self.inner.create(rec).await
     }
     async fn set_terminal(
@@ -1773,11 +1766,7 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
     async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError> {
         self.inner.sweep_interrupted(updated_ms).await
     }
-    async fn cancel_if_working(
-        &self,
-        id: &TaskId,
-        updated_ms: i64,
-    ) -> Result<bool, BridgeError> {
+    async fn cancel_if_working(&self, id: &TaskId, updated_ms: i64) -> Result<bool, BridgeError> {
         self.inner.cancel_if_working(id, updated_ms).await
     }
     async fn put_node_checkpoint(
@@ -1805,9 +1794,7 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
     ) -> Result<bridge_core::task_store::ResumeClaim, BridgeError> {
         self.inner.claim_resume_attempt(task, cap, now_ms).await
     }
-    async fn working_tasks(
-        &self,
-    ) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+    async fn working_tasks(&self) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
         self.inner.working_tasks().await
     }
 }
@@ -2098,7 +2085,13 @@ async fn resume_runs_only_pending_nodes() {
         .unwrap();
     // codex already finished before the crash → its checkpoint is the resume seed.
     store
-        .put_node_checkpoint(&task, &NodeId::parse("codex").unwrap(), "CODEX_DONE", true, 2)
+        .put_node_checkpoint(
+            &task,
+            &NodeId::parse("codex").unwrap(),
+            "CODEX_DONE",
+            true,
+            2,
+        )
         .await
         .unwrap();
 
@@ -2125,7 +2118,10 @@ async fn resume_runs_only_pending_nodes() {
         "synth was un-checkpointed → must be prompted; prompted: {nodes:?}"
     );
     // One resume attempt was consumed.
-    assert_eq!(rec.resume_attempts, 1, "exactly one resume attempt consumed");
+    assert_eq!(
+        rec.resume_attempts, 1,
+        "exactly one resume attempt consumed"
+    );
 }
 
 /// **resume_no_snapshot_interrupts**: a `Working` task with no workflow snapshot cannot
@@ -2292,7 +2288,9 @@ async fn resume_cap_exhausted_interrupts() {
 #[tokio::test]
 async fn resume_poison_task_terminates_at_cap() {
     use bridge_core::ids::TaskId;
-    use bridge_core::task_store::{MemoryTaskStore, ResumeClaim, TaskRecord, TaskRecordStatus, TaskStore};
+    use bridge_core::task_store::{
+        MemoryTaskStore, ResumeClaim, TaskRecord, TaskRecordStatus, TaskStore,
+    };
     use std::sync::Arc;
 
     let cap = 3u32;
@@ -2326,10 +2324,7 @@ async fn resume_poison_task_terminates_at_cap() {
     let mut resumable_count = 0u32;
     let mut saw_exhausted = false;
     for iteration in 0..(cap + 5) {
-        let claim = store
-            .claim_resume_attempt(&task, cap, 100)
-            .await
-            .unwrap();
+        let claim = store.claim_resume_attempt(&task, cap, 100).await.unwrap();
         match claim {
             ResumeClaim::Resumable { attempt } => {
                 resumable_count += 1;
@@ -2435,15 +2430,33 @@ async fn resume_terminal_checkpoint_short_circuits() {
     // Pre-write checkpoints for all upstream nodes AND the terminal node — the terminal
     // output was produced but the row was never flipped (the W3a §8 write-failure gap).
     store
-        .put_node_checkpoint(&task, &NodeId::parse("codex").unwrap(), "CODEX_DONE", true, 2)
+        .put_node_checkpoint(
+            &task,
+            &NodeId::parse("codex").unwrap(),
+            "CODEX_DONE",
+            true,
+            2,
+        )
         .await
         .unwrap();
     store
-        .put_node_checkpoint(&task, &NodeId::parse("claude").unwrap(), "CLAUDE_DONE", true, 2)
+        .put_node_checkpoint(
+            &task,
+            &NodeId::parse("claude").unwrap(),
+            "CLAUDE_DONE",
+            true,
+            2,
+        )
         .await
         .unwrap();
     store
-        .put_node_checkpoint(&task, &NodeId::parse("synth").unwrap(), "SYNTH_FINAL", true, 3)
+        .put_node_checkpoint(
+            &task,
+            &NodeId::parse("synth").unwrap(),
+            "SYNTH_FINAL",
+            true,
+            3,
+        )
         .await
         .unwrap();
 

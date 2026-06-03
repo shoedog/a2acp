@@ -1068,10 +1068,9 @@ fn spawn_workflow_producer(
         let mut sink = SseSink { tx: tx.clone() };
         // SseSink never errors (sends are best-effort); on a hypothetical error
         // treat it as no-terminal so the existing no-terminal fallback fires.
-        let terminal_seen =
-            crate::workflow_sink::drain_workflow(stream, &mut sink)
-                .await
-                .unwrap_or(false);
+        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink)
+            .await
+            .unwrap_or(false);
         // The executor always emits a Terminal, but guard against an early stream
         // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
         if !terminal_seen {
@@ -1133,7 +1132,8 @@ fn spawn_detached_workflow(
             }
         };
         let stream = executor.run_from(graph, input, run_id, token, seed);
-        let mut sink = crate::workflow_sink::TaskStoreSink::new(srv.task_store.clone(), task.clone());
+        let mut sink =
+            crate::workflow_sink::TaskStoreSink::new(srv.task_store.clone(), task.clone());
         let now = crate::workflow_sink::now_ms();
         match crate::workflow_sink::drain_workflow(stream, &mut sink).await {
             Ok(terminal_seen) => {
@@ -1194,7 +1194,15 @@ pub fn spawn_detached_workflow_for_test(
         .expect("workflow must be registered in the test server");
     let input = text_parts.join("\n");
     let run_id = task.as_str().to_string();
-    spawn_detached_workflow(srv, task, input, graph, run_id, token, std::collections::HashMap::new())
+    spawn_detached_workflow(
+        srv,
+        task,
+        input,
+        graph,
+        run_id,
+        token,
+        std::collections::HashMap::new(),
+    )
 }
 
 /// Test-only seam that takes an explicit token (so a cancel test can fire it).
@@ -1215,7 +1223,15 @@ pub fn spawn_detached_workflow_with_token_for_test(
         .expect("workflow must be registered in the test server");
     let input = text_parts.join("\n");
     let run_id = task.as_str().to_string();
-    spawn_detached_workflow(srv, task, input, graph, run_id, token, std::collections::HashMap::new())
+    spawn_detached_workflow(
+        srv,
+        task,
+        input,
+        graph,
+        run_id,
+        token,
+        std::collections::HashMap::new(),
+    )
 }
 
 /// The only snapshot schema version this server can resume. The forward-compat door:
@@ -1285,7 +1301,10 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
             {
                 tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-snapshot) failed");
             } else {
-                tracing::info!(task = task.as_str(), "resume scan: interrupted (no workflow snapshot)");
+                tracing::info!(
+                    task = task.as_str(),
+                    "resume scan: interrupted (no workflow snapshot)"
+                );
             }
             continue;
         };
@@ -1310,7 +1329,10 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/unreadable) failed");
                 } else {
-                    tracing::info!(task = task.as_str(), "resume scan: interrupted (unreadable workflow snapshot)");
+                    tracing::info!(
+                        task = task.as_str(),
+                        "resume scan: interrupted (unreadable workflow snapshot)"
+                    );
                 }
                 continue;
             }
@@ -1354,7 +1376,10 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-terminal) failed");
                 } else {
-                    tracing::info!(task = task.as_str(), "resume scan: interrupted (unreadable workflow snapshot)");
+                    tracing::info!(
+                        task = task.as_str(),
+                        "resume scan: interrupted (unreadable workflow snapshot)"
+                    );
                 }
                 continue;
             }
@@ -1399,7 +1424,10 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/cap) failed");
                 } else {
-                    tracing::info!(task = task.as_str(), "resume scan: interrupted (resume attempt cap exceeded)");
+                    tracing::info!(
+                        task = task.as_str(),
+                        "resume scan: interrupted (resume attempt cap exceeded)"
+                    );
                 }
                 continue;
             }
@@ -1649,7 +1677,12 @@ async fn unary_message(
             let now = crate::workflow_sink::now_ms();
             // Pre-join the input text so the persisted `input` is byte-identical to
             // what the runner receives. Both the record and the spawn use the same value.
-            let input: String = routed.parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
+            let input: String = routed
+                .parts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
             // Resolve the graph at submit time. If the wf_id is unknown, the graph is
             // None and the record persists without a spec snapshot (the runner will
             // fail when it also can't find the graph — but since the wf_id was

@@ -21,8 +21,11 @@ pub(crate) trait WorkflowSink: Send {
     ) -> Result<(), BridgeError> {
         Ok(())
     }
-    async fn terminal(&mut self, outcome: WorkflowOutcome, output: String)
-        -> Result<(), BridgeError>;
+    async fn terminal(
+        &mut self,
+        outcome: WorkflowOutcome,
+        output: String,
+    ) -> Result<(), BridgeError>;
     async fn error(&mut self, _err: BridgeError) -> Result<(), BridgeError> {
         Ok(())
     }
@@ -163,23 +166,18 @@ mod sink_tests {
 
     #[async_trait::async_trait]
     impl WorkflowSink for FailTerminalSink {
-        async fn terminal(
-            &mut self,
-            _o: WorkflowOutcome,
-            _out: String,
-        ) -> Result<(), BridgeError> {
+        async fn terminal(&mut self, _o: WorkflowOutcome, _out: String) -> Result<(), BridgeError> {
             Err(BridgeError::StoreFailure)
         }
     }
 
     #[tokio::test]
     async fn drain_aborts_on_sink_error() {
-        let stream: WorkflowStream = Box::pin(futures::stream::iter(vec![Ok(
-            WorkflowEvent::Terminal {
+        let stream: WorkflowStream =
+            Box::pin(futures::stream::iter(vec![Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
                 output: "x".into(),
-            },
-        )]));
+            })]));
         let mut sink = FailTerminalSink;
         assert!(drain_workflow(stream, &mut sink).await.is_err());
     }
@@ -207,11 +205,7 @@ mod sink_tests {
             self.log.push("node_finished");
             Ok(())
         }
-        async fn terminal(
-            &mut self,
-            _o: WorkflowOutcome,
-            _out: String,
-        ) -> Result<(), BridgeError> {
+        async fn terminal(&mut self, _o: WorkflowOutcome, _out: String) -> Result<(), BridgeError> {
             self.log.push("terminal");
             Ok(())
         }

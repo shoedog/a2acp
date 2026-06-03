@@ -238,7 +238,9 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             Ok(WorkflowEvent::NodeStarted { node }) => {
                 eprintln!("[workflow] node {} started", node.as_str());
             }
-            Ok(WorkflowEvent::NodeFinished { node, ok: node_ok, .. }) => {
+            Ok(WorkflowEvent::NodeFinished {
+                node, ok: node_ok, ..
+            }) => {
                 eprintln!(
                     "[workflow] node {} {}",
                     node.as_str(),
@@ -561,20 +563,17 @@ async fn main() -> Result<(), BoxError> {
         .as_ref()
         .and_then(|s| s.resume_attempt_cap)
         .unwrap_or(3);
-    let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> = match cfg
-        .store
-        .as_ref()
-        .map(|s| s.path.clone())
-    {
-        Some(path) => {
-            let s = std::sync::Arc::new(
-                SqliteStore::open(std::path::Path::new(&path))
-                    .map_err(|e| format!("serve: cannot open task store {path:?}: {e:?}"))?,
-            );
-            s as std::sync::Arc<dyn bridge_core::task_store::TaskStore>
-        }
-        None => std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
-    };
+    let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> =
+        match cfg.store.as_ref().map(|s| s.path.clone()) {
+            Some(path) => {
+                let s = std::sync::Arc::new(
+                    SqliteStore::open(std::path::Path::new(&path))
+                        .map_err(|e| format!("serve: cannot open task store {path:?}: {e:?}"))?,
+                );
+                s as std::sync::Arc<dyn bridge_core::task_store::TaskStore>
+            }
+            None => std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+        };
 
     // 8. Construct the inbound server.
     //    InboundServer::new(registry, store, policy, route, auth, base_url, delegation, local_source_label)
