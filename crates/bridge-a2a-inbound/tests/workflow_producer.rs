@@ -812,6 +812,51 @@ async fn tasks_get_returns_completed_with_artifact() {
     );
 }
 
+/// **cancel_terminal_detached**: cancelling a task whose TaskStore row is already
+/// terminal must return its true state (e.g. Completed) and must NOT mutate the row
+/// or re-cancel any backend.
+#[tokio::test]
+async fn cancel_terminal_detached_returns_true_state_not_recancel() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let id = TaskId::parse("c1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: id.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .set_terminal(&id, TaskRecordStatus::Completed, Some("DONE"), None, 2)
+        .await
+        .unwrap();
+
+    let resp = srv
+        .router()
+        .oneshot(post_request(methods::CANCEL_TASK, json!({ "taskId": "c1" })))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let state = body["result"]["task"]["state"]
+        .as_str()
+        .or_else(|| body["result"]["task"]["status"]["state"].as_str());
+    assert_eq!(state, Some("TASK_STATE_COMPLETED"), "{body}");
+    assert_eq!(store.get(&id).await.unwrap().unwrap().status, TaskRecordStatus::Completed);
+}
+
 /// **terminal_failed**: when the synth node errors, the A2A streaming task must end
 /// in a `Failed` terminal state (NOT a panic, NOT Completed).
 #[tokio::test]

@@ -1582,6 +1582,42 @@ async fn cancel_task(
     // will apply the cancel once the id appears) and signals an in-flight stream.
     let _ = srv.store.request_cancel(&task).await;
 
+    // Durable detached task? Consult the store first (it owns the truth).
+    if let Ok(Some(rec)) = srv.task_store.get(&task).await {
+        use bridge_core::task_store::TaskRecordStatus;
+        if rec.status.is_terminal() {
+            // Already finished — return its true state; do NOT re-cancel / touch a backend.
+            let wire = match rec.status {
+                TaskRecordStatus::Completed => "TASK_STATE_COMPLETED",
+                TaskRecordStatus::Canceled => "TASK_STATE_CANCELED",
+                _ => "TASK_STATE_FAILED", // Failed | Interrupted
+            };
+            return jsonrpc_ok(id, json!({ "task": { "id": task.as_str(), "state": wire } }));
+        }
+        // Working: fire the token if present (runner writes Canceled); else write Canceled
+        // directly. Scope the guard so it is NOT held across the set_terminal().await.
+        let fired = {
+            let guard = srv.workflow_cancels.lock().await;
+            match guard.get(&task) {
+                Some(tok) => {
+                    tok.cancel();
+                    true
+                }
+                None => false,
+            }
+        };
+        if !fired {
+            let _ = srv
+                .task_store
+                .set_terminal(&task, TaskRecordStatus::Canceled, None, None, crate::workflow_sink::now_ms())
+                .await;
+        }
+        return jsonrpc_ok(
+            id,
+            json!({ "task": { "id": task.as_str(), "state": "TASK_STATE_CANCELED" } }),
+        );
+    }
+
     // Workflow cancel: if this task is an in-flight workflow run, cancel its token
     // (the producer's executor stream observes the token and ends Canceled) and
     // return the same CANCELED response the other cancel arms return. Checked
