@@ -312,6 +312,7 @@ async fn detached_runner_persists_completed_result() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -941,6 +942,7 @@ async fn tasks_get_returns_completed_with_artifact() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -999,6 +1001,7 @@ async fn cancel_terminal_detached_returns_true_state_not_recancel() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -1055,6 +1058,7 @@ async fn cancel_working_no_token_flips_to_canceled() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -1108,6 +1112,7 @@ async fn tasks_list_returns_recent_newest_first() {
                 input: String::new(),
                 workflow_spec_json: None,
                 resume_attempts: 0,
+            session_cwd: None,
             })
             .await
             .unwrap();
@@ -1451,6 +1456,7 @@ async fn runner_panic_finalizes_failed_no_orphan() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -1509,6 +1515,7 @@ async fn detached_runner_persists_failed_on_node_failure() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -1560,6 +1567,7 @@ async fn detached_runner_persists_canceled_on_token_fire() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -1606,6 +1614,7 @@ async fn swept_interrupted_reports_failed_over_wire() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -1673,6 +1682,7 @@ async fn detached_runner_checkpoints_each_node() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -1904,6 +1914,7 @@ async fn detached_runner_checkpoint_write_failure_fails_task() {
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -2082,6 +2093,7 @@ async fn resume_runs_only_pending_nodes() {
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -2149,6 +2161,7 @@ async fn resume_no_snapshot_interrupts() {
             input: "DIFF".into(),
             workflow_spec_json: None,
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -2181,6 +2194,7 @@ async fn resume_unparseable_snapshot_interrupts() {
             input: "DIFF".into(),
             workflow_spec_json: Some("not json".into()),
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -2215,6 +2229,7 @@ async fn resume_unknown_version_interrupts() {
             // Valid graph, but an unknown schema version.
             workflow_spec_json: Some(review_snapshot(2)),
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -2250,6 +2265,7 @@ async fn resume_cap_exhausted_interrupts() {
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: cap, // already at the cap
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -2316,6 +2332,7 @@ async fn resume_poison_task_terminates_at_cap() {
             // never fires, so every boot would try to run the workflow again.
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -2426,6 +2443,7 @@ async fn resume_terminal_checkpoint_short_circuits() {
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -2608,6 +2626,7 @@ async fn resume_then_cancel_mid_run_finalizes_canceled() {
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
+            session_cwd: None,
         })
         .await
         .unwrap();
@@ -2889,4 +2908,55 @@ async fn detached_workflow_threads_cwd_to_every_node() {
             cwd
         );
     }
+}
+
+/// **detached_submit_persists_session_cwd**: a `message/send` with
+/// `a2a-bridge.cwd="/req"` must persist `session_cwd=Some("/req")` in the
+/// `TaskRecord` (Task 8 of the session_cwd increment).
+#[tokio::test]
+async fn detached_submit_persists_session_cwd() {
+    use bridge_core::task_store::{MemoryTaskStore, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::SEND_MESSAGE,
+            serde_json::json!({ "message": {
+                "text": "DIFF",
+                "metadata": {
+                    "a2a-bridge.skill": "code-review",
+                    "a2a-bridge.cwd": "/req"
+                }
+            }}),
+        ))
+        .await
+        .unwrap();
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid JSON");
+    assert!(body.get("error").is_none(), "must not be an error: {body}");
+
+    let task_id_str = body["result"]["task"]["id"]
+        .as_str()
+        .expect("task id present")
+        .to_string();
+    let task_id = bridge_core::ids::TaskId::parse(&task_id_str).unwrap();
+
+    let rec = store
+        .get(&task_id)
+        .await
+        .unwrap()
+        .expect("TaskRecord must exist");
+
+    assert_eq!(
+        rec.session_cwd.as_deref(),
+        Some("/req"),
+        "record.session_cwd must equal the submitted a2a-bridge.cwd"
+    );
 }

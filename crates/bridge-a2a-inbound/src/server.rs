@@ -1755,6 +1755,7 @@ async fn unary_message(
                 input: input.clone(),
                 workflow_spec_json,
                 resume_attempts: 0,
+                session_cwd: routed.session_cwd.as_ref().map(|c| c.as_str().to_string()),
             };
             if srv.task_store.create(&rec).await.is_err() {
                 return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
