@@ -12,7 +12,9 @@
 // Server listens on cfg.server.addr (default 127.0.0.1:8080).
 //
 // Subcommands:
-//   a2a-bridge                                           — serve (default)
+//   a2a-bridge                                           — serve (./a2a-bridge.toml)
+//   a2a-bridge serve [--config <path>]                   — serve an explicit config
+//   a2a-bridge init [--dir <p>] [--agents ..] [--force]  — scaffold a config + prompts
 //   a2a-bridge run-workflow <id> --input <file>
 //             [--out <file>] [--config <path>]           — run a workflow offline
 //   a2a-bridge submit <skill> --input <file> [--url <url>]
@@ -49,7 +51,9 @@ const CONFIG_PATH: &str = "a2a-bridge.toml";
 /// `a2a-bridge.toml` is absent, so the `FileConfigSource` load/watch pipeline has
 /// a concrete path to read and the parent directory to watch. A sensible
 /// single-agent default: one `kiro` agent running `kiro-cli acp`.
-const DEFAULT_CONFIG: &str = r#"default = "kiro"
+const DEFAULT_CONFIG: &str = r#"# Single-agent zero-auth default. For codex + claude + the review workflows,
+# run `a2a-bridge init` (or point `serve --config` at a multi-agent config).
+default = "kiro"
 
 [registry]
 allowed_cmds = ["kiro-cli"]
@@ -462,30 +466,337 @@ async fn task_watch_cmd(url: &str, id: &str, from: Option<i64>) -> Result<(), Bo
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `serve --config` flag + `init` scaffold
+// ---------------------------------------------------------------------------
+
+/// Parse the `serve` subcommand's flags. Only `--config <path>` is accepted;
+/// any other token errors (so a typo'd flag is not silently ignored).
+fn serve_config_flag(args: &[String]) -> Result<Option<PathBuf>, BoxError> {
+    let mut iter = args.iter();
+    let mut config: Option<PathBuf> = None;
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--config" => {
+                config = Some(PathBuf::from(
+                    iter.next().ok_or("serve: --config requires a <path>")?,
+                ));
+            }
+            other => {
+                return Err(format!("serve: unknown flag {other:?} (only --config <path>)").into());
+            }
+        }
+    }
+    Ok(config)
+}
+
+/// The review prompt files embedded in the binary so `init` is self-contained
+/// (no bridge repo needed at runtime). `(relative-output-path, contents)`.
+const INIT_PROMPTS: &[(&str, &str)] = &[
+    (
+        "prompts/review-codex.md",
+        include_str!("../../../prompts/review-codex.md"),
+    ),
+    (
+        "prompts/review-claude.md",
+        include_str!("../../../prompts/review-claude.md"),
+    ),
+    (
+        "prompts/review-synth.md",
+        include_str!("../../../prompts/review-synth.md"),
+    ),
+    (
+        "prompts/spec-review-rigor.md",
+        include_str!("../../../prompts/spec-review-rigor.md"),
+    ),
+    (
+        "prompts/spec-review-soundness.md",
+        include_str!("../../../prompts/spec-review-soundness.md"),
+    ),
+    (
+        "prompts/spec-review-synth.md",
+        include_str!("../../../prompts/spec-review-synth.md"),
+    ),
+    (
+        "prompts/plan-review-exec.md",
+        include_str!("../../../prompts/plan-review-exec.md"),
+    ),
+    (
+        "prompts/plan-review-coverage.md",
+        include_str!("../../../prompts/plan-review-coverage.md"),
+    ),
+    (
+        "prompts/plan-review-synth.md",
+        include_str!("../../../prompts/plan-review-synth.md"),
+    ),
+];
+
+const INIT_README: &str = include_str!("init-readme-template.md");
+
+/// The four agents `init` knows how to scaffold. `acp_cmd` is `Some` for process
+/// (ACP) agents — those go into `allowed_cmds`; `None` for the non-process `api` agent.
+fn known_init_agents() -> [(&'static str, Option<&'static str>); 4] {
+    [
+        ("kiro", Some("kiro-cli")),
+        ("codex", Some("codex-acp")),
+        ("claude", Some("claude-agent-acp")),
+        ("api", None),
+    ]
+}
+
+/// A TOML `[[agents]]` fragment for one known agent. `model`/`effort` are shown;
+/// `mode` is intentionally omitted (a bad `mode` HARD-fails session/set_mode).
+fn agent_fragment(name: &str) -> &'static str {
+    match name {
+        "kiro" => "\n# kiro: zero-auth local default (kiro-cli acp).\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\nmodel = \"auto\"\n",
+        "codex" => "\n# codex: gpt-5.5 with reasoning_effort (effort is codex-only).\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n",
+        "claude" => "\n# claude: subscription. NOTE: claude's model is NOT observable through the\n# bridge (claude-agent-acp uses the subscription default; set_model is best-effort).\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n",
+        "api" => "\n# api: OpenAI-compatible non-process backend. `api_key_env` is the NAME of an\n# env var holding the token (never the secret itself). Effort is not applied for api.\n[[agents]]\nid          = \"api\"\nkind        = \"api\"\nbase_url    = \"https://api.openai.com/v1\"\napi_key_env = \"OPENAI_API_KEY\"\nmodel       = \"gpt-4o-mini\"\n",
+        _ => "",
+    }
+}
+
+/// The three review workflows (relative `prompts/` paths for `init` output).
+/// All reference both `codex` and `claude`, so they're only emitted when both
+/// are selected (else `load_workflows` would fail on a missing agent at boot).
+const INIT_WORKFLOWS: &str = r#"
+# ── Review workflows (two independent lenses + a synthesis) ──
+[[workflows]]
+id = "code-review"
+[[workflows.nodes]]
+id = "codex"
+agent = "codex"
+prompt_file = "prompts/review-codex.md"
+inputs = []
+[[workflows.nodes]]
+id = "claude"
+agent = "claude"
+prompt_file = "prompts/review-claude.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "prompts/review-synth.md"
+inputs = ["codex", "claude"]
+
+[[workflows]]
+id = "spec-review"
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt_file = "prompts/spec-review-rigor.md"
+inputs = []
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt_file = "prompts/spec-review-soundness.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "prompts/spec-review-synth.md"
+inputs = ["rigor", "soundness"]
+
+[[workflows]]
+id = "plan-review"
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt_file = "prompts/plan-review-exec.md"
+inputs = []
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt_file = "prompts/plan-review-coverage.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "prompts/plan-review-synth.md"
+inputs = ["exec", "coverage"]
+"#;
+
+/// Build the `a2a-bridge.toml` contents for the selected agents.
+/// `default` is `--default` if given, else `kiro` if selected, else the first
+/// selected agent (so the generated default is always a real entry).
+fn build_init_config(
+    selected: &[String],
+    default_override: Option<&str>,
+) -> Result<String, BoxError> {
+    let known = known_init_agents();
+    let default_agent = match default_override {
+        Some(d) => {
+            if !selected.iter().any(|a| a == d) {
+                return Err(format!("init: --default {d:?} is not among --agents").into());
+            }
+            d.to_string()
+        }
+        None if selected.iter().any(|a| a == "kiro") => "kiro".to_string(),
+        None => selected[0].clone(),
+    };
+    let allowed: Vec<String> = selected
+        .iter()
+        .filter_map(|a| known.iter().find(|(n, _)| n == a).and_then(|(_, c)| *c))
+        .map(|c| format!("\"{c}\""))
+        .collect();
+
+    let mut out = String::new();
+    out.push_str("# Generated by `a2a-bridge init`. See README-a2a-bridge.md.\n");
+    out.push_str(&format!("default = \"{default_agent}\"\n\n"));
+    out.push_str(&format!(
+        "[registry]\nallowed_cmds = [{}]\n\n",
+        allowed.join(", ")
+    ));
+    out.push_str("[store]\npath = \".a2a-bridge/tasks.sqlite\"\nresume_attempt_cap = 3\n\n");
+    out.push_str("[server]\naddr = \"127.0.0.1:8080\"\n");
+    for a in selected {
+        out.push_str(agent_fragment(a));
+    }
+    // Workflows reference codex AND claude; emit only when both are present.
+    if selected.iter().any(|a| a == "codex") && selected.iter().any(|a| a == "claude") {
+        out.push_str(INIT_WORKFLOWS);
+    }
+    Ok(out)
+}
+
+/// `a2a-bridge init [--dir <path>] [--agents kiro,codex,claude,api] [--default <id>] [--force]`
+fn init_cmd(args: &[String]) -> Result<(), BoxError> {
+    let dir = PathBuf::from(flag(args, "--dir").unwrap_or("."));
+    let agents_csv = flag(args, "--agents")
+        .unwrap_or("kiro,codex,claude,api")
+        .to_string();
+    let default_override = flag(args, "--default");
+    let force = args.iter().any(|a| a == "--force");
+
+    let known = known_init_agents();
+    let selected: Vec<String> = agents_csv
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if selected.is_empty() {
+        return Err("init: --agents must list at least one agent".into());
+    }
+    for a in &selected {
+        if !known.iter().any(|(n, _)| n == a) {
+            return Err(
+                format!("init: unknown agent {a:?} (known: kiro, codex, claude, api)").into(),
+            );
+        }
+    }
+
+    let config = build_init_config(&selected, default_override)?;
+
+    // Assemble the managed file set: config + README + the 9 prompts.
+    let mut files: Vec<(PathBuf, String)> = vec![
+        (dir.join("a2a-bridge.toml"), config),
+        (dir.join("README-a2a-bridge.md"), INIT_README.to_string()),
+    ];
+    for (rel, contents) in INIT_PROMPTS {
+        files.push((dir.join(rel), contents.to_string()));
+    }
+
+    // Clobber guard: refuse if any managed file exists, unless --force.
+    if !force {
+        let existing: Vec<String> = files
+            .iter()
+            .filter(|(p, _)| p.exists())
+            .map(|(p, _)| p.display().to_string())
+            .collect();
+        if !existing.is_empty() {
+            return Err(format!(
+                "init: refusing to overwrite existing files (use --force):\n  {}",
+                existing.join("\n  ")
+            )
+            .into());
+        }
+    }
+
+    // Write everything (creating parent dirs); never touch unknown files.
+    std::fs::create_dir_all(dir.join("prompts"))?;
+    std::fs::create_dir_all(dir.join(".a2a-bridge"))?;
+    for (path, contents) in &files {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+    }
+
+    println!(
+        "Initialized a2a-bridge config in {} ({} agent{}: {}).",
+        dir.display(),
+        selected.len(),
+        if selected.len() == 1 { "" } else { "s" },
+        selected.join(", ")
+    );
+    println!(
+        "Run: a2a-bridge serve --config {}",
+        dir.join("a2a-bridge.toml").display()
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     // Dispatch subcommands BEFORE the server path touches the filesystem.
     let raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.get(1).map(|s| s.as_str()) == Some("run-workflow") {
-        return run_workflow_cmd(&raw_args[2..]).await;
-    }
-    if raw_args.get(1).map(|s| s.as_str()) == Some("submit") {
-        return submit_cmd(&raw_args[2..]).await;
-    }
-    if raw_args.get(1).map(|s| s.as_str()) == Some("task") {
-        return task_cmd(&raw_args[2..]).await;
+    match raw_args.get(1).map(|s| s.as_str()) {
+        Some("run-workflow") => return run_workflow_cmd(&raw_args[2..]).await,
+        Some("submit") => return submit_cmd(&raw_args[2..]).await,
+        Some("task") => return task_cmd(&raw_args[2..]).await,
+        Some("init") => return init_cmd(&raw_args[2..]),
+        // `serve` (explicit) and the bare invocation fall through to the server path.
+        Some("serve") | None => {}
+        // An unknown first token must NOT silently serve (a typo'd subcommand or flag
+        // would otherwise be swallowed and the default served).
+        Some(other) => {
+            return Err(format!(
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | submit | task | init)"
+            )
+            .into());
+        }
     }
 
     // 1. Observability — install tracing subscriber (idempotent).
     bridge_observ::init();
 
-    // 2. Configuration — ensure `a2a-bridge.toml` exists (materialise the built-in
-    //    default if absent) so the FileConfigSource has a concrete file to load +
-    //    a parent directory to watch.
-    let config_path = PathBuf::from(CONFIG_PATH);
-    if !config_path.exists() {
-        std::fs::write(&config_path, DEFAULT_CONFIG)?;
-    }
+    // 2. Configuration. `serve --config <path>` reads an EXPLICIT config (must already
+    //    exist — an explicit path is a promise, so a missing one errors with an `init`
+    //    hint rather than silently materialising a kiro-only file). Bare `a2a-bridge`
+    //    (or `serve` with no --config) reads ./a2a-bridge.toml, materialising the
+    //    kiro-only DEFAULT_CONFIG if absent (zero-config first run). The path is
+    //    absolutised so workflow prompt + relative store paths resolve against the
+    //    config's OWN directory, not the process CWD.
+    let explicit_config = if raw_args.get(1).map(|s| s.as_str()) == Some("serve") {
+        serve_config_flag(&raw_args[2..])?
+    } else {
+        None
+    };
+    let config_path = match explicit_config {
+        Some(p) => {
+            if !p.exists() {
+                return Err(format!(
+                    "a2a-bridge: config not found at {}; run `a2a-bridge init` to create one",
+                    p.display()
+                )
+                .into());
+            }
+            p
+        }
+        None => {
+            let p = PathBuf::from(CONFIG_PATH);
+            if !p.exists() {
+                std::fs::write(&p, DEFAULT_CONFIG)?;
+            }
+            p
+        }
+    };
+    let config_path = std::fs::canonicalize(&config_path).map_err(|e| {
+        format!(
+            "a2a-bridge: cannot resolve config path {}: {e}",
+            config_path.display()
+        )
+    })?;
 
     // 3. Build the policy engine FIRST so the SAME engine drives both the inbound
     //    server's permission decisions AND each backend's REVERSE
@@ -641,10 +952,21 @@ async fn main() -> Result<(), BoxError> {
     let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> =
         match cfg.store.as_ref().map(|s| s.path.clone()) {
             Some(path) => {
-                let s = std::sync::Arc::new(
-                    SqliteStore::open(std::path::Path::new(&path))
-                        .map_err(|e| format!("serve: cannot open task store {path:?}: {e:?}"))?,
-                );
+                // Resolve a RELATIVE store path against the config's own directory
+                // (`base`), not the process CWD — so `serve --config /elsewhere/...`
+                // keeps task state beside its config, not wherever serve was launched.
+                let store_path = {
+                    let p = std::path::Path::new(&path);
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        base.join(p)
+                    }
+                };
+                let s =
+                    std::sync::Arc::new(SqliteStore::open(&store_path).map_err(|e| {
+                        format!("serve: cannot open task store {store_path:?}: {e:?}")
+                    })?);
                 s as std::sync::Arc<dyn bridge_core::task_store::TaskStore>
             }
             None => std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
@@ -707,6 +1029,118 @@ mod cli_tests {
         assert_eq!(resolve_static_session_cwd(Some("/s"), Some("/c")), "/s"); // session_cwd wins
         assert_eq!(resolve_static_session_cwd(None, Some("/c")), "/c"); // falls to cwd
         assert_eq!(resolve_static_session_cwd(None, None), "."); // default
+    }
+
+    #[test]
+    fn serve_config_flag_parses_and_rejects_unknown() {
+        assert_eq!(serve_config_flag(&[]).unwrap(), None);
+        let a = vec!["--config".to_string(), "/x/a2a-bridge.toml".to_string()];
+        assert_eq!(
+            serve_config_flag(&a).unwrap(),
+            Some(PathBuf::from("/x/a2a-bridge.toml"))
+        );
+        assert!(serve_config_flag(&["--config".to_string()]).is_err()); // missing value
+        assert!(serve_config_flag(&["--bogus".to_string()]).is_err()); // unknown flag
+    }
+
+    #[test]
+    fn init_default_resolution_and_allowed_cmds() {
+        // kiro present -> default kiro; allowed_cmds = the ACP cmds (api excluded).
+        let all = vec![
+            "kiro".to_string(),
+            "codex".to_string(),
+            "claude".to_string(),
+            "api".to_string(),
+        ];
+        let cfg = build_init_config(&all, None).unwrap();
+        assert!(cfg.contains("default = \"kiro\""));
+        assert!(cfg.contains(r#"allowed_cmds = ["kiro-cli", "codex-acp", "claude-agent-acp"]"#));
+        // kiro excluded -> default falls to the first selected agent (codex), not a dangling kiro.
+        let codex_only = vec!["codex".to_string()];
+        let cfg = build_init_config(&codex_only, None).unwrap();
+        assert!(cfg.contains("default = \"codex\""));
+        // --default override must be among the selected agents.
+        assert!(build_init_config(&codex_only, Some("claude")).is_err());
+        assert!(build_init_config(&codex_only, Some("codex")).is_ok());
+    }
+
+    #[test]
+    fn init_workflows_only_when_codex_and_claude_present() {
+        // Both -> the review workflows are emitted.
+        let both = vec!["codex".to_string(), "claude".to_string()];
+        assert!(build_init_config(&both, None)
+            .unwrap()
+            .contains("[[workflows]]"));
+        // Missing one -> NO workflows (else load_workflows fails on a missing agent).
+        let codex_only = vec!["codex".to_string()];
+        assert!(!build_init_config(&codex_only, None)
+            .unwrap()
+            .contains("[[workflows]]"));
+    }
+
+    #[test]
+    fn init_generated_config_parses_and_loads() {
+        // End-to-end: init writes config + prompts; the generated config parses AND
+        // its workflows load (prompt paths resolve relative to the config dir).
+        let dir = std::env::temp_dir().join(format!("a2a-init-test-gen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init_cmd(&[
+            "--dir".to_string(),
+            dir.to_string_lossy().to_string(),
+            "--agents".to_string(),
+            "kiro,codex,claude".to_string(),
+        ])
+        .unwrap();
+        let raw = std::fs::read_to_string(dir.join("a2a-bridge.toml")).unwrap();
+        let cfg = config::RegistryConfig::parse(&raw).unwrap();
+        let wf = cfg.load_workflows(&dir).unwrap();
+        assert_eq!(wf.len(), 3, "code-review + spec-review + plan-review load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_clobber_guard_and_force_and_unknown_agent() {
+        let dir = std::env::temp_dir().join(format!("a2a-init-test-force-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let args = |extra: &[&str]| {
+            let mut v = vec!["--dir".to_string(), dir.to_string_lossy().to_string()];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            v
+        };
+        // First init succeeds.
+        init_cmd(&args(&["--agents", "kiro"])).unwrap();
+        // Second init REFUSES (would clobber the managed files).
+        assert!(init_cmd(&args(&["--agents", "kiro"])).is_err());
+        // ...but --force overwrites the managed set.
+        init_cmd(&args(&["--agents", "kiro", "--force"])).unwrap();
+        // An unknown agent name errors BEFORE writing anything.
+        let bad = std::env::temp_dir().join(format!("a2a-init-test-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bad);
+        assert!(init_cmd(&[
+            "--dir".to_string(),
+            bad.to_string_lossy().to_string(),
+            "--agents".to_string(),
+            "kiro,bogus".to_string(),
+        ])
+        .is_err());
+        assert!(
+            !bad.join("a2a-bridge.toml").exists(),
+            "no files written on bad --agents"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bad);
+    }
+
+    #[test]
+    fn reference_multi_agent_config_parses_and_loads() {
+        // The committed examples/ config parses + its workflows load via ../prompts/.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/a2a-bridge.multi-agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let cfg = config::RegistryConfig::parse(&raw).unwrap();
+        let base = path.parent().unwrap();
+        let wf = cfg.load_workflows(base).unwrap();
+        assert_eq!(wf.len(), 3);
     }
 
     // ---- Task 10: task watch <id> arg-parsing ----

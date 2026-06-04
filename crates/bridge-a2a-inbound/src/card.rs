@@ -1,4 +1,4 @@
-// card.rs — A2A Agent Card advertising the Kiro skill, plus version-pin guard.
+// card.rs — A2A Agent Card advertising the bridge skills, plus version-pin guard.
 //
 // The a2a-lf 0.3.0 API uses:
 //   - `AgentCard` { skills: Vec<AgentSkill>, supported_interfaces: Vec<AgentInterface>, … }
@@ -16,18 +16,18 @@ use bridge_core::error::BridgeError;
 /// Equals `a2a::VERSION` from the a2a-lf 0.3.0 crate (the A2A v1 wire protocol).
 pub const A2A_PINNED_VERSION: &str = VERSION;
 
-/// Build the AgentCard advertising the fixed skills (Kiro coding, `delegate`,
+/// Build the AgentCard advertising the fixed skills (`code`, `delegate`,
 /// `fan-out`) plus one `workflow`-tagged skill per configured workflow id.
 ///
 /// The card exposes a single JSONRPC interface at `<base_url>`.
 pub fn agent_card(base_url: &str, workflow_ids: &[&str]) -> AgentCard {
-    let kiro_skill = AgentSkill {
-        id: "kiro-code".to_string(),
-        name: "Kiro Code".to_string(),
-        description: "Drive the Kiro CLI agent to perform code generation, editing, and \
-                       development tasks on behalf of A2A clients."
+    let code_skill = AgentSkill {
+        id: "code".to_string(),
+        name: "Code".to_string(),
+        description: "Drive the configured local coding agent (ACP) to perform code \
+                       generation, editing, and development tasks on behalf of A2A clients."
             .to_string(),
-        tags: vec!["code".to_string(), "kiro".to_string(), "cli".to_string()],
+        tags: vec!["code".to_string(), "acp".to_string(), "cli".to_string()],
         examples: Some(vec![
             "Implement a Rust function that parses JSON".to_string(),
             "Add unit tests to the auth module".to_string(),
@@ -65,7 +65,7 @@ pub fn agent_card(base_url: &str, workflow_ids: &[&str]) -> AgentCard {
         security_requirements: None,
     };
 
-    let mut skills = vec![kiro_skill, delegate_skill, fanout_skill];
+    let mut skills = vec![code_skill, delegate_skill, fanout_skill];
     // One advertised skill per configured workflow id (W1): clients send
     // `a2a-bridge.skill = "<id>"` to run that workflow as a streaming task.
     for id in workflow_ids {
@@ -84,8 +84,10 @@ pub fn agent_card(base_url: &str, workflow_ids: &[&str]) -> AgentCard {
     }
 
     AgentCard {
-        name: "A2A-Bridge / Kiro".to_string(),
-        description: "A2A bridge that routes agent tasks to the Kiro CLI coding agent.".to_string(),
+        name: "a2a-bridge".to_string(),
+        description: "A2A↔ACP bridge that routes agent tasks to the configured local \
+                      agent(s) and review workflows."
+            .to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         supported_interfaces: vec![AgentInterface::new(base_url, TRANSPORT_PROTOCOL_JSONRPC)],
         capabilities: AgentCapabilities {
@@ -127,9 +129,9 @@ mod tests {
     #[test]
     fn card_has_two_skills_and_pinned_version() {
         let c = agent_card("http://localhost:8080", &[]);
-        // Updated for Task 5a: three skills now (kiro-code, delegate, fan-out).
+        // Updated for Task 5a: three skills now (code, delegate, fan-out).
         assert!(c.skills.len() >= 2);
-        assert!(c.skills.iter().any(|s| s.id == "kiro-code"));
+        assert!(c.skills.iter().any(|s| s.id == "code"));
         // Protocol version lives on the AgentInterface (not on AgentCard itself).
         // AgentInterface::new() auto-sets protocol_version = a2a::VERSION.
         assert_eq!(c.supported_interfaces.len(), 1);
@@ -158,7 +160,7 @@ mod tests {
         // Updated for Task 5a: three skills now.
         assert!(c.skills.len() >= 2);
         assert!(c.skills.iter().any(|s| s.id == "delegate"));
-        assert!(c.skills.iter().any(|s| s.id == "kiro-code"));
+        assert!(c.skills.iter().any(|s| s.id == "code"));
     }
 
     // ---- Task 5a: fan-out skill advertisement ----
@@ -202,7 +204,7 @@ mod tests {
     #[test]
     fn base_skills_are_not_marked_detached() {
         let card = agent_card("http://x", &["code-review"]);
-        for id in &["kiro-code", "delegate", "fan-out"] {
+        for id in &["code", "delegate", "fan-out"] {
             let skill = card.skills.iter().find(|s| s.id == *id).unwrap();
             let marked = skill.tags.iter().any(|x| x == "detached")
                 || skill.description.to_lowercase().contains("detached");
