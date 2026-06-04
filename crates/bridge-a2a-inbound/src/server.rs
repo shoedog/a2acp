@@ -315,10 +315,20 @@ impl InboundServer {
         let task = task_id_from_params(params)?;
         let session = SessionId::parse(format!("session-{}", task.as_str()))
             .unwrap_or_else(|_| SessionId::parse("session-default").unwrap());
+        // H1: reject a message with NO extractable text content BEFORE dispatch.
+        // An empty `parts` would otherwise reach the backend as a contentless prompt
+        // (zero ACP content blocks) and surface as an opaque "agent crashed" — reject
+        // it as a client error here instead.
+        let parts = parts_from_params(params);
+        if parts.is_empty() {
+            return Err(BridgeError::InvalidRequest {
+                field: "message: no text content (expected message.parts[].text or message.text)",
+            });
+        }
         Ok(RoutedCall {
             task,
             session,
-            parts: parts_from_params(params),
+            parts,
             target,
             auth,
             // Per-request overrides ride along so LOCAL dispatch can compute the
@@ -2950,15 +2960,19 @@ fn task_meta_from_params(params: &Value) -> Result<TaskMeta, BridgeError> {
 /// Pull message parts from params, extracting real text content.
 ///
 /// Priority:
-/// 1. If `message.parts` is a non-empty array, map each element's `text`
-///    field to a `Part { text }`, skipping elements without a string `text`.
+/// 1. If `message.parts` is a non-empty array, map each TEXT element's `text`
+///    field to a `Part { text }`. An element contributes text only when its
+///    `kind` is `"text"` (or absent — lenient); `data`/`file`/other-kind parts
+///    are NOT prompt text and are skipped (so a `data` part's stray `text`
+///    field is not misread as a prompt). A `parts` array that yields no text
+///    (e.g. only `data` parts) returns an empty vec — `gate()` rejects that.
 /// 2. Else if `message.text` is a string, one `Part { text }`.
 /// 3. Else if a top-level `text` field is present, one `Part { text }`.
 /// 4. Otherwise empty vec.
 fn parts_from_params(params: &Value) -> Vec<Part> {
     let message = params.get("message");
 
-    // 1. message.parts array
+    // 1. message.parts array — TEXT parts only.
     if let Some(parts_arr) = message
         .and_then(|m| m.get("parts"))
         .and_then(|p| p.as_array())
@@ -2967,6 +2981,14 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
             return parts_arr
                 .iter()
                 .filter_map(|elem| {
+                    // Only text parts carry prompt text. `kind` absent ⇒ lenient text.
+                    let is_text = matches!(
+                        elem.get("kind").and_then(|k| k.as_str()),
+                        Some("text") | None
+                    );
+                    if !is_text {
+                        return None;
+                    }
                     elem.get("text").and_then(|t| t.as_str()).map(|t| Part {
                         text: t.to_string(),
                     })
@@ -3919,6 +3941,52 @@ mod tests {
         assert_eq!(
             v.iter().map(|x| x.text.clone()).collect::<Vec<_>>(),
             vec!["A", "B"]
+        );
+    }
+
+    // ---- H2: kind-aware part extraction ----
+
+    #[test]
+    fn parts_skips_non_text_kinds() {
+        // A standard A2A message: text parts contribute; data/file parts do not
+        // (and a data part's stray `text` field must NOT be misread as a prompt).
+        let p = serde_json::json!({"message":{"parts":[
+            {"kind":"text","text":"hello"},
+            {"kind":"data","data":{"x":1},"text":"should-be-ignored"},
+            {"kind":"file","file":{"name":"f"}},
+            {"text":"kind-absent-is-lenient-text"},
+        ]}});
+        let v: Vec<String> = parts_from_params(&p).into_iter().map(|x| x.text).collect();
+        assert_eq!(v, vec!["hello", "kind-absent-is-lenient-text"]);
+    }
+
+    #[test]
+    fn parts_only_non_text_is_empty() {
+        let p = serde_json::json!({"message":{"parts":[{"kind":"data","data":{"x":1}}]}});
+        assert!(parts_from_params(&p).is_empty());
+    }
+
+    // ---- H1: empty/textless message is rejected (not dispatched empty) ----
+
+    #[tokio::test]
+    async fn send_message_with_no_text_returns_invalid_request() {
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "parts": [] } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // A request-level rejection (not a dispatched empty prompt to the agent).
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("no text content"),
+            "expected a 'no text content' error, got: {msg}"
         );
     }
 
