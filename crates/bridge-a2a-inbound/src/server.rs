@@ -178,6 +178,15 @@ pub struct InboundServer {
     /// Wired from `allowed_cwd_root` in the top-level config via
     /// [`InboundServer::with_allowed_cwd_root`].
     pub allowed_cwd_root: Option<String>,
+    /// Per-task broadcast hubs for streaming reattach (Task 3). Keyed by TaskId;
+    /// populated by the DetachedProgressSink (Task 4) and read by the
+    /// SubscribeToTask handler (Tasks 7-9). Cleaned up by the Finalizer (Task 6).
+    #[allow(dead_code)] // consumed in Task 4-9
+    pub(crate) progress_hubs: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>,
+        >,
+    >,
 }
 
 impl InboundServer {
@@ -210,6 +219,7 @@ impl InboundServer {
             workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
             allowed_cwd_root: None,
+            progress_hubs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
