@@ -252,6 +252,62 @@ async fn http_500_is_agent_crashed() {
 }
 
 #[tokio::test]
+async fn http_429_is_agent_overloaded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+    let be = ApiBackend::new(ApiConfig::new(format!("{}/v1", server.uri())));
+    let mut st = be
+        .prompt(
+            &SessionId::parse("s7").unwrap(),
+            vec![Part { text: "hi".into() }],
+        )
+        .await
+        .unwrap();
+    let mut err = None;
+    while let Some(item) = st.next().await {
+        if let Err(e) = item {
+            err = Some(e);
+        }
+    }
+    assert!(matches!(
+        err,
+        Some(bridge_core::error::BridgeError::AgentOverloaded)
+    ));
+}
+
+#[tokio::test]
+async fn http_401_is_agent_not_authenticated() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let be = ApiBackend::new(ApiConfig::new(format!("{}/v1", server.uri())));
+    let mut st = be
+        .prompt(
+            &SessionId::parse("s8").unwrap(),
+            vec![Part { text: "hi".into() }],
+        )
+        .await
+        .unwrap();
+    let mut err = None;
+    while let Some(item) = st.next().await {
+        if let Err(e) = item {
+            err = Some(e);
+        }
+    }
+    assert!(matches!(
+        err,
+        Some(bridge_core::error::BridgeError::AgentNotAuthenticated)
+    ));
+}
+
+#[tokio::test]
 async fn malformed_sse_is_frame_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
