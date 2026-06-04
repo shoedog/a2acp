@@ -115,3 +115,24 @@ id = "synth"
 agent = "claude"
 prompt_file = "../prompts/plan-review-synth.md"
 inputs = ["exec", "coverage"]
+
+# design: two CLEAN-ROOM architect lenses (firewalled — inputs=[] so neither sees
+# the other) + a synth that merges convergent-spine + adjudicated-divergences.
+# Feed a PROBLEM STATEMENT as the input; the architects read the repo (read-only).
+[[workflows]]
+id = "design"
+[[workflows.nodes]]
+id = "codex"
+agent = "codex"
+prompt_file = "../prompts/design-codex.md"
+inputs = []
+[[workflows.nodes]]
+id = "claude"
+agent = "claude"
+prompt_file = "../prompts/design-claude.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/design-synth.md"
+inputs = ["codex", "claude"]
