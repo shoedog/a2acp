@@ -6,6 +6,8 @@ use bridge_core::error::BridgeError;
 use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome, WorkflowStream};
 use futures::StreamExt;
 
+use crate::reattach::{FrameKind, Phase, TaskProgressHub, TerminalOutcome, WorkflowProgressFrame};
+
 /// A sink consumes the workflow's events. Intermediate node events are optional
 /// (the detached sink persists each node_finished as a checkpoint in W3b); terminal is also required.
 #[async_trait::async_trait]
@@ -117,6 +119,108 @@ impl WorkflowSink for TaskStoreSink {
             WorkflowOutcome::Completed => (TaskRecordStatus::Completed, Some(output), None),
             WorkflowOutcome::Failed => (TaskRecordStatus::Failed, None, Some(output)),
             WorkflowOutcome::Canceled => (TaskRecordStatus::Canceled, None, None),
+        });
+        Ok(())
+    }
+}
+
+/// Detached progress sink: persists each event via the sequenced store methods
+/// (durable-first), then publishes a `WorkflowProgressFrame` to the task's
+/// in-memory `TaskProgressHub`. A durable-write `Err` propagates (aborts the
+/// drain) — preserving the W3b "checkpoint-write-failure ⇒ task Failed" contract.
+#[allow(dead_code)] // wired into the runner in Task 5
+pub(crate) struct DetachedProgressSink {
+    store: Arc<dyn TaskStore>,
+    task: TaskId,
+    hub: Arc<TaskProgressHub>,
+}
+
+impl DetachedProgressSink {
+    #[allow(dead_code)] // wired into the runner in Task 5
+    pub(crate) fn new(store: Arc<dyn TaskStore>, task: TaskId, hub: Arc<TaskProgressHub>) -> Self {
+        Self { store, task, hub }
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkflowSink for DetachedProgressSink {
+    // `NodeId::parse` here mirrors `TaskStoreSink` (raw `?`): node names come from the
+    // already-validated workflow graph, so this parse is infallible in practice. This sink
+    // is only ever driven by the detached runner, which normalizes ANY drain `Err` to a
+    // terminal `Failed` — so the parse error's disposition is moot on this path.
+    async fn node_started(&mut self, node: &str) -> Result<(), BridgeError> {
+        let node_id = bridge_core::ids::NodeId::parse(node)?;
+        let seq = self
+            .store
+            .record_node_started(&self.task, &node_id, now_ms())
+            .await?;
+        self.hub.publish(WorkflowProgressFrame {
+            v: 1,
+            seq,
+            phase: Phase::Live,
+            kind: FrameKind::NodeStarted {
+                node: node.to_string(),
+            },
+        });
+        Ok(())
+    }
+
+    async fn node_finished(
+        &mut self,
+        node: &str,
+        ok: bool,
+        output: &str,
+    ) -> Result<(), BridgeError> {
+        let node_id = bridge_core::ids::NodeId::parse(node)?;
+        let seq = self
+            .store
+            .put_node_checkpoint_sequenced(&self.task, &node_id, output, ok, now_ms())
+            .await?;
+        self.hub.publish(WorkflowProgressFrame {
+            v: 1,
+            seq,
+            phase: Phase::Live,
+            kind: FrameKind::NodeFinished {
+                node: node.to_string(),
+                ok,
+                output: output.to_string(),
+            },
+        });
+        Ok(())
+    }
+
+    async fn terminal(
+        &mut self,
+        outcome: WorkflowOutcome,
+        output: String,
+    ) -> Result<(), BridgeError> {
+        let (status, result, error) = match &outcome {
+            WorkflowOutcome::Completed => (
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some(output.as_str()),
+                None,
+            ),
+            WorkflowOutcome::Failed => (
+                bridge_core::task_store::TaskRecordStatus::Failed,
+                None,
+                Some(output.as_str()),
+            ),
+            WorkflowOutcome::Canceled => {
+                (bridge_core::task_store::TaskRecordStatus::Canceled, None, None)
+            }
+        };
+        let seq = self
+            .store
+            .set_terminal_sequenced(&self.task, status, result, error, now_ms())
+            .await?;
+        self.hub.publish(WorkflowProgressFrame {
+            v: 1,
+            seq,
+            phase: Phase::Live,
+            kind: FrameKind::Terminal {
+                outcome: TerminalOutcome::from_workflow(&outcome),
+                output,
+            },
         });
         Ok(())
     }
@@ -257,6 +361,256 @@ mod sink_tests {
                 "terminal"
             ],
             "drain must fully await each sink call before advancing to the next event"
+        );
+    }
+
+    // ── DetachedProgressSink tests ────────────────────────────────────────────
+
+    /// Helper: build a minimal Working `TaskRecord` for use in store tests.
+    fn make_task_record(id: &str) -> bridge_core::task_store::TaskRecord {
+        bridge_core::task_store::TaskRecord {
+            id: TaskId::parse(id).unwrap(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        }
+    }
+
+    /// `DetachedProgressSink` persists durable events via the sequenced store
+    /// methods AND publishes frames to the hub. Verifies:
+    ///   - subscriber receives [NodeStarted, NodeFinished, Terminal] in order
+    ///   - seqs are strictly monotonic
+    ///   - the store snapshot has a checkpoint with a seq and a `terminal_seq`
+    #[tokio::test]
+    async fn detached_progress_sink_persists_and_publishes() {
+        use bridge_core::ids::NodeId;
+        use bridge_core::task_store::{MemoryTaskStore, TaskStore};
+        use crate::reattach::{FrameKind, TaskProgressHub};
+
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let task_id = TaskId::parse("t-prog").unwrap();
+        store.create(&make_task_record("t-prog")).await.unwrap();
+
+        let hub = Arc::new(TaskProgressHub::new());
+        // Subscribe BEFORE draining so we don't miss frames.
+        let mut rx = hub.subscribe();
+
+        let mut sink = DetachedProgressSink::new(store.clone(), task_id.clone(), hub);
+
+        let a = NodeId::parse("a").unwrap();
+        let events = vec![
+            Ok(WorkflowEvent::NodeStarted { node: a.clone() }),
+            Ok(WorkflowEvent::NodeFinished {
+                node: a.clone(),
+                ok: true,
+                output: "out-a".into(),
+            }),
+            Ok(WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                output: "done".into(),
+            }),
+        ];
+        let stream: WorkflowStream = Box::pin(futures::stream::iter(events));
+        let terminal_seen = drain_workflow(stream, &mut sink).await.unwrap();
+        assert!(terminal_seen, "terminal_seen must be true");
+
+        // Assert durable state: checkpoint with seq + terminal_seq.
+        let snap = store.progress_snapshot(&task_id).await.unwrap();
+        assert_eq!(snap.checkpoints.len(), 1, "one checkpoint for node 'a'");
+        let (_node, _output, ok, chk_seq) = &snap.checkpoints[0];
+        assert!(*ok);
+        assert!(*chk_seq > 0, "checkpoint must have a positive seq");
+        assert!(snap.terminal_seq.is_some(), "terminal_seq must be set");
+        let term_seq = snap.terminal_seq.unwrap();
+        assert!(term_seq > *chk_seq, "terminal seq must be > checkpoint seq");
+
+        // Collect published frames from the hub.
+        let mut frames = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            frames.push(f);
+        }
+        assert_eq!(frames.len(), 3, "expected NodeStarted, NodeFinished, Terminal frames");
+
+        // Verify frame kinds in order.
+        assert!(matches!(frames[0].kind, FrameKind::NodeStarted { .. }), "frame[0] must be NodeStarted");
+        assert!(matches!(frames[1].kind, FrameKind::NodeFinished { .. }), "frame[1] must be NodeFinished");
+        assert!(matches!(frames[2].kind, FrameKind::Terminal { .. }), "frame[2] must be Terminal");
+
+        // Verify strictly monotonic seqs.
+        assert!(frames[1].seq > frames[0].seq, "seqs must be strictly monotonic");
+        assert!(frames[2].seq > frames[1].seq, "seqs must be strictly monotonic");
+
+        // The terminal frame's seq must match the stored terminal_seq (durable-first).
+        assert_eq!(frames[2].seq, term_seq, "terminal frame seq == stored terminal_seq");
+
+        // All frames are Live phase.
+        assert!(matches!(frames[0].phase, crate::reattach::Phase::Live));
+        assert!(matches!(frames[1].phase, crate::reattach::Phase::Live));
+        assert!(matches!(frames[2].phase, crate::reattach::Phase::Live));
+    }
+
+    /// A `DetachedProgressSink` whose store's `put_node_checkpoint_sequenced`
+    /// returns `Err` must propagate the error so `drain_workflow` aborts —
+    /// preserving the W3b "checkpoint-write-failure ⇒ task Failed" contract.
+    #[tokio::test]
+    async fn detached_progress_sink_write_error_aborts_drain() {
+        use bridge_core::ids::NodeId;
+        use bridge_core::task_store::{
+            MemoryTaskStore, ResumeClaim, TaskProgressSnapshot, TaskRecord, TaskRecordStatus,
+            TaskStore,
+        };
+        use crate::reattach::TaskProgressHub;
+
+        /// A `TaskStore` wrapper that delegates everything to an inner
+        /// `MemoryTaskStore` but makes `put_node_checkpoint_sequenced` always
+        /// return `Err(StoreFailure)`.
+        struct FailingCheckpointStore {
+            inner: MemoryTaskStore,
+        }
+
+        #[async_trait::async_trait]
+        impl TaskStore for FailingCheckpointStore {
+            async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError> {
+                self.inner.create(rec).await
+            }
+            async fn set_terminal(
+                &self,
+                id: &TaskId,
+                status: TaskRecordStatus,
+                result: Option<&str>,
+                error: Option<&str>,
+                updated_ms: i64,
+            ) -> Result<(), BridgeError> {
+                self.inner.set_terminal(id, status, result, error, updated_ms).await
+            }
+            async fn get(&self, id: &TaskId) -> Result<Option<TaskRecord>, BridgeError> {
+                self.inner.get(id).await
+            }
+            async fn list(&self, limit: usize) -> Result<Vec<TaskRecord>, BridgeError> {
+                self.inner.list(limit).await
+            }
+            async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError> {
+                self.inner.sweep_interrupted(updated_ms).await
+            }
+            async fn cancel_if_working(
+                &self,
+                id: &TaskId,
+                updated_ms: i64,
+            ) -> Result<bool, BridgeError> {
+                self.inner.cancel_if_working(id, updated_ms).await
+            }
+            async fn put_node_checkpoint(
+                &self,
+                task: &TaskId,
+                node: &bridge_core::ids::NodeId,
+                output: &str,
+                ok: bool,
+                ts: i64,
+            ) -> Result<(), BridgeError> {
+                self.inner.put_node_checkpoint(task, node, output, ok, ts).await
+            }
+            async fn node_checkpoints(
+                &self,
+                task: &TaskId,
+            ) -> Result<Vec<(bridge_core::ids::NodeId, String, bool)>, BridgeError> {
+                self.inner.node_checkpoints(task).await
+            }
+            async fn claim_resume_attempt(
+                &self,
+                task: &TaskId,
+                cap: u32,
+                now_ms: i64,
+            ) -> Result<ResumeClaim, BridgeError> {
+                self.inner.claim_resume_attempt(task, cap, now_ms).await
+            }
+            async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError> {
+                self.inner.working_tasks().await
+            }
+            async fn record_node_started(
+                &self,
+                task: &TaskId,
+                node: &bridge_core::ids::NodeId,
+                ts: i64,
+            ) -> Result<i64, BridgeError> {
+                self.inner.record_node_started(task, node, ts).await
+            }
+            /// Always fails — used to test the W3b abort-on-write-failure contract.
+            async fn put_node_checkpoint_sequenced(
+                &self,
+                _task: &TaskId,
+                _node: &bridge_core::ids::NodeId,
+                _output: &str,
+                _ok: bool,
+                _ts: i64,
+            ) -> Result<i64, BridgeError> {
+                Err(BridgeError::StoreFailure)
+            }
+            async fn set_terminal_sequenced(
+                &self,
+                task: &TaskId,
+                status: TaskRecordStatus,
+                result: Option<&str>,
+                error: Option<&str>,
+                ts: i64,
+            ) -> Result<i64, BridgeError> {
+                self.inner.set_terminal_sequenced(task, status, result, error, ts).await
+            }
+            async fn progress_snapshot(
+                &self,
+                task: &TaskId,
+            ) -> Result<TaskProgressSnapshot, BridgeError> {
+                self.inner.progress_snapshot(task).await
+            }
+        }
+
+        let failing_store: Arc<dyn TaskStore> =
+            Arc::new(FailingCheckpointStore { inner: MemoryTaskStore::new() });
+        let task_id = TaskId::parse("t-fail").unwrap();
+        failing_store.create(&make_task_record("t-fail")).await.unwrap();
+
+        let hub = Arc::new(TaskProgressHub::new());
+        let mut rx = hub.subscribe(); // subscribe BEFORE the hub is moved into the sink
+        let mut sink =
+            DetachedProgressSink::new(failing_store.clone(), task_id.clone(), hub);
+
+        let a = NodeId::parse("a").unwrap();
+        // NodeStarted succeeds (record_node_started delegates to inner);
+        // NodeFinished calls put_node_checkpoint_sequenced which always errors.
+        let events = vec![
+            Ok(WorkflowEvent::NodeStarted { node: a.clone() }),
+            Ok(WorkflowEvent::NodeFinished {
+                node: a.clone(),
+                ok: true,
+                output: "out-a".into(),
+            }),
+            Ok(WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                output: "done".into(),
+            }),
+        ];
+        let stream: WorkflowStream = Box::pin(futures::stream::iter(events));
+        let result = drain_workflow(stream, &mut sink).await;
+        assert!(result.is_err(), "drain_workflow must return Err when checkpoint write fails");
+
+        // Durable-first: the failed NodeFinished must NOT have published a frame.
+        // Only the successful NodeStarted should have reached the subscriber.
+        match rx.try_recv() {
+            Ok(f) => assert!(
+                matches!(f.kind, FrameKind::NodeStarted { .. }),
+                "first frame should be the NodeStarted that persisted successfully"
+            ),
+            Err(e) => panic!("expected the NodeStarted frame, got {e:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no frame may be published after the write failure (no-publish-on-error)"
         );
     }
 }

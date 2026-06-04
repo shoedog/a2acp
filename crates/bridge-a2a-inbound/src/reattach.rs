@@ -5,16 +5,15 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 /// Whether this frame comes from a historical snapshot replay or from live streaming.
-#[allow(dead_code)] // consumed in Task 4-9
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
+    #[allow(dead_code)] // consumed in Tasks 8-9
     Snapshot,
     Live,
 }
 
 /// Serializable mirror of bridge_workflow::executor::WorkflowOutcome (which is not Serialize).
-#[allow(dead_code)] // consumed in Task 4-9
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TerminalOutcome {
@@ -24,7 +23,6 @@ pub(crate) enum TerminalOutcome {
 }
 
 impl TerminalOutcome {
-    #[allow(dead_code)] // consumed in Task 4-9
     pub(crate) fn from_workflow(o: &bridge_workflow::executor::WorkflowOutcome) -> Self {
         use bridge_workflow::executor::WorkflowOutcome as W;
         // Real variants (executor.rs:35-39): unit Completed, Failed, Canceled — no payloads.
@@ -37,12 +35,12 @@ impl TerminalOutcome {
 }
 
 /// The payload shape of a single progress frame on the broadcast channel.
-#[allow(dead_code)] // consumed in Task 4-9
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum FrameKind {
     NodeStarted { node: String },
     NodeFinished { node: String, ok: bool, output: String },
+    #[allow(dead_code)] // consumed in Tasks 8-9
     SnapshotComplete,
     Terminal { outcome: TerminalOutcome, output: String },
 }
@@ -53,7 +51,6 @@ pub(crate) enum FrameKind {
 /// lands at the TOP level of the JSON (`{"v":1,"seq":5,"phase":"live","kind":"node_finished",
 /// "node":"a","ok":true,"output":"o"}`) rather than nested as `"kind":{"kind":...}`. This is
 /// the locked SSE wire contract (serialize-only; the bridge never deserializes this type).
-#[allow(dead_code)] // consumed in Task 4-9
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct WorkflowProgressFrame {
     pub v: u8,
@@ -66,25 +63,23 @@ pub(crate) struct WorkflowProgressFrame {
 /// Per-task in-memory broadcast hub. Wraps a `tokio::sync::broadcast` channel so
 /// the DetachedProgressSink (publisher) and SubscribeToTask handler (subscriber)
 /// can communicate progress frames without sharing a lock.
-#[allow(dead_code)] // consumed in Task 4-9
 pub(crate) struct TaskProgressHub {
     tx: broadcast::Sender<WorkflowProgressFrame>,
 }
 
 impl TaskProgressHub {
-    #[allow(dead_code)] // consumed in Task 4-9
+    #[allow(dead_code)] // wired into the server in Task 5
     pub(crate) fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
         Self { tx }
     }
 
-    #[allow(dead_code)] // consumed in Task 4-9
+    #[allow(dead_code)] // consumed in Tasks 7-9
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<WorkflowProgressFrame> {
         self.tx.subscribe()
     }
 
     /// Publish a frame best-effort: if no receivers are listening the send is silently dropped.
-    #[allow(dead_code)] // consumed in Task 4-9
     pub(crate) fn publish(&self, f: WorkflowProgressFrame) {
         let _ = self.tx.send(f);
     }
