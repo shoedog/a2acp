@@ -65,20 +65,20 @@ model       = "gpt-4o-mini"
 [[workflows]]
 id = "code-review"
 [[workflows.nodes]]
-id = "codex"
+id = "correctness"
 agent = "codex"
-prompt_file = "../prompts/review-codex.md"
+prompt_file = "../prompts/review-correctness.md"
 inputs = []
 [[workflows.nodes]]
-id = "claude"
+id = "architecture"
 agent = "claude"
-prompt_file = "../prompts/review-claude.md"
+prompt_file = "../prompts/review-architecture.md"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
 prompt_file = "../prompts/review-synth.md"
-inputs = ["codex", "claude"]
+inputs = ["correctness", "architecture"]
 
 [[workflows]]
 id = "spec-review"
@@ -122,17 +122,17 @@ inputs = ["exec", "coverage"]
 [[workflows]]
 id = "design"
 [[workflows.nodes]]
-id = "codex"
+id = "executability"
 agent = "codex"
-prompt_file = "../prompts/design-codex.md"
+prompt_file = "../prompts/design-executability.md"
 inputs = []
 [[workflows.nodes]]
-id = "claude"
+id = "structure"
 agent = "claude"
-prompt_file = "../prompts/design-claude.md"
+prompt_file = "../prompts/design-structure.md"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
 prompt_file = "../prompts/design-synth.md"
-inputs = ["codex", "claude"]
+inputs = ["executability", "structure"]

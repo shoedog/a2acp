@@ -15,10 +15,10 @@ OUTPUT — one coherent design:
 - A final **DECISIONS FOR THE OWNER** list (the unresolved tradeoffs, each with the options + a recommendation).
 - End with a one-line readiness verdict (e.g. "ready to plan after deciding the 2 open questions").
 
-=== ARCHITECT A — codex (pragmatic / executability lens) ===
-{{codex}}
+=== EXECUTABILITY LENS (default: codex) ===
+{{executability}}
 
-=== ARCHITECT B — claude (structure / seam lens) ===
-{{claude}}
+=== STRUCTURE LENS (default: claude) ===
+{{structure}}
 
 (Problem statement, for reference: {{input}})
