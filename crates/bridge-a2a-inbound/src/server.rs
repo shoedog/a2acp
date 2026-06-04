@@ -699,76 +699,232 @@ async fn subscribe_to_task(
     // Look up the task in the durable store.  Not found → not-found error (M5: do
     // NOT fall through to gate() and start a new run).
     match srv.task_store.get(&task_id).await {
-        Ok(Some(_rec)) => {
-            // Task found: load its progress snapshot and dispatch on status.
-            let snap = match srv.task_store.progress_snapshot(&task_id).await {
-                Ok(s) => s,
-                Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
-            };
-
-            if snap.status.is_terminal() {
-                // --- Terminal-task flow (Task 8) ---
-                // Build snapshot frames (cursor-filtered, seq-ordered).
-                let mut frames = snapshot_frames(&snap, cursor);
-
-                // Append SnapshotComplete sentinel (seq = max snapshot frame seq or cut_seq).
-                let sentinel_seq = frames.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
-                frames.push(crate::reattach::WorkflowProgressFrame {
-                    v: 1,
-                    seq: sentinel_seq,
-                    phase: crate::reattach::Phase::Snapshot,
-                    kind: crate::reattach::FrameKind::SnapshotComplete,
-                });
-
-                // Append Terminal frame unless cursor already covers a KNOWN terminal_seq.
-                // None (legacy) → always emit; Some(ts) → emit only if cursor < ts.
-                let emit_terminal = snap
-                    .terminal_seq
-                    .is_none_or(|ts| cursor.is_none_or(|k| ts > k));
-                if emit_terminal {
-                    use bridge_core::task_store::TaskRecordStatus;
-                    let outcome = match snap.status {
-                        TaskRecordStatus::Completed => crate::reattach::TerminalOutcome::Completed,
-                        TaskRecordStatus::Canceled => crate::reattach::TerminalOutcome::Canceled,
-                        // Failed, Interrupted, Working all map to Failed on the wire.
-                        _ => crate::reattach::TerminalOutcome::Failed,
-                    };
-                    let output = snap
-                        .result
-                        .clone()
-                        .or(snap.error.clone())
-                        .unwrap_or_default();
-                    frames.push(crate::reattach::WorkflowProgressFrame {
-                        v: 1,
-                        seq: snap.terminal_seq.unwrap_or(0),
-                        phase: crate::reattach::Phase::Live,
-                        kind: crate::reattach::FrameKind::Terminal { outcome, output },
-                    });
-                }
-
-                // Convert Vec<WorkflowProgressFrame> into an SSE stream and return.
-                // A terminal task's stream is FINITE — it ends after the Terminal frame,
-                // so NO keep-alive (which would be a reader-trap suggesting more may come).
-                let sse_stream = futures::stream::iter(frames.into_iter().map(|f| {
-                    Ok::<_, std::convert::Infallible>(
-                        SseEvent::default()
-                            .id(f.seq.to_string())
-                            .data(serde_json::to_string(&f).unwrap_or_default()),
-                    )
-                }));
-                Sse::new(sse_stream).into_response()
+        Ok(Some(rec)) => {
+            if rec.status.is_terminal() {
+                // --- Terminal-task flow (Task 8) --- read the snapshot and replay it
+                // as a FINITE SSE stream (snapshot → SnapshotComplete → Terminal → close).
+                let snap = match srv.task_store.progress_snapshot(&task_id).await {
+                    Ok(s) => s,
+                    Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+                };
+                terminal_sse_response(&snap, cursor)
             } else {
-                // --- Working-task flow (Task 9, stub for now) ---
-                let empty_stream =
-                    futures::stream::empty::<Result<SseEvent, std::convert::Infallible>>();
-                Sse::new(empty_stream)
-                    .keep_alive(KeepAlive::default())
-                    .into_response()
+                // --- Working-task flow (Task 9) --- subscribe-first, then snapshot,
+                // then live-tail the hub until the Terminal frame.
+                working_sse_response(&srv, &task_id, cursor, id).await
             }
         }
         Ok(None) => bridge_err_to_jsonrpc(id, &BridgeError::TaskNotFound),
         Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
     }
+}
+
+/// Build the FINITE terminal SSE response from a durable snapshot: the
+/// cursor-filtered snapshot frames, a `SnapshotComplete` sentinel, and (unless the
+/// cursor already covers a known `terminal_seq`) the `Terminal` frame, then close.
+///
+/// Shared by BOTH the initial-terminal branch (the `get()` already returned a
+/// terminal record) AND the I5 terminal-during-snapshot race in the working flow
+/// (the post-subscribe snapshot read sees a terminal status). A terminal stream is
+/// FINITE — it ends after the Terminal frame, so NO keep-alive (which would be a
+/// reader-trap suggesting more may come).
+fn terminal_sse_response(
+    snap: &bridge_core::task_store::TaskProgressSnapshot,
+    cursor: Option<i64>,
+) -> Response {
+    // Build snapshot frames (cursor-filtered, seq-ordered).
+    let mut frames = snapshot_frames(snap, cursor);
+
+    // Append SnapshotComplete sentinel (seq = max snapshot frame seq or cut_seq).
+    let sentinel_seq = frames.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
+    frames.push(crate::reattach::WorkflowProgressFrame {
+        v: 1,
+        seq: sentinel_seq,
+        phase: crate::reattach::Phase::Snapshot,
+        kind: crate::reattach::FrameKind::SnapshotComplete,
+    });
+
+    // Append Terminal frame unless cursor already covers a KNOWN terminal_seq.
+    // None (legacy) → always emit; Some(ts) → emit only if cursor < ts.
+    let emit_terminal = snap
+        .terminal_seq
+        .is_none_or(|ts| cursor.is_none_or(|k| ts > k));
+    if emit_terminal {
+        use bridge_core::task_store::TaskRecordStatus;
+        let outcome = match snap.status {
+            TaskRecordStatus::Completed => crate::reattach::TerminalOutcome::Completed,
+            TaskRecordStatus::Canceled => crate::reattach::TerminalOutcome::Canceled,
+            // Failed, Interrupted, Working all map to Failed on the wire.
+            _ => crate::reattach::TerminalOutcome::Failed,
+        };
+        let output = snap.result.clone().or(snap.error.clone()).unwrap_or_default();
+        frames.push(crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq: snap.terminal_seq.unwrap_or(0),
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::Terminal { outcome, output },
+        });
+    }
+
+    // Convert Vec<WorkflowProgressFrame> into an SSE stream and return.
+    let sse_stream = futures::stream::iter(frames.into_iter().map(|f| {
+        Ok::<_, std::convert::Infallible>(
+            SseEvent::default()
+                .id(f.seq.to_string())
+                .data(serde_json::to_string(&f).unwrap_or_default()),
+        )
+    }));
+    Sse::new(sse_stream).into_response()
+}
+
+/// Build the streaming working SSE response: subscribe to the task's live progress
+/// hub FIRST (the exactly-once boundary), replay the durable snapshot, emit
+/// `SnapshotComplete`, then live-tail the broadcast receiver until the `Terminal`
+/// frame, then close.
+///
+/// Exactly-once across the snapshot↔live boundary: `rx = hub.subscribe()` happens
+/// BEFORE the snapshot read, so a frame published between the snapshot cut and the
+/// live tail is buffered in `rx` (no gap), and the dedup floor drops any live frame
+/// whose seq is already covered by the snapshot (no dup).
+///
+/// Races handled:
+/// - No hub registered yet (runner not started / just deregistered) → re-`get`; if
+///   now terminal, replay via [`terminal_sse_response`]; else a RETRYABLE JSON-RPC
+///   error (the client retries — the durable snapshot makes this lossless).
+/// - I5 terminal-during-snapshot: the post-subscribe snapshot reads a terminal
+///   status → replay via [`terminal_sse_response`] (do NOT rely on `rx` Closed).
+/// - I7 broadcast lag: `RecvError::Lagged` → emit ONE retryable `event: error` SSE
+///   event then close (the client reconnects with its `Last-Event-ID` cursor and
+///   re-snapshots — no lost state because the snapshot is durable).
+async fn working_sse_response(
+    srv: &Arc<InboundServer>,
+    task_id: &TaskId,
+    cursor: Option<i64>,
+    id: Value,
+) -> Response {
+    // Look up the per-task progress hub.
+    let hub = srv.progress_hubs.lock().await.get(task_id).cloned();
+    let hub = match hub {
+        Some(h) => h,
+        None => {
+            // No hub: the runner hasn't registered yet, or it just deregistered on
+            // finishing. Re-`get` to disambiguate: if the task is now terminal, the
+            // runner finished — replay the terminal snapshot. Otherwise it is a
+            // transient bind/dereg window → a RETRYABLE error (the client retries;
+            // the durable snapshot makes the retry lossless).
+            return match srv.task_store.get(task_id).await {
+                Ok(Some(rec)) if rec.status.is_terminal() => {
+                    match srv.task_store.progress_snapshot(task_id).await {
+                        Ok(snap) => terminal_sse_response(&snap, cursor),
+                        Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+                    }
+                }
+                // Still Working but no hub: a transient bind/dereg window. Map to a
+                // server-side (INTERNAL, not 400-reject) error so the client retries
+                // rather than treating it as a permanent not-found.
+                Ok(Some(_)) => bridge_err_to_jsonrpc(id, &BridgeError::AgentOverloaded),
+                Ok(None) => bridge_err_to_jsonrpc(id, &BridgeError::TaskNotFound),
+                Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+            };
+        }
+    };
+
+    // EXACTLY-ONCE BOUNDARY: subscribe BEFORE reading the snapshot. A frame
+    // published after this point is buffered in `rx`, so nothing is lost in the
+    // window between the snapshot cut and the start of the live tail.
+    let rx = hub.subscribe();
+
+    // Read the durable snapshot.
+    let snap = match srv.task_store.progress_snapshot(task_id).await {
+        Ok(s) => s,
+        Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+    };
+
+    // I5: the task finished during/just-before the snapshot read → replay the
+    // terminal snapshot (do NOT rely on `rx` Closed; the runner may have published
+    // its Terminal frame before we subscribed).
+    if snap.status.is_terminal() {
+        return terminal_sse_response(&snap, cursor);
+    }
+
+    // Snapshot phase: cursor-filtered, seq-ordered frames + a SnapshotComplete
+    // sentinel (seq = max snapshot frame seq, else cut_seq).
+    let mut snapshot_vec = snapshot_frames(&snap, cursor);
+    let sentinel_seq = snapshot_vec.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
+    snapshot_vec.push(crate::reattach::WorkflowProgressFrame {
+        v: 1,
+        seq: sentinel_seq,
+        phase: crate::reattach::Phase::Snapshot,
+        kind: crate::reattach::FrameKind::SnapshotComplete,
+    });
+
+    // Dedup floor: a cursor-less subscriber keeps seq 0, and the snapshot↔live
+    // overlap is deduped (drop live frames already covered by the snapshot cut).
+    let dedup_floor = cursor.unwrap_or(-1).max(snap.cut_seq);
+
+    // Build the streaming SSE body: the snapshot vec first, then the live tail from
+    // `rx`. `async_stream::stream!` lets us write the imperative snapshot-then-tail
+    // logic; the receiver is MOVED in so the subscribe already happened at
+    // handler-call time (the test publishes AFTER the handler returns).
+    let stream = async_stream::stream! {
+        // 1. Replay the snapshot phase.
+        for f in snapshot_vec {
+            yield Ok::<_, std::convert::Infallible>(
+                SseEvent::default()
+                    .id(f.seq.to_string())
+                    .data(serde_json::to_string(&f).unwrap_or_default()),
+            );
+        }
+        // 2. Live-tail the hub until the Terminal frame.
+        let mut rx = rx;
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    // Dedup: drop frames already covered by the snapshot cut/cursor.
+                    if frame.seq <= dedup_floor {
+                        continue;
+                    }
+                    let is_terminal = matches!(
+                        &frame.kind,
+                        crate::reattach::FrameKind::Terminal { .. }
+                    );
+                    yield Ok(
+                        SseEvent::default()
+                            .id(frame.seq.to_string())
+                            .data(serde_json::to_string(&frame).unwrap_or_default()),
+                    );
+                    // END the stream after emitting a Terminal-kind frame.
+                    if is_terminal {
+                        break;
+                    }
+                }
+                // I7: the receiver lagged (the runner outran this slow consumer) →
+                // emit ONE retryable error event then close. The client reconnects
+                // with its Last-Event-ID cursor and re-snapshots — lossless because
+                // the snapshot is durable.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok(
+                        SseEvent::default()
+                            .event("error")
+                            .data(
+                                serde_json::json!({"retryable": true, "reason": "lagged"})
+                                    .to_string(),
+                            ),
+                    );
+                    break;
+                }
+                // The hub was dropped (the task finalized and removed the hub) →
+                // close. The durable terminal is still readable via a fresh subscribe.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    // The working stream is long-lived (the in-flight tail) → keep-alive is
+    // appropriate here, unlike the FINITE terminal branch.
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Build the ordered, cursor-filtered `Vec<WorkflowProgressFrame>` for the snapshot phase.
@@ -5878,6 +6034,9 @@ mod tests {
         store.create(&rec).await.unwrap();
 
         let srv = build_with_task_store(store);
+        // Working task: the working flow requires a live progress hub (Task 9). Insert
+        // one so the request is routed to the working flow and yields an SSE response.
+        insert_hub(&srv, &TaskId::parse("test-task-7c").unwrap()).await;
         let resp = router(srv)
             .oneshot(post_request(
                 methods::SUBSCRIBE_TO_TASK,
@@ -5923,6 +6082,8 @@ mod tests {
         store.create(&rec).await.unwrap();
 
         let srv = build_with_task_store(store);
+        // Working task: the working flow requires a live progress hub (Task 9).
+        insert_hub(&srv, &TaskId::parse("test-task-7c2").unwrap()).await;
         let resp = router(srv)
             .oneshot(post_request(
                 methods::SUBSCRIBE_TO_TASK,
@@ -6191,6 +6352,331 @@ mod tests {
         assert!(
             body.contains("PONG"),
             "SendStreamingMessage must still route to stream_message and get PONG: {body}"
+        );
+    }
+
+    // ---- Task 9: working-state flow (subscribe-first + cut_seq dedup + live-tail) ----
+
+    /// Build a live `NodeFinished` frame for a hub publish at the given seq.
+    fn live_node_finished(seq: i64, node: &str) -> crate::reattach::WorkflowProgressFrame {
+        crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq,
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::NodeFinished {
+                node: node.to_string(),
+                ok: true,
+                output: "live".to_string(),
+            },
+        }
+    }
+
+    /// Build a live `Terminal` frame for a hub publish at the given seq.
+    fn live_terminal(seq: i64) -> crate::reattach::WorkflowProgressFrame {
+        crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq,
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::Terminal {
+                outcome: crate::reattach::TerminalOutcome::Completed,
+                output: "done".to_string(),
+            },
+        }
+    }
+
+    /// Call the `subscribe_to_task` handler DIRECTLY (not via the router) so the test
+    /// can publish live frames AFTER the handler returns — the handler subscribes
+    /// synchronously, so frames published after the call still land in the response
+    /// stream's buffered receiver.
+    async fn call_subscribe(
+        srv: &Arc<InboundServer>,
+        task_id: &str,
+        cursor: Option<i64>,
+    ) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(SVC_PARAM_VERSION, "1.0".parse().unwrap());
+        if let Some(k) = cursor {
+            headers.insert("Last-Event-ID", k.to_string().parse().unwrap());
+        }
+        subscribe_to_task(
+            srv.clone(),
+            headers,
+            json!(1),
+            json!({ "id": task_id }),
+        )
+        .await
+    }
+
+    /// Insert a fresh hub for `task` into the server's `progress_hubs` and return it
+    /// so the test can publish live frames to the same hub the handler subscribes to.
+    async fn insert_hub(
+        srv: &Arc<InboundServer>,
+        task: &TaskId,
+    ) -> Arc<crate::reattach::TaskProgressHub> {
+        let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+        srv.progress_hubs
+            .lock()
+            .await
+            .insert(task.clone(), hub.clone());
+        hub
+    }
+
+    /// (9a) In-flight: snapshot checkpoints (seqs 1,2), then live NodeFinished(3) +
+    /// Terminal(4). Expected ordered vector with NO dup of 1,2 in the live tail, NO gap.
+    #[tokio::test]
+    async fn subscribe_working_in_flight_snapshot_then_live_tail() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9a").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        // Durable snapshot: seqs 1,2 are finished checkpoints (task stays Working).
+        let s1 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap();
+        let s2 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .await
+            .unwrap();
+        assert_eq!((s1, s2), (1, 2));
+
+        let srv = build_with_task_store(store);
+        let hub = insert_hub(&srv, &task_id).await;
+
+        // Subscribe synchronously (the handler subscribes before returning).
+        let resp = call_subscribe(&srv, "t9a", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Now publish the live tail (buffers in the response stream's receiver).
+        hub.publish(live_node_finished(3, "node-c"));
+        hub.publish(live_terminal(4));
+
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (1, "node_finished".to_string()),
+                (2, "node_finished".to_string()),
+                (2, "snapshot_complete".to_string()),
+                (3, "node_finished".to_string()),
+                (4, "terminal".to_string()),
+            ],
+            "in-flight: snapshot then live tail, no dup/gap: {frames:?}"
+        );
+    }
+
+    /// (9b) Two concurrent subscribers each subscribe their own rx; publish the live
+    /// frames ONCE; both collected bodies equal the full ordered vector.
+    #[tokio::test]
+    async fn subscribe_working_two_concurrent_subscribers() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9b").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq 1
+
+        let srv = build_with_task_store(store);
+        let hub = insert_hub(&srv, &task_id).await;
+
+        // Two subscribers, each gets its own rx (subscribe-first).
+        let resp1 = call_subscribe(&srv, "t9b", None).await;
+        let resp2 = call_subscribe(&srv, "t9b", None).await;
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        // Publish the live frames ONCE — broadcast fans out to both receivers.
+        hub.publish(live_node_finished(2, "node-b"));
+        hub.publish(live_terminal(3));
+
+        let expected = vec![
+            (1, "node_finished".to_string()),
+            (1, "snapshot_complete".to_string()),
+            (2, "node_finished".to_string()),
+            (3, "terminal".to_string()),
+        ];
+        let f1 = collect_sse_frames(resp1).await;
+        let f2 = collect_sse_frames(resp2).await;
+        assert_eq!(f1, expected, "subscriber 1: {f1:?}");
+        assert_eq!(f2, expected, "subscriber 2: {f2:?}");
+    }
+
+    /// (9c) Empty snapshot: Working task, no checkpoints/starts → SnapshotComplete
+    /// at seq=cut_seq(0), then the live tail, then Terminal.
+    #[tokio::test]
+    async fn subscribe_working_empty_snapshot_emits_snapshot_complete_then_live() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9c").await;
+
+        let srv = build_with_task_store(store);
+        let hub = insert_hub(&srv, &task_id).await;
+
+        let resp = call_subscribe(&srv, "t9c", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // dedup_floor = max(-1, cut_seq=0) = 0 → live frames must have seq > 0.
+        hub.publish(live_node_finished(1, "node-a"));
+        hub.publish(live_terminal(2));
+
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (0, "snapshot_complete".to_string()),
+                (1, "node_finished".to_string()),
+                (2, "terminal".to_string()),
+            ],
+            "empty snapshot: snapshot_complete(cut_seq) then live tail: {frames:?}"
+        );
+    }
+
+    /// (9d) Cursor >= cut_seq on a TERMINAL task → SnapshotComplete then immediate
+    /// close (no hang). The terminal branch with a high cursor must not block.
+    #[tokio::test]
+    async fn subscribe_terminal_high_cursor_snapshot_complete_then_close() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9d").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq 1
+        let ts = store
+            .set_terminal_sequenced(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap(); // seq 2 (terminal_seq)
+        assert_eq!(ts, 2);
+
+        let srv = build_with_task_store(store);
+        // No hub needed (terminal branch). cursor=5 >= cut_seq=2 and >= terminal_seq=2.
+        let resp = call_subscribe(&srv, "t9d", Some(5)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Must NOT hang: collect returns. All snapshot frames are filtered by the
+        // high cursor, the terminal frame is suppressed (cursor >= terminal_seq),
+        // leaving only SnapshotComplete (its seq = cut_seq when no frames pass).
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![(2, "snapshot_complete".to_string())],
+            "high cursor terminal: snapshot_complete only, no hang: {frames:?}"
+        );
+    }
+
+    /// (9e) I5 terminal-during-snapshot: insert the hub, write snapshot checkpoints,
+    /// THEN set the task terminal, THEN call the handler. `get` returns the terminal
+    /// rec → the terminal branch runs. Assertion: a Terminal frame IS delivered and
+    /// the stream closes (never hangs / closes-without-terminal).
+    #[tokio::test]
+    async fn subscribe_terminal_during_snapshot_delivers_terminal() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9e").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        let srv = build_with_task_store(store.clone());
+        // Insert the hub (as a live runner would), write snapshot checkpoints...
+        let _hub = insert_hub(&srv, &task_id).await;
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq 1
+        // ...then the task finishes (terminal written) BEFORE the handler is called.
+        let ts = store
+            .set_terminal_sequenced(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap(); // seq 2
+
+        let resp = call_subscribe(&srv, "t9e", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let frames = collect_sse_frames(resp).await;
+        // Must terminate with a Terminal frame (never hang / close without terminal).
+        assert_eq!(
+            frames.last(),
+            Some(&(ts, "terminal".to_string())),
+            "terminal-during-snapshot must end with a Terminal frame: {frames:?}"
+        );
+    }
+
+    /// (9f) I7 broadcast-lag: subscribe, then publish MORE than the channel capacity
+    /// (300 > 256) to force the receiver to lag → the body ends with a retryable
+    /// `event: error` SSE event, then closes. A fresh re-subscribe with the last-seen
+    /// cursor still yields a coherent snapshot.
+    #[tokio::test]
+    async fn subscribe_working_broadcast_lag_yields_retryable_error_then_close() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9f").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq 1
+
+        let srv = build_with_task_store(store.clone());
+        let hub = insert_hub(&srv, &task_id).await;
+
+        let resp = call_subscribe(&srv, "t9f", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Publish 300 frames BEFORE the stream is drained → the receiver (cap 256)
+        // overflows → RecvError::Lagged on the first live recv.
+        for s in 2..302 {
+            hub.publish(live_node_finished(s, "node-x"));
+        }
+
+        // Collect the raw body and assert the retryable error event closes the stream.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("event: error") || body.contains("event:error"),
+            "lag must emit an SSE error event: {body}"
+        );
+        assert!(
+            body.contains("retryable") && body.contains("lagged"),
+            "lag error event must carry retryable/lagged: {body}"
+        );
+
+        // A fresh re-subscribe with the last-seen cursor re-snapshots coherently.
+        // (The durable snapshot makes reconnect lossless — the snapshot still
+        // reports the Working task and its checkpoint.)
+        let snap = store.progress_snapshot(&task_id).await.unwrap();
+        assert_eq!(
+            snap.status,
+            bridge_core::task_store::TaskRecordStatus::Working
+        );
+        let hub2 = insert_hub(&srv, &task_id).await;
+        let resp2 = call_subscribe(&srv, "t9f", Some(1)).await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        hub2.publish(live_terminal(2));
+        let frames2 = collect_sse_frames(resp2).await;
+        // cursor=1 filters the seq-1 checkpoint; snapshot_complete seq = cut_seq (1),
+        // then the live terminal.
+        assert_eq!(
+            frames2,
+            vec![
+                (1, "snapshot_complete".to_string()),
+                (2, "terminal".to_string()),
+            ],
+            "re-subscribe after lag must re-snapshot coherently: {frames2:?}"
         );
     }
 }
