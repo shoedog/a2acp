@@ -8,7 +8,6 @@ use tokio::sync::broadcast;
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Phase {
-    #[allow(dead_code)] // consumed in Tasks 8-9
     Snapshot,
     Live,
 }
@@ -46,7 +45,6 @@ pub(crate) enum FrameKind {
         ok: bool,
         output: String,
     },
-    #[allow(dead_code)] // consumed in Tasks 8-9
     SnapshotComplete,
     Terminal {
         outcome: TerminalOutcome,
@@ -77,13 +75,11 @@ pub(crate) struct TaskProgressHub {
 }
 
 impl TaskProgressHub {
-    #[allow(dead_code)] // wired into the server in Task 5
     pub(crate) fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
         Self { tx }
     }
 
-    #[allow(dead_code)] // consumed in Tasks 7-9
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<WorkflowProgressFrame> {
         self.tx.subscribe()
     }

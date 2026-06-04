@@ -181,7 +181,6 @@ pub struct InboundServer {
     /// Per-task broadcast hubs for streaming reattach (Task 3). Keyed by TaskId;
     /// populated by the DetachedProgressSink (Task 4) and read by the
     /// SubscribeToTask handler (Tasks 7-9). Cleaned up by the Finalizer (Task 6).
-    #[allow(dead_code)] // consumed in Task 4-9
     pub(crate) progress_hubs: Arc<
         tokio::sync::Mutex<
             std::collections::HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>,
