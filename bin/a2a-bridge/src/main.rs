@@ -529,6 +529,18 @@ const INIT_PROMPTS: &[(&str, &str)] = &[
         "prompts/plan-review-synth.md",
         include_str!("../../../prompts/plan-review-synth.md"),
     ),
+    (
+        "prompts/design-codex.md",
+        include_str!("../../../prompts/design-codex.md"),
+    ),
+    (
+        "prompts/design-claude.md",
+        include_str!("../../../prompts/design-claude.md"),
+    ),
+    (
+        "prompts/design-synth.md",
+        include_str!("../../../prompts/design-synth.md"),
+    ),
 ];
 
 const INIT_README: &str = include_str!("init-readme-template.md");
@@ -614,6 +626,25 @@ id = "synth"
 agent = "claude"
 prompt_file = "prompts/plan-review-synth.md"
 inputs = ["exec", "coverage"]
+
+# design: two clean-room architect lenses (firewalled via inputs=[]) + synth.
+[[workflows]]
+id = "design"
+[[workflows.nodes]]
+id = "codex"
+agent = "codex"
+prompt_file = "prompts/design-codex.md"
+inputs = []
+[[workflows.nodes]]
+id = "claude"
+agent = "claude"
+prompt_file = "prompts/design-claude.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "prompts/design-synth.md"
+inputs = ["codex", "claude"]
 "#;
 
 /// Build the `a2a-bridge.toml` contents for the selected agents.
@@ -1094,7 +1125,11 @@ mod cli_tests {
         let raw = std::fs::read_to_string(dir.join("a2a-bridge.toml")).unwrap();
         let cfg = config::RegistryConfig::parse(&raw).unwrap();
         let wf = cfg.load_workflows(&dir).unwrap();
-        assert_eq!(wf.len(), 3, "code-review + spec-review + plan-review load");
+        assert_eq!(
+            wf.len(),
+            4,
+            "code-review + spec-review + plan-review + design load"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1140,7 +1175,7 @@ mod cli_tests {
         let cfg = config::RegistryConfig::parse(&raw).unwrap();
         let base = path.parent().unwrap();
         let wf = cfg.load_workflows(base).unwrap();
-        assert_eq!(wf.len(), 3);
+        assert_eq!(wf.len(), 4);
     }
 
     // ---- Task 10: task watch <id> arg-parsing ----

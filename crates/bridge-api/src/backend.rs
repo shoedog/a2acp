@@ -14,6 +14,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::watch;
 
+/// Map a non-success upstream HTTP status to the RIGHT `BridgeError` variant so
+/// the disposition is correct: `429` → `AgentOverloaded`, `401`/`403` →
+/// `AgentNotAuthenticated` (→ `SetState(AuthRequired)` — "fix credentials"),
+/// everything else → `AgentCrashed{reason}` (→ `Failed`). The status string never
+/// embeds the URL/body, so the wire-leak guard is preserved.
+fn map_http_error(status: reqwest::StatusCode) -> BridgeError {
+    match status {
+        reqwest::StatusCode::TOO_MANY_REQUESTS => BridgeError::AgentOverloaded,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            BridgeError::AgentNotAuthenticated
+        }
+        _ => BridgeError::agent_crashed(format!("upstream API returned error status: {status}")),
+    }
+}
+
 /// Per-session state: the stashed effective model + a `watch` channel used as the
 /// cancel signal. A `watch` (level-triggered, version-counted) lets the turn loop
 /// `select!` on cancellation even while parked awaiting the next SSE chunk — an
@@ -141,7 +156,7 @@ impl AgentBackend for ApiBackend {
                 let mut builder = client.post(&url).json(&req);
                 if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
                 let resp = builder.send().await.map_err(|e| BridgeError::agent_crashed(format!("HTTP request to upstream API failed: {e}")))?;
-                if !resp.status().is_success() { Err(BridgeError::agent_crashed(format!("upstream API returned error status: {}", resp.status())))?; }
+                if !resp.status().is_success() { Err(map_http_error(resp.status()))?; }
 
                 let parsed = if do_stream {
                     let mut acc = SseAccumulator::default();
