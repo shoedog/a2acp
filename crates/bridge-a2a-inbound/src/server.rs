@@ -6497,6 +6497,48 @@ mod tests {
         );
     }
 
+    /// (9a2) A Working task with an IN-PROGRESS node — a `record_node_started` with no
+    /// matching checkpoint — surfaces as a `node_started` frame in the snapshot. This
+    /// exercises the `snap.starts → NodeStarted` branch of `snapshot_frames` (terminal
+    /// tasks clear their starts, so this is the only path that reaches it).
+    #[tokio::test]
+    async fn subscribe_working_snapshot_includes_in_progress_start() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9a2").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let node_x = bridge_core::ids::NodeId::parse("node-x").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        // node-a finished (seq 1); node-x started but NOT finished (seq 2, stays in starts).
+        let s1 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap();
+        let s2 = store
+            .record_node_started(&task_id, &node_x, now)
+            .await
+            .unwrap();
+        assert_eq!((s1, s2), (1, 2));
+
+        let srv = build_with_task_store(store);
+        let hub = insert_hub(&srv, &task_id).await;
+        let resp = call_subscribe(&srv, "t9a2", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Finish the in-flight run so the stream closes.
+        hub.publish(live_terminal(3));
+
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (1, "node_finished".to_string()),
+                (2, "node_started".to_string()),
+                (2, "snapshot_complete".to_string()),
+                (3, "terminal".to_string()),
+            ],
+            "snapshot must include the in-progress node as node_started: {frames:?}"
+        );
+    }
+
     /// (9b) Two concurrent subscribers each subscribe their own rx; publish the live
     /// frames ONCE; both collected bodies equal the full ordered vector.
     #[tokio::test]
