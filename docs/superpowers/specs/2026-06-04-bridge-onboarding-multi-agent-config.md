@@ -1,7 +1,7 @@
 # Bridge Onboarding — Turnkey Multi-Agent Config (design)
 
 **Date:** 2026-06-04
-**Status:** Draft rev2 (Claude design merged with the firewalled independent codex design; pending a codex review of this merged design)
+**Status:** Draft rev3 (Claude design + firewalled independent codex design, then a codex review of the merge — folded: example-vs-init prompt paths differ, init default-resolution when an agent is excluded, unknown-arg errors)
 
 **Goal:** Make it turnkey for an external project to run the a2a-bridge with **multiple agents (kiro + claude + codex + an `api` agent), each configured with model/effort/mode**, and to use the shipped review workflows — without it being "a setup sub-project."
 
@@ -16,14 +16,15 @@
 ## The deliverables
 
 ### 1. `serve --config <path>`
-- Make `serve` an **explicit subcommand** that accepts `--config <path>` (today serve is the bare/default invocation reading `./a2a-bridge.toml`). Keep **bare `a2a-bridge` = serve with `./a2a-bridge.toml`** (back-compat); document `a2a-bridge serve --config <path>`. (Optionally accept top-level `a2a-bridge --config <path>` as a compat alias.)
+- Make `serve` an **explicit subcommand** that accepts `--config <path>` (today serve is the bare/default invocation reading `./a2a-bridge.toml`). Keep **bare `a2a-bridge` (no args) = serve with `./a2a-bridge.toml`** (back-compat); document `a2a-bridge serve --config <path>`. (Optionally accept top-level `a2a-bridge --config <path>` as a compat alias.)
+- **(codex-review) Unknown top-level args must ERROR, not silently serve.** Today anything that isn't `run-workflow`/`submit`/`task` falls through to serve and ignores its args, so `a2a-bridge sreve --config x` (typo) silently serves the default (`main.rs:466`). The dispatch must reject an unknown first token / unknown serve flag with a usage error — so a typo'd subcommand or `--config` doesn't get swallowed.
 - **Missing-file behavior splits by intent:**
   - **No `--config` (zero-config first run):** keep materializing the kiro-only `DEFAULT_CONFIG` in CWD (zero-auth "just works"), but add a header comment pointing to `a2a-bridge init`.
   - **Explicit `--config <path>` to a missing file → ERROR** (`config not found at <path>; run `a2a-bridge init``). Do NOT create a kiro-only file at an explicit path — that hides typos and recreates the original "why can't I reach codex?" failure.
 - **Path normalization:** normalize the chosen config path to **absolute** at startup; use its **parent dir** as the base for workflow `prompt_file`s (already the behavior — `main.rs:608`) AND for a **relative `[store] path`** (NOT today's behavior — a relative store path currently resolves from process CWD; bring it into line so `serve --config ../proj/a2a-bridge.toml` doesn't write task state in the caller's CWD).
 
 ### 2. Canonical multi-agent reference config
-- Ship `examples/a2a-bridge.multi-agent.toml`, and use the SAME template (embedded) for `init`. Shape:
+- Ship `examples/a2a-bridge.multi-agent.toml` AND embed a near-identical template for `init`. **(codex-review) The two differ ONLY in the `prompt_file` prefix** — `load_workflows` resolves prompts relative to the config's dir (`config.rs:236`): the committed example (under `examples/`) must reference **`../prompts/...`** (prompts live in the repo's `prompts/`), while `init` writes prompts into `<dir>/prompts/` so its generated config uses **`prompts/...`**. Same agents + workflow structure; different prompt path. Shape:
   - `default = "kiro"` (low-friction first route — doesn't depend on codex/claude auth).
   - `[registry] allowed_cmds = ["kiro-cli", "codex-acp", "claude-agent-acp"]` — **the `api` agent's "command" does NOT belong here** (it's a non-process `kind="api"` backend).
   - `[store] path = ".a2a-bridge/tasks.sqlite"`, `resume_attempt_cap = 3`.
@@ -37,7 +38,8 @@
 
 ### 3. `a2a-bridge init` scaffold
 - `a2a-bridge init [--dir <path>] [--agents kiro,codex,claude,api] [--force]`:
-  - `--dir` default `.`; `--agents` default = all four (`default="kiro"`).
+  - `--dir` default `.`; `--agents` default = all four; optional `--default <id>`.
+  - **(codex-review) The generated `default` must be a SELECTED agent** (`Registry::validate` rejects a default not in entries, `registry.rs:129`): `default` = `--default` if given, else `kiro` if it's in `--agents`, else the FIRST selected agent. So `--agents codex` yields `default="codex"`, not a dangling `kiro`.
   - Writes: `<dir>/a2a-bridge.toml`, `<dir>/README-a2a-bridge.md`, `<dir>/prompts/{review-codex,review-claude,review-synth,spec-review-rigor,spec-review-soundness,spec-review-synth,plan-review-exec,plan-review-coverage,plan-review-synth}.md`, and the `<dir>/.a2a-bridge/` dir (for the store).
   - **Prompts + README are EMBEDDED in the binary (`include_str!`)** — `init` is self-contained (no bridge repo needed at runtime).
   - **`--agents` filters BOTH the agent entries AND the workflows that reference an excluded agent** (a kiro-only init must NOT emit a `code-review` workflow that references a missing codex/claude — it would fail `load_workflows` at boot). Still copy ALL prompt files regardless.
@@ -61,10 +63,10 @@
 ---
 
 ## Definition of Done (each → a check)
-1. `a2a-bridge serve --config <path>` reads the given config (path normalized absolute); a missing explicit path → a clear error pointing at `init`; bare `a2a-bridge` keeps the materialize-kiro-default first-run.
+1. `a2a-bridge serve --config <path>` reads the given config (path normalized absolute); a missing explicit path → a clear error pointing at `init`; bare `a2a-bridge` keeps the materialize-kiro-default first-run; an **unknown subcommand/flag errors** (no silent serve).
 2. Workflow prompt paths AND a relative store path resolve relative to the config's dir (not CWD) — verified with a config outside CWD.
-3. `a2a-bridge init` writes config + prompts + README + `.a2a-bridge/` to `--dir`; `--agents` filters agents AND the dependent workflows; `--force` guards clobber (managed files only); prompts embedded (works with no repo present).
-4. The reference config parses + its agents/workflows load (a config-parse test + a `load_workflows` smoke); no `mode` that would hard-fail session setup.
+3. `a2a-bridge init` writes config + prompts + README + `.a2a-bridge/` to `--dir`; `--agents` filters agents AND the dependent workflows; the generated `default` is always a selected agent; `--force` guards clobber (managed files only); prompts embedded (works with no repo present). A partial-agent init (e.g. `--agents codex`) still loads (valid default, no workflow referencing a missing agent).
+4. The reference config parses + its agents/workflows load — the committed `examples/` one via `../prompts/...`, an `init`-generated one via `prompts/...` (a config-parse test + a `load_workflows` smoke on both); no `mode` that would hard-fail session setup.
 5. Docs cover the agent-config reference + the three caveats (effort/mode/claude-model) + the run recipes + hot-reload + path rules.
 6. Agent Card is no longer kiro-branded.
 7. **Live (vs kiro AND codex/claude):** `init` a fresh temp dir → `serve --config` it → run a review workflow → `Completed`; confirm a **codex agent with `effort="high"` is reached** (not just kiro), and **kiro works zero-auth**.
