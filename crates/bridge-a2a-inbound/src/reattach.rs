@@ -38,11 +38,20 @@ impl TerminalOutcome {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum FrameKind {
-    NodeStarted { node: String },
-    NodeFinished { node: String, ok: bool, output: String },
+    NodeStarted {
+        node: String,
+    },
+    NodeFinished {
+        node: String,
+        ok: bool,
+        output: String,
+    },
     #[allow(dead_code)] // consumed in Tasks 8-9
     SnapshotComplete,
-    Terminal { outcome: TerminalOutcome, output: String },
+    Terminal {
+        outcome: TerminalOutcome,
+        output: String,
+    },
 }
 
 /// A single wire frame carried over the broadcast channel and serialized to SSE.

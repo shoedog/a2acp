@@ -177,10 +177,7 @@ pub trait TaskStore: Send + Sync {
     /// Under the single-writer-per-task model (one detached runner writes; the
     /// handler reads) this returns a consistent point-in-time view; `cut_seq` is
     /// guaranteed >= every included seq.
-    async fn progress_snapshot(
-        &self,
-        task: &TaskId,
-    ) -> Result<TaskProgressSnapshot, BridgeError>;
+    async fn progress_snapshot(&self, task: &TaskId) -> Result<TaskProgressSnapshot, BridgeError>;
 }
 
 use std::collections::HashMap;
@@ -453,13 +450,12 @@ impl TaskStore for MemoryTaskStore {
         Ok(seq)
     }
 
-    async fn progress_snapshot(
-        &self,
-        task: &TaskId,
-    ) -> Result<TaskProgressSnapshot, BridgeError> {
+    async fn progress_snapshot(&self, task: &TaskId) -> Result<TaskProgressSnapshot, BridgeError> {
         let row = {
             let g = self.inner.lock().unwrap();
-            g.get(task.as_str()).cloned().ok_or(BridgeError::StoreFailure)?
+            g.get(task.as_str())
+                .cloned()
+                .ok_or(BridgeError::StoreFailure)?
         };
         let cut_seq = {
             let g = self.seq_counters.lock().unwrap();
@@ -704,32 +700,63 @@ mod tests {
         let s = MemoryTaskStore::new();
         let t = TaskId::parse("t").unwrap();
         s.create(&rec("t", 1)).await.unwrap(); // use the EXISTING helper for a Working TaskRecord
-        let s1 = s.record_node_started(&t, &NodeId::parse("a").unwrap(), 1).await.unwrap();
-        let s2 = s.put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), "OUT", true, 2).await.unwrap();
+        let s1 = s
+            .record_node_started(&t, &NodeId::parse("a").unwrap(), 1)
+            .await
+            .unwrap();
+        let s2 = s
+            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), "OUT", true, 2)
+            .await
+            .unwrap();
         assert!(s2 > s1, "seq is monotonic");
         // Fix 4a: checkpoint carries the allocated seq.
         let snap = s.progress_snapshot(&t).await.unwrap();
-        assert_eq!(snap.checkpoints[0].3, s2, "checkpoint carries its allocated seq");
-        let s3 = s.set_terminal_sequenced(&t, TaskRecordStatus::Completed, Some("R"), None, 3).await.unwrap();
+        assert_eq!(
+            snap.checkpoints[0].3, s2,
+            "checkpoint carries its allocated seq"
+        );
+        let s3 = s
+            .set_terminal_sequenced(&t, TaskRecordStatus::Completed, Some("R"), None, 3)
+            .await
+            .unwrap();
         assert!(s3 > s2);
         let snap = s.progress_snapshot(&t).await.unwrap();
         assert_eq!(snap.cut_seq, s3);
         assert_eq!(snap.terminal_seq, Some(s3));
         assert_eq!(snap.checkpoints.len(), 1);
-        assert!(snap.starts.is_empty(), "the start row was cleared on finish");
+        assert!(
+            snap.starts.is_empty(),
+            "the start row was cleared on finish"
+        );
         // idempotent re-start (resume re-emit): no error, new seq
         s.create(&rec("t2", 1)).await.unwrap();
         let t2 = TaskId::parse("t2").unwrap();
-        let a = s.record_node_started(&t2, &NodeId::parse("x").unwrap(), 1).await.unwrap();
-        let b = s.record_node_started(&t2, &NodeId::parse("x").unwrap(), 2).await.unwrap();
+        let a = s
+            .record_node_started(&t2, &NodeId::parse("x").unwrap(), 1)
+            .await
+            .unwrap();
+        let b = s
+            .record_node_started(&t2, &NodeId::parse("x").unwrap(), 2)
+            .await
+            .unwrap();
         assert!(b > a, "re-start upserts a fresh seq, no PK error");
         // Fix 4b: mid-flight check — record_node_started on a fresh task, then snapshot.
         s.create(&rec("t3", 1)).await.unwrap();
         let t3 = TaskId::parse("t3").unwrap();
-        let start_seq = s.record_node_started(&t3, &NodeId::parse("a").unwrap(), 1).await.unwrap();
+        let start_seq = s
+            .record_node_started(&t3, &NodeId::parse("a").unwrap(), 1)
+            .await
+            .unwrap();
         let snap = s.progress_snapshot(&t3).await.unwrap();
-        assert_eq!(snap.starts.len(), 1, "start must be present before checkpoint");
-        assert_eq!(snap.starts[0].1, start_seq, "start carries the allocated seq");
+        assert_eq!(
+            snap.starts.len(),
+            1,
+            "start must be present before checkpoint"
+        );
+        assert_eq!(
+            snap.starts[0].1, start_seq,
+            "start carries the allocated seq"
+        );
         assert!(snap.checkpoints.is_empty(), "no checkpoint yet for t3");
     }
 

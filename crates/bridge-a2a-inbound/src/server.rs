@@ -554,12 +554,8 @@ async fn jsonrpc(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     match method {
-        m if m == methods::SEND_STREAMING_MESSAGE => {
-            stream_message(srv, headers, id, params).await
-        }
-        m if m == methods::SUBSCRIBE_TO_TASK => {
-            subscribe_to_task(srv, headers, id, params).await
-        }
+        m if m == methods::SEND_STREAMING_MESSAGE => stream_message(srv, headers, id, params).await,
+        m if m == methods::SUBSCRIBE_TO_TASK => subscribe_to_task(srv, headers, id, params).await,
         m if m == methods::SEND_MESSAGE => unary_message(srv, headers, id, params).await,
         m if m == methods::CANCEL_TASK => cancel_task(srv, headers, id, params).await,
         m if m == methods::GET_TASK => get_task(srv, headers, id, params).await,
@@ -672,9 +668,7 @@ async fn subscribe_to_task(
 
     // I3: read the standard a2a-lf `id` field first; fall back to `taskId` as a
     // lenient alias so old clients that send only `taskId` are not broken.
-    let task_str = params["id"]
-        .as_str()
-        .or_else(|| params["taskId"].as_str());
+    let task_str = params["id"].as_str().or_else(|| params["taskId"].as_str());
     let task_str = match task_str {
         Some(s) => s,
         None => {
@@ -757,7 +751,11 @@ fn terminal_sse_response(
             // Failed, Interrupted, Working all map to Failed on the wire.
             _ => crate::reattach::TerminalOutcome::Failed,
         };
-        let output = snap.result.clone().or(snap.error.clone()).unwrap_or_default();
+        let output = snap
+            .result
+            .clone()
+            .or(snap.error.clone())
+            .unwrap_or_default();
         frames.push(crate::reattach::WorkflowProgressFrame {
             v: 1,
             seq: snap.terminal_seq.unwrap_or(0),
@@ -1540,9 +1538,7 @@ fn new_detached_task_id() -> TaskId {
 /// hub was ever inserted (e.g. the pre-spawn unknown-workflow reject), pass `hub: None`.
 pub(crate) async fn finalize_detached(
     store: &Arc<dyn bridge_core::task_store::TaskStore>,
-    progress_hubs: &Arc<
-        tokio::sync::Mutex<HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>>,
-    >,
+    progress_hubs: &Arc<tokio::sync::Mutex<HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>>>,
     task: &TaskId,
     status: bridge_core::task_store::TaskRecordStatus,
     result: Option<&str>,
@@ -5970,11 +5966,7 @@ mod tests {
     async fn subscribe_to_task_missing_id_returns_error() {
         let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
         let resp = router(srv)
-            .oneshot(post_request(
-                methods::SUBSCRIBE_TO_TASK,
-                json!({}),
-                "1.0",
-            ))
+            .oneshot(post_request(methods::SUBSCRIBE_TO_TASK, json!({}), "1.0"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -6194,19 +6186,22 @@ mod tests {
     ) -> bridge_core::ids::TaskId {
         let id = bridge_core::ids::TaskId::parse(task_id).unwrap();
         let now = crate::workflow_sink::now_ms();
-        store.create(&bridge_core::task_store::TaskRecord {
-            id: id.clone(),
-            workflow: "code-review".to_string(),
-            status: bridge_core::task_store::TaskRecordStatus::Working,
-            result: None,
-            error: None,
-            created_ms: now,
-            updated_ms: now,
-            input: "test input".to_string(),
-            workflow_spec_json: None,
-            resume_attempts: 0,
-            session_cwd: None,
-        }).await.unwrap();
+        store
+            .create(&bridge_core::task_store::TaskRecord {
+                id: id.clone(),
+                workflow: "code-review".to_string(),
+                status: bridge_core::task_store::TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: now,
+                updated_ms: now,
+                input: "test input".to_string(),
+                workflow_spec_json: None,
+                resume_attempts: 0,
+                session_cwd: None,
+            })
+            .await
+            .unwrap();
         id
     }
 
@@ -6220,9 +6215,24 @@ mod tests {
         let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
         let now = crate::workflow_sink::now_ms();
         // seq 1: node-a finished; seq 2: node-b finished; seq 3: terminal.
-        let s1 = store.put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now).await.unwrap();
-        let s2 = store.put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now).await.unwrap();
-        let s3 = store.set_terminal_sequenced(&task_id, bridge_core::task_store::TaskRecordStatus::Completed, Some("done"), None, now).await.unwrap();
+        let s1 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap();
+        let s2 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .await
+            .unwrap();
+        let s3 = store
+            .set_terminal_sequenced(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
         assert_eq!(s1, 1);
         assert_eq!(s2, 2);
         assert_eq!(s3, 3);
@@ -6259,9 +6269,24 @@ mod tests {
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
         let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
         let now = crate::workflow_sink::now_ms();
-        store.put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now).await.unwrap(); // seq=1
-        store.put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now).await.unwrap(); // seq=2
-        store.set_terminal_sequenced(&task_id, bridge_core::task_store::TaskRecordStatus::Completed, Some("done"), None, now).await.unwrap(); // seq=3
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq=1
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .await
+            .unwrap(); // seq=2
+        store
+            .set_terminal_sequenced(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap(); // seq=3
 
         let srv = build_with_task_store(store);
         let resp = router(srv)
@@ -6296,9 +6321,21 @@ mod tests {
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
         let now = crate::workflow_sink::now_ms();
         // Legacy put_node_checkpoint writes seq=0 (stored as 0 in the CheckpointValue).
-        store.put_node_checkpoint(&task_id, &node_a, "out-a", true, now).await.unwrap();
+        store
+            .put_node_checkpoint(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap();
         // Legacy set_terminal: terminal_seq=None (not stored in terminal_seqs).
-        store.set_terminal(&task_id, bridge_core::task_store::TaskRecordStatus::Completed, Some("done"), None, now).await.unwrap();
+        store
+            .set_terminal(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
 
         let srv = build_with_task_store(store);
         let resp = router(srv)
@@ -6398,13 +6435,7 @@ mod tests {
         if let Some(k) = cursor {
             headers.insert("Last-Event-ID", k.to_string().parse().unwrap());
         }
-        subscribe_to_task(
-            srv.clone(),
-            headers,
-            json!(1),
-            json!({ "id": task_id }),
-        )
-        .await
+        subscribe_to_task(srv.clone(), headers, json!(1), json!({ "id": task_id })).await
     }
 
     /// Insert a fresh hub for `task` into the server's `progress_hubs` and return it
@@ -6590,7 +6621,7 @@ mod tests {
             .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
             .await
             .unwrap(); // seq 1
-        // ...then the task finishes (terminal written) BEFORE the handler is called.
+                       // ...then the task finishes (terminal written) BEFORE the handler is called.
         let ts = store
             .set_terminal_sequenced(
                 &task_id,

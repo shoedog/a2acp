@@ -699,7 +699,15 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .query_row(
                 "SELECT status, result, error, terminal_seq, last_event_seq FROM tasks WHERE id=?1",
                 rusqlite::params![task.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         let status = bridge_core::task_store::TaskRecordStatus::parse(&status_s)
@@ -730,9 +738,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         // Read in-progress start rows ordered by seq.
         let starts: Vec<(NodeId, i64)> = {
             let mut st_stmt = tx
-                .prepare(
-                    "SELECT node_id, seq FROM task_node_starts WHERE task_id=?1 ORDER BY seq",
-                )
+                .prepare("SELECT node_id, seq FROM task_node_starts WHERE task_id=?1 ORDER BY seq")
                 .map_err(|_| BridgeError::StoreFailure)?;
             let mut st_rows = st_stmt
                 .query(rusqlite::params![task.as_str()])
@@ -1057,8 +1063,9 @@ mod tests {
                      output TEXT NOT NULL, ok INTEGER NOT NULL, ts INTEGER NOT NULL,
                      PRIMARY KEY(task_id, node_id),
                      FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-                 );"
-            ).unwrap();
+                 );",
+            )
+            .unwrap();
             c.execute(
                 "INSERT INTO tasks(id,workflow,status,created_ms,updated_ms) VALUES('old','wf','working',1,1)",
                 [],
@@ -1094,15 +1101,26 @@ mod tests {
                     .unwrap()
                     .collect::<rusqlite::Result<_>>()
                     .unwrap();
-                assert!(cols.contains("last_event_seq"), "tasks.last_event_seq must exist after migration");
-                assert!(cols.contains("terminal_seq"), "tasks.terminal_seq must exist after migration");
-                let mut stmt2 = conn.prepare("PRAGMA table_info(task_node_checkpoints)").unwrap();
+                assert!(
+                    cols.contains("last_event_seq"),
+                    "tasks.last_event_seq must exist after migration"
+                );
+                assert!(
+                    cols.contains("terminal_seq"),
+                    "tasks.terminal_seq must exist after migration"
+                );
+                let mut stmt2 = conn
+                    .prepare("PRAGMA table_info(task_node_checkpoints)")
+                    .unwrap();
                 let cp_cols: HashSet<String> = stmt2
                     .query_map([], |row| row.get::<_, String>(1))
                     .unwrap()
                     .collect::<rusqlite::Result<_>>()
                     .unwrap();
-                assert!(cp_cols.contains("seq"), "task_node_checkpoints.seq must exist after migration");
+                assert!(
+                    cp_cols.contains("seq"),
+                    "task_node_checkpoints.seq must exist after migration"
+                );
                 // task_node_starts must exist.
                 let count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_node_starts'",
@@ -1114,19 +1132,30 @@ mod tests {
             // The pre-existing legacy checkpoint row should appear as seq=0 in the snapshot.
             let snap = s.progress_snapshot(&old).await.unwrap();
             let legacy_cp = snap.checkpoints.iter().find(|c| c.0.as_str() == "n");
-            assert!(legacy_cp.is_some(), "legacy checkpoint must appear in snapshot");
+            assert!(
+                legacy_cp.is_some(),
+                "legacy checkpoint must appear in snapshot"
+            );
             assert_eq!(legacy_cp.unwrap().3, 0, "legacy NULL seq must map to 0");
             // A seq write on the freshly-migrated task works from the DEFAULT 0 baseline.
             let first = s
                 .record_node_started(&old, &NodeId::parse("m").unwrap(), 10)
                 .await
                 .unwrap();
-            assert_eq!(first, 1, "first seq on a migrated task (last_event_seq DEFAULT 0) must be 1");
+            assert_eq!(
+                first, 1,
+                "first seq on a migrated task (last_event_seq DEFAULT 0) must be 1"
+            );
             // Adding a new checkpoint still works.
             s.node_checkpoints(&old).await.unwrap(); // already 1
-            // Verify we can't double-insert the legacy checkpoint (write-once).
-            let res = s.put_node_checkpoint(&old, &NodeId::parse("n").unwrap(), "o2", true, 3).await;
-            assert!(res.is_err(), "write-once must be enforced for the legacy checkpoint key");
+                                                     // Verify we can't double-insert the legacy checkpoint (write-once).
+            let res = s
+                .put_node_checkpoint(&old, &NodeId::parse("n").unwrap(), "o2", true, 3)
+                .await;
+            assert!(
+                res.is_err(),
+                "write-once must be enforced for the legacy checkpoint key"
+            );
         }
         // Second reopen: migration idempotent (no duplicate-column error), foreign_keys ON, cascade.
         {
@@ -1158,7 +1187,7 @@ mod tests {
         let snap = s.progress_snapshot(&t).await.unwrap();
         assert_eq!(snap.checkpoints[0].3, s2); // seq carried
         assert!(snap.starts.is_empty()); // start cleared on finish
-        // record_node_started is an UPSERT (resume re-emit): no PK error
+                                         // record_node_started is an UPSERT (resume re-emit): no PK error
         let r1 = s
             .record_node_started(&t, &NodeId::parse("b").unwrap(), 3)
             .await

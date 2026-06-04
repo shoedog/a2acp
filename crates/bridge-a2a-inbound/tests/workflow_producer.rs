@@ -1874,7 +1874,9 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
         error: Option<&str>,
         ts: i64,
     ) -> Result<i64, BridgeError> {
-        self.inner.set_terminal_sequenced(task, status, result, error, ts).await
+        self.inner
+            .set_terminal_sequenced(task, status, result, error, ts)
+            .await
     }
 
     async fn progress_snapshot(
@@ -2144,7 +2146,9 @@ async fn detached_unknown_workflow_reject_sets_terminal_seq() {
         .await
         .unwrap();
     // Drain the response body so the handler fully runs.
-    let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
 
     // Exactly one row was created (the unknown-workflow path `create`s before reject).
     let rows = store.list(10).await.unwrap();
@@ -2198,7 +2202,11 @@ async fn resume_short_circuit_sets_terminal_seq() {
         })
         .await
         .unwrap();
-    for (node, out) in [("codex", "CODEX_DONE"), ("claude", "CLAUDE_DONE"), ("synth", "SYNTH_FINAL")] {
+    for (node, out) in [
+        ("codex", "CODEX_DONE"),
+        ("claude", "CLAUDE_DONE"),
+        ("synth", "SYNTH_FINAL"),
+    ] {
         store
             .put_node_checkpoint(&task, &NodeId::parse(node).unwrap(), out, true, 2)
             .await

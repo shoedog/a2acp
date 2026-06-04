@@ -151,9 +151,11 @@ impl WorkflowSink for DetachedProgressSink {
                 None,
                 Some(output.as_str()),
             ),
-            WorkflowOutcome::Canceled => {
-                (bridge_core::task_store::TaskRecordStatus::Canceled, None, None)
-            }
+            WorkflowOutcome::Canceled => (
+                bridge_core::task_store::TaskRecordStatus::Canceled,
+                None,
+                None,
+            ),
         };
         let seq = self
             .store
@@ -347,9 +349,9 @@ mod sink_tests {
     ///   - the store snapshot has a checkpoint with a seq and a `terminal_seq`
     #[tokio::test]
     async fn detached_progress_sink_persists_and_publishes() {
+        use crate::reattach::{FrameKind, TaskProgressHub};
         use bridge_core::ids::NodeId;
         use bridge_core::task_store::{MemoryTaskStore, TaskStore};
-        use crate::reattach::{FrameKind, TaskProgressHub};
 
         let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
         let task_id = TaskId::parse("t-prog").unwrap();
@@ -393,19 +395,41 @@ mod sink_tests {
         while let Ok(f) = rx.try_recv() {
             frames.push(f);
         }
-        assert_eq!(frames.len(), 3, "expected NodeStarted, NodeFinished, Terminal frames");
+        assert_eq!(
+            frames.len(),
+            3,
+            "expected NodeStarted, NodeFinished, Terminal frames"
+        );
 
         // Verify frame kinds in order.
-        assert!(matches!(frames[0].kind, FrameKind::NodeStarted { .. }), "frame[0] must be NodeStarted");
-        assert!(matches!(frames[1].kind, FrameKind::NodeFinished { .. }), "frame[1] must be NodeFinished");
-        assert!(matches!(frames[2].kind, FrameKind::Terminal { .. }), "frame[2] must be Terminal");
+        assert!(
+            matches!(frames[0].kind, FrameKind::NodeStarted { .. }),
+            "frame[0] must be NodeStarted"
+        );
+        assert!(
+            matches!(frames[1].kind, FrameKind::NodeFinished { .. }),
+            "frame[1] must be NodeFinished"
+        );
+        assert!(
+            matches!(frames[2].kind, FrameKind::Terminal { .. }),
+            "frame[2] must be Terminal"
+        );
 
         // Verify strictly monotonic seqs.
-        assert!(frames[1].seq > frames[0].seq, "seqs must be strictly monotonic");
-        assert!(frames[2].seq > frames[1].seq, "seqs must be strictly monotonic");
+        assert!(
+            frames[1].seq > frames[0].seq,
+            "seqs must be strictly monotonic"
+        );
+        assert!(
+            frames[2].seq > frames[1].seq,
+            "seqs must be strictly monotonic"
+        );
 
         // The terminal frame's seq must match the stored terminal_seq (durable-first).
-        assert_eq!(frames[2].seq, term_seq, "terminal frame seq == stored terminal_seq");
+        assert_eq!(
+            frames[2].seq, term_seq,
+            "terminal frame seq == stored terminal_seq"
+        );
 
         // All frames are Live phase.
         assert!(matches!(frames[0].phase, crate::reattach::Phase::Live));
@@ -418,12 +442,12 @@ mod sink_tests {
     /// preserving the W3b "checkpoint-write-failure ⇒ task Failed" contract.
     #[tokio::test]
     async fn detached_progress_sink_write_error_aborts_drain() {
+        use crate::reattach::TaskProgressHub;
         use bridge_core::ids::NodeId;
         use bridge_core::task_store::{
             MemoryTaskStore, ResumeClaim, TaskProgressSnapshot, TaskRecord, TaskRecordStatus,
             TaskStore,
         };
-        use crate::reattach::TaskProgressHub;
 
         /// A `TaskStore` wrapper that delegates everything to an inner
         /// `MemoryTaskStore` but makes `put_node_checkpoint_sequenced` always
@@ -445,7 +469,9 @@ mod sink_tests {
                 error: Option<&str>,
                 updated_ms: i64,
             ) -> Result<(), BridgeError> {
-                self.inner.set_terminal(id, status, result, error, updated_ms).await
+                self.inner
+                    .set_terminal(id, status, result, error, updated_ms)
+                    .await
             }
             async fn get(&self, id: &TaskId) -> Result<Option<TaskRecord>, BridgeError> {
                 self.inner.get(id).await
@@ -471,7 +497,9 @@ mod sink_tests {
                 ok: bool,
                 ts: i64,
             ) -> Result<(), BridgeError> {
-                self.inner.put_node_checkpoint(task, node, output, ok, ts).await
+                self.inner
+                    .put_node_checkpoint(task, node, output, ok, ts)
+                    .await
             }
             async fn node_checkpoints(
                 &self,
@@ -517,7 +545,9 @@ mod sink_tests {
                 error: Option<&str>,
                 ts: i64,
             ) -> Result<i64, BridgeError> {
-                self.inner.set_terminal_sequenced(task, status, result, error, ts).await
+                self.inner
+                    .set_terminal_sequenced(task, status, result, error, ts)
+                    .await
             }
             async fn progress_snapshot(
                 &self,
@@ -527,15 +557,18 @@ mod sink_tests {
             }
         }
 
-        let failing_store: Arc<dyn TaskStore> =
-            Arc::new(FailingCheckpointStore { inner: MemoryTaskStore::new() });
+        let failing_store: Arc<dyn TaskStore> = Arc::new(FailingCheckpointStore {
+            inner: MemoryTaskStore::new(),
+        });
         let task_id = TaskId::parse("t-fail").unwrap();
-        failing_store.create(&make_task_record("t-fail")).await.unwrap();
+        failing_store
+            .create(&make_task_record("t-fail"))
+            .await
+            .unwrap();
 
         let hub = Arc::new(TaskProgressHub::new());
         let mut rx = hub.subscribe(); // subscribe BEFORE the hub is moved into the sink
-        let mut sink =
-            DetachedProgressSink::new(failing_store.clone(), task_id.clone(), hub);
+        let mut sink = DetachedProgressSink::new(failing_store.clone(), task_id.clone(), hub);
 
         let a = NodeId::parse("a").unwrap();
         // NodeStarted succeeds (record_node_started delegates to inner);
@@ -554,7 +587,10 @@ mod sink_tests {
         ];
         let stream: WorkflowStream = Box::pin(futures::stream::iter(events));
         let result = drain_workflow(stream, &mut sink).await;
-        assert!(result.is_err(), "drain_workflow must return Err when checkpoint write fails");
+        assert!(
+            result.is_err(),
+            "drain_workflow must return Err when checkpoint write fails"
+        );
 
         // Durable-first: the failed NodeFinished must NOT have published a frame.
         // Only the successful NodeStarted should have reached the subscriber.
