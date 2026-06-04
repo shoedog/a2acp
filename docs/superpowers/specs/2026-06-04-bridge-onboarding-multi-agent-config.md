@@ -1,7 +1,7 @@
 # Bridge Onboarding — Turnkey Multi-Agent Config (design)
 
 **Date:** 2026-06-04
-**Status:** Draft rev3 (Claude design + firewalled independent codex design, then a codex review of the merge — folded: example-vs-init prompt paths differ, init default-resolution when an agent is excluded, unknown-arg errors)
+**Status:** Accepted / shipped (Claude design + firewalled independent codex design + a codex review of the merge). Built + code-reviewed (QUALITY_APPROVED) + live-validated (init → serve --config → code-review Completed; codex effort=high reached; kiro zero-auth).
 
 **Goal:** Make it turnkey for an external project to run the a2a-bridge with **multiple agents (kiro + claude + codex + an `api` agent), each configured with model/effort/mode**, and to use the shipped review workflows — without it being "a setup sub-project."
 
