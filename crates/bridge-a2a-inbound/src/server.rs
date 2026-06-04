@@ -1194,7 +1194,7 @@ fn new_detached_task_id() -> TaskId {
 /// Because the terminal is written via `set_terminal_sequenced`, `terminal_seq` is never
 /// left NULL on any detached path (the reattach snapshot requirement). On a path where no
 /// hub was ever inserted (e.g. the pre-spawn unknown-workflow reject), pass `hub: None`.
-async fn finalize_detached(
+pub(crate) async fn finalize_detached(
     store: &Arc<dyn bridge_core::task_store::TaskStore>,
     progress_hubs: &Arc<
         tokio::sync::Mutex<HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>>,
@@ -1206,10 +1206,16 @@ async fn finalize_detached(
     hub: Option<&Arc<crate::reattach::TaskProgressHub>>,
 ) -> Result<(), BridgeError> {
     use bridge_core::task_store::TaskRecordStatus;
-    let seq = store
+    // Durable-first: write the sequenced terminal. Capture the result instead of
+    // early-returning so the hub is removed REGARDLESS of write success (I-1) — a
+    // write-Err must NEVER leak the in-memory hub. The durable Working-row gap on a
+    // write-Err is the pre-existing W3b §8 gap, backstopped by the boot sweep.
+    let write = store
         .set_terminal_sequenced(task, status, result, error, crate::workflow_sink::now_ms())
-        .await?;
-    if let Some(hub) = hub {
+        .await;
+    if let (Ok(seq), Some(hub)) = (&write, hub) {
+        // Publish the Terminal frame ONLY on a committed seq (durable-first): on a
+        // write-Err there is no seq to publish on.
         // Interrupted has no WorkflowOutcome analogue; the closest wire terminal is Failed.
         let outcome = match status {
             TaskRecordStatus::Completed => crate::reattach::TerminalOutcome::Completed,
@@ -1221,13 +1227,14 @@ async fn finalize_detached(
         let output = result.or(error).unwrap_or("").to_string();
         hub.publish(crate::reattach::WorkflowProgressFrame {
             v: 1,
-            seq,
+            seq: *seq,
             phase: crate::reattach::Phase::Live,
             kind: crate::reattach::FrameKind::Terminal { outcome, output },
         });
     }
+    // ALWAYS remove the hub, even on write error (I-1: the hub never leaks).
     progress_hubs.lock().await.remove(task);
-    Ok(())
+    write.map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1248,6 +1255,8 @@ fn spawn_detached_workflow(
             store: srv.task_store.clone(),
             task: task.clone(),
             cancels: srv.workflow_cancels.clone(),
+            progress_hubs: srv.progress_hubs.clone(),
+            hub: hub.clone(),
             done: false,
         };
         let executor = match &srv.executor {
@@ -1522,7 +1531,7 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
         //     write-failure gap). Finalize DIRECTLY from the checkpoint, with NO
         //     re-run and WITHOUT consuming a resume attempt. Completed carries the
         //     output as `result`; Failed carries it as `error` (mirrors
-        //     `TaskStoreSink::terminal` / `spawn_detached_workflow`'s finalize).
+        //     `finalize_detached` / `DetachedProgressSink::terminal`).
         let terminal_id = match graph.terminal() {
             Some(n) => n.id.as_str().to_string(),
             None => {

@@ -76,7 +76,6 @@ use tokio_util::sync::CancellationToken;
 /// (durable-first), then publishes a `WorkflowProgressFrame` to the task's
 /// in-memory `TaskProgressHub`. A durable-write `Err` propagates (aborts the
 /// drain) — preserving the W3b "checkpoint-write-failure ⇒ task Failed" contract.
-#[allow(dead_code)] // wired into the runner in Task 5
 pub(crate) struct DetachedProgressSink {
     store: Arc<dyn TaskStore>,
     task: TaskId,
@@ -84,7 +83,6 @@ pub(crate) struct DetachedProgressSink {
 }
 
 impl DetachedProgressSink {
-    #[allow(dead_code)] // wired into the runner in Task 5
     pub(crate) fn new(store: Arc<dyn TaskStore>, task: TaskId, hub: Arc<TaskProgressHub>) -> Self {
         Self { store, task, hub }
     }
@@ -92,8 +90,8 @@ impl DetachedProgressSink {
 
 #[async_trait::async_trait]
 impl WorkflowSink for DetachedProgressSink {
-    // `NodeId::parse` here mirrors `TaskStoreSink` (raw `?`): node names come from the
-    // already-validated workflow graph, so this parse is infallible in practice. This sink
+    // `NodeId::parse` here uses a raw `?`: node names come from the already-validated
+    // workflow graph, so this parse is infallible in practice. This sink
     // is only ever driven by the detached runner, which normalizes ANY drain `Err` to a
     // terminal `Failed` — so the parse error's disposition is moot on this path.
     async fn node_started(&mut self, node: &str) -> Result<(), BridgeError> {
@@ -175,13 +173,19 @@ impl WorkflowSink for DetachedProgressSink {
 }
 
 /// Drop guard: if the runner exits without finalizing (early return, error, or
-/// **panic**), write `Failed` and remove the cancel token. Within a serve lifetime
-/// a `Working` row is then orphaned only if `set_terminal` itself fails to write
-/// (the named §8 gap); the boot sweep is the cross-restart backstop.
+/// **panic**), finalize `Failed` (via `finalize_detached`) and remove the cancel token.
+/// `finalize_detached` writes the terminal through the SEQUENCED path (so `terminal_seq`
+/// is never NULL), broadcasts a `Terminal{Failed}` frame to the task's hub, and removes
+/// the hub from `progress_hubs` (the hub never leaks on panic). Within a serve lifetime a
+/// `Working` row is then orphaned only if the sequenced write itself fails (the named §8
+/// gap); the boot sweep is the cross-restart backstop.
 pub(crate) struct Finalizer {
     pub(crate) store: Arc<dyn TaskStore>,
     pub(crate) task: TaskId,
     pub(crate) cancels: Arc<Mutex<std::collections::HashMap<TaskId, CancellationToken>>>,
+    pub(crate) progress_hubs:
+        Arc<Mutex<std::collections::HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>>>,
+    pub(crate) hub: Arc<crate::reattach::TaskProgressHub>,
     pub(crate) done: bool,
 }
 
@@ -193,16 +197,21 @@ impl Drop for Finalizer {
         let store = self.store.clone();
         let task = self.task.clone();
         let cancels = self.cancels.clone();
+        let progress_hubs = self.progress_hubs.clone();
+        let hub = self.hub.clone();
         tokio::spawn(async move {
-            let _ = store
-                .set_terminal(
-                    &task,
-                    TaskRecordStatus::Failed,
-                    None,
-                    Some("runner ended without terminal"),
-                    now_ms(),
-                )
-                .await;
+            // Reuse the shared detached-finalize path: sequenced terminal + Terminal frame
+            // broadcast + hub removal (so the panic path matches every other terminal).
+            let _ = crate::server::finalize_detached(
+                &store,
+                &progress_hubs,
+                &task,
+                TaskRecordStatus::Failed,
+                None,
+                Some("runner ended without terminal"),
+                Some(&hub),
+            )
+            .await;
             cancels.lock().await.remove(&task);
         });
     }

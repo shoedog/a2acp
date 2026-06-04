@@ -1426,15 +1426,24 @@ fn build_panicking_workflow_server(
     )
 }
 
-/// **DoD-7 — panic finalizer**: when the spawned runner panics (backend panics
-/// through the executor), the `Finalizer` drop-guard must write a terminal row so
-/// the task is never left in `Working`.
+/// **DoD-7 / T6 — panic finalizer (sequenced + hub cleanup)**: when the spawned runner
+/// panics (backend panics through the executor), the `Finalizer` drop-guard must, by
+/// reusing `finalize_detached`:
+///   - write a terminal row so the task is never left in `Working` (it is `Failed`),
+///   - finalize via the SEQUENCED path (so `terminal_seq` is non-NULL — never orphaned),
+///   - REMOVE the task's hub from `progress_hubs` (the hub never leaks on panic).
+///
+/// (We assert the durable + hub-cleanup oracles rather than subscribing to the live
+/// `Terminal{Failed}` frame: `progress_hubs` / `TaskProgressHub::subscribe` are
+/// `pub(crate)`, so an integration test in a separate crate cannot attach a subscriber
+/// deterministically. `finalize_detached` publishes the frame on the same committed
+/// seq it writes — the publish is unit-tested via `DetachedProgressSink` in-crate.)
 ///
 /// NOTE: The `tokio::select! { biased; _ = cancel.cancelled() => … s = backend.prompt(…) => … }`
 /// in `run_node` does NOT wrap the prompt future in a catch-panic boundary. A panic
 /// inside `prompt()` propagates as an unwind through the spawned async block, which
 /// triggers `Finalizer::drop`. The drop guard spawns a secondary task to call
-/// `set_terminal(Failed, …)`. We wait up to 200 yields for that secondary task to
+/// `finalize_detached(Failed, …)`. We wait up to 200 yields for that secondary task to
 /// complete. The join handle returns `Err(JoinError{panic})` — we swallow it with
 /// `let _ = handle.await`.
 #[tokio::test]
@@ -1488,6 +1497,27 @@ async fn runner_panic_finalizes_failed_no_orphan() {
         rec.status.is_terminal(),
         "panic must finalize via drop-guard, not orphan Working; got: {:?}",
         rec.status
+    );
+    // T6: the Finalizer now reuses `finalize_detached` → terminal is `Failed`.
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Failed,
+        "panic must finalize as Failed"
+    );
+
+    // T6: the terminal was written via the SEQUENCED path → `terminal_seq` is non-NULL
+    // (the Finalizer no longer uses the old unsequenced `set_terminal`).
+    let snap = store.progress_snapshot(&task).await.unwrap();
+    assert!(
+        snap.terminal_seq.is_some(),
+        "panic finalize must set terminal_seq (sequenced write via finalize_detached)"
+    );
+
+    // T6: the hub must be REMOVED from `progress_hubs` after the panic finalize —
+    // the in-memory hub never leaks on a runner panic.
+    assert!(
+        !srv.has_progress_hub_for_test(&task).await,
+        "progress hub must be REMOVED after the runner panics (no hub leak)"
     );
 }
 
