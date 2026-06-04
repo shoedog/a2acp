@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn all_failed_terminal_is_failed() {
         let out = drive(vec![
-            src("kiro", vec![Err(BridgeError::AgentCrashed)]),
+            src("kiro", vec![Err(BridgeError::agent_crashed("test"))]),
             src("peer", vec![Err(BridgeError::UpstreamA2aError)]),
         ])
         .await;

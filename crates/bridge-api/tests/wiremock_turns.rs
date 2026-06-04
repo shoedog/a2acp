@@ -247,7 +247,7 @@ async fn http_500_is_agent_crashed() {
     }
     assert!(matches!(
         err,
-        Some(bridge_core::error::BridgeError::AgentCrashed)
+        Some(bridge_core::error::BridgeError::AgentCrashed { .. })
     ));
 }
 
@@ -297,7 +297,7 @@ async fn connection_refused_is_agent_crashed() {
     }
     assert!(matches!(
         err,
-        Some(bridge_core::error::BridgeError::AgentCrashed)
+        Some(bridge_core::error::BridgeError::AgentCrashed { .. })
     ));
 }
 

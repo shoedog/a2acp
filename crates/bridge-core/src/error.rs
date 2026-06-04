@@ -45,8 +45,8 @@ pub enum BridgeError {
     FrameError,
     #[error("message too large")]
     MessageTooLarge,
-    #[error("agent crashed")]
-    AgentCrashed,
+    #[error("agent crashed: {reason}")]
+    AgentCrashed { reason: String },
     #[error("agent overloaded")]
     AgentOverloaded,
     #[error("upstream a2a error")]
@@ -62,6 +62,30 @@ pub enum BridgeError {
 }
 
 impl BridgeError {
+    /// Construct an `AgentCrashed` carrying a short reason describing what failed
+    /// (e.g. "spawn failed: …", "handshake timeout"), so the client/log sees WHY
+    /// rather than an opaque "agent crashed".
+    pub fn agent_crashed(reason: impl Into<String>) -> Self {
+        BridgeError::AgentCrashed {
+            reason: reason.into(),
+        }
+    }
+
+    /// The message safe to surface to an inbound A2A client over the wire.
+    ///
+    /// Internal-failure reasons (`AgentCrashed`/`ConfigInvalid`) can embed infra
+    /// detail — upstream URLs (incl. query params), filesystem paths, SDK error
+    /// text — so they collapse to a STATIC category here; the full reason stays in
+    /// server logs (`tracing`). Client-caused errors (`InvalidRequest{field}`, etc.)
+    /// keep their `Display` because it's both safe and helpful to the caller.
+    pub fn client_message(&self) -> String {
+        match self {
+            BridgeError::AgentCrashed { .. } => "agent crashed".to_string(),
+            BridgeError::ConfigInvalid { .. } => "invalid config".to_string(),
+            other => other.to_string(),
+        }
+    }
+
     pub fn disposition(&self) -> A2aDisposition {
         use A2aDisposition::*;
         use A2aState as S;
@@ -140,7 +164,7 @@ mod tests {
     fn runtime_failures_set_failed_state() {
         for e in [
             BridgeError::FrameError,
-            BridgeError::AgentCrashed,
+            BridgeError::agent_crashed("test"),
             BridgeError::ModelNotAvailable,
             BridgeError::PermissionDenied,
             BridgeError::MessageTooLarge,
@@ -171,6 +195,35 @@ mod tests {
     #[test]
     fn agent_overloaded_displays() {
         assert_eq!(BridgeError::AgentOverloaded.to_string(), "agent overloaded");
+    }
+
+    #[test]
+    fn agent_crashed_carries_reason_in_display() {
+        // The reason IS in the Display (server logs / tracing see WHY).
+        let e = BridgeError::agent_crashed("spawn failed: no such file");
+        assert!(e.to_string().contains("spawn failed: no such file"));
+    }
+
+    #[test]
+    fn client_message_redacts_internal_reason_but_keeps_client_errors() {
+        // Internal-failure reason (could embed a URL with a token) is NOT surfaced
+        // to the wire — only the static category — while the full reason remains in
+        // Display for logs. This is the wire-leak guard.
+        let leaky = BridgeError::agent_crashed("HTTP failed: https://api.example/v1?token=SECRET");
+        assert_eq!(leaky.client_message(), "agent crashed");
+        assert!(leaky.to_string().contains("SECRET")); // full reason still logged
+        assert_eq!(
+            BridgeError::ConfigInvalid { reason: "x".into() }.client_message(),
+            "invalid config"
+        );
+        // Client-caused errors keep their helpful Display.
+        assert_eq!(
+            BridgeError::InvalidRequest {
+                field: "message: no text"
+            }
+            .client_message(),
+            "invalid request: message: no text"
+        );
     }
 
     #[test]

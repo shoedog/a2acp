@@ -140,8 +140,8 @@ impl AgentBackend for ApiBackend {
                     tools: vec![crate::tool::tool_def()], stream: do_stream };
                 let mut builder = client.post(&url).json(&req);
                 if let Some(k) = &api_key { builder = builder.bearer_auth(k); }
-                let resp = builder.send().await.map_err(|_| BridgeError::AgentCrashed)?;
-                if !resp.status().is_success() { Err(BridgeError::AgentCrashed)?; }
+                let resp = builder.send().await.map_err(|e| BridgeError::agent_crashed(format!("HTTP request to upstream API failed: {e}")))?;
+                if !resp.status().is_success() { Err(BridgeError::agent_crashed(format!("upstream API returned error status: {}", resp.status())))?; }
 
                 let parsed = if do_stream {
                     let mut acc = SseAccumulator::default();
@@ -158,7 +158,7 @@ impl AgentBackend for ApiBackend {
                             }
                             maybe = bytes.next() => match maybe { Some(c) => c, None => break 'read },
                         };
-                        let chunk = chunk.map_err(|_| BridgeError::AgentCrashed)?;
+                        let chunk = chunk.map_err(|e| BridgeError::agent_crashed(format!("error reading SSE chunk from upstream API: {e}")))?;
                         buf.push_str(&String::from_utf8_lossy(&chunk));
                         while let Some(nl) = buf.find('\n') {
                             let line: String = buf.drain(..=nl).collect();
@@ -182,7 +182,7 @@ impl AgentBackend for ApiBackend {
                     }
                     acc.finish()
                 } else {
-                    let body = resp.text().await.map_err(|_| BridgeError::AgentCrashed)?;
+                    let body = resp.text().await.map_err(|e| BridgeError::agent_crashed(format!("failed to read non-streaming response body from upstream API: {e}")))?;
                     let p = crate::wire::parse_nonstream(&body).map_err(|_| BridgeError::FrameError)?;
                     if !p.text.is_empty() { yield Update::Text(p.text.clone()); }
                     p
