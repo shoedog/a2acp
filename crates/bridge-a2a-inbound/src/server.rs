@@ -2132,10 +2132,14 @@ fn sse_event_stream(
     tokio_stream::wrappers::ReceiverStream::new(rx).map(move |item| {
         let frame = match item {
             Ok(ev) => event_to_sse(&ev, &task_id, &context_id),
-            Err(e) => SseEvent::default()
-                .event("error")
-                .json_data(json!({ "kind": "error", "text": e.to_string() }))
-                .expect("serde_json::Value serializes"),
+            Err(e) => {
+                tracing::warn!(error = %e, "workflow stream error");
+                SseEvent::default()
+                    .event("error")
+                    // Static category to the wire; full reason logged above.
+                    .json_data(json!({ "kind": "error", "text": e.client_message() }))
+                    .expect("serde_json::Value serializes")
+            }
         };
         Ok(frame)
     })
@@ -2812,8 +2816,16 @@ fn jsonrpc_err(id: Value, code: i32, message: &str) -> Response {
 /// becomes INTERNAL with the error's display message.
 fn bridge_err_to_jsonrpc(id: Value, e: &BridgeError) -> Response {
     match e.disposition() {
-        A2aDisposition::RejectRequest => jsonrpc_err(id, JSONRPC_INVALID_REQUEST, &e.to_string()),
-        A2aDisposition::SetState(_) => jsonrpc_err(id, JSONRPC_INTERNAL, &e.to_string()),
+        // Client-caused: `client_message()` is the (safe, helpful) Display.
+        A2aDisposition::RejectRequest => {
+            jsonrpc_err(id, JSONRPC_INVALID_REQUEST, &e.client_message())
+        }
+        // Internal failure: the full reason (may carry infra detail) goes to logs;
+        // the wire gets a static category via `client_message()`.
+        A2aDisposition::SetState(_) => {
+            tracing::warn!(error = %e, "request failed (internal)");
+            jsonrpc_err(id, JSONRPC_INTERNAL, &e.client_message())
+        }
     }
 }
 
@@ -2972,43 +2984,52 @@ fn task_meta_from_params(params: &Value) -> Result<TaskMeta, BridgeError> {
 fn parts_from_params(params: &Value) -> Vec<Part> {
     let message = params.get("message");
 
-    // 1. message.parts array — TEXT parts only.
+    // A non-blank text Part (blank/whitespace-only text never counts as content).
+    let part = |t: &str| {
+        let t = t.trim();
+        (!t.is_empty()).then(|| Part {
+            text: t.to_string(),
+        })
+    };
+
+    // 1. message.parts array — TEXT parts only (kind=="text" or absent ⇒ lenient).
+    //    If the array yields NO usable text (empty, or only data/file/blank parts)
+    //    we FALL THROUGH to message.text rather than returning empty — so e.g.
+    //    `{parts:[{kind:"file"}], text:"summarize"}` still uses "summarize".
     if let Some(parts_arr) = message
         .and_then(|m| m.get("parts"))
         .and_then(|p| p.as_array())
     {
-        if !parts_arr.is_empty() {
-            return parts_arr
-                .iter()
-                .filter_map(|elem| {
-                    // Only text parts carry prompt text. `kind` absent ⇒ lenient text.
-                    let is_text = matches!(
-                        elem.get("kind").and_then(|k| k.as_str()),
-                        Some("text") | None
-                    );
-                    if !is_text {
-                        return None;
-                    }
-                    elem.get("text").and_then(|t| t.as_str()).map(|t| Part {
-                        text: t.to_string(),
-                    })
-                })
-                .collect();
+        let texts: Vec<Part> = parts_arr
+            .iter()
+            .filter_map(|elem| {
+                let is_text = matches!(
+                    elem.get("kind").and_then(|k| k.as_str()),
+                    Some("text") | None
+                );
+                if !is_text {
+                    return None;
+                }
+                elem.get("text").and_then(|t| t.as_str()).and_then(part)
+            })
+            .collect();
+        if !texts.is_empty() {
+            return texts;
         }
     }
 
     // 2. message.text
-    if let Some(text) = message.and_then(|m| m.get("text")).and_then(|t| t.as_str()) {
-        return vec![Part {
-            text: text.to_string(),
-        }];
+    if let Some(p) = message
+        .and_then(|m| m.get("text"))
+        .and_then(|t| t.as_str())
+        .and_then(part)
+    {
+        return vec![p];
     }
 
     // 3. top-level text
-    if let Some(text) = params.get("text").and_then(|t| t.as_str()) {
-        return vec![Part {
-            text: text.to_string(),
-        }];
+    if let Some(p) = params.get("text").and_then(|t| t.as_str()).and_then(part) {
+        return vec![p];
     }
 
     vec![]
@@ -3964,6 +3985,59 @@ mod tests {
     fn parts_only_non_text_is_empty() {
         let p = serde_json::json!({"message":{"parts":[{"kind":"data","data":{"x":1}}]}});
         assert!(parts_from_params(&p).is_empty());
+    }
+
+    #[test]
+    fn parts_blank_text_is_dropped() {
+        // Whitespace-only / empty text is not content (would otherwise dispatch a
+        // textless prompt). Covers the PoC-codex finding.
+        assert!(parts_from_params(&serde_json::json!({"message":{"text":"   "}})).is_empty());
+        assert!(
+            parts_from_params(&serde_json::json!({"message":{"parts":[{"text":""}]}})).is_empty()
+        );
+        // and a blank part among real ones is dropped, not kept.
+        let p = serde_json::json!({"message":{"parts":[{"text":"  "},{"text":"real"}]}});
+        let v: Vec<String> = parts_from_params(&p).into_iter().map(|x| x.text).collect();
+        assert_eq!(v, vec!["real"]);
+    }
+
+    #[test]
+    fn parts_array_without_text_falls_through_to_message_text() {
+        // A parts array of only non-text parts must NOT suppress message.text
+        // (the self-hosted review's MAJOR 3).
+        let p = serde_json::json!({"message":{"parts":[{"kind":"file","file":{"name":"f"}}],"text":"summarize"}});
+        let v: Vec<String> = parts_from_params(&p).into_iter().map(|x| x.text).collect();
+        assert_eq!(v, vec!["summarize"]);
+    }
+
+    #[tokio::test]
+    async fn send_message_data_only_parts_returns_invalid_request() {
+        // Routed end-to-end: a data-only message is rejected, not dispatched.
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "parts": [{"kind":"data","data":{"x":1}}] } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn streaming_message_empty_text_rejected_before_sse() {
+        // H1 covers the STREAMING path too (both unary + stream go through gate()).
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "message": { "text": "   " } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // ---- H1: empty/textless message is rejected (not dispatched empty) ----
