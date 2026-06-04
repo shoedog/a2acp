@@ -72,58 +72,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// Detached sink: persists a per-node checkpoint on each `NodeFinished` (W3b Task 7)
-/// and captures the terminal mapping for the runner to persist.
-pub(crate) struct TaskStoreSink {
-    store: Arc<dyn TaskStore>,
-    task: TaskId,
-    terminal: Option<(TaskRecordStatus, Option<String>, Option<String>)>,
-}
-
-impl TaskStoreSink {
-    pub(crate) fn new(store: Arc<dyn TaskStore>, task: TaskId) -> Self {
-        Self {
-            store,
-            task,
-            terminal: None,
-        }
-    }
-    /// The captured terminal mapping (status, result, error), or None if no
-    /// terminal arrived.
-    pub(crate) fn take(self) -> Option<(TaskRecordStatus, Option<String>, Option<String>)> {
-        self.terminal
-    }
-}
-
-#[async_trait::async_trait]
-impl WorkflowSink for TaskStoreSink {
-    /// Persist a checkpoint for `node`; a write failure propagates as `Err`,
-    /// which aborts drain_workflow and causes the runner to mark the task Failed.
-    async fn node_finished(
-        &mut self,
-        node: &str,
-        ok: bool,
-        output: &str,
-    ) -> Result<(), BridgeError> {
-        let node_id = bridge_core::ids::NodeId::parse(node)?;
-        self.store
-            .put_node_checkpoint(&self.task, &node_id, output, ok, now_ms())
-            .await
-    }
-    async fn terminal(
-        &mut self,
-        outcome: WorkflowOutcome,
-        output: String,
-    ) -> Result<(), BridgeError> {
-        self.terminal = Some(match outcome {
-            WorkflowOutcome::Completed => (TaskRecordStatus::Completed, Some(output), None),
-            WorkflowOutcome::Failed => (TaskRecordStatus::Failed, None, Some(output)),
-            WorkflowOutcome::Canceled => (TaskRecordStatus::Canceled, None, None),
-        });
-        Ok(())
-    }
-}
-
 /// Detached progress sink: persists each event via the sequenced store methods
 /// (durable-first), then publishes a `WorkflowProgressFrame` to the task's
 /// in-memory `TaskProgressHub`. A durable-write `Err` propagates (aborts the

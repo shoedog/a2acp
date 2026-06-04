@@ -321,7 +321,8 @@ async fn detached_runner_persists_completed_result() {
         task.clone(),
         vec!["DIFF".to_string()],
         bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
-    );
+    )
+    .await;
     handle.await.unwrap();
     let got = store.get(&task).await.unwrap().unwrap();
     assert_eq!(got.status, TaskRecordStatus::Completed);
@@ -1465,7 +1466,8 @@ async fn runner_panic_finalizes_failed_no_orphan() {
         task.clone(),
         vec!["DIFF".to_string()],
         bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
-    );
+    )
+    .await;
     let _ = handle.await; // Err(JoinError{panic}) — swallow it
                           // The Finalizer spawns a secondary task; give it time to write the row.
     for _ in 0..200 {
@@ -1526,6 +1528,7 @@ async fn detached_runner_persists_failed_on_node_failure() {
         bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
     )
     .await
+    .await
     .unwrap();
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(rec.status, TaskRecordStatus::Failed);
@@ -1579,7 +1582,8 @@ async fn detached_runner_persists_canceled_on_token_fire() {
         vec!["DIFF".into()],
         bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
         token.clone(),
-    );
+    )
+    .await;
     // Cancel while the gated backend is parked on notified().await.
     token.cancel();
     let _ = handle.await;
@@ -1691,7 +1695,8 @@ async fn detached_runner_checkpoints_each_node() {
         task.clone(),
         vec!["DIFF".to_string()],
         bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
-    );
+    )
+    .await;
     handle.await.unwrap();
 
     // Task must complete.
@@ -1962,7 +1967,8 @@ async fn detached_runner_checkpoint_write_failure_fails_task() {
         task.clone(),
         vec!["DIFF".to_string()],
         bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
-    );
+    )
+    .await;
     handle.await.unwrap();
 
     // The checkpoint write failure must have aborted the drain → task is Failed.
@@ -1972,6 +1978,255 @@ async fn detached_runner_checkpoint_write_failure_fails_task() {
         TaskRecordStatus::Failed,
         "checkpoint write failure must mark the task Failed; got: {:?}",
         rec.status
+    );
+}
+
+// ============================================================================
+// Task 5: DetachedProgressSink in the detached runner — sequenced terminal on
+// ALL detached paths + hub-before-spawn + hub cleanup on terminal.
+// ============================================================================
+
+/// **detached_runner_sequenced_terminal_and_hub_cleanup**: a detached submit driven
+/// to completion must (1) still satisfy the W3b contract (status Completed, a
+/// checkpoint present), (2) have a NON-NULL `terminal_seq` (the sink wrote the
+/// terminal via the sequenced method), and (3) have its progress hub REMOVED from
+/// `progress_hubs` once the task reaches terminal.
+#[tokio::test]
+async fn detached_runner_sequenced_terminal_and_hub_cleanup() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = build_workflow_server_with_task_store(store.clone());
+    let task = TaskId::parse("detached-seq-1").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: String::new(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        })
+        .await
+        .unwrap();
+    let handle = bridge_a2a_inbound::server::spawn_detached_workflow_for_test(
+        &srv,
+        task.clone(),
+        vec!["DIFF".to_string()],
+        bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+    )
+    .await;
+    // While the runner is in-flight the hub must be present (inserted before spawn).
+    assert!(
+        srv.has_progress_hub_for_test(&task).await,
+        "hub must be inserted BEFORE the runner is spawned"
+    );
+    handle.await.unwrap();
+
+    // W3b contract: Completed with the synth result.
+    let got = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(got.status, TaskRecordStatus::Completed);
+    assert_eq!(got.result.as_deref(), Some("SYNTH_FINAL"));
+
+    // The terminal was written via the sequenced method → terminal_seq is non-NULL,
+    // and checkpoints are present (W3b checkpointing intact).
+    let snap = store.progress_snapshot(&task).await.unwrap();
+    assert!(
+        snap.terminal_seq.is_some(),
+        "detached terminal must set terminal_seq (sequenced write)"
+    );
+    assert!(
+        !snap.checkpoints.is_empty(),
+        "W3b checkpoints must still be persisted"
+    );
+
+    // The hub is cleaned up once the task reaches terminal (no leak).
+    assert!(
+        !srv.has_progress_hub_for_test(&task).await,
+        "progress hub must be REMOVED after the task reaches terminal"
+    );
+}
+
+/// **detached_unknown_workflow_reject_sets_terminal_seq (I6)**: a detached submit whose
+/// routed workflow id is NOT registered must finalize via the sequenced path — the
+/// resulting terminal task has a NON-NULL `terminal_seq`, and no hub is leaked (the
+/// reject happens pre-spawn, so no hub was ever inserted).
+#[tokio::test]
+async fn detached_unknown_workflow_reject_sets_terminal_seq() {
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    /// Routes `skill="code-review"` to a workflow id that is NOT registered on the
+    /// server (so the runner's graph lookup is `None` → the unknown-workflow reject).
+    struct GhostWorkflowRoute;
+    impl RouteDecision for GhostWorkflowRoute {
+        fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            if meta.skill.as_deref() == Some("code-review") {
+                Ok(RouteTarget::Workflow(WorkflowId::parse("ghost-workflow")?))
+            } else {
+                Ok(RouteTarget::Local(AgentId::parse("codex")?))
+            }
+        }
+    }
+
+    let registry = Arc::new(FakeRegistry {
+        replies: [("synth".to_string(), "SYNTH_FINAL".to_string())].into(),
+    });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>
+    ));
+    // Register ONLY `code-review`; the route returns `ghost-workflow`, which is absent.
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let srv = Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(GhostWorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_task_store(store.clone()),
+    );
+
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_MESSAGE,
+            json!({ "message": {
+                "text": "DIFF",
+                "metadata": { "a2a-bridge.skill": "code-review" }
+            }}),
+        ))
+        .await
+        .unwrap();
+    // Drain the response body so the handler fully runs.
+    let _ = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+    // Exactly one row was created (the unknown-workflow path `create`s before reject).
+    let rows = store.list(10).await.unwrap();
+    assert_eq!(rows.len(), 1, "one task row must have been created");
+    let rec = &rows[0];
+    assert_eq!(
+        rec.status,
+        TaskRecordStatus::Failed,
+        "unknown workflow → Failed; got {:?}",
+        rec.status
+    );
+
+    // I6: the terminal was written via the sequenced path → terminal_seq is non-NULL.
+    let snap = store.progress_snapshot(&rec.id).await.unwrap();
+    assert!(
+        snap.terminal_seq.is_some(),
+        "unknown-workflow terminal must set terminal_seq (sequenced write)"
+    );
+    // No hub was ever inserted for this pre-spawn reject → none leaked.
+    assert!(
+        !srv.has_progress_hub_for_test(&rec.id).await,
+        "no hub may be registered for a pre-spawn reject"
+    );
+}
+
+/// **I6 — resume short-circuit sets terminal_seq**: a resumed task whose terminal
+/// node already has a checkpoint short-circuits to terminal; that transition must now
+/// go through the sequenced path (non-NULL `terminal_seq`) and leave no hub.
+#[tokio::test]
+async fn resume_short_circuit_sets_terminal_seq() {
+    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, _prompted) = build_recording_resume_server(store.clone());
+    let task = TaskId::parse("resume-short-seq").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: Some(review_snapshot(1)),
+            resume_attempts: 0,
+            session_cwd: None,
+        })
+        .await
+        .unwrap();
+    for (node, out) in [("codex", "CODEX_DONE"), ("claude", "CLAUDE_DONE"), ("synth", "SYNTH_FINAL")] {
+        store
+            .put_node_checkpoint(&task, &NodeId::parse(node).unwrap(), out, true, 2)
+            .await
+            .unwrap();
+    }
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(rec.status, TaskRecordStatus::Completed);
+    let snap = store.progress_snapshot(&task).await.unwrap();
+    assert!(
+        snap.terminal_seq.is_some(),
+        "resume short-circuit terminal must set terminal_seq (sequenced write)"
+    );
+    assert!(
+        !srv.has_progress_hub_for_test(&task).await,
+        "resume short-circuit must not leave a hub"
+    );
+}
+
+/// **I6 — resume no-snapshot Interrupt sets terminal_seq**: a `Working` task with no
+/// snapshot is Interrupted at resume; that transition must now be sequenced (non-NULL
+/// `terminal_seq`).
+#[tokio::test]
+async fn resume_no_snapshot_interrupt_sets_terminal_seq() {
+    use bridge_core::ids::TaskId;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use std::sync::Arc;
+
+    let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (srv, _prompted) = build_recording_resume_server(store.clone());
+    let task = TaskId::parse("resume-no-snap-seq").unwrap();
+    store
+        .create(&TaskRecord {
+            id: task.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: "DIFF".into(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        })
+        .await
+        .unwrap();
+
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+
+    let rec = store.get(&task).await.unwrap().unwrap();
+    assert_eq!(rec.status, TaskRecordStatus::Interrupted);
+    let snap = store.progress_snapshot(&task).await.unwrap();
+    assert!(
+        snap.terminal_seq.is_some(),
+        "resume Interrupt must set terminal_seq (sequenced write)"
     );
 }
 

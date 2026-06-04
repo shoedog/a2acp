@@ -261,6 +261,15 @@ impl InboundServer {
         self
     }
 
+    /// Test-only: is a progress hub currently registered for `task`? Used by the
+    /// reattach tests to assert hub-before-spawn insertion and hub cleanup on
+    /// terminal (the `progress_hubs` field is `pub(crate)`, so integration tests in
+    /// a separate crate cannot inspect it directly).
+    #[doc(hidden)]
+    pub async fn has_progress_hub_for_test(&self, task: &TaskId) -> bool {
+        self.progress_hubs.lock().await.contains_key(task)
+    }
+
     /// Build the axum router, mounting the Agent Card and JSON-RPC endpoint.
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
@@ -1176,6 +1185,51 @@ fn new_detached_task_id() -> TaskId {
 /// resume: `"{task}-resume-{n}"`), and a `seed` of already-completed node outputs
 /// (fresh submit: empty; boot resume: checkpoints from the store). With an empty
 /// seed, `run_from` is behaviorally identical to `run`.
+/// Finalize a detached task through the SEQUENCED store path, optionally publishing a
+/// `Terminal` frame to the task's progress hub, and ALWAYS removing the hub from
+/// `progress_hubs` (so the in-memory hub never leaks). Used by every detached terminal
+/// transition EXCEPT the runner's `Ok(true)` happy path (where the `DetachedProgressSink`
+/// already wrote+published the sequenced terminal — see `spawn_detached_workflow`).
+///
+/// Because the terminal is written via `set_terminal_sequenced`, `terminal_seq` is never
+/// left NULL on any detached path (the reattach snapshot requirement). On a path where no
+/// hub was ever inserted (e.g. the pre-spawn unknown-workflow reject), pass `hub: None`.
+async fn finalize_detached(
+    store: &Arc<dyn bridge_core::task_store::TaskStore>,
+    progress_hubs: &Arc<
+        tokio::sync::Mutex<HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>>,
+    >,
+    task: &TaskId,
+    status: bridge_core::task_store::TaskRecordStatus,
+    result: Option<&str>,
+    error: Option<&str>,
+    hub: Option<&Arc<crate::reattach::TaskProgressHub>>,
+) -> Result<(), BridgeError> {
+    use bridge_core::task_store::TaskRecordStatus;
+    let seq = store
+        .set_terminal_sequenced(task, status, result, error, crate::workflow_sink::now_ms())
+        .await?;
+    if let Some(hub) = hub {
+        // Interrupted has no WorkflowOutcome analogue; the closest wire terminal is Failed.
+        let outcome = match status {
+            TaskRecordStatus::Completed => crate::reattach::TerminalOutcome::Completed,
+            TaskRecordStatus::Canceled => crate::reattach::TerminalOutcome::Canceled,
+            TaskRecordStatus::Failed
+            | TaskRecordStatus::Interrupted
+            | TaskRecordStatus::Working => crate::reattach::TerminalOutcome::Failed,
+        };
+        let output = result.or(error).unwrap_or("").to_string();
+        hub.publish(crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq,
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::Terminal { outcome, output },
+        });
+    }
+    progress_hubs.lock().await.remove(task);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_detached_workflow(
     srv: &Arc<InboundServer>,
@@ -1186,6 +1240,7 @@ fn spawn_detached_workflow(
     token: tokio_util::sync::CancellationToken,
     seed: std::collections::HashMap<String, (String, bool)>,
     ctx: bridge_workflow::executor::WorkflowRunContext,
+    hub: Arc<crate::reattach::TaskProgressHub>,
 ) -> tokio::task::JoinHandle<()> {
     let srv = srv.clone();
     tokio::spawn(async move {
@@ -1198,63 +1253,73 @@ fn spawn_detached_workflow(
         let executor = match &srv.executor {
             Some(e) => e.clone(),
             None => {
-                let _ = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        bridge_core::task_store::TaskRecordStatus::Failed,
-                        None,
-                        Some("no executor wired"),
-                        crate::workflow_sink::now_ms(),
-                    )
-                    .await;
+                // No executor wired: finalize Failed via the sequenced path (the hub was
+                // inserted before spawn, so publish + clean it up).
+                let _ = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    bridge_core::task_store::TaskRecordStatus::Failed,
+                    None,
+                    Some("no executor wired"),
+                    Some(&hub),
+                )
+                .await;
                 fin.done = true;
                 srv.workflow_cancels.lock().await.remove(&task);
                 return;
             }
         };
         let stream = executor.run_from_with_context(graph, input, run_id, token, seed, ctx);
-        let mut sink =
-            crate::workflow_sink::TaskStoreSink::new(srv.task_store.clone(), task.clone());
-        let now = crate::workflow_sink::now_ms();
+        // The DetachedProgressSink OWNS the sequenced terminal write: on a clean drain it
+        // has already written `set_terminal_sequenced` AND published the Terminal frame.
+        let mut sink = crate::workflow_sink::DetachedProgressSink::new(
+            srv.task_store.clone(),
+            task.clone(),
+            hub.clone(),
+        );
         match crate::workflow_sink::drain_workflow(stream, &mut sink).await {
-            Ok(terminal_seen) => {
-                if terminal_seen {
-                    if let Some((status, result, error)) = sink.take() {
-                        let _ = srv
-                            .task_store
-                            .set_terminal(&task, status, result.as_deref(), error.as_deref(), now)
-                            .await;
-                    }
-                } else {
-                    let _ = srv
-                        .task_store
-                        .set_terminal(
-                            &task,
-                            bridge_core::task_store::TaskRecordStatus::Failed,
-                            None,
-                            Some("workflow ended without terminal"),
-                            now,
-                        )
-                        .await;
-                }
+            Ok(true) => {
+                // Sink already committed+published the terminal. Do NOT write it again.
+                // M1: flip the finalizer done flag BEFORE the hub-removal await so the
+                // Finalizer's Drop can never clobber the committed terminal during the
+                // .await suspension point below.
+                fin.done = true;
+                srv.progress_hubs.lock().await.remove(&task);
+                srv.workflow_cancels.lock().await.remove(&task);
+            }
+            Ok(false) => {
+                // Drain ended with no terminal: finalize Failed via the sequenced path
+                // (also removes the hub).
+                let _ = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    bridge_core::task_store::TaskRecordStatus::Failed,
+                    None,
+                    Some("workflow ended without terminal"),
+                    Some(&hub),
+                )
+                .await;
+                fin.done = true;
+                srv.workflow_cancels.lock().await.remove(&task);
             }
             Err(e) => {
                 tracing::warn!(task = task.as_str(), error = ?e, "drain_workflow sink error; marking task Failed");
-                let _ = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        bridge_core::task_store::TaskRecordStatus::Failed,
-                        None,
-                        Some("checkpoint write failed"),
-                        now,
-                    )
-                    .await;
+                let _ = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    bridge_core::task_store::TaskRecordStatus::Failed,
+                    None,
+                    Some("checkpoint write failed"),
+                    Some(&hub),
+                )
+                .await;
+                fin.done = true;
+                srv.workflow_cancels.lock().await.remove(&task);
             }
         }
-        fin.done = true;
-        srv.workflow_cancels.lock().await.remove(&task);
     })
 }
 
@@ -1262,7 +1327,7 @@ fn spawn_detached_workflow(
 /// Resolves the graph from the server's `workflows` map (the graph must already be
 /// registered). `run_id` is set to the task id (matching the fresh-submit path).
 #[doc(hidden)]
-pub fn spawn_detached_workflow_for_test(
+pub async fn spawn_detached_workflow_for_test(
     srv: &Arc<InboundServer>,
     task: TaskId,
     text_parts: Vec<String>,
@@ -1276,6 +1341,12 @@ pub fn spawn_detached_workflow_for_test(
         .expect("workflow must be registered in the test server");
     let input = text_parts.join("\n");
     let run_id = task.as_str().to_string();
+    // Mirror the real callers: insert the hub BEFORE spawning.
+    let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+    srv.progress_hubs
+        .lock()
+        .await
+        .insert(task.clone(), hub.clone());
     spawn_detached_workflow(
         srv,
         task,
@@ -1285,6 +1356,7 @@ pub fn spawn_detached_workflow_for_test(
         token,
         std::collections::HashMap::new(),
         bridge_workflow::executor::WorkflowRunContext::default(),
+        hub,
     )
 }
 
@@ -1292,7 +1364,7 @@ pub fn spawn_detached_workflow_for_test(
 /// Resolves the graph from the server's `workflows` map (the graph must already be
 /// registered). `run_id` is set to the task id (matching the fresh-submit path).
 #[doc(hidden)]
-pub fn spawn_detached_workflow_with_token_for_test(
+pub async fn spawn_detached_workflow_with_token_for_test(
     srv: &Arc<InboundServer>,
     task: TaskId,
     text_parts: Vec<String>,
@@ -1306,6 +1378,12 @@ pub fn spawn_detached_workflow_with_token_for_test(
         .expect("workflow must be registered in the test server");
     let input = text_parts.join("\n");
     let run_id = task.as_str().to_string();
+    // Mirror the real callers: insert the hub BEFORE spawning.
+    let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+    srv.progress_hubs
+        .lock()
+        .await
+        .insert(task.clone(), hub.clone());
     spawn_detached_workflow(
         srv,
         task,
@@ -1315,6 +1393,7 @@ pub fn spawn_detached_workflow_with_token_for_test(
         token,
         std::collections::HashMap::new(),
         bridge_workflow::executor::WorkflowRunContext::default(),
+        hub,
     )
 }
 
@@ -1372,16 +1451,18 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
 
         // (1) No snapshot → cannot reconstruct the graph that was running. Interrupt.
         let Some(spec_json) = wt.workflow_spec_json.as_deref() else {
-            if let Err(e) = srv
-                .task_store
-                .set_terminal(
-                    &task,
-                    TaskRecordStatus::Interrupted,
-                    None,
-                    Some("not resumable: no workflow snapshot"),
-                    crate::workflow_sink::now_ms(),
-                )
-                .await
+            // Pre-spawn terminal (no hub inserted): finalize via the sequenced path
+            // (hub: None) so terminal_seq is never NULL.
+            if let Err(e) = finalize_detached(
+                &srv.task_store,
+                &srv.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: no workflow snapshot"),
+                None,
+            )
+            .await
             {
                 tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-snapshot) failed");
             } else {
@@ -1400,16 +1481,16 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
         let graph = match serde_json::from_str::<WorkflowSpecEnvelope>(spec_json) {
             Ok(env) if env.v == SUPPORTED_SNAPSHOT_VERSION => env.graph,
             _ => {
-                if let Err(e) = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        TaskRecordStatus::Interrupted,
-                        None,
-                        Some("not resumable: unreadable workflow snapshot"),
-                        crate::workflow_sink::now_ms(),
-                    )
-                    .await
+                if let Err(e) = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: unreadable workflow snapshot"),
+                    None,
+                )
+                .await
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/unreadable) failed");
                 } else {
@@ -1447,16 +1528,16 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
             None => {
                 // A snapshot that validate()'d at submit time always has exactly one
                 // terminal; a malformed snapshot with no terminal is not resumable.
-                if let Err(e) = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        TaskRecordStatus::Interrupted,
-                        None,
-                        Some("not resumable: workflow snapshot has no terminal node"),
-                        crate::workflow_sink::now_ms(),
-                    )
-                    .await
+                if let Err(e) = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: workflow snapshot has no terminal node"),
+                    None,
+                )
+                .await
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-terminal) failed");
                 } else {
@@ -1474,10 +1555,18 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
             } else {
                 (TaskRecordStatus::Failed, None, Some(output.as_str()))
             };
-            if let Err(e) = srv
-                .task_store
-                .set_terminal(&task, status, result, error, crate::workflow_sink::now_ms())
-                .await
+            // Pre-spawn terminal (no hub inserted): sequenced finalize so terminal_seq
+            // is never NULL.
+            if let Err(e) = finalize_detached(
+                &srv.task_store,
+                &srv.progress_hubs,
+                &task,
+                status,
+                result,
+                error,
+                None,
+            )
+            .await
             {
                 tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(short-circuit) failed");
             } else {
@@ -1495,16 +1584,16 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
             Ok(ResumeClaim::Exhausted) => {
                 // Poison-pill guard: a task that keeps crashing the server is marked
                 // Interrupted after `cap` attempts instead of looping forever.
-                if let Err(e) = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        TaskRecordStatus::Interrupted,
-                        None,
-                        Some("resume attempt cap exceeded"),
-                        crate::workflow_sink::now_ms(),
-                    )
-                    .await
+                if let Err(e) = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("resume attempt cap exceeded"),
+                    None,
+                )
+                .await
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/cap) failed");
                 } else {
@@ -1526,16 +1615,16 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                             session_cwd: Some(c),
                         },
                         Err(_) => {
-                            let _ = srv
-                                .task_store
-                                .set_terminal(
-                                    &task,
-                                    TaskRecordStatus::Interrupted,
-                                    None,
-                                    Some("not resumable: unreadable session cwd"),
-                                    crate::workflow_sink::now_ms(),
-                                )
-                                .await;
+                            let _ = finalize_detached(
+                                &srv.task_store,
+                                &srv.progress_hubs,
+                                &task,
+                                TaskRecordStatus::Interrupted,
+                                None,
+                                Some("not resumable: unreadable session cwd"),
+                                None,
+                            )
+                            .await;
                             tracing::info!(
                                 task = task.as_str(),
                                 "resume scan: interrupted (unreadable session cwd)"
@@ -1545,6 +1634,13 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     },
                     None => bridge_workflow::executor::WorkflowRunContext::default(),
                 };
+                // Insert the progress hub BEFORE spawning (mirrors the fresh-submit
+                // path) so a reattach subscriber can find it.
+                let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+                srv.progress_hubs
+                    .lock()
+                    .await
+                    .insert(task.clone(), hub.clone());
                 // Register a fresh cancel token BEFORE spawning so a concurrent
                 // tasks/cancel during resume can find and fire it.
                 let token = tokio_util::sync::CancellationToken::new();
@@ -1565,6 +1661,7 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     token,
                     seed,
                     ctx,
+                    hub,
                 ));
                 tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
             }
@@ -1830,19 +1927,28 @@ async fn unary_message(
             let graph = match graph {
                 Some(g) => g,
                 None => {
-                    let _ = srv
-                        .task_store
-                        .set_terminal(
-                            &task,
-                            bridge_core::task_store::TaskRecordStatus::Failed,
-                            None,
-                            Some("unknown workflow"),
-                            now,
-                        )
-                        .await;
+                    // Unknown workflow, pre-spawn: no hub was inserted (hub: None). Finalize
+                    // Failed via the sequenced path so terminal_seq is never NULL.
+                    let _ = finalize_detached(
+                        &srv.task_store,
+                        &srv.progress_hubs,
+                        &task,
+                        bridge_core::task_store::TaskRecordStatus::Failed,
+                        None,
+                        Some("unknown workflow"),
+                        None,
+                    )
+                    .await;
                     return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
                 }
             };
+            // Insert the progress hub BEFORE spawning so a reattach subscriber arriving
+            // immediately after this submit can find it.
+            let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+            srv.progress_hubs
+                .lock()
+                .await
+                .insert(task.clone(), hub.clone());
             let token = tokio_util::sync::CancellationToken::new();
             srv.workflow_cancels
                 .lock()
@@ -1859,6 +1965,7 @@ async fn unary_message(
                 bridge_workflow::executor::WorkflowRunContext {
                     session_cwd: routed.session_cwd.clone(),
                 },
+                hub,
             ));
             let working = a2a::Task {
                 id: task.as_str().to_owned(),
