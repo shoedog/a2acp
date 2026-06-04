@@ -691,8 +691,7 @@ async fn subscribe_to_task(
     };
 
     // I2 cursor: absent Last-Event-ID → None (not 0); Some(K) → only seq > K.
-    // Consumed in Tasks 8-9; prefixed with `_` to suppress the unused warning.
-    let _cursor: Option<i64> = headers
+    let cursor: Option<i64> = headers
         .get("Last-Event-ID")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
@@ -701,17 +700,125 @@ async fn subscribe_to_task(
     // NOT fall through to gate() and start a new run).
     match srv.task_store.get(&task_id).await {
         Ok(Some(_rec)) => {
-            // Task found: return a stub SSE response (Tasks 8-9 fill the body).
-            // Use an immediately-closing empty stream so the wire sees a proper
-            // `text/event-stream` content-type without hanging open.
-            let empty_stream = futures::stream::empty::<Result<SseEvent, std::convert::Infallible>>();
-            Sse::new(empty_stream)
-                .keep_alive(KeepAlive::default())
-                .into_response()
+            // Task found: load its progress snapshot and dispatch on status.
+            let snap = match srv.task_store.progress_snapshot(&task_id).await {
+                Ok(s) => s,
+                Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+            };
+
+            if snap.status.is_terminal() {
+                // --- Terminal-task flow (Task 8) ---
+                // Build snapshot frames (cursor-filtered, seq-ordered).
+                let mut frames = snapshot_frames(&snap, cursor);
+
+                // Append SnapshotComplete sentinel (seq = max snapshot frame seq or cut_seq).
+                let sentinel_seq = frames.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
+                frames.push(crate::reattach::WorkflowProgressFrame {
+                    v: 1,
+                    seq: sentinel_seq,
+                    phase: crate::reattach::Phase::Snapshot,
+                    kind: crate::reattach::FrameKind::SnapshotComplete,
+                });
+
+                // Append Terminal frame unless cursor already covers a KNOWN terminal_seq.
+                // None (legacy) → always emit; Some(ts) → emit only if cursor < ts.
+                let emit_terminal = snap
+                    .terminal_seq
+                    .is_none_or(|ts| cursor.is_none_or(|k| ts > k));
+                if emit_terminal {
+                    use bridge_core::task_store::TaskRecordStatus;
+                    let outcome = match snap.status {
+                        TaskRecordStatus::Completed => crate::reattach::TerminalOutcome::Completed,
+                        TaskRecordStatus::Canceled => crate::reattach::TerminalOutcome::Canceled,
+                        // Failed, Interrupted, Working all map to Failed on the wire.
+                        _ => crate::reattach::TerminalOutcome::Failed,
+                    };
+                    let output = snap
+                        .result
+                        .clone()
+                        .or(snap.error.clone())
+                        .unwrap_or_default();
+                    frames.push(crate::reattach::WorkflowProgressFrame {
+                        v: 1,
+                        seq: snap.terminal_seq.unwrap_or(0),
+                        phase: crate::reattach::Phase::Live,
+                        kind: crate::reattach::FrameKind::Terminal { outcome, output },
+                    });
+                }
+
+                // Convert Vec<WorkflowProgressFrame> into an SSE stream and return.
+                // A terminal task's stream is FINITE — it ends after the Terminal frame,
+                // so NO keep-alive (which would be a reader-trap suggesting more may come).
+                let sse_stream = futures::stream::iter(frames.into_iter().map(|f| {
+                    Ok::<_, std::convert::Infallible>(
+                        SseEvent::default()
+                            .id(f.seq.to_string())
+                            .data(serde_json::to_string(&f).unwrap_or_default()),
+                    )
+                }));
+                Sse::new(sse_stream).into_response()
+            } else {
+                // --- Working-task flow (Task 9, stub for now) ---
+                let empty_stream =
+                    futures::stream::empty::<Result<SseEvent, std::convert::Infallible>>();
+                Sse::new(empty_stream)
+                    .keep_alive(KeepAlive::default())
+                    .into_response()
+            }
         }
         Ok(None) => bridge_err_to_jsonrpc(id, &BridgeError::TaskNotFound),
         Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
     }
+}
+
+/// Build the ordered, cursor-filtered `Vec<WorkflowProgressFrame>` for the snapshot phase.
+///
+/// `cursor`: `None` passes everything including seq 0; `Some(K)` passes only `seq > K`.
+/// Frames from `snap.checkpoints` become `NodeFinished` entries; frames from
+/// `snap.starts` become `NodeStarted` entries. The result is sorted ascending by seq.
+fn snapshot_frames(
+    snap: &bridge_core::task_store::TaskProgressSnapshot,
+    cursor: Option<i64>,
+) -> Vec<crate::reattach::WorkflowProgressFrame> {
+    // `pass(seq)` returns true if the frame should be included given the cursor.
+    // Absent cursor → include everything (including seq 0). Some(K) → only seq > K.
+    let pass = |seq: i64| cursor.is_none_or(|k| seq > k);
+
+    let mut frames = Vec::new();
+
+    // Finished nodes (checkpoints): tuple = (node, output, ok, seq).
+    for (node, output, ok, seq) in &snap.checkpoints {
+        if pass(*seq) {
+            frames.push(crate::reattach::WorkflowProgressFrame {
+                v: 1,
+                seq: *seq,
+                phase: crate::reattach::Phase::Snapshot,
+                kind: crate::reattach::FrameKind::NodeFinished {
+                    node: node.as_str().to_string(),
+                    ok: *ok,
+                    output: output.clone(),
+                },
+            });
+        }
+    }
+
+    // In-progress nodes (starts): tuple = (node, seq).
+    for (node, seq) in &snap.starts {
+        if pass(*seq) {
+            frames.push(crate::reattach::WorkflowProgressFrame {
+                v: 1,
+                seq: *seq,
+                phase: crate::reattach::Phase::Snapshot,
+                kind: crate::reattach::FrameKind::NodeStarted {
+                    node: node.as_str().to_string(),
+                },
+            });
+        }
+    }
+
+    // Sort ascending by seq so the client sees events in the order they occurred.
+    frames.sort_by_key(|f| f.seq);
+    frames
 }
 
 /// Spawn the local-backend producer for an already-resolved [`LocalDispatch`]: drive
@@ -5865,6 +5972,194 @@ mod tests {
             tasks.is_empty(),
             "no task should have been created in the store: {:?}",
             tasks
+        );
+    }
+
+    // ---- Task 8: snapshot builder + terminal-state flow ----
+
+    /// Build a `post_request` and attach a `Last-Event-ID` header for the cursor.
+    fn post_request_with_cursor(
+        method: &str,
+        params: Value,
+        version: &str,
+        cursor: i64,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, version)
+            .header("Last-Event-ID", cursor.to_string())
+            .body(jsonrpc_body(method, params))
+            .unwrap()
+    }
+
+    /// Parse an SSE body into an ordered `Vec<(seq, kind_tag)>`.
+    /// Each SSE event block is separated by a blank line; we look for:
+    ///   `id: <seq>` and `data: <json>` (extracting the `"kind"` field).
+    async fn collect_sse_frames(resp: Response) -> Vec<(i64, String)> {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut result = Vec::new();
+        // Split on blank lines to get event blocks.
+        for block in body.split("\n\n") {
+            let mut seq: Option<i64> = None;
+            let mut kind: Option<String> = None;
+            for line in block.lines() {
+                if let Some(id_str) = line.strip_prefix("id:") {
+                    seq = id_str.trim().parse().ok();
+                } else if let Some(data_str) = line.strip_prefix("data:") {
+                    let trimmed = data_str.trim();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        if let Some(k) = v.get("kind").and_then(|k| k.as_str()) {
+                            kind = Some(k.to_string());
+                        }
+                    }
+                }
+            }
+            if let (Some(s), Some(k)) = (seq, kind) {
+                result.push((s, k));
+            }
+        }
+        result
+    }
+
+    /// Seed a `MemoryTaskStore` task record in the Working state.
+    async fn seed_task_record(
+        store: &std::sync::Arc<bridge_core::task_store::MemoryTaskStore>,
+        task_id: &str,
+    ) -> bridge_core::ids::TaskId {
+        let id = bridge_core::ids::TaskId::parse(task_id).unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store.create(&bridge_core::task_store::TaskRecord {
+            id: id.clone(),
+            workflow: "code-review".to_string(),
+            status: bridge_core::task_store::TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: now,
+            updated_ms: now,
+            input: "test input".to_string(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        }).await.unwrap();
+        id
+    }
+
+    /// (8a) Terminal task with 2 checkpoints (seqs 1, 2) + terminal_seq 3, no cursor.
+    /// Expected frames: [(1,"node_finished"),(2,"node_finished"),(2,"snapshot_complete"),(3,"terminal")]
+    #[tokio::test]
+    async fn subscribe_terminal_task_no_cursor_yields_snapshot_then_terminal() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t8a").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        // seq 1: node-a finished; seq 2: node-b finished; seq 3: terminal.
+        let s1 = store.put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now).await.unwrap();
+        let s2 = store.put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now).await.unwrap();
+        let s3 = store.set_terminal_sequenced(&task_id, bridge_core::task_store::TaskRecordStatus::Completed, Some("done"), None, now).await.unwrap();
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 2);
+        assert_eq!(s3, 3);
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "t8a" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (1, "node_finished".to_string()),
+                (2, "node_finished".to_string()),
+                (2, "snapshot_complete".to_string()),
+                (3, "terminal".to_string()),
+            ],
+            "expected ordered snapshot+terminal frames: {frames:?}"
+        );
+    }
+
+    /// (8b) Same terminal task, cursor=1 → only frames with seq > 1 are emitted.
+    /// Expected: [(2,"node_finished"),(2,"snapshot_complete"),(3,"terminal")]
+    #[tokio::test]
+    async fn subscribe_terminal_task_cursor_1_filters_seq_gt_1() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t8b").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store.put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now).await.unwrap(); // seq=1
+        store.put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now).await.unwrap(); // seq=2
+        store.set_terminal_sequenced(&task_id, bridge_core::task_store::TaskRecordStatus::Completed, Some("done"), None, now).await.unwrap(); // seq=3
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request_with_cursor(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "t8b" }),
+                "1.0",
+                1, // cursor: Last-Event-ID = 1 → only seq > 1
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (2, "node_finished".to_string()),
+                (2, "snapshot_complete".to_string()),
+                (3, "terminal".to_string()),
+            ],
+            "cursor=1 should filter out seq=1 frame: {frames:?}"
+        );
+    }
+
+    /// (8c) I2 NULL-seq: terminal task whose checkpoint was written via legacy
+    /// `put_node_checkpoint` (seq=0) and terminal via legacy `set_terminal` (terminal_seq=None).
+    /// No cursor → the (0,"node_finished") IS delivered AND a terminal frame is still emitted.
+    #[tokio::test]
+    async fn subscribe_terminal_task_legacy_null_seq_delivers_seq0_and_terminal() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t8c").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        // Legacy put_node_checkpoint writes seq=0 (stored as 0 in the CheckpointValue).
+        store.put_node_checkpoint(&task_id, &node_a, "out-a", true, now).await.unwrap();
+        // Legacy set_terminal: terminal_seq=None (not stored in terminal_seqs).
+        store.set_terminal(&task_id, bridge_core::task_store::TaskRecordStatus::Completed, Some("done"), None, now).await.unwrap();
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "t8c" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = collect_sse_frames(resp).await;
+        // seq=0 node_finished MUST be delivered (cursor absent → pass everything incl seq 0)
+        // terminal_seq=None → always emit terminal (seq=0 for the terminal frame since terminal_seq is None).
+        assert_eq!(
+            frames,
+            vec![
+                (0, "node_finished".to_string()),
+                (0, "snapshot_complete".to_string()),
+                (0, "terminal".to_string()),
+            ],
+            "NULL-seq legacy task: seq0 node_finished AND terminal must be delivered: {frames:?}"
         );
     }
 
