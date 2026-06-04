@@ -554,8 +554,11 @@ async fn jsonrpc(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     match method {
-        m if m == methods::SEND_STREAMING_MESSAGE || m == methods::SUBSCRIBE_TO_TASK => {
+        m if m == methods::SEND_STREAMING_MESSAGE => {
             stream_message(srv, headers, id, params).await
+        }
+        m if m == methods::SUBSCRIBE_TO_TASK => {
+            subscribe_to_task(srv, headers, id, params).await
         }
         m if m == methods::SEND_MESSAGE => unary_message(srv, headers, id, params).await,
         m if m == methods::CANCEL_TASK => cancel_task(srv, headers, id, params).await,
@@ -631,6 +634,84 @@ async fn stream_message(
     Sse::new(sse_stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// `SubscribeToTask` handler: auth + A2A-version check, extract `id` (with
+/// `taskId` as a lenient alias per I3), parse the `Last-Event-ID` cursor as
+/// `Option<i64>`, look up the task in the durable store, return not-found if
+/// absent. Does NOT call `gate()` — it never starts a new run.
+///
+/// Stub: the snapshot/SSE body is filled in by Tasks 8-9; for now returns an
+/// immediately-closing empty SSE event-stream so the wire sees a proper
+/// `text/event-stream` response.
+async fn subscribe_to_task(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    // Auth + version: the same bearer-token + supported-version check `gate()` performs,
+    // WITHOUT gate()'s routing (gate() would synthesize a task and start a run).
+    let token = bearer_token(&headers);
+    let inbound = match token {
+        Some(t) => InboundRequest::with_token(&t),
+        None => InboundRequest::anon(),
+    };
+    if let Err(e) = srv.auth.authorize(&inbound) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+
+    // A2A-version check.
+    let version = headers
+        .get(SVC_PARAM_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(A2A_PINNED_VERSION);
+    if let Err(e) = assert_supported_version(version) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+
+    // I3: read the standard a2a-lf `id` field first; fall back to `taskId` as a
+    // lenient alias so old clients that send only `taskId` are not broken.
+    let task_str = params["id"]
+        .as_str()
+        .or_else(|| params["taskId"].as_str());
+    let task_str = match task_str {
+        Some(s) => s,
+        None => {
+            return bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "id" });
+        }
+    };
+
+    // Parse the raw string into a bridge-core TaskId (rejects empty strings).
+    let task_id = match bridge_core::ids::TaskId::parse(task_str) {
+        Ok(t) => t,
+        Err(_) => {
+            return bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "id" });
+        }
+    };
+
+    // I2 cursor: absent Last-Event-ID → None (not 0); Some(K) → only seq > K.
+    // Consumed in Tasks 8-9; prefixed with `_` to suppress the unused warning.
+    let _cursor: Option<i64> = headers
+        .get("Last-Event-ID")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    // Look up the task in the durable store.  Not found → not-found error (M5: do
+    // NOT fall through to gate() and start a new run).
+    match srv.task_store.get(&task_id).await {
+        Ok(Some(_rec)) => {
+            // Task found: return a stub SSE response (Tasks 8-9 fill the body).
+            // Use an immediately-closing empty stream so the wire sees a proper
+            // `text/event-stream` content-type without hanging open.
+            let empty_stream = futures::stream::empty::<Result<SseEvent, std::convert::Infallible>>();
+            Sse::new(empty_stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        }
+        Ok(None) => bridge_err_to_jsonrpc(id, &BridgeError::TaskNotFound),
+        Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+    }
 }
 
 /// Spawn the local-backend producer for an already-resolved [`LocalDispatch`]: drive
@@ -5593,6 +5674,228 @@ mod tests {
             1,
             "changing a2a-bridge.cwd must NOT spawn a new backend; \
              the warm process is shared across distinct cwds (only the ACP session mint differs)"
+        );
+    }
+
+    // ---- Task 7: SubscribeToTask dispatch + handler skeleton ----
+
+    use bridge_core::task_store::TaskStore as _;
+
+    /// Build a server with a MemoryTaskStore for the reattach tests (the durable
+    /// task_store is what `subscribe_to_task` consults for task lookup).
+    fn build_with_task_store(
+        task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+    ) -> Arc<InboundServer> {
+        Arc::new(
+            InboundServer::new(
+                FakeRegistry::single("kiro", FakeBackend::new()),
+                Arc::new(FakeStore::default()),
+                Arc::new(AutoApprove),
+                Arc::new(AlwaysKiro),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "kiro",
+            )
+            .with_task_store(task_store),
+        )
+    }
+
+    /// (a) SubscribeToTask with NO task id (neither `id` nor `taskId` in params)
+    /// must return a JSON-RPC invalid-request error.
+    #[tokio::test]
+    async fn subscribe_to_task_missing_id_returns_error() {
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({}),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("error").is_some(),
+            "expected a JSON-RPC error for missing task id, got: {body}"
+        );
+    }
+
+    /// (b) SubscribeToTask with an unknown task id must return a not-found JSON-RPC error.
+    #[tokio::test]
+    async fn subscribe_to_task_unknown_id_returns_not_found() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "no-such-task" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // not-found maps to RejectRequest => INVALID_REQUEST => 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("error").is_some(),
+            "expected a JSON-RPC error for unknown task id, got: {body}"
+        );
+    }
+
+    /// (c) I3 wire-conformance: a SubscribeToTask with the standard a2a-lf field
+    /// `{"id": "<known-task-id>"}` (a task that exists in the store) is ACCEPTED —
+    /// the response is an event-stream (SSE), NOT a JSON-RPC error.
+    /// This test would FAIL if the handler read only `taskId`.
+    #[tokio::test]
+    async fn subscribe_to_task_standard_id_field_accepted() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        // Create a task record in the store so the lookup succeeds.
+        let now = crate::workflow_sink::now_ms();
+        let rec = bridge_core::task_store::TaskRecord {
+            id: TaskId::parse("test-task-7c").unwrap(),
+            workflow: "test-wf".to_string(),
+            status: bridge_core::task_store::TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: now,
+            updated_ms: now,
+            input: "test input".to_string(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        };
+        store.create(&rec).await.unwrap();
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "test-task-7c" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // Must succeed (SSE response, NOT a JSON-RPC error).
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The response must be an event-stream, not JSON.
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/event-stream"),
+            "expected event-stream content type, got: {content_type}"
+        );
+    }
+
+    /// (c2) I3 lenient alias: a request carrying the legacy `taskId` field (instead of
+    /// the standard a2a-lf `id`) is still accepted — locks the `.or_else(taskId)` fallback
+    /// so a refactor that drops it is caught.
+    #[tokio::test]
+    async fn subscribe_to_task_legacy_task_id_alias_accepted() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let now = crate::workflow_sink::now_ms();
+        let rec = bridge_core::task_store::TaskRecord {
+            id: TaskId::parse("test-task-7c2").unwrap(),
+            workflow: "test-wf".to_string(),
+            status: bridge_core::task_store::TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: now,
+            updated_ms: now,
+            input: "test input".to_string(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        };
+        store.create(&rec).await.unwrap();
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "taskId": "test-task-7c2" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/event-stream"),
+            "the taskId alias must be accepted; got content type: {content_type}"
+        );
+    }
+
+    /// (d) M5: a task id that is NOT in the TaskStore must return a not-found error
+    /// without falling through to gate() and starting a new run. This distinguishes
+    /// subscribe_to_task from stream_message (which would mint a new run for any id).
+    #[tokio::test]
+    async fn subscribe_to_task_unknown_id_no_gate_fallthrough() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let srv = build_with_task_store(store.clone());
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "phantom-task" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // Must be a not-found error (no run started).
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("error").is_some(),
+            "expected a JSON-RPC error for phantom task id, got: {body}"
+        );
+        // Confirm no new task was created in the store (gate() was NOT called).
+        let tasks = store.list(100).await.unwrap();
+        assert!(
+            tasks.is_empty(),
+            "no task should have been created in the store: {:?}",
+            tasks
+        );
+    }
+
+    /// Confirm SendStreamingMessage STILL routes to stream_message (produces SSE,
+    /// not a JSON-RPC error). This verifies the dispatch split did not break the
+    /// existing streaming path.
+    #[tokio::test]
+    async fn send_streaming_message_still_routes_to_stream_message() {
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/event-stream"),
+            "SendStreamingMessage must still produce SSE: {content_type}"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("PONG"),
+            "SendStreamingMessage must still route to stream_message and get PONG: {body}"
         );
     }
 }
