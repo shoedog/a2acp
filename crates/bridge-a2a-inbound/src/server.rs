@@ -299,6 +299,18 @@ impl InboundServer {
             .unwrap_or(A2A_PINNED_VERSION);
         assert_supported_version(version)?;
 
+        // 2b. H1: reject a message with NO extractable text content. Done BEFORE routing
+        //     so message validity is independent of routing — a prober can't distinguish
+        //     "valid agent, bad content" from "invalid agent" by the error. An empty
+        //     `parts` would otherwise reach the backend as a contentless prompt (zero ACP
+        //     content blocks) and surface as an opaque "agent crashed".
+        let parts = parts_from_params(params);
+        if parts.is_empty() {
+            return Err(BridgeError::InvalidRequest {
+                field: "message: no text content (expected message.parts[].text or message.text)",
+            });
+        }
+
         // 3. Route. Parse skill/agent/overrides from params and pass to route decision. The
         //    target (Local vs Delegate) is carried through so the handler picks
         //    the local-backend producer or the delegation producer.
@@ -315,16 +327,6 @@ impl InboundServer {
         let task = task_id_from_params(params)?;
         let session = SessionId::parse(format!("session-{}", task.as_str()))
             .unwrap_or_else(|_| SessionId::parse("session-default").unwrap());
-        // H1: reject a message with NO extractable text content BEFORE dispatch.
-        // An empty `parts` would otherwise reach the backend as a contentless prompt
-        // (zero ACP content blocks) and surface as an opaque "agent crashed" — reject
-        // it as a client error here instead.
-        let parts = parts_from_params(params);
-        if parts.is_empty() {
-            return Err(BridgeError::InvalidRequest {
-                field: "message: no text content (expected message.parts[].text or message.text)",
-            });
-        }
         Ok(RoutedCall {
             task,
             session,
@@ -2976,11 +2978,13 @@ fn task_meta_from_params(params: &Value) -> Result<TaskMeta, BridgeError> {
 ///    field to a `Part { text }`. An element contributes text only when its
 ///    `kind` is `"text"` (or absent — lenient); `data`/`file`/other-kind parts
 ///    are NOT prompt text and are skipped (so a `data` part's stray `text`
-///    field is not misread as a prompt). A `parts` array that yields no text
-///    (e.g. only `data` parts) returns an empty vec — `gate()` rejects that.
-/// 2. Else if `message.text` is a string, one `Part { text }`.
-/// 3. Else if a top-level `text` field is present, one `Part { text }`.
-/// 4. Otherwise empty vec.
+///    field is not misread as a prompt). If the `parts` array yields no usable
+///    text (e.g. only `data` parts, or only blank text) it FALLS THROUGH to (2).
+/// 2. Else if `message.text` is non-blank, one `Part { text }`.
+/// 3. Else if a top-level `text` field is non-blank, one `Part { text }`.
+/// 4. Otherwise empty vec — `gate()` rejects an empty result as a client error.
+///
+/// Blank/whitespace-only text never counts as content at any level.
 fn parts_from_params(params: &Value) -> Vec<Part> {
     let message = params.get("message");
 
