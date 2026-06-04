@@ -1809,6 +1809,45 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
     async fn working_tasks(&self) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
         self.inner.working_tasks().await
     }
+
+    async fn record_node_started(
+        &self,
+        task: &TaskId,
+        node: &bridge_core::ids::NodeId,
+        ts: i64,
+    ) -> Result<i64, BridgeError> {
+        self.inner.record_node_started(task, node, ts).await
+    }
+
+    async fn put_node_checkpoint_sequenced(
+        &self,
+        _task: &TaskId,
+        _node: &bridge_core::ids::NodeId,
+        _output: &str,
+        _ok: bool,
+        _ts: i64,
+    ) -> Result<i64, BridgeError> {
+        // Always fail — simulates a DB write error (mirrors put_node_checkpoint failure).
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn set_terminal_sequenced(
+        &self,
+        task: &TaskId,
+        status: bridge_core::task_store::TaskRecordStatus,
+        result: Option<&str>,
+        error: Option<&str>,
+        ts: i64,
+    ) -> Result<i64, BridgeError> {
+        self.inner.set_terminal_sequenced(task, status, result, error, ts).await
+    }
+
+    async fn progress_snapshot(
+        &self,
+        task: &TaskId,
+    ) -> Result<bridge_core::task_store::TaskProgressSnapshot, BridgeError> {
+        self.inner.progress_snapshot(task).await
+    }
 }
 
 // ============================================================================

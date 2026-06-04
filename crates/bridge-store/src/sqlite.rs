@@ -527,6 +527,44 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         }
         Ok(out)
     }
+
+    async fn record_node_started(
+        &self,
+        _task: &TaskId,
+        _node: &NodeId,
+        _ts: i64,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::StoreFailure) // TODO(Task 2)
+    }
+
+    async fn put_node_checkpoint_sequenced(
+        &self,
+        _task: &TaskId,
+        _node: &NodeId,
+        _output: &str,
+        _ok: bool,
+        _ts: i64,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::StoreFailure) // TODO(Task 2)
+    }
+
+    async fn set_terminal_sequenced(
+        &self,
+        _task: &TaskId,
+        _status: bridge_core::task_store::TaskRecordStatus,
+        _result: Option<&str>,
+        _error: Option<&str>,
+        _ts: i64,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::StoreFailure) // TODO(Task 2)
+    }
+
+    async fn progress_snapshot(
+        &self,
+        _task: &TaskId,
+    ) -> Result<bridge_core::task_store::TaskProgressSnapshot, BridgeError> {
+        Err(BridgeError::StoreFailure) // TODO(Task 2)
+    }
 }
 
 fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecord, BridgeError> {

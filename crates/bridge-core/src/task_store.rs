@@ -132,13 +132,80 @@ pub trait TaskStore: Send + Sync {
     ) -> Result<ResumeClaim, BridgeError>;
     /// Return all rows whose status is `Working` (for the boot-time resume scan).
     async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError>;
+
+    // ── Seq-bearing progress methods (Phase A: streaming reattach substrate) ──
+
+    /// Record that a node has started executing. Returns the allocated seq.
+    /// Re-starting the same node (resume re-emit) MUST NOT return an error —
+    /// it upserts a fresh seq and ts, overwriting the previous start row.
+    async fn record_node_started(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        ts: i64,
+    ) -> Result<i64, BridgeError>;
+
+    /// Persist a node output checkpoint WITH a monotonic seq. Returns the seq.
+    /// Removes the node's start row (the node is no longer "in progress").
+    ///
+    /// WRITE-ONCE per `(task,node)`, like `put_node_checkpoint` (W3b semantics):
+    /// a node finishes once; on resume, already-finished nodes are seeded and do
+    /// NOT re-checkpoint, so the durable (SQLite) impl uses a plain INSERT.
+    async fn put_node_checkpoint_sequenced(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        output: &str,
+        ok: bool,
+        ts: i64,
+    ) -> Result<i64, BridgeError>;
+
+    /// Set the terminal status + result/error, recording a seq for the event.
+    /// Returns the seq.
+    async fn set_terminal_sequenced(
+        &self,
+        task: &TaskId,
+        status: TaskRecordStatus,
+        result: Option<&str>,
+        error: Option<&str>,
+        ts: i64,
+    ) -> Result<i64, BridgeError>;
+
+    /// Reconstruct the current progress state for streaming reattach.
+    /// `checkpoints` is ordered by seq (ascending).
+    ///
+    /// Under the single-writer-per-task model (one detached runner writes; the
+    /// handler reads) this returns a consistent point-in-time view; `cut_seq` is
+    /// guaranteed >= every included seq.
+    async fn progress_snapshot(
+        &self,
+        task: &TaskId,
+    ) -> Result<TaskProgressSnapshot, BridgeError>;
 }
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// `(output, ok, ts)` stored per `(task_id, node_id)` checkpoint key.
-type CheckpointValue = (String, bool, i64);
+/// Snapshot of a task's current progress for streaming reattach.
+/// `checkpoints` is ordered by seq (ascending); tuple = `(node, output, ok, seq)`.
+/// `starts` holds in-progress nodes that have started but not yet finished.
+/// `terminal_seq` is the seq of the terminal event, if any.
+/// `cut_seq` is the highest seq allocated so far (equals `terminal_seq` when terminal).
+#[derive(Clone, Debug)]
+pub struct TaskProgressSnapshot {
+    pub status: TaskRecordStatus,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub checkpoints: Vec<(NodeId, String, bool, i64)>,
+    /// `(node, start_seq)` — the seq when the node's start was recorded; the
+    /// timestamp is intentionally not exposed.
+    pub starts: Vec<(NodeId, i64)>,
+    pub terminal_seq: Option<i64>,
+    pub cut_seq: i64,
+}
+
+/// `(output, ok, ts, seq)` stored per `(task_id, node_id)` checkpoint key.
+type CheckpointValue = (String, bool, i64, i64);
 
 /// In-memory `TaskStore` (the default when no DB path is configured). Production
 /// use, not just a test fake — lives in `bridge-core` so `bridge-a2a-inbound`
@@ -146,13 +213,34 @@ type CheckpointValue = (String, bool, i64);
 #[derive(Default)]
 pub struct MemoryTaskStore {
     inner: Mutex<HashMap<String, TaskRecord>>,
-    /// Key: (task_id, node_id) → (output, ok, ts)
+    /// Key: (task_id, node_id) → (output, ok, ts, seq)
     checkpoints: Mutex<HashMap<(String, String), CheckpointValue>>,
+    /// Per-task monotonic seq counter. Key: task_id.
+    seq_counters: Mutex<HashMap<String, i64>>,
+    /// Per-task terminal seq. Key: task_id.
+    terminal_seqs: Mutex<HashMap<String, i64>>,
+    /// In-progress node starts. Key: (task_id, node_id) → (seq, ts).
+    starts: Mutex<HashMap<(String, String), (i64, i64)>>,
 }
 
 impl MemoryTaskStore {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            checkpoints: Mutex::new(HashMap::new()),
+            seq_counters: Mutex::new(HashMap::new()),
+            terminal_seqs: Mutex::new(HashMap::new()),
+            starts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Allocate and return the next seq for the given task.
+    /// Must be called with NO other locks held (takes seq_counters lock internally).
+    fn next_seq(&self, task_id: &str) -> i64 {
+        let mut g = self.seq_counters.lock().unwrap();
+        let seq = g.entry(task_id.to_string()).or_insert(0);
+        *seq += 1;
+        *seq
     }
 }
 
@@ -236,7 +324,7 @@ impl TaskStore for MemoryTaskStore {
         if g.contains_key(&key) {
             return Err(BridgeError::StoreFailure);
         }
-        g.insert(key, (output.to_string(), ok, ts));
+        g.insert(key, (output.to_string(), ok, ts, 0));
         Ok(())
     }
     async fn node_checkpoints(
@@ -245,7 +333,7 @@ impl TaskStore for MemoryTaskStore {
     ) -> Result<Vec<(NodeId, String, bool)>, BridgeError> {
         let g = self.checkpoints.lock().unwrap();
         let mut out = Vec::new();
-        for ((tid, nid), (output, ok, _ts)) in g.iter() {
+        for ((tid, nid), (output, ok, _ts, _seq)) in g.iter() {
             if tid == task.as_str() {
                 let node = NodeId::parse(nid).map_err(|_| BridgeError::StoreFailure)?;
                 out.push((node, output.clone(), *ok));
@@ -276,6 +364,155 @@ impl TaskStore for MemoryTaskStore {
             .filter(|r| r.status == TaskRecordStatus::Working)
             .cloned()
             .collect())
+    }
+
+    async fn record_node_started(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        ts: i64,
+    ) -> Result<i64, BridgeError> {
+        // Task must exist.
+        {
+            let inner = self.inner.lock().unwrap();
+            if !inner.contains_key(task.as_str()) {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
+        let seq = self.next_seq(task.as_str());
+        let mut g = self.starts.lock().unwrap();
+        let key = (task.as_str().to_string(), node.as_str().to_string());
+        // Upsert: re-starting the same node is allowed (resume re-emit).
+        g.insert(key, (seq, ts));
+        Ok(seq)
+    }
+
+    async fn put_node_checkpoint_sequenced(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        output: &str,
+        ok: bool,
+        ts: i64,
+    ) -> Result<i64, BridgeError> {
+        // Task must exist.
+        {
+            let inner = self.inner.lock().unwrap();
+            if !inner.contains_key(task.as_str()) {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
+        let seq = self.next_seq(task.as_str());
+        // Remove start row for this node (it is no longer in progress).
+        {
+            let mut sg = self.starts.lock().unwrap();
+            sg.remove(&(task.as_str().to_string(), node.as_str().to_string()));
+        }
+        let mut g = self.checkpoints.lock().unwrap();
+        let key = (task.as_str().to_string(), node.as_str().to_string());
+        g.insert(key, (output.to_string(), ok, ts, seq));
+        Ok(seq)
+    }
+
+    async fn set_terminal_sequenced(
+        &self,
+        task: &TaskId,
+        status: TaskRecordStatus,
+        result: Option<&str>,
+        error: Option<&str>,
+        ts: i64,
+    ) -> Result<i64, BridgeError> {
+        // Task must exist — check BEFORE allocating a seq (mirrors record_node_started /
+        // put_node_checkpoint_sequenced order to avoid leaking a counter increment on
+        // a non-existent task).
+        {
+            let inner = self.inner.lock().unwrap();
+            if !inner.contains_key(task.as_str()) {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
+        let seq = self.next_seq(task.as_str());
+        {
+            let mut g = self.inner.lock().unwrap();
+            let row = g.get_mut(task.as_str()).ok_or(BridgeError::StoreFailure)?;
+            row.status = status;
+            row.result = result.map(|s| s.to_string());
+            row.error = error.map(|s| s.to_string());
+            row.updated_ms = ts;
+        }
+        // Record the terminal seq.
+        {
+            let mut tg = self.terminal_seqs.lock().unwrap();
+            tg.insert(task.as_str().to_string(), seq);
+        }
+        // Clear all start rows for this task.
+        {
+            let mut sg = self.starts.lock().unwrap();
+            sg.retain(|(tid, _nid), _| tid != task.as_str());
+        }
+        Ok(seq)
+    }
+
+    async fn progress_snapshot(
+        &self,
+        task: &TaskId,
+    ) -> Result<TaskProgressSnapshot, BridgeError> {
+        let row = {
+            let g = self.inner.lock().unwrap();
+            g.get(task.as_str()).cloned().ok_or(BridgeError::StoreFailure)?
+        };
+        let cut_seq = {
+            let g = self.seq_counters.lock().unwrap();
+            *g.get(task.as_str()).unwrap_or(&0)
+        };
+        let terminal_seq = {
+            let g = self.terminal_seqs.lock().unwrap();
+            g.get(task.as_str()).copied()
+        };
+        let mut checkpoints: Vec<(NodeId, String, bool, i64)> = {
+            let g = self.checkpoints.lock().unwrap();
+            let mut out = Vec::new();
+            for ((tid, nid), (output, ok, _ts, seq)) in g.iter() {
+                if tid == task.as_str() {
+                    let node = NodeId::parse(nid).map_err(|_| BridgeError::StoreFailure)?;
+                    out.push((node, output.clone(), *ok, *seq));
+                }
+            }
+            out
+        };
+        checkpoints.sort_by_key(|(_n, _o, _ok, seq)| *seq);
+        let starts: Vec<(NodeId, i64)> = {
+            let g = self.starts.lock().unwrap();
+            let mut out = Vec::new();
+            for ((tid, nid), (seq, _ts)) in g.iter() {
+                if tid == task.as_str() {
+                    let node = NodeId::parse(nid).map_err(|_| BridgeError::StoreFailure)?;
+                    out.push((node, *seq));
+                }
+            }
+            out
+        };
+        // Ensure cut_seq >= every seq actually included in the snapshot.  Under the
+        // single-writer-per-task model this is almost always a no-op, but a concurrent
+        // write between the counter read and the data reads could otherwise produce a
+        // snapshot where a checkpoint or start seq exceeds the recorded cut_seq.
+        let max_included = checkpoints
+            .iter()
+            .map(|(_, _, _, s)| *s)
+            .chain(starts.iter().map(|(_, s)| *s))
+            .chain(terminal_seq)
+            .max()
+            .unwrap_or(0);
+        let cut_seq = cut_seq.max(max_included);
+        Ok(TaskProgressSnapshot {
+            status: row.status,
+            result: row.result,
+            error: row.error,
+            checkpoints,
+            starts,
+            terminal_seq,
+            cut_seq,
+        })
     }
 }
 
@@ -460,6 +697,40 @@ mod tests {
             .put_node_checkpoint(&unknown, &NodeId::parse("node-a").unwrap(), "OUT", true, 1)
             .await;
         assert!(result.is_err(), "expected Err for unknown task id");
+    }
+
+    #[tokio::test]
+    async fn seq_methods_roundtrip_memory() {
+        let s = MemoryTaskStore::new();
+        let t = TaskId::parse("t").unwrap();
+        s.create(&rec("t", 1)).await.unwrap(); // use the EXISTING helper for a Working TaskRecord
+        let s1 = s.record_node_started(&t, &NodeId::parse("a").unwrap(), 1).await.unwrap();
+        let s2 = s.put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), "OUT", true, 2).await.unwrap();
+        assert!(s2 > s1, "seq is monotonic");
+        // Fix 4a: checkpoint carries the allocated seq.
+        let snap = s.progress_snapshot(&t).await.unwrap();
+        assert_eq!(snap.checkpoints[0].3, s2, "checkpoint carries its allocated seq");
+        let s3 = s.set_terminal_sequenced(&t, TaskRecordStatus::Completed, Some("R"), None, 3).await.unwrap();
+        assert!(s3 > s2);
+        let snap = s.progress_snapshot(&t).await.unwrap();
+        assert_eq!(snap.cut_seq, s3);
+        assert_eq!(snap.terminal_seq, Some(s3));
+        assert_eq!(snap.checkpoints.len(), 1);
+        assert!(snap.starts.is_empty(), "the start row was cleared on finish");
+        // idempotent re-start (resume re-emit): no error, new seq
+        s.create(&rec("t2", 1)).await.unwrap();
+        let t2 = TaskId::parse("t2").unwrap();
+        let a = s.record_node_started(&t2, &NodeId::parse("x").unwrap(), 1).await.unwrap();
+        let b = s.record_node_started(&t2, &NodeId::parse("x").unwrap(), 2).await.unwrap();
+        assert!(b > a, "re-start upserts a fresh seq, no PK error");
+        // Fix 4b: mid-flight check — record_node_started on a fresh task, then snapshot.
+        s.create(&rec("t3", 1)).await.unwrap();
+        let t3 = TaskId::parse("t3").unwrap();
+        let start_seq = s.record_node_started(&t3, &NodeId::parse("a").unwrap(), 1).await.unwrap();
+        let snap = s.progress_snapshot(&t3).await.unwrap();
+        assert_eq!(snap.starts.len(), 1, "start must be present before checkpoint");
+        assert_eq!(snap.starts[0].1, start_seq, "start carries the allocated seq");
+        assert!(snap.checkpoints.is_empty(), "no checkpoint yet for t3");
     }
 
     #[tokio::test]
