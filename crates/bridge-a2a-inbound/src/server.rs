@@ -4990,7 +4990,7 @@ mod tests {
             })])))
         }
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
-            Err(BridgeError::AgentCrashed)
+            Err(BridgeError::agent_crashed("test: cancel always errors"))
         }
     }
 

@@ -479,11 +479,17 @@ impl AcpBackend {
     /// This is `Supervised` + `connect(ByteStreams)`: process lifecycle stays
     /// with `Supervised`; protocol drive is the shared `connect` core.
     pub async fn spawn(cmd: &str, args: &[&str], config: AcpConfig) -> Result<Self, BridgeError> {
-        let mut supervised =
-            Supervised::spawn(cmd, args, None).map_err(|_| BridgeError::AgentCrashed)?;
+        let mut supervised = Supervised::spawn(cmd, args, None)
+            .map_err(|e| BridgeError::agent_crashed(format!("spawn failed: {e}")))?;
         let child = supervised.child_mut();
-        let stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed)?;
-        let stdout = child.stdout.take().ok_or(BridgeError::AgentCrashed)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BridgeError::agent_crashed("agent stdin unavailable after spawn"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BridgeError::agent_crashed("agent stdout unavailable after spawn"))?;
         // The crate uses `futures` async-io; our child uses tokio pipes — adapt
         // with tokio_util::compat. ByteStreams::new(outgoing_writer, incoming_reader).
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
@@ -631,7 +637,11 @@ impl AcpBackend {
         // hang on either step is caught by the outer timeout.
         let auth_method_cfg = config.auth_method.clone();
         let handshake = async move {
-            let cx = cx_rx.await.map_err(|_| BridgeError::AgentCrashed)?;
+            let cx = cx_rx.await.map_err(|_| {
+                BridgeError::agent_crashed(
+                    "handshake response channel closed before connection was established",
+                )
+            })?;
 
             // Run the ACP `initialize` handshake and capture the negotiated caps.
             let resp: InitializeResponse = cx
@@ -639,7 +649,9 @@ impl AcpBackend {
                 .block_task()
                 .await
                 .inspect_err(|e| tracing::warn!(error = ?e, "initialize handshake failed"))
-                .map_err(|_| BridgeError::AgentCrashed)?;
+                .map_err(|e| {
+                    BridgeError::agent_crashed(format!("initialize handshake failed: {e}"))
+                })?;
 
             // ── authenticate ──────────────────────────────────────────────────
             //
@@ -696,7 +708,7 @@ impl AcpBackend {
 
         let (cx, resp) = tokio::time::timeout(config.handshake_timeout, handshake)
             .await
-            .map_err(|_| BridgeError::AgentCrashed)??;
+            .map_err(|_| BridgeError::agent_crashed("initialize handshake timed out"))??;
 
         Ok(Self {
             conn: Some(AcpConn {
@@ -804,18 +816,18 @@ impl AcpBackend {
     /// connection exists, so prompt routing gets a clean error seam instead of a
     /// panic inside the event loop. Used to send agent-bound requests.
     fn cx(&self) -> Result<&ConnectionTo<Agent>, BridgeError> {
-        self.conn
-            .as_ref()
-            .map(|c| &c.cx)
-            .ok_or(BridgeError::AgentCrashed)
+        self.conn.as_ref().map(|c| &c.cx).ok_or_else(|| {
+            BridgeError::agent_crashed("SDK connection handle unavailable (backend not connected)")
+        })
     }
 
     /// The per-turn chunk routing registry shared with the notification handler.
     fn updates(&self) -> Result<&UpdateRegistry, BridgeError> {
-        self.conn
-            .as_ref()
-            .map(|c| &c.updates)
-            .ok_or(BridgeError::AgentCrashed)
+        self.conn.as_ref().map(|c| &c.updates).ok_or_else(|| {
+            BridgeError::agent_crashed(
+                "update routing registry unavailable (backend not connected)",
+            )
+        })
     }
 
     /// Look up (or create) the per-bridge-session state for `key`, cloning the
@@ -886,7 +898,7 @@ impl AcpBackend {
                     .as_ref()
                     .map(|c| c.cwd.to_string_lossy().into_owned())
             })
-            .ok_or(BridgeError::AgentCrashed)?;
+            .ok_or_else(|| BridgeError::agent_crashed("no cwd available for session/new (neither session spec nor backend config provides one)"))?;
         let (mode, model, effort) = match stashed {
             Some(spec) => (spec.config.mode, spec.config.model, spec.config.effort),
             None => (
@@ -912,7 +924,7 @@ impl AcpBackend {
                     .block_task()
                     .await
                     .inspect_err(|e| tracing::warn!(error = ?e, "session/new mint failed"))
-                    .map_err(|_| BridgeError::AgentCrashed)?;
+                    .map_err(|e| BridgeError::agent_crashed(format!("session/new failed: {e}")))?;
                 let id = resp.session_id;
 
                 // (2) set_mode — HARD error, configured INSIDE the closure (before
@@ -928,7 +940,9 @@ impl AcpBackend {
                     cx.send_request(Self::set_mode_request(id.clone(), mode))
                         .block_task()
                         .await
-                        .map_err(|_| BridgeError::AgentCrashed)?;
+                        .map_err(|e| {
+                            BridgeError::agent_crashed(format!("session/set_mode rejected: {e}"))
+                        })?;
                 }
 
                 // (3) set_model — BEST-EFFORT (NON-FATAL). Rationale: codex-acp's
@@ -997,7 +1011,11 @@ impl AcpBackend {
         // and no lost cancel (see the interleaving argument on the method docs).
         if newly_minted && entry.cancel_requested.swap(false, Ordering::SeqCst) {
             cx.send_notification(CancelNotification::new(id.clone()))
-                .map_err(|_| BridgeError::AgentCrashed)?;
+                .map_err(|e| {
+                    BridgeError::agent_crashed(format!(
+                        "failed to send deferred session/cancel after mint: {e}"
+                    ))
+                })?;
         }
 
         Ok(id.clone())
@@ -1024,7 +1042,11 @@ impl AcpBackend {
         if let Some(agent_id) = entry.agent_id.get() {
             if entry.cancel_requested.swap(false, Ordering::SeqCst) {
                 cx.send_notification(CancelNotification::new(agent_id.clone()))
-                    .map_err(|_| BridgeError::AgentCrashed)?;
+                    .map_err(|e| {
+                        BridgeError::agent_crashed(format!(
+                            "failed to send session/cancel notification: {e}"
+                        ))
+                    })?;
             }
         }
         Ok(())
@@ -1043,8 +1065,14 @@ impl AcpBackend {
         config: AcpConfig,
     ) -> Result<Self, BridgeError> {
         let child = supervised.child_mut();
-        let stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed)?;
-        let stdout = child.stdout.take().ok_or(BridgeError::AgentCrashed)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BridgeError::agent_crashed("agent stdin unavailable in from_child"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BridgeError::agent_crashed("agent stdout unavailable in from_child"))?;
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         let backend = Self::connect(transport, config).await?;
         *backend.supervised.lock().expect("supervised lock") = Some(supervised);
@@ -1203,7 +1231,9 @@ impl AgentBackend for AcpBackend {
         let done_sender = tx.clone();
         let registry = Arc::clone(self.updates()?);
         {
-            let mut map = registry.lock().map_err(|_| BridgeError::AgentCrashed)?;
+            let mut map = registry
+                .lock()
+                .map_err(|_| BridgeError::agent_crashed("update routing registry lock poisoned"))?;
             map.insert(agent_id.clone(), tx);
         }
 
@@ -1291,7 +1321,9 @@ impl AgentBackend for AcpBackend {
                         "session/prompt failed (transport/SDK error or kill-switch): \
                          surfacing AgentCrashed"
                     );
-                    TurnEvent::Failed(BridgeError::AgentCrashed)
+                    TurnEvent::Failed(BridgeError::agent_crashed(
+                        "session/prompt failed: transport error or kill-switch escalation",
+                    ))
                 }
             };
             // If the consumer already dropped the stream this `send` is a no-op,
@@ -1561,7 +1593,10 @@ mod tests {
         let (client_side, agent_side) = Channel::duplex();
         drop(agent_side);
         match AcpBackend::connect(client_side, test_config()).await {
-            Err(e) => assert_eq!(e, BridgeError::AgentCrashed),
+            Err(e) => assert!(
+                matches!(e, BridgeError::AgentCrashed { .. }),
+                "expected AgentCrashed, got {e:?}"
+            ),
             Ok(_) => panic!("expected AgentCrashed when the agent never answers initialize"),
         }
     }
@@ -1584,10 +1619,9 @@ mod tests {
         .expect("connect must return within the handshake bound, not hang");
 
         match outcome {
-            Err(e) => assert_eq!(
-                e,
-                BridgeError::AgentCrashed,
-                "hung initialize handshake must surface a clear error"
+            Err(e) => assert!(
+                matches!(e, BridgeError::AgentCrashed { .. }),
+                "hung initialize handshake must surface a clear error, got {e:?}"
             ),
             Ok(_) => panic!("expected an error when the agent never answers initialize"),
         }
@@ -1608,11 +1642,15 @@ mod tests {
         let pid = supervised.pid();
         // Take the pipes exactly as `spawn` does (also exercises the I3 seam).
         let child = supervised.child_mut();
-        let _stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed).unwrap();
+        let _stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BridgeError::agent_crashed("test: stdin unavailable"))
+            .unwrap();
         let _stdout = child
             .stdout
             .take()
-            .ok_or(BridgeError::AgentCrashed)
+            .ok_or_else(|| BridgeError::agent_crashed("test: stdout unavailable"))
             .unwrap();
 
         let backend = AcpBackend {
@@ -2568,7 +2606,7 @@ mod tests {
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "partial"));
         // The turn's terminal item is an Err — NOT a Done.
         match s.next().await {
-            Some(Err(BridgeError::AgentCrashed)) => {}
+            Some(Err(BridgeError::AgentCrashed { .. })) => {}
             other => panic!(
                 "prompt-turn error must surface as terminal Err(AgentCrashed), got {other:?}"
             ),
@@ -2754,7 +2792,7 @@ mod tests {
             .await
             .expect("hung turn must be terminated within grace, not hang")
         {
-            Some(Err(BridgeError::AgentCrashed)) => {}
+            Some(Err(BridgeError::AgentCrashed { .. })) => {}
             other => panic!("hung-agent escalation must end the turn with Err, got {other:?}"),
         }
         assert!(
@@ -3211,7 +3249,7 @@ mod tests {
         let key = bkey("bridge-BADMODE");
 
         match be.ensure_session(&key).await {
-            Err(BridgeError::AgentCrashed) => {}
+            Err(BridgeError::AgentCrashed { .. }) => {}
             other => panic!("a rejected set_mode must fail session setup, got {other:?}"),
         }
         // The agent recorded the (rejected) mode request from the first attempt.
@@ -3225,7 +3263,7 @@ mod tests {
         // SECOND attempt: cell is uninitialized → the closure re-runs → re-mints
         // and re-attempts set_mode, then errors again. NOT a silent success.
         match be.ensure_session(&key).await {
-            Err(BridgeError::AgentCrashed) => {}
+            Err(BridgeError::AgentCrashed { .. }) => {}
             other => panic!(
                 "a re-attempt after a set_mode failure must re-run and error, \
                  not silently proceed unconfigured, got {other:?}"
@@ -3334,7 +3372,7 @@ mod tests {
         .await
         .expect("connect must return within the handshake bound, not hang");
         match outcome {
-            Err(BridgeError::AgentCrashed) => {}
+            Err(BridgeError::AgentCrashed { .. }) => {}
             Err(e) => panic!("a hung initialize handshake must surface a clear error, got {e:?}"),
             Ok(_) => panic!("a hung initialize handshake must surface a clear error, got Ok"),
         }
@@ -3398,7 +3436,7 @@ mod tests {
         .await
         .expect("connect must return within the handshake bound, not hang on authenticate");
         match outcome {
-            Err(BridgeError::AgentCrashed) => {}
+            Err(BridgeError::AgentCrashed { .. }) => {}
             Err(e) => panic!("a hung authenticate must surface a clear bounded error, got {e:?}"),
             Ok(_) => panic!("a hung authenticate must surface a clear bounded error, got Ok"),
         }
@@ -3529,11 +3567,15 @@ mod tests {
         let mut supervised = Supervised::spawn("/bin/cat", &[], None).expect("spawn cat");
         let pid = supervised.pid();
         let child = supervised.child_mut();
-        let _stdin = child.stdin.take().ok_or(BridgeError::AgentCrashed).unwrap();
+        let _stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BridgeError::agent_crashed("test: stdin unavailable"))
+            .unwrap();
         let _stdout = child
             .stdout
             .take()
-            .ok_or(BridgeError::AgentCrashed)
+            .ok_or_else(|| BridgeError::agent_crashed("test: stdout unavailable"))
             .unwrap();
 
         let backend = AcpBackend {

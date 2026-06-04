@@ -45,8 +45,8 @@ pub enum BridgeError {
     FrameError,
     #[error("message too large")]
     MessageTooLarge,
-    #[error("agent crashed")]
-    AgentCrashed,
+    #[error("agent crashed: {reason}")]
+    AgentCrashed { reason: String },
     #[error("agent overloaded")]
     AgentOverloaded,
     #[error("upstream a2a error")]
@@ -62,6 +62,15 @@ pub enum BridgeError {
 }
 
 impl BridgeError {
+    /// Construct an `AgentCrashed` carrying a short reason describing what failed
+    /// (e.g. "spawn failed: …", "handshake timeout"), so the client/log sees WHY
+    /// rather than an opaque "agent crashed".
+    pub fn agent_crashed(reason: impl Into<String>) -> Self {
+        BridgeError::AgentCrashed {
+            reason: reason.into(),
+        }
+    }
+
     pub fn disposition(&self) -> A2aDisposition {
         use A2aDisposition::*;
         use A2aState as S;
@@ -140,7 +149,7 @@ mod tests {
     fn runtime_failures_set_failed_state() {
         for e in [
             BridgeError::FrameError,
-            BridgeError::AgentCrashed,
+            BridgeError::agent_crashed("test"),
             BridgeError::ModelNotAvailable,
             BridgeError::PermissionDenied,
             BridgeError::MessageTooLarge,
