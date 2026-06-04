@@ -20,6 +20,8 @@
 //   a2a-bridge task get <id> [--url <url>]               — get task by id
 //   a2a-bridge task list [--limit <n>] [--url <url>]     — list tasks
 //   a2a-bridge task cancel <id> [--url <url>]            — cancel task by id
+//   a2a-bridge task watch <id> [--from <seq>] [--url <url>]
+//                                                        — stream a task's progress (SSE)
 
 mod config;
 mod route;
@@ -343,7 +345,7 @@ async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
     let sub = args
         .first()
         .map(|s| s.as_str())
-        .ok_or("task: missing subcommand (get|list|cancel)")?;
+        .ok_or("task: missing subcommand (get|list|cancel|watch)")?;
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
     match sub {
         "get" => {
@@ -385,8 +387,78 @@ async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
             .await?;
             println!("{}", serde_json::to_string_pretty(&v["result"]["task"])?);
         }
+        "watch" => {
+            let id = args.get(1).cloned().ok_or("task watch: missing <id>")?;
+            let from: Option<i64> = flag(args, "--from").and_then(|s| s.parse().ok());
+            task_watch_cmd(url, &id, from).await?;
+        }
         other => return Err(format!("task: unknown subcommand {other:?}").into()),
     }
+    Ok(())
+}
+
+/// Execute `task watch <id> [--from <seq>]`: POSTs a SubscribeToTask JSON-RPC
+/// request and streams the SSE response, printing each `data:` line to stdout.
+/// Tracks the last `id:` value seen and prints a resume hint on stream close.
+async fn task_watch_cmd(url: &str, id: &str, from: Option<i64>) -> Result<(), BoxError> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "SubscribeToTask",
+        "params": { "id": id }
+    });
+
+    let mut req = reqwest::Client::new()
+        .post(url)
+        .header(a2a::SVC_PARAM_VERSION, a2a::VERSION)
+        .json(&body);
+    if let Some(cursor) = from {
+        req = req.header("Last-Event-ID", cursor.to_string());
+    }
+
+    let resp = req.send().await.map_err(|e| {
+        format!("cannot reach serve at {url} — is `a2a-bridge serve` running? ({e})")
+    })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        eprintln!("error: HTTP {status}\n{text}");
+        return Err(format!("task watch: server returned {status}").into());
+    }
+
+    // Stream the SSE response: accumulate bytes, split on newlines, handle
+    // `id:` and `data:` lines; ignore blank lines and comments.
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut last_id: Option<String> = None;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("task watch: stream error: {e}"))?;
+        let text = String::from_utf8_lossy(&chunk);
+        buf.push_str(&text);
+
+        // Process all complete lines (ending with '\n') in the buffer.
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim_end_matches('\r').to_string();
+            buf.drain(..=pos);
+
+            if let Some(data) = line.strip_prefix("data:") {
+                let payload = data.trim_start();
+                println!("{payload}");
+            } else if let Some(seq) = line.strip_prefix("id:") {
+                last_id = Some(seq.trim_start().to_string());
+            }
+            // Blank lines and comment lines (`:`) are silently ignored.
+        }
+    }
+
+    // Print resume hint if we received at least one id: line.
+    if let Some(seq) = last_id {
+        eprintln!("# stream closed; resume with --from {seq}");
+    }
+
     Ok(())
 }
 
@@ -635,5 +707,82 @@ mod cli_tests {
         assert_eq!(resolve_static_session_cwd(Some("/s"), Some("/c")), "/s"); // session_cwd wins
         assert_eq!(resolve_static_session_cwd(None, Some("/c")), "/c"); // falls to cwd
         assert_eq!(resolve_static_session_cwd(None, None), "."); // default
+    }
+
+    // ---- Task 10: task watch <id> arg-parsing ----
+
+    /// `task watch <id>` with no optional flags: id parsed, url defaults, from is None.
+    #[test]
+    fn task_watch_parses_id_only() {
+        // Simulate the args slice that task_cmd receives: ["watch", "<id>"]
+        let args = vec!["watch".to_string(), "task-abc-123".to_string()];
+        let sub = args.first().map(|s| s.as_str()).unwrap();
+        assert_eq!(sub, "watch");
+
+        let id = args.get(1).cloned().expect("id present");
+        assert_eq!(id, "task-abc-123");
+
+        let url = flag(&args, "--url").unwrap_or("http://127.0.0.1:8080");
+        assert_eq!(url, "http://127.0.0.1:8080");
+
+        let from: Option<i64> = flag(&args, "--from").and_then(|s| s.parse().ok());
+        assert!(from.is_none());
+    }
+
+    /// `task watch <id> --url <url>` overrides the default url.
+    #[test]
+    fn task_watch_parses_url_override() {
+        let args = vec![
+            "watch".to_string(),
+            "task-abc-123".to_string(),
+            "--url".to_string(),
+            "http://10.0.0.1:9090".to_string(),
+        ];
+        let id = args.get(1).cloned().expect("id present");
+        assert_eq!(id, "task-abc-123");
+
+        let url = flag(&args, "--url").unwrap_or("http://127.0.0.1:8080");
+        assert_eq!(url, "http://10.0.0.1:9090");
+    }
+
+    /// `task watch <id> --from <seq>` parses the cursor as i64.
+    #[test]
+    fn task_watch_parses_from_cursor() {
+        let args = vec![
+            "watch".to_string(),
+            "task-abc-123".to_string(),
+            "--from".to_string(),
+            "42".to_string(),
+        ];
+        let from: Option<i64> = flag(&args, "--from").and_then(|s| s.parse().ok());
+        assert_eq!(from, Some(42));
+    }
+
+    /// `task watch <id> --url <u> --from <seq>` — all three fields parse together.
+    #[test]
+    fn task_watch_parses_all_fields() {
+        let args = vec![
+            "watch".to_string(),
+            "task-xyz".to_string(),
+            "--url".to_string(),
+            "http://bridge:8080".to_string(),
+            "--from".to_string(),
+            "7".to_string(),
+        ];
+        let id = args.get(1).cloned().expect("id");
+        let url = flag(&args, "--url").unwrap_or("http://127.0.0.1:8080");
+        let from: Option<i64> = flag(&args, "--from").and_then(|s| s.parse().ok());
+
+        assert_eq!(id, "task-xyz");
+        assert_eq!(url, "http://bridge:8080");
+        assert_eq!(from, Some(7));
+    }
+
+    /// Missing `<id>` after `watch` returns an error (mirrors `task get` behaviour).
+    #[test]
+    fn task_watch_missing_id_is_error() {
+        let args = ["watch".to_string()];
+        let result = args.get(1).cloned().ok_or("task watch: missing <id>");
+        assert!(result.is_err());
     }
 }

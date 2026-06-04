@@ -178,6 +178,14 @@ pub struct InboundServer {
     /// Wired from `allowed_cwd_root` in the top-level config via
     /// [`InboundServer::with_allowed_cwd_root`].
     pub allowed_cwd_root: Option<String>,
+    /// Per-task broadcast hubs for streaming reattach (Task 3). Keyed by TaskId;
+    /// populated by the DetachedProgressSink (Task 4) and read by the
+    /// SubscribeToTask handler (Tasks 7-9). Cleaned up by the Finalizer (Task 6).
+    pub(crate) progress_hubs: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>,
+        >,
+    >,
 }
 
 impl InboundServer {
@@ -210,6 +218,7 @@ impl InboundServer {
             workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
             allowed_cwd_root: None,
+            progress_hubs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -249,6 +258,15 @@ impl InboundServer {
     pub fn with_allowed_cwd_root(mut self, root: Option<String>) -> Self {
         self.allowed_cwd_root = root;
         self
+    }
+
+    /// Test-only: is a progress hub currently registered for `task`? Used by the
+    /// reattach tests to assert hub-before-spawn insertion and hub cleanup on
+    /// terminal (the `progress_hubs` field is `pub(crate)`, so integration tests in
+    /// a separate crate cannot inspect it directly).
+    #[doc(hidden)]
+    pub async fn has_progress_hub_for_test(&self, task: &TaskId) -> bool {
+        self.progress_hubs.lock().await.contains_key(task)
     }
 
     /// Build the axum router, mounting the Agent Card and JSON-RPC endpoint.
@@ -535,9 +553,8 @@ async fn jsonrpc(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     match method {
-        m if m == methods::SEND_STREAMING_MESSAGE || m == methods::SUBSCRIBE_TO_TASK => {
-            stream_message(srv, headers, id, params).await
-        }
+        m if m == methods::SEND_STREAMING_MESSAGE => stream_message(srv, headers, id, params).await,
+        m if m == methods::SUBSCRIBE_TO_TASK => subscribe_to_task(srv, headers, id, params).await,
         m if m == methods::SEND_MESSAGE => unary_message(srv, headers, id, params).await,
         m if m == methods::CANCEL_TASK => cancel_task(srv, headers, id, params).await,
         m if m == methods::GET_TASK => get_task(srv, headers, id, params).await,
@@ -612,6 +629,349 @@ async fn stream_message(
     Sse::new(sse_stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// `SubscribeToTask` handler: auth + A2A-version check, extract `id` (with
+/// `taskId` as a lenient alias per I3), parse the `Last-Event-ID` cursor as
+/// `Option<i64>`, look up the task in the durable store, return not-found if
+/// absent. Does NOT call `gate()` — it never starts a new run.
+///
+/// Stub: the snapshot/SSE body is filled in by Tasks 8-9; for now returns an
+/// immediately-closing empty SSE event-stream so the wire sees a proper
+/// `text/event-stream` response.
+async fn subscribe_to_task(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    // Auth + version: the same bearer-token + supported-version check `gate()` performs,
+    // WITHOUT gate()'s routing (gate() would synthesize a task and start a run).
+    let token = bearer_token(&headers);
+    let inbound = match token {
+        Some(t) => InboundRequest::with_token(&t),
+        None => InboundRequest::anon(),
+    };
+    if let Err(e) = srv.auth.authorize(&inbound) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+
+    // A2A-version check.
+    let version = headers
+        .get(SVC_PARAM_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(A2A_PINNED_VERSION);
+    if let Err(e) = assert_supported_version(version) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+
+    // I3: read the standard a2a-lf `id` field first; fall back to `taskId` as a
+    // lenient alias so old clients that send only `taskId` are not broken.
+    let task_str = params["id"].as_str().or_else(|| params["taskId"].as_str());
+    let task_str = match task_str {
+        Some(s) => s,
+        None => {
+            return bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "id" });
+        }
+    };
+
+    // Parse the raw string into a bridge-core TaskId (rejects empty strings).
+    let task_id = match bridge_core::ids::TaskId::parse(task_str) {
+        Ok(t) => t,
+        Err(_) => {
+            return bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "id" });
+        }
+    };
+
+    // I2 cursor: absent Last-Event-ID → None (not 0); Some(K) → only seq > K.
+    let cursor: Option<i64> = headers
+        .get("Last-Event-ID")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    // Look up the task in the durable store.  Not found → not-found error (M5: do
+    // NOT fall through to gate() and start a new run).
+    match srv.task_store.get(&task_id).await {
+        Ok(Some(rec)) => {
+            if rec.status.is_terminal() {
+                // --- Terminal-task flow (Task 8) --- read the snapshot and replay it
+                // as a FINITE SSE stream (snapshot → SnapshotComplete → Terminal → close).
+                let snap = match srv.task_store.progress_snapshot(&task_id).await {
+                    Ok(s) => s,
+                    Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+                };
+                terminal_sse_response(&snap, cursor)
+            } else {
+                // --- Working-task flow (Task 9) --- subscribe-first, then snapshot,
+                // then live-tail the hub until the Terminal frame.
+                working_sse_response(&srv, &task_id, cursor, id).await
+            }
+        }
+        Ok(None) => bridge_err_to_jsonrpc(id, &BridgeError::TaskNotFound),
+        Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+    }
+}
+
+/// Build the FINITE terminal SSE response from a durable snapshot: the
+/// cursor-filtered snapshot frames, a `SnapshotComplete` sentinel, and (unless the
+/// cursor already covers a known `terminal_seq`) the `Terminal` frame, then close.
+///
+/// Shared by BOTH the initial-terminal branch (the `get()` already returned a
+/// terminal record) AND the I5 terminal-during-snapshot race in the working flow
+/// (the post-subscribe snapshot read sees a terminal status). A terminal stream is
+/// FINITE — it ends after the Terminal frame, so NO keep-alive (which would be a
+/// reader-trap suggesting more may come).
+fn terminal_sse_response(
+    snap: &bridge_core::task_store::TaskProgressSnapshot,
+    cursor: Option<i64>,
+) -> Response {
+    // Build snapshot frames (cursor-filtered, seq-ordered).
+    let mut frames = snapshot_frames(snap, cursor);
+
+    // Append SnapshotComplete sentinel (seq = max snapshot frame seq or cut_seq).
+    let sentinel_seq = frames.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
+    frames.push(crate::reattach::WorkflowProgressFrame {
+        v: 1,
+        seq: sentinel_seq,
+        phase: crate::reattach::Phase::Snapshot,
+        kind: crate::reattach::FrameKind::SnapshotComplete,
+    });
+
+    // Append Terminal frame unless cursor already covers a KNOWN terminal_seq.
+    // None (legacy) → always emit; Some(ts) → emit only if cursor < ts.
+    let emit_terminal = snap
+        .terminal_seq
+        .is_none_or(|ts| cursor.is_none_or(|k| ts > k));
+    if emit_terminal {
+        use bridge_core::task_store::TaskRecordStatus;
+        let outcome = match snap.status {
+            TaskRecordStatus::Completed => crate::reattach::TerminalOutcome::Completed,
+            TaskRecordStatus::Canceled => crate::reattach::TerminalOutcome::Canceled,
+            // Failed, Interrupted, Working all map to Failed on the wire.
+            _ => crate::reattach::TerminalOutcome::Failed,
+        };
+        let output = snap
+            .result
+            .clone()
+            .or(snap.error.clone())
+            .unwrap_or_default();
+        frames.push(crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq: snap.terminal_seq.unwrap_or(0),
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::Terminal { outcome, output },
+        });
+    }
+
+    // Convert Vec<WorkflowProgressFrame> into an SSE stream and return.
+    let sse_stream = futures::stream::iter(frames.into_iter().map(|f| {
+        Ok::<_, std::convert::Infallible>(
+            SseEvent::default()
+                .id(f.seq.to_string())
+                .data(serde_json::to_string(&f).unwrap_or_default()),
+        )
+    }));
+    Sse::new(sse_stream).into_response()
+}
+
+/// Build the streaming working SSE response: subscribe to the task's live progress
+/// hub FIRST (the exactly-once boundary), replay the durable snapshot, emit
+/// `SnapshotComplete`, then live-tail the broadcast receiver until the `Terminal`
+/// frame, then close.
+///
+/// Exactly-once across the snapshot↔live boundary: `rx = hub.subscribe()` happens
+/// BEFORE the snapshot read, so a frame published between the snapshot cut and the
+/// live tail is buffered in `rx` (no gap), and the dedup floor drops any live frame
+/// whose seq is already covered by the snapshot (no dup).
+///
+/// Races handled:
+/// - No hub registered yet (runner not started / just deregistered) → re-`get`; if
+///   now terminal, replay via [`terminal_sse_response`]; else a RETRYABLE JSON-RPC
+///   error (the client retries — the durable snapshot makes this lossless).
+/// - I5 terminal-during-snapshot: the post-subscribe snapshot reads a terminal
+///   status → replay via [`terminal_sse_response`] (do NOT rely on `rx` Closed).
+/// - I7 broadcast lag: `RecvError::Lagged` → emit ONE retryable `event: error` SSE
+///   event then close (the client reconnects with its `Last-Event-ID` cursor and
+///   re-snapshots — no lost state because the snapshot is durable).
+async fn working_sse_response(
+    srv: &Arc<InboundServer>,
+    task_id: &TaskId,
+    cursor: Option<i64>,
+    id: Value,
+) -> Response {
+    // Look up the per-task progress hub.
+    let hub = srv.progress_hubs.lock().await.get(task_id).cloned();
+    let hub = match hub {
+        Some(h) => h,
+        None => {
+            // No hub: the runner hasn't registered yet, or it just deregistered on
+            // finishing. Re-`get` to disambiguate: if the task is now terminal, the
+            // runner finished — replay the terminal snapshot. Otherwise it is a
+            // transient bind/dereg window → a RETRYABLE error (the client retries;
+            // the durable snapshot makes the retry lossless).
+            return match srv.task_store.get(task_id).await {
+                Ok(Some(rec)) if rec.status.is_terminal() => {
+                    match srv.task_store.progress_snapshot(task_id).await {
+                        Ok(snap) => terminal_sse_response(&snap, cursor),
+                        Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+                    }
+                }
+                // Still Working but no hub: a transient bind/dereg window. Map to a
+                // server-side (INTERNAL, not 400-reject) error so the client retries
+                // rather than treating it as a permanent not-found.
+                Ok(Some(_)) => bridge_err_to_jsonrpc(id, &BridgeError::AgentOverloaded),
+                Ok(None) => bridge_err_to_jsonrpc(id, &BridgeError::TaskNotFound),
+                Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+            };
+        }
+    };
+
+    // EXACTLY-ONCE BOUNDARY: subscribe BEFORE reading the snapshot. A frame
+    // published after this point is buffered in `rx`, so nothing is lost in the
+    // window between the snapshot cut and the start of the live tail.
+    let rx = hub.subscribe();
+
+    // Read the durable snapshot.
+    let snap = match srv.task_store.progress_snapshot(task_id).await {
+        Ok(s) => s,
+        Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+    };
+
+    // I5: the task finished during/just-before the snapshot read → replay the
+    // terminal snapshot (do NOT rely on `rx` Closed; the runner may have published
+    // its Terminal frame before we subscribed).
+    if snap.status.is_terminal() {
+        return terminal_sse_response(&snap, cursor);
+    }
+
+    // Snapshot phase: cursor-filtered, seq-ordered frames + a SnapshotComplete
+    // sentinel (seq = max snapshot frame seq, else cut_seq).
+    let mut snapshot_vec = snapshot_frames(&snap, cursor);
+    let sentinel_seq = snapshot_vec.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
+    snapshot_vec.push(crate::reattach::WorkflowProgressFrame {
+        v: 1,
+        seq: sentinel_seq,
+        phase: crate::reattach::Phase::Snapshot,
+        kind: crate::reattach::FrameKind::SnapshotComplete,
+    });
+
+    // Dedup floor: a cursor-less subscriber keeps seq 0, and the snapshot↔live
+    // overlap is deduped (drop live frames already covered by the snapshot cut).
+    let dedup_floor = cursor.unwrap_or(-1).max(snap.cut_seq);
+
+    // Build the streaming SSE body: the snapshot vec first, then the live tail from
+    // `rx`. `async_stream::stream!` lets us write the imperative snapshot-then-tail
+    // logic; the receiver is MOVED in so the subscribe already happened at
+    // handler-call time (the test publishes AFTER the handler returns).
+    let stream = async_stream::stream! {
+        // 1. Replay the snapshot phase.
+        for f in snapshot_vec {
+            yield Ok::<_, std::convert::Infallible>(
+                SseEvent::default()
+                    .id(f.seq.to_string())
+                    .data(serde_json::to_string(&f).unwrap_or_default()),
+            );
+        }
+        // 2. Live-tail the hub until the Terminal frame.
+        let mut rx = rx;
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    // Dedup: drop frames already covered by the snapshot cut/cursor.
+                    if frame.seq <= dedup_floor {
+                        continue;
+                    }
+                    let is_terminal = matches!(
+                        &frame.kind,
+                        crate::reattach::FrameKind::Terminal { .. }
+                    );
+                    yield Ok(
+                        SseEvent::default()
+                            .id(frame.seq.to_string())
+                            .data(serde_json::to_string(&frame).unwrap_or_default()),
+                    );
+                    // END the stream after emitting a Terminal-kind frame.
+                    if is_terminal {
+                        break;
+                    }
+                }
+                // I7: the receiver lagged (the runner outran this slow consumer) →
+                // emit ONE retryable error event then close. The client reconnects
+                // with its Last-Event-ID cursor and re-snapshots — lossless because
+                // the snapshot is durable.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok(
+                        SseEvent::default()
+                            .event("error")
+                            .data(
+                                serde_json::json!({"retryable": true, "reason": "lagged"})
+                                    .to_string(),
+                            ),
+                    );
+                    break;
+                }
+                // The hub was dropped (the task finalized and removed the hub) →
+                // close. The durable terminal is still readable via a fresh subscribe.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    // The working stream is long-lived (the in-flight tail) → keep-alive is
+    // appropriate here, unlike the FINITE terminal branch.
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// Build the ordered, cursor-filtered `Vec<WorkflowProgressFrame>` for the snapshot phase.
+///
+/// `cursor`: `None` passes everything including seq 0; `Some(K)` passes only `seq > K`.
+/// Frames from `snap.checkpoints` become `NodeFinished` entries; frames from
+/// `snap.starts` become `NodeStarted` entries. The result is sorted ascending by seq.
+fn snapshot_frames(
+    snap: &bridge_core::task_store::TaskProgressSnapshot,
+    cursor: Option<i64>,
+) -> Vec<crate::reattach::WorkflowProgressFrame> {
+    // `pass(seq)` returns true if the frame should be included given the cursor.
+    // Absent cursor → include everything (including seq 0). Some(K) → only seq > K.
+    let pass = |seq: i64| cursor.is_none_or(|k| seq > k);
+
+    let mut frames = Vec::new();
+
+    // Finished nodes (checkpoints): tuple = (node, output, ok, seq).
+    for (node, output, ok, seq) in &snap.checkpoints {
+        if pass(*seq) {
+            frames.push(crate::reattach::WorkflowProgressFrame {
+                v: 1,
+                seq: *seq,
+                phase: crate::reattach::Phase::Snapshot,
+                kind: crate::reattach::FrameKind::NodeFinished {
+                    node: node.as_str().to_string(),
+                    ok: *ok,
+                    output: output.clone(),
+                },
+            });
+        }
+    }
+
+    // In-progress nodes (starts): tuple = (node, seq).
+    for (node, seq) in &snap.starts {
+        if pass(*seq) {
+            frames.push(crate::reattach::WorkflowProgressFrame {
+                v: 1,
+                seq: *seq,
+                phase: crate::reattach::Phase::Snapshot,
+                kind: crate::reattach::FrameKind::NodeStarted {
+                    node: node.as_str().to_string(),
+                },
+            });
+        }
+    }
+
+    // Sort ascending by seq so the client sees events in the order they occurred.
+    frames.sort_by_key(|f| f.seq);
+    frames
 }
 
 /// Spawn the local-backend producer for an already-resolved [`LocalDispatch`]: drive
@@ -1166,6 +1526,56 @@ fn new_detached_task_id() -> TaskId {
 /// resume: `"{task}-resume-{n}"`), and a `seed` of already-completed node outputs
 /// (fresh submit: empty; boot resume: checkpoints from the store). With an empty
 /// seed, `run_from` is behaviorally identical to `run`.
+/// Finalize a detached task through the SEQUENCED store path, optionally publishing a
+/// `Terminal` frame to the task's progress hub, and ALWAYS removing the hub from
+/// `progress_hubs` (so the in-memory hub never leaks). Used by every detached terminal
+/// transition EXCEPT the runner's `Ok(true)` happy path (where the `DetachedProgressSink`
+/// already wrote+published the sequenced terminal — see `spawn_detached_workflow`).
+///
+/// Because the terminal is written via `set_terminal_sequenced`, `terminal_seq` is never
+/// left NULL on any detached path (the reattach snapshot requirement). On a path where no
+/// hub was ever inserted (e.g. the pre-spawn unknown-workflow reject), pass `hub: None`.
+pub(crate) async fn finalize_detached(
+    store: &Arc<dyn bridge_core::task_store::TaskStore>,
+    progress_hubs: &Arc<tokio::sync::Mutex<HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>>>,
+    task: &TaskId,
+    status: bridge_core::task_store::TaskRecordStatus,
+    result: Option<&str>,
+    error: Option<&str>,
+    hub: Option<&Arc<crate::reattach::TaskProgressHub>>,
+) -> Result<(), BridgeError> {
+    use bridge_core::task_store::TaskRecordStatus;
+    // Durable-first: write the sequenced terminal. Capture the result instead of
+    // early-returning so the hub is removed REGARDLESS of write success (I-1) — a
+    // write-Err must NEVER leak the in-memory hub. The durable Working-row gap on a
+    // write-Err is the pre-existing W3b §8 gap, backstopped by the boot sweep.
+    let write = store
+        .set_terminal_sequenced(task, status, result, error, crate::workflow_sink::now_ms())
+        .await;
+    if let (Ok(seq), Some(hub)) = (&write, hub) {
+        // Publish the Terminal frame ONLY on a committed seq (durable-first): on a
+        // write-Err there is no seq to publish on.
+        // Interrupted has no WorkflowOutcome analogue; the closest wire terminal is Failed.
+        let outcome = match status {
+            TaskRecordStatus::Completed => crate::reattach::TerminalOutcome::Completed,
+            TaskRecordStatus::Canceled => crate::reattach::TerminalOutcome::Canceled,
+            TaskRecordStatus::Failed
+            | TaskRecordStatus::Interrupted
+            | TaskRecordStatus::Working => crate::reattach::TerminalOutcome::Failed,
+        };
+        let output = result.or(error).unwrap_or("").to_string();
+        hub.publish(crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq: *seq,
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::Terminal { outcome, output },
+        });
+    }
+    // ALWAYS remove the hub, even on write error (I-1: the hub never leaks).
+    progress_hubs.lock().await.remove(task);
+    write.map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_detached_workflow(
     srv: &Arc<InboundServer>,
@@ -1176,6 +1586,7 @@ fn spawn_detached_workflow(
     token: tokio_util::sync::CancellationToken,
     seed: std::collections::HashMap<String, (String, bool)>,
     ctx: bridge_workflow::executor::WorkflowRunContext,
+    hub: Arc<crate::reattach::TaskProgressHub>,
 ) -> tokio::task::JoinHandle<()> {
     let srv = srv.clone();
     tokio::spawn(async move {
@@ -1183,68 +1594,80 @@ fn spawn_detached_workflow(
             store: srv.task_store.clone(),
             task: task.clone(),
             cancels: srv.workflow_cancels.clone(),
+            progress_hubs: srv.progress_hubs.clone(),
+            hub: hub.clone(),
             done: false,
         };
         let executor = match &srv.executor {
             Some(e) => e.clone(),
             None => {
-                let _ = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        bridge_core::task_store::TaskRecordStatus::Failed,
-                        None,
-                        Some("no executor wired"),
-                        crate::workflow_sink::now_ms(),
-                    )
-                    .await;
+                // No executor wired: finalize Failed via the sequenced path (the hub was
+                // inserted before spawn, so publish + clean it up).
+                let _ = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    bridge_core::task_store::TaskRecordStatus::Failed,
+                    None,
+                    Some("no executor wired"),
+                    Some(&hub),
+                )
+                .await;
                 fin.done = true;
                 srv.workflow_cancels.lock().await.remove(&task);
                 return;
             }
         };
         let stream = executor.run_from_with_context(graph, input, run_id, token, seed, ctx);
-        let mut sink =
-            crate::workflow_sink::TaskStoreSink::new(srv.task_store.clone(), task.clone());
-        let now = crate::workflow_sink::now_ms();
+        // The DetachedProgressSink OWNS the sequenced terminal write: on a clean drain it
+        // has already written `set_terminal_sequenced` AND published the Terminal frame.
+        let mut sink = crate::workflow_sink::DetachedProgressSink::new(
+            srv.task_store.clone(),
+            task.clone(),
+            hub.clone(),
+        );
         match crate::workflow_sink::drain_workflow(stream, &mut sink).await {
-            Ok(terminal_seen) => {
-                if terminal_seen {
-                    if let Some((status, result, error)) = sink.take() {
-                        let _ = srv
-                            .task_store
-                            .set_terminal(&task, status, result.as_deref(), error.as_deref(), now)
-                            .await;
-                    }
-                } else {
-                    let _ = srv
-                        .task_store
-                        .set_terminal(
-                            &task,
-                            bridge_core::task_store::TaskRecordStatus::Failed,
-                            None,
-                            Some("workflow ended without terminal"),
-                            now,
-                        )
-                        .await;
-                }
+            Ok(true) => {
+                // Sink already committed+published the terminal. Do NOT write it again.
+                // M1: flip the finalizer done flag BEFORE the hub-removal await so the
+                // Finalizer's Drop can never clobber the committed terminal during the
+                // .await suspension point below.
+                fin.done = true;
+                srv.progress_hubs.lock().await.remove(&task);
+                srv.workflow_cancels.lock().await.remove(&task);
+            }
+            Ok(false) => {
+                // Drain ended with no terminal: finalize Failed via the sequenced path
+                // (also removes the hub).
+                let _ = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    bridge_core::task_store::TaskRecordStatus::Failed,
+                    None,
+                    Some("workflow ended without terminal"),
+                    Some(&hub),
+                )
+                .await;
+                fin.done = true;
+                srv.workflow_cancels.lock().await.remove(&task);
             }
             Err(e) => {
                 tracing::warn!(task = task.as_str(), error = ?e, "drain_workflow sink error; marking task Failed");
-                let _ = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        bridge_core::task_store::TaskRecordStatus::Failed,
-                        None,
-                        Some("checkpoint write failed"),
-                        now,
-                    )
-                    .await;
+                let _ = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    bridge_core::task_store::TaskRecordStatus::Failed,
+                    None,
+                    Some("checkpoint write failed"),
+                    Some(&hub),
+                )
+                .await;
+                fin.done = true;
+                srv.workflow_cancels.lock().await.remove(&task);
             }
         }
-        fin.done = true;
-        srv.workflow_cancels.lock().await.remove(&task);
     })
 }
 
@@ -1252,7 +1675,7 @@ fn spawn_detached_workflow(
 /// Resolves the graph from the server's `workflows` map (the graph must already be
 /// registered). `run_id` is set to the task id (matching the fresh-submit path).
 #[doc(hidden)]
-pub fn spawn_detached_workflow_for_test(
+pub async fn spawn_detached_workflow_for_test(
     srv: &Arc<InboundServer>,
     task: TaskId,
     text_parts: Vec<String>,
@@ -1266,6 +1689,12 @@ pub fn spawn_detached_workflow_for_test(
         .expect("workflow must be registered in the test server");
     let input = text_parts.join("\n");
     let run_id = task.as_str().to_string();
+    // Mirror the real callers: insert the hub BEFORE spawning.
+    let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+    srv.progress_hubs
+        .lock()
+        .await
+        .insert(task.clone(), hub.clone());
     spawn_detached_workflow(
         srv,
         task,
@@ -1275,6 +1704,7 @@ pub fn spawn_detached_workflow_for_test(
         token,
         std::collections::HashMap::new(),
         bridge_workflow::executor::WorkflowRunContext::default(),
+        hub,
     )
 }
 
@@ -1282,7 +1712,7 @@ pub fn spawn_detached_workflow_for_test(
 /// Resolves the graph from the server's `workflows` map (the graph must already be
 /// registered). `run_id` is set to the task id (matching the fresh-submit path).
 #[doc(hidden)]
-pub fn spawn_detached_workflow_with_token_for_test(
+pub async fn spawn_detached_workflow_with_token_for_test(
     srv: &Arc<InboundServer>,
     task: TaskId,
     text_parts: Vec<String>,
@@ -1296,6 +1726,12 @@ pub fn spawn_detached_workflow_with_token_for_test(
         .expect("workflow must be registered in the test server");
     let input = text_parts.join("\n");
     let run_id = task.as_str().to_string();
+    // Mirror the real callers: insert the hub BEFORE spawning.
+    let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+    srv.progress_hubs
+        .lock()
+        .await
+        .insert(task.clone(), hub.clone());
     spawn_detached_workflow(
         srv,
         task,
@@ -1305,6 +1741,7 @@ pub fn spawn_detached_workflow_with_token_for_test(
         token,
         std::collections::HashMap::new(),
         bridge_workflow::executor::WorkflowRunContext::default(),
+        hub,
     )
 }
 
@@ -1362,16 +1799,18 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
 
         // (1) No snapshot → cannot reconstruct the graph that was running. Interrupt.
         let Some(spec_json) = wt.workflow_spec_json.as_deref() else {
-            if let Err(e) = srv
-                .task_store
-                .set_terminal(
-                    &task,
-                    TaskRecordStatus::Interrupted,
-                    None,
-                    Some("not resumable: no workflow snapshot"),
-                    crate::workflow_sink::now_ms(),
-                )
-                .await
+            // Pre-spawn terminal (no hub inserted): finalize via the sequenced path
+            // (hub: None) so terminal_seq is never NULL.
+            if let Err(e) = finalize_detached(
+                &srv.task_store,
+                &srv.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: no workflow snapshot"),
+                None,
+            )
+            .await
             {
                 tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-snapshot) failed");
             } else {
@@ -1390,16 +1829,16 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
         let graph = match serde_json::from_str::<WorkflowSpecEnvelope>(spec_json) {
             Ok(env) if env.v == SUPPORTED_SNAPSHOT_VERSION => env.graph,
             _ => {
-                if let Err(e) = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        TaskRecordStatus::Interrupted,
-                        None,
-                        Some("not resumable: unreadable workflow snapshot"),
-                        crate::workflow_sink::now_ms(),
-                    )
-                    .await
+                if let Err(e) = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: unreadable workflow snapshot"),
+                    None,
+                )
+                .await
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/unreadable) failed");
                 } else {
@@ -1431,22 +1870,22 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
         //     write-failure gap). Finalize DIRECTLY from the checkpoint, with NO
         //     re-run and WITHOUT consuming a resume attempt. Completed carries the
         //     output as `result`; Failed carries it as `error` (mirrors
-        //     `TaskStoreSink::terminal` / `spawn_detached_workflow`'s finalize).
+        //     `finalize_detached` / `DetachedProgressSink::terminal`).
         let terminal_id = match graph.terminal() {
             Some(n) => n.id.as_str().to_string(),
             None => {
                 // A snapshot that validate()'d at submit time always has exactly one
                 // terminal; a malformed snapshot with no terminal is not resumable.
-                if let Err(e) = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        TaskRecordStatus::Interrupted,
-                        None,
-                        Some("not resumable: workflow snapshot has no terminal node"),
-                        crate::workflow_sink::now_ms(),
-                    )
-                    .await
+                if let Err(e) = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: workflow snapshot has no terminal node"),
+                    None,
+                )
+                .await
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-terminal) failed");
                 } else {
@@ -1464,10 +1903,18 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
             } else {
                 (TaskRecordStatus::Failed, None, Some(output.as_str()))
             };
-            if let Err(e) = srv
-                .task_store
-                .set_terminal(&task, status, result, error, crate::workflow_sink::now_ms())
-                .await
+            // Pre-spawn terminal (no hub inserted): sequenced finalize so terminal_seq
+            // is never NULL.
+            if let Err(e) = finalize_detached(
+                &srv.task_store,
+                &srv.progress_hubs,
+                &task,
+                status,
+                result,
+                error,
+                None,
+            )
+            .await
             {
                 tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(short-circuit) failed");
             } else {
@@ -1485,16 +1932,16 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
             Ok(ResumeClaim::Exhausted) => {
                 // Poison-pill guard: a task that keeps crashing the server is marked
                 // Interrupted after `cap` attempts instead of looping forever.
-                if let Err(e) = srv
-                    .task_store
-                    .set_terminal(
-                        &task,
-                        TaskRecordStatus::Interrupted,
-                        None,
-                        Some("resume attempt cap exceeded"),
-                        crate::workflow_sink::now_ms(),
-                    )
-                    .await
+                if let Err(e) = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("resume attempt cap exceeded"),
+                    None,
+                )
+                .await
                 {
                     tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/cap) failed");
                 } else {
@@ -1516,16 +1963,16 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                             session_cwd: Some(c),
                         },
                         Err(_) => {
-                            let _ = srv
-                                .task_store
-                                .set_terminal(
-                                    &task,
-                                    TaskRecordStatus::Interrupted,
-                                    None,
-                                    Some("not resumable: unreadable session cwd"),
-                                    crate::workflow_sink::now_ms(),
-                                )
-                                .await;
+                            let _ = finalize_detached(
+                                &srv.task_store,
+                                &srv.progress_hubs,
+                                &task,
+                                TaskRecordStatus::Interrupted,
+                                None,
+                                Some("not resumable: unreadable session cwd"),
+                                None,
+                            )
+                            .await;
                             tracing::info!(
                                 task = task.as_str(),
                                 "resume scan: interrupted (unreadable session cwd)"
@@ -1535,6 +1982,13 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     },
                     None => bridge_workflow::executor::WorkflowRunContext::default(),
                 };
+                // Insert the progress hub BEFORE spawning (mirrors the fresh-submit
+                // path) so a reattach subscriber can find it.
+                let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+                srv.progress_hubs
+                    .lock()
+                    .await
+                    .insert(task.clone(), hub.clone());
                 // Register a fresh cancel token BEFORE spawning so a concurrent
                 // tasks/cancel during resume can find and fire it.
                 let token = tokio_util::sync::CancellationToken::new();
@@ -1555,6 +2009,7 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     token,
                     seed,
                     ctx,
+                    hub,
                 ));
                 tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
             }
@@ -1820,19 +2275,28 @@ async fn unary_message(
             let graph = match graph {
                 Some(g) => g,
                 None => {
-                    let _ = srv
-                        .task_store
-                        .set_terminal(
-                            &task,
-                            bridge_core::task_store::TaskRecordStatus::Failed,
-                            None,
-                            Some("unknown workflow"),
-                            now,
-                        )
-                        .await;
+                    // Unknown workflow, pre-spawn: no hub was inserted (hub: None). Finalize
+                    // Failed via the sequenced path so terminal_seq is never NULL.
+                    let _ = finalize_detached(
+                        &srv.task_store,
+                        &srv.progress_hubs,
+                        &task,
+                        bridge_core::task_store::TaskRecordStatus::Failed,
+                        None,
+                        Some("unknown workflow"),
+                        None,
+                    )
+                    .await;
                     return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
                 }
             };
+            // Insert the progress hub BEFORE spawning so a reattach subscriber arriving
+            // immediately after this submit can find it.
+            let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+            srv.progress_hubs
+                .lock()
+                .await
+                .insert(task.clone(), hub.clone());
             let token = tokio_util::sync::CancellationToken::new();
             srv.workflow_cancels
                 .lock()
@@ -1849,6 +2313,7 @@ async fn unary_message(
                 bridge_workflow::executor::WorkflowRunContext {
                     session_cwd: routed.session_cwd.clone(),
                 },
+                hub,
             ));
             let working = a2a::Task {
                 id: task.as_str().to_owned(),
@@ -5467,6 +5932,823 @@ mod tests {
             1,
             "changing a2a-bridge.cwd must NOT spawn a new backend; \
              the warm process is shared across distinct cwds (only the ACP session mint differs)"
+        );
+    }
+
+    // ---- Task 7: SubscribeToTask dispatch + handler skeleton ----
+
+    use bridge_core::task_store::TaskStore as _;
+
+    /// Build a server with a MemoryTaskStore for the reattach tests (the durable
+    /// task_store is what `subscribe_to_task` consults for task lookup).
+    fn build_with_task_store(
+        task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+    ) -> Arc<InboundServer> {
+        Arc::new(
+            InboundServer::new(
+                FakeRegistry::single("kiro", FakeBackend::new()),
+                Arc::new(FakeStore::default()),
+                Arc::new(AutoApprove),
+                Arc::new(AlwaysKiro),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "kiro",
+            )
+            .with_task_store(task_store),
+        )
+    }
+
+    /// (a) SubscribeToTask with NO task id (neither `id` nor `taskId` in params)
+    /// must return a JSON-RPC invalid-request error.
+    #[tokio::test]
+    async fn subscribe_to_task_missing_id_returns_error() {
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(methods::SUBSCRIBE_TO_TASK, json!({}), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("error").is_some(),
+            "expected a JSON-RPC error for missing task id, got: {body}"
+        );
+    }
+
+    /// (b) SubscribeToTask with an unknown task id must return a not-found JSON-RPC error.
+    #[tokio::test]
+    async fn subscribe_to_task_unknown_id_returns_not_found() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "no-such-task" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // not-found maps to RejectRequest => INVALID_REQUEST => 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("error").is_some(),
+            "expected a JSON-RPC error for unknown task id, got: {body}"
+        );
+    }
+
+    /// (c) I3 wire-conformance: a SubscribeToTask with the standard a2a-lf field
+    /// `{"id": "<known-task-id>"}` (a task that exists in the store) is ACCEPTED —
+    /// the response is an event-stream (SSE), NOT a JSON-RPC error.
+    /// This test would FAIL if the handler read only `taskId`.
+    #[tokio::test]
+    async fn subscribe_to_task_standard_id_field_accepted() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        // Create a task record in the store so the lookup succeeds.
+        let now = crate::workflow_sink::now_ms();
+        let rec = bridge_core::task_store::TaskRecord {
+            id: TaskId::parse("test-task-7c").unwrap(),
+            workflow: "test-wf".to_string(),
+            status: bridge_core::task_store::TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: now,
+            updated_ms: now,
+            input: "test input".to_string(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        };
+        store.create(&rec).await.unwrap();
+
+        let srv = build_with_task_store(store);
+        // Working task: the working flow requires a live progress hub (Task 9). Insert
+        // one so the request is routed to the working flow and yields an SSE response.
+        insert_hub(&srv, &TaskId::parse("test-task-7c").unwrap()).await;
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "test-task-7c" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // Must succeed (SSE response, NOT a JSON-RPC error).
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The response must be an event-stream, not JSON.
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/event-stream"),
+            "expected event-stream content type, got: {content_type}"
+        );
+    }
+
+    /// (c2) I3 lenient alias: a request carrying the legacy `taskId` field (instead of
+    /// the standard a2a-lf `id`) is still accepted — locks the `.or_else(taskId)` fallback
+    /// so a refactor that drops it is caught.
+    #[tokio::test]
+    async fn subscribe_to_task_legacy_task_id_alias_accepted() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let now = crate::workflow_sink::now_ms();
+        let rec = bridge_core::task_store::TaskRecord {
+            id: TaskId::parse("test-task-7c2").unwrap(),
+            workflow: "test-wf".to_string(),
+            status: bridge_core::task_store::TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: now,
+            updated_ms: now,
+            input: "test input".to_string(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        };
+        store.create(&rec).await.unwrap();
+
+        let srv = build_with_task_store(store);
+        // Working task: the working flow requires a live progress hub (Task 9).
+        insert_hub(&srv, &TaskId::parse("test-task-7c2").unwrap()).await;
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "taskId": "test-task-7c2" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/event-stream"),
+            "the taskId alias must be accepted; got content type: {content_type}"
+        );
+    }
+
+    /// (d) M5: a task id that is NOT in the TaskStore must return a not-found error
+    /// without falling through to gate() and starting a new run. This distinguishes
+    /// subscribe_to_task from stream_message (which would mint a new run for any id).
+    #[tokio::test]
+    async fn subscribe_to_task_unknown_id_no_gate_fallthrough() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let srv = build_with_task_store(store.clone());
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "phantom-task" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // Must be a not-found error (no run started).
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("error").is_some(),
+            "expected a JSON-RPC error for phantom task id, got: {body}"
+        );
+        // Confirm no new task was created in the store (gate() was NOT called).
+        let tasks = store.list(100).await.unwrap();
+        assert!(
+            tasks.is_empty(),
+            "no task should have been created in the store: {:?}",
+            tasks
+        );
+    }
+
+    // ---- Task 8: snapshot builder + terminal-state flow ----
+
+    /// Build a `post_request` and attach a `Last-Event-ID` header for the cursor.
+    fn post_request_with_cursor(
+        method: &str,
+        params: Value,
+        version: &str,
+        cursor: i64,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, version)
+            .header("Last-Event-ID", cursor.to_string())
+            .body(jsonrpc_body(method, params))
+            .unwrap()
+    }
+
+    /// Parse an SSE body into an ordered `Vec<(seq, kind_tag)>`.
+    /// Each SSE event block is separated by a blank line; we look for:
+    ///   `id: <seq>` and `data: <json>` (extracting the `"kind"` field).
+    async fn collect_sse_frames(resp: Response) -> Vec<(i64, String)> {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut result = Vec::new();
+        // Split on blank lines to get event blocks.
+        for block in body.split("\n\n") {
+            let mut seq: Option<i64> = None;
+            let mut kind: Option<String> = None;
+            for line in block.lines() {
+                if let Some(id_str) = line.strip_prefix("id:") {
+                    seq = id_str.trim().parse().ok();
+                } else if let Some(data_str) = line.strip_prefix("data:") {
+                    let trimmed = data_str.trim();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        if let Some(k) = v.get("kind").and_then(|k| k.as_str()) {
+                            kind = Some(k.to_string());
+                        }
+                    }
+                }
+            }
+            if let (Some(s), Some(k)) = (seq, kind) {
+                result.push((s, k));
+            }
+        }
+        result
+    }
+
+    /// Seed a `MemoryTaskStore` task record in the Working state.
+    async fn seed_task_record(
+        store: &std::sync::Arc<bridge_core::task_store::MemoryTaskStore>,
+        task_id: &str,
+    ) -> bridge_core::ids::TaskId {
+        let id = bridge_core::ids::TaskId::parse(task_id).unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store
+            .create(&bridge_core::task_store::TaskRecord {
+                id: id.clone(),
+                workflow: "code-review".to_string(),
+                status: bridge_core::task_store::TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: now,
+                updated_ms: now,
+                input: "test input".to_string(),
+                workflow_spec_json: None,
+                resume_attempts: 0,
+                session_cwd: None,
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    /// (8a) Terminal task with 2 checkpoints (seqs 1, 2) + terminal_seq 3, no cursor.
+    /// Expected frames: [(1,"node_finished"),(2,"node_finished"),(2,"snapshot_complete"),(3,"terminal")]
+    #[tokio::test]
+    async fn subscribe_terminal_task_no_cursor_yields_snapshot_then_terminal() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t8a").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        // seq 1: node-a finished; seq 2: node-b finished; seq 3: terminal.
+        let s1 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap();
+        let s2 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .await
+            .unwrap();
+        let s3 = store
+            .set_terminal_sequenced(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 2);
+        assert_eq!(s3, 3);
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "t8a" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (1, "node_finished".to_string()),
+                (2, "node_finished".to_string()),
+                (2, "snapshot_complete".to_string()),
+                (3, "terminal".to_string()),
+            ],
+            "expected ordered snapshot+terminal frames: {frames:?}"
+        );
+    }
+
+    /// (8b) Same terminal task, cursor=1 → only frames with seq > 1 are emitted.
+    /// Expected: [(2,"node_finished"),(2,"snapshot_complete"),(3,"terminal")]
+    #[tokio::test]
+    async fn subscribe_terminal_task_cursor_1_filters_seq_gt_1() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t8b").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq=1
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .await
+            .unwrap(); // seq=2
+        store
+            .set_terminal_sequenced(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap(); // seq=3
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request_with_cursor(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "t8b" }),
+                "1.0",
+                1, // cursor: Last-Event-ID = 1 → only seq > 1
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (2, "node_finished".to_string()),
+                (2, "snapshot_complete".to_string()),
+                (3, "terminal".to_string()),
+            ],
+            "cursor=1 should filter out seq=1 frame: {frames:?}"
+        );
+    }
+
+    /// (8c) I2 NULL-seq: terminal task whose checkpoint was written via legacy
+    /// `put_node_checkpoint` (seq=0) and terminal via legacy `set_terminal` (terminal_seq=None).
+    /// No cursor → the (0,"node_finished") IS delivered AND a terminal frame is still emitted.
+    #[tokio::test]
+    async fn subscribe_terminal_task_legacy_null_seq_delivers_seq0_and_terminal() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t8c").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        // Legacy put_node_checkpoint writes seq=0 (stored as 0 in the CheckpointValue).
+        store
+            .put_node_checkpoint(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap();
+        // Legacy set_terminal: terminal_seq=None (not stored in terminal_seqs).
+        store
+            .set_terminal(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "t8c" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = collect_sse_frames(resp).await;
+        // seq=0 node_finished MUST be delivered (cursor absent → pass everything incl seq 0)
+        // terminal_seq=None → always emit terminal (seq=0 for the terminal frame since terminal_seq is None).
+        assert_eq!(
+            frames,
+            vec![
+                (0, "node_finished".to_string()),
+                (0, "snapshot_complete".to_string()),
+                (0, "terminal".to_string()),
+            ],
+            "NULL-seq legacy task: seq0 node_finished AND terminal must be delivered: {frames:?}"
+        );
+    }
+
+    /// Confirm SendStreamingMessage STILL routes to stream_message (produces SSE,
+    /// not a JSON-RPC error). This verifies the dispatch split did not break the
+    /// existing streaming path.
+    #[tokio::test]
+    async fn send_streaming_message_still_routes_to_stream_message() {
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/event-stream"),
+            "SendStreamingMessage must still produce SSE: {content_type}"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("PONG"),
+            "SendStreamingMessage must still route to stream_message and get PONG: {body}"
+        );
+    }
+
+    // ---- Task 9: working-state flow (subscribe-first + cut_seq dedup + live-tail) ----
+
+    /// Build a live `NodeFinished` frame for a hub publish at the given seq.
+    fn live_node_finished(seq: i64, node: &str) -> crate::reattach::WorkflowProgressFrame {
+        crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq,
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::NodeFinished {
+                node: node.to_string(),
+                ok: true,
+                output: "live".to_string(),
+            },
+        }
+    }
+
+    /// Build a live `Terminal` frame for a hub publish at the given seq.
+    fn live_terminal(seq: i64) -> crate::reattach::WorkflowProgressFrame {
+        crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq,
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::Terminal {
+                outcome: crate::reattach::TerminalOutcome::Completed,
+                output: "done".to_string(),
+            },
+        }
+    }
+
+    /// Call the `subscribe_to_task` handler DIRECTLY (not via the router) so the test
+    /// can publish live frames AFTER the handler returns — the handler subscribes
+    /// synchronously, so frames published after the call still land in the response
+    /// stream's buffered receiver.
+    async fn call_subscribe(
+        srv: &Arc<InboundServer>,
+        task_id: &str,
+        cursor: Option<i64>,
+    ) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(SVC_PARAM_VERSION, "1.0".parse().unwrap());
+        if let Some(k) = cursor {
+            headers.insert("Last-Event-ID", k.to_string().parse().unwrap());
+        }
+        subscribe_to_task(srv.clone(), headers, json!(1), json!({ "id": task_id })).await
+    }
+
+    /// Insert a fresh hub for `task` into the server's `progress_hubs` and return it
+    /// so the test can publish live frames to the same hub the handler subscribes to.
+    async fn insert_hub(
+        srv: &Arc<InboundServer>,
+        task: &TaskId,
+    ) -> Arc<crate::reattach::TaskProgressHub> {
+        let hub = Arc::new(crate::reattach::TaskProgressHub::new());
+        srv.progress_hubs
+            .lock()
+            .await
+            .insert(task.clone(), hub.clone());
+        hub
+    }
+
+    /// (9a) In-flight: snapshot checkpoints (seqs 1,2), then live NodeFinished(3) +
+    /// Terminal(4). Expected ordered vector with NO dup of 1,2 in the live tail, NO gap.
+    #[tokio::test]
+    async fn subscribe_working_in_flight_snapshot_then_live_tail() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9a").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        // Durable snapshot: seqs 1,2 are finished checkpoints (task stays Working).
+        let s1 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap();
+        let s2 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .await
+            .unwrap();
+        assert_eq!((s1, s2), (1, 2));
+
+        let srv = build_with_task_store(store);
+        let hub = insert_hub(&srv, &task_id).await;
+
+        // Subscribe synchronously (the handler subscribes before returning).
+        let resp = call_subscribe(&srv, "t9a", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Now publish the live tail (buffers in the response stream's receiver).
+        hub.publish(live_node_finished(3, "node-c"));
+        hub.publish(live_terminal(4));
+
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (1, "node_finished".to_string()),
+                (2, "node_finished".to_string()),
+                (2, "snapshot_complete".to_string()),
+                (3, "node_finished".to_string()),
+                (4, "terminal".to_string()),
+            ],
+            "in-flight: snapshot then live tail, no dup/gap: {frames:?}"
+        );
+    }
+
+    /// (9a2) A Working task with an IN-PROGRESS node — a `record_node_started` with no
+    /// matching checkpoint — surfaces as a `node_started` frame in the snapshot. This
+    /// exercises the `snap.starts → NodeStarted` branch of `snapshot_frames` (terminal
+    /// tasks clear their starts, so this is the only path that reaches it).
+    #[tokio::test]
+    async fn subscribe_working_snapshot_includes_in_progress_start() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9a2").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let node_x = bridge_core::ids::NodeId::parse("node-x").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        // node-a finished (seq 1); node-x started but NOT finished (seq 2, stays in starts).
+        let s1 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap();
+        let s2 = store
+            .record_node_started(&task_id, &node_x, now)
+            .await
+            .unwrap();
+        assert_eq!((s1, s2), (1, 2));
+
+        let srv = build_with_task_store(store);
+        let hub = insert_hub(&srv, &task_id).await;
+        let resp = call_subscribe(&srv, "t9a2", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Finish the in-flight run so the stream closes.
+        hub.publish(live_terminal(3));
+
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (1, "node_finished".to_string()),
+                (2, "node_started".to_string()),
+                (2, "snapshot_complete".to_string()),
+                (3, "terminal".to_string()),
+            ],
+            "snapshot must include the in-progress node as node_started: {frames:?}"
+        );
+    }
+
+    /// (9b) Two concurrent subscribers each subscribe their own rx; publish the live
+    /// frames ONCE; both collected bodies equal the full ordered vector.
+    #[tokio::test]
+    async fn subscribe_working_two_concurrent_subscribers() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9b").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq 1
+
+        let srv = build_with_task_store(store);
+        let hub = insert_hub(&srv, &task_id).await;
+
+        // Two subscribers, each gets its own rx (subscribe-first).
+        let resp1 = call_subscribe(&srv, "t9b", None).await;
+        let resp2 = call_subscribe(&srv, "t9b", None).await;
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        // Publish the live frames ONCE — broadcast fans out to both receivers.
+        hub.publish(live_node_finished(2, "node-b"));
+        hub.publish(live_terminal(3));
+
+        let expected = vec![
+            (1, "node_finished".to_string()),
+            (1, "snapshot_complete".to_string()),
+            (2, "node_finished".to_string()),
+            (3, "terminal".to_string()),
+        ];
+        let f1 = collect_sse_frames(resp1).await;
+        let f2 = collect_sse_frames(resp2).await;
+        assert_eq!(f1, expected, "subscriber 1: {f1:?}");
+        assert_eq!(f2, expected, "subscriber 2: {f2:?}");
+    }
+
+    /// (9c) Empty snapshot: Working task, no checkpoints/starts → SnapshotComplete
+    /// at seq=cut_seq(0), then the live tail, then Terminal.
+    #[tokio::test]
+    async fn subscribe_working_empty_snapshot_emits_snapshot_complete_then_live() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9c").await;
+
+        let srv = build_with_task_store(store);
+        let hub = insert_hub(&srv, &task_id).await;
+
+        let resp = call_subscribe(&srv, "t9c", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // dedup_floor = max(-1, cut_seq=0) = 0 → live frames must have seq > 0.
+        hub.publish(live_node_finished(1, "node-a"));
+        hub.publish(live_terminal(2));
+
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (0, "snapshot_complete".to_string()),
+                (1, "node_finished".to_string()),
+                (2, "terminal".to_string()),
+            ],
+            "empty snapshot: snapshot_complete(cut_seq) then live tail: {frames:?}"
+        );
+    }
+
+    /// (9d) Cursor >= cut_seq on a TERMINAL task → SnapshotComplete then immediate
+    /// close (no hang). The terminal branch with a high cursor must not block.
+    #[tokio::test]
+    async fn subscribe_terminal_high_cursor_snapshot_complete_then_close() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9d").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq 1
+        let ts = store
+            .set_terminal_sequenced(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap(); // seq 2 (terminal_seq)
+        assert_eq!(ts, 2);
+
+        let srv = build_with_task_store(store);
+        // No hub needed (terminal branch). cursor=5 >= cut_seq=2 and >= terminal_seq=2.
+        let resp = call_subscribe(&srv, "t9d", Some(5)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Must NOT hang: collect returns. All snapshot frames are filtered by the
+        // high cursor, the terminal frame is suppressed (cursor >= terminal_seq),
+        // leaving only SnapshotComplete (its seq = cut_seq when no frames pass).
+        let frames = collect_sse_frames(resp).await;
+        assert_eq!(
+            frames,
+            vec![(2, "snapshot_complete".to_string())],
+            "high cursor terminal: snapshot_complete only, no hang: {frames:?}"
+        );
+    }
+
+    /// (9e) I5 terminal-during-snapshot: insert the hub, write snapshot checkpoints,
+    /// THEN set the task terminal, THEN call the handler. `get` returns the terminal
+    /// rec → the terminal branch runs. Assertion: a Terminal frame IS delivered and
+    /// the stream closes (never hangs / closes-without-terminal).
+    #[tokio::test]
+    async fn subscribe_terminal_during_snapshot_delivers_terminal() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9e").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        let srv = build_with_task_store(store.clone());
+        // Insert the hub (as a live runner would), write snapshot checkpoints...
+        let _hub = insert_hub(&srv, &task_id).await;
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq 1
+                       // ...then the task finishes (terminal written) BEFORE the handler is called.
+        let ts = store
+            .set_terminal_sequenced(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap(); // seq 2
+
+        let resp = call_subscribe(&srv, "t9e", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let frames = collect_sse_frames(resp).await;
+        // Must terminate with a Terminal frame (never hang / close without terminal).
+        assert_eq!(
+            frames.last(),
+            Some(&(ts, "terminal".to_string())),
+            "terminal-during-snapshot must end with a Terminal frame: {frames:?}"
+        );
+    }
+
+    /// (9f) I7 broadcast-lag: subscribe, then publish MORE than the channel capacity
+    /// (300 > 256) to force the receiver to lag → the body ends with a retryable
+    /// `event: error` SSE event, then closes. A fresh re-subscribe with the last-seen
+    /// cursor still yields a coherent snapshot.
+    #[tokio::test]
+    async fn subscribe_working_broadcast_lag_yields_retryable_error_then_close() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = seed_task_record(&store, "t9f").await;
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap(); // seq 1
+
+        let srv = build_with_task_store(store.clone());
+        let hub = insert_hub(&srv, &task_id).await;
+
+        let resp = call_subscribe(&srv, "t9f", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Publish 300 frames BEFORE the stream is drained → the receiver (cap 256)
+        // overflows → RecvError::Lagged on the first live recv.
+        for s in 2..302 {
+            hub.publish(live_node_finished(s, "node-x"));
+        }
+
+        // Collect the raw body and assert the retryable error event closes the stream.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("event: error") || body.contains("event:error"),
+            "lag must emit an SSE error event: {body}"
+        );
+        assert!(
+            body.contains("retryable") && body.contains("lagged"),
+            "lag error event must carry retryable/lagged: {body}"
+        );
+
+        // A fresh re-subscribe with the last-seen cursor re-snapshots coherently.
+        // (The durable snapshot makes reconnect lossless — the snapshot still
+        // reports the Working task and its checkpoint.)
+        let snap = store.progress_snapshot(&task_id).await.unwrap();
+        assert_eq!(
+            snap.status,
+            bridge_core::task_store::TaskRecordStatus::Working
+        );
+        let hub2 = insert_hub(&srv, &task_id).await;
+        let resp2 = call_subscribe(&srv, "t9f", Some(1)).await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        hub2.publish(live_terminal(2));
+        let frames2 = collect_sse_frames(resp2).await;
+        // cursor=1 filters the seq-1 checkpoint; snapshot_complete seq = cut_seq (1),
+        // then the live terminal.
+        assert_eq!(
+            frames2,
+            vec![
+                (1, "snapshot_complete".to_string()),
+                (2, "terminal".to_string()),
+            ],
+            "re-subscribe after lag must re-snapshot coherently: {frames2:?}"
         );
     }
 }
