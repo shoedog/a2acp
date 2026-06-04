@@ -1,0 +1,70 @@
+# a2a-bridge — local setup
+
+This directory was scaffolded by `a2a-bridge init`. It contains:
+
+- `a2a-bridge.toml` — the bridge config (agents + review workflows + store + server).
+- `prompts/` — the review prompt templates the workflows use.
+- `.a2a-bridge/` — durable task store (created on first `serve`).
+
+## Run it
+
+```sh
+a2a-bridge serve --config ./a2a-bridge.toml
+```
+
+Bare `a2a-bridge` (no args) also serves, but reads `./a2a-bridge.toml` from the
+current directory and writes a kiro-only default if absent — use `serve --config`
+to point at this file explicitly.
+
+## Agents
+
+Each `[[agents]]` entry is one CLI the bridge drives over ACP (or, for
+`kind="api"`, an OpenAI-compatible HTTP backend). Install the CLIs you use:
+
+| agent  | command            | auth                        |
+|--------|--------------------|-----------------------------|
+| kiro   | `kiro-cli acp`     | none (local default)        |
+| codex  | `codex-acp`        | codex login                 |
+| claude | `claude-agent-acp` | claude subscription / login |
+| api    | (HTTP)             | `OPENAI_API_KEY` env var     |
+
+`[registry] allowed_cmds` is an EXACT allowlist of the process commands the
+bridge may spawn — every ACP agent's `cmd` must appear there (the `api` agent has
+no command).
+
+### model / effort / mode
+
+- `model` → requested via `session/set_model` (**best-effort**). **Caveat:**
+  claude's model is **not observable** through the bridge — `claude-agent-acp`
+  uses the subscription's default; treat `model` on claude as advisory.
+- `effort` (minimal/low/medium/high/max) → **codex only** (mapped to codex-acp's
+  `reasoning_effort` config option). kiro / claude / api get no bridge effort.
+- `mode` → `session/set_mode`, which **HARD-fails** on an invalid/unknown mode id
+  (modes are agent-native). This template omits `mode` deliberately; set it only
+  to a mode your agent actually advertises.
+
+Auth failures generally surface on the FIRST request to an agent, not at serve
+boot.
+
+## Review workflows
+
+`code-review`, `spec-review`, and `plan-review` each run two independent reviewer
+lenses (codex + claude) and a synthesis. They reference `codex` and `claude`, so
+they are only present if you scaffolded both.
+
+```sh
+# Offline (foreground): run a workflow and print the synthesis.
+a2a-bridge run-workflow code-review --input diff.txt --config ./a2a-bridge.toml
+
+# Detached (durable): submit, then follow live progress over SSE (reattachable).
+a2a-bridge submit code-review --input diff.txt --url http://127.0.0.1:8080
+a2a-bridge task watch <task-id> --url http://127.0.0.1:8080
+```
+
+## Notes
+
+- Workflow `prompt_file` paths and a relative `[store] path` resolve relative to
+  **this config file's directory**.
+- Registry agent entries hot-reload on edit; **workflows, the server addr, and the
+  store are read once at boot** — restart `serve` after changing them.
+- Never put secrets in the config — `api_key_env` is the NAME of an env var.

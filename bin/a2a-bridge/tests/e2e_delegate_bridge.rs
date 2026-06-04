@@ -2,7 +2,7 @@
 //
 // Stands up two REAL bridge instances (A and B) in-process:
 //   Bridge B: InboundServer wired to a real AcpBackend (kiro-cli acp) on an
-//             ephemeral port. Serves the "kiro-code" skill.
+//             ephemeral port. Serves the "code" skill.
 //   Bridge A: InboundServer wired to PeerDelegation pointing at Bridge B, with
 //             SkillRoute sending "delegate" requests to Bridge B.
 //
@@ -83,7 +83,7 @@ async fn serve_on_ephemeral_port(router: axum::Router) -> String {
 #[tokio::test]
 async fn bridge_a_delegates_through_bridge_b_to_kiro() {
     // ----------------------------------------------------------------
-    // Bridge B — real Kiro backend, no delegation (serves kiro-code).
+    // Bridge B — real Kiro backend, no delegation (serves code).
     // ----------------------------------------------------------------
 
     let supervised_b = Supervised::spawn("kiro-cli", &["acp"], None)

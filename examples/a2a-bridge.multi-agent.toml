@@ -1,0 +1,117 @@
+# Canonical multi-agent reference config for the a2a-bridge.
+#
+# This file lives in `examples/`, so its workflow `prompt_file` paths use
+# `../prompts/...` (prompts live in the repo's `prompts/` dir). `a2a-bridge init`
+# generates a near-identical config that writes its own `prompts/` and uses
+# `prompts/...` instead. Run it with:
+#     a2a-bridge serve --config examples/a2a-bridge.multi-agent.toml
+#
+# model/effort/mode (all OPTIONAL, all applied per session):
+#   model  -> session/set_model (BEST-EFFORT). NOTE: claude's model is NOT
+#             observable through the bridge (claude-agent-acp uses the
+#             subscription default); treat `model` on claude as advisory.
+#   effort -> codex ONLY (mapped to codex-acp's `reasoning_effort`). kiro /
+#             claude / api get no bridge effort. Values: minimal|low|medium|high|max.
+#   mode   -> session/set_mode, which HARD-FAILS on an unknown/invalid mode id
+#             (modes are agent-native). Omitted here on purpose; set it only to a
+#             mode your agent actually advertises.
+
+default = "kiro"
+
+[registry]
+# Exact allowlist of process commands the bridge may spawn (the `api` agent has
+# no command and is NOT listed here).
+allowed_cmds = ["kiro-cli", "codex-acp", "claude-agent-acp"]
+
+[store]
+# Durable task store (detached submit + crash-resume + streaming reattach).
+# A relative path resolves against THIS config file's directory.
+path = ".a2a-bridge/tasks.sqlite"
+resume_attempt_cap = 3
+
+[server]
+addr = "127.0.0.1:8080"
+
+# kiro: zero-auth local default (kiro-cli acp).
+[[agents]]
+id    = "kiro"
+cmd   = "kiro-cli"
+args  = ["acp"]
+model = "auto"
+
+# codex: gpt-5.5 with reasoning_effort (effort is codex-only).
+[[agents]]
+id     = "codex"
+cmd    = "codex-acp"
+model  = "gpt-5.5"
+effort = "high"
+
+# claude: subscription. `model` is advisory (not observable through the bridge).
+[[agents]]
+id    = "claude"
+cmd   = "claude-agent-acp"
+model = "sonnet"
+
+# api: OpenAI-compatible non-process backend. `api_key_env` is the NAME of an env
+# var holding the token (NEVER the secret). Effort is not applied for api agents.
+[[agents]]
+id          = "api"
+kind        = "api"
+base_url    = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model       = "gpt-4o-mini"
+
+# ── Review workflows: two independent reviewer lenses (codex + claude) + a synthesis ──
+[[workflows]]
+id = "code-review"
+[[workflows.nodes]]
+id = "codex"
+agent = "codex"
+prompt_file = "../prompts/review-codex.md"
+inputs = []
+[[workflows.nodes]]
+id = "claude"
+agent = "claude"
+prompt_file = "../prompts/review-claude.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-synth.md"
+inputs = ["codex", "claude"]
+
+[[workflows]]
+id = "spec-review"
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor.md"
+inputs = []
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/spec-review-synth.md"
+inputs = ["rigor", "soundness"]
+
+[[workflows]]
+id = "plan-review"
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec.md"
+inputs = []
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/plan-review-synth.md"
+inputs = ["exec", "coverage"]

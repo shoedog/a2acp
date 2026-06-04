@@ -3773,9 +3773,9 @@ mod tests {
         let body = body_string(resp).await;
         let card: Value = serde_json::from_str(&body).unwrap();
         let skills = card["skills"].as_array().unwrap();
-        // Updated for Task 5a: three skills (kiro-code, delegate, fan-out).
+        // Updated for Task 5a: three skills (code, delegate, fan-out).
         assert_eq!(skills.len(), 3);
-        assert!(skills.iter().any(|s| s["id"] == "kiro-code"));
+        assert!(skills.iter().any(|s| s["id"] == "code"));
         assert!(skills.iter().any(|s| s["id"] == "delegate"));
         assert!(skills.iter().any(|s| s["id"] == "fan-out"));
     }

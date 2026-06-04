@@ -3,7 +3,7 @@
 // Stands up two REAL bridge instances (A and B) in-process:
 //
 //   Bridge B: InboundServer wired to a real AcpBackend (kiro-cli acp) on an
-//             ephemeral port. Serves the "kiro-code" skill via AlwaysKiroRoute.
+//             ephemeral port. Serves the "code" skill via AlwaysKiroRoute.
 //             Bridge B is the "peer" from A's perspective.
 //
 //   Bridge A: InboundServer wired to:
@@ -105,7 +105,7 @@ fn kiro_ndjson() -> Vec<u8> {
 #[tokio::test]
 async fn bridge_a_fanout_through_bridge_b_to_kiro() {
     // ----------------------------------------------------------------
-    // Bridge B — real Kiro backend, no delegation (serves kiro-code).
+    // Bridge B — real Kiro backend, no delegation (serves code).
     // ----------------------------------------------------------------
 
     let supervised_b = Supervised::spawn("kiro-cli", &["acp"], None)
