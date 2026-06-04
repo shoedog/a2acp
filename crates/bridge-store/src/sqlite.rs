@@ -114,6 +114,14 @@ impl SqliteStore {
                 ts        INTEGER NOT NULL,
                 PRIMARY KEY (task_id, node_id),
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS task_node_starts (
+                task_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                seq     INTEGER NOT NULL,
+                ts      INTEGER NOT NULL,
+                PRIMARY KEY (task_id, node_id),
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
             );",
         )
         .map_err(|_| BridgeError::StoreFailure)?;
@@ -125,7 +133,7 @@ impl SqliteStore {
 /// Reads existing columns via `PRAGMA table_info`, then issues `ALTER TABLE ADD COLUMN`
 /// only for columns that are missing. Safe to call on both fresh and old databases.
 fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    // Collect existing column names.
+    // Collect existing column names for `tasks`.
     let mut stmt = conn.prepare("PRAGMA table_info(tasks)")?;
     let existing: HashSet<String> = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -137,12 +145,24 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         ("resume_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("last_resume_ms", "INTEGER"),
         ("session_cwd", "TEXT"),
+        ("last_event_seq", "INTEGER NOT NULL DEFAULT 0"),
+        ("terminal_seq", "INTEGER"),
     ];
     for (col, def) in additive {
         if !existing.contains(col) {
             conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {col} {def};"))?;
         }
     }
+
+    // Collect existing column names for `task_node_checkpoints`.
+    let mut stmt2 = conn.prepare("PRAGMA table_info(task_node_checkpoints)")?;
+    let cp_existing: HashSet<String> = stmt2
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !cp_existing.contains("seq") {
+        conn.execute_batch("ALTER TABLE task_node_checkpoints ADD COLUMN seq INTEGER;")?;
+    }
+
     Ok(())
 }
 
@@ -530,40 +550,213 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
 
     async fn record_node_started(
         &self,
-        _task: &TaskId,
-        _node: &NodeId,
-        _ts: i64,
+        task: &TaskId,
+        node: &NodeId,
+        ts: i64,
     ) -> Result<i64, BridgeError> {
-        Err(BridgeError::StoreFailure) // TODO(Task 2)
+        let conn = self.conn.lock().unwrap();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        // Allocate seq by bumping last_event_seq.
+        let n = tx
+            .execute(
+                "UPDATE tasks SET last_event_seq = last_event_seq + 1 WHERE id=?1",
+                rusqlite::params![task.as_str()],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if n == 0 {
+            return Err(BridgeError::StoreFailure);
+        }
+        let seq: i64 = tx
+            .query_row(
+                "SELECT last_event_seq FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        // Upsert start row — resume re-emits are allowed.
+        tx.execute(
+            "INSERT INTO task_node_starts(task_id, node_id, seq, ts)
+             VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(task_id, node_id) DO UPDATE SET seq=excluded.seq, ts=excluded.ts",
+            rusqlite::params![task.as_str(), node.as_str(), seq, ts],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+        Ok(seq)
     }
 
     async fn put_node_checkpoint_sequenced(
         &self,
-        _task: &TaskId,
-        _node: &NodeId,
-        _output: &str,
-        _ok: bool,
-        _ts: i64,
+        task: &TaskId,
+        node: &NodeId,
+        output: &str,
+        ok: bool,
+        ts: i64,
     ) -> Result<i64, BridgeError> {
-        Err(BridgeError::StoreFailure) // TODO(Task 2)
+        let conn = self.conn.lock().unwrap();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        // Allocate seq.
+        let n = tx
+            .execute(
+                "UPDATE tasks SET last_event_seq = last_event_seq + 1 WHERE id=?1",
+                rusqlite::params![task.as_str()],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if n == 0 {
+            return Err(BridgeError::StoreFailure);
+        }
+        let seq: i64 = tx
+            .query_row(
+                "SELECT last_event_seq FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        // Plain INSERT (write-once per W3b; PK enforces uniqueness).
+        tx.execute(
+            "INSERT INTO task_node_checkpoints(task_id, node_id, output, ok, ts, seq)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![task.as_str(), node.as_str(), output, ok as i64, ts, seq],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        // Remove the start row — the node is no longer in-progress.
+        tx.execute(
+            "DELETE FROM task_node_starts WHERE task_id=?1 AND node_id=?2",
+            rusqlite::params![task.as_str(), node.as_str()],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+        Ok(seq)
     }
 
     async fn set_terminal_sequenced(
         &self,
-        _task: &TaskId,
-        _status: bridge_core::task_store::TaskRecordStatus,
-        _result: Option<&str>,
-        _error: Option<&str>,
-        _ts: i64,
+        task: &TaskId,
+        status: bridge_core::task_store::TaskRecordStatus,
+        result: Option<&str>,
+        error: Option<&str>,
+        ts: i64,
     ) -> Result<i64, BridgeError> {
-        Err(BridgeError::StoreFailure) // TODO(Task 2)
+        let conn = self.conn.lock().unwrap();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        // Allocate seq.
+        let n = tx
+            .execute(
+                "UPDATE tasks SET last_event_seq = last_event_seq + 1 WHERE id=?1",
+                rusqlite::params![task.as_str()],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if n == 0 {
+            return Err(BridgeError::StoreFailure);
+        }
+        let seq: i64 = tx
+            .query_row(
+                "SELECT last_event_seq FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        // Write the terminal status, result, error, and record terminal_seq.
+        tx.execute(
+            "UPDATE tasks SET status=?2, result=?3, error=?4, updated_ms=?5, terminal_seq=?6 WHERE id=?1",
+            rusqlite::params![task.as_str(), status.as_str(), result, error, ts, seq],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        // Clear all start rows for this task.
+        tx.execute(
+            "DELETE FROM task_node_starts WHERE task_id=?1",
+            rusqlite::params![task.as_str()],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+        Ok(seq)
     }
 
     async fn progress_snapshot(
         &self,
-        _task: &TaskId,
+        task: &TaskId,
     ) -> Result<bridge_core::task_store::TaskProgressSnapshot, BridgeError> {
-        Err(BridgeError::StoreFailure) // TODO(Task 2)
+        use bridge_core::task_store::TaskProgressSnapshot;
+        let conn = self.conn.lock().unwrap();
+        // Use a transaction for a consistent read so cut_seq is exact.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        // Read task row: status, result, error, terminal_seq, last_event_seq.
+        let (status_s, result, error, terminal_seq, cut_seq): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            i64,
+        ) = tx
+            .query_row(
+                "SELECT status, result, error, terminal_seq, last_event_seq FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let status = bridge_core::task_store::TaskRecordStatus::parse(&status_s)
+            .ok_or(BridgeError::StoreFailure)?;
+        // Read checkpoints ordered by seq (NULL seq → 0 via COALESCE).
+        // Each stmt+rows pair is in its own scope so the borrow is released before the next prepare.
+        let checkpoints: Vec<(NodeId, String, bool, i64)> = {
+            let mut cp_stmt = tx
+                .prepare(
+                    "SELECT node_id, output, ok, COALESCE(seq, 0) FROM task_node_checkpoints
+                     WHERE task_id=?1 ORDER BY COALESCE(seq, 0)",
+                )
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut cp_rows = cp_stmt
+                .query(rusqlite::params![task.as_str()])
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut out = Vec::new();
+            while let Some(row) = cp_rows.next().map_err(|_| BridgeError::StoreFailure)? {
+                let node_s: String = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+                let output: String = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
+                let ok_i: i64 = row.get(2).map_err(|_| BridgeError::StoreFailure)?;
+                let seq: i64 = row.get(3).map_err(|_| BridgeError::StoreFailure)?;
+                let node = NodeId::parse(node_s).map_err(|_| BridgeError::StoreFailure)?;
+                out.push((node, output, ok_i != 0, seq));
+            }
+            out
+        };
+        // Read in-progress start rows ordered by seq.
+        let starts: Vec<(NodeId, i64)> = {
+            let mut st_stmt = tx
+                .prepare(
+                    "SELECT node_id, seq FROM task_node_starts WHERE task_id=?1 ORDER BY seq",
+                )
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut st_rows = st_stmt
+                .query(rusqlite::params![task.as_str()])
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut out = Vec::new();
+            while let Some(row) = st_rows.next().map_err(|_| BridgeError::StoreFailure)? {
+                let node_s: String = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+                let seq: i64 = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
+                let node = NodeId::parse(node_s).map_err(|_| BridgeError::StoreFailure)?;
+                out.push((node, seq));
+            }
+            out
+        };
+        // Read-only transaction: commit or just let it drop — either is fine.
+        drop(tx);
+        Ok(TaskProgressSnapshot {
+            status,
+            result,
+            error,
+            checkpoints,
+            starts,
+            terminal_seq,
+            cut_seq,
+        })
     }
 }
 
@@ -853,14 +1046,33 @@ mod tests {
         {
             use rusqlite::Connection;
             let c = Connection::open(&path).unwrap();
-            c.execute_batch("CREATE TABLE tasks(id TEXT PRIMARY KEY, workflow TEXT NOT NULL, status TEXT NOT NULL, result TEXT, error TEXT, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);").unwrap();
+            // Pre-create the legacy 5-column task_node_checkpoints table (no `seq` column) and
+            // insert one row — exercises the ALTER-add-seq-on-a-populated-table path.
+            c.execute_batch(
+                "CREATE TABLE tasks(id TEXT PRIMARY KEY, workflow TEXT NOT NULL, \
+                 status TEXT NOT NULL, result TEXT, error TEXT, \
+                 created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
+                 CREATE TABLE task_node_checkpoints(
+                     task_id TEXT NOT NULL, node_id TEXT NOT NULL,
+                     output TEXT NOT NULL, ok INTEGER NOT NULL, ts INTEGER NOT NULL,
+                     PRIMARY KEY(task_id, node_id),
+                     FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                 );"
+            ).unwrap();
             c.execute(
                 "INSERT INTO tasks(id,workflow,status,created_ms,updated_ms) VALUES('old','wf','working',1,1)",
                 [],
             )
             .unwrap();
+            // Insert a legacy checkpoint row (no seq column).
+            c.execute(
+                "INSERT INTO task_node_checkpoints(task_id,node_id,output,ok,ts) VALUES('old','n','o',1,2)",
+                [],
+            )
+            .unwrap();
         }
-        // First reopen: migrates.
+        // First reopen: migrates — adds tasks columns (last_event_seq, terminal_seq, etc.),
+        // adds seq to task_node_checkpoints, creates task_node_starts.
         {
             let s = SqliteStore::open(&path).unwrap();
             let got = s
@@ -873,10 +1085,48 @@ mod tests {
             assert_eq!(got.session_cwd, None); // NULL for migrated old row
             use bridge_core::ids::NodeId;
             let old = TaskId::parse("old").unwrap();
-            s.put_node_checkpoint(&old, &NodeId::parse("n").unwrap(), "o", true, 2)
+            // Verify the migration added the new columns by checking PRAGMA.
+            {
+                let conn = s.conn.lock().unwrap();
+                let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
+                let cols: HashSet<String> = stmt
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert!(cols.contains("last_event_seq"), "tasks.last_event_seq must exist after migration");
+                assert!(cols.contains("terminal_seq"), "tasks.terminal_seq must exist after migration");
+                let mut stmt2 = conn.prepare("PRAGMA table_info(task_node_checkpoints)").unwrap();
+                let cp_cols: HashSet<String> = stmt2
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert!(cp_cols.contains("seq"), "task_node_checkpoints.seq must exist after migration");
+                // task_node_starts must exist.
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_node_starts'",
+                    [],
+                    |row| row.get(0),
+                ).unwrap();
+                assert_eq!(count, 1, "task_node_starts table must be created");
+            }
+            // The pre-existing legacy checkpoint row should appear as seq=0 in the snapshot.
+            let snap = s.progress_snapshot(&old).await.unwrap();
+            let legacy_cp = snap.checkpoints.iter().find(|c| c.0.as_str() == "n");
+            assert!(legacy_cp.is_some(), "legacy checkpoint must appear in snapshot");
+            assert_eq!(legacy_cp.unwrap().3, 0, "legacy NULL seq must map to 0");
+            // A seq write on the freshly-migrated task works from the DEFAULT 0 baseline.
+            let first = s
+                .record_node_started(&old, &NodeId::parse("m").unwrap(), 10)
                 .await
                 .unwrap();
-            assert_eq!(s.node_checkpoints(&old).await.unwrap().len(), 1);
+            assert_eq!(first, 1, "first seq on a migrated task (last_event_seq DEFAULT 0) must be 1");
+            // Adding a new checkpoint still works.
+            s.node_checkpoints(&old).await.unwrap(); // already 1
+            // Verify we can't double-insert the legacy checkpoint (write-once).
+            let res = s.put_node_checkpoint(&old, &NodeId::parse("n").unwrap(), "o2", true, 3).await;
+            assert!(res.is_err(), "write-once must be enforced for the legacy checkpoint key");
         }
         // Second reopen: migration idempotent (no duplicate-column error), foreign_keys ON, cascade.
         {
@@ -888,5 +1138,81 @@ mod tests {
             assert_eq!(s.node_checkpoints(&old).await.unwrap().len(), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sqlite_seq_and_snapshot() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        use bridge_core::ids::NodeId;
+        let t = TaskId::parse("t").unwrap();
+        s.create(&trec("t", 1)).await.unwrap();
+        let s1 = s
+            .record_node_started(&t, &NodeId::parse("a").unwrap(), 1)
+            .await
+            .unwrap();
+        let s2 = s
+            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), "OUT", true, 2)
+            .await
+            .unwrap();
+        assert!(s2 > s1);
+        let snap = s.progress_snapshot(&t).await.unwrap();
+        assert_eq!(snap.checkpoints[0].3, s2); // seq carried
+        assert!(snap.starts.is_empty()); // start cleared on finish
+        // record_node_started is an UPSERT (resume re-emit): no PK error
+        let r1 = s
+            .record_node_started(&t, &NodeId::parse("b").unwrap(), 3)
+            .await
+            .unwrap();
+        let r2 = s
+            .record_node_started(&t, &NodeId::parse("b").unwrap(), 4)
+            .await
+            .unwrap();
+        assert!(r2 > r1);
+        let term = s
+            .set_terminal_sequenced(&t, TaskRecordStatus::Completed, Some("R"), None, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.progress_snapshot(&t).await.unwrap().terminal_seq,
+            Some(term)
+        );
+    }
+
+    #[tokio::test]
+    async fn null_seq_legacy_checkpoint_is_seq_zero() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        use bridge_core::ids::NodeId;
+        let t = TaskId::parse("t").unwrap();
+        s.create(&trec("t", 1)).await.unwrap();
+        // Use the legacy (no-seq) put_node_checkpoint to insert without a seq.
+        s.put_node_checkpoint(&t, &NodeId::parse("old").unwrap(), "O", true, 1)
+            .await
+            .unwrap();
+        let snap = s.progress_snapshot(&t).await.unwrap();
+        assert_eq!(
+            snap.checkpoints
+                .iter()
+                .find(|c| c.0.as_str() == "old")
+                .unwrap()
+                .3,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn seq_continues_across_resume_seed() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        use bridge_core::ids::NodeId;
+        let t = TaskId::parse("t").unwrap();
+        s.create(&trec("t", 1)).await.unwrap();
+        let a = s
+            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), "A", true, 1)
+            .await
+            .unwrap();
+        let b = s
+            .record_node_started(&t, &NodeId::parse("b").unwrap(), 2)
+            .await
+            .unwrap();
+        assert!(b > a, "seq continues across a resumed run, not reset");
     }
 }
