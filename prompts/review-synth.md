@@ -13,10 +13,10 @@ HOW TO MERGE:
 OUTPUT FORMAT:
 A single prioritized list, **BLOCKER → MAJOR → MINOR**, each with location, the issue, and the fix. Then a one-line overall verdict (e.g. "ship after fixing the 2 BLOCKERs").
 
-=== CODEX (correctness lens) ===
-{{codex}}
+=== CORRECTNESS LENS (default: codex) ===
+{{correctness}}
 
-=== CLAUDE (architecture lens) ===
-{{claude}}
+=== ARCHITECTURE LENS (default: claude) ===
+{{architecture}}
 
 (Original artifact under review, for reference: {{input}})

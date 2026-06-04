@@ -494,12 +494,12 @@ fn serve_config_flag(args: &[String]) -> Result<Option<PathBuf>, BoxError> {
 /// (no bridge repo needed at runtime). `(relative-output-path, contents)`.
 const INIT_PROMPTS: &[(&str, &str)] = &[
     (
-        "prompts/review-codex.md",
-        include_str!("../../../prompts/review-codex.md"),
+        "prompts/review-correctness.md",
+        include_str!("../../../prompts/review-correctness.md"),
     ),
     (
-        "prompts/review-claude.md",
-        include_str!("../../../prompts/review-claude.md"),
+        "prompts/review-architecture.md",
+        include_str!("../../../prompts/review-architecture.md"),
     ),
     (
         "prompts/review-synth.md",
@@ -530,12 +530,12 @@ const INIT_PROMPTS: &[(&str, &str)] = &[
         include_str!("../../../prompts/plan-review-synth.md"),
     ),
     (
-        "prompts/design-codex.md",
-        include_str!("../../../prompts/design-codex.md"),
+        "prompts/design-executability.md",
+        include_str!("../../../prompts/design-executability.md"),
     ),
     (
-        "prompts/design-claude.md",
-        include_str!("../../../prompts/design-claude.md"),
+        "prompts/design-structure.md",
+        include_str!("../../../prompts/design-structure.md"),
     ),
     (
         "prompts/design-synth.md",
@@ -576,20 +576,20 @@ const INIT_WORKFLOWS: &str = r#"
 [[workflows]]
 id = "code-review"
 [[workflows.nodes]]
-id = "codex"
+id = "correctness"
 agent = "codex"
-prompt_file = "prompts/review-codex.md"
+prompt_file = "prompts/review-correctness.md"
 inputs = []
 [[workflows.nodes]]
-id = "claude"
+id = "architecture"
 agent = "claude"
-prompt_file = "prompts/review-claude.md"
+prompt_file = "prompts/review-architecture.md"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
 prompt_file = "prompts/review-synth.md"
-inputs = ["codex", "claude"]
+inputs = ["correctness", "architecture"]
 
 [[workflows]]
 id = "spec-review"
@@ -631,20 +631,20 @@ inputs = ["exec", "coverage"]
 [[workflows]]
 id = "design"
 [[workflows.nodes]]
-id = "codex"
+id = "executability"
 agent = "codex"
-prompt_file = "prompts/design-codex.md"
+prompt_file = "prompts/design-executability.md"
 inputs = []
 [[workflows.nodes]]
-id = "claude"
+id = "structure"
 agent = "claude"
-prompt_file = "prompts/design-claude.md"
+prompt_file = "prompts/design-structure.md"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
 prompt_file = "prompts/design-synth.md"
-inputs = ["codex", "claude"]
+inputs = ["executability", "structure"]
 "#;
 
 /// Build the `a2a-bridge.toml` contents for the selected agents.

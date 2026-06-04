@@ -12,22 +12,22 @@ cmd = "claude-agent-acp"
 id = "code-review"
 
 [[workflows.nodes]]
-id = "codex"
+id = "correctness"
 agent = "codex"
-prompt_file = "../prompts/review-codex.md"
+prompt_file = "../prompts/review-correctness.md"
 inputs = []
 
 [[workflows.nodes]]
-id = "claude"
+id = "architecture"
 agent = "claude"
-prompt_file = "../prompts/review-claude.md"
+prompt_file = "../prompts/review-architecture.md"
 inputs = []
 
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
 prompt_file = "../prompts/review-synth.md"
-inputs = ["codex", "claude"]
+inputs = ["correctness", "architecture"]
 
 # spec-review: rigor (completeness/ambiguity) + soundness (design) -> synth.
 # Feed a design spec as the input; agents do not explore, so inline all context.
