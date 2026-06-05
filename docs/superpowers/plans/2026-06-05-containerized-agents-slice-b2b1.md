@@ -832,3 +832,80 @@ Expected: `FILE_COMMITTED_OK`, `CONTENT_OK`, bot identity on the commit, `SOURCE
 **3. Type consistency:** `implement::{clone_argv, commit_argv, commit_message, read_commit_msg_file, task_id, branch_for, nonce, handoff_text, run_git, StageState, stage_state, head_sha, current_branch, head_guard, host_commit, assert_dest_outside_worktree, do_clone, do_checkout_branch}` — names match across T1–T10. `WorkflowOutcome::Completed` + `WorkflowEvent::Terminal{outcome}` match executor.rs:35,51. `RegistryConfig.allowed_cwd_root` + `into_snapshot` + `load_workflows` + `Registry::new(snap, spawn)` match the `run_workflow_cmd` seams.
 
 **Open item for the plan-review:** the container-reap-before-host-commit ordering (T10 drops the stream; the per-turn reaper is detached) — confirm the stale-`index.lock` clear in `host_commit` (T7) is a sufficient settle, or whether `implement_cmd` should additionally `retire()` the resolved `impl` backend before committing.
+
+---
+
+## Plan rev2 — dual-review corrections (BINDING; override the body where they conflict)
+
+Both plan-reviews (containerized dogfood + a2a-local codex `gpt-5.5`) = **needs-changes**; both verified the
+real seams compile and affirmed the decomposition/design. Apply ALL of R1–R14.
+
+- **R1 — Remove unused test imports** (clippy `-D warnings` blocker). In Task 5's `#[cfg(test)]` block do
+  NOT add `use std::path::Path;` (it's unused in tests — production already imports it); keep
+  `use std::process::Command;` (used by `temp_repo`). Verify each test module compiles clean under
+  `-D warnings`.
+- **R2 — Genuinely tests-first ordering.** In every pure task (T1–T4), Step "write the failing test"
+  contains ONLY the test; the production fns land in the "implement" step. (T1's first block currently mixes
+  them — split it.)
+- **R3 — Extract a pure `decide()` (the coverage keystone, P#6).** Add to `implement.rs`:
+  ```rust
+  pub enum Action { Commit(String), NoCommitDirty, NoCommitClean, Abort(String) }
+  /// Pure soft-gate decision. `head_guard` is the head_guard result; `msg` is (message, used_fallback).
+  pub fn decide(completed: bool, head_guard: Result<(), String>, stage: StageState, msg: (String, bool)) -> Action {
+      if !completed { return Action::Abort("workflow did not complete".into()); }
+      if let Err(e) = head_guard { return Action::Abort(e); }
+      match stage {
+          StageState::Clean => Action::NoCommitClean,
+          StageState::DirtyUnstaged => Action::NoCommitDirty,
+          StageState::Staged => Action::Commit(msg.0),
+      }
+  }
+  ```
+  **Unit-test the full matrix** (completed×head_guard×stage). `implement_cmd` resolves the inputs
+  (outcome, `head_guard(...)`, `stage_state(...)`, `commit_message(...)`) then `match decide(...)`: `Commit`
+  → `host_commit`+strip+leftover-report+hand-off; `NoCommitDirty` → flag + leave clone; `NoCommitClean` →
+  "no changes" + leave; `Abort(r)` → eprintln + leave + Err. This closes the coverage hole on the riskiest
+  logic and shrinks Task 10.
+- **R4 — Split Task 10** into 10a (dispatch arm + `parse_implement_args`, unit-tested) and 10b
+  (`implement_cmd` orchestration that resolves inputs + executes `decide`'s `Action`). State the expected
+  workspace-coverage movement (positive — T1–T8 + `decide` add a heavily-tested `implement.rs` to the
+  uncapped `a2a-bridge` crate).
+- **R5 — Check git exit status** in `stage_state`, `head_sha`, `current_branch` (and any `run_git` reader):
+  on `!out.status.success()` return an `Err` carrying stderr (else a failed `git status` → false `Clean`).
+  Change their signatures to `Result<_, String>` and the temp-repo tests accordingly.
+- **R6 — Clone-guard before mkdir.** Probe the **existing canonical `allowed_cwd_root`** (which exists)
+  with `assert_dest_outside_worktree` BEFORE `create_dir_all(.a2a-implement)` — make
+  `assert_dest_outside_worktree` walk to the nearest existing ancestor of its argument so it never depends
+  on the not-yet-created dir. Reorder T10: read+canonicalize root → guard(root) → mkdir → task-id → clone.
+- **R7 — `host_commit` retry-on-lock (not blind pre-clear)** [spec settle ratified]. Do NOT
+  `remove_file(index.lock)` up front. Attempt `git commit`; on an index-lock error (`stderr` contains
+  `index.lock` / `Another git process`) sleep ~200ms and retry up to 5×; only if still locked, remove the
+  stale `.git/index.lock` and make one final attempt. Add `use std::time::Duration` + `std::thread::sleep`.
+- **R8 — `read_commit_msg_file`: bounded read + NUL reject.** Open the file and read at most 64 KiB via a
+  `take(65536)` reader (don't `fs::read` the whole file); return `None` on read error, oversize, invalid
+  UTF-8, **or any NUL byte** (a NUL breaks `git commit -m`). Add a temp-file test for the NUL/oversize cases.
+- **R9 — `--base-ref` → SHA.** After cloning (or before), resolve the ref to a SHA: when `--base-ref` is
+  given, `git -C <clone> rev-parse <ref>` then `checkout <sha>`; when absent, resolve the **source repo's**
+  HEAD to a SHA first (`git -C <repo> rev-parse HEAD`) and check that SHA out in the clone (honors the
+  detached-HEAD clause; pins against a concurrent push). Error on an unresolvable ref.
+- **R10 — Extend the Task 7 hook test** to also plant a `core.hooksPath`-pointed `pre-commit` AND a
+  `prepare-commit-msg`/`post-commit` hook (all `exit 1` / side-effecting) and assert the commit still
+  succeeds + no side effect — proving the full hook surface the spec claims, not just default `pre-commit`.
+- **R11 — Strengthen the config-validation check (T11).** The "unknown workflow" run-workflow probe returns
+  BEFORE `into_snapshot`, so it doesn't validate the registry. Add a Docker-free check/test that
+  `RegistryConfig::parse` + `load_workflows` (finds `implement-edit`) + `into_snapshot` + `Registry::new`
+  all succeed for `examples/a2a-bridge.containerized.toml` (the `impl` agent + the workflow validate).
+- **R12 — `implement` usage discoverability.** Add `implement` to `main.rs`'s unknown-subcommand usage
+  enumeration (`serve | run-workflow | submit | task | init` → `… | implement`) + the top command comment,
+  and give `parse_implement_args` errors a one-line usage hint.
+- **R13 — Strip `.git/A2A_COMMIT_MSG` before AND after the commit** (the spec says before/after; the body
+  only stripped after). Quote the clone/repo **paths in the hand-off text** (so spaces don't garble the
+  printed copy-paste). Task 12's gate **parses the clone path from `implement`'s printed hand-off** (the
+  `clone:` line), not `ls … | tail`.
+- **R14 — Confirmed intentional (no change):** `implement-edit` duplicates `impl-smoke`'s 1-node shape but
+  with a distinct contract (the B2a smoke writes a marker; B2b-1's edit+stage+`.git/A2A_COMMIT_MSG`
+  contract) — keep both.
+
+**Both verdicts:** design + decomposition sound; R1–R14 are correctness/decomposition/coverage fixes + the
+ratified settle. After applying them the plan builds green-per-task with the soft-gate matrix unit-covered;
+no third plan-review needed — the inline TDD build is the verification.

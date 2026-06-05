@@ -93,8 +93,14 @@ A 1-node `implement-edit` workflow (`agent="impl"`, `prompt_file="../prompts/imp
 
 ### Commit (bridge, deterministic state machine)
 After the workflow stream terminates:
-1. **Settle the container:** `retire()` the backend (awaited) so no container races the host commit on the
-   `.git/index` lock [review: B2a reaps async]. Clear any stale `.git/index.lock` if present.
+1. **Settle the container** [rev2, plan-review-ratified]: the agent's in-container git completes BEFORE the
+   turn's `Done` (its last `git add` releases the index lock), so at stream-terminate the clone's index is
+   stable and the per-turn container's *detached* reap doesn't touch the host clone files. The host commit
+   therefore proceeds at `Done` **with a bounded retry on an index-lock error** (clearing a stale
+   `.git/index.lock` only after retries exhaust) to cover the abnormal/teardown-race case. *(A fully-awaited
+   container-reap-before-commit would need a new `Registry` retire-all-and-await seam — `retire()` is
+   per-`AgentBackend`, not on the registry — deferred as over-engineering for B2b-1; the identical-path mount
+   + the Done-releases-the-lock invariant make the retry sufficient.)*
 2. **Outcome gate:** commit ONLY on `WorkflowOutcome::Completed`. On executor error / Failed / Canceled →
    **no commit**, leave the clone for inspection, report.
 3. **HEAD guard:** assert `git -C <clone> symbolic-ref --short HEAD == implement/<task-id>` and that HEAD
