@@ -67,6 +67,12 @@ a2a-bridge serve --config examples/a2a-bridge.containerized.toml      # reads fr
 **no cwd gate**). The identical-path mount (`-v /Users/wesleyjinks/code:/Users/wesleyjinks/code:ro`)
 makes the per-request `session_cwd` resolve unchanged inside the container.
 
+> **Slice B1 (ADR-0017):** with the enforced `[sandbox]` block, this rule is now a **load error, not just
+> operator discipline** — `into_snapshot` rejects a sandboxed agent whose `mount != allowed_cwd_root` (S2),
+> and the bridge composes the `docker run` argv itself (so `:ro`/egress/`--network` can't be forgotten).
+> See the `[sandbox]` form in `examples/a2a-bridge.containerized.toml`. (`mount`/`allowed_cwd_root` are
+> boot-fixed — changing them needs a restart.)
+
 ## 5. Validation gates (all PASS as of 2026-06-04)
 
 **(a) Egress curl-triad** — providers allowed, everything else blocked:
