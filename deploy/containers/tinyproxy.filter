@@ -1,0 +1,6 @@
+# One POSIX-ERE per line, matched against the CONNECT host. Anchored so
+# `evil-anthropic.com.attacker.net` does NOT match. `*.anthropic.com` would be an INVALID regex.
+(^|\.)anthropic\.com$
+(^|\.)openai\.com$
+# kiro (Amazon Q / CodeWhisperer + AWS SSO/OIDC) — pinned to EXACT hosts from the proxy log (Task 9),
+# NOT a broad amazonaws.com glob. Add the discovered hosts below during kiro validation.

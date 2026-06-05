@@ -1,0 +1,21 @@
+# Two-network egress lockdown: agents on an --internal net (no route out) reach ONLY the proxy;
+# the proxy also sits on an external net to reach the providers.
+# Bring up:  docker compose -f deploy/containers/compose.egress.yaml up -d --build
+networks:
+  a2a-egress-internal:
+    name: a2a-egress-internal
+    internal: true          # no gateway -> agents on this net have NO direct internet route
+  a2a-egress-external:
+    name: a2a-egress-external
+
+services:
+  egress-proxy:
+    build:
+      context: .
+      dockerfile: proxy.Containerfile
+    image: a2a-egress-proxy:latest
+    container_name: a2a-egress-proxy
+    networks:
+      - a2a-egress-internal   # reachable by agents
+      - a2a-egress-external   # can reach the providers
+    restart: unless-stopped
