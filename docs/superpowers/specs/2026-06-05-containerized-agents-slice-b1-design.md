@@ -91,11 +91,15 @@ With a sandbox, `entry.cmd` names the **agent CLI** (`claude-agent-acp`, `kiro-c
 **Parse layer — `config.rs::into_snapshot` (the only place with both `sandbox` AND `allowed_cwd_root`;
 `allowed_cwd_root` lives on `RegistryConfig`/`config.rs:118` + `InboundServer`/`server.rs:180`, NOT in
 `RegistrySnapshot`):**
+**Routing rule (dogfood):** snapshot-visible invariants live in `validate()` (re-fire on reconcile);
+only an invariant needing config-only data (`allowed_cwd_root`) lives at parse. Any future
+`RegistrySnapshot` producer setting `sandbox` must originate from `into_snapshot` or perform equivalent
+S0/S2.
+
 - **S0 — `allowed_cmds` default must use the RESOLVED RUNTIME for sandboxed entries** (Codex catch).
   `into_snapshot` currently defaults `allowed_cmds` to the union of `[[agents]].cmd`; for a sandboxed
   entry `cmd` is the *agent CLI*, but S3 gates the *runtime* — so the default union must use
   `sb.runtime()` for sandboxed entries (and `cmd` for raw), else a sandbox config **self-rejects**.
-- **S1 — `sandbox.is_some() ⇒ kind == Acp`** (an `Api` agent has no process to contain — rejected).
 - **S2 — `sandbox.is_some() ⇒ allowed_cwd_root == Some && == sandbox.mount`** (both normalized via
   `SessionCwd::parse(…).as_str()`). The Slice A operator-discipline rule becomes a **load failure**.
   **Boot-fixed caveat (Codex blocker):** the live cwd gate reads `allowed_cwd_root` copied into
@@ -104,16 +108,25 @@ With a sandbox, `entry.cmd` names the **agent CLI** (`claude-agent-acp`, `kiro-c
   (already true of `allowed_cwd_root` in Slice A). A **loud code comment** at S2 records that it re-fires
   only where `into_snapshot` runs (today the sole `ConfigSource`); a future 2nd source must re-thread it.
 
-**Snapshot layer — `registry.rs::validate` (re-runs on reconcile):**
+**Snapshot layer — `registry.rs::validate` (re-runs on reconcile; needs only the snapshot entry):**
+- **S1 — `sandbox.is_some() ⇒ kind == Acp`** (dogfood: moved here from parse — it needs only
+  `kind`+`sandbox`, both in the snapshot, and belongs with the existing kind-shape guards).
 - **S3 — `sb.runtime()` ∈ `allowed_cmds`** (the SAME resolved value compose spawns — a shared accessor,
-  not the literal `Option`, so validate + spawn can't drift). The Acp arm **branches on `sandbox.is_some()`**:
+  not the literal `Option`, so validate + spawn can't drift; **allowlist-only** — the `"docker"|"podman"`
+  in the type comment is just examples, not a hard-coded set). The Acp arm **branches on `sandbox.is_some()`**:
   when sandboxed, `entry.cmd` (the inner CLI, e.g. `kiro-cli`) is required-present but **not** allowlist-
   checked (it runs *contained*); when `sandbox = None`, the existing `cmd` check (registry.rs:109-113)
   stands unchanged (Slice-A `cmd="docker"` still gated).
-- **S4 — `access == Rw` REJECTED in B1** (single condition; no volumes clause) — "requires the
-  `container_rw` kind (Slice B2)". The warm path can't safely host concurrent writers.
+- **S4 — `access == Rw` REJECTED in B1** — "requires the `container_rw` kind (Slice B2)". The warm path
+  can't safely host concurrent writers.
 - **S5 — `SessionCwd::parse(&sandbox.mount)` must succeed** (absolute/normalized; reuses `session_cwd.rs`).
-- *(The old S6 "Locked ⇒ network+proxy" is GONE — the data-carrying `EgressPolicy::Locked { network, proxy }`
+- **S6 — no `volumes` destination equal-to or NESTED-UNDER `mount`** (dogfood catch — protects B1's own
+  guarantee). An exact-destination collision is already a loud docker error, but a `volumes` entry whose
+  *destination* is a subdir of `mount` with no `:ro` re-exposes part of the repo **rw** — the very
+  "forgot `:ro`" failure B1 exists to make loud. Reject any volume dest `is_under` (or `==`) `mount`;
+  creds / named volumes *outside* the tree pass (operator-trusted). Parent/sibling deny-checks stay
+  deferred (§7 defense-in-depth).
+- *(The old "Locked ⇒ network+proxy" is GONE — the data-carrying `EgressPolicy::Locked { network, proxy }`
   makes it a type guarantee; `compose_sandbox` is total.)*
 
 **Reuse predicate (`registry.rs:264-272`) — fix ALL THREE omissions** (owner decision): add
@@ -149,15 +162,15 @@ The raw `cmd="docker" args=[…]` form still works (opt-in; Slice A compat).
   pairs, `Open` omits them; `no_proxy` when set; `volumes` verbatim order; identical-path `mount:mount:ro`;
   `runtime` default `docker` / `podman` override; `access=Rw` emits `mount:mount` (no `:ro`) for B2 reuse;
   agent-args tail.
-- **Unit — snapshot invariants (bridge-registry::validate):** S3 reject `sb.runtime()` ∉ `allowed_cmds`
-  (incl. default-`docker` resolution) + sandboxed `entry.cmd` NOT allowlist-checked; S4 reject
-  `access=rw`; S5 reject non-absolute `mount`; the reuse predicate forces a new slot on a change to
-  `sandbox` **or `session_cwd` or `api_key_env`** (all three). *(No S6 test — it's a type guarantee now.)*
+- **Unit — snapshot invariants (bridge-registry::validate):** S1 reject `api`+sandbox; S3 reject
+  `sb.runtime()` ∉ `allowed_cmds` (incl. default-`docker` resolution; a non-allowlisted runtime rejected)
+  + sandboxed `entry.cmd` NOT allowlist-checked; S4 reject `access=rw`; S5 reject non-absolute `mount`;
+  **S6 reject a `volumes` dest nested-under/`==` `mount`** (accept one outside the tree); the reuse
+  predicate forces a new slot on a change to `sandbox` **or `session_cwd` or `api_key_env`** (all three).
 - **Unit — parse invariants (config.rs::into_snapshot):** S0 `allowed_cmds` default uses `sb.runtime()`
-  for sandboxed entries (a sandbox config with no explicit `allowed_cmds` does NOT self-reject); S1
-  reject `api`+sandbox; S2 reject `mount != allowed_cwd_root` and `allowed_cwd_root == None` + sandbox,
-  accept `mount == allowed_cwd_root`; `Locked`-without-`network`/`proxy` fails at the TOML→`EgressPolicy`
-  conversion (not a runtime check).
+  for sandboxed entries (a sandbox config with no explicit `allowed_cmds` does NOT self-reject); S2 reject
+  `mount != allowed_cwd_root` and `allowed_cwd_root == None` + sandbox, accept `mount == allowed_cwd_root`;
+  `Locked`-without-`network`/`proxy` fails at the TOML→`EgressPolicy` conversion (not a runtime check).
 - **Dogfood validation (the acceptance gate):** migrate the containerized config and re-run **ALL FIVE**
   smokes — `smoke-claude` / `smoke-codex` / `smoke-kiro` (now via `[sandbox]`) **and** `smoke-ollama` /
   `smoke-ollama-cloud` (untouched `api`) — every one returns `SMOKE_OK`.
@@ -178,9 +191,12 @@ The raw `cmd="docker" args=[…]` form still works (opt-in; Slice A compat).
    it's a LOCAL test-double `struct AgentEntry`, not the domain type. `AgentEntry` has no `Default`, so the
    compiler flags every real site (effort-budget only). Same shape as the prior `session_cwd` ripple.
 2. **`compose_sandbox` + Docker-free unit tests** (bridge-core/src/sandbox.rs).
-3. **`registry::validate` S3–S6 + the all-three reuse-tuple fix + tests.**
-4. **`config::into_snapshot` parse + S1/S2** (`SandboxToml`, `parse_access`/`parse_egress` mirroring
-   `parse_kind`; the `mount == allowed_cwd_root` cross-check) + parse tests.
+3. **`registry::validate` S1, S3, S4, S5, S6 + the all-three reuse-tuple fix + tests** (the snapshot-
+   visible invariants).
+4. **`config::into_snapshot` parse: S0 + S2 + the TOML→`EgressPolicy` conversion** (`SandboxToml`,
+   `parse_access`/`parse_egress` mirroring `parse_kind`; flat `egress="locked"`+`network`+`proxy`+
+   `no_proxy` → `EgressPolicy::Locked{…}`, rejecting Locked-without-both; the `mount==allowed_cwd_root`
+   cross-check + the `allowed_cmds` default fix) + parse tests.
 5. **Wire BOTH `SpawnFn` closures** (`main.rs:163` + `main.rs:844`) — compose-or-raw.
 6. **Migrate `examples/a2a-bridge.containerized.toml`** (3 readers) + the all-five-smokes acceptance gate.
 
@@ -240,7 +256,20 @@ correct; `:rw` correctly gated). Folded:
   hot-edit now respawns) — flag in the plan/changelog, not "no-op"; `egress="open"` stays permitted for a
   sandboxed reader (operator-opt-in unrestricted egress; every B1 deliverable reader uses `Locked`).
 Per [[review-agent-roles]]: Codex carried the hot-reload + allowlist correctness; Claude carried the
-type-design + the containment test gap. The containerized dogfood `spec-review` ran as a third pass.
+type-design + the containment test gap.
+
+**The dogfood `spec-review` (self-hosted, containerized) caught what the rigorous dual-review MISSED:**
+- **MAJOR — nested `volumes` re-mount the `:ro` repo `rw`** → new invariant **S6** (reject any `volumes`
+  destination `==`/nested-under `mount`). The a2a-local reviews accepted `volumes` as a blanket trusted
+  hole; the dogfood found the specific nested-remount attack on B1's own guarantee. *(This alone justified
+  the dogfood.)*
+- **MAJOR — move S1 (`sandbox⇒Acp`) to `validate()`** (snapshot-visible) + state the routing rule; keep
+  S2 as the single parse-layer exception.
+- **runtime is allowlist-only** (the `docker|podman` comment is just examples); **migration snippet shows
+  the full `[registry]`/`allowed_cwd_root`/`[server]` context**; name the reuse mechanism
+  (`session_cwd→AcpConfig.cwd`, `api_key_env→ApiConfig`, frozen at spawn); wiring errors reuse
+  `ConfigInvalid`, not placeholders. (Both lenses retracted an earlier S2-normalization blocker after
+  checking `SessionCwd::parse`.)
 
 ## Firewall
 Designed from the bridge's own ports (`AgentEntry`/`AgentKind`, the two `SpawnFn` closures,
