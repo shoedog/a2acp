@@ -212,7 +212,10 @@ mod tests {
             compose_container_rw(&sb, &rw, "a2a-rw-inst-0", "claude-agent-acp", &[]);
         assert_eq!(program, "docker");
         // --name spliced immediately after --rm
-        assert_eq!(&argv[0..5], &["run", "-i", "--rm", "--name", "a2a-rw-inst-0"]);
+        assert_eq!(
+            &argv[0..5],
+            &["run", "-i", "--rm", "--name", "a2a-rw-inst-0"]
+        );
         // mount is the rw_target, identical-path, NO :ro suffix
         assert!(argv
             .windows(2)
@@ -220,7 +223,9 @@ mod tests {
         assert!(!argv.iter().any(|a| a.ends_with(":ro")));
         // egress + creds volume + image + cmd preserved from sb
         assert!(argv.iter().any(|a| a == "--network"));
-        assert!(argv.iter().any(|a| a == "/host/creds:/root/.codex/auth.json"));
+        assert!(argv
+            .iter()
+            .any(|a| a == "/host/creds:/root/.codex/auth.json"));
         assert_eq!(argv[argv.len() - 1], "claude-agent-acp");
     }
 
@@ -252,6 +257,9 @@ mod tests {
         assert!(check_rw_target(&root, &ok).is_ok());
         assert!(check_rw_target(&root, &root).is_ok()); // equal is under
         let err = check_rw_target(&root, &sib).unwrap_err();
-        assert!(format!("{err:?}").contains("escapes mount root"), "got {err:?}");
+        assert!(
+            format!("{err:?}").contains("escapes mount root"),
+            "got {err:?}"
+        );
     }
 }

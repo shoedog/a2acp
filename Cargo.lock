@@ -442,6 +442,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-container"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bridge-acp",
+ "bridge-core",
+ "futures",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
 name = "bridge-core"
 version = "0.1.0"
 dependencies = [

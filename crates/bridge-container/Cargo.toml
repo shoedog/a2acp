@@ -1,0 +1,20 @@
+[package]
+name = "bridge-container"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bridge-core = { path = "../bridge-core" }
+bridge-acp = { path = "../bridge-acp" }
+async-trait.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+tokio = { workspace = true }
+tokio-stream.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = { workspace = true }
+tempfile = "3"
