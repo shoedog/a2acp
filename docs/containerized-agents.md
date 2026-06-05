@@ -44,6 +44,17 @@ mount breaks refresh):
   cp ~/.codex/auth.json          ~/.config/a2a-creds/codex/auth.json
   chmod -R u+rw ~/.config/a2a-creds
   ```
+
+> **Token rotation (re-sync before each session).** OAuth/SSO tokens **rotate on refresh** (the refresh
+> token is single-use), so a copy goes **stale** when you use the agent *on the host* — the host rotates
+> the lineage and the copy's refresh token dies, surfacing as `session/prompt failed: transport error`.
+> Run the pre-flight sync before a containerized session so each short turn borrows the host's *current*
+> token (no mid-turn refresh → no rotation → the host stays valid too):
+> ```bash
+> deploy/containers/sync-creds.sh && a2a-bridge serve --config examples/a2a-bridge.containerized.toml
+> ```
+> (claude/codex are host-file copies; **kiro** is the `a2a-kiro-data` volume — re-run its device-flow
+> login if it has fully expired, not a host sync.)
 - **kiro** — a one-time in-container **device-flow** login (the host's macOS auth is NOT portable to
   Linux). Auth lives in `~/.local/share/kiro-cli/data.sqlite3`, persisted to a named volume:
   ```bash
