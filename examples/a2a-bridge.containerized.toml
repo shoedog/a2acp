@@ -62,6 +62,22 @@ network = "a2a-egress-internal"
 proxy   = "http://a2a-egress-proxy:8888"
 volumes = ["a2a-kiro-data:/root/.local/share"]
 
+# ── impl: WRITE-capable per-turn container (Slice B2a). kind="container_rw" PERMITS access="rw".
+#    A FRESH :rw container per turn, reaped after; the :rw mount is the per-request session cwd
+#    (a scratch dir; in B2b a per-task git clone) under allowed_cwd_root, canonicalized + is_under-gated.
+[[agents]]
+id   = "impl"
+kind = "container_rw"
+cmd  = "claude-agent-acp"
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"            # == allowed_cwd_root (S2); :rw target is the session cwd under it
+access  = "rw"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json"]
+
 # ── ollama: non-process api agent (kind="api"). Uncontainerized by design — no mount/proxy/creds.
 #    NOT tool-free — it advertises a deterministic side-effect-free stub tool (no fs/shell).
 #    Local => no remote egress (a cloud base_url would egress host-direct, bypassing the proxy). ──
@@ -100,6 +116,16 @@ id = "synth"
 agent = "claude"
 prompt_file = "../prompts/review-synth.md"
 inputs = ["correctness", "architecture"]
+
+[[workflows]]
+# B2a acceptance gate: a single write-capable container_rw node. Run from under the mount with
+#   a2a-bridge run-workflow impl-smoke --input README.md --session-cwd /Users/wesleyjinks/code/.b2a-scratch
+id = "impl-smoke"
+[[workflows.nodes]]
+id = "write"
+agent = "impl"
+prompt_file = "../prompts/impl-smoke.md"
+inputs = []
 
 [[workflows]]
 id = "spec-review"
