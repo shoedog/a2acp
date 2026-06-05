@@ -56,6 +56,62 @@ pub fn compose_sandbox(
     (sb.runtime().to_string(), argv)
 }
 
+/// PURE+TOTAL. Per-turn `:rw` argv for a `ContainerRw` agent (Slice B2a). The `:rw` mount is the
+/// per-task `rw_target` (NOT `sb.mount`); model as "same sandbox, mount=rw_target, access=Rw" and REUSE
+/// [`compose_sandbox`] so egress / volumes / runtime / suffix derivation stay ONE source of truth. A
+/// unique `--name` is spliced immediately after `--rm` so the container is reapable by name.
+pub fn compose_container_rw(
+    sb: &SandboxConfig,
+    rw_target: &crate::session_cwd::SessionCwd,
+    name: &str,
+    cmd: &str,
+    args: &[String],
+) -> (String, Vec<String>) {
+    let derived = SandboxConfig {
+        mount: rw_target.as_str().to_string(),
+        access: MountAccess::Rw,
+        ..sb.clone()
+    };
+    let (program, mut argv) = compose_sandbox(&derived, cmd, args);
+    // INVARIANT: compose_sandbox always emits ["run","-i","--rm", ...] (this module, ~line 17).
+    debug_assert_eq!(
+        &argv[0..3],
+        &["run", "-i", "--rm"],
+        "compose_sandbox prefix changed — fix the --name splice"
+    );
+    argv.splice(3..3, [String::from("--name"), name.to_string()]);
+    (program, argv)
+}
+
+/// PURE. The reap command for a named per-turn container: `<runtime> rm -f <name>`. Idempotent at the
+/// Docker layer (`rm -f` of a gone container is a harmless error the caller ignores).
+pub fn reap_argv(runtime: &str, name: &str) -> (String, Vec<String>) {
+    (
+        runtime.to_string(),
+        vec!["rm".into(), "-f".into(), name.to_string()],
+    )
+}
+
+/// PURE. Lexical containment of a WRITABLE target under the mount root. BOTH inputs MUST already be
+/// canonicalized by the caller (the backend does the filesystem I/O — this module stays pure). Stable
+/// error fragment `":rw target escapes mount root"`.
+pub fn check_rw_target(
+    mount_canon: &crate::session_cwd::SessionCwd,
+    rw_canon: &crate::session_cwd::SessionCwd,
+) -> Result<(), crate::error::BridgeError> {
+    if rw_canon.is_under(mount_canon) {
+        Ok(())
+    } else {
+        Err(crate::error::BridgeError::ConfigInvalid {
+            reason: format!(
+                ":rw target escapes mount root: {} not under {}",
+                rw_canon.as_str(),
+                mount_canon.as_str()
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +200,58 @@ mod tests {
         assert_eq!(compose_sandbox(&sb, "x", &[]).0, "podman");
         sb.runtime = None;
         assert_eq!(compose_sandbox(&sb, "x", &[]).0, "docker");
+    }
+
+    // --- B2a pure composers --------------------------------------------------
+
+    #[test]
+    fn container_rw_mounts_target_rw_with_name_after_rm() {
+        let sb = ro_locked(); // egress=Locked, volumes=[creds]; access overridden inside
+        let rw = crate::session_cwd::SessionCwd::parse("/Users/w/code/.scratch").unwrap();
+        let (program, argv) =
+            compose_container_rw(&sb, &rw, "a2a-rw-inst-0", "claude-agent-acp", &[]);
+        assert_eq!(program, "docker");
+        // --name spliced immediately after --rm
+        assert_eq!(&argv[0..5], &["run", "-i", "--rm", "--name", "a2a-rw-inst-0"]);
+        // mount is the rw_target, identical-path, NO :ro suffix
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "-v" && w[1] == "/Users/w/code/.scratch:/Users/w/code/.scratch"));
+        assert!(!argv.iter().any(|a| a.ends_with(":ro")));
+        // egress + creds volume + image + cmd preserved from sb
+        assert!(argv.iter().any(|a| a == "--network"));
+        assert!(argv.iter().any(|a| a == "/host/creds:/root/.codex/auth.json"));
+        assert_eq!(argv[argv.len() - 1], "claude-agent-acp");
+    }
+
+    #[test]
+    fn container_rw_appends_agent_args_tail() {
+        let sb = ro_locked();
+        let rw = crate::session_cwd::SessionCwd::parse("/m/t").unwrap();
+        let (_p, argv) = compose_container_rw(&sb, &rw, "n", "kiro-cli", &["acp".into()]);
+        assert_eq!(argv.last().unwrap(), "acp");
+    }
+
+    #[test]
+    fn reap_argv_shape_docker_and_podman() {
+        assert_eq!(
+            reap_argv("docker", "a2a-rw-x"),
+            (
+                "docker".to_string(),
+                vec!["rm".into(), "-f".into(), "a2a-rw-x".into()]
+            )
+        );
+        assert_eq!(reap_argv("podman", "a2a-rw-y").0, "podman");
+    }
+
+    #[test]
+    fn check_rw_target_accepts_under_rejects_escape() {
+        let root = crate::session_cwd::SessionCwd::parse("/Users/w/code").unwrap();
+        let ok = crate::session_cwd::SessionCwd::parse("/Users/w/code/.scratch").unwrap();
+        let sib = crate::session_cwd::SessionCwd::parse("/Users/w/code-evil").unwrap();
+        assert!(check_rw_target(&root, &ok).is_ok());
+        assert!(check_rw_target(&root, &root).is_ok()); // equal is under
+        let err = check_rw_target(&root, &sib).unwrap_err();
+        assert!(format!("{err:?}").contains("escapes mount root"), "got {err:?}");
     }
 }
