@@ -23,19 +23,23 @@ pub sandbox: Option<SandboxConfig>,   // between session_cwd and auth_method
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxConfig {
-    pub runtime: Option<String>,   // "docker" (default) | "podman"
+    pub runtime: Option<String>,   // "docker" (default) | "podman"; resolve via sb.runtime() accessor
     pub image: String,
     pub mount: String,             // the SOURCE (repo root); identical-path; MUST == allowed_cwd_root (S2)
     pub access: MountAccess,       // Ro | Rw
-    pub egress: EgressPolicy,      // Locked | Open
-    pub network: Option<String>,   // --network; REQUIRED when egress=Locked (S6)
-    pub proxy: Option<String>,     // HTTPS_PROXY; REQUIRED when egress=Locked (S6)
-    pub no_proxy: Option<String>,  // NO_PROXY (e.g. "localhost,127.0.0.1"); optional
+    pub egress: EgressPolicy,      // data-carrying (below) → compose is TOTAL, no runtime S6
     pub volumes: Vec<String>,      // extra mounts (creds / named vols), verbatim; trusted passthrough
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum MountAccess { Ro, Rw }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum EgressPolicy { Locked, Open }
+
+// EgressPolicy CARRIES its data (clean-room+dual-review): "Locked ⇒ network+proxy" becomes a TYPE
+// guarantee, so compose_sandbox is total (no unwrap/panic) and the old runtime S6 invariant DISAPPEARS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressPolicy {
+    Locked { network: String, proxy: String, no_proxy: Option<String> },
+    Open,
+}
 ```
 `PartialEq,Eq` are required because the registry reuse predicate compares fields with `==`. (`AgentEntry`
 itself stays `Debug+Clone`; only `SandboxConfig` needs `Eq`.)
@@ -47,10 +51,11 @@ itself stays `Debug+Clone`; only `SandboxConfig` needs `Eq`.)
 /// ACP session/new cwd resolve in-container (container OS cwd is irrelevant).
 pub fn compose_sandbox(sb: &SandboxConfig, agent_cmd: &str, agent_args: &[String]) -> (String, Vec<String>)
 ```
-Emits `(program, argv)`:
-- `program = sb.runtime.as_deref().unwrap_or("docker")`
+Emits `(program, argv)` — **total**, no `unwrap`/panic (the egress data lives in the variant):
+- `program = sb.runtime()` — a shared accessor returning `self.runtime.as_deref().unwrap_or("docker")`
+  (S3 allowlists this SAME resolved value, so validate + spawn can't drift).
 - `argv = ["run", "-i", "--rm"]`
-  - if `egress == Locked`: `+ ["--network", <network>, "-e", "HTTPS_PROXY="+proxy, "-e", "HTTP_PROXY="+proxy]`
+  - `match &sb.egress { Locked { network, proxy, no_proxy } => + ["--network", network, "-e", "HTTPS_PROXY="+proxy, "-e", "HTTP_PROXY="+proxy] + (no_proxy ⇒ ["-e", "NO_PROXY="+v]); Open => [] }`
   - source mount (access-derived): `+ ["-v", format!("{m}:{m}{}", if Ro {":ro"} else {""})]` (identical-path by construction)
   - extra volumes verbatim: `for v in volumes: + ["-v", v]`
   - `+ [image, agent_cmd]` then `+ agent_args`
@@ -83,24 +88,33 @@ With a sandbox, `entry.cmd` names the **agent CLI** (`claude-agent-acp`, `kiro-c
 `validate()` sees only a `RegistrySnapshot`, and **`allowed_cwd_root` is NOT in `RegistrySnapshot`**
 (it lives in `RegistryConfig`/server, `domain.rs:127`). So the invariants partition by data visibility:
 
-**Parse layer — `config.rs::into_snapshot` (the only place with both `sandbox` AND `allowed_cwd_root`):**
+**Parse layer — `config.rs::into_snapshot` (the only place with both `sandbox` AND `allowed_cwd_root`;
+`allowed_cwd_root` lives on `RegistryConfig`/`config.rs:118` + `InboundServer`/`server.rs:180`, NOT in
+`RegistrySnapshot`):**
+- **S0 — `allowed_cmds` default must use the RESOLVED RUNTIME for sandboxed entries** (Codex catch).
+  `into_snapshot` currently defaults `allowed_cmds` to the union of `[[agents]].cmd`; for a sandboxed
+  entry `cmd` is the *agent CLI*, but S3 gates the *runtime* — so the default union must use
+  `sb.runtime()` for sandboxed entries (and `cmd` for raw), else a sandbox config **self-rejects**.
 - **S1 — `sandbox.is_some() ⇒ kind == Acp`** (an `Api` agent has no process to contain — rejected).
 - **S2 — `sandbox.is_some() ⇒ allowed_cwd_root == Some && == sandbox.mount`** (both normalized via
-  `SessionCwd::parse(…).as_str()`). **This is the codeful guarantee** — the Slice A operator-discipline
-  rule ("`allowed_cwd_root` MUST equal the mount root or readers ship with NO cwd gate",
-  `docs/containerized-agents.md:66`) becomes a **load failure**. Replaces the spec's earlier denylist
-  (which was speculative + over-broad); creds still ride the trusted `volumes` passthrough, never
-  path-checked.
+  `SessionCwd::parse(…).as_str()`). The Slice A operator-discipline rule becomes a **load failure**.
+  **Boot-fixed caveat (Codex blocker):** the live cwd gate reads `allowed_cwd_root` copied into
+  `InboundServer` **once at boot** (`main.rs:1024`); hot-reload re-applies only the `RegistrySnapshot`,
+  not the server root. So `mount`/`allowed_cwd_root` are **boot-fixed — changing them needs a restart**
+  (already true of `allowed_cwd_root` in Slice A). A **loud code comment** at S2 records that it re-fires
+  only where `into_snapshot` runs (today the sole `ConfigSource`); a future 2nd source must re-thread it.
 
-**Snapshot layer — `registry.rs::validate` (re-runs on every hot-reload / any config source):**
-- **S3 — runtime ∈ `allowed_cmds`**; `entry.cmd` (the inner agent CLI) required-present but **not**
-  allowlist-checked (it runs *contained*). When `sandbox = None`, the existing `cmd` allowlist check
-  (registry.rs:109-113) stands unchanged (Slice-A `cmd="docker"` still gated).
+**Snapshot layer — `registry.rs::validate` (re-runs on reconcile):**
+- **S3 — `sb.runtime()` ∈ `allowed_cmds`** (the SAME resolved value compose spawns — a shared accessor,
+  not the literal `Option`, so validate + spawn can't drift). The Acp arm **branches on `sandbox.is_some()`**:
+  when sandboxed, `entry.cmd` (the inner CLI, e.g. `kiro-cli`) is required-present but **not** allowlist-
+  checked (it runs *contained*); when `sandbox = None`, the existing `cmd` check (registry.rs:109-113)
+  stands unchanged (Slice-A `cmd="docker"` still gated).
 - **S4 — `access == Rw` REJECTED in B1** (single condition; no volumes clause) — "requires the
   `container_rw` kind (Slice B2)". The warm path can't safely host concurrent writers.
 - **S5 — `SessionCwd::parse(&sandbox.mount)` must succeed** (absolute/normalized; reuses `session_cwd.rs`).
-- **S6 — `egress == Locked ⇒ network.is_some() && proxy.is_some()`** (so `compose_sandbox` stays pure +
-  infra-agnostic — no hardcoded `a2a-egress-*` names — and can't emit a dangling `--network`).
+- *(The old S6 "Locked ⇒ network+proxy" is GONE — the data-carrying `EgressPolicy::Locked { network, proxy }`
+  makes it a type guarantee; `compose_sandbox` is total.)*
 
 **Reuse predicate (`registry.rs:264-272`) — fix ALL THREE omissions** (owner decision): add
 `&& c.sandbox == e.sandbox && c.session_cwd == e.session_cwd && c.api_key_env == e.api_key_env`. The
@@ -135,22 +149,34 @@ The raw `cmd="docker" args=[…]` form still works (opt-in; Slice A compat).
   pairs, `Open` omits them; `no_proxy` when set; `volumes` verbatim order; identical-path `mount:mount:ro`;
   `runtime` default `docker` / `podman` override; `access=Rw` emits `mount:mount` (no `:ro`) for B2 reuse;
   agent-args tail.
-- **Unit — snapshot invariants (bridge-registry::validate):** S3 reject runtime ∉ `allowed_cmds`; S4
-  reject `access=rw`; S5 reject non-absolute `mount`; S6 reject `Locked` without `network`+`proxy`; the
-  reuse predicate forces a new slot on a change to `sandbox` **or `session_cwd` or `api_key_env`** (all
-  three).
-- **Unit — parse invariants (config.rs::into_snapshot):** S1 reject `api`+sandbox; S2 reject
-  `mount != allowed_cwd_root` and `allowed_cwd_root == None` + sandbox; accept `mount == allowed_cwd_root`.
+- **Unit — snapshot invariants (bridge-registry::validate):** S3 reject `sb.runtime()` ∉ `allowed_cmds`
+  (incl. default-`docker` resolution) + sandboxed `entry.cmd` NOT allowlist-checked; S4 reject
+  `access=rw`; S5 reject non-absolute `mount`; the reuse predicate forces a new slot on a change to
+  `sandbox` **or `session_cwd` or `api_key_env`** (all three). *(No S6 test — it's a type guarantee now.)*
+- **Unit — parse invariants (config.rs::into_snapshot):** S0 `allowed_cmds` default uses `sb.runtime()`
+  for sandboxed entries (a sandbox config with no explicit `allowed_cmds` does NOT self-reject); S1
+  reject `api`+sandbox; S2 reject `mount != allowed_cwd_root` and `allowed_cwd_root == None` + sandbox,
+  accept `mount == allowed_cwd_root`; `Locked`-without-`network`/`proxy` fails at the TOML→`EgressPolicy`
+  conversion (not a runtime check).
 - **Dogfood validation (the acceptance gate):** migrate the containerized config and re-run **ALL FIVE**
   smokes — `smoke-claude` / `smoke-codex` / `smoke-kiro` (now via `[sandbox]`) **and** `smoke-ollama` /
-  `smoke-ollama-cloud` (untouched `api`) — every one returns `SMOKE_OK`. Proves the bridge-composed argv
-  is equivalent to the hand-typed Slice A one AND that `sandbox ⇒ Acp` leaves ollama intact.
+  `smoke-ollama-cloud` (untouched `api`) — every one returns `SMOKE_OK`.
+- **POSITIVE containment assertion (Claude catch — `SMOKE_OK` alone false-greens).** A `SMOKE_OK` only
+  proves a successful *read*; if `main.rs:163` is mis-wired the agent spawns **uncontained on the host**
+  and the smoke still passes. So during a reader smoke, ALSO assert containment: `docker ps` shows a
+  live `a2a-agent-reader` container for that run (the definitive proof the bridge actually composed +
+  spawned the sandbox), and/or the egress curl-triad / `:ro`-write-rejection from inside. Run it via
+  **both** code paths — `run-workflow` (main.rs:163) **and** a `serve`+A2A `SendMessage` (main.rs:844) —
+  since each is a separate SpawnFn site.
 - Coverage after `cargo llvm-cov clean --workspace` (floors: workspace 85, bridge-core 90).
 
 ## Build order (clean-room; slices 1–4 are pure/no-Docker)
-1. **Domain types + the `sandbox: None` ripple** across ~9 `AgentEntry { … }` construction sites
-   (domain, registry, config, route.rs, test helpers in bridge-a2a-inbound / bridge-workflow / e2e) —
-   pure compile, existing tests stay green. Same shape as the prior `session_cwd` ripple.
+1. **Domain types (incl. the data-carrying `EgressPolicy`) + the `sandbox: None` ripple** across **~14-15**
+   real `AgentEntry { … }` construction sites (domain.rs:247/274/299, registry.rs:369/423, config.rs:315,
+   route.rs:109, e2e_registry.rs:225/558/614, common/mod.rs:23, server.rs:3133/5394, workflow_producer.rs:39,
+   executor.rs:391 — Codex `rg` counts up to 17 incl. helpers). **SKIP `integration_run_workflow.rs:86`** —
+   it's a LOCAL test-double `struct AgentEntry`, not the domain type. `AgentEntry` has no `Default`, so the
+   compiler flags every real site (effort-budget only). Same shape as the prior `session_cwd` ripple.
 2. **`compose_sandbox` + Docker-free unit tests** (bridge-core/src/sandbox.rs).
 3. **`registry::validate` S3–S6 + the all-three reuse-tuple fix + tests.**
 4. **`config::into_snapshot` parse + S1/S2** (`SandboxToml`, `parse_access`/`parse_egress` mirroring
@@ -195,6 +221,26 @@ gates the runtime; volumes verbatim). It **corrected three things my spec got wr
 - **`allowed_cwd_root` isn't in `RegistrySnapshot`** → validation is **two-layered** (parse S1/S2 +
   snapshot S3–S6), not all in `validate()`.
 Plus the `sandbox:None` ripple (~9 sites) and the all-three reuse fix.
+
+## Dual-review fold (Codex gpt-5.5 + Claude opus-4-8, against this spec + the real code)
+Both **verified the spine** (two SpawnFn sites; `allowed_cwd_root` not in `RegistrySnapshot`; the
+all-three reuse fix is safe; mount-equality is the right gate; compose argv == Slice A exactly; cwd-drop
+correct; `:rw` correctly gated). Folded:
+- **BLOCKER (Codex) — S2 hot-reload:** the server's `allowed_cwd_root` is boot-fixed, so `mount`/root are
+  **boot-fixed (restart to change)** — documented + a loud comment at S2.
+- **Type-design (Claude) — `EgressPolicy` carries its data** (`Locked { network, proxy, no_proxy }`) →
+  `compose_sandbox` is **total**, the runtime **S6 invariant is removed** (illegal states unrepresentable).
+- **Correctness (both) — runtime allowlist:** a shared `sb.runtime()` accessor; S3 gates the *resolved*
+  runtime; the `allowed_cmds` **default-union uses the runtime for sandboxed entries** (S0) so a sandbox
+  config doesn't self-reject; the Acp arm branches on `sandbox.is_some()`.
+- **Test gap (Claude) — `SMOKE_OK` false-greens** if `main.rs:163` is mis-wired (uncontained host spawn) →
+  the acceptance gate adds a **positive containment assertion** + runs via both code paths.
+- **Minors:** `NO_PROXY` emission explicit (Locked, when set); ripple is **~14-15** real sites (+1
+  test-double to skip); the reuse-key `session_cwd`/`api_key_env` addition is a **behavior change** (a
+  hot-edit now respawns) — flag in the plan/changelog, not "no-op"; `egress="open"` stays permitted for a
+  sandboxed reader (operator-opt-in unrestricted egress; every B1 deliverable reader uses `Locked`).
+Per [[review-agent-roles]]: Codex carried the hot-reload + allowlist correctness; Claude carried the
+type-design + the containment test gap. The containerized dogfood `spec-review` ran as a third pass.
 
 ## Firewall
 Designed from the bridge's own ports (`AgentEntry`/`AgentKind`, the two `SpawnFn` closures,
