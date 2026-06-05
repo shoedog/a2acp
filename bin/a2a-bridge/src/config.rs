@@ -175,6 +175,9 @@ pub struct AgentEntryToml {
     /// When absent falls back to `cwd` then `"."` at mint time.
     #[serde(default)]
     pub session_cwd: Option<String>,
+    /// The enforced `[sandbox]` block (B1). Converted to `SandboxConfig` + S0/S2-checked in `into_snapshot`.
+    #[serde(default)]
+    pub sandbox: Option<SandboxToml>,
     #[serde(default)]
     pub auth_method: Option<String>,
     #[serde(default)]
@@ -187,6 +190,62 @@ pub struct AgentEntryToml {
     pub version: Option<String>,
     #[serde(default)]
     pub extensions: BTreeMap<String, toml::Value>,
+}
+
+/// `[agents.sandbox]` TOML mirror. Flat for ergonomics; converted to the typed (data-carrying)
+/// `EgressPolicy` in `into_snapshot` (which rejects `locked` without `network`+`proxy`).
+#[derive(Debug, serde::Deserialize)]
+pub struct SandboxToml {
+    #[serde(default)]
+    pub runtime: Option<String>,
+    pub image: String,
+    pub mount: String,
+    pub access: String, // "ro" | "rw"
+    pub egress: String, // "locked" | "open"
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+    #[serde(default)]
+    pub volumes: Vec<String>,
+}
+
+fn parse_access(s: &str) -> Result<bridge_core::domain::MountAccess, ConfigError> {
+    use bridge_core::domain::MountAccess;
+    match s.to_ascii_lowercase().as_str() {
+        "ro" => Ok(MountAccess::Ro),
+        "rw" => Ok(MountAccess::Rw),
+        other => Err(ConfigError::Registry(format!(
+            "invalid sandbox access: {other:?} (expected ro|rw)"
+        ))),
+    }
+}
+
+/// Convert the flat TOML egress into the data-carrying domain enum. `locked` REQUIRES network+proxy —
+/// so `compose_sandbox` is total and the old runtime "Locked ⇒ network+proxy" invariant is structural.
+fn parse_egress(t: &SandboxToml) -> Result<bridge_core::domain::EgressPolicy, ConfigError> {
+    use bridge_core::domain::EgressPolicy;
+    match t.egress.to_ascii_lowercase().as_str() {
+        "open" => Ok(EgressPolicy::Open),
+        "locked" => {
+            let network = t.network.clone().ok_or_else(|| {
+                ConfigError::Registry("sandbox egress=locked requires network".into())
+            })?;
+            let proxy = t.proxy.clone().ok_or_else(|| {
+                ConfigError::Registry("sandbox egress=locked requires proxy".into())
+            })?;
+            Ok(EgressPolicy::Locked {
+                network,
+                proxy,
+                no_proxy: t.no_proxy.clone(),
+            })
+        }
+        other => Err(ConfigError::Registry(format!(
+            "invalid sandbox egress: {other:?} (expected locked|open)"
+        ))),
+    }
 }
 
 impl RegistryConfig {
@@ -269,12 +328,23 @@ impl RegistryConfig {
 
     /// Convert this parsed config into a `RegistrySnapshot` with typed domain values.
     pub fn into_snapshot(self) -> Result<RegistrySnapshot, ConfigError> {
-        // `allowed_cmds`: use the explicit list if provided; otherwise default to the
-        // union of all entry cmds (so every entry is trivially allowed).
+        // The global cwd-gate root; captured before `self.agents` is moved by the loop below.
+        let allowed_cwd_root = self.allowed_cwd_root.clone();
+        // `allowed_cmds`: use the explicit list if provided; otherwise default to the union of all
+        // entry cmds. S0 (dual-review): for a SANDBOXED entry the spawned program is the RUNTIME
+        // (`sb.runtime()`), not `cmd` (the inner cli) — so default on the runtime, else the entry would
+        // self-reject at the snapshot-layer S3 allowlist.
         let allowed_cmds = match self.registry {
             Some(r) if !r.allowed_cmds.is_empty() => r.allowed_cmds,
             _ => {
-                let mut v: Vec<String> = self.agents.iter().filter_map(|a| a.cmd.clone()).collect();
+                let mut v: Vec<String> = self
+                    .agents
+                    .iter()
+                    .filter_map(|a| match &a.sandbox {
+                        Some(sb) => Some(sb.runtime.clone().unwrap_or_else(|| "docker".into())),
+                        None => a.cmd.clone(),
+                    })
+                    .collect();
                 v.sort();
                 v.dedup();
                 v
@@ -312,6 +382,41 @@ impl RegistryConfig {
                 }
                 _ => {}
             }
+            // Build the typed sandbox + S2 (mount == allowed_cwd_root). Stored NORMALIZED so the
+            // snapshot-layer volume check (S6) compares like-for-like.
+            // BOOT-FIXED (Codex): the live cwd gate reads `allowed_cwd_root` copied into InboundServer
+            // ONCE at boot (main.rs ~1024); hot-reload re-applies only the RegistrySnapshot, not the
+            // server root — so a sandbox mount/root change needs a RESTART. This S2 re-fires only where
+            // `into_snapshot` runs (today the sole ConfigSource); a future 2nd source must re-thread it.
+            let sandbox = match &a.sandbox {
+                None => None,
+                Some(sb) => {
+                    let root = allowed_cwd_root.as_deref().ok_or_else(|| {
+                        ConfigError::Registry(format!(
+                            "sandboxed agent {:?} requires allowed_cwd_root",
+                            id.as_str()
+                        ))
+                    })?;
+                    let mount_n = bridge_core::SessionCwd::parse(&sb.mount)
+                        .map_err(|e| ConfigError::Registry(format!("sandbox mount: {e:?}")))?;
+                    let root_n = bridge_core::SessionCwd::parse(root)
+                        .map_err(|e| ConfigError::Registry(format!("allowed_cwd_root: {e:?}")))?;
+                    if mount_n.as_str() != root_n.as_str() {
+                        return Err(ConfigError::Registry(format!(
+                            "sandbox mount {:?} must equal allowed_cwd_root {:?}",
+                            sb.mount, root
+                        )));
+                    }
+                    Some(bridge_core::domain::SandboxConfig {
+                        runtime: sb.runtime.clone(),
+                        image: sb.image.clone(),
+                        mount: mount_n.as_str().to_string(), // NORMALIZED
+                        access: parse_access(&sb.access)?,
+                        egress: parse_egress(sb)?,
+                        volumes: sb.volumes.clone(),
+                    })
+                }
+            };
             entries.push(AgentEntry {
                 id,
                 cmd: a.cmd,
@@ -325,7 +430,7 @@ impl RegistryConfig {
                 mode: a.mode,
                 cwd: a.cwd,
                 session_cwd: a.session_cwd,
-                sandbox: None,
+                sandbox,
                 auth_method: a.auth_method,
                 name: a.name,
                 description: a.description,
@@ -817,6 +922,44 @@ addr="127.0.0.1:8080"
             bridge_core::domain::AgentKind::Api
         );
         assert!(parse_kind("bogus").is_err());
+    }
+
+    // --- B1 [sandbox] parse layer (S0 / S2 / EgressPolicy conversion) ----------
+
+    const SB_OK: &str = "default=\"a\"\nallowed_cwd_root=\"/work\"\n[[agents]]\nid=\"a\"\ncmd=\"claude-agent-acp\"\n[agents.sandbox]\nimage=\"img\"\nmount=\"/work\"\naccess=\"ro\"\negress=\"open\"\n[server]\n";
+
+    #[test]
+    fn sandbox_mount_must_equal_allowed_cwd_root() {
+        assert!(RegistryConfig::parse(SB_OK).unwrap().into_snapshot().is_ok());
+        let bad = SB_OK.replace("mount=\"/work\"", "mount=\"/work/sub\"");
+        assert!(
+            RegistryConfig::parse(&bad).unwrap().into_snapshot().is_err(),
+            "mount != allowed_cwd_root must reject"
+        );
+    }
+
+    #[test]
+    fn sandbox_default_allowed_cmds_uses_runtime_not_cli() {
+        // No [registry] → allowed_cmds defaults; a sandboxed agent must NOT self-reject (default docker).
+        let snap = RegistryConfig::parse(SB_OK).unwrap().into_snapshot().unwrap();
+        assert!(snap.allowed_cmds.contains(&"docker".to_string()));
+        assert!(!snap.allowed_cmds.contains(&"claude-agent-acp".to_string()));
+    }
+
+    #[test]
+    fn sandbox_egress_locked_requires_network_and_proxy() {
+        let bad = SB_OK.replace("egress=\"open\"", "egress=\"locked\"");
+        assert!(
+            RegistryConfig::parse(&bad).unwrap().into_snapshot().is_err(),
+            "locked without network/proxy must reject at the EgressPolicy conversion"
+        );
+    }
+
+    #[test]
+    fn sandbox_requires_allowed_cwd_root() {
+        // S2: a sandboxed entry with NO allowed_cwd_root must fail into_snapshot.
+        let bad = SB_OK.replace("allowed_cwd_root=\"/work\"\n", "");
+        assert!(RegistryConfig::parse(&bad).unwrap().into_snapshot().is_err());
     }
 
     #[test]
