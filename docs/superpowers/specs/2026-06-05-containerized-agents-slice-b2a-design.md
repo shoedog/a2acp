@@ -1,9 +1,9 @@
 # Containerized Agents — Slice B2a Design: the per-turn `:rw` ContainerRwBackend
 
 **Date:** 2026-06-05
-**Status:** Draft (rev2, post dual-review). Reworked from warm-per-session → **per-turn** after the
-containerized-dogfood + a2a-local-codex spec reviews showed warm-per-session is materially more concurrency
-surface than B2a needs (and that reaping on `forget_session` is broken). Warm is split into its own slice:
+**Status:** Draft (rev3, post per-turn re-review). Reworked from warm-per-session → **per-turn** after the
+first dual review; rev3 folds the per-turn re-review's 4 blockers (cancel handle, inner-session
+propagation, stable-identity sweep, non-blocking Drop reap) + majors. Warm is split into its own slice:
 `2026-06-05-containerized-agents-warm-pool-slice.md`.
 **Builds on:** B1 (the enforced `[sandbox]` block, merged 567d354). First sub-slice of Slice B2 (B2b = the
 `implement` workflow + per-task git clone + verify + human-approval gate, follows).
@@ -27,7 +27,9 @@ stays for `Acp`; `ContainerRw` is the new kind that *permits* `rw`.
    carries work continuity, so warmth would only add conversational memory in interactive `serve`.
    Consequence: per-turn **eliminates** the review's biggest blockers — the `forget_session` lifecycle
    contradiction, the no-session-end-event problem, the mid-session-cwd-stale hazard, and the warm mint-
-   race all dissolve because each prompt mints its own container and the stream reaps it.
+   race all dissolve because each prompt mints its own container and the stream reaps it. **Document the
+   user-visible asymmetry** in the agent-kind reference: per-turn `serve` loses conversational memory across
+   turns (a fresh `session/new` each turn), unlike the warm `:ro` reader. [re-review MINOR 11]
 2. **Strict-reject when no session cwd** → a `ContainerRw` `prompt` with no stashed cwd errors
    `ConfigInvalid` (a writer must name its `:rw` target; no `fallback_cwd`). **Review caveat (codex):**
    `run-workflow` calls `executor.run(...)` with **default context** (`cwd = None`, `main.rs` run-workflow
@@ -78,11 +80,12 @@ pub fn reap_argv(runtime: &str, name: &str) -> (String, Vec<String>) {   // dock
     (runtime.into(), vec!["rm".into(), "-f".into(), name.into()])
 }
 
-/// CANONICALIZING containment guard for a WRITABLE mount: SessionCwd::is_under is lexical and
-/// does NOT resolve symlinks (session_cwd.rs:48), so a symlink under the anchor could write
-/// outside it. check_rw_target canonicalizes an existing rw_target before is_under; for a
-/// not-yet-existing scratch dir, canonicalize the nearest existing ancestor + the lexical tail.
-/// [BLOCKER fix — both reviews]
+/// CANONICALIZING containment guard for a WRITABLE mount. The AUTHORITATIVE root is the
+/// canonicalized `sb.mount` (== normalized allowed_cwd_root, config.rs:385). SessionCwd::is_under
+/// is lexical and does NOT resolve symlinks (session_cwd.rs:48), so canonicalize BOTH sides before
+/// is_under: an existing rw_target fully; a not-yet-existing scratch dir via its nearest existing
+/// ancestor + the lexical tail; and sb.mount itself (a symlinked anchor must not spuriously reject
+/// nor mask an escape). [BLOCKER — both reviews + re-review MAJOR 5]
 pub fn check_rw_target(sb: &SandboxConfig, rw: &SessionCwd) -> Result<(), BridgeError>;
 ```
 
@@ -107,10 +110,14 @@ pub struct ContainerRwConfig {
 pub struct ContainerRwBackend {
     cfg: ContainerRwConfig,
     session_cfg: Mutex<HashMap<SessionId, SessionSpec>>,   // stash only
+    inflight: Mutex<HashMap<SessionId, InflightTurn>>,     // live inner+name per session, for cancel routing
     spawn: Arc<dyn ContainerSpawn>,
-    owner: String,              // per-process owner token for the boot-sweep label/name prefix
+    owner: String,              // STABLE instance id (hash of config-path + allowed_cwd_root) — survives restart
     turn_seq: AtomicU64,        // per-TURN unique names
 }
+
+/// Recorded in `prompt`, cleared on the turn's terminal. Lets `cancel` reach the inner.
+struct InflightTurn { inner: Arc<dyn AgentBackend>, name: String }
 
 /// Owned by the returned stream; reaps on Done | Err | drop | cancel. Idempotent.
 struct ContainerReaper { runtime: String, name: String, reaped: AtomicBool }
@@ -125,24 +132,40 @@ struct ContainerReaper { runtime: String, name: String, reaped: AtomicBool }
   5. `inner = self.spawn.spawn(&prog, &argv, AcpConfig { cwd, .. }).await` — **on Err, reap `name`** before
      returning (the `docker run` client may already be up before the handshake fails → don't orphan).
      [codex BLOCKER 1]
-  6. `let stream = inner.prompt(session, parts).await?;` wrap the stream so its state **owns**
-     `(inner, ContainerReaper{runtime, name})`; forward inner updates; on terminal/drop → reaper reaps.
+  6. **Propagate per-request overrides:** `inner.configure_session(session, &spec).await` so the inner
+     `AcpBackend` applies the stashed `SessionSpec.config` (model/mode/effort) on `ensure_session`
+     (acp_backend.rs:1422–1443) — else per-request overrides are silently dropped. [re-review BLOCKER 1]
+  7. Record `inflight[session] = InflightTurn { inner: inner.clone(), name }`; reject a **second concurrent
+     prompt on a live `session`** with `ConfigInvalid` (executor/serve drive one turn per session at a time).
+  8. `let stream = inner.prompt(session, parts).await?;` wrap the stream so its state **owns**
+     `(inner, ContainerReaper{runtime, name})`; forward inner updates; on terminal/drop → **clear
+     `inflight[session]`**, then reaper reaps.
 - **`forget_session`** — **stash-only** (drop `session_cfg[session]`); does NOT reap. Uniform with the
   ACP/API backends. [BLOCKER/hygiene — both reviews]
-- **`cancel(session)`** — best-effort cancel on the in-flight inner; the stream drop reaps.
-- **`retire()`** — no warm state to drop (per-turn); the boot-sweep handles crash orphans.
+- **`cancel(session)`** — look up `inflight[session]` → `inner.cancel(session).await` (the inner owns
+  `session/cancel` + kill-on-grace, acp_backend.rs:1383–1418) → reap its container. A2A cancel is a **direct
+  `backend.cancel`** independent of stream drop (server.rs:2627/2675), so this handle is mandatory — without
+  it cancel is a no-op and the writable container runs to natural completion. [re-review BLOCKER 2]
+- **`retire()`** — drain `inflight`, cancel + reap each; the boot-sweep covers crash orphans.
 
-### Reaping (explicit async + Drop fallback + owner-scoped sweep)
+### Reaping (detached async + non-blocking Drop + stable-identity sweep)
 
 `Supervised` is `process_group(0)`+`kill_on_drop(true)` (`process.rs:24`), so dropping the inner SIGKILLs
 the `docker run` **client**, not the `--rm` container the daemon owns → an explicit `docker rm -f <name>`
-is genuinely required. Define an **awaited** reap (spawned task, with a timeout + best-effort logging) as
-the primary path, and a synchronous best-effort `Command` in `Drop` only as a backstop (since `Drop` can't
-await). [codex SF4 / dogfood B5] Idempotent via `AtomicBool`.
-**Boot-time orphan sweep:** `docker ps -aq --filter name=a2a-rw-<owner>-` (or a `label`), scoped by the
-**per-process owner token** so one bridge startup can NOT reap another live bridge's containers. [both
-reviews] Owner/trigger: run at `ContainerRwBackend` construction in BOTH `SpawnFn` closures; tolerate
-Docker/Podman being unavailable (log, don't fail boot).
+is genuinely required. **Observable contract:** the reap is `reap_argv` → `docker rm -f <name>`, idempotent
+via `AtomicBool`, with a timeout, stderr/status logged under `agent_stderr`; stream completion does NOT
+block on the reap. **Never block a Tokio worker from `Drop`** — the early-drop path (consumer-disconnect /
+cancel-drop) must NOT run a synchronous `docker rm -f` (a disconnect burst would starve workers). Detach it:
+`tokio::spawn` via `Handle::try_current()` when on a runtime, else an off-runtime reaper thread; the
+`AtomicBool` makes the detached-vs-awaited race harmless. [re-review BLOCKER 4]
+**Boot-time orphan sweep:** scoped by a **STABLE instance identity** (`owner` = hash of config-path +
+`allowed_cwd_root`), NOT a per-process token — so a *restarted* process reaps its *own* prior crash orphans
+(a per-process token never matches a dead process's containers → leak). Because a stable owner removes the
+random-token collision-immunity and `turn_seq` resets to 0 on restart, the first post-crash mint
+`a2a-rw-<owner>-0` would collide with a surviving orphan on `docker run --name`; therefore the sweep is a
+**blocking-at-construction invariant** — it MUST complete before the first mint. Run at `ContainerRwBackend`
+construction in BOTH `SpawnFn` closures; tolerate Docker/Podman being unavailable (log, don't fail boot).
+[re-review BLOCKER 3]
 
 ### Validation arm (complete matrix — review M9)
 
@@ -151,6 +174,24 @@ Docker/Podman being unavailable (log, don't fail boot).
 `allowed_cmds`, the resolved runtime not the inner cli), S5 (mount absolute), S6 (no nested volume) still
 apply. `Acp` keeps its S4 `access=rw` reject; `Api` keeps its sandbox reject. Reuse predicate keys
 (`sandbox` + `session_cwd` + `api_key_env`) are unchanged and confirmed real (`registry.rs:321`).
+
+**Parse layer (`config.rs`):** `parse_kind` adds `"container_rw"` (error text `expected acp|api` →
+`expected acp|api|container_rw`). TOML shape mirrors a sandboxed `acp` agent:
+```toml
+[[agents]]
+id   = "impl"
+kind = "container_rw"
+cmd  = "claude-agent-acp"          # the inner ACP CLI; args optional
+  [agents.sandbox]                 # required for container_rw
+  image  = "a2a-agent-reader:latest"
+  mount  = "/Users/wesleyjinks/code"   # == allowed_cwd_root (S2)
+  access = "rw"                    # permitted for container_rw (rejected for acp by S4)
+  egress = "locked"
+```
+**Stable error fragments** (so tests don't hard-code ad-hoc strings, mirroring registry.rs:933–956):
+`missing session cwd` (strict-reject), `:rw target escapes mount root` (check_rw_target),
+`container_rw requires cmd`, `container_rw forbids base_url`, `container_rw requires sandbox`,
+`container spawn failed` / `container reap failed`.
 
 ### Image
 B2a reuses the existing `a2a-agent-reader` image — writing a file needs no toolchain (B2b's concern).
@@ -166,12 +207,16 @@ B2a reuses the existing `a2a-agent-reader` image — writing a file needs no too
   failure reaps** the container (no orphan); off-runtime `Drop` doesn't panic; `forget_session` is stash-
   only (does NOT reap).
 - **Unit — `bridge-registry::validate`:** the full `ContainerRw` matrix above.
-- **Acceptance gate (Docker, live) — via serve + A2A:** a `ContainerRw` agent (reader image); `SendMessage`
-  with `message.metadata` cwd = `/Users/wesleyjinks/code/.b2a-scratch` (under `allowed_cwd_root`),
-  prompting "write `/…/.b2a-scratch/B2A_OK.txt` and STOP" → the file **persists on the host**; assert the
-  named container existed **during** the turn (positive containment, `docker events`/`ps`) and is **gone
-  after** the stream ends (`docker ps -a` shows no `a2a-rw-<owner>-*` — proves per-turn reap). A second
-  turn mints a **distinct** container (per-turn identity). [hardened gate — review B12]
+- **Acceptance gate (Docker, live) — via serve + A2A:** a `ContainerRw` agent **`cmd="claude-agent-acp"`**
+  (reader image; the proven baseline + synced claude creds), `access=rw`. **Pre-create** the scratch dir
+  `/Users/wesleyjinks/code/.b2a-scratch` with the host user's ownership BEFORE the run (a bind-mount of a
+  non-existent source is created root-owned by Docker and `compose_sandbox` emits no `--user`, so the
+  "persists on host" assertion would otherwise fail on ownership, not logic). `SendMessage` with
+  `message.metadata` cwd = the scratch dir, prompting "write `/…/.b2a-scratch/B2A_OK.txt` and STOP" → the
+  file **persists on the host**; assert the named container existed **during** the turn (positive
+  containment, `docker events`/`ps`) and is **gone after** the stream ends (`docker ps -a` shows no
+  `a2a-rw-<owner>-*` — proves per-turn reap). A second turn mints a **distinct** container (per-turn
+  identity). Also assert A2A **cancel** mid-turn terminates the inner + reaps. [review B12 + re-review M7/M9]
 - Coverage after `cargo llvm-cov clean --workspace` (floors: workspace 85, bridge-core 90) — preserved as
   CI gates for this slice.
 
