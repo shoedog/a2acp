@@ -77,6 +77,16 @@ base_url    = "http://localhost:11434/v1"
 api_key_env = "OLLAMA_API_KEY"
 model       = "qwen2.5-coder:7b"
 
+# ── ollama-cloud: same api backend, ollama's hosted models. base_url is host-direct egress
+#    (ollama.com), bypassing the container egress proxy — fine: this is the BRIDGE calling out
+#    (non-process), not a contained agent. ──
+[[agents]]
+id          = "ollama-cloud"
+kind        = "api"
+base_url    = "https://ollama.com/v1"
+api_key_env = "OLLAMA_API_KEY"
+model       = "qwen3-coder:480b"
+
 # ── Review/design workflows (single-pass here; Phase D restructures design/spec/plan into two-pass) ──
 [[workflows]]
 id = "code-review"
@@ -180,5 +190,13 @@ id = "smoke-ollama"
 [[workflows.nodes]]
 id = "go"
 agent = "ollama"
+prompt_file = "../prompts/smoke-reply.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-ollama-cloud"
+[[workflows.nodes]]
+id = "go"
+agent = "ollama-cloud"
 prompt_file = "../prompts/smoke-reply.md"
 inputs = []
