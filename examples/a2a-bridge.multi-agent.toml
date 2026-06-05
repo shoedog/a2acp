@@ -83,15 +83,25 @@ inputs = ["correctness", "architecture"]
 [[workflows]]
 id = "spec-review"
 [[workflows.nodes]]
-id = "rigor"
+id = "rigordraft"
 agent = "codex"
 prompt_file = "../prompts/spec-review-rigor.md"
 inputs = []
 [[workflows.nodes]]
-id = "soundness"
+id = "soundnessdraft"
 agent = "claude"
 prompt_file = "../prompts/spec-review-soundness.md"
 inputs = []
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor-refine.md"
+inputs = ["rigordraft"]
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness-refine.md"
+inputs = ["soundnessdraft"]
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
@@ -101,15 +111,25 @@ inputs = ["rigor", "soundness"]
 [[workflows]]
 id = "plan-review"
 [[workflows.nodes]]
-id = "exec"
+id = "execdraft"
 agent = "codex"
 prompt_file = "../prompts/plan-review-exec.md"
 inputs = []
 [[workflows.nodes]]
-id = "coverage"
+id = "coveragedraft"
 agent = "claude"
 prompt_file = "../prompts/plan-review-coverage.md"
 inputs = []
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec-refine.md"
+inputs = ["execdraft"]
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage-refine.md"
+inputs = ["coveragedraft"]
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
@@ -121,16 +141,29 @@ inputs = ["exec", "coverage"]
 # Feed a PROBLEM STATEMENT as the input; the architects read the repo (read-only).
 [[workflows]]
 id = "design"
+# draft = clean-room (inputs=[], reuse the existing lens prompts)
 [[workflows.nodes]]
-id = "executability"
+id = "executabilitydraft"
 agent = "codex"
 prompt_file = "../prompts/design-executability.md"
 inputs = []
 [[workflows.nodes]]
-id = "structure"
+id = "structuredraft"
 agent = "claude"
 prompt_file = "../prompts/design-structure.md"
 inputs = []
+# refine = grounded second pass on OWN draft (firewall preserved: each sees only its own draft)
+[[workflows.nodes]]
+id = "executability"
+agent = "codex"
+prompt_file = "../prompts/design-executability-refine.md"
+inputs = ["executabilitydraft"]
+[[workflows.nodes]]
+id = "structure"
+agent = "claude"
+prompt_file = "../prompts/design-structure-refine.md"
+inputs = ["structuredraft"]
+# synth UNCHANGED (consumes the refined lenses)
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
