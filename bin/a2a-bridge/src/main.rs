@@ -1760,4 +1760,32 @@ mod cli_tests {
         // task present but no --repo
         assert!(super::parse_implement_args(&["task".into()]).is_err());
     }
+
+    // R11: the example containerized config (the `impl` ContainerRw agent + the implement-edit workflow)
+    // parses, the workflow loads, into_snapshot succeeds, and Registry::new validates it — Docker-free.
+    #[test]
+    fn containerized_config_validates_with_implement_edit() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let raw =
+            std::fs::read_to_string(root.join("examples/a2a-bridge.containerized.toml")).unwrap();
+        let cfg = config::RegistryConfig::parse(&raw).unwrap();
+        let wf = cfg.load_workflows(&root.join("examples")).unwrap();
+        assert!(
+            wf.contains_key(&bridge_core::ids::WorkflowId::parse("implement-edit").unwrap()),
+            "implement-edit workflow loads"
+        );
+        let snap = cfg.into_snapshot().unwrap();
+        // Registry::new validates the snapshot WITHOUT spawning (lazy), so the real make_spawn_fn is never
+        // called here — reuse it to avoid hand-rolling a typed no-op SpawnFn.
+        let policy: std::sync::Arc<dyn bridge_core::ports::PolicyEngine> =
+            std::sync::Arc::new(AutoPolicy);
+        let spawn =
+            super::make_spawn_fn(policy, root.join("examples/a2a-bridge.containerized.toml"));
+        bridge_registry::registry::Registry::new(snap, spawn)
+            .expect("containerized config (incl. the impl container_rw agent) validates");
+    }
 }

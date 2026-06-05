@@ -128,6 +128,16 @@ prompt_file = "../prompts/impl-smoke.md"
 inputs = []
 
 [[workflows]]
+# B2b-1: the write-capable edit node driven by `a2a-bridge implement`. The agent edits + stages + writes
+# .git/A2A_COMMIT_MSG; the bridge host-commits the staged index.
+id = "implement-edit"
+[[workflows.nodes]]
+id = "edit"
+agent = "impl"
+prompt_file = "../prompts/implement-edit.md"
+inputs = []
+
+[[workflows]]
 id = "spec-review"
 [[workflows.nodes]]
 id = "rigordraft"
