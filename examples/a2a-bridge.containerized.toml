@@ -1,0 +1,232 @@
+# Containerized :ro readers (claude + codex + kiro) behind the egress lock, + the non-process ollama.
+# Run:  a2a-bridge serve --config examples/a2a-bridge.containerized.toml   (from the repo root)
+# Prereqs (see docs/containerized-agents.md):
+#   - docker compose -f deploy/containers/compose.egress.yaml up -d --build
+#   - the reader image built (deploy/containers/reader.Containerfile)
+#   - per-agent creds: WRITABLE single-file copies in ~/.config/a2a-creds/{claude,codex}, and a
+#     one-time `kiro-cli login --use-device-flow` into the `a2a-kiro-data` volume.
+#
+# MUST-FIX (dual-review): allowed_cwd_root is OPT-IN and MUST equal the mount root, or readers ship
+# with NO cwd gate. Identical-path :ro mount makes the session/new cwd resolve inside the container.
+
+default = "claude"
+
+allowed_cwd_root = "/Users/wesleyjinks/code"
+
+[registry]
+# The spawned program is `docker`; validate() requires it allowlisted (also defaults to the union of
+# entry cmds, but state it explicitly as a tightening).
+allowed_cmds = ["docker"]
+
+[server]
+addr = "127.0.0.1:8080"
+
+# ── claude: the proven containerized agent (ADR-0013). Default + first to validate. ──
+[[agents]]
+id   = "claude"
+cmd  = "docker"
+args = [
+  "run", "-i", "--rm",
+  "--network", "a2a-egress-internal",
+  "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
+  "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
+  "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
+  "-v", "/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json",
+  "a2a-agent-reader:latest",
+  "claude-agent-acp",
+]
+
+# ── codex: gpt-5.5 (auth + openai egress validated in-container). ──
+[[agents]]
+id   = "codex"
+cmd  = "docker"
+args = [
+  "run", "-i", "--rm",
+  "--network", "a2a-egress-internal",
+  "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
+  "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
+  "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
+  "-v", "/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json",
+  "a2a-agent-reader:latest",
+  "codex-acp",
+]
+
+# ── kiro: Linux build baked into the image. VERIFIED: Linux auth is ~/.local/share/kiro-cli/data.sqlite3
+#    (NOT ~/.aws); minted once via `kiro-cli login --use-device-flow` into the a2a-kiro-data volume. ──
+[[agents]]
+id   = "kiro"
+cmd  = "docker"
+args = [
+  "run", "-i", "--rm",
+  "--network", "a2a-egress-internal",
+  "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
+  "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
+  "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
+  "-v", "a2a-kiro-data:/root/.local/share",
+  "a2a-agent-reader:latest",
+  "kiro-cli", "acp",
+]
+
+# ── ollama: non-process api agent (kind="api"). Uncontainerized by design — no mount/proxy/creds.
+#    NOT tool-free — it advertises a deterministic side-effect-free stub tool (no fs/shell).
+#    Local => no remote egress (a cloud base_url would egress host-direct, bypassing the proxy). ──
+[[agents]]
+id          = "ollama"
+kind        = "api"
+base_url    = "http://localhost:11434/v1"
+api_key_env = "OLLAMA_API_KEY"
+model       = "qwen2.5-coder:7b"
+
+# ── ollama-cloud: same api backend, ollama's hosted models. base_url is host-direct egress
+#    (ollama.com), bypassing the container egress proxy — fine: this is the BRIDGE calling out
+#    (non-process), not a contained agent. ──
+[[agents]]
+id          = "ollama-cloud"
+kind        = "api"
+base_url    = "https://ollama.com/v1"
+api_key_env = "OLLAMA_API_KEY"
+model       = "qwen3-coder:480b"
+
+# ── Review/design workflows (single-pass here; Phase D restructures design/spec/plan into two-pass) ──
+[[workflows]]
+id = "code-review"
+[[workflows.nodes]]
+id = "correctness"
+agent = "codex"
+prompt_file = "../prompts/review-correctness.md"
+inputs = []
+[[workflows.nodes]]
+id = "architecture"
+agent = "claude"
+prompt_file = "../prompts/review-architecture.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-synth.md"
+inputs = ["correctness", "architecture"]
+
+[[workflows]]
+id = "spec-review"
+[[workflows.nodes]]
+id = "rigordraft"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor.md"
+inputs = []
+[[workflows.nodes]]
+id = "soundnessdraft"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness.md"
+inputs = []
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor-refine.md"
+inputs = ["rigordraft"]
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness-refine.md"
+inputs = ["soundnessdraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/spec-review-synth.md"
+inputs = ["rigor", "soundness"]
+
+[[workflows]]
+id = "plan-review"
+[[workflows.nodes]]
+id = "execdraft"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec.md"
+inputs = []
+[[workflows.nodes]]
+id = "coveragedraft"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage.md"
+inputs = []
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec-refine.md"
+inputs = ["execdraft"]
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage-refine.md"
+inputs = ["coveragedraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/plan-review-synth.md"
+inputs = ["exec", "coverage"]
+
+[[workflows]]
+id = "design"
+[[workflows.nodes]]
+id = "executabilitydraft"
+agent = "codex"
+prompt_file = "../prompts/design-executability.md"
+inputs = []
+[[workflows.nodes]]
+id = "structuredraft"
+agent = "claude"
+prompt_file = "../prompts/design-structure.md"
+inputs = []
+[[workflows.nodes]]
+id = "executability"
+agent = "codex"
+prompt_file = "../prompts/design-executability-refine.md"
+inputs = ["executabilitydraft"]
+[[workflows.nodes]]
+id = "structure"
+agent = "claude"
+prompt_file = "../prompts/design-structure-refine.md"
+inputs = ["structuredraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/design-synth.md"
+inputs = ["executability", "structure"]
+
+# ── Single-agent auth smokes (one node, one agent) — the per-agent validation gates (Task 8) ──
+[[workflows]]
+id = "smoke-claude"
+[[workflows.nodes]]
+id = "go"
+agent = "claude"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-codex"
+[[workflows.nodes]]
+id = "go"
+agent = "codex"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-kiro"
+[[workflows.nodes]]
+id = "go"
+agent = "kiro"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-ollama"
+[[workflows.nodes]]
+id = "go"
+agent = "ollama"
+prompt_file = "../prompts/smoke-reply.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-ollama-cloud"
+[[workflows.nodes]]
+id = "go"
+agent = "ollama-cloud"
+prompt_file = "../prompts/smoke-reply.md"
+inputs = []

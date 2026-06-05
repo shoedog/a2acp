@@ -1,0 +1,10 @@
+# One POSIX-ERE per line, matched against the CONNECT host. Anchored so
+# `evil-anthropic.com.attacker.net` does NOT match. `*.anthropic.com` would be an INVALID regex.
+(^|\.)anthropic\.com$
+(^|\.)openai\.com$
+(^|\.)chatgpt\.com$
+# kiro (Amazon Q / Cognito + kiro.dev) — EXACT region-pinned hosts from the proxy log (Task 9), NOT a
+# broad amazonaws.com glob. The q.us-east-1 regex also covers desktop-release.q.us-east-1.amazonaws.com.
+(^|\.)cognito-identity\.us-east-1\.amazonaws\.com$
+(^|\.)q\.us-east-1\.amazonaws\.com$
+(^|\.)kiro\.dev$
