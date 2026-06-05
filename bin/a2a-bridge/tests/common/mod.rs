@@ -33,6 +33,7 @@ pub fn single_agent_registry(id: &str, backend: Arc<dyn AgentBackend>) -> Arc<dy
         mode: None,
         cwd: None,
         session_cwd: None,
+        sandbox: None,
         auth_method: None,
         name: Some(id.to_owned()),
         description: None,

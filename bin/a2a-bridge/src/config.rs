@@ -325,6 +325,7 @@ impl RegistryConfig {
                 mode: a.mode,
                 cwd: a.cwd,
                 session_cwd: a.session_cwd,
+                sandbox: None,
                 auth_method: a.auth_method,
                 name: a.name,
                 description: a.description,
