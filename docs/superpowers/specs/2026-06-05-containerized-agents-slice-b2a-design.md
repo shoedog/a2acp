@@ -236,6 +236,23 @@ only the warm container + ACP conversational memory are lost (re-spawned).
 - **Proxy-is-sole-egress:** reconfirm the write agent's net is `internal: true` (already true for readers)
   so the allowlist is enforced, not advisory.
 
+### Isolation hardening (stronger-than-OCI runtimes — gVisor / Kata / Firecracker)
+Plain OCI containers share the host kernel; their gap is a **kernel-exploit container escape**. Defense-in-
+depth options, ranked by integration cost:
+- **gVisor (`runsc`)** — a user-space kernel; **drop-in as an OCI runtime** (`docker run --runtime=runsc`
+  or the daemon default). Our `SandboxConfig.runtime` seam anticipates it (today it's the CLI binary
+  docker/podman; add a small `oci_runtime: Option<String>` emitting `--runtime=…`, or set the daemon
+  default = **zero bridge code**). **Cost: gofer file I/O is slow** and our `:rw` clone is bind-mount-heavy
+  → **measure on the clone workload before committing.**
+- **Kata / Firecracker** — a per-container **guest kernel** in a microVM (stronger); a real lift (guest
+  rootfs + kernel + virtio-fs for the bind mounts). Reserve for if the threat model expands to genuinely
+  untrusted third-party agents. Raw Firecracker is its own API, not docker-CLI.
+- **Scope/where:** a **Linux-production** concern, NOT B2a and NOT macOS-dev (Docker Desktop already runs
+  containers inside a Linux VM; gVisor/Kata on top = nested virt, finicky). Most justified for the **write**
+  agents (B2b `implement`, which commits) — the kernel-escape vector is already narrowed for readers by the
+  egress lock. **Recommendation:** run the write agents under `--runtime=runsc` on the Linux target behind
+  the egress lock, after measuring the `:rw` I/O hit.
+
 ### Capability mounts (curated `:ro` skills/agents/commands — bring the capability layer in, exclude the dangerous layer)
 The VirtusLab "don't mount `.claude`/`.kiro`/`.codex`" advice conflates three things; the move is to **mount
 the capability layer and exclude the dangerous layer**, at sub-dir granularity — especially valuable for the
