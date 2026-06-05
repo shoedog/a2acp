@@ -127,6 +127,9 @@ fn acp_spawn_fn() -> SpawnFn {
                     Ok(std::sync::Arc::new(bridge_api::ApiBackend::new(cfg))
                         as std::sync::Arc<dyn AgentBackend>)
                 }
+                AgentKind::ContainerRw => {
+                    unreachable!("e2e_registry does not exercise container_rw")
+                }
             }
         })
     })

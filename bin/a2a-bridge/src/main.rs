@@ -221,6 +221,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                     let be = bridge_api::ApiBackend::new(api_cfg).with_policy(policy);
                     Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
                 }
+                AgentKind::ContainerRw => Err(BridgeError::ConfigInvalid {
+                    reason: format!(
+                        "container_rw agent {} not yet wired (Slice B2a Slice 3)",
+                        entry.id.as_str()
+                    ),
+                }),
             }
         })
     });
@@ -904,6 +910,12 @@ async fn main() -> Result<(), BoxError> {
                     let be = bridge_api::ApiBackend::new(cfg).with_policy(policy);
                     Ok(Arc::new(be) as Arc<dyn AgentBackend>)
                 }
+                AgentKind::ContainerRw => Err(BridgeError::ConfigInvalid {
+                    reason: format!(
+                        "container_rw agent {} not yet wired (Slice B2a Slice 3)",
+                        entry.id.as_str()
+                    ),
+                }),
             }
         })
     });

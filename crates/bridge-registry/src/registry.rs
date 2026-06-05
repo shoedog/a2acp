@@ -91,6 +91,42 @@ pub struct Registry {
 /// Shared snapshot validation: rejects duplicate ids, disallowed cmds, and a
 /// default that isn't present in `entries`. Used at boot (`new`) and reconcile
 /// (`apply`, Task 4) so malformed config fails loudly. [spec §7]
+/// S3/S5/S6 sandbox invariants shared by the `Acp` (`:ro`) and `ContainerRw` (`:rw`) arms.
+/// S4 (the `:rw` policy) is per-kind and stays in the arms (Acp rejects; ContainerRw permits).
+fn validate_sandbox(
+    sb: &bridge_core::domain::SandboxConfig,
+    allowed_cmds: &[String],
+) -> Result<(), BridgeError> {
+    // S3: allowlist the RESOLVED RUNTIME (NOT the inner cli, which runs contained).
+    let runtime = sb.runtime();
+    if !allowed_cmds.iter().any(|c| c == runtime) {
+        return Err(BridgeError::ConfigInvalid {
+            reason: format!("sandbox runtime not allowed: {runtime}"),
+        });
+    }
+    // S5: mount must be an absolute/normalized path (reuses SessionCwd).
+    let mount =
+        bridge_core::SessionCwd::parse(&sb.mount).map_err(|_| BridgeError::ConfigInvalid {
+            reason: format!("sandbox mount must be an absolute path: {}", sb.mount),
+        })?;
+    // S6: no volume DEST equal-to / nested-under `mount`. Normalize both via SessionCwd so `/work/.`
+    // etc. can't slip past. Bare / anonymous vol specs (no `:dest`, or non-absolute) aren't S6-checked.
+    for v in &sb.volumes {
+        let dest = v.split(':').nth(1).unwrap_or("");
+        if let Ok(d) = bridge_core::SessionCwd::parse(dest) {
+            if d.as_str() == mount.as_str() || d.is_under(&mount) {
+                return Err(BridgeError::ConfigInvalid {
+                    reason: format!(
+                        "sandbox volume dest {dest:?} is nested under the mount {:?}",
+                        sb.mount
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate(snap: &RegistrySnapshot) -> Result<(), BridgeError> {
     let mut seen = std::collections::HashSet::new();
     for e in &snap.entries {
@@ -109,14 +145,8 @@ pub(crate) fn validate(snap: &RegistrySnapshot) -> Result<(), BridgeError> {
                 match &e.sandbox {
                     // Sandboxed: the bridge spawns the RUNTIME (docker/podman) wrapping the agent cli.
                     Some(sb) => {
-                        // S3: allowlist the RESOLVED RUNTIME (NOT the inner cli, which runs contained).
-                        let runtime = sb.runtime();
-                        if !snap.allowed_cmds.iter().any(|c| c == runtime) {
-                            return Err(BridgeError::ConfigInvalid {
-                                reason: format!("sandbox runtime not allowed: {runtime}"),
-                            });
-                        }
-                        // S4: :rw requires the container_rw kind (Slice B2).
+                        // S4: :rw requires the container_rw kind (Slice B2). Acp-specific — the
+                        // ContainerRw arm INVERTS this (permits rw); S3/S5/S6 are shared below.
                         if sb.access == bridge_core::domain::MountAccess::Rw {
                             return Err(BridgeError::ConfigInvalid {
                                 reason: format!(
@@ -125,31 +155,7 @@ pub(crate) fn validate(snap: &RegistrySnapshot) -> Result<(), BridgeError> {
                                 ),
                             });
                         }
-                        // S5: mount must be an absolute/normalized path (reuses SessionCwd).
-                        let mount = bridge_core::SessionCwd::parse(&sb.mount).map_err(|_| {
-                            BridgeError::ConfigInvalid {
-                                reason: format!(
-                                    "sandbox mount must be an absolute path: {}",
-                                    sb.mount
-                                ),
-                            }
-                        })?;
-                        // S6: no volume DEST equal-to / nested-under `mount` (would re-expose the :ro
-                        // repo rw). Normalize both via SessionCwd so `/work/.` etc. can't slip past. Bare
-                        // / anonymous vol specs (no `:dest`, or a non-absolute dest) aren't S6-checked.
-                        for v in &sb.volumes {
-                            let dest = v.split(':').nth(1).unwrap_or("");
-                            if let Ok(d) = bridge_core::SessionCwd::parse(dest) {
-                                if d.as_str() == mount.as_str() || d.is_under(&mount) {
-                                    return Err(BridgeError::ConfigInvalid {
-                                        reason: format!(
-                                            "sandbox volume dest {dest:?} is nested under the :ro mount {:?}",
-                                            sb.mount
-                                        ),
-                                    });
-                                }
-                            }
-                        }
+                        validate_sandbox(sb, &snap.allowed_cmds)?;
                     }
                     // Raw (Slice A compat): the existing allowlist check on the spawned cmd.
                     None => {
@@ -178,6 +184,26 @@ pub(crate) fn validate(snap: &RegistrySnapshot) -> Result<(), BridgeError> {
                         reason: format!("api agent {} must not set sandbox", e.id.as_str()),
                     });
                 }
+            }
+            AgentKind::ContainerRw => {
+                // Write-capable per-turn container (Slice B2a). Requires cmd + sandbox; forbids
+                // base_url; PERMITS access=rw (S4 inverted). S3/S5/S6 still apply.
+                if e.cmd.is_none() {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: format!("container_rw agent {} requires cmd", e.id.as_str()),
+                    });
+                }
+                if e.base_url.is_some() {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: format!("container_rw agent {} forbids base_url", e.id.as_str()),
+                    });
+                }
+                let Some(sb) = &e.sandbox else {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: format!("container_rw agent {} requires sandbox", e.id.as_str()),
+                    });
+                };
+                validate_sandbox(sb, &snap.allowed_cmds)?;
             }
         }
     }
@@ -568,6 +594,64 @@ mod tests {
         snap.entries = vec![sandboxed_entry("a", MountAccess::Rw, vec![])];
         snap.allowed_cmds = vec!["docker".into()];
         assert!(err_reason(&snap).contains("container_rw")); // red-first: the SPECIFIC S4 reason
+    }
+
+    // --- B2a: ContainerRw validate arm (S4 inverted; S3/S5/S6 shared) ----------
+
+    fn container_rw_entry(id: &str) -> AgentEntry {
+        use bridge_core::domain::{AgentKind, MountAccess};
+        let mut e = sandboxed_entry(id, MountAccess::Rw, vec![]);
+        e.kind = AgentKind::ContainerRw;
+        e
+    }
+
+    #[test]
+    fn container_rw_permits_rw_with_sandbox_and_cmd() {
+        let mut snap = snapshot(&["a"]);
+        snap.entries = vec![container_rw_entry("a")];
+        snap.allowed_cmds = vec!["docker".into()];
+        assert!(
+            validate(&snap).is_ok(),
+            "container_rw + sandbox + cmd + access=rw must validate"
+        );
+    }
+
+    #[test]
+    fn container_rw_requires_sandbox() {
+        let mut snap = snapshot(&["a"]);
+        let mut e = container_rw_entry("a");
+        e.sandbox = None;
+        snap.entries = vec![e];
+        snap.allowed_cmds = vec!["docker".into()];
+        assert!(err_reason(&snap).contains("container_rw agent a requires sandbox"));
+    }
+
+    #[test]
+    fn container_rw_requires_cmd() {
+        let mut snap = snapshot(&["a"]);
+        let mut e = container_rw_entry("a");
+        e.cmd = None;
+        snap.entries = vec![e];
+        snap.allowed_cmds = vec!["docker".into()];
+        assert!(err_reason(&snap).contains("container_rw agent a requires cmd"));
+    }
+
+    #[test]
+    fn container_rw_forbids_base_url() {
+        let mut snap = snapshot(&["a"]);
+        let mut e = container_rw_entry("a");
+        e.base_url = Some("http://x".into());
+        snap.entries = vec![e];
+        snap.allowed_cmds = vec!["docker".into()];
+        assert!(err_reason(&snap).contains("container_rw agent a forbids base_url"));
+    }
+
+    #[test]
+    fn container_rw_still_applies_s3_runtime_allowlist() {
+        let mut snap = snapshot(&["a"]);
+        snap.entries = vec![container_rw_entry("a")];
+        snap.allowed_cmds = vec!["podman".into()]; // runtime is docker → not allowed
+        assert!(err_reason(&snap).contains("runtime not allowed"));
     }
 
     #[test]

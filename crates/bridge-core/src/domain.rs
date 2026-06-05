@@ -33,6 +33,8 @@ pub enum AgentKind {
     Acp,
     /// Non-process OpenAI-compatible HTTP backend (bridge-api).
     Api,
+    /// Write-capable per-turn containerized ACP agent (bridge-container, Slice B2a).
+    ContainerRw,
 }
 
 /// How a containerized agent is launched (the enforced `[sandbox]` block, Slice B1). The bridge

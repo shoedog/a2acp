@@ -473,9 +473,10 @@ fn parse_kind(s: &str) -> Result<AgentKind, ConfigError> {
     Ok(match s {
         "acp" => AgentKind::Acp,
         "api" => AgentKind::Api,
+        "container_rw" => AgentKind::ContainerRw,
         other => {
             return Err(ConfigError::Registry(format!(
-                "invalid kind: {other:?} (expected acp|api)"
+                "invalid kind: {other:?} (expected acp|api|container_rw)"
             )))
         }
     })
@@ -1141,5 +1142,22 @@ path = "/tmp/x.db"
         )
         .unwrap();
         assert_eq!(cfg2.store.as_ref().unwrap().resume_attempt_cap, None);
+    }
+
+    #[test]
+    fn parse_kind_accepts_container_rw() {
+        assert_eq!(
+            super::parse_kind("container_rw").unwrap(),
+            bridge_core::domain::AgentKind::ContainerRw
+        );
+    }
+
+    #[test]
+    fn parse_kind_error_lists_container_rw() {
+        let err = super::parse_kind("nope").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("acp|api|container_rw"),
+            "got: {err:?}"
+        );
     }
 }
