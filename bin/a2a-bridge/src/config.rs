@@ -930,10 +930,16 @@ addr="127.0.0.1:8080"
 
     #[test]
     fn sandbox_mount_must_equal_allowed_cwd_root() {
-        assert!(RegistryConfig::parse(SB_OK).unwrap().into_snapshot().is_ok());
+        assert!(RegistryConfig::parse(SB_OK)
+            .unwrap()
+            .into_snapshot()
+            .is_ok());
         let bad = SB_OK.replace("mount=\"/work\"", "mount=\"/work/sub\"");
         assert!(
-            RegistryConfig::parse(&bad).unwrap().into_snapshot().is_err(),
+            RegistryConfig::parse(&bad)
+                .unwrap()
+                .into_snapshot()
+                .is_err(),
             "mount != allowed_cwd_root must reject"
         );
     }
@@ -941,7 +947,10 @@ addr="127.0.0.1:8080"
     #[test]
     fn sandbox_default_allowed_cmds_uses_runtime_not_cli() {
         // No [registry] → allowed_cmds defaults; a sandboxed agent must NOT self-reject (default docker).
-        let snap = RegistryConfig::parse(SB_OK).unwrap().into_snapshot().unwrap();
+        let snap = RegistryConfig::parse(SB_OK)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
         assert!(snap.allowed_cmds.contains(&"docker".to_string()));
         assert!(!snap.allowed_cmds.contains(&"claude-agent-acp".to_string()));
     }
@@ -950,7 +959,10 @@ addr="127.0.0.1:8080"
     fn sandbox_egress_locked_requires_network_and_proxy() {
         let bad = SB_OK.replace("egress=\"open\"", "egress=\"locked\"");
         assert!(
-            RegistryConfig::parse(&bad).unwrap().into_snapshot().is_err(),
+            RegistryConfig::parse(&bad)
+                .unwrap()
+                .into_snapshot()
+                .is_err(),
             "locked without network/proxy must reject at the EgressPolicy conversion"
         );
     }
@@ -959,7 +971,10 @@ addr="127.0.0.1:8080"
     fn sandbox_requires_allowed_cwd_root() {
         // S2: a sandboxed entry with NO allowed_cwd_root must fail into_snapshot.
         let bad = SB_OK.replace("allowed_cwd_root=\"/work\"\n", "");
-        assert!(RegistryConfig::parse(&bad).unwrap().into_snapshot().is_err());
+        assert!(RegistryConfig::parse(&bad)
+            .unwrap()
+            .into_snapshot()
+            .is_err());
     }
 
     #[test]

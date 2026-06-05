@@ -106,7 +106,9 @@ mod tests {
         let mut sb = ro_locked();
         sb.egress = EgressPolicy::Open;
         let (_p, argv) = compose_sandbox(&sb, "claude-agent-acp", &[]);
-        assert!(!argv.iter().any(|a| a == "--network" || a.starts_with("HTTPS_PROXY")));
+        assert!(!argv
+            .iter()
+            .any(|a| a == "--network" || a.starts_with("HTTPS_PROXY")));
         assert!(argv.contains(&"-v".to_string()));
     }
 

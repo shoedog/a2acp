@@ -128,7 +128,10 @@ pub(crate) fn validate(snap: &RegistrySnapshot) -> Result<(), BridgeError> {
                         // S5: mount must be an absolute/normalized path (reuses SessionCwd).
                         let mount = bridge_core::SessionCwd::parse(&sb.mount).map_err(|_| {
                             BridgeError::ConfigInvalid {
-                                reason: format!("sandbox mount must be an absolute path: {}", sb.mount),
+                                reason: format!(
+                                    "sandbox mount must be an absolute path: {}",
+                                    sb.mount
+                                ),
                             }
                         })?;
                         // S6: no volume DEST equal-to / nested-under `mount` (would re-expose the :ro
@@ -519,7 +522,11 @@ mod tests {
 
     // --- B1 sandbox validate invariants (S1/S3/S4/S5/S6) ----------------------
 
-    fn sandboxed_entry(id: &str, access: bridge_core::domain::MountAccess, volumes: Vec<String>) -> AgentEntry {
+    fn sandboxed_entry(
+        id: &str,
+        access: bridge_core::domain::MountAccess,
+        volumes: Vec<String>,
+    ) -> AgentEntry {
         use bridge_core::domain::{EgressPolicy, SandboxConfig};
         let mut e = entry(id);
         e.cmd = Some("claude-agent-acp".into()); // the inner agent cli (NOT allowlist-checked)
@@ -580,13 +587,25 @@ mod tests {
         let mut snap = snapshot(&["a"]);
         snap.allowed_cmds = vec!["docker".into()];
         // nested under the :ro mount /work → re-exposes the repo rw → REJECT.
-        snap.entries = vec![sandboxed_entry("a", MountAccess::Ro, vec!["/h:/work/secret".into()])];
+        snap.entries = vec![sandboxed_entry(
+            "a",
+            MountAccess::Ro,
+            vec!["/h:/work/secret".into()],
+        )];
         assert!(err_reason(&snap).contains("nested under"));
         // equal to the mount → also REJECT.
-        snap.entries = vec![sandboxed_entry("a", MountAccess::Ro, vec!["/h:/work".into()])];
+        snap.entries = vec![sandboxed_entry(
+            "a",
+            MountAccess::Ro,
+            vec!["/h:/work".into()],
+        )];
         assert!(err_reason(&snap).contains("nested under"));
         // a creds vol OUTSIDE the tree passes.
-        snap.entries = vec![sandboxed_entry("a", MountAccess::Ro, vec!["/h:/root/.codex/auth.json".into()])];
+        snap.entries = vec![sandboxed_entry(
+            "a",
+            MountAccess::Ro,
+            vec!["/h:/root/.codex/auth.json".into()],
+        )];
         assert!(validate(&snap).is_ok());
     }
 
