@@ -145,3 +145,23 @@ backend, not `api.openai.com`); **kiro `cognito-identity.us-east-1.amazonaws.com
 - **macOS Docker Desktop:** add `~/.config` under Settings → Resources → File Sharing if a creds mount
   is rejected; bind-mount I/O is slower than Linux.
 - The egress proxy + the agent image are **operator-maintained infra** (not bridge code).
+
+## 8. Write-capable agents (`container_rw`, Slice B2a)
+
+`kind="container_rw"` unlocks a **write-capable** agent: the bridge spawns a **fresh `:rw` container per
+turn** (composing the same ACP machinery as the `:ro` readers) and reliably reaps it (an explicit
+`docker rm -f` on every terminal path, since killing the `docker run` client doesn't remove the `--rm`
+container). Config mirrors a sandboxed `:ro` agent but with `kind="container_rw"` + `access="rw"`;
+validation requires `cmd` + `[sandbox]` and PERMITS `access=rw` (the `acp` kind still rejects it). The
+`:rw` mount is the **per-request session cwd** (a scratch dir; in B2b a per-task git clone), gated
+`is_under` the **canonicalized** mount root — symlinks are resolved, so a `:rw` target can't escape the
+root via a symlink.
+
+> **Per-turn memory asymmetry.** Unlike the warm `:ro` reader (one long-lived container, conversational
+> memory across turns), a `container_rw` agent mints a fresh container + ACP session **each turn**, so it
+> does NOT retain conversational memory across turns in interactive `serve`. Work continuity comes from the
+> shared `:rw` target (the clone/scratch on the host), not the container. (A warm-pool for writers is a
+> separate future slice.)
+
+Set the per-request `:rw` target via **`serve` + A2A** (`message.metadata` cwd) or, for **`run-workflow`**,
+the `--session-cwd <dir>` flag — without it, agents run in the LAUNCH cwd, not the target repo.

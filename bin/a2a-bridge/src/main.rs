@@ -131,9 +131,10 @@ fn container_owner(config_path: &std::path::Path, mount: &str, agent_id: &str) -
 /// Parse `a2a-bridge run-workflow <id> --input <file> [--out <file>] [--config <path>]`
 /// from a raw args iterator (skipping the binary name at position 0 and the
 /// subcommand name at position 1).
+#[allow(clippy::type_complexity)]
 fn parse_run_workflow_args(
     args: &[String],
-) -> Result<(String, PathBuf, Option<PathBuf>, PathBuf), BoxError> {
+) -> Result<(String, PathBuf, Option<PathBuf>, PathBuf, Option<String>), BoxError> {
     let mut iter = args.iter().peekable();
     // Positional: workflow id
     let workflow_id = iter
@@ -143,6 +144,9 @@ fn parse_run_workflow_args(
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
+    // The per-request ACP session cwd (the writable target for a container_rw agent, or the repo a
+    // reader works in). Without it, run-workflow agents run in the LAUNCH cwd, not the target repo.
+    let mut session_cwd: Option<String> = None;
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--input" => {
@@ -162,12 +166,19 @@ fn parse_run_workflow_args(
                         .ok_or("run-workflow: --config requires a value")?,
                 ));
             }
+            "--session-cwd" => {
+                session_cwd = Some(
+                    iter.next()
+                        .ok_or("run-workflow: --session-cwd requires a value")?
+                        .clone(),
+                );
+            }
             other => return Err(format!("run-workflow: unknown flag {other:?}").into()),
         }
     }
     let input = input.ok_or("run-workflow: --input <file> is required")?;
     let config = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
-    Ok((workflow_id, input, out, config))
+    Ok((workflow_id, input, out, config, session_cwd))
 }
 
 /// Execute the `run-workflow` subcommand.
@@ -176,7 +187,8 @@ fn parse_run_workflow_args(
 /// (or `--out <file>`).
 async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     bridge_observ::init();
-    let (workflow_id, input_path, out_path, config_path) = parse_run_workflow_args(args)?;
+    let (workflow_id, input_path, out_path, config_path, session_cwd) =
+        parse_run_workflow_args(args)?;
 
     // Load config.
     let raw = std::fs::read_to_string(&config_path)
@@ -311,14 +323,28 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             .unwrap_or(0)
     );
 
+    // Per-request session cwd: thread it into the context so EVERY node's agent works in the target
+    // dir (a container_rw :rw target, or the repo a reader reads) — not the launch cwd.
+    let ctx = match session_cwd {
+        Some(dir) => {
+            let cwd = bridge_core::SessionCwd::parse(&dir)
+                .map_err(|e| format!("run-workflow: invalid --session-cwd {dir:?}: {e:?}"))?;
+            bridge_workflow::executor::WorkflowRunContext {
+                session_cwd: Some(cwd),
+            }
+        }
+        None => bridge_workflow::executor::WorkflowRunContext::default(),
+    };
+
     // Run the workflow.
     use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
     use futures::StreamExt;
-    let mut stream = executor.run(
+    let mut stream = executor.run_with_context(
         graph,
         input,
         run_id,
         tokio_util::sync::CancellationToken::new(),
+        ctx,
     );
     let mut output = String::new();
     let mut ok = true;
@@ -1414,5 +1440,27 @@ mod cli_tests {
         let args = ["watch".to_string()];
         let result = args.get(1).cloned().ok_or("task watch: missing <id>");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_run_workflow_args_session_cwd() {
+        let args: Vec<String> = ["wf", "--input", "in.md", "--session-cwd", "/work/repo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (id, input, _out, _cfg, scwd) = super::parse_run_workflow_args(&args).unwrap();
+        assert_eq!(id, "wf");
+        assert_eq!(input, std::path::PathBuf::from("in.md"));
+        assert_eq!(scwd.as_deref(), Some("/work/repo"));
+    }
+
+    #[test]
+    fn parse_run_workflow_args_no_session_cwd_is_none() {
+        let args: Vec<String> = ["wf", "--input", "in.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_id, _input, _out, _cfg, scwd) = super::parse_run_workflow_args(&args).unwrap();
+        assert!(scwd.is_none());
     }
 }
