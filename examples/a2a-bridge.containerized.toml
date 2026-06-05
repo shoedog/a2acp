@@ -23,49 +23,44 @@ addr = "127.0.0.1:8080"
 
 # ── claude: the proven containerized agent (ADR-0013). Default + first to validate. ──
 [[agents]]
-id   = "claude"
-cmd  = "docker"
-args = [
-  "run", "-i", "--rm",
-  "--network", "a2a-egress-internal",
-  "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
-  "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
-  "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
-  "-v", "/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json",
-  "a2a-agent-reader:latest",
-  "claude-agent-acp",
-]
+id  = "claude"
+cmd = "claude-agent-acp"
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"            # == allowed_cwd_root (S2)
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json"]
 
 # ── codex: gpt-5.5 (auth + openai egress validated in-container). ──
 [[agents]]
-id   = "codex"
-cmd  = "docker"
-args = [
-  "run", "-i", "--rm",
-  "--network", "a2a-egress-internal",
-  "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
-  "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
-  "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
-  "-v", "/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json",
-  "a2a-agent-reader:latest",
-  "codex-acp",
-]
+id  = "codex"
+cmd = "codex-acp"
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
 
 # ── kiro: Linux build baked into the image. VERIFIED: Linux auth is ~/.local/share/kiro-cli/data.sqlite3
 #    (NOT ~/.aws); minted once via `kiro-cli login --use-device-flow` into the a2a-kiro-data volume. ──
 [[agents]]
 id   = "kiro"
-cmd  = "docker"
-args = [
-  "run", "-i", "--rm",
-  "--network", "a2a-egress-internal",
-  "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
-  "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
-  "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
-  "-v", "a2a-kiro-data:/root/.local/share",
-  "a2a-agent-reader:latest",
-  "kiro-cli", "acp",
-]
+cmd  = "kiro-cli"
+args = ["acp"]
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["a2a-kiro-data:/root/.local/share"]
 
 # ── ollama: non-process api agent (kind="api"). Uncontainerized by design — no mount/proxy/creds.
 #    NOT tool-free — it advertises a deterministic side-effect-free stub tool (no fs/shell).

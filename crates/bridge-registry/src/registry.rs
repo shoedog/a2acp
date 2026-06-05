@@ -106,10 +106,59 @@ pub(crate) fn validate(snap: &RegistrySnapshot) -> Result<(), BridgeError> {
                         reason: format!("acp agent {} requires cmd", e.id.as_str()),
                     });
                 };
-                if !snap.allowed_cmds.iter().any(|c| c == cmd) {
-                    return Err(BridgeError::ConfigInvalid {
-                        reason: format!("cmd not allowed: {cmd}"),
-                    });
+                match &e.sandbox {
+                    // Sandboxed: the bridge spawns the RUNTIME (docker/podman) wrapping the agent cli.
+                    Some(sb) => {
+                        // S3: allowlist the RESOLVED RUNTIME (NOT the inner cli, which runs contained).
+                        let runtime = sb.runtime();
+                        if !snap.allowed_cmds.iter().any(|c| c == runtime) {
+                            return Err(BridgeError::ConfigInvalid {
+                                reason: format!("sandbox runtime not allowed: {runtime}"),
+                            });
+                        }
+                        // S4: :rw requires the container_rw kind (Slice B2).
+                        if sb.access == bridge_core::domain::MountAccess::Rw {
+                            return Err(BridgeError::ConfigInvalid {
+                                reason: format!(
+                                    "sandbox agent {} access=rw requires the container_rw kind (Slice B2)",
+                                    e.id.as_str()
+                                ),
+                            });
+                        }
+                        // S5: mount must be an absolute/normalized path (reuses SessionCwd).
+                        let mount = bridge_core::SessionCwd::parse(&sb.mount).map_err(|_| {
+                            BridgeError::ConfigInvalid {
+                                reason: format!(
+                                    "sandbox mount must be an absolute path: {}",
+                                    sb.mount
+                                ),
+                            }
+                        })?;
+                        // S6: no volume DEST equal-to / nested-under `mount` (would re-expose the :ro
+                        // repo rw). Normalize both via SessionCwd so `/work/.` etc. can't slip past. Bare
+                        // / anonymous vol specs (no `:dest`, or a non-absolute dest) aren't S6-checked.
+                        for v in &sb.volumes {
+                            let dest = v.split(':').nth(1).unwrap_or("");
+                            if let Ok(d) = bridge_core::SessionCwd::parse(dest) {
+                                if d.as_str() == mount.as_str() || d.is_under(&mount) {
+                                    return Err(BridgeError::ConfigInvalid {
+                                        reason: format!(
+                                            "sandbox volume dest {dest:?} is nested under the :ro mount {:?}",
+                                            sb.mount
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // Raw (Slice A compat): the existing allowlist check on the spawned cmd.
+                    None => {
+                        if !snap.allowed_cmds.iter().any(|c| c == cmd) {
+                            return Err(BridgeError::ConfigInvalid {
+                                reason: format!("cmd not allowed: {cmd}"),
+                            });
+                        }
+                    }
                 }
             }
             AgentKind::Api => {
@@ -121,6 +170,12 @@ pub(crate) fn validate(snap: &RegistrySnapshot) -> Result<(), BridgeError> {
                 if e.cmd.is_some() {
                     return Err(BridgeError::ConfigInvalid {
                         reason: format!("api agent {} must not set cmd", e.id.as_str()),
+                    });
+                }
+                // S1: an api agent has no process to contain → must not declare a sandbox.
+                if e.sandbox.is_some() {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: format!("api agent {} must not set sandbox", e.id.as_str()),
                     });
                 }
             }
@@ -269,6 +324,13 @@ impl AgentRegistry for Registry {
                     && c.cwd == e.cwd
                     && c.auth_method == e.auth_method
                     && c.kind == e.kind
+                    // All three are frozen into the backend at spawn (sandbox→argv,
+                    // session_cwd→AcpConfig.cwd, api_key_env→ApiConfig) and never refreshed on warm
+                    // reuse — so a change to any MUST force a fresh slot. BEHAVIOR CHANGE: session_cwd /
+                    // api_key_env edits now drain + respawn (were previously silently ignored).
+                    && c.sandbox == e.sandbox
+                    && c.session_cwd == e.session_cwd
+                    && c.api_key_env == e.api_key_env
             });
             match reuse {
                 // Config-only edit: keep the warm slot, swap only its entry config.
@@ -379,6 +441,7 @@ mod tests {
             mode: None,
             cwd: None,
             session_cwd: None,
+            sandbox: None,
             auth_method: None,
             name: None,
             description: None,
@@ -433,6 +496,7 @@ mod tests {
                 mode: None,
                 cwd: None,
                 session_cwd: None,
+                sandbox: None,
                 auth_method: None,
                 name: None,
                 description: None,
@@ -454,6 +518,144 @@ mod tests {
         let mut s = api_snap();
         s.entries[0].base_url = None;
         assert!(validate(&s).is_err());
+    }
+
+    // --- B1 sandbox validate invariants (S1/S3/S4/S5/S6) ----------------------
+
+    fn sandboxed_entry(
+        id: &str,
+        access: bridge_core::domain::MountAccess,
+        volumes: Vec<String>,
+    ) -> AgentEntry {
+        use bridge_core::domain::{EgressPolicy, SandboxConfig};
+        let mut e = entry(id);
+        e.cmd = Some("claude-agent-acp".into()); // the inner agent cli (NOT allowlist-checked)
+        e.sandbox = Some(SandboxConfig {
+            runtime: Some("docker".into()),
+            image: "img".into(),
+            mount: "/work".into(),
+            access,
+            egress: EgressPolicy::Open,
+            volumes,
+        });
+        e
+    }
+
+    fn err_reason(snap: &RegistrySnapshot) -> String {
+        match validate(snap) {
+            Err(BridgeError::ConfigInvalid { reason }) => reason,
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s3_allowlists_runtime_not_inner_cmd() {
+        use bridge_core::domain::MountAccess;
+        // allowed_cmds has the RUNTIME "docker", NOT the inner cli "claude-agent-acp" → passes.
+        let mut snap = snapshot(&["a"]);
+        snap.entries = vec![sandboxed_entry("a", MountAccess::Ro, vec![])];
+        snap.allowed_cmds = vec!["docker".into()];
+        assert!(validate(&snap).is_ok());
+        // runtime not allowlisted → reject (specific reason).
+        snap.allowed_cmds = vec!["podman".into()];
+        assert!(err_reason(&snap).contains("runtime not allowed"));
+    }
+
+    #[test]
+    fn s4_rejects_rw_in_b1() {
+        use bridge_core::domain::MountAccess;
+        let mut snap = snapshot(&["a"]);
+        snap.entries = vec![sandboxed_entry("a", MountAccess::Rw, vec![])];
+        snap.allowed_cmds = vec!["docker".into()];
+        assert!(err_reason(&snap).contains("container_rw")); // red-first: the SPECIFIC S4 reason
+    }
+
+    #[test]
+    fn s5_rejects_non_absolute_mount() {
+        use bridge_core::domain::MountAccess;
+        let mut snap = snapshot(&["a"]);
+        let mut e = sandboxed_entry("a", MountAccess::Ro, vec![]);
+        e.sandbox.as_mut().unwrap().mount = "work/rel".into();
+        snap.entries = vec![e];
+        snap.allowed_cmds = vec!["docker".into()];
+        assert!(err_reason(&snap).contains("absolute path"));
+    }
+
+    #[test]
+    fn s6_rejects_volume_nested_under_or_eq_mount() {
+        use bridge_core::domain::MountAccess;
+        let mut snap = snapshot(&["a"]);
+        snap.allowed_cmds = vec!["docker".into()];
+        // nested under the :ro mount /work → re-exposes the repo rw → REJECT.
+        snap.entries = vec![sandboxed_entry(
+            "a",
+            MountAccess::Ro,
+            vec!["/h:/work/secret".into()],
+        )];
+        assert!(err_reason(&snap).contains("nested under"));
+        // equal to the mount → also REJECT.
+        snap.entries = vec![sandboxed_entry(
+            "a",
+            MountAccess::Ro,
+            vec!["/h:/work".into()],
+        )];
+        assert!(err_reason(&snap).contains("nested under"));
+        // a creds vol OUTSIDE the tree passes.
+        snap.entries = vec![sandboxed_entry(
+            "a",
+            MountAccess::Ro,
+            vec!["/h:/root/.codex/auth.json".into()],
+        )];
+        assert!(validate(&snap).is_ok());
+    }
+
+    #[test]
+    fn s1_api_must_not_set_sandbox() {
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
+        let mut snap = api_snap();
+        snap.entries[0].sandbox = Some(SandboxConfig {
+            runtime: None,
+            image: "i".into(),
+            mount: "/work".into(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
+        assert!(err_reason(&snap).contains("must not set sandbox"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_session_cwd_api_key_each_force_new_slot() {
+        use bridge_core::domain::MountAccess;
+        // Each of the three newly-keyed fields must force a NEW slot (was silently reused before).
+        for mutate in [0u8, 1, 2] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let retired = Arc::new(AtomicUsize::new(0));
+            let reg = Registry::new(
+                snapshot(&["a"]),
+                counting_spawn_recording(count.clone(), 0, retired.clone()),
+            )
+            .unwrap();
+            let a = AgentId::parse("a").unwrap();
+            let _r = reg.resolve(&a).await.unwrap();
+            let before = reg.slot_arc(&a).unwrap();
+
+            let mut snap = snapshot(&["a"]);
+            match mutate {
+                0 => {
+                    snap.entries[0].sandbox = sandboxed_entry("a", MountAccess::Ro, vec![]).sandbox;
+                    snap.allowed_cmds = vec!["fake-cmd".into(), "docker".into()];
+                }
+                1 => snap.entries[0].session_cwd = Some("/work/x".into()),
+                _ => snap.entries[0].api_key_env = Some("SOME_KEY".into()),
+            }
+            reg.apply(snap).await.unwrap();
+            let after = reg.slot_arc(&a).unwrap();
+            assert!(
+                !Arc::ptr_eq(&before, &after),
+                "mutate={mutate}: changing this field must force a NEW slot"
+            );
+        }
     }
 
     /// A SpawnFn that counts invocations and (optionally) fails the first N calls.

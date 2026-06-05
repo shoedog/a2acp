@@ -80,6 +80,20 @@ fn resolve_static_session_cwd(session_cwd: Option<&str>, cwd: Option<&str>) -> S
 // `run-workflow` subcommand
 // ---------------------------------------------------------------------------
 
+/// Compose-or-raw: the `(runtime program, argv)` for spawning a `kind="acp"` agent. A `[sandbox]`
+/// agent runs the runtime (docker) wrapping the agent cli; a raw agent runs `cmd`+`args` directly
+/// (Slice A compat). BOTH `SpawnFn` closures (run-workflow + serve) call this, so the two paths can't
+/// diverge. Unit-tested below; the Docker acceptance gate then proves it end-to-end.
+fn acp_program_argv(entry: &AgentEntry) -> Result<(String, Vec<String>), BridgeError> {
+    let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
+        reason: format!("acp agent {} missing cmd", entry.id.as_str()),
+    })?;
+    Ok(match &entry.sandbox {
+        Some(sb) => bridge_core::sandbox::compose_sandbox(sb, cmd, &entry.args),
+        None => (cmd.to_string(), entry.args.clone()),
+    })
+}
+
 /// Parse `a2a-bridge run-workflow <id> --input <file> [--out <file>] [--config <path>]`
 /// from a raw args iterator (skipping the binary name at position 0 and the
 /// subcommand name at position 1).
@@ -179,14 +193,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                         .join(p)
                 }
             };
-            let args: Vec<String> = entry.args.clone();
-            let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
             use bridge_core::domain::AgentKind;
             match entry.kind {
                 AgentKind::Acp => {
-                    let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!("acp agent {} missing cmd", entry.id.as_str()),
-                    })?;
+                    // Compose-or-raw via the shared helper (sandbox → docker argv; else raw cmd+args).
+                    let (program, argv) = acp_program_argv(&entry)?;
+                    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
                     let acp = bridge_acp::acp_backend::AcpConfig {
                         cwd,
                         model: entry.model.clone(),
@@ -194,7 +206,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                         auth_method: entry.auth_method.clone(),
                         ..bridge_acp::acp_backend::AcpConfig::default()
                     };
-                    let be = bridge_acp::acp_backend::AcpBackend::spawn(cmd, &args_ref, acp)
+                    let be = bridge_acp::acp_backend::AcpBackend::spawn(&program, &argv_ref, acp)
                         .await?
                         .with_policy(policy);
                     Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
@@ -861,14 +873,12 @@ async fn main() -> Result<(), BoxError> {
                         .join(p)
                 }
             };
-            let args: Vec<String> = entry.args.clone();
-            let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
             use bridge_core::domain::AgentKind;
             match entry.kind {
                 AgentKind::Acp => {
-                    let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!("acp agent {} missing cmd", entry.id.as_str()),
-                    })?;
+                    // Compose-or-raw via the shared helper (same logic as the run-workflow site).
+                    let (program, argv) = acp_program_argv(&entry)?;
+                    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
                     let acp = AcpConfig {
                         cwd,
                         model: entry.model.clone(),
@@ -877,7 +887,7 @@ async fn main() -> Result<(), BoxError> {
                         // handshake_timeout / cancel_grace: reuse the codebase defaults.
                         ..AcpConfig::default()
                     };
-                    let be = AcpBackend::spawn(cmd, &args_ref, acp)
+                    let be = AcpBackend::spawn(&program, &argv_ref, acp)
                         .await?
                         // Thread the system policy into the backend so its reverse-permission
                         // decisions match the inbound server's policy (Task 5/6).
@@ -1043,6 +1053,61 @@ async fn main() -> Result<(), BoxError> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    fn acp_entry(id: &str) -> AgentEntry {
+        use bridge_core::ids::AgentId;
+        use std::collections::BTreeMap;
+        AgentEntry {
+            id: AgentId::parse(id).unwrap(),
+            cmd: Some("claude-agent-acp".into()),
+            base_url: None,
+            api_key_env: None,
+            args: vec![],
+            kind: bridge_core::domain::AgentKind::Acp,
+            model_provider: None,
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: None,
+            session_cwd: None,
+            sandbox: None,
+            auth_method: None,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn acp_program_argv_raw_passthrough_and_sandbox_wrap() {
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
+        // raw: program = cmd, argv = args (Slice A compat).
+        let raw = acp_entry("a");
+        assert_eq!(
+            acp_program_argv(&raw).unwrap(),
+            ("claude-agent-acp".to_string(), Vec::<String>::new())
+        );
+        // sandbox: program = runtime (docker), argv wraps the inner cli with the :ro mount.
+        let mut sb = acp_entry("b");
+        sb.sandbox = Some(SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: "/work".into(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
+        let (program, argv) = acp_program_argv(&sb).unwrap();
+        assert_eq!(program, "docker");
+        assert_eq!(argv.last().unwrap(), "claude-agent-acp");
+        assert!(argv.contains(&"/work:/work:ro".to_string()));
+        // missing cmd → ConfigInvalid.
+        let mut nocmd = acp_entry("c");
+        nocmd.cmd = None;
+        assert!(acp_program_argv(&nocmd).is_err());
+    }
 
     #[test]
     fn flag_parses_value_and_missing() {

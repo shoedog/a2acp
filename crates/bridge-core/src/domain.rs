@@ -35,6 +35,53 @@ pub enum AgentKind {
     Api,
 }
 
+/// How a containerized agent is launched (the enforced `[sandbox]` block, Slice B1). The bridge
+/// composes the runtime argv from this (see [`crate::sandbox::compose_sandbox`]) and the registry/config
+/// layers enforce its invariants, so containment can't silently degrade via hand-typed args.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxConfig {
+    /// Container runtime; resolve via [`SandboxConfig::runtime`] (`"docker"` default). e.g. docker|podman.
+    pub runtime: Option<String>,
+    pub image: String,
+    /// The primary identical-path source mount; MUST equal `allowed_cwd_root` (parse-layer S2). Stored
+    /// NORMALIZED (via `SessionCwd`) so the snapshot-layer volume check (S6) compares like-for-like.
+    pub mount: String,
+    pub access: MountAccess,
+    /// Data-carrying so `compose_sandbox` is total (the old runtime "Locked ⇒ network+proxy" is a type
+    /// guarantee).
+    pub egress: EgressPolicy,
+    /// Verbatim extra `-v` specs (creds / named volumes); trusted passthrough. The primary `mount` is
+    /// structurally validated; volume destinations may not nest under `mount` (S6).
+    pub volumes: Vec<String>,
+}
+
+impl SandboxConfig {
+    /// The resolved container runtime program (default `docker`). The single source of truth: the
+    /// snapshot-layer allowlist (S3) gates THIS value, and `compose_sandbox` spawns THIS — so validate
+    /// and spawn can't drift.
+    pub fn runtime(&self) -> &str {
+        self.runtime.as_deref().unwrap_or("docker")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountAccess {
+    Ro,
+    Rw,
+}
+
+/// `Locked` CARRIES its network/proxy so `compose_sandbox` is total (no `unwrap`/panic). The TOML→enum
+/// conversion (`config.rs::parse_egress`) is the only constructor and rejects `locked` without both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressPolicy {
+    Locked {
+        network: String,
+        proxy: String,
+        no_proxy: Option<String>,
+    },
+    Open,
+}
+
 /// A named bundle: which CLI adapter to launch + model/effort/mode configuration.
 #[derive(Debug, Clone)]
 pub struct AgentEntry {
@@ -57,6 +104,8 @@ pub struct AgentEntry {
     /// Resolution chain at mint: `session_cwd` → `cwd` → `"."`.
     /// This is NOT a host-process cwd — the host child has no cwd (Supervised gets None).
     pub session_cwd: Option<String>,
+    /// The enforced `[sandbox]` block (B1): how to containerize this agent. `None` = raw `cmd`/`args`.
+    pub sandbox: Option<SandboxConfig>,
     pub auth_method: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -257,6 +306,7 @@ mod tests {
             mode: None,
             cwd: None,
             session_cwd: None,
+            sandbox: None,
             auth_method: None,
             name: None,
             description: None,
@@ -284,6 +334,7 @@ mod tests {
             mode: None,
             cwd: None,
             session_cwd: None,
+            sandbox: None,
             auth_method: None,
             name: None,
             description: None,
@@ -309,6 +360,7 @@ mod tests {
             mode: Some("read-only".into()),
             cwd: None,
             session_cwd: None,
+            sandbox: None,
             auth_method: None,
             name: None,
             description: None,
