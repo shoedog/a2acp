@@ -612,28 +612,30 @@ Run (serve in one shell, request in another):
 # shell 1
 cargo run -q -p a2a-bridge -- serve --config examples/a2a-bridge.containerized.toml &
 SERVE=$!; sleep 3
-# shell 2 — an A2A message/send with a cwd OUTSIDE allowed_cwd_root must be rejected
-curl -sS -X POST http://127.0.0.1:8080/ -H 'content-type: application/json' -d '{
-  "jsonrpc":"2.0","id":1,"method":"message/send",
-  "params":{"message":{"role":"user","parts":[{"kind":"text","text":"hi"}]},
-            "metadata":{"a2a-bridge.cwd":"/etc"}}}'
-echo   # expect an error: cwd not under allowed_cwd_root
+# shell 2 — A2A method is CamelCase "SendMessage", needs the `A2A-Version: 1.0` header, and the
+# cwd metadata lives under message.metadata (NOT top-level params.metadata). cwd OUTSIDE the root rejects:
+curl -sS -X POST http://127.0.0.1:8080/ -H 'content-type: application/json' -H 'A2A-Version: 1.0' -d '{
+  "jsonrpc":"2.0","id":1,"method":"SendMessage",
+  "params":{"message":{"role":"user","parts":[{"kind":"text","text":"hi"}],
+                       "metadata":{"a2a-bridge.cwd":"/etc"}}}}'
 ```
-Expected: a JSON-RPC error rejecting `/etc` (outside `/Users/wesleyjinks/code`). A cwd UNDER the root (e.g. `/Users/wesleyjinks/code/a2a-bridge`) is accepted. Kill serve: `kill $SERVE`.
+Expected (VERIFIED): `{"error":{"code":-32600,"message":"invalid request: a2a-bridge.cwd"}}` — `/etc`
+is outside `/Users/wesleyjinks/code`, rejected before any work. A cwd UNDER the root (e.g.
+`/Users/wesleyjinks/code/a2a-bridge`) is **accepted** and the containerized agent reads that repo. Kill
+serve: `kill $SERVE`.
 
 - [ ] **Step 2: Multi-repo — a second repo under the mount resolves with the same serve**
 
-Run: with `serve` up, send an **A2A `message/send`** (NOT `run-workflow` — only the serve path threads
-`session_cwd` into the gate + the agent mint) selecting a single agent, with
-`metadata."a2a-bridge.cwd" = "/Users/wesleyjinks/code/<other-repo>"`:
+Run: with `serve` up, send an **A2A `SendMessage`** (NOT `run-workflow` — only the serve path threads
+`session_cwd` into the gate + the agent mint), with the cwd under `message.metadata`:
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/ -H 'content-type: application/json' -d '{
-  "jsonrpc":"2.0","id":2,"method":"message/send",
-  "params":{"message":{"role":"user","parts":[{"kind":"text","text":"List the top-level files here and STOP."}]},
-            "metadata":{"a2a-bridge.cwd":"/Users/wesleyjinks/code/<other-repo>","a2a-bridge.agent":"claude"}}}'
+curl -sS --max-time 90 -X POST http://127.0.0.1:8080/ -H 'content-type: application/json' -H 'A2A-Version: 1.0' -d '{
+  "jsonrpc":"2.0","id":2,"method":"SendMessage",
+  "params":{"message":{"role":"user","parts":[{"kind":"text","text":"List the top-level files here and STOP."}],
+                       "metadata":{"a2a-bridge.cwd":"/Users/wesleyjinks/code/<other-repo>"}}}}'
 ```
-Expected: the containerized agent reads that *other* repo (one broad `:ro` mount, many repos via
-`session_cwd`). Kill serve when done.
+Expected (VERIFIED for this repo): the containerized agent reads the repo at that `session_cwd` (one
+broad `:ro` mount, many repos). Kill serve when done.
 
 - [ ] **Step 3: Commit the gate result**
 
