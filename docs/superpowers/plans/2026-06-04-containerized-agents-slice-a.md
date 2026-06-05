@@ -8,7 +8,14 @@
 
 **Tech Stack:** Docker (Desktop, macOS — 29.4.0), `node:24-slim` base image, npm-installed ACP CLIs, tinyproxy (default-deny, POSIX-ERE host allowlist), the existing `a2a-bridge` binary + workflows (`code-review`/`design`), `bridge-api` for ollama.
 
-**Scope note (from grounding):** `codex-acp`/`claude-agent-acp` are portable Node packages → containerize trivially and ship now. **`kiro-cli` on this host is a macOS Mach-O binary** (`/Applications/Kiro CLI.app`) and will NOT run in a Linux container; kiro containerization is **gated on obtaining Amazon's Linux kiro build** (Task 9, explicitly deferrable). Claude is the only agent with prior container evidence (ADR-0013) → **claude-first validation, claude+codex as the shippable core, kiro + the four unproven assumptions (auth / egress allowlist / `HTTPS_PROXY` honoring / ACP-cwd honoring) retired during validation; claude-only is the documented fallback.**
+**Scope note (from grounding):** the reader image is **Linux** — on macOS, Docker Desktop runs all
+containers in a Linux VM — so the host's `kiro-cli` (a macOS Mach-O at `/Applications/Kiro CLI.app`)
+can't run in it; we install kiro's **Linux** build *into* the image via its official installer
+(`curl -fsSL https://cli.kiro.dev/install | bash`, Task 1). All three agents — `claude-agent-acp` +
+`codex-acp` (npm) + `kiro-cli` (curl installer) — are first-class containerized readers; **kiro is no
+longer deferred.** Claude has prior container evidence (ADR-0013); codex/kiro carry **four unproven
+assumptions** (auth / egress allowlist / `HTTPS_PROXY` honoring / ACP-cwd honoring) retired during
+validation (Task 8/9). **claude-only is the documented fallback** if any agent fails those.
 
 **Branch:** `feat/containerized-agents` (already created; spec committed at `2357a97`).
 
@@ -52,10 +59,10 @@
 # (readers verify via read/grep/git diff; they don't compile — that's the Slice B implement image).
 FROM node:24-slim
 
-# Read tools the review/design lenses use, + curl for the egress curl-triad gate, + CA certs for TLS
-# to the model providers through the proxy.
+# Read tools the review/design lenses use, + curl for the egress gate + the kiro installer,
+# + unzip/ca-certificates for installers, + git/ripgrep for read/grep.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git ripgrep ca-certificates curl \
+      git ripgrep ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin the ACP agent CLIs (portable Node packages; versions match the host as of 2026-06-04).
@@ -64,6 +71,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g \
       @agentclientprotocol/claude-agent-acp@0.39.0 \
       @zed-industries/codex-acp@0.15.0
+
+# kiro-cli: install the LINUX build via the official installer (the host's macOS binary can't run in
+# this Linux image). The installer drops the binary under ~/.local/bin (root → /root/.local/bin).
+RUN curl -fsSL https://cli.kiro.dev/install | bash
+ENV PATH="/root/.local/bin:${PATH}"
 
 # Workdir is cosmetic: the ACP session cwd arrives over the protocol (session/new); the repo is
 # bind-mounted at its identical host path at run time.
@@ -80,9 +92,13 @@ Expected: build succeeds; final line `naming to docker.io/library/a2a-agent-read
 Run:
 ```bash
 docker run --rm a2a-agent-reader:latest sh -c \
-  'command -v claude-agent-acp && command -v codex-acp && git --version && rg --version | head -1'
+  'command -v claude-agent-acp && command -v codex-acp && command -v kiro-cli && git --version && rg --version | head -1'
 ```
-Expected: prints both CLI paths, a git version, and an `ripgrep 1.x` line. If a CLI is missing, the npm install step failed — fix the package name/version against `npm ls -g` on the host.
+Expected: prints all three CLI paths, a git version, and an `ripgrep 1.x` line. If a npm CLI is
+missing, fix the package name/version against `npm ls -g` on the host. **If `kiro-cli` is missing**,
+the installer used a different dir — find it (`docker run --rm a2a-agent-reader:latest sh -c 'ls -R /root/.local /usr/local/bin 2>/dev/null | grep -i kiro'`) and fix the `ENV PATH`; if the installer
+itself failed (network/license), capture its output and, if unrecoverable, drop kiro to the
+claude+codex core (it's used primarily at work) and note it in ADR-0016.
 
 - [ ] **Step 4: Commit**
 
@@ -286,6 +302,22 @@ args = [
   "codex-acp",
 ]
 
+# ── kiro: AWS-SSO auth; Linux build baked into the image (Task 1). Auth + egress allowlist validated
+#    in Task 9. Mounts a WRITABLE copy of the AWS-SSO cache (token refresh writes back). ──
+[[agents]]
+id   = "kiro"
+cmd  = "docker"
+args = [
+  "run", "-i", "--rm",
+  "--network", "a2a-egress-internal",
+  "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
+  "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
+  "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
+  "-v", "/Users/wesleyjinks/.config/a2a-creds/kiro/.aws:/root/.aws",   # WRITABLE AWS-SSO cache copy
+  "a2a-agent-reader:latest",
+  "kiro-cli", "acp",
+]
+
 # ── ollama: non-process api agent (kind="api"). Uncontainerized by design — no mount/proxy/creds.
 #    Role: tools-off nodes (synth/draft/inlined review). Local => no remote egress. ──
 [[agents]]
@@ -294,8 +326,6 @@ kind        = "api"
 base_url    = "http://localhost:11434/v1"
 api_key_env = "OLLAMA_API_KEY"            # NAME of the env var; export it in the serve process env
 model       = "qwen2.5-coder:7b"          # any installed `ollama list` model; adjust to taste
-
-# kiro is added in Task 9 (gated on a Linux kiro-cli build).
 
 # ── Workflows: reuse the existing review/design lenses (../prompts). Design two-pass added in Phase D. ──
 # (Copy the [[workflows]] code-review / spec-review / plan-review / design blocks verbatim from
@@ -409,50 +439,58 @@ git commit --allow-empty -m "validate: per-agent end-to-end PASS (claude design;
 ```
 (Record the actual per-agent outcome — including any fallback — in the message.)
 
-### Task 9: kiro (DEFERRABLE — gated on a Linux kiro-cli build)
+### Task 9: kiro validation — auth in-box + egress allowlist discovery
 
-**Files:** modify `deploy/containers/reader.Containerfile`, `examples/a2a-bridge.containerized.toml`, `deploy/containers/tinyproxy.filter`.
+(kiro is already in the image (Task 1) and the config (Task 5). This task retires its two unknowns:
+in-container AWS-SSO auth, and which egress hosts it needs.)
 
-- [ ] **Step 1: Determine if a Linux kiro-cli build is obtainable**
+**Files:** modify `deploy/containers/tinyproxy.filter` (add kiro's discovered hosts).
 
-Run: check Amazon's docs/installer for a Linux kiro-cli (the host binary at `/Applications/Kiro CLI.app/.../kiro-cli` is macOS Mach-O and CANNOT run in the Linux image). Look for a Linux install script (e.g. `curl …/install.sh | sh`) or an `apt`/tarball.
-**Decision gate:** if NO Linux build is available → **STOP this task, mark kiro deferred in the ADR (use claude+codex), and proceed to Phase D.** Do not block the increment on kiro.
+- [ ] **Step 1: Copy kiro's AWS-SSO creds (WRITABLE — token refresh writes back)**
 
-- [ ] **Step 2 (only if a Linux build exists): add kiro to the image**
-
-Add to `reader.Containerfile` (after the npm install), using the discovered Linux installer:
-```dockerfile
-# kiro-cli (Linux) — install per Amazon's Linux installer (pin the version).
-RUN <amazon-linux-kiro-install-command>
-```
-Rebuild: `docker build -t a2a-agent-reader:latest -f deploy/containers/reader.Containerfile deploy/containers`.
-
-- [ ] **Step 3 (only if added): kiro agent entry + creds + allowlist discovery**
-
-Add to `examples/a2a-bridge.containerized.toml`:
-```toml
-[[agents]]
-id   = "kiro"
-cmd  = "docker"
-args = [
-  "run", "-i", "--rm",
-  "--network", "a2a-egress-internal",
-  "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
-  "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
-  "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
-  "-v", "/Users/wesleyjinks/.config/a2a-creds/kiro/.aws:/root/.aws",   # WRITABLE AWS-SSO cache copy
-  "a2a-agent-reader:latest",
-  "kiro-cli", "acp",
-]
-```
-Then run `cargo run -q -p a2a-bridge -- run-workflow code-review --config examples/a2a-bridge.containerized.toml --input /tmp/containerized-agents-problem.md` (point a node at `kiro`), read `docker logs a2a-egress-proxy` for DENIED hosts, and add the matching anchored ERE regexes (Amazon Q / CodeWhisperer + SSO/Cognito) to `tinyproxy.filter`. Re-run until the turn completes. **If kiro auth fails in-box:** defer kiro (it's used primarily at work), record the assumption that failed.
-
-- [ ] **Step 4: Commit (only if kiro landed)**
-
+Run:
 ```bash
-git add deploy/containers/reader.Containerfile examples/a2a-bridge.containerized.toml deploy/containers/tinyproxy.filter
-git commit -m "containers: add kiro reader (Linux build) + empirical egress allowlist"
+mkdir -p ~/.config/a2a-creds/kiro/.aws
+cp -R ~/.aws/sso  ~/.config/a2a-creds/kiro/.aws/sso  2>/dev/null || true
+cp -R ~/.aws/config ~/.config/a2a-creds/kiro/.aws/config 2>/dev/null || true
+chmod -R u+rw ~/.config/a2a-creds/kiro
 ```
+Expected: `~/.config/a2a-creds/kiro/.aws/sso/cache` exists. (If kiro stores creds elsewhere — check
+`~/.kiro` — copy that path instead and adjust the config mount.)
+
+- [ ] **Step 2: Run a workflow node through kiro and discover its egress hosts from the proxy log**
+
+Run: temporarily point a `code-review` node at `agent = "kiro"` (or add a throwaway one), then:
+```bash
+cargo run -q -p a2a-bridge -- run-workflow code-review \
+  --input /tmp/containerized-agents-problem.md \
+  --config examples/a2a-bridge.containerized.toml 2>&1 | tail -8
+docker logs a2a-egress-proxy 2>&1 | grep -iE "deny|filter|connect" | tail -30
+```
+Expected: the proxy log shows the hosts kiro tried to reach. Denied ones it legitimately needs are the
+allowlist gaps.
+
+- [ ] **Step 3: Add kiro's hosts as anchored ERE regexes + rebuild the proxy**
+
+Append to `deploy/containers/tinyproxy.filter` (real hosts from Step 2 — likely Amazon Q /
+CodeWhisperer + AWS SSO/Cognito):
+```text
+(^|\.)amazonaws\.com$
+(^|\.)amazoncognito\.com$
+```
+Then `docker compose -f deploy/containers/compose.egress.yaml up -d --build` and re-run Step 2 until
+the kiro turn **completes** (auth through the proxy + repo read + terminate).
+
+- [ ] **Step 4: Decision + commit**
+
+If kiro completes → commit the allowlist:
+```bash
+git add deploy/containers/tinyproxy.filter
+git commit -m "containers: pin kiro egress allowlist (Amazon Q + AWS SSO) from proxy-log discovery"
+```
+**If kiro auth fails in-box** (AWS-SSO doesn't port into the container) → drop to the claude+codex core
+(kiro is used primarily at work), revert the kiro allowlist lines, and record the failed assumption in
+ADR-0016. Do not block the increment.
 
 ### Task 10: GATE — cwd gate + multi-repo (validation gates 4 + 5)
 
@@ -715,9 +753,9 @@ identical-path, writable creds) → T5/T6; A4/A4b creds + ollama → T5/T6; A5 t
 ADR T14; runbook → T13; ADR → T14. **All dual-review must-fixes** (gate set + allowed_cwd_root +
 writable creds + ERE allowlist + tools-off wording) are baked into T5/T2/T7/T8. Covered.
 
-**Placeholder scan:** the only intentional "discover during the task" steps are the kiro Linux
-installer (T9 — genuinely host/vendor-dependent, with a STOP/defer decision gate) and the ollama model
-name (T5 — `ollama list` picks it). No silent TBDs.
+**Placeholder scan:** the kiro installer is concrete (`curl …/install`, T1). The only intentional
+"discover during the task" steps are kiro's exact egress hosts (T9 — pinned empirically from the proxy
+log) and the ollama model name (T5 — `ollama list` picks it). No silent TBDs.
 
 **Consistency:** image tag `a2a-agent-reader:latest`, proxy `a2a-egress-proxy:8888`, networks
 `a2a-egress-internal`/`a2a-egress-external`, creds `~/.config/a2a-creds/<agent>`, node-id convention
