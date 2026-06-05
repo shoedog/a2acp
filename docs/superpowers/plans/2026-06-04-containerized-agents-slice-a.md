@@ -85,8 +85,10 @@ RUN set -eux; \
     esac; \
     curl --proto '=https' --tlsv1.2 -sSf "$url" -o /tmp/kirocli.zip; \
     unzip -q /tmp/kirocli.zip -d /tmp; \
-    /tmp/kirocli/install.sh --no-confirm 2>/dev/null || /tmp/kirocli/install.sh </dev/null; \
+    /tmp/kirocli/install.sh --force --no-confirm; \
     rm -rf /tmp/kirocli /tmp/kirocli.zip
+# NOTE: kiro's install.sh needs `--force` (it refuses to run as root, which we are in the image)
+# AND `--no-confirm` (unattended/no TTY during docker build).
 ENV PATH="/root/.local/bin:${PATH}"
 
 # Workdir is cosmetic: the ACP session cwd arrives over the protocol (session/new); the repo is
