@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Run the existing review/design agents (codex, claude; kiro when a Linux build is sourced) as `:ro` containerized readers behind an egress-locked proxy, plus a non-process `ollama` (`kind="api"`) agent — validated end-to-end against this repo, with **zero bridge (Rust) code**.
+**Goal:** Run the existing review/design agents (codex, claude, kiro) as `:ro` containerized readers behind an egress-locked proxy, plus a non-process `ollama` (`kind="api"`) agent — validated end-to-end against this repo, with **zero bridge (Rust) code**.
 
 **Architecture:** Config + infra + prompts + docs only. The registry already passes each agent's `cmd`/`args` straight to `Supervised::spawn`, and the ACP session cwd is sent over the protocol at `session/new` (not the OS process cwd), so wrapping an agent as `cmd="docker" args=["run", …, "<agent-cli>"]` with an **identical-path `:ro` mount** is a pure config change. Egress is locked by a default-deny tinyproxy on an `--internal` Docker network. Verification is a set of **falsifiable manual gates** (Docker-gated, not CI).
 
@@ -27,6 +27,8 @@ validation (Task 8/9). **claude-only is the documented fallback** if any agent f
 ## File Structure
 
 **Create:**
+- `examples/sample-input.md` — a tiny problem-statement input for validation runs (Task 0).
+- `prompts/smoke-read.md`, `prompts/smoke-reply.md` — single-agent auth-smoke prompts (Task 8).
 - `deploy/containers/reader.Containerfile` — the `:ro` reader image (node + ACP CLIs + read tools).
 - `deploy/containers/proxy.Containerfile` — a pinned tinyproxy image.
 - `deploy/containers/tinyproxy.conf` — default-deny proxy config.
@@ -48,7 +50,27 @@ validation (Task 8/9). **claude-only is the documented fallback** if any agent f
 
 ## Phase A — The reader image
 
-### Task 1: Build the `:ro` reader image (codex + claude)
+### Task 0: Author the workflow input file (dual-review gap — nothing else creates it)
+
+**Files:** Create `examples/sample-input.md`.
+
+- [ ] **Step 1: Write a tiny problem-statement input** (used as `--input` by the config-parse /
+  two-pass validations; the smoke workflows ignore their input and can use `README.md`):
+
+```markdown
+<!-- examples/sample-input.md -->
+Problem statement (sample): Evaluate whether the a2a-bridge's workflow executor cleanly separates
+node fan-out from the synthesis step. Keep it brief.
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add examples/sample-input.md
+git commit -m "examples: sample workflow input for containerized validation runs"
+```
+
+### Task 1: Build the `:ro` reader image (codex + claude + kiro)
 
 **Files:**
 - Create: `deploy/containers/reader.Containerfile`
@@ -316,9 +338,10 @@ args = [
   "codex-acp",
 ]
 
-# ── kiro: Linux build baked into the image (Task 1). Device-flow auth done ONCE in-container and
-#    persisted to the WRITABLE named volume `a2a-kiro-home` (token refresh writes back). The volume
-#    holds kiro's $HOME state (~/.aws SSO cache, etc.); validated + allowlist-pinned in Task 9. ──
+# ── kiro: Linux build baked into the image (Task 1). Device-flow auth done ONCE in-container
+#    (`kiro-cli login --use-device-flow`) and persisted to the WRITABLE named volume `a2a-kiro-data`.
+#    VERIFIED LIVE: kiro's Linux auth state is `~/.local/share/kiro-cli/data.sqlite3` (NOT ~/.aws);
+#    the token refreshes into the volume. See Task 9. ──
 [[agents]]
 id   = "kiro"
 cmd  = "docker"
@@ -328,13 +351,14 @@ args = [
   "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
   "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
   "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
-  "-v", "a2a-kiro-home:/root/.aws",        # WRITABLE named volume: persisted device-flow creds
+  "-v", "a2a-kiro-data:/root/.local/share",   # WRITABLE: kiro Linux auth (kiro-cli/data.sqlite3)
   "a2a-agent-reader:latest",
   "kiro-cli", "acp",
 ]
 
 # ── ollama: non-process api agent (kind="api"). Uncontainerized by design — no mount/proxy/creds.
-#    Role: tools-off nodes (synth/draft/inlined review). Local => no remote egress. ──
+#    Tools: NOT tool-free — it advertises a deterministic side-effect-free stub tool (no fs/shell).
+#    Role: inlined-context nodes (synth/draft/inlined review). Local => no remote egress. ──
 [[agents]]
 id          = "ollama"
 kind        = "api"
@@ -352,10 +376,10 @@ model       = "qwen2.5-coder:7b"          # any installed `ollama list` model; a
 
 Run: open `examples/a2a-bridge.multi-agent.toml`, copy the `code-review`, `spec-review`, `plan-review`, and `design` `[[workflows]]` blocks (verbatim) into the new file under the comment in Step 1. Verify the `agent =` ids are `codex`/`claude` (which now exist in this config).
 
-- [ ] **Step 3: Validate the config parses**
+- [ ] **Step 3: Validate the config parses** (run from a dir UNDER the mount root — see Task 0)
 
-Run: `cargo run -q -p a2a-bridge -- run-workflow design --input /tmp/containerized-agents-problem.md --config examples/a2a-bridge.containerized.toml 2>&1 | head -5`
-Expected: it begins running (node `executability`/`structure` started) — proving the config + `allowed_cmds=["docker"]` + the agents parse and resolve. (Ctrl-C after the start lines; the full run is Task 8.) If it errors `cmd not allowed: docker`, the `[registry] allowed_cmds` is missing/wrong.
+Run (from the repo root, which is under `/Users/wesleyjinks/code`): `cargo run -q -p a2a-bridge -- run-workflow design --input examples/sample-input.md --config examples/a2a-bridge.containerized.toml 2>&1 | head -5`
+Expected: it begins running (nodes started) — proving the config + the agents parse and resolve. (Ctrl-C after the start lines; the real per-agent run is Task 8.) Note: omitting `[registry] allowed_cmds` would NOT error — the allowlist defaults to the union of entry `cmd`s (which includes `docker`); the explicit `allowed_cmds=["docker"]` is still desirable as a tightening, so keep it.
 
 - [ ] **Step 4: Commit**
 
@@ -414,111 +438,168 @@ Expected: Binds JSON contains `…/code:…/code:ro`; `repo write blocked (expec
 git commit --allow-empty -m "validate: :ro integrity PASS (repo bind :ro asserted; repo write blocked)"
 ```
 
-### Task 8: GATE — per-agent end-to-end auth + ACP-over-container (validation gate 2)
+### Task 8: GATE — per-AGENT auth smoke via SINGLE-agent workflows (validation gate 2)
 
-**Files:** none (verification only). This is the central validation — it retires the unproven assumptions.
+> **Dual-review BLOCKER fix:** `design`/`code-review` start BOTH agents (both root lenses are
+> `inputs=[]`, and the executor schedules every ready root), so they can NOT isolate one agent. Use
+> one-node, one-agent **smoke** workflows instead. **Also (dual-review):** `run-workflow` drives the
+> agent via the *static* `current_dir` cwd — NOT a per-request `session_cwd` — so this gate proves
+> spawn + auth + `:ro` read + cwd-honoring + terminate, **not** the `allowed_cwd_root` gate (that's
+> Task 10 via `serve`). **MUST run from the repo root** (a dir under the mount) so the `session/new`
+> cwd exists inside the container.
 
-- [ ] **Step 1: claude first (the proven path) — run the `design` workflow through the container**
+**Files:** Create `prompts/smoke-read.md`, `prompts/smoke-reply.md`; add four one-node smoke workflows
+to `examples/a2a-bridge.containerized.toml`.
 
-Run:
-```bash
-cargo run -q -p a2a-bridge -- run-workflow design \
-  --input /tmp/containerized-agents-problem.md \
-  --out /tmp/c-design-claude.md \
-  --config examples/a2a-bridge.containerized.toml
-echo "EXIT=$?"; tail -5 /tmp/c-design-claude.md
+- [ ] **Step 1: Write the smoke prompts**
+
+```markdown
+<!-- prompts/smoke-read.md -->
+You are a READ-ONLY agent. Using read-only tools, list the top-level entries of the repository at your
+current working directory, then output the list on one line prefixed with `SMOKE_OK:` and STOP. Do not
+modify anything, run no builds, and make no network calls beyond your model.
 ```
-Expected: the `structure` node (claude, containerized) completes; `/tmp/c-design-claude.md` holds a synthesized design; EXIT=0. This proves: claude authenticates through the proxy inside the box, reads the repo (`:ro`), honors the ACP session cwd, and the turn terminates.
+```markdown
+<!-- prompts/smoke-reply.md -->
+Reply with exactly this line and nothing else: SMOKE_OK
+```
 
-- [ ] **Step 2: Inspect the proxy log to confirm egress went through the lock + discover hosts**
+- [ ] **Step 2: Add four single-agent smoke workflows to the containerized config**
+
+```toml
+[[workflows]]
+id = "smoke-claude"
+[[workflows.nodes]]
+id = "go"
+agent = "claude"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-codex"
+[[workflows.nodes]]
+id = "go"
+agent = "codex"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-kiro"
+[[workflows.nodes]]
+id = "go"
+agent = "kiro"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-ollama"
+[[workflows.nodes]]
+id = "go"
+agent = "ollama"
+prompt_file = "../prompts/smoke-reply.md"
+inputs = []
+```
+
+- [ ] **Step 3: claude smoke (the proven path) — RUN FROM THE REPO ROOT**
+
+Run (cwd = `/Users/wesleyjinks/code/a2a-bridge`, under the mount):
+```bash
+cargo run -q -p a2a-bridge -- run-workflow smoke-claude --input /dev/null \
+  --out /tmp/smoke-claude.txt --config examples/a2a-bridge.containerized.toml
+echo "EXIT=$?"; grep -o 'SMOKE_OK.*' /tmp/smoke-claude.txt | head -1
+```
+Expected: `SMOKE_OK: <repo top-level files>`, EXIT=0 → claude authenticates through the proxy in-box,
+reads the repo `:ro`, honors the ACP session cwd, terminates. (If `--input /dev/null` is rejected,
+point `--input` at any tiny file, e.g. `README.md`; the smoke prompt ignores the input.)
+
+- [ ] **Step 4: codex smoke — retire its in-box auth + `*.openai.com` egress**
+
+Run: same as Step 3 with `smoke-codex` → `/tmp/smoke-codex.txt`. Expected `SMOKE_OK: …`. **If codex
+fails auth/proxy-honoring:** record it, drop to claude-only, note the failing assumption in ADR-0016.
+
+- [ ] **Step 5: ollama smoke — retire the api-agent reachability (dual-review gap)**
+
+Ensure `OLLAMA_API_KEY` is exported in the serve/run env and a model is pulled (`ollama list`; match
+`model =` in the config). Run: same as Step 3 with `smoke-ollama` → expect `SMOKE_OK`. **If no local
+model is available**, record ollama as *config-only / unvalidated* in ADR-0016 (do not block).
+
+- [ ] **Step 6: Confirm egress went through the lock**
 
 Run: `docker logs a2a-egress-proxy 2>&1 | grep -iE "connect|deny|filter" | tail -20`
-Expected: CONNECT lines to `*.anthropic.com` (allowed); no successful connects to anything off-allowlist. **This log is also the discovery tool for Task 9 (kiro).**
+Expected: CONNECT to `*.anthropic.com` / `*.openai.com` only; nothing off-allowlist.
 
-- [ ] **Step 3: codex — same run via codex, retire its unproven auth + openai egress**
-
-Run:
-```bash
-cargo run -q -p a2a-bridge -- run-workflow code-review \
-  --input /tmp/containerized-agents-problem.md \
-  --out /tmp/c-review-codex.md \
-  --config examples/a2a-bridge.containerized.toml
-echo "EXIT=$?"; tail -5 /tmp/c-review-codex.md
-```
-Expected: the `correctness` node (codex, containerized) completes → codex authenticates in-box + `*.openai.com` egress works through the proxy. **If codex fails auth or proxy-honoring:** record it, drop codex to claude-only containerized (per the fallback), and note the failing assumption (auth / `HTTPS_PROXY` / ACP-cwd) in the ADR.
-
-- [ ] **Step 4: Commit the gate result (per agent)**
+- [ ] **Step 7: Commit the gate result (per agent)**
 
 ```bash
-git commit --allow-empty -m "validate: per-agent end-to-end PASS (claude design; codex code-review) through container+proxy"
+git add prompts/smoke-read.md prompts/smoke-reply.md examples/a2a-bridge.containerized.toml
+git commit -m "validate: per-agent auth smokes (single-agent workflows) — record claude/codex/ollama outcomes"
 ```
-(Record the actual per-agent outcome — including any fallback — in the message.)
 
 ### Task 9: kiro validation — device-flow login (once) + egress allowlist discovery
 
 (kiro is already in the image (Task 1) and config (Task 5). This task retires its two unknowns:
-device-flow auth into a persistent volume, and which egress hosts it needs. The auth is **interactive**
-— a human completes the browser step once; the token then persists + refreshes in the named volume.)
+device-flow auth into a persistent volume, and which egress hosts it needs. **VERIFIED LIVE
+2026-06-04** — the steps below are confirmed working, not hypothetical.)
 
 **Files:** modify `deploy/containers/tinyproxy.filter` (add kiro's discovered hosts).
 
-- [ ] **Step 1: One-time device-flow login inside a container, persisted to the named volume**
+- [ ] **Step 1: One-time device-flow login, persisted to the `a2a-kiro-data` volume**
 
-Run (interactive `-it`; the named volume `a2a-kiro-home` holds `/root/.aws`, so the SSO token persists):
+The host's macOS kiro auth state is **NOT** portable to Linux (kiro tries to open a browser and fails),
+so the auth must be minted in-container. Use **`--use-device-flow`** (prints a URL+code; no browser):
 ```bash
-docker run -it --rm \
-  --network a2a-egress-internal \
-  -e HTTPS_PROXY=http://a2a-egress-proxy:8888 -e HTTP_PROXY=http://a2a-egress-proxy:8888 \
-  -v a2a-kiro-home:/root/.aws \
-  a2a-agent-reader:latest kiro-cli login
+docker volume create a2a-kiro-data >/dev/null
+docker run -it --rm -v a2a-kiro-data:/root/.local/share \
+  a2a-agent-reader:latest kiro-cli login --use-device-flow
 ```
-The CLI prints a **URL + one-time code** — open the URL in a browser, enter the code, finish auth (e.g.
-Builder ID). Expected: login succeeds; the SSO token is written into the `a2a-kiro-home` volume
-(`/root/.aws/sso/cache`).
+Pick a sign-in method, open the printed URL, enter the one-time code. **VERIFIED:** kiro writes its
+Linux auth state to `~/.local/share/kiro-cli/data.sqlite3` (a sqlite DB — **NOT** `~/.aws`), which the
+volume persists; the token refreshes there on use. Login on a **plain network** (full egress) is
+simplest — the egress-locked path is exercised by the Step 3 smoke. *(The agent entry in Task 5 mounts
+exactly `a2a-kiro-data:/root/.local/share`.)*
 
-- [ ] **Step 2: If login is blocked by egress, discover + add the SSO hosts, then retry**
+- [ ] **Step 2: Verify auth from the volume (no browser) before wiring the bridge**
 
-The login itself must reach AWS SSO/OIDC through the proxy. If Step 1 hangs/fails on network, read the
-denied hosts and allowlist them:
 ```bash
+echo "Reply with exactly: KIRO_OK" | docker run -i --rm \
+  -v a2a-kiro-data:/root/.local/share \
+  a2a-agent-reader:latest kiro-cli chat --no-interactive --wrap never
+```
+Expected: a `KIRO_OK` reply (VERIFIED). If it instead prints "Opening browser…", the volume is empty /
+mis-mounted — re-do Step 1.
+
+- [ ] **Step 3: kiro through the egress-locked bridge — discover + pin EXACT hosts**
+
+Run the single-agent kiro smoke (from the repo root, through the proxy):
+```bash
+cargo run -q -p a2a-bridge -- run-workflow smoke-kiro --input README.md \
+  --out /tmp/smoke-kiro.txt --config examples/a2a-bridge.containerized.toml
+echo "EXIT=$?"; grep -o 'SMOKE_OK.*' /tmp/smoke-kiro.txt | head -1
 docker logs a2a-egress-proxy 2>&1 | grep -iE "deny|filter|connect" | tail -30
 ```
-Append the real denied hosts as **anchored ERE** regexes to `deploy/containers/tinyproxy.filter`
-(expected family: AWS SSO/OIDC + Cognito + Amazon Q / CodeWhisperer):
+If it's blocked, the proxy log names the **exact** denied hosts. Append them as **anchored,
+host-specific ERE** regexes (NOT the broad `(^|\.)amazonaws\.com$`, which would permit *any* AWS
+service — dual-review MAJOR) to `deploy/containers/tinyproxy.filter`, e.g. the specific Q / OIDC hosts
+seen in the log:
 ```text
-(^|\.)amazonaws\.com$
-(^|\.)amazoncognito\.com$
+# examples — replace with the EXACT hosts from the proxy log:
+(^|\.)q\.us-east-1\.amazonaws\.com$
+(^|\.)oidc\.us-east-1\.amazonaws\.com$
+(^|\.)codewhisperer\.us-east-1\.amazonaws\.com$
 ```
-Then `docker compose -f deploy/containers/compose.egress.yaml up -d --build` and re-run Step 1 until
-login completes.
-
-- [ ] **Step 3: Validate a kiro workflow node end-to-end (inference egress)**
-
-Run (point a throwaway `code-review` node at `agent = "kiro"`):
-```bash
-cargo run -q -p a2a-bridge -- run-workflow code-review \
-  --input /tmp/containerized-agents-problem.md \
-  --config examples/a2a-bridge.containerized.toml 2>&1 | tail -8
-```
-Expected: the kiro node authenticates (reusing the volume token), reads the repo `:ro`, and the turn
-**completes**. If inference needs hosts the login didn't (CodeWhisperer/Q runtime), repeat the Step 2
-discovery for those and re-run.
+Then `docker compose -f deploy/containers/compose.egress.yaml up -d --build` and re-run until the kiro
+smoke prints `SMOKE_OK`.
 
 - [ ] **Step 4: Decision + commit**
 
-If kiro completes → commit the allowlist:
+If kiro completes → commit the pinned allowlist:
 ```bash
 git add deploy/containers/tinyproxy.filter
-git commit -m "containers: pin kiro egress allowlist (AWS SSO + Amazon Q) from proxy-log discovery"
+git commit -m "containers: pin EXACT kiro egress hosts (Q/OIDC) from proxy-log discovery"
 ```
-**If kiro auth/inference won't work in-box** → drop to the claude+codex core (kiro is used primarily at
-work), revert the kiro allowlist lines + the kiro agent entry, and record the failed assumption in
-ADR-0016. **Do not block the increment on kiro.**
-
-> Note: the named volume captures `/root/.aws` (the SSO token cache). If kiro stores auth state
-> elsewhere (check `~/.kiro` or `~/.local/share` inside the container after login:
-> `docker run --rm -v a2a-kiro-home:/root/.aws a2a-agent-reader:latest find /root -name '*token*' 2>/dev/null`),
-> add a second named volume for that path and mirror it into the Task 5 kiro mount.
+**If kiro's egress won't close to specific hosts, or auth won't hold** → drop to the claude+codex core
+(kiro is used primarily at work), revert the kiro allowlist lines + the kiro agent entry, and record the
+failed assumption in ADR-0016. **Do not block the increment on kiro.**
 
 ### Task 10: GATE — cwd gate + multi-repo (validation gates 4 + 5)
 
@@ -542,7 +623,17 @@ Expected: a JSON-RPC error rejecting `/etc` (outside `/Users/wesleyjinks/code`).
 
 - [ ] **Step 2: Multi-repo — a second repo under the mount resolves with the same serve**
 
-Run: with serve up, run `code-review` against a DIFFERENT repo under `/Users/wesleyjinks/code` by setting its `session_cwd` (via `run-workflow` from that repo dir, or an A2A request with `a2a-bridge.cwd=/Users/wesleyjinks/code/<other>`). Expect the containerized agent to read that repo (one mount, many repos).
+Run: with `serve` up, send an **A2A `message/send`** (NOT `run-workflow` — only the serve path threads
+`session_cwd` into the gate + the agent mint) selecting a single agent, with
+`metadata."a2a-bridge.cwd" = "/Users/wesleyjinks/code/<other-repo>"`:
+```bash
+curl -sS -X POST http://127.0.0.1:8080/ -H 'content-type: application/json' -d '{
+  "jsonrpc":"2.0","id":2,"method":"message/send",
+  "params":{"message":{"role":"user","parts":[{"kind":"text","text":"List the top-level files here and STOP."}]},
+            "metadata":{"a2a-bridge.cwd":"/Users/wesleyjinks/code/<other-repo>","a2a-bridge.agent":"claude"}}}'
+```
+Expected: the containerized agent reads that *other* repo (one broad `:ro` mount, many repos via
+`session_cwd`). Kill serve when done.
 
 - [ ] **Step 3: Commit the gate result**
 
@@ -653,7 +744,7 @@ inputs = ["executability", "structure"]
 
 - [ ] **Step 4: Verify the two-pass design runs + the firewall holds**
 
-Run: `cargo run -q -p a2a-bridge -- run-workflow design --input /tmp/containerized-agents-problem.md --out /tmp/twopass.md --config examples/a2a-bridge.multi-agent.toml`
+Run: `cargo run -q -p a2a-bridge -- run-workflow design --input examples/sample-input.md --out /tmp/twopass.md --config examples/a2a-bridge.multi-agent.toml`
 Expected: nodes run in order draft → refine → synth; `/tmp/twopass.md` contains a synthesized design; each refine output starts with a GAPS register. Confirm no refine node declares the peer's draft in `inputs` (firewall).
 
 - [ ] **Step 5: Commit**
@@ -737,13 +828,18 @@ git commit -m "workflow: two-pass spec-review + plan-review (draft -> grounded r
 
 - [ ] **Step 1: Write the runbook** — covering, in order: (1) build the reader image; (2)
   `docker compose … up -d --build` the egress; (3) creds per agent — copy WRITABLE single-file creds
-  into `~/.config/a2a-creds/<agent>` for claude/codex, and the **one-time `kiro-cli login` device flow
-  into the `a2a-kiro-home` volume** for kiro; (4) `serve --config examples/a2a-bridge.containerized.toml`; (5) the
-  five validation gates as copy-paste blocks (egress triad, `:ro` Binds probe, per-agent end-to-end,
-  cwd gate, multi-repo); (6) the proxy-log allowlist-discovery method; (7) the claude-only fallback +
-  the four unproven assumptions; (8) macOS Docker Desktop notes (file-sharing for `~/.config`,
-  bind-mount latency) and the rootless-podman-on-Linux production note. Pull the exact commands from
-  Tasks 1–10 (DRY — reference, don't reinvent).
+  into `~/.config/a2a-creds/<agent>` for claude/codex, and the **one-time `kiro-cli login --use-device-flow`
+  into the `a2a-kiro-data` volume** (`~/.local/share/kiro-cli/data.sqlite3`) for kiro; (4)
+  `serve --config examples/a2a-bridge.containerized.toml`; (5) the validation gates as copy-paste blocks
+  (egress triad, `:ro` Binds probe, per-agent single-agent smokes, cwd gate via serve, multi-repo via
+  serve); (6) the proxy-log allowlist-discovery method (pin EXACT hosts, not broad globs); (7) the
+  claude-only fallback + the four unproven assumptions; (8) macOS Docker Desktop notes (file-sharing for
+  `~/.config`, bind-mount latency) and the rootless-podman-on-Linux production note. **Two load-bearing
+  rules to state explicitly:** (a) `run-workflow` uses the *static* cwd — **always run it from a dir
+  under `allowed_cwd_root`** (else the `session/new` cwd won't exist in the container); the cwd *gate*
+  is only enforced on the `serve`+A2A path. (b) **ollama**: only **local** `base_url` has no remote
+  egress — an ollama-*cloud* `base_url` egresses host-direct (bypasses the proxy). Pull exact commands
+  from Tasks 0–12 (DRY — reference, don't reinvent).
 
 - [ ] **Step 2: Commit**
 
@@ -760,10 +856,11 @@ git commit -m "docs: containerized-agents operator runbook (build, egress, creds
 - [ ] **Step 1: Write ADR-0016** — Context (the R1 finding: `:ro` is the only hard read-only
   guarantee; agent CLIs can't be flag-restricted); Decision (Slice A = config-only containerized `:ro`
   readers + egress lock + the uncontainerized api agent; amends ADR-0013's "config-only" toward the
-  Slice B enforced `[sandbox]` block); Evidence (the per-agent gate outcomes — which agents validated,
-  which fell back); Consequences (claude+codex containerized; kiro deferred-or-landed; ollama
-  uncontainerized; the four unproven assumptions retired-or-recorded). Carry the `Co-Authored-By`
-  trailer.
+  Slice B enforced `[sandbox]` block); Evidence (the per-agent **single-agent smoke** outcomes — which
+  agents validated, which fell back; **kiro auth VERIFIED via `~/.local/share/kiro-cli/data.sqlite3`**);
+  Consequences (claude+codex+kiro containerized; **ollama local-only — validated-or-recorded-unvalidated,
+  and note cloud `base_url` is host-direct egress**; the cwd gate is enforced only on the serve path;
+  the four unproven assumptions retired-or-recorded). Carry the `Co-Authored-By` trailer.
 
 - [ ] **Step 2: Commit**
 
@@ -787,18 +884,37 @@ writable creds + ERE allowlist + tools-off wording) are baked into T5/T2/T7/T8. 
 log) and the ollama model name (T5 — `ollama list` picks it). No silent TBDs.
 
 **Consistency:** image tag `a2a-agent-reader:latest`, proxy `a2a-egress-proxy:8888`, networks
-`a2a-egress-internal`/`a2a-egress-external`, creds `~/.config/a2a-creds/<agent>`, node-id convention
-`<lens>draft` → `<lens>` → `synth` are used identically across all tasks.
+`a2a-egress-internal`/`a2a-egress-external`, claude/codex creds `~/.config/a2a-creds/<agent>`, kiro
+auth volume `a2a-kiro-data:/root/.local/share`, node-id convention `<lens>draft` → `<lens>` → `synth`
+are used identically across all tasks.
+
+## Dual-review fold (Codex gpt-5.5 + Claude opus-4-8, against this plan + the real code)
+
+Both reviewers **confirmed the zero-Rust premise and the two-pass refine shape** against the code;
+neither found architectural rework. Folded fixes:
+- **BLOCKER (Codex):** `design`/`code-review` start *both* agents → can't isolate one → **Task 8 now
+  uses single-agent smoke workflows.**
+- **BLOCKER (Codex) — kiro auth:** resolved **LIVE** — Linux auth is `~/.local/share/kiro-cli/data.sqlite3`
+  (not `~/.aws`), via `kiro-cli login --use-device-flow` → the `a2a-kiro-data` volume (Tasks 5/9).
+- **Both — `run-workflow` ≠ cwd gate:** it uses the static `current_dir`, so Task 8/9 are spawn/auth
+  smokes (run from under the mount); the cwd gate stays on `serve` (Task 10, fixed multi-repo too);
+  runbook states the rule.
+- **Both — ollama unvalidated:** Task 8 Step 5 adds an ollama smoke; ADR records unvalidated if no
+  local model. "tools-off" → "side-effect-free stub tool"; cloud-egress caveat kept.
+- **Codex — kiro egress too broad:** Task 9 pins **exact** hosts from the proxy log, not `amazonaws.com`.
+- **Claude — input file gap:** **Task 0** authors `examples/sample-input.md`. Task 5 Step 3 diagnostic
+  corrected (`allowed_cmds` defaults to the union incl. docker). Containerfile drift reconciled
+  (committed, `--force --no-confirm`).
 
 ---
 
 ## Execution Handoff
 
-Per the project loop, this plan gets its **own Codex + Claude dual-review** (submitted via the
-a2a-local-bridge, like the spec) BEFORE any build. After folding that review:
+The plan's **Codex + Claude dual-review is DONE and folded** (above). Task 0/1 are already executed
+ahead of time (the reader image is built + the kiro login verified) to unblock the human-gated steps.
 
 **Two execution options:**
 1. **Subagent-Driven (recommended)** — fresh subagent per task + two-stage review (spec-compliance,
-   then quality). Note: the validation GATES (T4/T7/T8/T10) need a human-in-the-loop with Docker +
+   then quality). Note: the validation GATES (T4/T7/T8/T9/T10) need a human-in-the-loop with Docker +
    live creds — those tasks are operator-run, not subagent-automated.
 2. **Inline Execution** — execute in this session with checkpoints.

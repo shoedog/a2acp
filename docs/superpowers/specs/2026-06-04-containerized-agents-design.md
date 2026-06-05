@@ -111,11 +111,13 @@ honestly:
   the directory exists or that the Docker bind actually matches that root. "Exists inside the
   container" holds **only if** the operator's `-v` mount equals `allowed_cwd_root` (a config
   discipline in A; the Slice B `[sandbox]` block *enforces* mount==root and derives the bind).
-- The gate covers the **per-request** cwd only. A **static** `AgentEntry.session_cwd → cwd → "."`
-  fallback (`main.rs` `resolve_static_session_cwd`) is **not** `is_under`-checked. So in Slice A:
-  **always drive containerized readers with a per-request `session_cwd`** (the workflow/run-workflow
-  path does), and if a static cwd is configured it must *also* be under the mount (operator
-  discipline; a boot-time check is a small Slice B addition).
+- The gate covers the **per-request** `session_cwd` (the `serve`+A2A path) only. **`run-workflow` does
+  NOT supply a per-request `session_cwd`** (dual-review correction) — it drives the agent via the
+  *static* `current_dir`/`AcpConfig.cwd` (`main.rs` `resolve_static_session_cwd`), which is **not**
+  `is_under`-checked. So in Slice A: the cwd **gate** is proven on the `serve`+A2A path; the
+  `run-workflow` smokes **must be run from a dir under the mount root** (else the `session/new` cwd
+  won't exist in the container). If a static cwd is configured it must *also* be under the mount
+  (operator discipline; a boot-time check is a small Slice B addition).
 
 **Runtime:** examples use `docker` (what's installed here) for local validation; the args are
 CLI-compatible with **rootless podman** (ADR-0013's production target). Runtime-agnostic by design.
