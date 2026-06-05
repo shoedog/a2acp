@@ -10,10 +10,11 @@
 
 **Scope note (from grounding):** the reader image is **Linux** — on macOS, Docker Desktop runs all
 containers in a Linux VM — so the host's `kiro-cli` (a macOS Mach-O at `/Applications/Kiro CLI.app`)
-can't run in it; we install kiro's **Linux** build *into* the image via its official installer
-(`curl -fsSL https://cli.kiro.dev/install | bash`, Task 1). All three agents — `claude-agent-acp` +
-`codex-acp` (npm) + `kiro-cli` (curl installer) — are first-class containerized readers; **kiro is no
-longer deferred.** Claude has prior container evidence (ADR-0013); codex/kiro carry **four unproven
+can't run in it; we install kiro's **Linux** build *into* the image via the official arch-aware
+zip method (Task 1). All three agents — `claude-agent-acp` + `codex-acp` (npm) + `kiro-cli` (zip
+installer) — are first-class containerized readers; **kiro is no longer deferred.** kiro auth is an
+interactive **device flow** done **once** inside a container, persisted to a writable named volume
+(Task 9). Claude has prior container evidence (ADR-0013); codex/kiro carry **four unproven
 assumptions** (auth / egress allowlist / `HTTPS_PROXY` honoring / ACP-cwd honoring) retired during
 validation (Task 8/9). **claude-only is the documented fallback** if any agent fails those.
 
@@ -72,9 +73,20 @@ RUN npm install -g \
       @agentclientprotocol/claude-agent-acp@0.39.0 \
       @zed-industries/codex-acp@0.15.0
 
-# kiro-cli: install the LINUX build via the official installer (the host's macOS binary can't run in
-# this Linux image). The installer drops the binary under ~/.local/bin (root → /root/.local/bin).
-RUN curl -fsSL https://cli.kiro.dev/install | bash
+# kiro-cli: install the LINUX build (the host's macOS binary can't run in this Linux image). Official
+# zip method (https://kiro.dev/docs/cli/installation/#with-a-zip-file); arch-aware so it works whether
+# Docker Desktop runs amd64 or arm64 (Apple Silicon → arm64). node:24-slim is bookworm/glibc 2.36 (>=2.34
+# required). install.sh drops the binary under ~/.local/bin (root → /root/.local/bin).
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) url="https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux.zip" ;; \
+      arm64) url="https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-aarch64-linux.zip" ;; \
+      *) echo "unsupported arch" >&2; exit 1 ;; \
+    esac; \
+    curl --proto '=https' --tlsv1.2 -sSf "$url" -o /tmp/kirocli.zip; \
+    unzip -q /tmp/kirocli.zip -d /tmp; \
+    /tmp/kirocli/install.sh --no-confirm 2>/dev/null || /tmp/kirocli/install.sh </dev/null; \
+    rm -rf /tmp/kirocli /tmp/kirocli.zip
 ENV PATH="/root/.local/bin:${PATH}"
 
 # Workdir is cosmetic: the ACP session cwd arrives over the protocol (session/new); the repo is
@@ -302,8 +314,9 @@ args = [
   "codex-acp",
 ]
 
-# ── kiro: AWS-SSO auth; Linux build baked into the image (Task 1). Auth + egress allowlist validated
-#    in Task 9. Mounts a WRITABLE copy of the AWS-SSO cache (token refresh writes back). ──
+# ── kiro: Linux build baked into the image (Task 1). Device-flow auth done ONCE in-container and
+#    persisted to the WRITABLE named volume `a2a-kiro-home` (token refresh writes back). The volume
+#    holds kiro's $HOME state (~/.aws SSO cache, etc.); validated + allowlist-pinned in Task 9. ──
 [[agents]]
 id   = "kiro"
 cmd  = "docker"
@@ -313,7 +326,7 @@ args = [
   "-e", "HTTPS_PROXY=http://a2a-egress-proxy:8888",
   "-e", "HTTP_PROXY=http://a2a-egress-proxy:8888",
   "-v", "/Users/wesleyjinks/code:/Users/wesleyjinks/code:ro",
-  "-v", "/Users/wesleyjinks/.config/a2a-creds/kiro/.aws:/root/.aws",   # WRITABLE AWS-SSO cache copy
+  "-v", "a2a-kiro-home:/root/.aws",        # WRITABLE named volume: persisted device-flow creds
   "a2a-agent-reader:latest",
   "kiro-cli", "acp",
 ]
@@ -439,58 +452,71 @@ git commit --allow-empty -m "validate: per-agent end-to-end PASS (claude design;
 ```
 (Record the actual per-agent outcome — including any fallback — in the message.)
 
-### Task 9: kiro validation — auth in-box + egress allowlist discovery
+### Task 9: kiro validation — device-flow login (once) + egress allowlist discovery
 
-(kiro is already in the image (Task 1) and the config (Task 5). This task retires its two unknowns:
-in-container AWS-SSO auth, and which egress hosts it needs.)
+(kiro is already in the image (Task 1) and config (Task 5). This task retires its two unknowns:
+device-flow auth into a persistent volume, and which egress hosts it needs. The auth is **interactive**
+— a human completes the browser step once; the token then persists + refreshes in the named volume.)
 
 **Files:** modify `deploy/containers/tinyproxy.filter` (add kiro's discovered hosts).
 
-- [ ] **Step 1: Copy kiro's AWS-SSO creds (WRITABLE — token refresh writes back)**
+- [ ] **Step 1: One-time device-flow login inside a container, persisted to the named volume**
 
-Run:
+Run (interactive `-it`; the named volume `a2a-kiro-home` holds `/root/.aws`, so the SSO token persists):
 ```bash
-mkdir -p ~/.config/a2a-creds/kiro/.aws
-cp -R ~/.aws/sso  ~/.config/a2a-creds/kiro/.aws/sso  2>/dev/null || true
-cp -R ~/.aws/config ~/.config/a2a-creds/kiro/.aws/config 2>/dev/null || true
-chmod -R u+rw ~/.config/a2a-creds/kiro
+docker run -it --rm \
+  --network a2a-egress-internal \
+  -e HTTPS_PROXY=http://a2a-egress-proxy:8888 -e HTTP_PROXY=http://a2a-egress-proxy:8888 \
+  -v a2a-kiro-home:/root/.aws \
+  a2a-agent-reader:latest kiro-cli login
 ```
-Expected: `~/.config/a2a-creds/kiro/.aws/sso/cache` exists. (If kiro stores creds elsewhere — check
-`~/.kiro` — copy that path instead and adjust the config mount.)
+The CLI prints a **URL + one-time code** — open the URL in a browser, enter the code, finish auth (e.g.
+Builder ID). Expected: login succeeds; the SSO token is written into the `a2a-kiro-home` volume
+(`/root/.aws/sso/cache`).
 
-- [ ] **Step 2: Run a workflow node through kiro and discover its egress hosts from the proxy log**
+- [ ] **Step 2: If login is blocked by egress, discover + add the SSO hosts, then retry**
 
-Run: temporarily point a `code-review` node at `agent = "kiro"` (or add a throwaway one), then:
+The login itself must reach AWS SSO/OIDC through the proxy. If Step 1 hangs/fails on network, read the
+denied hosts and allowlist them:
 ```bash
-cargo run -q -p a2a-bridge -- run-workflow code-review \
-  --input /tmp/containerized-agents-problem.md \
-  --config examples/a2a-bridge.containerized.toml 2>&1 | tail -8
 docker logs a2a-egress-proxy 2>&1 | grep -iE "deny|filter|connect" | tail -30
 ```
-Expected: the proxy log shows the hosts kiro tried to reach. Denied ones it legitimately needs are the
-allowlist gaps.
-
-- [ ] **Step 3: Add kiro's hosts as anchored ERE regexes + rebuild the proxy**
-
-Append to `deploy/containers/tinyproxy.filter` (real hosts from Step 2 — likely Amazon Q /
-CodeWhisperer + AWS SSO/Cognito):
+Append the real denied hosts as **anchored ERE** regexes to `deploy/containers/tinyproxy.filter`
+(expected family: AWS SSO/OIDC + Cognito + Amazon Q / CodeWhisperer):
 ```text
 (^|\.)amazonaws\.com$
 (^|\.)amazoncognito\.com$
 ```
-Then `docker compose -f deploy/containers/compose.egress.yaml up -d --build` and re-run Step 2 until
-the kiro turn **completes** (auth through the proxy + repo read + terminate).
+Then `docker compose -f deploy/containers/compose.egress.yaml up -d --build` and re-run Step 1 until
+login completes.
+
+- [ ] **Step 3: Validate a kiro workflow node end-to-end (inference egress)**
+
+Run (point a throwaway `code-review` node at `agent = "kiro"`):
+```bash
+cargo run -q -p a2a-bridge -- run-workflow code-review \
+  --input /tmp/containerized-agents-problem.md \
+  --config examples/a2a-bridge.containerized.toml 2>&1 | tail -8
+```
+Expected: the kiro node authenticates (reusing the volume token), reads the repo `:ro`, and the turn
+**completes**. If inference needs hosts the login didn't (CodeWhisperer/Q runtime), repeat the Step 2
+discovery for those and re-run.
 
 - [ ] **Step 4: Decision + commit**
 
 If kiro completes → commit the allowlist:
 ```bash
 git add deploy/containers/tinyproxy.filter
-git commit -m "containers: pin kiro egress allowlist (Amazon Q + AWS SSO) from proxy-log discovery"
+git commit -m "containers: pin kiro egress allowlist (AWS SSO + Amazon Q) from proxy-log discovery"
 ```
-**If kiro auth fails in-box** (AWS-SSO doesn't port into the container) → drop to the claude+codex core
-(kiro is used primarily at work), revert the kiro allowlist lines, and record the failed assumption in
-ADR-0016. Do not block the increment.
+**If kiro auth/inference won't work in-box** → drop to the claude+codex core (kiro is used primarily at
+work), revert the kiro allowlist lines + the kiro agent entry, and record the failed assumption in
+ADR-0016. **Do not block the increment on kiro.**
+
+> Note: the named volume captures `/root/.aws` (the SSO token cache). If kiro stores auth state
+> elsewhere (check `~/.kiro` or `~/.local/share` inside the container after login:
+> `docker run --rm -v a2a-kiro-home:/root/.aws a2a-agent-reader:latest find /root -name '*token*' 2>/dev/null`),
+> add a second named volume for that path and mirror it into the Task 5 kiro mount.
 
 ### Task 10: GATE — cwd gate + multi-repo (validation gates 4 + 5)
 
@@ -708,8 +734,9 @@ git commit -m "workflow: two-pass spec-review + plan-review (draft -> grounded r
 - Create: `docs/containerized-agents.md`
 
 - [ ] **Step 1: Write the runbook** — covering, in order: (1) build the reader image; (2)
-  `docker compose … up -d --build` the egress; (3) copy per-agent WRITABLE creds into
-  `~/.config/a2a-creds/<agent>`; (4) `serve --config examples/a2a-bridge.containerized.toml`; (5) the
+  `docker compose … up -d --build` the egress; (3) creds per agent — copy WRITABLE single-file creds
+  into `~/.config/a2a-creds/<agent>` for claude/codex, and the **one-time `kiro-cli login` device flow
+  into the `a2a-kiro-home` volume** for kiro; (4) `serve --config examples/a2a-bridge.containerized.toml`; (5) the
   five validation gates as copy-paste blocks (egress triad, `:ro` Binds probe, per-agent end-to-end,
   cwd gate, multi-repo); (6) the proxy-log allowlist-discovery method; (7) the claude-only fallback +
   the four unproven assumptions; (8) macOS Docker Desktop notes (file-sharing for `~/.config`,
