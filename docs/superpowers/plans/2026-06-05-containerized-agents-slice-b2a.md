@@ -1196,3 +1196,47 @@ Expected: `PERSIST_OK`, `REAPED_OK`, one contained `a2a-agent-reader` mid-turn (
 **3. Type consistency:** `ContainerRwConfig` fields (sandbox/cmd/args/model/mode/auth_method/handshake_timeout/cancel_grace) match T7 ↔ T10 ↔ T14. `AcpConfig` fields match acp_backend.rs:68 (cwd/model/mode/auth_method/handshake_timeout/cancel_grace). `ContainerSpawn::spawn(&self, program, argv, cfg)` matches T7 ↔ T10 ↔ T14. `reap_fn: ReapFn(runtime, name)` consistent T10/11/13. `check_rw_target(mount_canon, rw_canon)` pure in bridge-core, called by backend `resolve_rw_target` (T6 ↔ T9).
 
 **Open item for the plan-review to weigh:** the `with_policy` threading in T14 (the inner `AcpBackend` needs the policy; applied in `AcpContainerSpawn::with_policy`) — confirm this matches how the existing `Acp` arm applies `with_policy` (main.rs:211) and that `ContainerRwBackend` doesn't also need the policy (it only forwards to the inner). If the inner never raises permission asks under AutoPolicy, the policy field on the backend may be droppable — leave it for parity, flag for the reviewer.
+
+---
+
+## Plan rev2 — dual-review corrections (BINDING; override the body where they conflict)
+
+Both plan-reviews (containerized dogfood primary + a2a-local codex `gpt-5.5` backstop) returned
+**needs-changes**, and **both** confirmed the DESIGN + spec→task spine are SOUND — the defects are
+decomposition/placeholder/compile issues. Apply ALL of R1–R24 during the build.
+
+### Structural (apply before the Slice-2 tasks)
+- **R1 — One constructor, defined once in Task 7/8, never churned.** `pub async fn new_with_hooks(cfg: ContainerRwConfig, spawn: Arc<dyn ContainerSpawn>, owner: String, reap_fn: ReapFn, sweep_fn: SweepFn) -> Result<Self, BridgeError>` (AWAITS the boot-sweep before returning) + a thin `pub async fn new(cfg, spawn, owner) -> Result<Self, BridgeError>` supplying `production_reap_fn(runtime)` + `production_sweep_fn(runtime)`. EVERY test helper calls `new_with_hooks` with a no-op `sweep_fn` + a counting `reap_fn`. No later task changes the signature; Task 14 uses `.await?`. (codex B3 / dogfood B3)
+- **R2 — Reorder Slice 2 so the reaper infra lands BEFORE `prompt`.** New order: T7 crate+seam+struct → T8 constructor+configure/forget → **T9 `ContainerReaper`+`ReapFn`+`SweepFn`+`spawn_detached`+`wrap_with_reaper`+`reap_now`** → T10 canonicalizing guard → T11 `prompt` mint (uses the REAL reaper, correct arity) → T12 cancel/retire → T13 production boot-sweep+reap wiring. `prompt` then references no undefined symbols. (codex B4 / dogfood B4)
+- **R3 — No dead fields.** `ContainerRwBackend` has NO `policy` and NO `allowed_cwd_root` field. Containment anchor = `cfg.sandbox.mount` (S2 == normalized allowed_cwd_root); policy lives only on `AcpContainerSpawn`. Remove the temporary `#![allow(dead_code)]`; add `-- -D warnings` to every clippy step (CI enforces it, ci.yml:11/45). (dogfood M2 / codex nit2)
+
+### Correctness (subtle — NOT compiler-caught; do not skip)
+- **R4 — `bridge_core::domain::PermissionDecision::Approve`** (not `ports::Allow`) in the `AllowAll` test stub. (codex B1)
+- **R5 — Owner includes the AGENT ID.** `container_owner(config_path, mount, agent_id)` hashes all three, so two `container_rw` agents never both mint `a2a-rw-<owner>-0` nor cross-reap. (codex B4)
+- **R6 — Forward the CANONICAL cwd to the inner.** AcpBackend prefers the stashed `SessionSpec.cwd` over `AcpConfig.cwd` (acp_backend.rs:889). Before `inner.configure_session`, clone the spec and set `cwd = Some(rw_canon.clone())` so the ACP session cwd == the mounted path. (codex B5)
+- **R7 — Atomic check-and-reserve.** Under ONE `inflight` lock: present → reject; else insert a reservation; release; spawn; on success fill, on any failure remove. Model `inflight: Mutex<HashMap<SessionId, InflightState>>` = `Reserving | Live(InflightTurn)`. No separate `contains_key`+`insert`. (codex B6)
+- **R8 — One shared `reaped` across cancel + stream-drop.** `InflightTurn` and its `ContainerReaper` share ONE `Arc<AtomicBool>`; whoever reaps first wins, the other is a no-op. (codex B7)
+- **R9 — Reap on `configure_session`/`prompt` failure.** Any `?` between a successful spawn and the reaper-owning stream must `reap_now(&name)` + clear the reservation before returning. (codex B8)
+- **R10 — Runtime-parametric sweep + reap.** Production `sweep_fn`/`reap_fn` use `cfg.sandbox.runtime()` (docker|podman), never hardcoded `docker`; add a timeout + `agent_stderr` logging. (dogfood M4 / codex SF6)
+
+### Wiring (Slice 3 / Task 14, split 14a spawn+owner / 14b replace-arms)
+- **R11 — Anchor from `entry.sandbox.mount`, NOT `allowed_cwd_root`.** The field is absent from `RegistrySnapshot` AND out of scope in both closures (serve: cfg parsed at :953 AFTER the closure at :856; run-workflow: cfg consumed by `into_snapshot()` at :172 BEFORE the closure at :177). S2 guarantees `entry.sandbox.mount` == normalized `allowed_cwd_root`. `config_path` IS in scope before both closures (serve :837, run-workflow :145). Delete the false "snapshot carries it" line and the `[registry] allowed_cwd_root` nit (it's top-level; moot now). (dogfood B1 / codex B2,nit3)
+- **R12 — Concrete `AcpContainerSpawn { policy: Arc<dyn PolicyEngine> }`** + `fn with_policy(policy) -> Self`; apply `.with_policy(policy)` to the inner `AcpBackend` INSIDE `spawn` (matches main.rs:211). Not a unit struct. (both)
+
+### Test rigor (no vacuous or threshold-gated tests)
+- **R13 — Assert the reap FIRED on spawn-failure** via the `reap_fn` counter (not just empty `inflight`). (both M1)
+- **R14 — Dedicated failing-test steps** (not the Task-15 threshold backfill) for: `canonicalize_lenient` nearest-existing-ancestor on a not-yet-existing scratch dir (T10); the `inner.prompt`-error reap path (T11); `retire` cancel+reap (T12); off-runtime `ContainerReaper` Drop (T9). (dogfood M3 / codex SF4,SF5)
+- **R15 — Backend-level argv assertion** (`:rw` mount / no `:ro`) in the prompt mint test, not only the pure composer. (codex SF3)
+- **R16 — Fix invalid commands:** Task 1 → `cargo test -p a2a-bridge parse_kind` (bin has NO lib target — drop `--lib`); Task 11 → one bare filter per command. (codex SF7 / dogfood M7)
+- **R17 — Tasks 1–3 are ONE green commit** (workspace red only transiently between T1–T3; commit at T3). State it; no red checkpoint. (dogfood M5)
+- **R18 — `retire` cancels THEN reaps** each inflight (graceful `session/cancel` before `rm -f`). (both N2/SF1)
+
+### New tasks folded per the run-workflow cwd learning (memory: workflow-cwd-cleanroom-gotcha)
+- **R19 — Task 17: `run-workflow --session-cwd <dir>`** — parse the flag, validate via `SessionCwd::parse`, thread into `WorkflowRunContext { session_cwd: Some(..) }` (use `run_with_context`). Fixes the agents-get-launch-cwd gap AND lets the B2a gate run via run-workflow (the "both paths" the gate dropped to serve-only). TDD: a unit test that the parsed flag reaches the context (mirror executor.rs:1363's cwd-threading test). codex B2's missing-cwd path for run-workflow closes here.
+- **R20 — Task 18: brief-only clean-room `design`/review prompts** — config/prompt-only edit to the workflow node prompts in `examples/*.toml`: "work FROM the inlined brief/diff; repo access is optional context, its absence is NOT a failure — never bail for missing files." No Rust.
+- **R21 — Task 19: doc the per-turn memory-loss asymmetry** in `docs/containerized-agents.md` (per-turn `serve` loses conversational memory vs the warm `:ro` reader; spec decision #1). (dogfood M6 / codex SF8)
+
+### Self-review correction
+- **R22 —** the body's "no placeholders" self-check was FALSE (Tasks 10–14 had forward-ref placeholders); R1–R12 remove them. The concrete test helpers (`test_cfg()`, `noop_reap_fn()`, full `CountingSpawn` literal, `backend_with_reapfn` with a real `tempdir` root, `spec_with_cwd` with a real root) MUST be written out, not left as `/* ... */`. (codex N4 / dogfood N4,B5)
+
+**Both verdicts:** design + spine sound; R1–R22 are decomposition/placeholder/compile fixes. After applying them the plan builds green-per-task; **no third plan-review needed** — the inline TDD build (compiler + tests per task) is the verification.
