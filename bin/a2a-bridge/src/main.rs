@@ -94,6 +94,40 @@ fn acp_program_argv(entry: &AgentEntry) -> Result<(String, Vec<String>), BridgeE
     })
 }
 
+/// Production [`bridge_container::ContainerSpawn`]: spawn a real `AcpBackend` inside the composed
+/// container and apply the system policy (mirrors the `Acp` arm's `.with_policy`). The policy lives
+/// HERE, not on `ContainerRwBackend` (which only forwards to the inner).
+struct AcpContainerSpawn {
+    policy: Arc<dyn bridge_core::ports::PolicyEngine>,
+}
+#[async_trait::async_trait]
+impl bridge_container::ContainerSpawn for AcpContainerSpawn {
+    async fn spawn(
+        &self,
+        program: &str,
+        argv: &[String],
+        cfg: bridge_acp::acp_backend::AcpConfig,
+    ) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
+        let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let be = bridge_acp::acp_backend::AcpBackend::spawn(program, &argv_ref, cfg)
+            .await?
+            .with_policy(Arc::clone(&self.policy));
+        Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+    }
+}
+
+/// Stable per-instance owner token for `ContainerRw` container names: hash of the canonical config
+/// path + the mount anchor + the agent id. STABLE across restarts (a restarted process reaps its OWN
+/// crash orphans) and UNIQUE per agent (two `container_rw` agents can't collide / cross-reap).
+fn container_owner(config_path: &std::path::Path, mount: &str, agent_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    config_path.hash(&mut h);
+    mount.hash(&mut h);
+    agent_id.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Parse `a2a-bridge run-workflow <id> --input <file> [--out <file>] [--config <path>]`
 /// from a raw args iterator (skipping the binary name at position 0 and the
 /// subcommand name at position 1).
@@ -174,8 +208,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
     let policy = Arc::new(bridge_policy::permission::AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
+    let owner_config_path = config_path.clone();
     let spawn: bridge_registry::registry::SpawnFn = Arc::new(move |entry: Arc<AgentEntry>| {
         let policy = Arc::clone(&policy_for_spawn);
+        let owner_config_path = owner_config_path.clone();
         Box::pin(async move {
             // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
             // Resolution chain: session_cwd → cwd → "."; then absolutize relative values.
@@ -221,12 +257,35 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                     let be = bridge_api::ApiBackend::new(api_cfg).with_policy(policy);
                     Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
                 }
-                AgentKind::ContainerRw => Err(BridgeError::ConfigInvalid {
-                    reason: format!(
-                        "container_rw agent {} not yet wired (Slice B2a Slice 3)",
-                        entry.id.as_str()
-                    ),
-                }),
+                AgentKind::ContainerRw => {
+                    let sb = entry.sandbox.clone().ok_or(BridgeError::ConfigInvalid {
+                        reason: format!(
+                            "container_rw agent {} requires sandbox",
+                            entry.id.as_str()
+                        ),
+                    })?;
+                    let cmd = entry.cmd.clone().ok_or(BridgeError::ConfigInvalid {
+                        reason: format!("container_rw agent {} requires cmd", entry.id.as_str()),
+                    })?;
+                    let owner = container_owner(&owner_config_path, &sb.mount, entry.id.as_str());
+                    let ccfg = bridge_container::ContainerRwConfig {
+                        sandbox: sb,
+                        cmd,
+                        args: entry.args.clone(),
+                        model: entry.model.clone(),
+                        mode: entry.mode.clone(),
+                        auth_method: entry.auth_method.clone(),
+                        handshake_timeout: bridge_acp::acp_backend::AcpConfig::default()
+                            .handshake_timeout,
+                        cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+                    };
+                    let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
+                        Arc::new(AcpContainerSpawn {
+                            policy: Arc::clone(&policy),
+                        });
+                    let be = bridge_container::ContainerRwBackend::new(ccfg, cspawn, owner).await?;
+                    Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+                }
             }
         })
     });
@@ -859,8 +918,10 @@ async fn main() -> Result<(), BoxError> {
     //    each `session/new`. `model`/`mode` here are the per-MINT FALLBACK; the
     //    per-session `configure_session` overrides them at dispatch (Task 6).
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
+    let owner_config_path = config_path.clone();
     let spawn: SpawnFn = Arc::new(move |entry: Arc<AgentEntry>| {
         let policy = Arc::clone(&policy_for_spawn);
+        let owner_config_path = owner_config_path.clone();
         Box::pin(async move {
             // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
             // Resolution chain: session_cwd → cwd → ".". A relative resolved value is joined
@@ -910,12 +971,35 @@ async fn main() -> Result<(), BoxError> {
                     let be = bridge_api::ApiBackend::new(cfg).with_policy(policy);
                     Ok(Arc::new(be) as Arc<dyn AgentBackend>)
                 }
-                AgentKind::ContainerRw => Err(BridgeError::ConfigInvalid {
-                    reason: format!(
-                        "container_rw agent {} not yet wired (Slice B2a Slice 3)",
-                        entry.id.as_str()
-                    ),
-                }),
+                AgentKind::ContainerRw => {
+                    let sb = entry.sandbox.clone().ok_or(BridgeError::ConfigInvalid {
+                        reason: format!(
+                            "container_rw agent {} requires sandbox",
+                            entry.id.as_str()
+                        ),
+                    })?;
+                    let cmd = entry.cmd.clone().ok_or(BridgeError::ConfigInvalid {
+                        reason: format!("container_rw agent {} requires cmd", entry.id.as_str()),
+                    })?;
+                    let owner = container_owner(&owner_config_path, &sb.mount, entry.id.as_str());
+                    let ccfg = bridge_container::ContainerRwConfig {
+                        sandbox: sb,
+                        cmd,
+                        args: entry.args.clone(),
+                        model: entry.model.clone(),
+                        mode: entry.mode.clone(),
+                        auth_method: entry.auth_method.clone(),
+                        handshake_timeout: bridge_acp::acp_backend::AcpConfig::default()
+                            .handshake_timeout,
+                        cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+                    };
+                    let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
+                        Arc::new(AcpContainerSpawn {
+                            policy: Arc::clone(&policy),
+                        });
+                    let be = bridge_container::ContainerRwBackend::new(ccfg, cspawn, owner).await?;
+                    Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+                }
             }
         })
     });
