@@ -26,6 +26,7 @@
 //                                                        — stream a task's progress (SSE)
 
 mod config;
+mod implement;
 mod route;
 
 use std::path::PathBuf;
@@ -128,100 +129,14 @@ fn container_owner(config_path: &std::path::Path, mount: &str, agent_id: &str) -
     format!("{:016x}", h.finish())
 }
 
-/// Parse `a2a-bridge run-workflow <id> --input <file> [--out <file>] [--config <path>]`
-/// from a raw args iterator (skipping the binary name at position 0 and the
-/// subcommand name at position 1).
-#[allow(clippy::type_complexity)]
-fn parse_run_workflow_args(
-    args: &[String],
-) -> Result<(String, PathBuf, Option<PathBuf>, PathBuf, Option<String>), BoxError> {
-    let mut iter = args.iter().peekable();
-    // Positional: workflow id
-    let workflow_id = iter
-        .next()
-        .cloned()
-        .ok_or("run-workflow: missing <workflow-id>")?;
-    let mut input: Option<PathBuf> = None;
-    let mut out: Option<PathBuf> = None;
-    let mut config: Option<PathBuf> = None;
-    // The per-request ACP session cwd (the writable target for a container_rw agent, or the repo a
-    // reader works in). Without it, run-workflow agents run in the LAUNCH cwd, not the target repo.
-    let mut session_cwd: Option<String> = None;
-    while let Some(flag) = iter.next() {
-        match flag.as_str() {
-            "--input" => {
-                input = Some(PathBuf::from(
-                    iter.next()
-                        .ok_or("run-workflow: --input requires a value")?,
-                ));
-            }
-            "--out" => {
-                out = Some(PathBuf::from(
-                    iter.next().ok_or("run-workflow: --out requires a value")?,
-                ));
-            }
-            "--config" => {
-                config = Some(PathBuf::from(
-                    iter.next()
-                        .ok_or("run-workflow: --config requires a value")?,
-                ));
-            }
-            "--session-cwd" => {
-                session_cwd = Some(
-                    iter.next()
-                        .ok_or("run-workflow: --session-cwd requires a value")?
-                        .clone(),
-                );
-            }
-            other => return Err(format!("run-workflow: unknown flag {other:?}").into()),
-        }
-    }
-    let input = input.ok_or("run-workflow: --input <file> is required")?;
-    let config = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
-    Ok((workflow_id, input, out, config, session_cwd))
-}
-
-/// Execute the `run-workflow` subcommand.
-/// Loads the config, resolves the workflow graph, runs the executor,
-/// prints NodeStarted/NodeFinished to stderr and the terminal output to stdout
-/// (or `--out <file>`).
-async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
-    bridge_observ::init();
-    let (workflow_id, input_path, out_path, config_path, session_cwd) =
-        parse_run_workflow_args(args)?;
-
-    // Load config.
-    let raw = std::fs::read_to_string(&config_path)
-        .map_err(|e| format!("run-workflow: cannot read config {:?}: {e}", config_path))?;
-    let cfg = config::RegistryConfig::parse(&raw)
-        .map_err(|e| format!("run-workflow: config parse error: {e}"))?;
-
-    // Resolve prompt file base dir (same logic as `serve`).
-    let base = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
-    let wf_map = cfg
-        .load_workflows(&base)
-        .map_err(|e| format!("run-workflow: workflow load error: {e}"))?;
-
-    // Resolve workflow id.
-    let wf_id = bridge_core::ids::WorkflowId::parse(workflow_id.clone())
-        .map_err(|e| format!("run-workflow: invalid workflow id {workflow_id:?}: {e:?}"))?;
-    let graph = wf_map
-        .get(&wf_id)
-        .cloned()
-        .ok_or_else(|| format!("run-workflow: unknown workflow {workflow_id:?}"))?;
-
-    // Build the registry + executor using the same SpawnFn the server uses.
-    let snapshot = cfg
-        .into_snapshot()
-        .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
-    let policy = Arc::new(bridge_policy::permission::AutoPolicy);
-    let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
-    let owner_config_path = config_path.clone();
-    let spawn: bridge_registry::registry::SpawnFn = Arc::new(move |entry: Arc<AgentEntry>| {
+/// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
+/// `implement` subcommand so their registry builds can't drift. `owner_config_path` seeds the ContainerRw
+/// owner token.
+fn make_spawn_fn(
+    policy_for_spawn: Arc<dyn bridge_core::ports::PolicyEngine>,
+    owner_config_path: PathBuf,
+) -> bridge_registry::registry::SpawnFn {
+    Arc::new(move |entry: Arc<AgentEntry>| {
         let policy = Arc::clone(&policy_for_spawn);
         let owner_config_path = owner_config_path.clone();
         Box::pin(async move {
@@ -300,7 +215,358 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 }
             }
         })
-    });
+    })
+}
+
+/// Parse `a2a-bridge run-workflow <id> --input <file> [--out <file>] [--config <path>]`
+/// from a raw args iterator (skipping the binary name at position 0 and the
+/// subcommand name at position 1).
+#[allow(clippy::type_complexity)]
+fn parse_run_workflow_args(
+    args: &[String],
+) -> Result<(String, PathBuf, Option<PathBuf>, PathBuf, Option<String>), BoxError> {
+    let mut iter = args.iter().peekable();
+    // Positional: workflow id
+    let workflow_id = iter
+        .next()
+        .cloned()
+        .ok_or("run-workflow: missing <workflow-id>")?;
+    let mut input: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut config: Option<PathBuf> = None;
+    // The per-request ACP session cwd (the writable target for a container_rw agent, or the repo a
+    // reader works in). Without it, run-workflow agents run in the LAUNCH cwd, not the target repo.
+    let mut session_cwd: Option<String> = None;
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--input" => {
+                input = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or("run-workflow: --input requires a value")?,
+                ));
+            }
+            "--out" => {
+                out = Some(PathBuf::from(
+                    iter.next().ok_or("run-workflow: --out requires a value")?,
+                ));
+            }
+            "--config" => {
+                config = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or("run-workflow: --config requires a value")?,
+                ));
+            }
+            "--session-cwd" => {
+                session_cwd = Some(
+                    iter.next()
+                        .ok_or("run-workflow: --session-cwd requires a value")?
+                        .clone(),
+                );
+            }
+            other => return Err(format!("run-workflow: unknown flag {other:?}").into()),
+        }
+    }
+    let input = input.ok_or("run-workflow: --input <file> is required")?;
+    let config = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
+    Ok((workflow_id, input, out, config, session_cwd))
+}
+
+// ---------------------------------------------------------------------------
+// `implement` subcommand (Slice B2b-1)
+// ---------------------------------------------------------------------------
+
+struct ImplementArgs {
+    task: String,
+    repo: PathBuf,
+    base_ref: Option<String>,
+    config: PathBuf,
+    workflow: String,
+}
+
+const IMPLEMENT_USAGE: &str =
+    "usage: a2a-bridge implement <task> --repo <path> [--base-ref <ref>] [--config <path>] [--workflow <id>]";
+
+fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
+    let mut iter = args.iter();
+    let task = iter
+        .next()
+        .cloned()
+        .ok_or_else(|| format!("implement: missing <task>\n{IMPLEMENT_USAGE}"))?;
+    if task.starts_with("--") {
+        return Err(
+            format!("implement: missing <task> (got flag {task:?})\n{IMPLEMENT_USAGE}").into(),
+        );
+    }
+    let (mut repo, mut base_ref, mut config, mut workflow) = (None, None, None, None);
+    while let Some(f) = iter.next() {
+        match f.as_str() {
+            "--repo" => {
+                repo = Some(PathBuf::from(
+                    iter.next().ok_or("implement: --repo needs a value")?,
+                ))
+            }
+            "--base-ref" => {
+                base_ref = Some(
+                    iter.next()
+                        .ok_or("implement: --base-ref needs a value")?
+                        .clone(),
+                )
+            }
+            "--config" => {
+                config = Some(PathBuf::from(
+                    iter.next().ok_or("implement: --config needs a value")?,
+                ))
+            }
+            "--workflow" => {
+                workflow = Some(
+                    iter.next()
+                        .ok_or("implement: --workflow needs a value")?
+                        .clone(),
+                )
+            }
+            other => {
+                return Err(format!("implement: unknown flag {other:?}\n{IMPLEMENT_USAGE}").into())
+            }
+        }
+    }
+    Ok(ImplementArgs {
+        task,
+        repo: repo
+            .ok_or_else(|| format!("implement: --repo <path> is required\n{IMPLEMENT_USAGE}"))?,
+        base_ref,
+        config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
+        workflow: workflow.unwrap_or_else(|| "implement-edit".into()),
+    })
+}
+
+/// `a2a-bridge implement <task> --repo <path>` — clone a quarantine, run the 1-node `implement-edit`
+/// workflow on the ContainerRw `impl` agent (session_cwd = the clone), then the deterministic commit
+/// state machine + the operator hand-off. The agent owns staging + the message; the bridge owns the commit.
+async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
+    bridge_observ::init();
+    let a = parse_implement_args(args)?;
+
+    // 1. config + canonical allowed_cwd_root (the ContainerRw mount anchor).
+    let raw = std::fs::read_to_string(&a.config)
+        .map_err(|e| format!("implement: read config {:?}: {e}", a.config))?;
+    let cfg =
+        config::RegistryConfig::parse(&raw).map_err(|e| format!("implement: config parse: {e}"))?;
+    let root = cfg
+        .allowed_cwd_root
+        .clone()
+        .ok_or("implement: config needs allowed_cwd_root (the ContainerRw mount anchor)")?;
+    let root = std::fs::canonicalize(&root)
+        .map_err(|e| format!("implement: allowed_cwd_root {root:?}: {e}"))?;
+
+    // R6: probe the EXISTING root for an enclosing worktree BEFORE creating .a2a-implement.
+    implement::assert_dest_outside_worktree(&root)?;
+    let impl_dir = root.join(".a2a-implement");
+    std::fs::create_dir_all(&impl_dir)
+        .map_err(|e| format!("implement: mkdir {impl_dir:?}: {e}"))?;
+
+    // 2. task-id (collision-retry) + clone dest.
+    let (task_id, clone) = {
+        let mut chosen = None;
+        for _ in 0..8 {
+            let id = implement::task_id(std::process::id(), &implement::nonce(8));
+            let dir = impl_dir.join(&id);
+            if !dir.exists() {
+                chosen = Some((id, dir));
+                break;
+            }
+        }
+        chosen.ok_or("implement: could not find a free task-id")?
+    };
+
+    // R9: resolve the base ref (or the source HEAD) to a SHA for determinism.
+    let refname = a.base_ref.clone().unwrap_or_else(|| "HEAD".into());
+    let rp = implement::run_git(Some(&a.repo), &["rev-parse", &refname])
+        .map_err(|e| format!("implement: rev-parse {refname:?} in {:?}: {e}", a.repo))?;
+    if !rp.status.success() {
+        return Err(format!(
+            "implement: base-ref {refname:?}: {}",
+            String::from_utf8_lossy(&rp.stderr).trim()
+        )
+        .into());
+    }
+    let base_sha = String::from_utf8_lossy(&rp.stdout).trim().to_string();
+
+    // 3. clone (committed-only) + checkout the base SHA + the task branch.
+    implement::do_clone(&a.repo.to_string_lossy(), &clone.to_string_lossy())?;
+    let co = implement::run_git(Some(&clone), &["checkout", "-q", &base_sha])
+        .map_err(|e| format!("implement: checkout {base_sha}: {e}"))?;
+    if !co.status.success() {
+        return Err(format!(
+            "implement: checkout {base_sha}: {}",
+            String::from_utf8_lossy(&co.stderr).trim()
+        )
+        .into());
+    }
+    let branch = implement::branch_for(&task_id);
+    implement::do_checkout_branch(&clone, &branch)?;
+    let pre = implement::head_sha(&clone)?;
+    let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13: strip before
+
+    // 4. run the 1-node implement-edit workflow with session_cwd = the clone.
+    let base = a
+        .config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let wf_map = cfg
+        .load_workflows(&base)
+        .map_err(|e| format!("implement: workflow load: {e}"))?;
+    let wf_id = bridge_core::ids::WorkflowId::parse(a.workflow.clone())
+        .map_err(|e| format!("implement: workflow id {:?}: {e:?}", a.workflow))?;
+    let graph = wf_map
+        .get(&wf_id)
+        .cloned()
+        .ok_or_else(|| format!("implement: unknown workflow {:?}", a.workflow))?;
+    let snapshot = cfg
+        .into_snapshot()
+        .map_err(|e| format!("implement: snapshot: {e}"))?;
+    let policy = Arc::new(AutoPolicy);
+    let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
+    let spawn = make_spawn_fn(policy_for_spawn, a.config.clone());
+    let registry = Arc::new(
+        bridge_registry::registry::Registry::new(snapshot, spawn)
+            .map_err(|e| format!("implement: registry: {e:?}"))?,
+    );
+    let executor = bridge_workflow::executor::WorkflowExecutor::new(
+        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
+    );
+    let run_id = format!("impl-{task_id}");
+    let ctx = bridge_workflow::executor::WorkflowRunContext {
+        session_cwd: Some(bridge_core::SessionCwd::parse(&clone.to_string_lossy())?),
+    };
+    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+    use futures::StreamExt;
+    let mut stream = executor.run_with_context(
+        graph,
+        a.task.clone(),
+        run_id,
+        tokio_util::sync::CancellationToken::new(),
+        ctx,
+    );
+    let mut completed = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(WorkflowEvent::NodeStarted { node }) => {
+                eprintln!("[implement] node {} started", node.as_str())
+            }
+            Ok(WorkflowEvent::NodeFinished { node, ok, .. }) => {
+                eprintln!(
+                    "[implement] node {} {}",
+                    node.as_str(),
+                    if ok { "ok" } else { "failed" }
+                )
+            }
+            Ok(WorkflowEvent::Terminal { outcome, .. }) => {
+                completed = matches!(outcome, WorkflowOutcome::Completed)
+            }
+            Err(e) => eprintln!("[implement] error: {e:?}"),
+        }
+    }
+    drop(stream); // end the run; the per-turn ContainerRw container is reaped (detached).
+
+    // 5. the pure soft-gate decision, then execute its Action.
+    let guard = implement::head_guard(&clone, &branch, &pre);
+    let stage =
+        implement::stage_state(&clone).map_err(|e| format!("implement: stage check: {e}"))?;
+    let msg = implement::commit_message(implement::read_commit_msg_file(&clone), &a.task);
+    if msg.1 {
+        eprintln!("[implement] no .git/A2A_COMMIT_MSG — using task-derived message");
+    }
+    match implement::decide(completed, guard, stage, msg) {
+        implement::Action::Abort(reason) => {
+            eprintln!(
+                "[implement] {reason} — NO commit; clone left at {}",
+                clone.display()
+            );
+            Err(format!("implement: {reason}").into())
+        }
+        implement::Action::NoCommitClean => {
+            println!(
+                "implement: made no changes; clone left at {}",
+                clone.display()
+            );
+            Ok(())
+        }
+        implement::Action::NoCommitDirty => {
+            eprintln!(
+                "[implement] agent edited but staged NOTHING — NOT committing (agent owns staging). \
+                 Clone left at {} for inspection.",
+                clone.display()
+            );
+            Ok(())
+        }
+        implement::Action::Commit(message) => {
+            let sha = implement::host_commit(&clone, &message)?;
+            let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13: strip after
+            if !matches!(
+                implement::stage_state(&clone)
+                    .map_err(|e| format!("implement: post-commit stage: {e}"))?,
+                implement::StageState::Clean
+            ) {
+                eprintln!("[implement] note: the clone still has uncommitted changes the agent left unstaged.");
+            }
+            let subject = message.lines().next().unwrap_or("").to_string();
+            println!(
+                "{}",
+                implement::handoff_text(
+                    &clone.to_string_lossy(),
+                    &branch,
+                    &sha,
+                    &subject,
+                    &a.repo.to_string_lossy()
+                )
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Execute the `run-workflow` subcommand.
+/// Loads the config, resolves the workflow graph, runs the executor,
+/// prints NodeStarted/NodeFinished to stderr and the terminal output to stdout
+/// (or `--out <file>`).
+async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
+    bridge_observ::init();
+    let (workflow_id, input_path, out_path, config_path, session_cwd) =
+        parse_run_workflow_args(args)?;
+
+    // Load config.
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("run-workflow: cannot read config {:?}: {e}", config_path))?;
+    let cfg = config::RegistryConfig::parse(&raw)
+        .map_err(|e| format!("run-workflow: config parse error: {e}"))?;
+
+    // Resolve prompt file base dir (same logic as `serve`).
+    let base = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let wf_map = cfg
+        .load_workflows(&base)
+        .map_err(|e| format!("run-workflow: workflow load error: {e}"))?;
+
+    // Resolve workflow id.
+    let wf_id = bridge_core::ids::WorkflowId::parse(workflow_id.clone())
+        .map_err(|e| format!("run-workflow: invalid workflow id {workflow_id:?}: {e:?}"))?;
+    let graph = wf_map
+        .get(&wf_id)
+        .cloned()
+        .ok_or_else(|| format!("run-workflow: unknown workflow {workflow_id:?}"))?;
+
+    // Build the registry + executor using the same SpawnFn the server uses.
+    let snapshot = cfg
+        .into_snapshot()
+        .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
+    let policy = Arc::new(bridge_policy::permission::AutoPolicy);
+    let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
+    let spawn = make_spawn_fn(policy_for_spawn, config_path.clone());
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
             .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
@@ -876,6 +1142,7 @@ async fn main() -> Result<(), BoxError> {
     let raw_args: Vec<String> = std::env::args().collect();
     match raw_args.get(1).map(|s| s.as_str()) {
         Some("run-workflow") => return run_workflow_cmd(&raw_args[2..]).await,
+        Some("implement") => return implement_cmd(&raw_args[2..]).await,
         Some("submit") => return submit_cmd(&raw_args[2..]).await,
         Some("task") => return task_cmd(&raw_args[2..]).await,
         Some("init") => return init_cmd(&raw_args[2..]),
@@ -885,7 +1152,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         Some(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | submit | task | init)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | implement | submit | task | init)"
             )
             .into());
         }
@@ -1462,5 +1729,35 @@ mod cli_tests {
             .collect();
         let (_id, _input, _out, _cfg, scwd) = super::parse_run_workflow_args(&args).unwrap();
         assert!(scwd.is_none());
+    }
+
+    #[test]
+    fn parse_implement_args_basic() {
+        let a: Vec<String> = [
+            "Add a FOO file",
+            "--repo",
+            "/src/repo",
+            "--base-ref",
+            "main",
+            "--config",
+            "c.toml",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let p = super::parse_implement_args(&a).unwrap();
+        assert_eq!(p.task, "Add a FOO file");
+        assert_eq!(p.repo, std::path::PathBuf::from("/src/repo"));
+        assert_eq!(p.base_ref.as_deref(), Some("main"));
+        assert_eq!(p.config, std::path::PathBuf::from("c.toml"));
+        assert_eq!(p.workflow, "implement-edit"); // default
+    }
+
+    #[test]
+    fn parse_implement_args_requires_task_and_repo() {
+        // first token is a flag -> treated as missing <task>
+        assert!(super::parse_implement_args(&["--repo".into(), "/r".into()]).is_err());
+        // task present but no --repo
+        assert!(super::parse_implement_args(&["task".into()]).is_err());
     }
 }
