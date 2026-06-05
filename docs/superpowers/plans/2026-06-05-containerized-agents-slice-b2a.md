@@ -1233,7 +1233,15 @@ decomposition/placeholder/compile issues. Apply ALL of R1–R24 during the build
 
 ### New tasks folded per the run-workflow cwd learning (memory: workflow-cwd-cleanroom-gotcha)
 - **R19 — Task 17: `run-workflow --session-cwd <dir>`** — parse the flag, validate via `SessionCwd::parse`, thread into `WorkflowRunContext { session_cwd: Some(..) }` (use `run_with_context`). Fixes the agents-get-launch-cwd gap AND lets the B2a gate run via run-workflow (the "both paths" the gate dropped to serve-only). TDD: a unit test that the parsed flag reaches the context (mirror executor.rs:1363's cwd-threading test). codex B2's missing-cwd path for run-workflow closes here.
-- **R20 — Task 18: brief-only clean-room `design`/review prompts** — config/prompt-only edit to the workflow node prompts in `examples/*.toml`: "work FROM the inlined brief/diff; repo access is optional context, its absence is NOT a failure — never bail for missing files." No Rust.
+- **R20 — Task 18: read-the-real-code prompt robustness (NOT brief-only).** Per owner feedback: reading +
+  reasoning through the existing code + architecture is the VALUE — brief-only forces blind assumptions
+  about a project the agent can't see, and contradicts the shipped RO-review approach (which caught more
+  bugs than tool-free). The real fix is R19 (cwd → the agent reads the RIGHT project). Config/prompt-only
+  edit to the `design`/review node prompts in `examples/*.toml`: keep RO-tool reading; ADD — "the brief is
+  the goal, the project's actual code + architecture are ground truth: read and reason through them.
+  Sanity-check that your working directory matches the brief. If expected files genuinely can't be located,
+  STATE the gap and proceed with EXPLICIT, FLAGGED assumptions — never silently bail, and never design
+  against the wrong directory." No Rust.
 - **R21 — Task 19: doc the per-turn memory-loss asymmetry** in `docs/containerized-agents.md` (per-turn `serve` loses conversational memory vs the warm `:ro` reader; spec decision #1). (dogfood M6 / codex SF8)
 
 ### Self-review correction
