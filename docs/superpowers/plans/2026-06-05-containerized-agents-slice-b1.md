@@ -822,3 +822,41 @@ git commit -m "config: migrate the 3 containerized readers to the [sandbox] bloc
 ## Execution Handoff
 
 Per the loop, this plan gets its **own Codex + Claude dual-review** (a2a-local-bridge) — optionally the containerized dogfood `plan-review` — before the build. After folding: slices 1–5 are pure-Rust TDD I run inline; the T6 acceptance gate is operator-run (Docker + Slice-A creds/volumes, both present). **Two execution options:** (1) Subagent-Driven (fresh subagent per task + two-stage review); (2) Inline Execution (this session, checkpoints — fits the pure-Rust TDD + the human-gated Docker acceptance, like Slice A).
+
+---
+
+## Plan-review fold (Codex + Claude + dogfood — BINDING corrections to the tasks above)
+
+All three verified the end-state is correct (byte-for-byte argv, two SpawnFn sites, partial-move holds,
+ripple/test-double, `SessionCwd::parse` sig). Apply these corrections during the build:
+
+**T1 (ripple):**
+- Discover the ripple with **`cargo test -p bridge-core --no-run`** then **`cargo test --workspace --no-run`** — NOT `cargo build` (a build never compiles the `#[cfg(test)]`/integration sites the ripple lives in). The compiler enumerates every real site; **SKIP `bin/a2a-bridge/tests/integration_run_workflow.rs`** (local test-double struct).
+- Step 9 commit: use **`git add -u`** (+ explicit add for the new `sandbox.rs` in T2) — do NOT hardcode the path list (several were wrong; the real `route.rs`/`e2e_registry.rs`/`common/mod.rs` live under `bin/a2a-bridge/...`).
+
+**T3 (validate + reuse):**
+- **Split** every multi-filter `cargo test` (cargo takes ONE filter): one command per test, or a shared substring.
+- **TDD red-step isolation:** each invariant test asserts the SPECIFIC error reason (e.g. S4 asserts the reason contains `container_rw`; S6 its nested-mount message) so the red step fails for the right reason, not the pre-existing cmd-allowlist path.
+- **Add `s5_rejects_non_absolute_mount`** (mount `"work/rel"` / `""` → err) — S5 was implemented but untested.
+- **Reuse test covers ALL THREE** keys: three assertions (mutate `sandbox`, `session_cwd`, `api_key_env` each → `!Arc::ptr_eq` new slot). Adding only `session_cwd` would green a partial impl.
+- **S6 normalization (Codex blocker):** store the **normalized** mount in `SandboxConfig` (`mount_n.as_str()`), and in S6 normalize the volume dest + use the real component-wise **`SessionCwd::is_under`** (not raw `Path::starts_with`); add an **equal-dest** case (`"/h:/work"`). Bare/anonymous vol specs (no `:dest`) aren't S6-checked — one-line comment.
+- (optional) split the behavior-changing reuse-tuple fix into its own commit for bisectability.
+
+**T4 (parse):**
+- **Every test TOML MUST include `[server]`** (`RegistryConfig.server` is NOT `#[serde(default)]`) — `addr = "127.0.0.1:8080"` — else `toml::from_str().unwrap()` panics before the assertion. Split the multi-filter `cargo test`.
+- **Add a test** that a sandboxed entry with **no `allowed_cwd_root`** fails `into_snapshot` (S2's `.ok_or_else`).
+- Store the **normalized** mount (consistent with the S2 comparison + T3's S6).
+
+**T5 (wiring — make it TDD-able):**
+- Extract a **testable free fn** in `main.rs`, e.g. `fn acp_program_argv(entry: &AgentEntry) -> Result<(String, Vec<String>), BridgeError>` doing the compose-or-raw (`Some(sb) => compose_sandbox(sb, cmd, &entry.args)`, `None => (cmd, args)`; missing cmd → `ConfigInvalid`). **Both** closures call it. Add a unit test asserting the composed argv for a sandboxed entry AND raw passthrough — this proves both paths identically (no divergence) in pure Rust, reducing reliance on the Docker gate.
+
+**T6 (split + de-risk the gate):**
+- **Two commits:** (a) build/parse-only "migrate the 3 readers to `[sandbox]`" (no PASS claim, lands without Docker); (b) the operator sign-off whose message records the gate **result after it runs** (never a pre-written "PASS").
+- **Robust containment:** don't rely on racy `docker ps --filter ancestor` (false-pos: another match; false-neg: `--rm` exits first). Capture **`docker events --filter image=a2a-agent-reader:latest --filter event=start`** during the smoke window (catches the start even if it exits fast), and run the containment check on **both** spawn paths (run-workflow + serve).
+
+**Final:**
+- **ADR-0017 is a real numbered step:** create `docs/adr/0017-containerized-agents-slice-b1.md` (the enforced `[sandbox]` block; two-layer validation; data-carrying `EgressPolicy`; the nested-`volumes` S6 the dogfood caught; amends ADR-0016) + explicit `git add` + the `Co-Authored-By: Claude Opus 4.8 (1M context)` trailer.
+- **Runbook:** one-line update to `docs/containerized-agents.md` — retitle off "(Slice A)" where needed and note the `allowed_cwd_root == mount` rule is now **enforced by `[sandbox]` S2 (a load error)**, not just operator discipline.
+- Coverage floors: `cargo-llvm-cov` may be absent → "must satisfy existing CI floors" / spot-check.
+
+*(Dropped: the T4 "partial-move blocker" — the dogfood's executability lens verified `match a.sandbox { Some(sb) => … }` then reusing other `AgentEntryToml` fields is a valid field-by-field move. No action.)*
