@@ -1004,6 +1004,14 @@ fn serve_config_flag(args: &[String]) -> Result<Option<PathBuf>, BoxError> {
 /// (no bridge repo needed at runtime). `(relative-output-path, contents)`.
 const INIT_PROMPTS: &[(&str, &str)] = &[
     (
+        "prompts/review-implement.md",
+        include_str!("../../../prompts/review-implement.md"),
+    ),
+    (
+        "prompts/review-implement-synth.md",
+        include_str!("../../../prompts/review-implement-synth.md"),
+    ),
+    (
         "prompts/review-correctness.md",
         include_str!("../../../prompts/review-correctness.md"),
     ),
@@ -1100,6 +1108,25 @@ id = "synth"
 agent = "claude"
 prompt_file = "prompts/review-synth.md"
 inputs = ["correctness", "architecture"]
+
+# ── implement-review (B2b-3a): two folded reviewers of the committed diff → synth verdict ──
+[[workflows]]
+id = "implement-review"
+[[workflows.nodes]]
+id = "reviewer_codex"
+agent = "codex"
+prompt_file = "prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "reviewer_claude"
+agent = "claude"
+prompt_file = "prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "prompts/review-implement-synth.md"
+inputs = ["reviewer_codex", "reviewer_claude"]
 
 [[workflows]]
 id = "spec-review"
@@ -1725,8 +1752,8 @@ mod cli_tests {
         let wf = cfg.load_workflows(&dir).unwrap();
         assert_eq!(
             wf.len(),
-            4,
-            "code-review + spec-review + plan-review + design load"
+            5,
+            "code-review + implement-review + spec-review + plan-review + design load"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
