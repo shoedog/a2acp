@@ -29,6 +29,7 @@ mod config;
 mod implement;
 mod review;
 mod route;
+mod tweak;
 mod verify;
 
 use std::path::PathBuf;
