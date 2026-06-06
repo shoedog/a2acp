@@ -448,6 +448,135 @@ async fn drain_review(
     review::reduce(&events)
 }
 
+/// Drain the implement-edit / implement-fix workflow stream → `completed`. Shared by the first edit turn and
+/// every fix turn; polls to the end so the executor runs its cancel cleanup. Total (no `?`).
+async fn drain_impl(mut stream: bridge_workflow::executor::WorkflowStream) -> bool {
+    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+    use futures::StreamExt;
+    let mut completed = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(WorkflowEvent::NodeStarted { node }) => {
+                eprintln!("[implement] node {} started", node.as_str())
+            }
+            Ok(WorkflowEvent::NodeFinished { node, ok, .. }) => eprintln!(
+                "[implement] node {} {}",
+                node.as_str(),
+                if ok { "ok" } else { "failed" }
+            ),
+            Ok(WorkflowEvent::Terminal { outcome, .. }) => {
+                completed = matches!(outcome, WorkflowOutcome::Completed)
+            }
+            Err(e) => eprintln!("[implement] error: {e:?}"),
+        }
+    }
+    completed
+}
+
+/// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
+/// fails (a runner error becomes a failed result); a config error reduces to `ConfigError`.
+fn run_verify_step(
+    verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    clone_cwd: &bridge_core::SessionCwd,
+    repo: &std::path::Path,
+) -> verify::VerifyOutcome {
+    match verify_cfg {
+        None => verify::VerifyOutcome::NotConfigured,
+        Some(Err(e)) => {
+            eprintln!("[implement] verify: config error: {e:?} — skipping verify");
+            verify::VerifyOutcome::ConfigError
+        }
+        Some(Ok(vcfg)) => {
+            let repo_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+            let cache_vol = verify::cache_volume_name(&vcfg.cache, &repo_canon.to_string_lossy());
+            eprintln!(
+                "[implement] verify: running {} command(s) in {}",
+                vcfg.commands.len(),
+                vcfg.image
+            );
+            let verdict =
+                verify::run_verify(vcfg, clone_cwd, &cache_vol, &verify::docker_runner, 16 * 1024);
+            for r in &verdict.results {
+                if !r.ok {
+                    eprintln!("[implement] verify: {} failed:\n{}", r.name, r.output);
+                }
+            }
+            verify::VerifyOutcome::Ran(verdict)
+        }
+    }
+}
+
+/// Run the B2b-3a review once (total). Returns `(outcome, synth_body)`. Fresh `CancellationToken` + `select!`
+/// timeout→cancel→keep-drain PER call (so the `:ro` reaper still fires on a timed-out attempt). `run_id` is
+/// qualified by `attempt`.
+#[allow(clippy::too_many_arguments)]
+async fn run_review_step(
+    review_cfg: &Option<Result<config::ReviewConfig, config::ConfigError>>,
+    wf_map: &std::collections::HashMap<
+        bridge_core::ids::WorkflowId,
+        std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
+    >,
+    executor: &bridge_workflow::executor::WorkflowExecutor,
+    task: &str,
+    base_sha: &str,
+    head_sha: &str,
+    clone_cwd: &bridge_core::SessionCwd,
+    task_id: &str,
+    attempt: u32,
+) -> (review::ReviewOutcome, String) {
+    let rcfg = match review_cfg {
+        None => return (review::ReviewOutcome::NotConfigured, String::new()),
+        Some(Err(e)) => {
+            eprintln!("[implement] review: config error: {e:?}");
+            return (review::ReviewOutcome::ConfigError, String::new());
+        }
+        Some(Ok(c)) => c,
+    };
+    let Some(graph) = wf_map.get(&rcfg.workflow).cloned() else {
+        return (review::ReviewOutcome::NotLoaded, String::new());
+    };
+    let input = review::build_review_input(task, base_sha, head_sha);
+    let ctx = bridge_workflow::executor::WorkflowRunContext {
+        session_cwd: Some(clone_cwd.clone()),
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+    let stream = executor.run_with_context(
+        graph,
+        input,
+        format!("impl-review-{task_id}-{attempt}"),
+        token.clone(),
+        ctx,
+    );
+    eprintln!("[implement] review: running implement-review (attempt {attempt})");
+    let mut drain = std::pin::pin!(drain_review(stream));
+    let (completed, synth, reviewers_failed) = tokio::select! {
+        r = &mut drain => r,
+        _ = tokio::time::sleep(rcfg.timeout) => {
+            eprintln!("[implement] review: timed out after {:?}", rcfg.timeout);
+            token.cancel();
+            (&mut drain).await
+        }
+    };
+    if !completed {
+        return (review::ReviewOutcome::Incomplete, String::new());
+    }
+    let (verdict, summary) = review::parse_verdict(&synth);
+    if !matches!(verdict, review::Verdict::Approve) {
+        eprintln!(
+            "[implement] review {verdict:?}:\n{}",
+            verify::truncate_output(&synth, rcfg.max_output_bytes)
+        );
+    }
+    (
+        review::ReviewOutcome::Ran {
+            verdict,
+            summary,
+            reviewers_failed,
+        },
+        synth,
+    )
+}
+
 /// `a2a-bridge implement <task> --repo <path>` — clone a quarantine, run the 1-node `implement-edit`
 /// workflow on the ContainerRw `impl` agent (session_cwd = the clone), then the deterministic commit
 /// state machine + the operator hand-off. The agent owns staging + the message; the bridge owns the commit.
