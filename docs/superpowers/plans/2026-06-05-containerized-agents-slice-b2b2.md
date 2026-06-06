@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-05-containerized-agents-slice-b2b2-design.md` (rev2, committed `1448f02`, branch `feat/implement-verify`).
 
-**Conventions:** TDD green-per-task; task/code commits do NOT carry the `Co-Authored-By` trailer (the ADR doc does). Coverage after `cargo llvm-cov clean --workspace` (floors: workspace 85, bridge-core 90, bridge-registry 90). All host process spawns = direct argv `std::process::Command`, no shell. The plan gets its own Codex+Claude dual-review before the build.
+**Conventions:** TDD green-per-task; task/code commits do NOT carry the `Co-Authored-By` trailer (the ADR doc does). Coverage after `cargo llvm-cov clean --workspace` (floors per ci.yml: workspace 85, bridge-core 90, bridge-acp 90, bridge-api 90, bridge-workflow 90). All host process spawns = direct argv `std::process::Command`, no shell. The plan gets its own Codex+Claude dual-review before the build.
 
 ---
 
@@ -73,6 +73,9 @@ fn compose_verify_ro_clone_plus_cache_reuses_compose_sandbox() {
     assert_eq!(argv[argv.len() - 3], "sh");
     assert_eq!(argv[argv.len() - 2], "-c");
     let script = argv.last().unwrap();
+    // BLOCKER fold: compose_sandbox emits NO --workdir (ACP gets cwd via session/new) and the reader
+    // base sets WORKDIR /work — so a bare `sh -c` cargo would run in /work. The script MUST cd the clone.
+    assert!(script.contains("cd '/Users/w/code/.a2a-implement/impl-1-ab'"));
     assert!(script.contains("CARGO_HOME=/cache/cargo"));
     assert!(script.contains("CARGO_TARGET_DIR=/cache/target"));
     assert!(script.contains("cargo build --locked"));
@@ -112,9 +115,14 @@ pub fn compose_verify(
     cache_vol: &str,
     command: &str,
 ) -> (String, Vec<String>) {
+    // `cd` the clone FIRST: compose_sandbox emits no --workdir (ACP cwd arrives via session/new), the
+    // reader base image sets WORKDIR /work, and verify is a bare `sh -c`. The clone is mounted identical-
+    // path, so `cd '<clone>'` lands in the repo. `&&` chains so a failed cd surfaces as a verify failure
+    // and the trailing `{command}`'s exit code is the script's exit (read by the caller from the container).
     let script = format!(
-        "export CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target; \
-         mkdir -p \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\"; {command}"
+        "cd '{clone}' && export CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target && \
+         mkdir -p \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\" && {command}",
+        clone = clone.as_str(),
     );
     let sb = SandboxConfig {
         runtime: runtime.map(str::to_string),
@@ -157,6 +165,8 @@ fn verify_config_parses_structured_commands_and_locked_egress() {
     let c = RegistryConfig::parse(
         r#"
         default = "x"
+        [server]
+        addr = "127.0.0.1:8080"
         [[agents]]
         id = "x"
         cmd = "echo"
@@ -191,6 +201,8 @@ fn verify_config_rejects_locked_without_network() {
     let c = RegistryConfig::parse(
         r#"
         default = "x"
+        [server]
+        addr = "127.0.0.1:8080"
         [[agents]]
         id = "x"
         cmd = "echo"
@@ -214,6 +226,8 @@ fn verify_config_rejects_empty_commands() {
     let c = RegistryConfig::parse(
         r#"
         default = "x"
+        [server]
+        addr = "127.0.0.1:8080"
         [[agents]]
         id = "x"
         cmd = "echo"
@@ -380,8 +394,9 @@ Create `bin/a2a-bridge/src/verify.rs`:
 //! per-repo cache), read each CONTAINER exit code (unforgeable — agent code in `cargo test` can't fake
 //! it), aggregate a reported (non-gating) verdict for the operator hand-off. The Docker run is the only
 //! impure piece (`docker_runner`, live-gated); everything else is pure + unit-tested.
-
-use crate::config::{VerifyCommand, VerifyConfig};
+//!
+//! (The `use crate::config::{VerifyCommand, VerifyConfig};` import is added in Task 4 when `run_verify`
+//! first needs it — Task 3's helpers below use only local types, so importing it here would warn.)
 
 /// One command's outcome. `gate=false` commands are reported but never fail the verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,9 +452,29 @@ pub fn verdict_line(v: &VerifyVerdict) -> String {
     }
 }
 
+/// The three terminal states of the verify step (the riskiest classification — extracted pure so the
+/// `Action::Commit` wiring is unit-tested, mirroring B2b-1's `implement::decide`).
+#[derive(Debug, Clone)]
+pub enum VerifyOutcome {
+    Ran(VerifyVerdict),
+    NotConfigured,
+    ConfigError(String),
+}
+
+/// PURE. The hand-off suffix (stdout) for each outcome. Failing-command OUTPUT is dumped to stderr by the
+/// caller; this is the one-line summary appended to the operator hand-off.
+pub fn outcome_suffix(o: &VerifyOutcome) -> String {
+    match o {
+        VerifyOutcome::Ran(v) => verdict_line(v),
+        VerifyOutcome::NotConfigured => "verify: not configured".to_string(),
+        VerifyOutcome::ConfigError(_) => "verify: skipped (config error)".to_string(),
+    }
+}
+
 /// PURE. A stable per-repo cache volume name: `<base>-<hash(canonical repo path)>`. Per-repo keying
 /// isolates repos; same-repo runs share (single-flight serializes them — see `run_verify`'s caller).
-/// Reuses the codebase's `DefaultHasher` owner-token pattern (`main::container_owner`).
+/// Reuses the codebase's `DefaultHasher` owner-token pattern (`main::container_owner`). The CALLER passes
+/// the CANONICAL repo path (Task 5 canonicalizes `a.repo`) — two spellings must not split the cache.
 pub fn cache_volume_name(base: &str, repo_canon: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -497,6 +532,19 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("a2a-verify-cache-"));
     }
+
+    #[test]
+    fn outcome_suffix_covers_three_arms() {
+        let ran = VerifyOutcome::Ran(aggregate(vec![r("fmt", true, true)]));
+        assert!(outcome_suffix(&ran).starts_with("verify: PASS"));
+        let failed = VerifyOutcome::Ran(aggregate(vec![r("clippy", true, false)]));
+        assert!(outcome_suffix(&failed).starts_with("verify: FAIL"));
+        assert_eq!(outcome_suffix(&VerifyOutcome::NotConfigured), "verify: not configured");
+        assert_eq!(
+            outcome_suffix(&VerifyOutcome::ConfigError("bad".into())),
+            "verify: skipped (config error)"
+        );
+    }
 }
 ```
 
@@ -511,7 +559,7 @@ Expected: PASS (6 tests).
 
 ```bash
 git add bin/a2a-bridge/src/verify.rs bin/a2a-bridge/src/main.rs
-git commit -m "feat(b2b2): pure verify helpers (verdict, truncate, hand-off line, per-repo cache name)"
+git commit -m "feat(b2b2): pure verify helpers (verdict, truncate, hand-off line, outcome_suffix, per-repo cache name)"
 ```
 
 ---
@@ -541,7 +589,6 @@ fn cfg(cmds: &[(&str, bool)]) -> VerifyConfig {
 
 #[test]
 fn run_verify_stops_at_first_gate_failure() {
-    use crate::session_cwd_helpers::sc; // see Step 3 note; or inline SessionCwd::parse
     let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
     // runner: fmt ok, clippy FAILS (gate) -> build/test must NOT run.
     let runner = |_p: &str, argv: &[String]| -> std::io::Result<(i32, String)> {
@@ -566,15 +613,19 @@ fn run_verify_stops_at_first_gate_failure() {
 }
 
 #[test]
-fn run_verify_reports_nongate_failure_but_passes() {
+fn run_verify_reports_nongate_failure_then_continues_to_a_later_gate() {
+    // The failing NON-GATE command is FIRST, a GATE command FOLLOWS — so a buggy "stop on ANY failure"
+    // impl would stop after coverage (len==1) and this test would catch it. (codex plan-review catch.)
     let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
     let runner = |_p: &str, argv: &[String]| -> std::io::Result<(i32, String)> {
         let script = argv.last().unwrap();
         if script.contains("cargo coverage") { Ok((1, "cov fail".into())) } else { Ok((0, "ok".into())) }
     };
-    let v = run_verify(&cfg(&[("test", true), ("coverage", false)]), &clone, "cache-x", &runner, 4096);
+    let v = run_verify(&cfg(&[("coverage", false), ("test", true)]), &clone, "cache-x", &runner, 4096);
     assert!(v.passed); // the non-gate coverage failure doesn't fail the verdict
-    assert_eq!(v.results.len(), 2);
+    assert_eq!(v.results.len(), 2); // the later GATE ran (did NOT stop on the non-gate failure)
+    assert_eq!(v.results[1].name, "test");
+    assert!(v.results[1].ok);
 }
 
 #[test]
@@ -589,8 +640,6 @@ fn run_verify_runner_error_is_a_failure() {
 }
 ```
 
-(Delete the `use crate::session_cwd_helpers::sc;` placeholder line — it was illustrative; the tests use `bridge_core::SessionCwd::parse` directly.)
-
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p a2a-bridge --bin a2a-bridge run_verify`
@@ -598,7 +647,11 @@ Expected: FAIL — `cannot find function run_verify`.
 
 - [ ] **Step 3: Implement `run_verify` + `docker_runner`**
 
-Add to `bin/a2a-bridge/src/verify.rs` (above the test module):
+Add the config import at the top of `bin/a2a-bridge/src/verify.rs` (deferred from Task 3 — now first needed), then add the runner + loop above the test module:
+
+```rust
+use crate::config::{VerifyCommand, VerifyConfig};
+```
 
 ```rust
 /// A command runner: given `(program, argv)`, run it and return `(exit_code, combined_output)`. The real
@@ -669,9 +722,21 @@ git commit -m "feat(b2b2): run_verify per-command loop (unforgeable container ex
 ## Task 5: wire verify into `implement_cmd`'s `Action::Commit` arm
 
 **Files:**
-- Modify: `bin/a2a-bridge/src/main.rs` (the `Action::Commit` arm, lines 504-526)
+- Modify: `bin/a2a-bridge/src/main.rs` (capture verify config before `into_snapshot`; the `Action::Commit` arm, lines 504-526)
 
-- [ ] **Step 1: Add the integration**
+- [ ] **Step 1: Capture the verify config BEFORE `cfg` is moved (BLOCKER fix)**
+
+`cfg.into_snapshot()` at `main.rs:426-428` consumes `cfg` by value, *before* the `Action::Commit` arm — so reading `cfg.verify` in the arm is a use-after-move (hard compile error). Capture it as an owned `Option<Result<VerifyConfig, ConfigError>>` just before line 426. Keep it as `Option<Result<…>>` (do **NOT** `transpose()?` — a bad `[verify]` must not abort `implement`; verify is informational):
+
+```rust
+    // B2b-2: parse [verify] NOW, before into_snapshot moves cfg. Owned + Clone, survives the move.
+    let verify_cfg = cfg.verify.as_ref().map(|t| t.into_config());
+    let snapshot = cfg
+        .into_snapshot()
+        .map_err(|e| format!("implement: snapshot: {e}"))?;
+```
+
+- [ ] **Step 2: Replace the `Action::Commit` arm**
 
 Replace the body of the `implement::Action::Commit(message) => { ... }` arm (lines 504-526) so verify runs after the commit, before the hand-off. The verdict line is appended to the hand-off (stdout); failing-command output goes to stderr. Verify only runs if `[verify]` is configured; `implement` always exits `Ok` (verify is informational).
 
@@ -696,11 +761,20 @@ Replace the body of the `implement::Action::Commit(message) => { ... }` arm (lin
             );
 
             // B2b-2: deterministic build+test verify on the committed clone (reported, not gating).
-            match cfg.verify.as_ref().map(|t| t.into_config()).transpose() {
-                Ok(Some(vcfg)) => {
+            // `verify_cfg` was captured before into_snapshot (Step 1). The pure `outcome_suffix` (Task 3)
+            // does the riskiest classification; this arm only resolves the outcome (impure) + dumps stderr.
+            let outcome = match verify_cfg {
+                Some(Ok(vcfg)) => {
                     let clone_cwd = bridge_core::SessionCwd::parse(&clone.to_string_lossy())?;
-                    let cache_vol = verify::cache_volume_name(&vcfg.cache, &a.repo.to_string_lossy());
-                    eprintln!("[implement] verify: running {} command(s) in {}", vcfg.commands.len(), vcfg.image);
+                    // Canonicalize a.repo for the cache key so two spellings don't split the warm cache.
+                    let repo_canon = std::fs::canonicalize(&a.repo).unwrap_or_else(|_| a.repo.clone());
+                    let cache_vol =
+                        verify::cache_volume_name(&vcfg.cache, &repo_canon.to_string_lossy());
+                    eprintln!(
+                        "[implement] verify: running {} command(s) in {}",
+                        vcfg.commands.len(),
+                        vcfg.image
+                    );
                     let verdict = verify::run_verify(
                         &vcfg,
                         &clone_cwd,
@@ -713,32 +787,33 @@ Replace the body of the `implement::Action::Commit(message) => { ... }` arm (lin
                             eprintln!("[implement] verify: {} failed:\n{}", r.name, r.output);
                         }
                     }
-                    handoff.push('\n');
-                    handoff.push_str(&verify::verdict_line(&verdict));
+                    verify::VerifyOutcome::Ran(verdict)
                 }
-                Ok(None) => handoff.push_str("\nverify: not configured"),
-                Err(e) => {
+                Some(Err(e)) => {
                     eprintln!("[implement] verify: config error: {e:?} — skipping verify");
-                    handoff.push_str("\nverify: skipped (config error)");
+                    verify::VerifyOutcome::ConfigError(format!("{e:?}"))
                 }
-            }
+                None => verify::VerifyOutcome::NotConfigured,
+            };
+            handoff.push('\n');
+            handoff.push_str(&verify::outcome_suffix(&outcome));
 
             println!("{handoff}");
             Ok(())
         }
 ```
 
-- [ ] **Step 2: Build + run the existing implement tests**
+- [ ] **Step 3: Build + run the verify/implement tests**
 
-Run: `cargo build -p a2a-bridge && cargo test -p a2a-bridge --bin a2a-bridge implement::`
-Expected: compiles; the existing `decide_matrix`/`host_commit`/argv tests still PASS (this arm has no new unit test — it's the impure orchestration, covered by the live gate; `run_verify`/`compose_verify` are unit-tested in Tasks 1/4).
+Run: `cargo build -p a2a-bridge && cargo test -p a2a-bridge --bin a2a-bridge verify:: && cargo test -p a2a-bridge --bin a2a-bridge implement::`
+Expected: compiles; the existing `decide_matrix`/`host_commit`/argv tests still PASS, and `verify::outcome_suffix_covers_three_arms` covers the arm's classification (the impure resolution — runner spawn + stderr dump — is live-gated in Task 9; the riskiest branching is pure-tested).
 
-- [ ] **Step 3: clippy**
+- [ ] **Step 4: clippy**
 
 Run: `cargo clippy -p a2a-bridge --all-targets -- -D warnings`
 Expected: clean.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add bin/a2a-bridge/src/main.rs
@@ -809,12 +884,10 @@ Create `deploy/containers/tinyproxy.verify.filter` (cargo registries + git deps 
 
 ```
 # Verify-only egress: the cargo registries + GitHub for git deps. Anchored ERE, default-deny.
-# Sparse index = index.crates.io; crate downloads = static.crates.io; git deps = github/codeload.
+# `(^|\.)crates\.io$` already covers index.crates.io (sparse index) + static.crates.io (downloads);
+# `(^|\.)github\.com$` already covers codeload.github.com (git-dep tarballs). Two lines, no redundancy.
 (^|\.)crates\.io$
-(^|\.)static\.crates\.io$
-(^|\.)index\.crates\.io$
 (^|\.)github\.com$
-(^|\.)codeload\.github\.com$
 ```
 
 - [ ] **Step 2: Add the verify net + proxy to compose**
@@ -921,14 +994,17 @@ cmd  = "cargo test --locked"
 # gate = false
 ```
 
-- [ ] **Step 3: Verify the config parses**
+- [ ] **Step 3: Verify the example deserializes**
 
-Run: `cargo run -q -p a2a-bridge -- --help >/dev/null 2>&1; cargo test -p a2a-bridge --bin a2a-bridge verify_config`
-Then a parse smoke (the example must load):
+First the unit-level `[verify]` validation (the real check — `into_config` rejects bad egress / empty commands):
 ```bash
-cargo run -q -p a2a-bridge -- run-workflow nonexistent --input README.md --config examples/a2a-bridge.containerized.toml 2>&1 | grep -qi "unknown workflow" && echo "config parses"
+cargo test -p a2a-bridge --bin a2a-bridge verify_config
 ```
-Expected: `config parses` (the config loaded; only the workflow id is unknown — proves `[verify]` + the toolchain image parse without error).
+Then a deserialization smoke — the example config must LOAD (proves `[verify]` + the toolchain image deserialize). `run-workflow` parses the config, then errors on the unknown id (confirmed string `run-workflow: unknown workflow`, main.rs:540):
+```bash
+cargo run -q -p a2a-bridge -- run-workflow __nope__ --input README.md --config examples/a2a-bridge.containerized.toml 2>&1 | grep -q "unknown workflow" && echo "config deserializes"
+```
+Expected: `config deserializes`. NOTE: this only proves the TOML *deserializes* — `into_config()` (semantic `[verify]` validation: locked-egress, non-empty commands) runs on the `implement` path, so it's covered by Task 2's unit tests + the Task 9 live gate, not here.
 
 - [ ] **Step 4: Commit**
 
@@ -965,15 +1041,28 @@ Prompt the agent to introduce a clippy violation (e.g. `--repo` a clone and a ta
 
 - [ ] **Step 4: containment proof (the load-bearing assertion)**
 
-While a verify container runs (or via `docker inspect` on it), assert:
+The verify containers use `--rm` (`compose_sandbox`, sandbox.rs:17), so `docker inspect`/`docker ps -a` race the reaper. Prove containment with `docker events` (captures the container lifetime regardless of `--rm`) + a behavioral `:ro` probe from inside the real verify container.
+
+(a) **Egress isolation** — start an events capture, run the implement (Step 1), then assert the verify container attached to `a2a-verify-egress` and NOT `a2a-egress-internal`:
 ```bash
-# verify ran on the verify egress, NOT the agent egress:
-docker ps -a --filter ancestor=a2a-toolchain:latest --format '{{.Names}} {{.Networks}}' | grep a2a-verify-egress
-# and that the verify container has NO creds mount + the clone is :ro:
-docker inspect <verify-container> --format '{{json .Mounts}}' | grep -q '"RO":true' && echo "clone :ro OK"
-docker inspect <verify-container> --format '{{json .Mounts}}' | grep -qi credentials && echo "LEAK: creds mounted" || echo "no creds mount OK"
+( docker events --since 0m --until 2m \
+    --filter type=network --filter event=connect \
+    --format '{{.Actor.Attributes.name}} {{.Actor.Attributes.container}}' > /tmp/verify-events.log & )
+# ... run the Step 1 implement now ...
+grep -q "^a2a-verify-egress " /tmp/verify-events.log && echo "verify on a2a-verify-egress OK"
 ```
-Expected: the verify container is on `a2a-verify-egress`; the clone mount is `:ro`; **no creds mount**. (macOS Docker Desktop remaps bind ownership — prove containment via the mount flags + the network, not file ownership.)
+Expected: a `connect` to `a2a-verify-egress` appears (the verify container); the agent's editing container connected to `a2a-egress-internal` separately — the two egresses are distinct.
+
+(b) **Clone is `:ro` (behavioral)** — temporarily set a single scratch `[verify]` command and run implement; the write must fail from inside the real verify container:
+```toml
+[[verify.commands]]
+name = "ro-probe"
+cmd  = "touch ./__verify_write_probe__ || echo VERIFY_CLONE_IS_RO"
+gate = false
+```
+Expected (captured verify output / stderr): `VERIFY_CLONE_IS_RO` (and `Read-only file system`) — the clone mount is `:ro` in the live container. Revert the scratch command after.
+
+(c) **No creds** is guaranteed structurally — Task 1's golden test asserts `compose_verify`'s argv carries only the `:ro` clone + the cache volume, no `.credentials.json`/`auth.json` — and verify never receives a creds volume (the `[verify]` block has none). (macOS Docker Desktop remaps bind ownership — prove `:ro` via the write probe + the network via events, never via host file ownership.)
 
 - [ ] **Step 5: record the gate result** in the ADR (Task 10) — PASS/FAIL per step + the warm-vs-cold timing.
 
@@ -990,15 +1079,14 @@ Create `docs/adr/0020-containerized-agents-b2b2-verify.md` capturing: the decisi
 
 - [ ] **Step 2: Commit (with the trailer)**
 
+Use `-m` flags (not a heredoc — more robust under a non-interactive runner); the third `-m` is the trailer paragraph:
+
 ```bash
 git add docs/adr/0020-containerized-agents-b2b2-verify.md
-git commit -F - <<'EOF'
-docs(adr): ADR-0020 — B2b-2 build+test verify step
-
-[summary per Step 1]
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
-EOF
+git commit \
+  -m "docs(adr): ADR-0020 — B2b-2 build+test verify step" \
+  -m "Bridge-deterministic post-commit verify on a :ro quarantine, reported-not-gating, CI authoritative. Folds the dual-review keystones: reuse compose_sandbox/parse_egress (no parallel schema), unforgeable per-command container-exit verdict, structured commands, --locked everywhere, separate verify egress, coverage opt-in, per-repo cache + single-flight." \
+  -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
@@ -1007,8 +1095,16 @@ EOF
 
 - [ ] `cargo fmt --all` (workspace-wide; zero semantic change)
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` → clean
-- [ ] `cargo llvm-cov clean --workspace && cargo llvm-cov --workspace --fail-under-lines 85` → workspace ≥ 85
-- [ ] `cargo llvm-cov -p bridge-core --fail-under-lines 90` and `-p bridge-registry --fail-under-lines 90` → both met (new bridge-core code = `compose_verify`)
+- [ ] Coverage matching **ci.yml ground truth** (NOT the stale README, which lists bridge-registry — `ci.yml:51-63` gates these):
+  ```bash
+  cargo llvm-cov clean --workspace
+  cargo llvm-cov --workspace        --fail-under-lines 85
+  cargo llvm-cov --package bridge-core     --fail-under-lines 90   # new code: compose_verify
+  cargo llvm-cov --package bridge-acp      --fail-under-lines 90   # untouched
+  cargo llvm-cov --package bridge-api      --fail-under-lines 90   # untouched
+  cargo llvm-cov --package bridge-workflow --fail-under-lines 90   # untouched
+  ```
+  New code lives in bridge-core (`compose_verify`, well-tested) + the `a2a-bridge` bin (no per-package floor → rolls into workspace-85; the pure verify helpers + `outcome_suffix` are unit-tested, only `docker_runner` + the impure run resolution are live-gated). NOTE: the README floor table (README:198-200) is stale — it omits bridge-acp/api/workflow and lists bridge-registry; flag a follow-up README fix (out of B2b-2 scope).
 - [ ] the Task 9 live gate PASS recorded in ADR-0020
 - [ ] Use **superpowers:finishing-a-development-branch** (Wesley's pattern: merge to main, then push)
 
@@ -1017,11 +1113,12 @@ EOF
 ## Self-review (spec coverage)
 
 - Decision 1 (bridge-deterministic, post-commit, reported) → Task 5 integration.
-- Decision 2 (unforgeable out-of-band exit) → Task 4 per-command `docker run` + container exit; Task 9 Step 3.
+- Decision 2 (unforgeable out-of-band exit) → Task 4 per-command `docker run` + container exit; Task 9 Step 3. The verify container runs in the clone via a tested `cd '<clone>'` in the script (compose_sandbox emits no `--workdir`; the reader base is `WORKDIR /work`) — Task 1.
 - Decision 3 (reuse `SandboxConfig`/`compose_sandbox`, no parallel schema; `VerifyConfig` via `parse_egress`) → Tasks 1 + 2.
 - Decision 4 (structured `{name,cmd,gate}`) → Task 2 + Task 3 aggregation.
 - Decision 5 (`--locked` everywhere) → Task 8 default commands.
 - Decision 6 (separate verify egress; no creds) → Task 7 + Task 9 Step 4.
 - Decision 7 (coverage opt-in; tools in image) → Task 6 (tools) + Task 8 (commented command).
 - Decision 8 (`:ro` clone; per-repo cache; single-flight) → Task 1 (`access=Ro`) + Task 3 (`cache_volume_name`) + Task 8 (`cache` base). **Single-flight note:** B2b-2 ships per-repo cache keying (different repos isolated); concurrent *same-repo* `implement` runs are not expected (the operator drives `implement` serially) and cargo's own package-cache + target locks serialize within a shared volume — an explicit cross-container verify lock is deferred to the warm-pool/concurrency slice and called out in ADR-0020.
-- Toolchain image pin / impl image before-after / hand-off contract / floors → Tasks 6 / 8 / 5 / Final.
+- Toolchain image pin / impl image before-after / hand-off contract → Tasks 6 / 8 / 5.
+- **Dual-review folds (plan rev2):** Task 5 use-after-move (capture `verify_cfg` before `into_snapshot`, no `transpose()?`); `compose_verify` cwd `cd '<clone>'` (Task 1); Task 2 fixtures get `[server]`; cache key canonicalizes `a.repo` (Task 5); pure `outcome_suffix` + test for the Commit-arm classification (Tasks 3/5); non-gate test reordered before a gate (Task 4); Task 8 smoke honest (deserialize ≠ validate); Task 9 containment via `docker events` + `:ro` probe (not `--rm`-raced inspect); Task 10 `-m` flags; **floors = ci.yml (workspace 85 + bridge-core/acp/api/workflow 90), NOT the stale README's bridge-registry.**

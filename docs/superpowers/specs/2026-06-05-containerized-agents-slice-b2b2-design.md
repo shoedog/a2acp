@@ -153,8 +153,9 @@ A SECOND egress in `deploy/containers/compose.egress.yaml`: `a2a-verify-egress` 
   2nd run); inject a clippy failure → ❌ at clippy + the output on stderr + verify stops; assert the verify
   container ran on `a2a-verify-egress` (NOT `a2a-egress-internal`) with **no creds mount** and the clone
   `:ro` (a write to the clone path fails), via `docker inspect`/`events`.
-- Coverage after `cargo llvm-cov clean --workspace` (floors: workspace 85, **bridge-core 90, bridge-registry
-  90** — per the README; B2b-2's new pure code is in bridge-core (`compose_verify`) + the bin).
+- Coverage after `cargo llvm-cov clean --workspace` (floors per **ci.yml** ground truth, NOT the stale
+  README: workspace 85, **bridge-core 90, bridge-acp 90, bridge-api 90, bridge-workflow 90**). B2b-2's new
+  pure code is in bridge-core (`compose_verify`) + the `a2a-bridge` bin (no per-package floor → workspace 85).
 
 ## Deferred
 - **B2b-3:** review→tweak loop (re-prompt the agent — in its toolchain image — to fix a failing verify);
