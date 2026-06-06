@@ -1,7 +1,7 @@
 //! The B2b-3b review→tweak loop. PURE core (`classify`/`fix_step`/`build_fix_input`/`loop_outcome_suffix`)
-//! + the injectable `run_tweak_loop` driven through the `TweakEffects` seam — so the no-work-loss wiring is
-//! unit-tested with a FAKE executor while the git ops run on a REAL clone. No panics, no slicing (B2b-3a's
-//! em-dash lesson); phase-2 totality (no `?`).
+//! plus the injectable `run_tweak_loop` driven through the `TweakEffects` seam — so the no-work-loss wiring
+//! is unit-tested with a FAKE executor while the git ops run on a REAL clone. No panics, no slicing
+//! (B2b-3a's em-dash lesson); phase-2 totality (no `?`).
 
 use crate::review::{ReviewOutcome, Verdict};
 use crate::verify::VerifyOutcome;
@@ -158,6 +158,7 @@ pub trait TweakEffects {
 
 /// The bounded review→tweak loop. Git ops run on a REAL clone; the workflow effects are injected via `eff`
 /// (so the no-work-loss wiring is fake-executor testable). Phase 2: NO `?` — every fallible op → a StopReason.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tweak_loop(
     clone: &std::path::Path,
     branch: &str,

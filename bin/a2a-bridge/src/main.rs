@@ -577,9 +577,64 @@ async fn run_review_step(
     )
 }
 
+/// The production `tweak::TweakEffects`: the real verify/review/fix turns. Borrows the loop's setup for its
+/// lifetime; `fix` is only called when `fix_graph` is `Some` (the loop guards with `fix_available`).
+struct ProdEffects<'a> {
+    verify_cfg: &'a Option<Result<config::VerifyConfig, config::ConfigError>>,
+    review_cfg: &'a Option<Result<config::ReviewConfig, config::ConfigError>>,
+    wf_map: &'a std::collections::HashMap<
+        bridge_core::ids::WorkflowId,
+        std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
+    >,
+    executor: &'a bridge_workflow::executor::WorkflowExecutor,
+    fix_graph: Option<std::sync::Arc<bridge_workflow::graph::WorkflowGraph>>,
+    clone_cwd: &'a bridge_core::SessionCwd,
+    repo: &'a std::path::Path,
+    task: &'a str,
+    base_sha: &'a str,
+    task_id: &'a str,
+}
+
+#[async_trait::async_trait]
+impl tweak::TweakEffects for ProdEffects<'_> {
+    async fn verify(&mut self, _attempt: u32) -> verify::VerifyOutcome {
+        run_verify_step(self.verify_cfg, self.clone_cwd, self.repo)
+    }
+    async fn review(&mut self, attempt: u32, head_sha: &str) -> (review::ReviewOutcome, String) {
+        run_review_step(
+            self.review_cfg,
+            self.wf_map,
+            self.executor,
+            self.task,
+            self.base_sha,
+            head_sha,
+            self.clone_cwd,
+            self.task_id,
+            attempt,
+        )
+        .await
+    }
+    async fn fix(&mut self, attempt: u32, input: &str) -> bool {
+        let graph = self
+            .fix_graph
+            .clone()
+            .expect("fix only called when fix_available");
+        drain_impl(self.executor.run_with_context(
+            graph,
+            input.to_string(),
+            format!("impl-fix-{}-{}", self.task_id, attempt),
+            tokio_util::sync::CancellationToken::new(),
+            bridge_workflow::executor::WorkflowRunContext {
+                session_cwd: Some(self.clone_cwd.clone()),
+            },
+        ))
+        .await
+    }
+}
+
 /// `a2a-bridge implement <task> --repo <path>` — clone a quarantine, run the 1-node `implement-edit`
-/// workflow on the ContainerRw `impl` agent (session_cwd = the clone), then the deterministic commit
-/// state machine + the operator hand-off. The agent owns staging + the message; the bridge owns the commit.
+/// workflow on the ContainerRw `impl` agent (session_cwd = the clone), then commit + the bounded
+/// review→tweak loop (B2b-3b) + the operator hand-off. The agent owns staging; the bridge owns the commit.
 async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     bridge_observ::init();
     let a = parse_implement_args(args)?;
@@ -598,6 +653,18 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
 
     // R6: probe the EXISTING root for an enclosing worktree BEFORE creating .a2a-implement.
     implement::assert_dest_outside_worktree(&root)?;
+
+    // B2b-3b: resolve the loop config PRE-CLONE so a malformed [implement] fails loud before any quarantine
+    // clone is created. Absent → LoopConfig::default() (loop ON, max_attempts=3). `fix_graph` is resolved
+    // later (it needs the loaded workflow map).
+    let loop_cfg = cfg
+        .implement
+        .as_ref()
+        .map(|t| t.to_config())
+        .transpose()
+        .map_err(|e| format!("implement: [implement] config: {e}"))?
+        .unwrap_or_default();
+
     let impl_dir = root.join(".a2a-implement");
     std::fs::create_dir_all(&impl_dir)
         .map_err(|e| format!("implement: mkdir {impl_dir:?}: {e}"))?;
@@ -665,6 +732,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         .get(&wf_id)
         .cloned()
         .ok_or_else(|| format!("implement: unknown workflow {:?}", a.workflow))?;
+    // B2b-3b: resolve the fix workflow against the loaded map (None → FixUnavailable, a soft loop stop).
+    let fix_graph = wf_map.get(&loop_cfg.fix_workflow).cloned();
     // B2b-2: parse [verify] NOW, before into_snapshot moves cfg. Owned + Clone, survives the move.
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config()); // B2b-3a: parsed pre-commit (beside verify)
@@ -690,35 +759,15 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
     };
-    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
-    use futures::StreamExt;
-    let mut stream = executor.run_with_context(
+    // First edit turn; the per-turn ContainerRw container is reaped (detached) when the stream drops.
+    let completed = drain_impl(executor.run_with_context(
         graph,
         a.task.clone(),
         run_id,
         tokio_util::sync::CancellationToken::new(),
         ctx,
-    );
-    let mut completed = false;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(WorkflowEvent::NodeStarted { node }) => {
-                eprintln!("[implement] node {} started", node.as_str())
-            }
-            Ok(WorkflowEvent::NodeFinished { node, ok, .. }) => {
-                eprintln!(
-                    "[implement] node {} {}",
-                    node.as_str(),
-                    if ok { "ok" } else { "failed" }
-                )
-            }
-            Ok(WorkflowEvent::Terminal { outcome, .. }) => {
-                completed = matches!(outcome, WorkflowOutcome::Completed)
-            }
-            Err(e) => eprintln!("[implement] error: {e:?}"),
-        }
-    }
-    drop(stream); // end the run; the per-turn ContainerRw container is reaped (detached).
+    ))
+    .await;
 
     // 5. the pure soft-gate decision, then execute its Action.
     let guard = implement::head_guard(&clone, &branch, &pre);
@@ -752,119 +801,49 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             Ok(())
         }
         implement::Action::Commit(message) => {
+            // Phase 1 → 2 boundary: the ONLY post-commit `?`. After this, the loop body is lossy (no `?`).
             let sha = implement::host_commit(&clone, &message)?;
-            let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13: strip after
-                                                                                     // Best-effort (NO `?`): the post-commit tail must always reach the hand-off (B2b-3a invariant).
-            if !matches!(
-                implement::stage_state(&clone).unwrap_or(implement::StageState::Clean),
-                implement::StageState::Clean
-            ) {
-                eprintln!("[implement] note: the clone still has uncommitted changes the agent left unstaged.");
-            }
+            let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13 hygiene
+            let mut effects = ProdEffects {
+                verify_cfg: &verify_cfg,
+                review_cfg: &review_cfg,
+                wf_map: &wf_map,
+                executor: &executor,
+                fix_graph: fix_graph.clone(),
+                clone_cwd: &clone_cwd,
+                repo: &a.repo,
+                task: &a.task,
+                base_sha: &base_sha,
+                task_id: &task_id,
+            };
+            let final_ = tweak::run_tweak_loop(
+                &clone,
+                &branch,
+                &a.task,
+                sha,
+                &message,
+                loop_cfg.max_attempts,
+                fix_graph.is_some(),
+                &mut effects,
+            )
+            .await;
+
+            // Hand-off: the FINAL sha (patches the stale committed line) + the ORIGINAL subject, then the
+            // verify + review + loop suffixes. Always prints (the invariant).
             let subject = message.lines().next().unwrap_or("").to_string();
             let mut handoff = implement::handoff_text(
                 &clone.to_string_lossy(),
                 &branch,
-                &sha,
+                &final_.sha,
                 &subject,
                 &a.repo.to_string_lossy(),
             );
-
-            // B2b-2: deterministic build+test verify on the committed clone (reported, not gating).
-            // `verify_cfg` was captured before into_snapshot. The pure `outcome_suffix` (verify.rs) does
-            // the riskiest classification; this arm only resolves the outcome (impure) + dumps stderr.
-            let outcome = match verify_cfg {
-                Some(Ok(vcfg)) => {
-                    // Canonicalize a.repo for the cache key so two spellings don't split the warm cache.
-                    let repo_canon =
-                        std::fs::canonicalize(&a.repo).unwrap_or_else(|_| a.repo.clone());
-                    let cache_vol =
-                        verify::cache_volume_name(&vcfg.cache, &repo_canon.to_string_lossy());
-                    eprintln!(
-                        "[implement] verify: running {} command(s) in {}",
-                        vcfg.commands.len(),
-                        vcfg.image
-                    );
-                    let verdict = verify::run_verify(
-                        &vcfg,
-                        &clone_cwd,
-                        &cache_vol,
-                        &verify::docker_runner,
-                        16 * 1024,
-                    );
-                    for r in &verdict.results {
-                        if !r.ok {
-                            eprintln!("[implement] verify: {} failed:\n{}", r.name, r.output);
-                        }
-                    }
-                    verify::VerifyOutcome::Ran(verdict)
-                }
-                Some(Err(e)) => {
-                    eprintln!("[implement] verify: config error: {e:?} — skipping verify");
-                    verify::VerifyOutcome::ConfigError
-                }
-                None => verify::VerifyOutcome::NotConfigured,
-            };
             handoff.push('\n');
-            handoff.push_str(&verify::outcome_suffix(&outcome));
-
-            // B2b-3a: advisory review of the committed diff (bounded; never blocks the hand-off — NO `?`).
-            let review_outcome = match review_cfg {
-                None => review::ReviewOutcome::NotConfigured,
-                Some(Err(e)) => {
-                    eprintln!("[implement] review: config error: {e:?}");
-                    review::ReviewOutcome::ConfigError
-                }
-                Some(Ok(rcfg)) => match wf_map.get(&rcfg.workflow).cloned() {
-                    None => review::ReviewOutcome::NotLoaded,
-                    Some(graph) => {
-                        let input = review::build_review_input(&a.task, &base_sha, &sha);
-                        let ctx = bridge_workflow::executor::WorkflowRunContext {
-                            session_cwd: Some(clone_cwd.clone()),
-                        };
-                        let token = tokio_util::sync::CancellationToken::new();
-                        let stream = executor.run_with_context(
-                            graph,
-                            input,
-                            format!("impl-review-{task_id}"),
-                            token.clone(),
-                            ctx,
-                        );
-                        eprintln!("[implement] review: running implement-review");
-                        // Timeout = cancel-then-KEEP-DRAINING (don't drop the stream — the executor must
-                        // keep being polled to run backend.cancel/forget_session on cancel).
-                        let mut drain = std::pin::pin!(drain_review(stream));
-                        let (completed, synth, reviewers_failed) = tokio::select! {
-                            r = &mut drain => r,
-                            _ = tokio::time::sleep(rcfg.timeout) => {
-                                eprintln!("[implement] review: timed out after {:?}", rcfg.timeout);
-                                token.cancel();
-                                (&mut drain).await
-                            }
-                        };
-                        if completed {
-                            // Parse the FULL synth (truncation could drop a body VERDICT → flip it).
-                            let (verdict, summary) = review::parse_verdict(&synth);
-                            if !matches!(verdict, review::Verdict::Approve) {
-                                eprintln!(
-                                    "[implement] review {verdict:?}:\n{}",
-                                    verify::truncate_output(&synth, rcfg.max_output_bytes)
-                                );
-                            }
-                            review::ReviewOutcome::Ran {
-                                verdict,
-                                summary,
-                                reviewers_failed,
-                            }
-                        } else {
-                            review::ReviewOutcome::Incomplete
-                        }
-                    }
-                },
-            };
+            handoff.push_str(&verify::outcome_suffix(&final_.last_verify));
             handoff.push('\n');
-            handoff.push_str(&review::outcome_suffix(&review_outcome));
-
+            handoff.push_str(&review::outcome_suffix(&final_.last_review));
+            handoff.push('\n');
+            handoff.push_str(&tweak::loop_outcome_suffix(&final_.report));
             println!("{handoff}");
             Ok(())
         }
