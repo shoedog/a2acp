@@ -122,6 +122,9 @@ pub struct RegistryConfig {
     /// `[review]` (Slice B2b-3a): the review-the-diff workflow run after `implement` commits. Absent → skipped.
     #[serde(default)]
     pub review: Option<ReviewToml>,
+    /// `[implement]` (Slice B2b-3b): the review→tweak loop config. Absent → `LoopConfig::default()`.
+    #[serde(default)]
+    pub implement: Option<ImplementToml>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -331,6 +334,67 @@ impl ReviewToml {
             workflow,
             max_output_bytes,
             timeout,
+        })
+    }
+}
+
+/// `[implement]` (Slice B2b-3b): bounds + names the fix workflow for the review→tweak loop.
+#[derive(Debug, serde::Deserialize)]
+pub struct ImplementToml {
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub fix_workflow: Option<String>,
+}
+
+/// Parsed `[implement]`: a validated max + a parsed fix-workflow id (so the post-commit lookup is a soft
+/// `FixUnavailable`, never an abort). A malformed block is fail-loud PRE-clone (resolved before the clone).
+#[derive(Debug, Clone)]
+pub struct LoopConfig {
+    pub max_attempts: u32,
+    pub fix_workflow: bridge_core::ids::WorkflowId,
+}
+
+fn default_fix_workflow_id() -> bridge_core::ids::WorkflowId {
+    bridge_core::ids::WorkflowId::parse("implement-fix").expect("static id is valid")
+}
+
+const IMPLEMENT_HARD_MAX: u32 = 10;
+
+impl Default for LoopConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            fix_workflow: default_fix_workflow_id(),
+        }
+    }
+}
+
+impl ImplementToml {
+    pub fn to_config(&self) -> Result<LoopConfig, ConfigError> {
+        let max_attempts = match self.max_attempts {
+            None => 3,
+            Some(0) => {
+                return Err(ConfigError::Registry(
+                    "[implement] max_attempts must be >= 1".into(),
+                ))
+            }
+            Some(n) if n > IMPLEMENT_HARD_MAX => {
+                eprintln!(
+                    "[implement] max_attempts {n} > {IMPLEMENT_HARD_MAX}; clamping to {IMPLEMENT_HARD_MAX}"
+                );
+                IMPLEMENT_HARD_MAX
+            }
+            Some(n) => n,
+        };
+        let fix_workflow = match &self.fix_workflow {
+            Some(s) => bridge_core::ids::WorkflowId::parse(s.clone())
+                .map_err(|e| ConfigError::Registry(format!("[implement] fix_workflow id: {e:?}")))?,
+            None => default_fix_workflow_id(),
+        };
+        Ok(LoopConfig {
+            max_attempts,
+            fix_workflow,
         })
     }
 }
@@ -1235,6 +1299,77 @@ addr="127.0.0.1:8080"
         )
         .unwrap();
         assert!(c.review.as_ref().unwrap().to_config().is_err());
+    }
+
+    #[test]
+    fn implement_config_defaults_when_absent() {
+        let lc = ImplementToml {
+            max_attempts: None,
+            fix_workflow: None,
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(lc.max_attempts, 3);
+        assert_eq!(lc.fix_workflow.as_str(), "implement-fix");
+        assert_eq!(LoopConfig::default().max_attempts, 3);
+        assert_eq!(LoopConfig::default().fix_workflow.as_str(), "implement-fix");
+    }
+
+    #[test]
+    fn implement_config_max_attempts_zero_is_error() {
+        assert!(ImplementToml {
+            max_attempts: Some(0),
+            fix_workflow: None,
+        }
+        .to_config()
+        .is_err());
+    }
+
+    #[test]
+    fn implement_config_clamps_above_hard_max() {
+        let lc = ImplementToml {
+            max_attempts: Some(99),
+            fix_workflow: None,
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(lc.max_attempts, 10);
+    }
+
+    #[test]
+    fn implement_config_custom_fix_workflow_and_malformed() {
+        let lc = ImplementToml {
+            max_attempts: Some(2),
+            fix_workflow: Some("my-fix".into()),
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(lc.max_attempts, 2);
+        assert_eq!(lc.fix_workflow.as_str(), "my-fix");
+        assert!(ImplementToml {
+            max_attempts: None,
+            fix_workflow: Some("".into()),
+        }
+        .to_config()
+        .is_err());
+    }
+
+    #[test]
+    fn implement_block_parses_from_toml() {
+        let c = RegistryConfig::parse(
+            "default=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n\
+             [implement]\nmax_attempts=2\nfix_workflow=\"implement-fix\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.implement.as_ref().unwrap().to_config().unwrap().max_attempts,
+            2
+        );
+        let c2 = RegistryConfig::parse(
+            "default=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n",
+        )
+        .unwrap();
+        assert!(c2.implement.is_none());
     }
 
     #[test]
