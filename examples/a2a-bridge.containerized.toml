@@ -13,6 +13,34 @@ default = "claude"
 
 allowed_cwd_root = "/Users/wesleyjinks/code"
 
+# B2b-2: the build+test verify run after `a2a-bridge implement` commits. Bridge-deterministic (the
+# agent can't fake it), REPORTED not gating. Separate egress (registries only; NO creds) so creds and
+# registry-egress never coexist. Coverage is opt-in (commented) — it can't reuse the warm non-instrumented
+# cache. Default gates are fmt/clippy/build/test, all --locked against the :ro clone.
+[verify]
+image   = "a2a-toolchain:latest"
+cache   = "a2a-verify-cache"                   # per-repo: the bridge appends a hash of the source path
+egress  = "locked"
+network = "a2a-verify-egress"
+proxy   = "http://a2a-verify-proxy:8888"
+[[verify.commands]]
+name = "fmt"
+cmd  = "cargo fmt --all -- --check"
+[[verify.commands]]
+name = "clippy"
+cmd  = "cargo clippy --all-targets --all-features --locked -- -D warnings"
+[[verify.commands]]
+name = "build"
+cmd  = "cargo build --locked"
+[[verify.commands]]
+name = "test"
+cmd  = "cargo test --locked"
+# opt-in coverage (instrumented recompile; reported, never gates):
+# [[verify.commands]]
+# name = "coverage"
+# cmd  = "cargo llvm-cov --workspace --locked --summary-only"
+# gate = false
+
 [registry]
 # The spawned program is `docker`; validate() requires it allowlisted (also defaults to the union of
 # entry cmds, but state it explicitly as a tightening).
@@ -70,7 +98,7 @@ id   = "impl"
 kind = "container_rw"
 cmd  = "claude-agent-acp"
 [agents.sandbox]
-image   = "a2a-agent-reader:latest"
+image   = "a2a-toolchain:latest"               # B2b-2: toolchain so the agent (and verify) has cargo
 mount   = "/Users/wesleyjinks/code"            # == allowed_cwd_root (S2); :rw target is the session cwd under it
 access  = "rw"
 egress  = "locked"

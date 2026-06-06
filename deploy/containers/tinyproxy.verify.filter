@@ -1,0 +1,5 @@
+# Verify-only egress: the cargo registries + GitHub for git deps. Anchored ERE, default-deny.
+# `(^|\.)crates\.io$` already covers index.crates.io (sparse index) + static.crates.io (downloads);
+# `(^|\.)github\.com$` already covers codeload.github.com (git-dep tarballs). Two lines, no redundancy.
+(^|\.)crates\.io$
+(^|\.)github\.com$

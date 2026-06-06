@@ -7,6 +7,9 @@ networks:
     internal: true          # no gateway -> agents on this net have NO direct internet route
   a2a-egress-external:
     name: a2a-egress-external
+  a2a-verify-egress:        # B2b-2: verify-only internal net; reaches ONLY the verify-proxy
+    name: a2a-verify-egress
+    internal: true
 
 services:
   egress-proxy:
@@ -18,4 +21,20 @@ services:
     networks:
       - a2a-egress-internal   # reachable by agents
       - a2a-egress-external   # can reach the providers
+    restart: unless-stopped
+
+  # B2b-2: a SECOND proxy for the `implement` verify containers only — registries (crates.io/github),
+  # NO provider hosts, and verify mounts NO creds. Reuses the proxy image; overrides the filter via a
+  # read-only bind so the agent/reader egress (provider-only) is untouched. Creds XOR registry-egress.
+  verify-proxy:
+    build:
+      context: .
+      dockerfile: proxy.Containerfile
+    image: a2a-egress-proxy:latest
+    container_name: a2a-verify-proxy
+    networks:
+      - a2a-verify-egress     # reachable by verify containers
+      - a2a-egress-external   # can reach the registries
+    volumes:
+      - ./tinyproxy.verify.filter:/etc/tinyproxy/filter:ro
     restart: unless-stopped
