@@ -182,6 +182,8 @@ impl AgentBackend for ContainerRwBackend {
             auth_method: self.cfg.auth_method.clone(),
             handshake_timeout: self.cfg.handshake_timeout,
             cancel_grace: self.cfg.cancel_grace,
+            // :rw has its own ContainerReaper (this crate); the inner AcpBackend's :ro reaper stays off.
+            container: None,
         };
 
         // Spawn — the `docker run` client may be up before the handshake fails → reap by name on error.

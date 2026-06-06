@@ -86,6 +86,29 @@ pub struct AcpConfig {
     /// [`DEFAULT_CANCEL_GRACE`]; tests override it to a short value to assert the
     /// hung-agent escalation deterministically without hanging the suite.
     pub cancel_grace: std::time::Duration,
+    /// Reaper for a containerized agent's `docker run` container (`:ro` sandbox). `None` for local-process
+    /// and in-process (test) backends — reaping is then a no-op.
+    pub container: Option<ContainerReap>,
+}
+
+/// Reaper handle for a containerized (`:ro` sandbox) agent: the named `docker run` container is removed
+/// (`docker rm -f`) on every teardown path. Built by the bin's spawn factories; `reap_fn` is injected so
+/// the teardown logic is Docker-free unit-testable.
+#[derive(Clone)]
+pub struct ContainerReap {
+    pub runtime: String,
+    pub name: String,
+    pub reap_fn: bridge_core::reaper::ReapFn,
+}
+
+impl std::fmt::Debug for ContainerReap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerReap")
+            .field("runtime", &self.runtime)
+            .field("name", &self.name)
+            .field("reap_fn", &"<fn>")
+            .finish()
+    }
 }
 
 impl Default for AcpConfig {
@@ -97,6 +120,7 @@ impl Default for AcpConfig {
             auth_method: None,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             cancel_grace: DEFAULT_CANCEL_GRACE,
+            container: None,
         }
     }
 }
@@ -296,6 +320,9 @@ pub struct AcpBackend {
     supervised: Arc<StdMutex<Option<Supervised>>>,
     /// Static config (cwd for `session/new`, model/mode for later tasks).
     config: Option<AcpConfig>,
+    /// Idempotency flag for the `:ro` container reaper (shared across the teardown sites: cancel-escalate,
+    /// retire, Drop). Always present; reaping is a no-op when `config.container` is `None`.
+    reaped: Arc<AtomicBool>,
     /// bridge-session-key → per-session agent state. The map itself is behind a
     /// `Mutex` held ONLY long enough to look up / insert the `Arc<AgentSession>`;
     /// it is dropped before any `session/new` await so the mint of one session
@@ -479,26 +506,44 @@ impl AcpBackend {
     /// This is `Supervised` + `connect(ByteStreams)`: process lifecycle stays
     /// with `Supervised`; protocol drive is the shared `connect` core.
     pub async fn spawn(cmd: &str, args: &[&str], config: AcpConfig) -> Result<Self, BridgeError> {
+        // Reaper handle for the SPAWN-FAILURE path (Site A): once `Supervised::spawn` succeeds the
+        // `docker run` container is up, but if pipe-take or the handshake then fails there is no backend
+        // to reap from — so reap here. Cloned before `config` moves into `connect`.
+        let container_on_fail = config.container.clone();
         let mut supervised = Supervised::spawn(cmd, args, None)
             .map_err(|e| BridgeError::agent_crashed(format!("spawn failed: {e}")))?;
-        let child = supervised.child_mut();
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| BridgeError::agent_crashed("agent stdin unavailable after spawn"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| BridgeError::agent_crashed("agent stdout unavailable after spawn"))?;
-        // The crate uses `futures` async-io; our child uses tokio pipes — adapt
-        // with tokio_util::compat. ByteStreams::new(outgoing_writer, incoming_reader).
-        let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-        // `supervised` (the process-group owner) MUST live for the whole backend
-        // lifetime: `kill_on_drop(true)` would SIGKILL the child the instant it
-        // dropped, killing the event-loop task's pipes. Hold it on the backend.
-        let backend = Self::connect(transport, config).await?;
-        *backend.supervised.lock().expect("supervised lock") = Some(supervised);
-        Ok(backend)
+        // Everything after the (now-running) child: any error orphans the container → reap it.
+        let result = async {
+            let child = supervised.child_mut();
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| BridgeError::agent_crashed("agent stdin unavailable after spawn"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| BridgeError::agent_crashed("agent stdout unavailable after spawn"))?;
+            // The crate uses `futures` async-io; our child uses tokio pipes — adapt
+            // with tokio_util::compat. ByteStreams::new(outgoing_writer, incoming_reader).
+            let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+            Self::connect(transport, config).await
+        }
+        .await;
+        match result {
+            Ok(backend) => {
+                // `supervised` (the process-group owner) MUST live for the whole backend lifetime:
+                // `kill_on_drop(true)` would SIGKILL the child the instant it dropped, killing the
+                // event-loop task's pipes. Hold it on the backend.
+                *backend.supervised.lock().expect("supervised lock") = Some(supervised);
+                Ok(backend)
+            }
+            Err(e) => {
+                // One-shot reap (no backend exists; `supervised` drops here → SIGKILLs the client).
+                let reaped = Arc::new(AtomicBool::new(false));
+                AcpBackend::reap_container(&container_on_fail, &reaped);
+                Err(e)
+            }
+        }
     }
 
     /// **Transport-generic** core constructor. Accepts any SDK transport, so
@@ -720,6 +765,7 @@ impl AcpBackend {
             }),
             supervised: Arc::new(StdMutex::new(None)),
             config: Some(config),
+            reaped: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             policy,
@@ -1105,12 +1151,26 @@ impl AcpBackend {
     /// no-op there (closing the duplex channel is the test's own concern).
     /// `terminate(self, _)` is async + consumes the child, so we run it on a
     /// detached task and return immediately.
-    fn escalate_terminate(supervised: &Arc<StdMutex<Option<Supervised>>>) {
+    fn escalate_terminate(
+        supervised: &Arc<StdMutex<Option<Supervised>>>,
+        container: &Option<ContainerReap>,
+        reaped: &Arc<AtomicBool>,
+    ) {
         let taken = supervised.lock().ok().and_then(|mut g| g.take());
         if let Some(child) = taken {
             tokio::spawn(async move {
                 child.terminate(TERMINATE_GRACE).await;
             });
+        }
+        // Site B: the agent PROCESS is being nuked → reap its `:ro` container (idempotent; no-op if none).
+        AcpBackend::reap_container(container, reaped);
+    }
+
+    /// Reap the agent's `:ro` container (idempotent; no-op when `container` is `None`). Called from every
+    /// teardown site (spawn-failure, escalate_terminate, retire, Drop) — at most one `docker rm -f` total.
+    fn reap_container(container: &Option<ContainerReap>, reaped: &Arc<AtomicBool>) {
+        if let Some(c) = container {
+            bridge_core::reaper::reap_once(&c.reap_fn, &c.runtime, &c.name, reaped);
         }
     }
 
@@ -1252,6 +1312,8 @@ impl AgentBackend for AcpBackend {
         let registry_for_driver = Arc::clone(&registry);
         let agent_id_for_driver = agent_id.clone();
         let supervised_for_driver = Arc::clone(&self.supervised);
+        let container_for_driver = self.config.as_ref().and_then(|c| c.container.clone());
+        let reaped_for_driver = Arc::clone(&self.reaped);
         let kill_slot = Arc::clone(&entry.turn_kill);
         let grace = self.cancel_grace();
         tokio::spawn(async move {
@@ -1287,7 +1349,11 @@ impl AgentBackend for AcpBackend {
                         outcome = &mut prompt_fut => outcome.map_err(|_| ()),
                         _ = kill.notified() => Err(()),
                         _ = tokio::time::sleep(grace) => {
-                            AcpBackend::escalate_terminate(&supervised_for_driver);
+                            AcpBackend::escalate_terminate(
+                                &supervised_for_driver,
+                                &container_for_driver,
+                                &reaped_for_driver,
+                            );
                             Err(())
                         }
                     }
@@ -1393,6 +1459,8 @@ impl AgentBackend for AcpBackend {
 
         let turn_lock = Arc::clone(&entry.turn_lock);
         let supervised = Arc::clone(&self.supervised);
+        let container = self.config.as_ref().and_then(|c| c.container.clone());
+        let reaped = Arc::clone(&self.reaped);
         let kill_slot = Arc::clone(&entry.turn_kill);
         let grace = self.cancel_grace();
         tokio::spawn(async move {
@@ -1406,7 +1474,7 @@ impl AgentBackend for AcpBackend {
                 // this is a no-op, so ALSO fire the per-turn kill switch to unblock
                 // the driver deterministically; either path ends the turn with a
                 // terminal `Err`, releases the lock, and unhangs the caller.
-                AcpBackend::escalate_terminate(&supervised);
+                AcpBackend::escalate_terminate(&supervised, &container, &reaped);
                 let kill = kill_slot.lock().ok().and_then(|g| g.clone());
                 if let Some(k) = kill {
                     // `notify_one` stores a permit if the driver has not yet
@@ -1458,7 +1526,20 @@ impl AgentBackend for AcpBackend {
         if let Some(sup) = sup {
             sup.terminate(self.cancel_grace()).await;
         }
+        // Site C: lease-drain teardown → reap the `:ro` container (idempotent; no-op if none).
+        let container = self.config.as_ref().and_then(|c| c.container.clone());
+        AcpBackend::reap_container(&container, &self.reaped);
         Ok(())
+    }
+}
+
+impl Drop for AcpBackend {
+    /// Site D: the plain-drop path (normal workflow completion → registry drop). Reaps the `:ro` container
+    /// if no earlier site already did. `reap_container` → `reap_once` → `production_reap_fn`'s
+    /// `spawn_detached` is off-runtime-safe, so a Drop at process shutdown never panics.
+    fn drop(&mut self) {
+        let container = self.config.as_ref().and_then(|c| c.container.clone());
+        AcpBackend::reap_container(&container, &self.reaped);
     }
 }
 
@@ -1563,6 +1644,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn container_reap_is_idempotent_across_sites_and_noop_without_container() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let reap_fn: bridge_core::reaper::ReapFn = Arc::new(move |_r, _n| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        let container = Some(ContainerReap {
+            runtime: "docker".into(),
+            name: "a2a-ro-owner-nonce".into(),
+            reap_fn,
+        });
+        let reaped = Arc::new(AtomicBool::new(false));
+        // escalate_terminate + retire + Drop all firing → still one `docker rm -f`.
+        AcpBackend::reap_container(&container, &reaped);
+        AcpBackend::reap_container(&container, &reaped);
+        AcpBackend::reap_container(&container, &reaped);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "reaped at most once across all sites");
+
+        // No container → never reaps.
+        let none: Option<ContainerReap> = None;
+        let r2 = Arc::new(AtomicBool::new(false));
+        AcpBackend::reap_container(&none, &r2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_handshake_failure_reaps_the_container() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let reap_fn: bridge_core::reaper::ReapFn = Arc::new(move |_r, _n| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        let cfg = AcpConfig {
+            cwd: std::env::temp_dir(),
+            handshake_timeout: Duration::from_millis(200), // force the timeout fast
+            cancel_grace: Duration::from_millis(200),
+            container: Some(ContainerReap {
+                runtime: "docker".into(),
+                name: "a2a-ro-owner-nonce".into(),
+                reap_fn,
+            }),
+            ..AcpConfig::default()
+        };
+        // /bin/cat starts (Supervised ok) but never answers `initialize` → handshake timeout → spawn Err.
+        let res = AcpBackend::spawn("/bin/cat", &[], cfg).await;
+        assert!(res.is_err(), "handshake must time out");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the started container is reaped on the spawn-error path"
+        );
+    }
+
+    #[tokio::test]
     async fn connect_runs_initialize_and_captures_agent_capabilities() {
         // Fake agent advertises one auth method; assert the backend captured the
         // negotiated InitializeResponse (caps + auth methods) over the transport seam.
@@ -1657,6 +1794,7 @@ mod tests {
             conn: None,
             supervised: Arc::new(StdMutex::new(Some(supervised))),
             config: None,
+            reaped: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             policy: Arc::new(StdMutex::new(
@@ -3582,6 +3720,7 @@ mod tests {
             conn: None,
             supervised: Arc::new(StdMutex::new(Some(supervised))),
             config: None,
+            reaped: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             policy: Arc::new(StdMutex::new(
