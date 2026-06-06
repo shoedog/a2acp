@@ -12,7 +12,7 @@ pub enum StopReason {
     BoundReached,
     NotActionable,
     NoProgress,            // a fix turn staged nothing new (NoCommitClean/Dirty)
-    HeadMutated,           // a fix turn advanced/switched HEAD; the branch was restored to last-good
+    HeadMutated, // a fix turn advanced/switched HEAD; the branch was restored to last-good
     RestoreFailed(String), // HEAD diverged AND restoring the branch failed → the branch tip is UNTRUSTED
     FixIncomplete,         // the fix workflow did not complete (NOT a HEAD mutation)
     AmendFailed,
@@ -57,12 +57,7 @@ pub fn fix_step(action: &crate::implement::Action) -> FixDisposition {
     }
 }
 
-pub fn classify(
-    attempt: u32,
-    max_attempts: u32,
-    v: &VerifyOutcome,
-    r: &ReviewOutcome,
-) -> LoopStep {
+pub fn classify(attempt: u32, max_attempts: u32, v: &VerifyOutcome, r: &ReviewOutcome) -> LoopStep {
     let verify_ok = match v {
         VerifyOutcome::Ran(verdict) => verdict.passed,
         VerifyOutcome::NotConfigured => true,
@@ -391,7 +386,12 @@ mod tests {
             LoopStep::Stop(StopReason::NotActionable)
         );
         assert_eq!(
-            classify(1, 3, &VerifyOutcome::NotConfigured, &ReviewOutcome::NotLoaded),
+            classify(
+                1,
+                3,
+                &VerifyOutcome::NotConfigured,
+                &ReviewOutcome::NotLoaded
+            ),
             LoopStep::Stop(StopReason::NotActionable)
         );
     }
@@ -400,7 +400,10 @@ mod tests {
     fn fix_step_maps_each_action() {
         use crate::implement::Action;
         assert_eq!(fix_step(&Action::Commit("m".into())), FixDisposition::Amend);
-        assert_eq!(fix_step(&Action::Abort("x".into())), FixDisposition::Diverged);
+        assert_eq!(
+            fix_step(&Action::Abort("x".into())),
+            FixDisposition::Diverged
+        );
         assert_eq!(fix_step(&Action::NoCommitClean), FixDisposition::NoProgress);
         assert_eq!(fix_step(&Action::NoCommitDirty), FixDisposition::NoProgress);
     }
@@ -580,8 +583,17 @@ mod tests {
             review: vec![rev(Verdict::Approve, 0)],
             fixes: vec![FixAct::SwitchCommit("rogue.md")],
         };
-        let f = run_tweak_loop(&p, "implement/x", "task", sha0.clone(), "feat", 3, true, &mut fake)
-            .await;
+        let f = run_tweak_loop(
+            &p,
+            "implement/x",
+            "task",
+            sha0.clone(),
+            "feat",
+            3,
+            true,
+            &mut fake,
+        )
+        .await;
         assert_eq!(f.report.stop_reason, StopReason::HeadMutated);
         assert_eq!(implement::current_branch(&p).unwrap(), "implement/x");
         assert_eq!(implement::head_sha(&p).unwrap(), sha0); // our branch back at the trusted tip

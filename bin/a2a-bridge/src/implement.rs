@@ -709,7 +709,10 @@ mod tests {
         let parent = run_git(Some(&p), &["rev-parse", "HEAD^"]).unwrap();
         assert_eq!(String::from_utf8_lossy(&parent.stdout).trim(), base);
         let subj = run_git(Some(&p), &["log", "-1", "--format=%s"]).unwrap();
-        assert_eq!(String::from_utf8_lossy(&subj.stdout).trim(), "feat: the change");
+        assert_eq!(
+            String::from_utf8_lossy(&subj.stdout).trim(),
+            "feat: the change"
+        );
         assert!(p.join("A.md").exists() && p.join("B.md").exists());
         let an = run_git(Some(&p), &["log", "-1", "--format=%an"]).unwrap();
         assert_eq!(String::from_utf8_lossy(&an.stdout).trim(), "a2a-implement");

@@ -388,8 +388,9 @@ impl ImplementToml {
             Some(n) => n,
         };
         let fix_workflow = match &self.fix_workflow {
-            Some(s) => bridge_core::ids::WorkflowId::parse(s.clone())
-                .map_err(|e| ConfigError::Registry(format!("[implement] fix_workflow id: {e:?}")))?,
+            Some(s) => bridge_core::ids::WorkflowId::parse(s.clone()).map_err(|e| {
+                ConfigError::Registry(format!("[implement] fix_workflow id: {e:?}"))
+            })?,
             None => default_fix_workflow_id(),
         };
         Ok(LoopConfig {
@@ -1362,7 +1363,12 @@ addr="127.0.0.1:8080"
         )
         .unwrap();
         assert_eq!(
-            c.implement.as_ref().unwrap().to_config().unwrap().max_attempts,
+            c.implement
+                .as_ref()
+                .unwrap()
+                .to_config()
+                .unwrap()
+                .max_attempts,
             2
         );
         let c2 = RegistryConfig::parse(

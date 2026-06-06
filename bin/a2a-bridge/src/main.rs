@@ -494,8 +494,13 @@ fn run_verify_step(
                 vcfg.commands.len(),
                 vcfg.image
             );
-            let verdict =
-                verify::run_verify(vcfg, clone_cwd, &cache_vol, &verify::docker_runner, 16 * 1024);
+            let verdict = verify::run_verify(
+                vcfg,
+                clone_cwd,
+                &cache_vol,
+                &verify::docker_runner,
+                16 * 1024,
+            );
             for r in &verdict.results {
                 if !r.ok {
                     eprintln!("[implement] verify: {} failed:\n{}", r.name, r.output);
