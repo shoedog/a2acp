@@ -433,7 +433,9 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
 /// delegates the reduction to the PURE `review::reduce`. `run_with_context` already returns a boxed
 /// `WorkflowStream`, so take it directly (no `Box::pin`). Keeps polling to the end so the executor runs its
 /// cancel cleanup (backend.cancel/forget_session) even after a timeout cancel.
-async fn drain_review(mut stream: bridge_workflow::executor::WorkflowStream) -> (bool, String, usize) {
+async fn drain_review(
+    mut stream: bridge_workflow::executor::WorkflowStream,
+) -> (bool, String, usize) {
     use futures::StreamExt;
     let mut events = Vec::new();
     while let Some(item) = stream.next().await {
@@ -622,7 +624,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         implement::Action::Commit(message) => {
             let sha = implement::host_commit(&clone, &message)?;
             let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13: strip after
-            // Best-effort (NO `?`): the post-commit tail must always reach the hand-off (B2b-3a invariant).
+                                                                                     // Best-effort (NO `?`): the post-commit tail must always reach the hand-off (B2b-3a invariant).
             if !matches!(
                 implement::stage_state(&clone).unwrap_or(implement::StageState::Clean),
                 implement::StageState::Clean

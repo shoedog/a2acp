@@ -20,9 +20,9 @@ pub enum ReviewOutcome {
         reviewers_failed: usize,
     },
     NotConfigured, // no [review]
-    ConfigError,   // [review] present but to_config() failed (e.g. malformed workflow id) — captured pre-commit
-    NotLoaded,     // a valid workflow id absent from a successfully-loaded wf_map (typo)
-    Incomplete,    // executor stream Err / missing terminal / timeout / cancel — the runtime catch-all
+    ConfigError, // [review] present but to_config() failed (e.g. malformed workflow id) — captured pre-commit
+    NotLoaded,   // a valid workflow id absent from a successfully-loaded wf_map (typo)
+    Incomplete, // executor stream Err / missing terminal / timeout / cancel — the runtime catch-all
 }
 
 /// PURE. Tail-anchored footer parse. Exactly ONE `^VERDICT:` line must exist, and it must be the FOOTER:
@@ -152,7 +152,10 @@ mod tests {
 
     #[test]
     fn missing_verdict_is_inconclusive() {
-        assert_eq!(parse_verdict("just a review, no footer").0, Verdict::Inconclusive);
+        assert_eq!(
+            parse_verdict("just a review, no footer").0,
+            Verdict::Inconclusive
+        );
     }
 
     #[test]
@@ -203,11 +206,26 @@ mod tests {
             summary: String::new(),
             reviewers_failed: 1,
         };
-        assert_eq!(outcome_suffix(&degraded), "review: REJECT  [1 reviewer(s) failed]");
-        assert_eq!(outcome_suffix(&ReviewOutcome::NotConfigured), "review: not configured");
-        assert_eq!(outcome_suffix(&ReviewOutcome::ConfigError), "review: skipped (config error)");
-        assert_eq!(outcome_suffix(&ReviewOutcome::NotLoaded), "review: skipped (unknown workflow)");
-        assert_eq!(outcome_suffix(&ReviewOutcome::Incomplete), "review: incomplete (did not finish)");
+        assert_eq!(
+            outcome_suffix(&degraded),
+            "review: REJECT  [1 reviewer(s) failed]"
+        );
+        assert_eq!(
+            outcome_suffix(&ReviewOutcome::NotConfigured),
+            "review: not configured"
+        );
+        assert_eq!(
+            outcome_suffix(&ReviewOutcome::ConfigError),
+            "review: skipped (config error)"
+        );
+        assert_eq!(
+            outcome_suffix(&ReviewOutcome::NotLoaded),
+            "review: skipped (unknown workflow)"
+        );
+        assert_eq!(
+            outcome_suffix(&ReviewOutcome::Incomplete),
+            "review: incomplete (did not finish)"
+        );
     }
 
     #[test]

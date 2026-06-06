@@ -322,7 +322,10 @@ impl ReviewToml {
     pub fn to_config(&self) -> Result<ReviewConfig, ConfigError> {
         let workflow = bridge_core::ids::WorkflowId::parse(self.workflow.clone())
             .map_err(|e| ConfigError::Registry(format!("[review] workflow id: {e:?}")))?;
-        let max_output_bytes = self.max_output_bytes.filter(|&n| n > 0).unwrap_or(16 * 1024);
+        let max_output_bytes = self
+            .max_output_bytes
+            .filter(|&n| n > 0)
+            .unwrap_or(16 * 1024);
         let timeout = std::time::Duration::from_secs(self.timeout_secs.unwrap_or(300));
         Ok(ReviewConfig {
             workflow,
@@ -1214,7 +1217,13 @@ addr="127.0.0.1:8080"
         )
         .unwrap();
         assert_eq!(
-            c.review.as_ref().unwrap().to_config().unwrap().workflow.as_str(),
+            c.review
+                .as_ref()
+                .unwrap()
+                .to_config()
+                .unwrap()
+                .workflow
+                .as_str(),
             "implement-review"
         );
     }
