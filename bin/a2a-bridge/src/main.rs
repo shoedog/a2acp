@@ -27,6 +27,7 @@
 
 mod config;
 mod implement;
+mod review;
 mod route;
 mod verify;
 
@@ -428,6 +429,24 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     })
 }
 
+/// B2b-3a: drain a review workflow stream → (completed, synth_output, reviewers_failed). Collects events +
+/// delegates the reduction to the PURE `review::reduce`. `run_with_context` already returns a boxed
+/// `WorkflowStream`, so take it directly (no `Box::pin`). Keeps polling to the end so the executor runs its
+/// cancel cleanup (backend.cancel/forget_session) even after a timeout cancel.
+async fn drain_review(
+    mut stream: bridge_workflow::executor::WorkflowStream,
+) -> (bool, String, usize) {
+    use futures::StreamExt;
+    let mut events = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(ev) => events.push(ev),
+            Err(e) => eprintln!("[implement] review: stream error: {e:?}"),
+        }
+    }
+    review::reduce(&events)
+}
+
 /// `a2a-bridge implement <task> --repo <path>` — clone a quarantine, run the 1-node `implement-edit`
 /// workflow on the ContainerRw `impl` agent (session_cwd = the clone), then the deterministic commit
 /// state machine + the operator hand-off. The agent owns staging + the message; the bridge owns the commit.
@@ -494,6 +513,10 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let branch = implement::branch_for(&task_id);
     implement::do_checkout_branch(&clone, &branch)?;
     let pre = implement::head_sha(&clone)?;
+    // Precompute the clone's SessionCwd ONCE (pre-commit, fallible here) — reused by the implement-edit
+    // ctx, verify, and review so NO `SessionCwd::parse` runs after the commit (the hand-off must always
+    // print). B2b-3a: removes the latent post-commit verify parse too.
+    let clone_cwd = bridge_core::SessionCwd::parse(&clone.to_string_lossy())?;
     let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13: strip before
 
     // 4. run the 1-node implement-edit workflow with session_cwd = the clone.
@@ -514,6 +537,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         .ok_or_else(|| format!("implement: unknown workflow {:?}", a.workflow))?;
     // B2b-2: parse [verify] NOW, before into_snapshot moves cfg. Owned + Clone, survives the move.
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
+    let review_cfg = cfg.review.as_ref().map(|t| t.to_config()); // B2b-3a: parsed pre-commit (beside verify)
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
@@ -534,7 +558,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     );
     let run_id = format!("impl-{task_id}");
     let ctx = bridge_workflow::executor::WorkflowRunContext {
-        session_cwd: Some(bridge_core::SessionCwd::parse(&clone.to_string_lossy())?),
+        session_cwd: Some(clone_cwd.clone()),
     };
     use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
     use futures::StreamExt;
@@ -600,9 +624,9 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         implement::Action::Commit(message) => {
             let sha = implement::host_commit(&clone, &message)?;
             let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13: strip after
+                                                                                     // Best-effort (NO `?`): the post-commit tail must always reach the hand-off (B2b-3a invariant).
             if !matches!(
-                implement::stage_state(&clone)
-                    .map_err(|e| format!("implement: post-commit stage: {e}"))?,
+                implement::stage_state(&clone).unwrap_or(implement::StageState::Clean),
                 implement::StageState::Clean
             ) {
                 eprintln!("[implement] note: the clone still has uncommitted changes the agent left unstaged.");
@@ -621,7 +645,6 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             // the riskiest classification; this arm only resolves the outcome (impure) + dumps stderr.
             let outcome = match verify_cfg {
                 Some(Ok(vcfg)) => {
-                    let clone_cwd = bridge_core::SessionCwd::parse(&clone.to_string_lossy())?;
                     // Canonicalize a.repo for the cache key so two spellings don't split the warm cache.
                     let repo_canon =
                         std::fs::canonicalize(&a.repo).unwrap_or_else(|_| a.repo.clone());
@@ -654,6 +677,63 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             };
             handoff.push('\n');
             handoff.push_str(&verify::outcome_suffix(&outcome));
+
+            // B2b-3a: advisory review of the committed diff (bounded; never blocks the hand-off — NO `?`).
+            let review_outcome = match review_cfg {
+                None => review::ReviewOutcome::NotConfigured,
+                Some(Err(e)) => {
+                    eprintln!("[implement] review: config error: {e:?}");
+                    review::ReviewOutcome::ConfigError
+                }
+                Some(Ok(rcfg)) => match wf_map.get(&rcfg.workflow).cloned() {
+                    None => review::ReviewOutcome::NotLoaded,
+                    Some(graph) => {
+                        let input = review::build_review_input(&a.task, &base_sha, &sha);
+                        let ctx = bridge_workflow::executor::WorkflowRunContext {
+                            session_cwd: Some(clone_cwd.clone()),
+                        };
+                        let token = tokio_util::sync::CancellationToken::new();
+                        let stream = executor.run_with_context(
+                            graph,
+                            input,
+                            format!("impl-review-{task_id}"),
+                            token.clone(),
+                            ctx,
+                        );
+                        eprintln!("[implement] review: running implement-review");
+                        // Timeout = cancel-then-KEEP-DRAINING (don't drop the stream — the executor must
+                        // keep being polled to run backend.cancel/forget_session on cancel).
+                        let mut drain = std::pin::pin!(drain_review(stream));
+                        let (completed, synth, reviewers_failed) = tokio::select! {
+                            r = &mut drain => r,
+                            _ = tokio::time::sleep(rcfg.timeout) => {
+                                eprintln!("[implement] review: timed out after {:?}", rcfg.timeout);
+                                token.cancel();
+                                (&mut drain).await
+                            }
+                        };
+                        if completed {
+                            // Parse the FULL synth (truncation could drop a body VERDICT → flip it).
+                            let (verdict, summary) = review::parse_verdict(&synth);
+                            if !matches!(verdict, review::Verdict::Approve) {
+                                eprintln!(
+                                    "[implement] review {verdict:?}:\n{}",
+                                    verify::truncate_output(&synth, rcfg.max_output_bytes)
+                                );
+                            }
+                            review::ReviewOutcome::Ran {
+                                verdict,
+                                summary,
+                                reviewers_failed,
+                            }
+                        } else {
+                            review::ReviewOutcome::Incomplete
+                        }
+                    }
+                },
+            };
+            handoff.push('\n');
+            handoff.push_str(&review::outcome_suffix(&review_outcome));
 
             println!("{handoff}");
             Ok(())
@@ -1003,6 +1083,14 @@ fn serve_config_flag(args: &[String]) -> Result<Option<PathBuf>, BoxError> {
 /// (no bridge repo needed at runtime). `(relative-output-path, contents)`.
 const INIT_PROMPTS: &[(&str, &str)] = &[
     (
+        "prompts/review-implement.md",
+        include_str!("../../../prompts/review-implement.md"),
+    ),
+    (
+        "prompts/review-implement-synth.md",
+        include_str!("../../../prompts/review-implement-synth.md"),
+    ),
+    (
         "prompts/review-correctness.md",
         include_str!("../../../prompts/review-correctness.md"),
     ),
@@ -1099,6 +1187,25 @@ id = "synth"
 agent = "claude"
 prompt_file = "prompts/review-synth.md"
 inputs = ["correctness", "architecture"]
+
+# ── implement-review (B2b-3a): two folded reviewers of the committed diff → synth verdict ──
+[[workflows]]
+id = "implement-review"
+[[workflows.nodes]]
+id = "reviewer_codex"
+agent = "codex"
+prompt_file = "prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "reviewer_claude"
+agent = "claude"
+prompt_file = "prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "prompts/review-implement-synth.md"
+inputs = ["reviewer_codex", "reviewer_claude"]
 
 [[workflows]]
 id = "spec-review"
@@ -1724,8 +1831,8 @@ mod cli_tests {
         let wf = cfg.load_workflows(&dir).unwrap();
         assert_eq!(
             wf.len(),
-            4,
-            "code-review + spec-review + plan-review + design load"
+            5,
+            "code-review + implement-review + spec-review + plan-review + design load"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

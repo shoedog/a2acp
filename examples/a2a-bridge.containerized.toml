@@ -13,6 +13,13 @@ default = "claude"
 
 allowed_cwd_root = "/Users/wesleyjinks/code"
 
+# B2b-3a: the review-the-diff run after `implement` commits + verifies. Two folded reviewers (codex+claude)
+# review `git diff base..HEAD` in the clone (read-only nav tools) -> a synth emits VERDICT: APPROVE|REJECT,
+# surfaced in the hand-off. ADVISORY (the operator accepts at merge). Absent -> skipped.
+[review]
+workflow = "implement-review"
+# timeout_secs = 300   # bound the review; absent -> 300
+
 # B2b-2: the build+test verify run after `a2a-bridge implement` commits. Bridge-deterministic (the
 # agent can't fake it), REPORTED not gating. Separate egress (registries only; NO creds) so creds and
 # registry-egress never coexist. Coverage is opt-in (commented) — it can't reuse the warm non-instrumented
@@ -153,6 +160,26 @@ id = "synth"
 agent = "claude"
 prompt_file = "../prompts/review-synth.md"
 inputs = ["correctness", "architecture"]
+
+# ── implement-review (B2b-3a): two folded reviewers of the committed diff → synth verdict. Driven by
+#    `a2a-bridge implement` after the commit + verify (via the [review] block above). ──
+[[workflows]]
+id = "implement-review"
+[[workflows.nodes]]
+id = "reviewer_codex"
+agent = "codex"
+prompt_file = "../prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "reviewer_claude"
+agent = "claude"
+prompt_file = "../prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-implement-synth.md"
+inputs = ["reviewer_codex", "reviewer_claude"]
 
 [[workflows]]
 # B2a acceptance gate: a single write-capable container_rw node. Run from under the mount with
