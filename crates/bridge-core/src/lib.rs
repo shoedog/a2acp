@@ -5,6 +5,7 @@ pub mod error;
 pub mod ids;
 pub mod ports;
 pub mod process;
+pub mod reaper;
 pub mod sandbox;
 pub mod session;
 pub mod session_cwd;

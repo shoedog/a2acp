@@ -116,6 +116,45 @@ pub fn compose_verify(
     compose_sandbox(&sb, "sh", &["-c".to_string(), script])
 }
 
+/// PURE+TOTAL. Like [`compose_sandbox`] but NAMES the container so a reaper can `docker rm -f` it
+/// deterministically (the `:ro` analogue of [`compose_container_rw`]'s `--name` splice). Identical argv
+/// otherwise. The `--name` is spliced right after the `run -i --rm` prefix.
+pub fn compose_sandbox_named(
+    sb: &SandboxConfig,
+    name: &str,
+    cmd: &str,
+    args: &[String],
+) -> (String, Vec<String>) {
+    let (program, mut argv) = compose_sandbox(sb, cmd, args);
+    debug_assert_eq!(
+        &argv[0..3],
+        &["run", "-i", "--rm"],
+        "compose_sandbox prefix changed — fix the --name splice"
+    );
+    argv.splice(3..3, [String::from("--name"), name.to_string()]);
+    (program, argv)
+}
+
+/// PURE. The reaper container name for a `:ro` agent: `a2a-ro-<owner>-<nonce>`. `owner` is the hex
+/// `container_owner` hash (Docker-name-safe even when the agent id is not); `nonce` is per-spawn.
+pub fn ro_container_name(owner: &str, nonce: &str) -> String {
+    format!("a2a-ro-{owner}-{nonce}")
+}
+
+/// PURE. `(program, argv)` for the owner-scoped `:ro` boot-sweep: `ps -aq --filter name=a2a-ro-<owner>-`.
+/// Owner-scoping makes the (substring) name filter specific to THIS bridge instance's containers.
+pub fn ro_sweep_filter_argv(runtime: &str, owner: &str) -> (String, Vec<String>) {
+    (
+        runtime.to_string(),
+        vec![
+            "ps".into(),
+            "-aq".into(),
+            "--filter".into(),
+            format!("name=a2a-ro-{owner}-"),
+        ],
+    )
+}
+
 /// PURE. The reap command for a named per-turn container: `<runtime> rm -f <name>`. Idempotent at the
 /// Docker layer (`rm -f` of a gone container is a harmless error the caller ignores).
 pub fn reap_argv(runtime: &str, name: &str) -> (String, Vec<String>) {
@@ -277,6 +316,43 @@ mod tests {
             "cargo test --locked",
         );
         assert!(!argv.iter().any(|a| a == "--network"));
+    }
+
+    #[test]
+    fn compose_sandbox_named_splices_name_after_rm() {
+        let (prog, argv) =
+            compose_sandbox_named(&ro_locked(), "a2a-ro-deadbeef-abcd", "codex-acp", &[]);
+        assert_eq!(prog, "docker");
+        // --name lands immediately after `run -i --rm` (same position as compose_container_rw)
+        assert_eq!(
+            &argv[0..5],
+            &["run", "-i", "--rm", "--name", "a2a-ro-deadbeef-abcd"]
+        );
+        // everything else identical to compose_sandbox spliced
+        let (_p, plain) = compose_sandbox(&ro_locked(), "codex-acp", &[]);
+        let mut spliced = plain.clone();
+        spliced.splice(
+            3..3,
+            ["--name".to_string(), "a2a-ro-deadbeef-abcd".to_string()],
+        );
+        assert_eq!(argv, spliced);
+    }
+
+    #[test]
+    fn ro_container_name_is_docker_safe_and_prefixed() {
+        let n = ro_container_name("deadbeef0badf00d", "ab12cd34");
+        assert_eq!(n, "a2a-ro-deadbeef0badf00d-ab12cd34");
+        assert!(n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn ro_sweep_filter_argv_is_owner_scoped_substring() {
+        let (prog, argv) = ro_sweep_filter_argv("podman", "deadbeef0badf00d");
+        assert_eq!(prog, "podman");
+        assert_eq!(
+            argv,
+            vec!["ps", "-aq", "--filter", "name=a2a-ro-deadbeef0badf00d-"]
+        );
     }
 
     #[test]

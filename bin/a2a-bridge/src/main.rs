@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
-use bridge_acp::acp_backend::{AcpBackend, AcpConfig};
+use bridge_acp::acp_backend::AcpBackend;
 use bridge_core::domain::AgentEntry;
 use bridge_core::error::BridgeError;
 use bridge_core::ports::{AgentBackend, AgentRegistry, ConfigSource, DelegationPort, PolicyEngine};
@@ -86,14 +86,59 @@ fn resolve_static_session_cwd(session_cwd: Option<&str>, cwd: Option<&str>) -> S
 /// agent runs the runtime (docker) wrapping the agent cli; a raw agent runs `cmd`+`args` directly
 /// (Slice A compat). BOTH `SpawnFn` closures (run-workflow + serve) call this, so the two paths can't
 /// diverge. Unit-tested below; the Docker acceptance gate then proves it end-to-end.
-fn acp_program_argv(entry: &AgentEntry) -> Result<(String, Vec<String>), BridgeError> {
+fn acp_program_argv(
+    entry: &AgentEntry,
+    container_name: Option<&str>,
+) -> Result<(String, Vec<String>), BridgeError> {
     let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
         reason: format!("acp agent {} missing cmd", entry.id.as_str()),
     })?;
-    Ok(match &entry.sandbox {
-        Some(sb) => bridge_core::sandbox::compose_sandbox(sb, cmd, &entry.args),
-        None => (cmd.to_string(), entry.args.clone()),
+    Ok(match (&entry.sandbox, container_name) {
+        // Named (`:ro` reaper) container when the caller supplied a name.
+        (Some(sb), Some(name)) => {
+            bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &entry.args)
+        }
+        (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &entry.args),
+        (None, _) => (cmd.to_string(), entry.args.clone()),
     })
+}
+
+/// Build `(program, argv, AcpConfig)` for a `kind=acp` agent, attaching the `:ro` container reaper when the
+/// sandbox is `access=ro` (owner-scoped name `a2a-ro-<owner>-<nonce>` + a `docker rm -f` reap_fn). Shared by
+/// BOTH spawn factories (`make_spawn_fn` + `serve`) so the `:ro` naming/reaping can't diverge.
+fn acp_spawn_inputs(
+    entry: &AgentEntry,
+    cwd: PathBuf,
+    owner_config_path: &std::path::Path,
+) -> Result<(String, Vec<String>, bridge_acp::acp_backend::AcpConfig), BridgeError> {
+    use bridge_core::domain::MountAccess;
+    let ro_name = entry
+        .sandbox
+        .as_ref()
+        .filter(|sb| matches!(sb.access, MountAccess::Ro))
+        .map(|sb| {
+            let owner = container_owner(owner_config_path, &sb.mount, entry.id.as_str());
+            bridge_core::sandbox::ro_container_name(&owner, &implement::nonce(8))
+        });
+    let (program, argv) = acp_program_argv(entry, ro_name.as_deref())?;
+    let container = ro_name.map(|name| bridge_acp::acp_backend::ContainerReap {
+        runtime: entry
+            .sandbox
+            .as_ref()
+            .map(|sb| sb.runtime().to_string())
+            .unwrap_or_else(|| "docker".to_string()),
+        name,
+        reap_fn: bridge_core::reaper::production_reap_fn(),
+    });
+    let acp = bridge_acp::acp_backend::AcpConfig {
+        cwd,
+        model: entry.model.clone(),
+        mode: entry.mode.clone(),
+        auth_method: entry.auth_method.clone(),
+        container,
+        ..bridge_acp::acp_backend::AcpConfig::default()
+    };
+    Ok((program, argv, acp))
 }
 
 /// Production [`bridge_container::ContainerSpawn`]: spawn a real `AcpBackend` inside the composed
@@ -130,6 +175,56 @@ fn container_owner(config_path: &std::path::Path, mount: &str, agent_id: &str) -
     format!("{:016x}", h.finish())
 }
 
+/// The `(runtime, owner)` sweep targets for THIS bridge instance's `:ro` agents. Reads the SNAPSHOT
+/// (normalized mount + typed kind/access) so the owner matches the spawn-time owner; `config_path` must be
+/// the SAME (canonical) value `make_spawn_fn` is given. Scoped per (config, mount, agent) owner so a
+/// CONCURRENT bridge's containers are untouched.
+fn ro_sweep_targets(
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    config_path: &std::path::Path,
+) -> Vec<(String, String)> {
+    use bridge_core::domain::{AgentKind, MountAccess};
+    let mut targets = Vec::new();
+    for entry in &snapshot.entries {
+        let Some(sb) = entry.sandbox.as_ref() else {
+            continue;
+        };
+        if entry.kind != AgentKind::Acp || !matches!(sb.access, MountAccess::Ro) {
+            continue;
+        }
+        let owner = container_owner(config_path, &sb.mount, entry.id.as_str());
+        targets.push((sb.runtime().to_string(), owner));
+    }
+    targets
+}
+
+/// SYNCHRONOUS owner-scoped reap of `a2a-ro-<owner>-` containers (best-effort, blocking). Used for both
+/// the boot-sweep (crash recovery) and the one-shot END-sweep — the latter must be synchronous because the
+/// per-backend Drop reaper detaches its `docker rm -f`, which races process exit on a one-shot command
+/// (run-workflow/implement) where the runtime dies before the detached task runs (live-gate finding).
+fn ro_sweep(targets: &[(String, String)]) {
+    for (runtime, owner) in targets {
+        let (prog, argv) = bridge_core::sandbox::ro_sweep_filter_argv(runtime, owner);
+        if let Ok(out) = std::process::Command::new(&prog).args(&argv).output() {
+            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                let _ = std::process::Command::new(runtime)
+                    .args(["rm", "-f", id])
+                    .output();
+            }
+        }
+    }
+}
+
+/// RAII end-sweep for one-shot commands: on drop (any return path) it synchronously reaps this run's `:ro`
+/// containers, so a clean `run-workflow`/`implement` exit doesn't leak (the detached Drop reaper races the
+/// process exit). Declared early so it drops AFTER the registry/backends (whose detached reaps fire first).
+struct RoSweepGuard(Vec<(String, String)>);
+impl Drop for RoSweepGuard {
+    fn drop(&mut self) {
+        ro_sweep(&self.0);
+    }
+}
+
 /// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
 /// `implement` subcommand so their registry builds can't drift. `owner_config_path` seeds the ContainerRw
 /// owner token.
@@ -160,16 +255,9 @@ fn make_spawn_fn(
             use bridge_core::domain::AgentKind;
             match entry.kind {
                 AgentKind::Acp => {
-                    // Compose-or-raw via the shared helper (sandbox → docker argv; else raw cmd+args).
-                    let (program, argv) = acp_program_argv(&entry)?;
+                    // Compose-or-raw + the `:ro` reaper via the shared helper (both factories agree).
+                    let (program, argv, acp) = acp_spawn_inputs(&entry, cwd, &owner_config_path)?;
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    let acp = bridge_acp::acp_backend::AcpConfig {
-                        cwd,
-                        model: entry.model.clone(),
-                        mode: entry.mode.clone(),
-                        auth_method: entry.auth_method.clone(),
-                        ..bridge_acp::acp_backend::AcpConfig::default()
-                    };
                     let be = bridge_acp::acp_backend::AcpBackend::spawn(&program, &argv_ref, acp)
                         .await?
                         .with_policy(policy);
@@ -429,9 +517,14 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
+    // Canonical config path: the owner token must match between the sweeps and the spawn factory.
+    let owner_config_path = std::fs::canonicalize(&a.config).unwrap_or_else(|_| a.config.clone());
+    let ro_targets = ro_sweep_targets(&snapshot, &owner_config_path);
+    ro_sweep(&ro_targets); // boot-sweep (crash recovery)
+    let _ro_guard = RoSweepGuard(ro_targets); // synchronous END-sweep on any return (one-shot reliability)
     let policy = Arc::new(AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
-    let spawn = make_spawn_fn(policy_for_spawn, a.config.clone());
+    let spawn = make_spawn_fn(policy_for_spawn, owner_config_path);
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
             .map_err(|e| format!("implement: registry: {e:?}"))?,
@@ -605,9 +698,15 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
+    // Canonical config path: the owner token must match between the sweeps and the spawn factory.
+    let owner_config_path =
+        std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
+    let ro_targets = ro_sweep_targets(&snapshot, &owner_config_path);
+    ro_sweep(&ro_targets); // boot-sweep (crash recovery)
+    let _ro_guard = RoSweepGuard(ro_targets); // synchronous END-sweep on any return (one-shot reliability)
     let policy = Arc::new(bridge_policy::permission::AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
-    let spawn = make_spawn_fn(policy_for_spawn, config_path.clone());
+    let spawn = make_spawn_fn(policy_for_spawn, owner_config_path);
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
             .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
@@ -1277,17 +1376,9 @@ async fn main() -> Result<(), BoxError> {
             use bridge_core::domain::AgentKind;
             match entry.kind {
                 AgentKind::Acp => {
-                    // Compose-or-raw via the shared helper (same logic as the run-workflow site).
-                    let (program, argv) = acp_program_argv(&entry)?;
+                    // Compose-or-raw + the `:ro` reaper via the shared helper (same as run-workflow).
+                    let (program, argv, acp) = acp_spawn_inputs(&entry, cwd, &owner_config_path)?;
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    let acp = AcpConfig {
-                        cwd,
-                        model: entry.model.clone(),
-                        mode: entry.mode.clone(),
-                        auth_method: entry.auth_method.clone(),
-                        // handshake_timeout / cancel_grace: reuse the codebase defaults.
-                        ..AcpConfig::default()
-                    };
                     let be = AcpBackend::spawn(&program, &argv_ref, acp)
                         .await?
                         // Thread the system policy into the backend so its reverse-permission
@@ -1343,9 +1434,15 @@ async fn main() -> Result<(), BoxError> {
     //    the RegistryConfig we re-read below for the non-registry fields.
     let source = FileConfigSource::new(config_path.clone());
     let snapshot = source.load().await?; // initial desired state
-                                         // Fan-out source label (wire-observable in fan-out artifacts): the default
-                                         // entry's `name` if set, else the default agent id, so a non-Kiro default
-                                         // (e.g. codex) isn't mislabeled "kiro".
+                                         // :ro reaper boot-sweep: reap this instance's orphaned :ro
+                                         // containers (config_path is already canonical, matching the
+                                         // owner the spawn factory uses). serve is long-running, so it
+                                         // needs no END-sweep — per-backend retire reaps run with the
+                                         // runtime alive, and the next boot-sweep catches any leftover.
+    ro_sweep(&ro_sweep_targets(&snapshot, &config_path));
+    // Fan-out source label (wire-observable in fan-out artifacts): the default
+    // entry's `name` if set, else the default agent id, so a non-Kiro default
+    // (e.g. codex) isn't mislabeled "kiro".
     let default_label = snapshot
         .entries
         .iter()
@@ -1516,7 +1613,7 @@ mod cli_tests {
         // raw: program = cmd, argv = args (Slice A compat).
         let raw = acp_entry("a");
         assert_eq!(
-            acp_program_argv(&raw).unwrap(),
+            acp_program_argv(&raw, None).unwrap(),
             ("claude-agent-acp".to_string(), Vec::<String>::new())
         );
         // sandbox: program = runtime (docker), argv wraps the inner cli with the :ro mount.
@@ -1529,14 +1626,19 @@ mod cli_tests {
             egress: EgressPolicy::Open,
             volumes: vec![],
         });
-        let (program, argv) = acp_program_argv(&sb).unwrap();
+        let (program, argv) = acp_program_argv(&sb, None).unwrap();
         assert_eq!(program, "docker");
         assert_eq!(argv.last().unwrap(), "claude-agent-acp");
         assert!(argv.contains(&"/work:/work:ro".to_string()));
+        // sandbox + a container name → the `--name` is spliced in (the :ro reaper path).
+        let (_p, named) = acp_program_argv(&sb, Some("a2a-ro-owner-nonce")).unwrap();
+        assert!(named
+            .windows(2)
+            .any(|w| w == ["--name", "a2a-ro-owner-nonce"]));
         // missing cmd → ConfigInvalid.
         let mut nocmd = acp_entry("c");
         nocmd.cmd = None;
-        assert!(acp_program_argv(&nocmd).is_err());
+        assert!(acp_program_argv(&nocmd, None).is_err());
     }
 
     #[test]
