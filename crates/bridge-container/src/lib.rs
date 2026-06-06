@@ -4,9 +4,7 @@
 //! future slice (see `docs/superpowers/specs/2026-06-05-containerized-agents-warm-pool-slice.md`).
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,18 +15,13 @@ use bridge_core::domain::{Part, SandboxConfig, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{AgentBackend, BackendStream};
-use bridge_core::sandbox::{check_rw_target, compose_container_rw, reap_argv};
+use bridge_core::reaper::{
+    production_reap_fn, production_sweep_fn, reap_once, spawn_detached, ReapFn, SweepFn,
+};
+use bridge_core::sandbox::{check_rw_target, compose_container_rw};
 use bridge_core::session_cwd::SessionCwd;
 use futures::StreamExt;
 use tokio::sync::Mutex;
-
-/// Fire-and-forget reap of a named container: `(runtime, name)`. Production detaches a `docker rm -f`;
-/// tests inject a counter. NEVER blocks the caller.
-pub type ReapFn = Arc<dyn Fn(String, String) + Send + Sync>;
-
-/// Boot-time orphan sweep over a `name=<prefix>` filter. Production runs `<runtime> ps -aq …` → `rm -f`;
-/// tests inject a recorder.
-pub type SweepFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Injection seam so warm-reuse / reaper tests run Docker-free. Production wraps `AcpBackend::spawn`
 /// (and applies the system `PolicyEngine` to the inner backend — see `main.rs`'s `AcpContainerSpawn`).
@@ -302,13 +295,6 @@ impl AgentBackend for ContainerRwBackend {
     }
 }
 
-/// Reap a named container exactly once (idempotent via the shared `reaped` flag).
-fn reap_once(reap_fn: &ReapFn, runtime: &str, name: &str, reaped: &Arc<AtomicBool>) {
-    if !reaped.swap(true, Ordering::SeqCst) {
-        reap_fn(runtime.to_string(), name.to_string());
-    }
-}
-
 /// Owned by the returned stream: reaps the container + clears the inflight entry on EVERY exit path
 /// (Done / error / consumer-drop). Reap is idempotent + detached — `Drop` never blocks a worker.
 struct ContainerReaper {
@@ -356,26 +342,6 @@ fn wrap_with_reaper(
     })
 }
 
-/// Spawn a future onto the current runtime if there is one, else on a throwaway thread+runtime. `Drop`
-/// can fire off-runtime (process shutdown), so this must never panic.
-fn spawn_detached<F: Future<Output = ()> + Send + 'static>(fut: F) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) => {
-            h.spawn(fut);
-        }
-        Err(_) => {
-            std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    rt.block_on(fut);
-                }
-            });
-        }
-    }
-}
-
 /// Canonicalize `path`, resolving symlinks. If it doesn't exist yet (a fresh scratch dir), canonicalize
 /// the nearest existing ancestor and re-append the missing tail.
 fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
@@ -405,43 +371,6 @@ fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
         out.push(seg);
     }
     SessionCwd::parse(&out.to_string_lossy())
-}
-
-fn production_reap_fn() -> ReapFn {
-    Arc::new(|runtime: String, name: String| {
-        let (prog, argv) = reap_argv(&runtime, &name);
-        spawn_detached(async move {
-            // Best-effort; `rm -f` of a gone container is harmless. Bounded so a hung daemon can't pile up.
-            let _ = tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::process::Command::new(&prog).args(&argv).output(),
-            )
-            .await;
-        });
-    })
-}
-
-fn production_sweep_fn(runtime: String) -> SweepFn {
-    Arc::new(move |filter: String| {
-        let runtime = runtime.clone();
-        Box::pin(async move {
-            let ps = tokio::process::Command::new(&runtime)
-                .args(["ps", "-aq", "--filter", &format!("name={filter}")])
-                .output()
-                .await;
-            let Ok(ps) = ps else {
-                tracing::warn!(runtime = %runtime, "container_rw boot sweep: runtime unavailable");
-                return;
-            };
-            let ids = String::from_utf8_lossy(&ps.stdout);
-            for id in ids.split_whitespace() {
-                let _ = tokio::process::Command::new(&runtime)
-                    .args(["rm", "-f", id])
-                    .output()
-                    .await;
-            }
-        })
-    })
 }
 
 #[cfg(test)]
