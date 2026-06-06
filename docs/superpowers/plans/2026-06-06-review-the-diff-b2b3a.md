@@ -68,20 +68,30 @@ pub enum ReviewOutcome {
 /// `VERDICT: APPROVE` is the footer verdict. SUMMARY = the line immediately following the footer VERDICT
 /// line iff it matches `^\s*SUMMARY:`.
 pub fn parse_verdict(synth: &str) -> (Verdict, String) {
-    let verdict_lines: Vec<usize> = synth
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| {
-            let t = l.trim_start();
-            t.len() >= 8 && t[..8].eq_ignore_ascii_case("VERDICT:")
-        })
-        .map(|(i, _)| i)
-        .collect();
-    if verdict_lines.len() != 1 {
-        return (Verdict::Inconclusive, String::new()); // none or conflicting → fail-safe
+    fn starts_ci(l: &str, kw: &str) -> bool {
+        let t = l.trim_start();
+        t.len() >= kw.len() && t[..kw.len()].eq_ignore_ascii_case(kw)
     }
     let lines: Vec<&str> = synth.lines().collect();
-    let vi = verdict_lines[0];
+    // Exactly ONE `VERDICT:` line anywhere — 0 or conflicting (>=2) → Inconclusive (a body-quoted
+    // line-start VERDICT can't override a real one).
+    let vidxs: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| starts_ci(l, "VERDICT:")).map(|(i, _)| i).collect();
+    if vidxs.len() != 1 {
+        return (Verdict::Inconclusive, String::new());
+    }
+    let vi = vidxs[0];
+    // TAIL-ANCHORED: after the VERDICT line, allow ONLY an immediately-following SUMMARY line, then blanks.
+    let mut summary = String::new();
+    let mut j = vi + 1;
+    if let Some(l) = lines.get(j) {
+        if starts_ci(l, "SUMMARY:") {
+            summary = l.trim_start()[8..].trim().to_string();
+            j += 1;
+        }
+    }
+    if lines[j..].iter().any(|l| !l.trim().is_empty()) {
+        return (Verdict::Inconclusive, String::new()); // footer not at the tail → fail-safe
+    }
     let token = lines[vi].trim_start()[8..].trim();
     let verdict = if token.eq_ignore_ascii_case("APPROVE") {
         Verdict::Approve
@@ -90,13 +100,26 @@ pub fn parse_verdict(synth: &str) -> (Verdict, String) {
     } else {
         return (Verdict::Inconclusive, String::new());
     };
-    let summary = lines
-        .get(vi + 1)
-        .map(|l| l.trim_start())
-        .filter(|l| l.len() >= 8 && l[..8].eq_ignore_ascii_case("SUMMARY:"))
-        .map(|l| l.trim_start()[8..].trim().to_string())
-        .unwrap_or_default();
     (verdict, summary)
+}
+
+/// PURE. Reduce drained workflow events → (completed, terminal_output, reviewers_failed). Extracted from
+/// the impure drain so the riskiest reduction is unit-tested (the B2b-2 keystone pattern). A failed
+/// non-`synth` node = a failed reviewer leg (diversity collapse, surfaced in the suffix).
+pub fn reduce(events: &[bridge_workflow::executor::WorkflowEvent]) -> (bool, String, usize) {
+    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+    let (mut completed, mut output, mut failed) = (false, String::new(), 0usize);
+    for e in events {
+        match e {
+            WorkflowEvent::NodeFinished { node, ok, .. } if !ok && node.as_str() != "synth" => failed += 1,
+            WorkflowEvent::Terminal { outcome, output: o } => {
+                completed = matches!(outcome, WorkflowOutcome::Completed);
+                output = o.clone();
+            }
+            _ => {}
+        }
+    }
+    (completed, output, failed)
 }
 
 /// PURE. The `{{input}}` the reviewers + synth see: the task + both host-resolved SHAs + the explicit
@@ -166,9 +189,9 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_verdicts_are_inconclusive() {
-        // a body-quoted APPROVE must NOT override a real REJECT
-        let s = "the agent said `VERDICT: APPROVE` but I disagree\n\nVERDICT: REJECT\nSUMMARY: missing X";
+    fn conflicting_line_start_verdicts_are_inconclusive() {
+        // TWO line-start VERDICT: lines (e.g. a fenced quote) → conflict → Inconclusive
+        let s = "```\nVERDICT: APPROVE\n```\n\nVERDICT: REJECT\nSUMMARY: missing X";
         assert_eq!(parse_verdict(s).0, Verdict::Inconclusive);
     }
 
@@ -179,15 +202,39 @@ mod tests {
 
     #[test]
     fn finding_mentioning_approve_does_not_match() {
-        // only a line STARTING with VERDICT: counts
+        // only a line STARTING with VERDICT: counts; the mid-line mention is ignored
         let s = "MAJOR: the author wants to approve this quickly\n\nVERDICT: REJECT";
         assert_eq!(parse_verdict(s).0, Verdict::Reject);
     }
 
     #[test]
-    fn summary_only_immediately_after_verdict() {
-        let s = "VERDICT: APPROVE\n\nSUMMARY: not adjacent"; // blank line between → not lifted
-        assert_eq!(parse_verdict(s), (Verdict::Approve, String::new()));
+    fn footer_not_at_tail_is_inconclusive() {
+        // a VERDICT followed by more findings (not the footer) → Inconclusive (tail-anchored)
+        let s = "VERDICT: APPROVE\nMINOR: one more thing";
+        assert_eq!(parse_verdict(s).0, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn non_adjacent_summary_breaks_the_footer() {
+        // a SUMMARY after a blank line is non-footer trailing content → Inconclusive (fail-safe)
+        let s = "VERDICT: APPROVE\n\nSUMMARY: not adjacent";
+        assert_eq!(parse_verdict(s).0, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn reduce_counts_failed_reviewers_and_terminal() {
+        use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+        use bridge_core::ids::NodeId;
+        let ev = vec![
+            WorkflowEvent::NodeFinished { node: NodeId::parse("reviewer_codex").unwrap(), ok: false, output: String::new() },
+            WorkflowEvent::NodeFinished { node: NodeId::parse("reviewer_claude").unwrap(), ok: true, output: "ok".into() },
+            WorkflowEvent::NodeFinished { node: NodeId::parse("synth").unwrap(), ok: true, output: "VERDICT: APPROVE".into() },
+            WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output: "VERDICT: APPROVE\nSUMMARY: ok".into() },
+        ];
+        let (completed, output, failed) = reduce(&ev);
+        assert!(completed);
+        assert_eq!(failed, 1); // the codex reviewer leg failed; synth failure would NOT count here
+        assert!(output.contains("VERDICT: APPROVE"));
     }
 
     #[test]
@@ -222,7 +269,7 @@ mod tests {
 
 Add `mod review;` near `mod verify;` in `bin/a2a-bridge/src/main.rs`.
 Run: `cargo test -p a2a-bridge --bin a2a-bridge review::`
-Expected: PASS (9 tests).
+Expected: PASS (all `review::` unit tests — parse_verdict matrix incl. tail-anchoring + conflict + footer-not-at-tail, `reduce`, `build_review_input`, `outcome_suffix`).
 
 - [ ] **Step 3: Commit**
 
@@ -438,14 +485,23 @@ workflow = "implement-review"
 # timeout_secs = 300   # bound; absent → 300
 ```
 
-- [ ] **Step 5: Verify it loads + the init test still passes**
+- [ ] **Step 5: Update the init-count assertion (4→5) + verify loads**
+
+`init_generated_config_parses_and_loads` (main.rs ~1710-1729) **hard-asserts `wf.len() == 4`** with a
+message naming the four workflows; `INIT_WORKFLOWS` is emitted when codex+claude are both selected (the
+test selects both), so adding `implement-review` makes it **5**. Update the assertion `4 → 5` and add
+`implement-review` to the message string (a certain break otherwise). (`reference_multi_agent_config_…`
+reads a separate untouched file; `containerized_config_validates_with_implement_edit` uses `contains_key`,
+not `len`, so it's unaffected.)
 
 Run:
 ```bash
 cargo test -p a2a-bridge --bin a2a-bridge init_generated_config_parses_and_loads
-cargo run -q -p a2a-bridge -- run-workflow __nope__ --input README.md --config examples/a2a-bridge.containerized.toml 2>&1 | grep -q "unknown workflow" && echo "example loads (implement-review + [review] parse)"
+cargo test -p a2a-bridge --bin a2a-bridge containerized_config_validates_with_implement_edit   # example config still loads with [review] + implement-review
+cargo run -q -p a2a-bridge -- run-workflow __nope__ --input README.md --config examples/a2a-bridge.containerized.toml 2>&1 | grep -q "unknown workflow" && echo "example deserializes"
 ```
-Expected: the init test passes (it asserts the embedded workflows load — now includes implement-review); `example loads`. If `init_generated_config_parses_and_loads` asserts a specific workflow set, update it to include `implement-review`.
+Expected: both tests pass; `example deserializes`. NOTE: `[review].to_config()` validation on the real
+example runs on the `implement` path — covered by Task 2's unit tests + the Task 5 live gate, not here.
 
 - [ ] **Step 6: Hand-iterate the prompts (optional, operator)**
 
@@ -492,37 +548,26 @@ The post-commit dirty-note check (~604) `implement::stage_state(&clone).map_err(
 
 - [ ] **Step 3: Add a review-drain helper** (captures output + counts failed reviewer legs)
 
-Add a free async fn in main.rs (near `implement_cmd`):
+Add a free async fn in main.rs (near `implement_cmd`). `run_with_context` returns the
+`bridge_workflow::executor::WorkflowStream` alias (= `Pin<Box<dyn Stream<Item=Result<WorkflowEvent,
+BridgeError>>+Send>>`), so take it DIRECTLY — do NOT `Box::pin` it (that double-pins → type mismatch). It
+collects events then delegates the reduction to the PURE `review::reduce`:
 ```rust
-/// Drain a review workflow stream: returns (completed, synth_output, reviewers_failed). Unlike the
-/// implement-edit loop, this CAPTURES the terminal output and counts failed (non-synth) reviewer legs.
-async fn drain_review(
-    mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<bridge_workflow::executor::WorkflowEvent, BridgeError>> + Send>>,
-) -> (bool, String, usize) {
-    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+/// Drain a review workflow stream → (completed, synth_output, reviewers_failed). Collects events + delegates
+/// the reduction to the pure `review::reduce`. Keeps polling to the end so the executor runs its cancel
+/// cleanup (backend.cancel/forget_session) even after a timeout cancel.
+async fn drain_review(mut stream: bridge_workflow::executor::WorkflowStream) -> (bool, String, usize) {
     use futures::StreamExt;
-    let mut completed = false;
-    let mut output = String::new();
-    let mut reviewers_failed = 0usize;
+    let mut events = Vec::new();
     while let Some(item) = stream.next().await {
         match item {
-            Ok(WorkflowEvent::NodeFinished { node, ok, .. }) => {
-                if !ok && node.as_str() != "synth" {
-                    reviewers_failed += 1;
-                }
-            }
-            Ok(WorkflowEvent::Terminal { outcome, output: o }) => {
-                completed = matches!(outcome, WorkflowOutcome::Completed);
-                output = o;
-            }
-            Ok(_) => {}
+            Ok(ev) => events.push(ev),
             Err(e) => eprintln!("[implement] review: stream error: {e:?}"),
         }
     }
-    (completed, output, reviewers_failed)
+    review::reduce(&events)
 }
 ```
-(Confirm the `BackendStream`/executor return type — match `run_workflow_cmd`'s stream type exactly; adapt the signature if the executor returns a concrete type rather than a boxed `Stream`.)
 
 - [ ] **Step 4: Add the timed review stage in the `Action::Commit` arm** (after the verify suffix, before `println!`)
 
@@ -554,23 +599,30 @@ Replace `handoff.push_str(&verify::outcome_suffix(&outcome)); \n println!("{hand
                             ctx,
                         );
                         eprintln!("[implement] review: running implement-review");
-                        match tokio::time::timeout(rcfg.timeout, drain_review(Box::pin(stream))).await {
-                            Ok((true, synth, failed)) => {
-                                let (verdict, summary) = review::parse_verdict(
-                                    &verify::truncate_output(&synth, rcfg.max_output_bytes),
-                                );
-                                review::ReviewOutcome::Ran {
-                                    verdict,
-                                    summary,
-                                    reviewers_failed: failed,
-                                }
-                            }
-                            Ok((false, _, _)) => review::ReviewOutcome::Incomplete,
-                            Err(_) => {
-                                token.cancel();
+                        // Timeout = cancel-then-KEEP-DRAINING (do NOT drop the stream — the executor must
+                        // keep being polled to run backend.cancel/forget_session, executor.rs:136/312).
+                        let mut drain = std::pin::pin!(drain_review(stream));
+                        let (completed, synth, failed) = tokio::select! {
+                            r = &mut drain => r,
+                            _ = tokio::time::sleep(rcfg.timeout) => {
                                 eprintln!("[implement] review: timed out after {:?}", rcfg.timeout);
-                                review::ReviewOutcome::Incomplete
+                                token.cancel();
+                                (&mut drain).await   // keep draining so the executor cleans up
                             }
+                        };
+                        if completed {
+                            // Parse the FULL synth (truncation drops the middle → could lose a body
+                            // VERDICT and flip the verdict). Truncate only for the stderr dump.
+                            let (verdict, summary) = review::parse_verdict(&synth);
+                            if !matches!(verdict, review::Verdict::Approve) {
+                                eprintln!(
+                                    "[implement] review {verdict:?}:\n{}",
+                                    verify::truncate_output(&synth, rcfg.max_output_bytes)
+                                );
+                            }
+                            review::ReviewOutcome::Ran { verdict, summary, reviewers_failed: failed }
+                        } else {
+                            review::ReviewOutcome::Incomplete
                         }
                     }
                 },
@@ -581,7 +633,6 @@ Replace `handoff.push_str(&verify::outcome_suffix(&outcome)); \n println!("{hand
             println!("{handoff}");
             Ok(())
 ```
-(Note: `parse_verdict` runs on the truncated synth — truncation keeps head+tail so the footer survives; if a pathological truncation could drop the footer, parse the FULL synth for the verdict and only truncate the stderr dump. Prefer: `parse_verdict(&synth)` on the full text; `truncate_output` only for an stderr dump. Adjust accordingly.)
 
 - [ ] **Step 5: Build + clippy + existing tests**
 
@@ -625,6 +676,16 @@ Prereqs: egress proxies up; `a2a-toolchain`/reader images built; creds synced.
 - [ ] `cargo llvm-cov clean --workspace` then floors per ci.yml (workspace 85, bridge-core/acp/api/workflow 90); new code is the `a2a-bridge` bin (review.rs well-tested + config) → workspace 85
 - [ ] the Task-5 live gate PASS recorded in ADR-0022
 - [ ] Use **superpowers:finishing-a-development-branch** (merge to main, then push)
+
+## Dual-review folds (plan rev2)
+
+Both plan reviews (containerized + a2a-local codex) confirmed the seams (WorkflowStream type, post-commit
+infallibility, config, embedded shape) and drove: **tail-anchored `parse_verdict`** (exactly-one VERDICT,
+must be the footer, conflict/footer-not-at-tail→Inconclusive) + fixed fixtures + a `footer_not_at_tail`
+test; a pure **`reduce(events)`** extracted from `drain_review` + unit-tested; **timeout = `select!`-cancel-
+then-keep-draining** (not drop — the executor needs polling to run its cancel cleanup); **parse the FULL
+synth** (truncate only the stderr dump) + **`eprintln` the body on non-APPROVE** (surface the findings, not
+just the one-liner); `drain_review` takes `WorkflowStream` (no `Box::pin`); **init-count 4→5** (explicit).
 
 ## Self-review (spec coverage)
 
