@@ -25,16 +25,30 @@ pub enum ReviewOutcome {
     Incomplete, // executor stream Err / missing terminal / timeout / cancel — the runtime catch-all
 }
 
-/// PURE. Tail-anchored footer parse. Exactly ONE `^VERDICT:` line must exist, and it must be the FOOTER:
-/// only an immediately-following `^SUMMARY:` line (then trailing blanks) may follow. 0 or conflicting (>=2)
-/// `VERDICT:` lines, an unrecognized token, or any non-footer trailing content → Inconclusive. NEVER
-/// returns Approve unless an unambiguous footer `VERDICT: APPROVE` is present.
+/// PURE. Tail-anchored footer parse. The LAST `^VERDICT:` line is the footer and must be anchored: only an
+/// immediately-following `^SUMMARY:` line (then trailing blanks) may follow it. A synth model often restates
+/// its verdict (a lead `VERDICT: X` AND the mandated footer `VERDICT: X`) — that is fine when every VERDICT
+/// line AGREES; a genuine CONFLICT (e.g. a body `APPROVE` + footer `REJECT`), an unrecognized token, no
+/// VERDICT line, or non-footer trailing content → Inconclusive. NEVER returns Approve unless an unambiguous,
+/// unconflicted footer `VERDICT: APPROVE` is present. (Live gate: the synth led with + footed APPROVE → the
+/// old "exactly one VERDICT line" rule wrongly read agreement as Inconclusive.)
 pub fn parse_verdict(synth: &str) -> (Verdict, String) {
     fn starts_ci(l: &str, kw: &str) -> bool {
         // Compare BYTES (the keywords are pure ASCII) — slicing `&str[..kw.len()]` panics when a
         // multi-byte char (e.g. an em-dash in a finding like "MAJOR — none.") straddles the boundary.
         let b = l.trim_start().as_bytes();
         b.len() >= kw.len() && b[..kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+    }
+    // The token after "VERDICT:" (8 ASCII bytes; the line is in `vidxs` so trim_start().len() >= 8).
+    fn verdict_token(line: &str) -> Option<Verdict> {
+        let t = line.trim_start()[8..].trim();
+        if t.eq_ignore_ascii_case("APPROVE") {
+            Some(Verdict::Approve)
+        } else if t.eq_ignore_ascii_case("REJECT") {
+            Some(Verdict::Reject)
+        } else {
+            None
+        }
     }
     let lines: Vec<&str> = synth.lines().collect();
     let vidxs: Vec<usize> = lines
@@ -43,11 +57,10 @@ pub fn parse_verdict(synth: &str) -> (Verdict, String) {
         .filter(|(_, l)| starts_ci(l, "VERDICT:"))
         .map(|(i, _)| i)
         .collect();
-    if vidxs.len() != 1 {
-        return (Verdict::Inconclusive, String::new()); // none or conflicting → fail-safe
-    }
-    let vi = vidxs[0];
-    // Tail-anchor: after the VERDICT line, allow ONLY an immediately-following SUMMARY line, then blanks.
+    let Some(&vi) = vidxs.last() else {
+        return (Verdict::Inconclusive, String::new()); // no VERDICT line → fail-safe
+    };
+    // Tail-anchor on the LAST VERDICT line: after it, allow ONLY an immediately-following SUMMARY, then blanks.
     let mut summary = String::new();
     let mut j = vi + 1;
     if let Some(l) = lines.get(j) {
@@ -59,15 +72,17 @@ pub fn parse_verdict(synth: &str) -> (Verdict, String) {
     if lines[j..].iter().any(|l| !l.trim().is_empty()) {
         return (Verdict::Inconclusive, String::new()); // footer not at the tail → fail-safe
     }
-    let token = lines[vi].trim_start()[8..].trim();
-    let verdict = if token.eq_ignore_ascii_case("APPROVE") {
-        Verdict::Approve
-    } else if token.eq_ignore_ascii_case("REJECT") {
-        Verdict::Reject
-    } else {
+    // The footer token, and every VERDICT line must agree with it (a restatement is fine; a conflict is not).
+    let Some(footer) = verdict_token(lines[vi]) else {
         return (Verdict::Inconclusive, String::new());
     };
-    (verdict, summary)
+    if vidxs
+        .iter()
+        .any(|&i| verdict_token(lines[i]).as_ref() != Some(&footer))
+    {
+        return (Verdict::Inconclusive, String::new()); // conflicting / unrecognized earlier verdict
+    }
+    (footer, summary)
 }
 
 /// PURE. Reduce drained workflow events → (completed, terminal_output, reviewers_failed). Extracted from
@@ -164,6 +179,20 @@ mod tests {
     fn conflicting_line_start_verdicts_are_inconclusive() {
         let s = "```\nVERDICT: APPROVE\n```\n\nVERDICT: REJECT\nSUMMARY: missing X";
         assert_eq!(parse_verdict(s).0, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn restated_agreeing_verdict_takes_the_footer() {
+        // Live-gate shape: the synth led with VERDICT: APPROVE and footed VERDICT: APPROVE — agreement, not
+        // a conflict, so the footer wins (the old "exactly one VERDICT line" rule wrongly said Inconclusive).
+        let s = "VERDICT: APPROVE\n\nmerged review, no findings.\n\nVERDICT: APPROVE\nSUMMARY: both agree";
+        assert_eq!(
+            parse_verdict(s),
+            (Verdict::Approve, "both agree".to_string())
+        );
+        // a restated REJECT likewise resolves to REJECT.
+        let r = "VERDICT: REJECT\n\nblocker found.\n\nVERDICT: REJECT\nSUMMARY: blocker";
+        assert_eq!(parse_verdict(r).0, Verdict::Reject);
     }
 
     #[test]
