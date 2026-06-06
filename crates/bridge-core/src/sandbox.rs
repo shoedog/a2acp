@@ -235,9 +235,15 @@ mod tests {
         );
         assert_eq!(prog, "docker");
         // egress from the EgressPolicy (both proxies, like compose_sandbox)
-        assert!(argv.windows(2).any(|w| w == ["--network", "a2a-verify-egress"]));
-        assert!(argv.iter().any(|a| a == "HTTPS_PROXY=http://a2a-verify-proxy:8888"));
-        assert!(argv.iter().any(|a| a == "HTTP_PROXY=http://a2a-verify-proxy:8888"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["--network", "a2a-verify-egress"]));
+        assert!(argv
+            .iter()
+            .any(|a| a == "HTTPS_PROXY=http://a2a-verify-proxy:8888"));
+        assert!(argv
+            .iter()
+            .any(|a| a == "HTTP_PROXY=http://a2a-verify-proxy:8888"));
         // the clone mounted :ro (identical path) — NOT :rw
         let mnt = "/Users/w/code/.a2a-implement/impl-1-ab";
         assert!(argv.iter().any(|a| a == &format!("{mnt}:{mnt}:ro")));

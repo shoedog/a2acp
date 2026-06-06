@@ -184,14 +184,20 @@ mod tests {
         let pass = aggregate(vec![r("fmt", true, true), r("test", true, true)]);
         assert_eq!(verdict_line(&pass), "verify: PASS  (fmt ✓ · test ✓)");
         let fail = aggregate(vec![r("fmt", true, true), r("clippy", true, false)]);
-        assert_eq!(verdict_line(&fail), "verify: FAIL at clippy  (fmt ✓ · clippy ✗)");
+        assert_eq!(
+            verdict_line(&fail),
+            "verify: FAIL at clippy  (fmt ✓ · clippy ✗)"
+        );
     }
 
     #[test]
     fn cache_volume_name_is_stable_and_per_repo() {
         let a = cache_volume_name("a2a-verify-cache", "/Users/w/code/proj-a");
         let b = cache_volume_name("a2a-verify-cache", "/Users/w/code/proj-b");
-        assert_eq!(a, cache_volume_name("a2a-verify-cache", "/Users/w/code/proj-a"));
+        assert_eq!(
+            a,
+            cache_volume_name("a2a-verify-cache", "/Users/w/code/proj-a")
+        );
         assert_ne!(a, b);
         assert!(a.starts_with("a2a-verify-cache-"));
     }
@@ -202,7 +208,10 @@ mod tests {
         assert!(outcome_suffix(&ran).starts_with("verify: PASS"));
         let failed = VerifyOutcome::Ran(aggregate(vec![r("clippy", true, false)]));
         assert!(outcome_suffix(&failed).starts_with("verify: FAIL"));
-        assert_eq!(outcome_suffix(&VerifyOutcome::NotConfigured), "verify: not configured");
+        assert_eq!(
+            outcome_suffix(&VerifyOutcome::NotConfigured),
+            "verify: not configured"
+        );
         assert_eq!(
             outcome_suffix(&VerifyOutcome::ConfigError),
             "verify: skipped (config error)"
@@ -241,7 +250,12 @@ mod tests {
             }
         };
         let v = run_verify(
-            &cfg(&[("fmt", true), ("clippy", true), ("build", true), ("test", true)]),
+            &cfg(&[
+                ("fmt", true),
+                ("clippy", true),
+                ("build", true),
+                ("test", true),
+            ]),
             &clone,
             "cache-x",
             &runner,
