@@ -119,6 +119,9 @@ pub struct RegistryConfig {
     /// `[verify]` (Slice B2b-2): the build+test verify run after `implement` commits. Absent → skipped.
     #[serde(default)]
     pub verify: Option<VerifyToml>,
+    /// `[review]` (Slice B2b-3a): the review-the-diff workflow run after `implement` commits. Absent → skipped.
+    #[serde(default)]
+    pub review: Option<ReviewToml>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -286,6 +289,45 @@ impl VerifyToml {
                     gate: c.gate,
                 })
                 .collect(),
+        })
+    }
+}
+
+fn default_review_workflow() -> String {
+    "implement-review".to_string()
+}
+
+/// `[review]` (Slice B2b-3a): the review-the-diff workflow run after `implement` commits + verifies.
+/// Only NAMES a workflow id (model is an agent-level property); absent → review skipped.
+#[derive(Debug, serde::Deserialize)]
+pub struct ReviewToml {
+    #[serde(default = "default_review_workflow")]
+    pub workflow: String,
+    #[serde(default)]
+    pub max_output_bytes: Option<usize>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Parsed `[review]`: the workflow id is parsed (validated) HERE, pre-commit, so the post-commit lookup is
+/// infallible (a malformed id surfaces as a soft `ConfigError`, never an abort after the commit).
+#[derive(Debug, Clone)]
+pub struct ReviewConfig {
+    pub workflow: bridge_core::ids::WorkflowId,
+    pub max_output_bytes: usize,
+    pub timeout: std::time::Duration,
+}
+
+impl ReviewToml {
+    pub fn to_config(&self) -> Result<ReviewConfig, ConfigError> {
+        let workflow = bridge_core::ids::WorkflowId::parse(self.workflow.clone())
+            .map_err(|e| ConfigError::Registry(format!("[review] workflow id: {e:?}")))?;
+        let max_output_bytes = self.max_output_bytes.filter(|&n| n > 0).unwrap_or(16 * 1024);
+        let timeout = std::time::Duration::from_secs(self.timeout_secs.unwrap_or(300));
+        Ok(ReviewConfig {
+            workflow,
+            max_output_bytes,
+            timeout,
         })
     }
 }
@@ -1151,6 +1193,39 @@ addr="127.0.0.1:8080"
         .unwrap();
         let e = c.verify.as_ref().unwrap().to_config().unwrap_err();
         assert!(format!("{e:?}").contains("at least one command"));
+    }
+
+    #[test]
+    fn review_config_parses_workflow_and_defaults() {
+        let c = RegistryConfig::parse(
+            "default=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n[review]\nworkflow=\"implement-review\"\n",
+        )
+        .unwrap();
+        let r = c.review.as_ref().unwrap().to_config().unwrap();
+        assert_eq!(r.workflow.as_str(), "implement-review");
+        assert_eq!(r.max_output_bytes, 16 * 1024);
+        assert_eq!(r.timeout, std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn review_config_defaults_workflow_when_absent() {
+        let c = RegistryConfig::parse(
+            "default=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n[review]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.review.as_ref().unwrap().to_config().unwrap().workflow.as_str(),
+            "implement-review"
+        );
+    }
+
+    #[test]
+    fn review_config_rejects_malformed_workflow_id() {
+        let c = RegistryConfig::parse(
+            "default=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n[review]\nworkflow=\"\"\n",
+        )
+        .unwrap();
+        assert!(c.review.as_ref().unwrap().to_config().is_err());
     }
 
     #[test]
