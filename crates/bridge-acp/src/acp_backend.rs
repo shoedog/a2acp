@@ -519,10 +519,9 @@ impl AcpBackend {
                 .stdin
                 .take()
                 .ok_or_else(|| BridgeError::agent_crashed("agent stdin unavailable after spawn"))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| BridgeError::agent_crashed("agent stdout unavailable after spawn"))?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                BridgeError::agent_crashed("agent stdout unavailable after spawn")
+            })?;
             // The crate uses `futures` async-io; our child uses tokio pipes — adapt
             // with tokio_util::compat. ByteStreams::new(outgoing_writer, incoming_reader).
             let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
@@ -1661,7 +1660,11 @@ mod tests {
         AcpBackend::reap_container(&container, &reaped);
         AcpBackend::reap_container(&container, &reaped);
         AcpBackend::reap_container(&container, &reaped);
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "reaped at most once across all sites");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "reaped at most once across all sites"
+        );
 
         // No container → never reaps.
         let none: Option<ContainerReap> = None;

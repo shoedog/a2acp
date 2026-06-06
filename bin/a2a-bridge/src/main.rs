@@ -1411,8 +1411,8 @@ async fn main() -> Result<(), BoxError> {
                                          // owner the spawn factory uses).
     ro_boot_sweep(&snapshot, &config_path);
     // Fan-out source label (wire-observable in fan-out artifacts): the default
-                                         // entry's `name` if set, else the default agent id, so a non-Kiro default
-                                         // (e.g. codex) isn't mislabeled "kiro".
+    // entry's `name` if set, else the default agent id, so a non-Kiro default
+    // (e.g. codex) isn't mislabeled "kiro".
     let default_label = snapshot
         .entries
         .iter()
