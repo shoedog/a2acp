@@ -20,6 +20,14 @@ allowed_cwd_root = "/Users/wesleyjinks/code"
 workflow = "implement-review"
 # timeout_secs = 300   # bound the review; absent -> 300
 
+# B2b-3b: the review->tweak loop. After the first commit, the bridge runs verify+review each attempt; on a
+# verify-FAIL or review-REJECT it re-prompts the `impl` agent (the `implement-fix` workflow) to fix on the
+# SAME clone, then AMENDs the fix into the single commit. Bounded by max_attempts (commit turns: the initial
+# commit + up to max_attempts-1 fix amends). Advisory -> the operator still accepts at merge. Absent -> 3.
+[implement]
+max_attempts = 3
+fix_workflow = "implement-fix"
+
 # B2b-2: the build+test verify run after `a2a-bridge implement` commits. Bridge-deterministic (the
 # agent can't fake it), REPORTED not gating. Separate egress (registries only; NO creds) so creds and
 # registry-egress never coexist. Coverage is opt-in (commented) — it can't reuse the warm non-instrumented
@@ -199,6 +207,16 @@ id = "implement-edit"
 id = "edit"
 agent = "impl"
 prompt_file = "../prompts/implement-edit.md"
+inputs = []
+
+# ── implement-fix (B2b-3b): one ContainerRw `impl` turn to FIX verify/review failures on the existing clone.
+#    EXAMPLE-ONLY (references `impl`, which is not in the `init` scaffold). ──
+[[workflows]]
+id = "implement-fix"
+[[workflows.nodes]]
+id = "fix"
+agent = "impl"
+prompt_file = "../prompts/implement-fix.md"
 inputs = []
 
 [[workflows]]

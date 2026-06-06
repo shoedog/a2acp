@@ -2137,6 +2137,10 @@ mod cli_tests {
             wf.contains_key(&bridge_core::ids::WorkflowId::parse("implement-edit").unwrap()),
             "implement-edit workflow loads"
         );
+        assert!(
+            wf.contains_key(&bridge_core::ids::WorkflowId::parse("implement-fix").unwrap()),
+            "implement-fix workflow loads"
+        );
         let snap = cfg.into_snapshot().unwrap();
         // Registry::new validates the snapshot WITHOUT spawning (lazy), so the real make_spawn_fn is never
         // called here — reuse it to avoid hand-rolling a typed no-op SpawnFn.
