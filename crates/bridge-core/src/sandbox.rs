@@ -83,6 +83,39 @@ pub fn compose_container_rw(
     (program, argv)
 }
 
+/// PURE+TOTAL. The `(program, argv)` for ONE verify command (Slice B2b-2). Reuses [`compose_sandbox`]
+/// (clone `mount=clone, access=Ro`, the cache volume appended) so egress / runtime / suffix derivation
+/// stay ONE source of truth. The command runs under `sh -c` with CARGO_HOME/CARGO_TARGET_DIR exported
+/// into the cache mount — so its exit code (read by the caller from the container) IS the command's
+/// verdict. NO creds: the only volumes are the `:ro` clone + the cache.
+pub fn compose_verify(
+    runtime: Option<&str>,
+    image: &str,
+    egress: &EgressPolicy,
+    clone: &crate::session_cwd::SessionCwd,
+    cache_vol: &str,
+    command: &str,
+) -> (String, Vec<String>) {
+    // `cd` the clone FIRST: compose_sandbox emits no --workdir (ACP cwd arrives via session/new), the
+    // reader base image sets WORKDIR /work, and verify is a bare `sh -c`. The clone is mounted identical-
+    // path, so `cd '<clone>'` lands in the repo. `&&` chains so a failed cd surfaces as a verify failure
+    // and the trailing `{command}`'s exit code is the script's exit (read by the caller from the container).
+    let script = format!(
+        "cd '{clone}' && export CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target && \
+         mkdir -p \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\" && {command}",
+        clone = clone.as_str(),
+    );
+    let sb = SandboxConfig {
+        runtime: runtime.map(str::to_string),
+        image: image.to_string(),
+        mount: clone.as_str().to_string(),
+        access: MountAccess::Ro,
+        egress: egress.clone(),
+        volumes: vec![format!("{cache_vol}:/cache")],
+    };
+    compose_sandbox(&sb, "sh", &["-c".to_string(), script])
+}
+
 /// PURE. The reap command for a named per-turn container: `<runtime> rm -f <name>`. Idempotent at the
 /// Docker layer (`rm -f` of a gone container is a harmless error the caller ignores).
 pub fn reap_argv(runtime: &str, name: &str) -> (String, Vec<String>) {
@@ -181,6 +214,63 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "-e" && w[1] == "NO_PROXY=localhost,127.0.0.1"));
         assert_eq!(argv.last().unwrap(), "acp"); // agent args tail through after the image
+    }
+
+    #[test]
+    fn compose_verify_ro_clone_plus_cache_reuses_compose_sandbox() {
+        use crate::session_cwd::SessionCwd;
+        let egress = EgressPolicy::Locked {
+            network: "a2a-verify-egress".into(),
+            proxy: "http://a2a-verify-proxy:8888".into(),
+            no_proxy: None,
+        };
+        let clone = SessionCwd::parse("/Users/w/code/.a2a-implement/impl-1-ab").unwrap();
+        let (prog, argv) = compose_verify(
+            None,
+            "a2a-toolchain:latest",
+            &egress,
+            &clone,
+            "a2a-verify-cache-deadbeef",
+            "cargo build --locked",
+        );
+        assert_eq!(prog, "docker");
+        // egress from the EgressPolicy (both proxies, like compose_sandbox)
+        assert!(argv.windows(2).any(|w| w == ["--network", "a2a-verify-egress"]));
+        assert!(argv.iter().any(|a| a == "HTTPS_PROXY=http://a2a-verify-proxy:8888"));
+        assert!(argv.iter().any(|a| a == "HTTP_PROXY=http://a2a-verify-proxy:8888"));
+        // the clone mounted :ro (identical path) — NOT :rw
+        let mnt = "/Users/w/code/.a2a-implement/impl-1-ab";
+        assert!(argv.iter().any(|a| a == &format!("{mnt}:{mnt}:ro")));
+        // the cache volume
+        assert!(argv.iter().any(|a| a == "a2a-verify-cache-deadbeef:/cache"));
+        // NO creds volume (verify mounts nothing but the clone + cache)
+        assert!(!argv
+            .iter()
+            .any(|a| a.contains(".credentials.json") || a.contains("auth.json")));
+        // the command runs under sh -c with the cargo env exported into the cache
+        assert_eq!(argv[argv.len() - 3], "sh");
+        assert_eq!(argv[argv.len() - 2], "-c");
+        let script = argv.last().unwrap();
+        // compose_sandbox emits NO --workdir and the reader base sets WORKDIR /work — the script MUST cd.
+        assert!(script.contains("cd '/Users/w/code/.a2a-implement/impl-1-ab'"));
+        assert!(script.contains("CARGO_HOME=/cache/cargo"));
+        assert!(script.contains("CARGO_TARGET_DIR=/cache/target"));
+        assert!(script.contains("cargo build --locked"));
+    }
+
+    #[test]
+    fn compose_verify_open_egress_has_no_network() {
+        use crate::session_cwd::SessionCwd;
+        let clone = SessionCwd::parse("/repo/clone").unwrap();
+        let (_p, argv) = compose_verify(
+            Some("podman"),
+            "img",
+            &EgressPolicy::Open,
+            &clone,
+            "c",
+            "cargo test --locked",
+        );
+        assert!(!argv.iter().any(|a| a == "--network"));
     }
 
     #[test]
