@@ -265,7 +265,7 @@ pub struct VerifyCommand {
 }
 
 impl VerifyToml {
-    pub fn into_config(&self) -> Result<VerifyConfig, ConfigError> {
+    pub fn to_config(&self) -> Result<VerifyConfig, ConfigError> {
         if self.commands.is_empty() {
             return Err(ConfigError::Registry(
                 "[verify] needs at least one command".into(),
@@ -1094,7 +1094,7 @@ addr="127.0.0.1:8080"
             "#,
         )
         .unwrap();
-        let v = c.verify.as_ref().unwrap().into_config().unwrap();
+        let v = c.verify.as_ref().unwrap().to_config().unwrap();
         assert_eq!(v.image, "a2a-toolchain:latest");
         assert_eq!(v.cache, "a2a-verify-cache");
         assert!(matches!(
@@ -1128,7 +1128,7 @@ addr="127.0.0.1:8080"
             "#,
         )
         .unwrap();
-        let e = c.verify.as_ref().unwrap().into_config().unwrap_err();
+        let e = c.verify.as_ref().unwrap().to_config().unwrap_err();
         assert!(format!("{e:?}").contains("requires network"));
     }
 
@@ -1149,7 +1149,7 @@ addr="127.0.0.1:8080"
             "#,
         )
         .unwrap();
-        let e = c.verify.as_ref().unwrap().into_config().unwrap_err();
+        let e = c.verify.as_ref().unwrap().to_config().unwrap_err();
         assert!(format!("{e:?}").contains("at least one command"));
     }
 

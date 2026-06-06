@@ -3,7 +3,7 @@
 //! it), aggregate a reported (non-gating) verdict for the operator hand-off. The Docker run is the only
 //! impure piece (`docker_runner`, live-gated); everything else is pure + unit-tested.
 //!
-use crate::config::{VerifyCommand, VerifyConfig};
+use crate::config::VerifyConfig;
 
 /// One command's outcome. `gate=false` commands are reported but never fail the verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +65,8 @@ pub fn verdict_line(v: &VerifyVerdict) -> String {
 pub enum VerifyOutcome {
     Ran(VerifyVerdict),
     NotConfigured,
-    ConfigError(String),
+    /// The `[verify]` block failed validation; the detail is logged to stderr at the call site.
+    ConfigError,
 }
 
 /// PURE. The hand-off suffix (stdout) for each outcome. Failing-command OUTPUT is dumped to stderr by the
@@ -74,7 +75,7 @@ pub fn outcome_suffix(o: &VerifyOutcome) -> String {
     match o {
         VerifyOutcome::Ran(v) => verdict_line(v),
         VerifyOutcome::NotConfigured => "verify: not configured".to_string(),
-        VerifyOutcome::ConfigError(_) => "verify: skipped (config error)".to_string(),
+        VerifyOutcome::ConfigError => "verify: skipped (config error)".to_string(),
     }
 }
 
@@ -203,10 +204,12 @@ mod tests {
         assert!(outcome_suffix(&failed).starts_with("verify: FAIL"));
         assert_eq!(outcome_suffix(&VerifyOutcome::NotConfigured), "verify: not configured");
         assert_eq!(
-            outcome_suffix(&VerifyOutcome::ConfigError("bad".into())),
+            outcome_suffix(&VerifyOutcome::ConfigError),
             "verify: skipped (config error)"
         );
     }
+
+    use crate::config::VerifyCommand;
 
     fn cfg(cmds: &[(&str, bool)]) -> VerifyConfig {
         VerifyConfig {
