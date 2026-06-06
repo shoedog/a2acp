@@ -218,11 +218,9 @@ pub fn head_guard(clone: &Path, expect_branch: &str, pre_sha: &str) -> Result<()
     Ok(())
 }
 
-/// Deterministically commit the AGENT-STAGED index with the bot identity + the full hook/sign/ownership
-/// pins. Bounded retry on an index-lock error (the per-turn container that held it is being reaped);
-/// clears a stale `.git/index.lock` only AFTER retries exhaust. Returns the new commit sha. Stages nothing.
-pub fn host_commit(clone: &Path, msg: &str) -> Result<String, String> {
-    let argv = commit_argv(&clone.to_string_lossy(), msg);
+/// Run a prepared commit argv with `git -C <clone>`: the bounded index-lock retry, the stale-`.git/index.
+/// lock` clear after retries, and reading the new sha. Shared by `host_commit` (fresh) + `host_amend_commit`.
+fn host_commit_argv_run(clone: &Path, argv: &[String]) -> Result<String, String> {
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     for _ in 0..5 {
         let out = run_git(Some(clone), &refs).map_err(|e| format!("git commit: {e}"))?;
@@ -245,6 +243,59 @@ pub fn host_commit(clone: &Path, msg: &str) -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ))
     }
+}
+
+/// Deterministically commit the AGENT-STAGED index with the bot identity + the full hook/sign/ownership
+/// pins. Bounded retry on an index-lock error (the per-turn container that held it is being reaped);
+/// clears a stale `.git/index.lock` only AFTER retries exhaust. Returns the new commit sha. Stages nothing.
+pub fn host_commit(clone: &Path, msg: &str) -> Result<String, String> {
+    host_commit_argv_run(clone, &commit_argv(&clone.to_string_lossy(), msg))
+}
+
+/// `commit --amend --no-edit` argv with the SAME pins as `commit_argv` (run with `git -C <clone>`). Folds
+/// the freshly-staged fix into the single commit, KEEPING the stored message + parent — so the operator
+/// hand-off (`cherry-pick -n FETCH_HEAD`) stays byte-identical across attempts.
+pub fn commit_amend_argv(clone: &str) -> Vec<String> {
+    vec![
+        "-c".into(),
+        format!("safe.directory={clone}"),
+        "-c".into(),
+        "core.hooksPath=/dev/null".into(),
+        "-c".into(),
+        "commit.gpgsign=false".into(),
+        "-c".into(),
+        format!("user.name={BOT_NAME}"),
+        "-c".into(),
+        format!("user.email={BOT_EMAIL}"),
+        "commit".into(),
+        "--no-verify".into(),
+        "--amend".into(),
+        "--no-edit".into(),
+    ]
+}
+
+/// Amend the agent-staged fix into the single commit (keeps the original message + parent + bot identity).
+pub fn host_amend_commit(clone: &Path) -> Result<String, String> {
+    host_commit_argv_run(clone, &commit_amend_argv(&clone.to_string_lossy()))
+}
+
+/// Reset the working tree to the committed HEAD (discard unstaged tracked changes + untracked files) so
+/// VERIFY tests EXACTLY the committed tree, not the agent's leftover scratch.
+pub fn reset_worktree_to_head(clone: &Path) -> Result<(), String> {
+    let sd = format!("safe.directory={}", clone.to_string_lossy());
+    git_ok(Some(clone), &["-c", &sd, "reset", "--hard", "HEAD"])?;
+    git_ok(Some(clone), &["-c", &sd, "clean", "-fdq"]).map(|_| ())
+}
+
+/// Restore OUR task branch to a trusted commit after a fix turn mutated HEAD (advanced OR switched branches).
+/// `checkout -f <branch>` returns to our branch (robust to a switch; discards the rogue working tree), then
+/// `reset --hard <sha>` moves the branch ref to the trusted tip — which is what the hand-off FETCHES. This is
+/// the no-work-loss fix: a bare `reset --hard` on the agent's (possibly switched) HEAD would leave OUR branch
+/// at the rogue tip.
+pub fn restore_branch(clone: &Path, branch: &str, sha: &str) -> Result<(), String> {
+    let sd = format!("safe.directory={}", clone.to_string_lossy());
+    git_ok(Some(clone), &["-c", &sd, "checkout", "-q", "-f", branch])?;
+    git_ok(Some(clone), &["-c", &sd, "reset", "--hard", sha]).map(|_| ())
 }
 
 /// Refuse a clone dest inside a git worktree (cloning into a repo dirties it). Walks to the nearest
@@ -628,6 +679,92 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&subj.stdout).trim(), "subject line");
+    }
+
+    #[test]
+    fn commit_amend_argv_pins_and_amends_no_edit() {
+        let a = commit_amend_argv("/c");
+        let joined = a.join(" ");
+        assert!(joined.contains("-c safe.directory=/c"));
+        assert!(joined.contains("-c core.hooksPath=/dev/null"));
+        assert!(joined.contains("-c user.name=a2a-implement"));
+        let ci = a.iter().position(|x| x == "commit").unwrap();
+        assert_eq!(&a[ci..], &["commit", "--no-verify", "--amend", "--no-edit"]);
+    }
+
+    #[test]
+    fn host_amend_folds_into_one_commit_keeping_parent_and_message() {
+        let (_g, p) = temp_repo();
+        let base = head_sha(&p).unwrap();
+        run_git(Some(&p), &["checkout", "-q", "-b", "implement/x"]).unwrap();
+        std::fs::write(p.join("A.md"), "a\n").unwrap();
+        run_git(Some(&p), &["add", "A.md"]).unwrap();
+        let sha1 = host_commit(&p, "feat: the change").unwrap();
+        std::fs::write(p.join("B.md"), "b\n").unwrap();
+        run_git(Some(&p), &["add", "B.md"]).unwrap();
+        let sha2 = host_amend_commit(&p).unwrap();
+        assert_ne!(sha1, sha2);
+        let count = run_git(Some(&p), &["rev-list", "--count", &format!("{base}..HEAD")]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+        let parent = run_git(Some(&p), &["rev-parse", "HEAD^"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&parent.stdout).trim(), base);
+        let subj = run_git(Some(&p), &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&subj.stdout).trim(), "feat: the change");
+        assert!(p.join("A.md").exists() && p.join("B.md").exists());
+        let an = run_git(Some(&p), &["log", "-1", "--format=%an"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&an.stdout).trim(), "a2a-implement");
+    }
+
+    #[test]
+    fn reset_worktree_to_head_discards_unstaged_and_untracked() {
+        let (_g, p) = temp_repo();
+        run_git(Some(&p), &["checkout", "-q", "-b", "implement/x"]).unwrap();
+        std::fs::write(p.join("A.md"), "a\n").unwrap();
+        run_git(Some(&p), &["add", "A.md"]).unwrap();
+        host_commit(&p, "feat").unwrap();
+        std::fs::write(p.join("A.md"), "MUTATED\n").unwrap();
+        std::fs::write(p.join("scratch.tmp"), "junk\n").unwrap();
+        assert_ne!(stage_state(&p).unwrap(), StageState::Clean);
+        reset_worktree_to_head(&p).unwrap();
+        assert_eq!(stage_state(&p).unwrap(), StageState::Clean);
+        assert_eq!(std::fs::read_to_string(p.join("A.md")).unwrap(), "a\n");
+        assert!(!p.join("scratch.tmp").exists());
+    }
+
+    #[test]
+    fn restore_branch_recovers_after_head_advance() {
+        let (_g, p) = temp_repo();
+        run_git(Some(&p), &["checkout", "-q", "-b", "implement/x"]).unwrap();
+        std::fs::write(p.join("A.md"), "a\n").unwrap();
+        run_git(Some(&p), &["add", "A.md"]).unwrap();
+        let good = host_commit(&p, "feat").unwrap();
+        std::fs::write(p.join("rogue.md"), "r\n").unwrap();
+        run_git(Some(&p), &["add", "rogue.md"]).unwrap();
+        run_git(Some(&p), &["commit", "-q", "-m", "rogue"]).unwrap();
+        restore_branch(&p, "implement/x", &good).unwrap();
+        assert_eq!(head_sha(&p).unwrap(), good);
+        assert_eq!(current_branch(&p).unwrap(), "implement/x");
+        assert!(p.join("A.md").exists() && !p.join("rogue.md").exists());
+    }
+
+    #[test]
+    fn restore_branch_recovers_after_branch_switch() {
+        // the deeper hole: a bare `reset --hard` would reset the WRONG branch. restore_branch must force
+        // OUR branch (the one the hand-off fetches) back to the trusted tip.
+        let (_g, p) = temp_repo();
+        run_git(Some(&p), &["checkout", "-q", "-b", "implement/x"]).unwrap();
+        std::fs::write(p.join("A.md"), "a\n").unwrap();
+        run_git(Some(&p), &["add", "A.md"]).unwrap();
+        let good = host_commit(&p, "feat").unwrap();
+        run_git(Some(&p), &["checkout", "-q", "-b", "rogue-branch"]).unwrap();
+        std::fs::write(p.join("rogue.md"), "r\n").unwrap();
+        run_git(Some(&p), &["add", "rogue.md"]).unwrap();
+        run_git(Some(&p), &["commit", "-q", "-m", "rogue"]).unwrap();
+        restore_branch(&p, "implement/x", &good).unwrap();
+        assert_eq!(current_branch(&p).unwrap(), "implement/x");
+        let tip = run_git(Some(&p), &["rev-parse", "implement/x"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), good);
+        assert!(p.join("A.md").exists() && !p.join("rogue.md").exists());
     }
 
     #[test]
