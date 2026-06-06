@@ -46,6 +46,32 @@ pub fn truncate_output(s: &str, max: usize) -> String {
     format!("{}\n…[truncated {} bytes]…\n{}", &s[..h], t - h, &s[t..])
 }
 
+/// PURE. The fix-turn digest: ONLY the GATE failures (the ones that fail the verdict + drive `actionable`),
+/// in order, each `### <name>` + its (truncated) output. Non-gate failures are reported in the hand-off but
+/// never re-prompted. Empty when no gate failed. `run_verify` stops at the first gate failure, so this is
+/// normally one entry; the per-result budget splits `max_bytes` across however many there are.
+pub fn failure_digest(v: &VerifyVerdict, max_bytes: usize) -> String {
+    let failed: Vec<&VerifyResult> = v.results.iter().filter(|r| r.gate && !r.ok).collect();
+    if failed.is_empty() {
+        return String::new();
+    }
+    let per = (max_bytes / failed.len()).max(1);
+    let mut s = String::new();
+    for r in failed {
+        s.push_str("### ");
+        s.push_str(&r.name);
+        s.push('\n');
+        let body = if r.output.trim().is_empty() {
+            "(no output)"
+        } else {
+            &r.output
+        };
+        s.push_str(&truncate_output(body, per));
+        s.push('\n');
+    }
+    s
+}
+
 /// PURE. The one-line verdict for the operator hand-off (stdout). Failing-command OUTPUT goes to
 /// stderr separately; this is the summary line.
 pub fn verdict_line(v: &VerifyVerdict) -> String {
@@ -75,6 +101,9 @@ pub enum VerifyOutcome {
     NotConfigured,
     /// The `[verify]` block failed validation; the detail is logged to stderr at the call site.
     ConfigError,
+    /// The step did not run to completion (e.g. a pre-verify worktree reset failed) — the loop sentinel +
+    /// catch-all so the always-print hand-off has a defined value. (B2b-3b.)
+    Incomplete,
 }
 
 /// PURE. The hand-off suffix (stdout) for each outcome. Failing-command OUTPUT is dumped to stderr by the
@@ -84,6 +113,7 @@ pub fn outcome_suffix(o: &VerifyOutcome) -> String {
         VerifyOutcome::Ran(v) => verdict_line(v),
         VerifyOutcome::NotConfigured => "verify: not configured".to_string(),
         VerifyOutcome::ConfigError => "verify: skipped (config error)".to_string(),
+        VerifyOutcome::Incomplete => "verify: incomplete (did not finish)".to_string(),
     }
 }
 
@@ -226,6 +256,66 @@ mod tests {
             outcome_suffix(&VerifyOutcome::ConfigError),
             "verify: skipped (config error)"
         );
+    }
+
+    #[test]
+    fn outcome_suffix_incomplete() {
+        assert_eq!(
+            outcome_suffix(&VerifyOutcome::Incomplete),
+            "verify: incomplete (did not finish)"
+        );
+    }
+
+    #[test]
+    fn failure_digest_only_failed_gates_with_budget() {
+        let v = aggregate(vec![
+            VerifyResult {
+                name: "fmt".into(),
+                gate: true,
+                ok: true,
+                output: "ok".into(),
+            },
+            VerifyResult {
+                name: "clippy".into(),
+                gate: true,
+                ok: false,
+                output: "E".repeat(50),
+            },
+        ]);
+        let d = failure_digest(&v, 20);
+        assert!(d.contains("### clippy"));
+        assert!(!d.contains("### fmt"));
+        assert!(d.contains("truncated"));
+    }
+
+    #[test]
+    fn failure_digest_empty_when_no_gate_failures() {
+        let v = aggregate(vec![
+            VerifyResult {
+                name: "test".into(),
+                gate: true,
+                ok: true,
+                output: "ok".into(),
+            },
+            VerifyResult {
+                name: "cov".into(),
+                gate: false,
+                ok: false,
+                output: "x".into(),
+            },
+        ]);
+        assert_eq!(failure_digest(&v, 4096), "");
+    }
+
+    #[test]
+    fn failure_digest_empty_output_placeholder() {
+        let v = aggregate(vec![VerifyResult {
+            name: "build".into(),
+            gate: true,
+            ok: false,
+            output: "   ".into(),
+        }]);
+        assert!(failure_digest(&v, 4096).contains("(no output)"));
     }
 
     use crate::config::VerifyCommand;
