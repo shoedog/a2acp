@@ -175,12 +175,16 @@ fn container_owner(config_path: &std::path::Path, mount: &str, agent_id: &str) -
     format!("{:016x}", h.finish())
 }
 
-/// Owner-scoped boot-sweep: reap THIS bridge instance's orphaned `:ro` containers (from a prior crash)
-/// before spawning. Reads the SNAPSHOT (normalized mount + typed kind/access) so the owner matches the
-/// spawn-time owner; `config_path` must be the SAME (canonical) value `make_spawn_fn` is given. Scoped per
-/// (config, mount, agent) owner so a CONCURRENT bridge's live containers are untouched. Best-effort.
-fn ro_boot_sweep(snapshot: &bridge_core::domain::RegistrySnapshot, config_path: &std::path::Path) {
+/// The `(runtime, owner)` sweep targets for THIS bridge instance's `:ro` agents. Reads the SNAPSHOT
+/// (normalized mount + typed kind/access) so the owner matches the spawn-time owner; `config_path` must be
+/// the SAME (canonical) value `make_spawn_fn` is given. Scoped per (config, mount, agent) owner so a
+/// CONCURRENT bridge's containers are untouched.
+fn ro_sweep_targets(
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    config_path: &std::path::Path,
+) -> Vec<(String, String)> {
     use bridge_core::domain::{AgentKind, MountAccess};
+    let mut targets = Vec::new();
     for entry in &snapshot.entries {
         let Some(sb) = entry.sandbox.as_ref() else {
             continue;
@@ -188,9 +192,19 @@ fn ro_boot_sweep(snapshot: &bridge_core::domain::RegistrySnapshot, config_path: 
         if entry.kind != AgentKind::Acp || !matches!(sb.access, MountAccess::Ro) {
             continue;
         }
-        let runtime = sb.runtime();
         let owner = container_owner(config_path, &sb.mount, entry.id.as_str());
-        let (prog, argv) = bridge_core::sandbox::ro_sweep_filter_argv(runtime, &owner);
+        targets.push((sb.runtime().to_string(), owner));
+    }
+    targets
+}
+
+/// SYNCHRONOUS owner-scoped reap of `a2a-ro-<owner>-` containers (best-effort, blocking). Used for both
+/// the boot-sweep (crash recovery) and the one-shot END-sweep — the latter must be synchronous because the
+/// per-backend Drop reaper detaches its `docker rm -f`, which races process exit on a one-shot command
+/// (run-workflow/implement) where the runtime dies before the detached task runs (live-gate finding).
+fn ro_sweep(targets: &[(String, String)]) {
+    for (runtime, owner) in targets {
+        let (prog, argv) = bridge_core::sandbox::ro_sweep_filter_argv(runtime, owner);
         if let Ok(out) = std::process::Command::new(&prog).args(&argv).output() {
             for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
                 let _ = std::process::Command::new(runtime)
@@ -198,6 +212,16 @@ fn ro_boot_sweep(snapshot: &bridge_core::domain::RegistrySnapshot, config_path: 
                     .output();
             }
         }
+    }
+}
+
+/// RAII end-sweep for one-shot commands: on drop (any return path) it synchronously reaps this run's `:ro`
+/// containers, so a clean `run-workflow`/`implement` exit doesn't leak (the detached Drop reaper races the
+/// process exit). Declared early so it drops AFTER the registry/backends (whose detached reaps fire first).
+struct RoSweepGuard(Vec<(String, String)>);
+impl Drop for RoSweepGuard {
+    fn drop(&mut self) {
+        ro_sweep(&self.0);
     }
 }
 
@@ -493,9 +517,11 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
-    // Canonical config path: the owner token must match between the boot-sweep and the spawn factory.
+    // Canonical config path: the owner token must match between the sweeps and the spawn factory.
     let owner_config_path = std::fs::canonicalize(&a.config).unwrap_or_else(|_| a.config.clone());
-    ro_boot_sweep(&snapshot, &owner_config_path);
+    let ro_targets = ro_sweep_targets(&snapshot, &owner_config_path);
+    ro_sweep(&ro_targets); // boot-sweep (crash recovery)
+    let _ro_guard = RoSweepGuard(ro_targets); // synchronous END-sweep on any return (one-shot reliability)
     let policy = Arc::new(AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
     let spawn = make_spawn_fn(policy_for_spawn, owner_config_path);
@@ -672,10 +698,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
-    // Canonical config path: the owner token must match between the boot-sweep and the spawn factory.
+    // Canonical config path: the owner token must match between the sweeps and the spawn factory.
     let owner_config_path =
         std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
-    ro_boot_sweep(&snapshot, &owner_config_path);
+    let ro_targets = ro_sweep_targets(&snapshot, &owner_config_path);
+    ro_sweep(&ro_targets); // boot-sweep (crash recovery)
+    let _ro_guard = RoSweepGuard(ro_targets); // synchronous END-sweep on any return (one-shot reliability)
     let policy = Arc::new(bridge_policy::permission::AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
     let spawn = make_spawn_fn(policy_for_spawn, owner_config_path);
@@ -1408,8 +1436,10 @@ async fn main() -> Result<(), BoxError> {
     let snapshot = source.load().await?; // initial desired state
                                          // :ro reaper boot-sweep: reap this instance's orphaned :ro
                                          // containers (config_path is already canonical, matching the
-                                         // owner the spawn factory uses).
-    ro_boot_sweep(&snapshot, &config_path);
+                                         // owner the spawn factory uses). serve is long-running, so it
+                                         // needs no END-sweep — per-backend retire reaps run with the
+                                         // runtime alive, and the next boot-sweep catches any leftover.
+    ro_sweep(&ro_sweep_targets(&snapshot, &config_path));
     // Fan-out source label (wire-observable in fan-out artifacts): the default
     // entry's `name` if set, else the default agent id, so a non-Kiro default
     // (e.g. codex) isn't mislabeled "kiro".
