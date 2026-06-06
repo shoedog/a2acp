@@ -26,16 +26,24 @@ pub fn aggregate(results: Vec<VerifyResult>) -> VerifyVerdict {
     VerifyVerdict { results, passed }
 }
 
-/// PURE. Clamp captured output to `max` bytes on a char boundary, marking truncation.
+/// PURE. Clamp captured output to ~`max` bytes, keeping the HEAD (early context: which command, the
+/// first errors) AND the TAIL (where a failing command's failure list + summary live — cargo prints those
+/// last). A head-only clamp would hide the very failure the operator needs.
 pub fn truncate_output(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    let head = max / 4;
+    let tail = max - head;
+    let mut h = head;
+    while h > 0 && !s.is_char_boundary(h) {
+        h -= 1;
     }
-    format!("{}\n…[truncated {} bytes]", &s[..end], s.len() - end)
+    let mut t = s.len() - tail;
+    while t < s.len() && !s.is_char_boundary(t) {
+        t += 1;
+    }
+    format!("{}\n…[truncated {} bytes]…\n{}", &s[..h], t - h, &s[t..])
 }
 
 /// PURE. The one-line verdict for the operator hand-off (stdout). Failing-command OUTPUT goes to
@@ -172,11 +180,13 @@ mod tests {
     }
 
     #[test]
-    fn truncate_marks_oversized_output() {
-        let out = truncate_output(&"x".repeat(100), 10);
-        assert!(out.starts_with(&"x".repeat(10)));
-        assert!(out.contains("truncated 90 bytes"));
-        assert_eq!(truncate_output("short", 10), "short");
+    fn truncate_keeps_head_and_tail() {
+        let s = format!("{}{}", "H".repeat(50), "T".repeat(50)); // 100 bytes
+        let out = truncate_output(&s, 20); // head=5, tail=15
+        assert!(out.starts_with("HHHHH")); // head kept (early context)
+        assert!(out.ends_with(&"T".repeat(15))); // tail kept (the failure lives here)
+        assert!(out.contains("truncated 80 bytes"));
+        assert_eq!(truncate_output("short", 20), "short");
     }
 
     #[test]

@@ -18,11 +18,14 @@ allowed_cwd_root = "/Users/wesleyjinks/code"
 # registry-egress never coexist. Coverage is opt-in (commented) — it can't reuse the warm non-instrumented
 # cache. Default gates are fmt/clippy/build/test, all --locked against the :ro clone.
 [verify]
-image   = "a2a-toolchain:latest"
-cache   = "a2a-verify-cache"                   # per-repo: the bridge appends a hash of the source path
-egress  = "locked"
-network = "a2a-verify-egress"
-proxy   = "http://a2a-verify-proxy:8888"
+image    = "a2a-toolchain:latest"
+cache    = "a2a-verify-cache"                  # per-repo: the bridge appends a hash of the source path
+egress   = "locked"
+network  = "a2a-verify-egress"
+proxy    = "http://a2a-verify-proxy:8888"
+# NO_PROXY=localhost so `cargo test`'s local HTTP servers (wiremock etc.) aren't hijacked by the cargo-
+# fetch proxy. Without it, any test that binds 127.0.0.1 spuriously fails verify (live-gate finding).
+no_proxy = "localhost,127.0.0.1"
 [[verify.commands]]
 name = "fmt"
 cmd  = "cargo fmt --all -- --check"
@@ -34,7 +37,13 @@ name = "build"
 cmd  = "cargo build --locked"
 [[verify.commands]]
 name = "test"
-cmd  = "cargo test --locked"
+# A HERMETIC verify can't run this repo's SYSTEM-INTEGRATION tests — they need host capabilities the
+# bare container lacks (dogfood finding). CI runs the full suite post-merge; the pre-merge verify covers
+# fmt/clippy/build + the hermetic-safe tests:
+#   --exclude bridge-container: its B2a tests spawn a real Docker daemon (no docker-in-docker here).
+#   --skip process::tests::{terminate_reaps_child_no_zombie,term_ignoring_loop_forces_group_sigkill}:
+#     the supervisor's zombie-reaping + process-group-SIGKILL tests need host PID-1/signal semantics.
+cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill"
 # opt-in coverage (instrumented recompile; reported, never gates):
 # [[verify.commands]]
 # name = "coverage"
