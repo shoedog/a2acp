@@ -31,8 +31,10 @@ pub enum ReviewOutcome {
 /// returns Approve unless an unambiguous footer `VERDICT: APPROVE` is present.
 pub fn parse_verdict(synth: &str) -> (Verdict, String) {
     fn starts_ci(l: &str, kw: &str) -> bool {
-        let t = l.trim_start();
-        t.len() >= kw.len() && t[..kw.len()].eq_ignore_ascii_case(kw)
+        // Compare BYTES (the keywords are pure ASCII) — slicing `&str[..kw.len()]` panics when a
+        // multi-byte char (e.g. an em-dash in a finding like "MAJOR — none.") straddles the boundary.
+        let b = l.trim_start().as_bytes();
+        b.len() >= kw.len() && b[..kw.len()].eq_ignore_ascii_case(kw.as_bytes())
     }
     let lines: Vec<&str> = synth.lines().collect();
     let vidxs: Vec<usize> = lines
@@ -185,6 +187,13 @@ mod tests {
     fn non_adjacent_summary_breaks_the_footer() {
         let s = "VERDICT: APPROVE\n\nSUMMARY: not adjacent";
         assert_eq!(parse_verdict(s).0, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn multibyte_finding_line_does_not_panic() {
+        // an em-dash (3 bytes) before byte 8 used to panic the byte-slice prefix check
+        let s = "MAJOR — none.\nMINOR — tidy up.\n\nVERDICT: APPROVE\nSUMMARY: ok";
+        assert_eq!(parse_verdict(s), (Verdict::Approve, "ok".to_string()));
     }
 
     #[test]
