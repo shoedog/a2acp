@@ -3,8 +3,7 @@
 //! it), aggregate a reported (non-gating) verdict for the operator hand-off. The Docker run is the only
 //! impure piece (`docker_runner`, live-gated); everything else is pure + unit-tested.
 //!
-//! (The `use crate::config::{VerifyCommand, VerifyConfig};` import is added in Task 4 when `run_verify`
-//! first needs it — Task 3's helpers below use only local types, so importing it here would warn.)
+use crate::config::{VerifyCommand, VerifyConfig};
 
 /// One command's outcome. `gate=false` commands are reported but never fail the verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +89,56 @@ pub fn cache_volume_name(base: &str, repo_canon: &str) -> String {
     format!("{base}-{:016x}", h.finish())
 }
 
+/// A command runner: given `(program, argv)`, run it and return `(exit_code, combined_output)`. The real
+/// impl spawns Docker; tests inject a stub. The exit code is the CONTAINER's — unforgeable by in-container
+/// agent code.
+pub type Runner<'a> = dyn Fn(&str, &[String]) -> std::io::Result<(i32, String)> + 'a;
+
+/// Run every configured command as its own container (sharing the per-repo cache volume), reading each
+/// container's exit code. Stops at the FIRST gate failure. Pure given an injected `runner`.
+pub fn run_verify(
+    cfg: &VerifyConfig,
+    clone: &bridge_core::SessionCwd,
+    cache_vol: &str,
+    runner: &Runner,
+    max_bytes: usize,
+) -> VerifyVerdict {
+    let mut results = Vec::new();
+    for c in &cfg.commands {
+        let (prog, argv) = bridge_core::sandbox::compose_verify(
+            cfg.runtime.as_deref(),
+            &cfg.image,
+            &cfg.egress,
+            clone,
+            cache_vol,
+            &c.cmd,
+        );
+        let (exit, out) = match runner(&prog, &argv) {
+            Ok((e, o)) => (e, o),
+            Err(e) => (-1, format!("verify: runner error: {e}")),
+        };
+        let ok = exit == 0;
+        results.push(VerifyResult {
+            name: c.name.clone(),
+            gate: c.gate,
+            ok,
+            output: truncate_output(&out, max_bytes),
+        });
+        if c.gate && !ok {
+            break; // stop at the first gate failure
+        }
+    }
+    aggregate(results)
+}
+
+/// The real runner: spawn the container, capture stdout+stderr combined, return the exit code.
+pub fn docker_runner(program: &str, argv: &[String]) -> std::io::Result<(i32, String)> {
+    let out = std::process::Command::new(program).args(argv).output()?;
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.code().unwrap_or(-1), combined))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +206,84 @@ mod tests {
             outcome_suffix(&VerifyOutcome::ConfigError("bad".into())),
             "verify: skipped (config error)"
         );
+    }
+
+    fn cfg(cmds: &[(&str, bool)]) -> VerifyConfig {
+        VerifyConfig {
+            runtime: None,
+            image: "img".into(),
+            cache: "cache".into(),
+            egress: bridge_core::domain::EgressPolicy::Open,
+            commands: cmds
+                .iter()
+                .map(|(c, gate)| VerifyCommand {
+                    name: (*c).into(),
+                    cmd: format!("cargo {c}"),
+                    gate: *gate,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn run_verify_stops_at_first_gate_failure() {
+        let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
+        // runner: fmt ok, clippy FAILS (gate) -> build/test must NOT run.
+        let runner = |_p: &str, argv: &[String]| -> std::io::Result<(i32, String)> {
+            let script = argv.last().unwrap();
+            if script.contains("cargo clippy") {
+                Ok((1, "error: clippy".into()))
+            } else {
+                Ok((0, "ok".into()))
+            }
+        };
+        let v = run_verify(
+            &cfg(&[("fmt", true), ("clippy", true), ("build", true), ("test", true)]),
+            &clone,
+            "cache-x",
+            &runner,
+            4096,
+        );
+        assert!(!v.passed);
+        assert_eq!(v.results.len(), 2); // stopped after clippy
+        assert_eq!(v.results[1].name, "clippy");
+        assert!(!v.results[1].ok);
+    }
+
+    #[test]
+    fn run_verify_reports_nongate_failure_then_continues_to_a_later_gate() {
+        // The failing NON-GATE command is FIRST, a GATE command FOLLOWS — so a buggy "stop on ANY failure"
+        // impl would stop after coverage (len==1) and this test would catch it. (codex plan-review catch.)
+        let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
+        let runner = |_p: &str, argv: &[String]| -> std::io::Result<(i32, String)> {
+            let script = argv.last().unwrap();
+            if script.contains("cargo coverage") {
+                Ok((1, "cov fail".into()))
+            } else {
+                Ok((0, "ok".into()))
+            }
+        };
+        let v = run_verify(
+            &cfg(&[("coverage", false), ("test", true)]),
+            &clone,
+            "cache-x",
+            &runner,
+            4096,
+        );
+        assert!(v.passed); // the non-gate coverage failure doesn't fail the verdict
+        assert_eq!(v.results.len(), 2); // the later GATE ran (did NOT stop on the non-gate failure)
+        assert_eq!(v.results[1].name, "test");
+        assert!(v.results[1].ok);
+    }
+
+    #[test]
+    fn run_verify_runner_error_is_a_failure() {
+        let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
+        let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
+            Err(std::io::Error::other("docker missing"))
+        };
+        let v = run_verify(&cfg(&[("build", true)]), &clone, "cache-x", &runner, 4096);
+        assert!(!v.passed);
+        assert!(v.results[0].output.contains("docker missing"));
     }
 }
