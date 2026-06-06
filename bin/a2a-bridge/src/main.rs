@@ -28,6 +28,7 @@
 mod config;
 mod implement;
 mod route;
+mod verify;
 
 use std::path::PathBuf;
 use std::sync::Arc;
