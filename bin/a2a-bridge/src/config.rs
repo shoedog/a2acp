@@ -116,6 +116,9 @@ pub struct RegistryConfig {
     /// Absent → no global root restriction.
     #[serde(default)]
     pub allowed_cwd_root: Option<String>,
+    /// `[verify]` (Slice B2b-2): the build+test verify run after `implement` commits. Absent → skipped.
+    #[serde(default)]
+    pub verify: Option<VerifyToml>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -212,6 +215,81 @@ pub struct SandboxToml {
     pub volumes: Vec<String>,
 }
 
+fn default_gate() -> bool {
+    true
+}
+
+/// One verify command: `gate=false` is reported but never fails the verdict (e.g. coverage).
+#[derive(Debug, serde::Deserialize)]
+pub struct VerifyCommandToml {
+    pub name: String,
+    pub cmd: String,
+    #[serde(default = "default_gate")]
+    pub gate: bool,
+}
+
+/// `[verify]` (Slice B2b-2): the build+test verify the `implement` subcommand runs after the commit.
+/// Egress reuses the shared `parse_egress_fields` invariant (locked ⇒ network+proxy).
+#[derive(Debug, serde::Deserialize)]
+pub struct VerifyToml {
+    #[serde(default)]
+    pub runtime: Option<String>,
+    pub image: String,
+    pub cache: String,
+    pub egress: String,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+    #[serde(default)]
+    pub commands: Vec<VerifyCommandToml>,
+}
+
+/// Parsed `[verify]`: structured commands + a validated egress policy.
+#[derive(Debug, Clone)]
+pub struct VerifyConfig {
+    pub runtime: Option<String>,
+    pub image: String,
+    pub cache: String,
+    pub egress: bridge_core::domain::EgressPolicy,
+    pub commands: Vec<VerifyCommand>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifyCommand {
+    pub name: String,
+    pub cmd: String,
+    pub gate: bool,
+}
+
+impl VerifyToml {
+    pub fn to_config(&self) -> Result<VerifyConfig, ConfigError> {
+        if self.commands.is_empty() {
+            return Err(ConfigError::Registry(
+                "[verify] needs at least one command".into(),
+            ));
+        }
+        let egress = parse_egress_fields(&self.egress, &self.network, &self.proxy, &self.no_proxy)?;
+        Ok(VerifyConfig {
+            runtime: self.runtime.clone(),
+            image: self.image.clone(),
+            cache: self.cache.clone(),
+            egress,
+            commands: self
+                .commands
+                .iter()
+                .map(|c| VerifyCommand {
+                    name: c.name.clone(),
+                    cmd: c.cmd.clone(),
+                    gate: c.gate,
+                })
+                .collect(),
+        })
+    }
+}
+
 fn parse_access(s: &str) -> Result<bridge_core::domain::MountAccess, ConfigError> {
     use bridge_core::domain::MountAccess;
     match s.to_ascii_lowercase().as_str() {
@@ -223,29 +301,41 @@ fn parse_access(s: &str) -> Result<bridge_core::domain::MountAccess, ConfigError
     }
 }
 
-/// Convert the flat TOML egress into the data-carrying domain enum. `locked` REQUIRES network+proxy —
-/// so `compose_sandbox` is total and the old runtime "Locked ⇒ network+proxy" invariant is structural.
-fn parse_egress(t: &SandboxToml) -> Result<bridge_core::domain::EgressPolicy, ConfigError> {
+/// The locked-vs-open invariant on raw fields, so both [`SandboxToml`] and `[verify]` share it: `locked`
+/// REQUIRES network+proxy — so `compose_sandbox` is total and the "Locked ⇒ network+proxy" invariant is
+/// structural (a typo'd/missing `network` can't yield a no-`--network` = full-internet container).
+fn parse_egress_fields(
+    egress: &str,
+    network: &Option<String>,
+    proxy: &Option<String>,
+    no_proxy: &Option<String>,
+) -> Result<bridge_core::domain::EgressPolicy, ConfigError> {
     use bridge_core::domain::EgressPolicy;
-    match t.egress.to_ascii_lowercase().as_str() {
+    match egress.to_ascii_lowercase().as_str() {
         "open" => Ok(EgressPolicy::Open),
         "locked" => {
-            let network = t.network.clone().ok_or_else(|| {
-                ConfigError::Registry("sandbox egress=locked requires network".into())
-            })?;
-            let proxy = t.proxy.clone().ok_or_else(|| {
-                ConfigError::Registry("sandbox egress=locked requires proxy".into())
-            })?;
+            let network = network
+                .clone()
+                .ok_or_else(|| ConfigError::Registry("egress=locked requires network".into()))?;
+            let proxy = proxy
+                .clone()
+                .ok_or_else(|| ConfigError::Registry("egress=locked requires proxy".into()))?;
             Ok(EgressPolicy::Locked {
                 network,
                 proxy,
-                no_proxy: t.no_proxy.clone(),
+                no_proxy: no_proxy.clone(),
             })
         }
         other => Err(ConfigError::Registry(format!(
-            "invalid sandbox egress: {other:?} (expected locked|open)"
+            "invalid egress: {other:?} (expected locked|open)"
         ))),
     }
+}
+
+/// Convert the flat sandbox TOML egress into the data-carrying domain enum (delegates to the shared
+/// field-level invariant).
+fn parse_egress(t: &SandboxToml) -> Result<bridge_core::domain::EgressPolicy, ConfigError> {
+    parse_egress_fields(&t.egress, &t.network, &t.proxy, &t.no_proxy)
 }
 
 impl RegistryConfig {
@@ -976,6 +1066,91 @@ addr="127.0.0.1:8080"
             .unwrap()
             .into_snapshot()
             .is_err());
+    }
+
+    #[test]
+    fn verify_config_parses_structured_commands_and_locked_egress() {
+        let c = RegistryConfig::parse(
+            r#"
+            default = "x"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "x"
+            cmd = "echo"
+            [verify]
+            image = "a2a-toolchain:latest"
+            cache = "a2a-verify-cache"
+            egress = "locked"
+            network = "a2a-verify-egress"
+            proxy = "http://a2a-verify-proxy:8888"
+            [[verify.commands]]
+            name = "fmt"
+            cmd = "cargo fmt --all -- --check"
+            [[verify.commands]]
+            name = "test"
+            cmd = "cargo test --locked"
+            gate = false
+            "#,
+        )
+        .unwrap();
+        let v = c.verify.as_ref().unwrap().to_config().unwrap();
+        assert_eq!(v.image, "a2a-toolchain:latest");
+        assert_eq!(v.cache, "a2a-verify-cache");
+        assert!(matches!(
+            v.egress,
+            bridge_core::domain::EgressPolicy::Locked { .. }
+        ));
+        assert_eq!(v.commands.len(), 2);
+        assert_eq!(v.commands[0].name, "fmt");
+        assert!(v.commands[0].gate); // gate defaults to true
+        assert!(!v.commands[1].gate); // explicit gate=false
+    }
+
+    #[test]
+    fn verify_config_rejects_locked_without_network() {
+        let c = RegistryConfig::parse(
+            r#"
+            default = "x"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "x"
+            cmd = "echo"
+            [verify]
+            image = "i"
+            cache = "c"
+            egress = "locked"
+            proxy = "http://p:8888"
+            [[verify.commands]]
+            name = "t"
+            cmd = "cargo test"
+            "#,
+        )
+        .unwrap();
+        let e = c.verify.as_ref().unwrap().to_config().unwrap_err();
+        assert!(format!("{e:?}").contains("requires network"));
+    }
+
+    #[test]
+    fn verify_config_rejects_empty_commands() {
+        let c = RegistryConfig::parse(
+            r#"
+            default = "x"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "x"
+            cmd = "echo"
+            [verify]
+            image = "i"
+            cache = "c"
+            egress = "open"
+            "#,
+        )
+        .unwrap();
+        let e = c.verify.as_ref().unwrap().to_config().unwrap_err();
+        assert!(format!("{e:?}").contains("at least one command"));
     }
 
     #[test]

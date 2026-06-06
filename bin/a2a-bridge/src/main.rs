@@ -28,6 +28,7 @@
 mod config;
 mod implement;
 mod route;
+mod verify;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -423,6 +424,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         .get(&wf_id)
         .cloned()
         .ok_or_else(|| format!("implement: unknown workflow {:?}", a.workflow))?;
+    // B2b-2: parse [verify] NOW, before into_snapshot moves cfg. Owned + Clone, survives the move.
+    let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
@@ -512,16 +515,54 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 eprintln!("[implement] note: the clone still has uncommitted changes the agent left unstaged.");
             }
             let subject = message.lines().next().unwrap_or("").to_string();
-            println!(
-                "{}",
-                implement::handoff_text(
-                    &clone.to_string_lossy(),
-                    &branch,
-                    &sha,
-                    &subject,
-                    &a.repo.to_string_lossy()
-                )
+            let mut handoff = implement::handoff_text(
+                &clone.to_string_lossy(),
+                &branch,
+                &sha,
+                &subject,
+                &a.repo.to_string_lossy(),
             );
+
+            // B2b-2: deterministic build+test verify on the committed clone (reported, not gating).
+            // `verify_cfg` was captured before into_snapshot. The pure `outcome_suffix` (verify.rs) does
+            // the riskiest classification; this arm only resolves the outcome (impure) + dumps stderr.
+            let outcome = match verify_cfg {
+                Some(Ok(vcfg)) => {
+                    let clone_cwd = bridge_core::SessionCwd::parse(&clone.to_string_lossy())?;
+                    // Canonicalize a.repo for the cache key so two spellings don't split the warm cache.
+                    let repo_canon =
+                        std::fs::canonicalize(&a.repo).unwrap_or_else(|_| a.repo.clone());
+                    let cache_vol =
+                        verify::cache_volume_name(&vcfg.cache, &repo_canon.to_string_lossy());
+                    eprintln!(
+                        "[implement] verify: running {} command(s) in {}",
+                        vcfg.commands.len(),
+                        vcfg.image
+                    );
+                    let verdict = verify::run_verify(
+                        &vcfg,
+                        &clone_cwd,
+                        &cache_vol,
+                        &verify::docker_runner,
+                        16 * 1024,
+                    );
+                    for r in &verdict.results {
+                        if !r.ok {
+                            eprintln!("[implement] verify: {} failed:\n{}", r.name, r.output);
+                        }
+                    }
+                    verify::VerifyOutcome::Ran(verdict)
+                }
+                Some(Err(e)) => {
+                    eprintln!("[implement] verify: config error: {e:?} — skipping verify");
+                    verify::VerifyOutcome::ConfigError
+                }
+                None => verify::VerifyOutcome::NotConfigured,
+            };
+            handoff.push('\n');
+            handoff.push_str(&verify::outcome_suffix(&outcome));
+
+            println!("{handoff}");
             Ok(())
         }
     }
