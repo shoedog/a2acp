@@ -274,6 +274,29 @@ impl Drop for RwSweepGuard {
     }
 }
 
+/// Build a [`bridge_container::ContainerRwConfig`] from a ContainerRw agent entry — shared by
+/// [`make_spawn_fn`] (per-turn) and the warm `implement` path so both compose the SAME container.
+fn container_rw_cfg_from_entry(
+    entry: &AgentEntry,
+) -> Result<bridge_container::ContainerRwConfig, BridgeError> {
+    let sb = entry.sandbox.clone().ok_or(BridgeError::ConfigInvalid {
+        reason: format!("container_rw agent {} requires sandbox", entry.id.as_str()),
+    })?;
+    let cmd = entry.cmd.clone().ok_or(BridgeError::ConfigInvalid {
+        reason: format!("container_rw agent {} requires cmd", entry.id.as_str()),
+    })?;
+    Ok(bridge_container::ContainerRwConfig {
+        sandbox: sb,
+        cmd,
+        args: entry.args.clone(),
+        model: entry.model.clone(),
+        mode: entry.mode.clone(),
+        auth_method: entry.auth_method.clone(),
+        handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
+        cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+    })
+}
+
 /// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
 /// `implement` subcommand so their registry builds can't drift. `owner_config_path` seeds the ContainerRw
 /// owner token.
@@ -323,27 +346,16 @@ fn make_spawn_fn(
                     Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
                 }
                 AgentKind::ContainerRw => {
-                    let sb = entry.sandbox.clone().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!(
-                            "container_rw agent {} requires sandbox",
-                            entry.id.as_str()
-                        ),
-                    })?;
-                    let cmd = entry.cmd.clone().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!("container_rw agent {} requires cmd", entry.id.as_str()),
-                    })?;
-                    let owner = container_owner(&owner_config_path, &sb.mount, entry.id.as_str());
-                    let ccfg = bridge_container::ContainerRwConfig {
-                        sandbox: sb,
-                        cmd,
-                        args: entry.args.clone(),
-                        model: entry.model.clone(),
-                        mode: entry.mode.clone(),
-                        auth_method: entry.auth_method.clone(),
-                        handshake_timeout: bridge_acp::acp_backend::AcpConfig::default()
-                            .handshake_timeout,
-                        cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+                    let owner = {
+                        let sb = entry.sandbox.as_ref().ok_or(BridgeError::ConfigInvalid {
+                            reason: format!(
+                                "container_rw agent {} requires sandbox",
+                                entry.id.as_str()
+                            ),
+                        })?;
+                        container_owner(&owner_config_path, &sb.mount, entry.id.as_str())
                     };
+                    let ccfg = container_rw_cfg_from_entry(&entry)?;
                     let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
                         Arc::new(AcpContainerSpawn {
                             policy: Arc::clone(&policy),
@@ -1665,27 +1677,16 @@ async fn main() -> Result<(), BoxError> {
                     Ok(Arc::new(be) as Arc<dyn AgentBackend>)
                 }
                 AgentKind::ContainerRw => {
-                    let sb = entry.sandbox.clone().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!(
-                            "container_rw agent {} requires sandbox",
-                            entry.id.as_str()
-                        ),
-                    })?;
-                    let cmd = entry.cmd.clone().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!("container_rw agent {} requires cmd", entry.id.as_str()),
-                    })?;
-                    let owner = container_owner(&owner_config_path, &sb.mount, entry.id.as_str());
-                    let ccfg = bridge_container::ContainerRwConfig {
-                        sandbox: sb,
-                        cmd,
-                        args: entry.args.clone(),
-                        model: entry.model.clone(),
-                        mode: entry.mode.clone(),
-                        auth_method: entry.auth_method.clone(),
-                        handshake_timeout: bridge_acp::acp_backend::AcpConfig::default()
-                            .handshake_timeout,
-                        cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+                    let owner = {
+                        let sb = entry.sandbox.as_ref().ok_or(BridgeError::ConfigInvalid {
+                            reason: format!(
+                                "container_rw agent {} requires sandbox",
+                                entry.id.as_str()
+                            ),
+                        })?;
+                        container_owner(&owner_config_path, &sb.mount, entry.id.as_str())
                     };
+                    let ccfg = container_rw_cfg_from_entry(&entry)?;
                     let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
                         Arc::new(AcpContainerSpawn {
                             policy: Arc::clone(&policy),
