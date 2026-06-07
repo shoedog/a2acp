@@ -322,6 +322,30 @@ impl ContainerRwBackend {
         };
         Ok(wrap_with_turn_guard(inner, inner_stream, guard))
     }
+
+    /// Warm cancel: cancel the cached inner's current turn + clear `turn_active`. Does NOT reap (the warm
+    /// container survives for the next turn; `retire` owns reaping).
+    async fn cancel_warm(&self, session: &SessionId) -> Result<(), BridgeError> {
+        let inner = self.warm.lock().await.get(session).map(|wi| wi.inner.clone());
+        if let Some(inner) = inner {
+            let _ = inner.cancel(session).await;
+        }
+        self.turn_active.lock().await.remove(session);
+        Ok(())
+    }
+
+    /// Warm retire — the SOLE warm reap site. Drain the cache; per entry: cancel the inner, reap once,
+    /// and clear any stale `turn_active` marker (a held/raced stream could leave one behind).
+    async fn retire_warm(&self) -> Result<(), BridgeError> {
+        let entries: Vec<(SessionId, WarmInner)> = { self.warm.lock().await.drain().collect() };
+        let runtime = self.cfg.sandbox.runtime().to_string();
+        for (s, wi) in entries {
+            let _ = wi.inner.cancel(&s).await;
+            reap_once(&self.reap_fn, &runtime, &wi.name, &wi.reaped);
+            self.turn_active.lock().await.remove(&s);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -399,6 +423,9 @@ impl AgentBackend for ContainerRwBackend {
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
+        if self.is_warm() {
+            return self.cancel_warm(session).await;
+        }
         let turn = {
             let mut m = self.inflight.lock().await;
             match m.remove(session) {
@@ -436,6 +463,9 @@ impl AgentBackend for ContainerRwBackend {
     }
 
     async fn retire(&self) -> Result<(), BridgeError> {
+        if self.is_warm() {
+            return self.retire_warm().await;
+        }
         let turns: Vec<(SessionId, InflightTurn)> = {
             let mut m = self.inflight.lock().await;
             m.drain()
@@ -1073,6 +1103,57 @@ mod tests {
             format!("{err:?}").contains("in-flight turn"),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn warm_retire_is_the_sole_reap_site() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, spawn.clone(), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        {
+            let mut a = be.prompt(&s, vec![]).await.unwrap();
+            while a.next().await.is_some() {}
+        }
+        {
+            let mut b = be.prompt(&s, vec![]).await.unwrap();
+            while b.next().await.is_some() {}
+        }
+        assert_eq!(reaps.load(Ordering::SeqCst), 0, "no reap across turns");
+        be.retire().await.unwrap();
+        let inner = spawn.last_inner.lock().await.clone().unwrap();
+        assert!(
+            inner.canceled.load(Ordering::SeqCst),
+            "retire cancels the inner"
+        );
+        assert_eq!(
+            reaps.load(Ordering::SeqCst),
+            1,
+            "reaped exactly once at retire"
+        );
+        assert!(be.warm.lock().await.is_empty(), "warm cache drained");
+    }
+
+    #[tokio::test]
+    async fn warm_cancel_clears_turn_active_without_reaping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(false), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let _held = be.prompt(&s, vec![]).await.unwrap();
+        be.cancel(&s).await.unwrap();
+        assert_eq!(reaps.load(Ordering::SeqCst), 0, "warm cancel does NOT reap");
+        assert!(
+            !be.turn_active.lock().await.contains(&s),
+            "cancel cleared turn_active"
+        );
+        be.retire().await.unwrap(); // retire still reaps the cached container
+        assert_eq!(reaps.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
