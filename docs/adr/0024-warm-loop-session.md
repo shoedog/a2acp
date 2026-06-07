@@ -82,6 +82,36 @@ the warm contract (never-reap-except-retire) can't be cross-contaminated by an e
   `ignore` configs that survive the worktree reset. A future verify-hardening could `git clean` + reset to a
   pristine committed tree before each verify.
 
+## Code review (dual: containerized codex+claude PRIMARY + a2a-local codex BACKSTOP)
+
+The built diff was dual-reviewed before merge. **Folded fixes:**
+
+- **(backstop, HIGH — real regression)** The warm `SessionSpec` used `config: Default::default()`, dropping
+  the impl agent's model/mode/**effort** (the executor stashes `effective_config`; `AcpBackend` prefers the
+  stashed spec). Fixed to `effective_config(&impl_entry, None)`.
+- **(both)** `TurnGuard`'s early-drop clear could erase a *later* turn's `turn_active` marker — `turn_active`
+  is now `HashMap<SessionId, u64>` and every clear (sync + detached) is **epoch-guarded**.
+- **(both)** `prompt_warm` re-fetched the warm entry with `.unwrap()` across awaits → a concurrent `retire`
+  could panic. Now returns a handled `Err` ("retired during prompt").
+- **(backstop)** Post-edit `?` paths (`stage_state`, `host_commit`) now `retire()` before returning (a
+  container exists by then; `RwSweepGuard` stays the backstop).
+- **(primary)** `drain_turn` now **latches** completion (a trailing teardown `Err` after a successful `Done`
+  no longer un-completes the turn).
+
+**Known constraints / deferred (documented, not reachable in current sequential usage):**
+
+- **Two execution engines (HARD CONSTRAINT).** Edit/fix run via `warm.prompt` + `drain_turn`; review runs on
+  the executor. `resolve_impl_identity` rejects anything but a single-node graph, so the warm edit/fix path
+  cannot gain multi-node graphs, per-node cancel/timeout, or `NodeStarted/Finished/Terminal` telemetry. A
+  future workflow-model feature will NOT apply to edit/fix unless the executor learns to run on a
+  caller-supplied warm session.
+- **Implicit "always fully drain, never cancel mid-stream" contract.** The warm concurrency hazards are
+  unreachable today only because `run_tweak_loop`/`drain_turn` always poll to stream end and nothing cancels
+  mid-stream. Deferred hardening for when the loop gains concurrency/early-drop: a `Reserving/Live/Retiring`
+  warm state machine; making `Lifecycle` an enum that OWNS its state (`PerTurn(Inflight)` /
+  `Warm{warm,turn_active}`) so a method can't reach the wrong mode's fields; and distinguishing a fatal
+  child loss (reap + respawn next turn) from a recoverable reuse-turn error.
+
 ## Consequences
 
 - Continuity (one session) + no per-turn cold start within a loop; the container is reaped at `retire`
