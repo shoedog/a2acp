@@ -73,6 +73,25 @@ addr = "127.0.0.1:8080"
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Top-level usage, printed by `a2a-bridge help|--help|-h`. The detailed flags live in each subcommand's
+/// `--help`; the copy-paste quickstart lives in `AGENTS.md`.
+const TOP_USAGE: &str = "\
+a2a-bridge — A2A↔ACP bridge + multi-agent workflow runner
+
+USAGE:
+  a2a-bridge <subcommand> [options]      (bare `a2a-bridge` or `serve` runs the A2A server)
+
+SUBCOMMANDS:
+  run-workflow <id>   Run a workflow against a repo (design | code-review | spec-review | plan-review | …).
+                      --input <file> --session-cwd <repo> [--config <f>] [--out <f>]
+  implement <task>    Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
+                      --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>]
+  init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
+  serve               Run the A2A server.  [--config <path>]
+  submit | task       Detached workflow submit + durable task store.
+
+Run `a2a-bridge <subcommand> --help` for details. Quickstart + cwd/creds/concurrency notes: AGENTS.md.";
+
 /// Resolve the static (config-time) ACP session cwd for an agent entry.
 /// Resolution chain: `session_cwd` → `cwd` → `"."`.
 /// The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
@@ -371,6 +390,14 @@ fn make_spawn_fn(
 /// Parse `a2a-bridge run-workflow <id> --input <file> [--out <file>] [--config <path>]`
 /// from a raw args iterator (skipping the binary name at position 0 and the
 /// subcommand name at position 1).
+const RUN_WORKFLOW_USAGE: &str = "\
+usage: a2a-bridge run-workflow <workflow-id> --input <file> [--session-cwd <repo>] [--config <path>] [--out <file>]
+  <workflow-id>   design | code-review | spec-review | plan-review | … (whatever your --config defines)
+  --input <file>  the problem statement / material the workflow acts on (required)
+  --session-cwd   the repo the agents read/work in (per-request cwd; without it they use the launch cwd)
+  --config <path> registry config (default: ./a2a-bridge.toml)
+  --out <file>    write the terminal node's output here (default: stdout)";
+
 #[allow(clippy::type_complexity)]
 fn parse_run_workflow_args(
     args: &[String],
@@ -380,7 +407,7 @@ fn parse_run_workflow_args(
     let workflow_id = iter
         .next()
         .cloned()
-        .ok_or("run-workflow: missing <workflow-id>")?;
+        .ok_or_else(|| format!("run-workflow: missing <workflow-id>\n{RUN_WORKFLOW_USAGE}"))?;
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
@@ -413,10 +440,15 @@ fn parse_run_workflow_args(
                         .clone(),
                 );
             }
-            other => return Err(format!("run-workflow: unknown flag {other:?}").into()),
+            other => {
+                return Err(
+                    format!("run-workflow: unknown flag {other:?}\n{RUN_WORKFLOW_USAGE}").into(),
+                )
+            }
         }
     }
-    let input = input.ok_or("run-workflow: --input <file> is required")?;
+    let input = input
+        .ok_or_else(|| format!("run-workflow: --input <file> is required\n{RUN_WORKFLOW_USAGE}"))?;
     let config = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
     Ok((workflow_id, input, out, config, session_cwd))
 }
@@ -433,8 +465,15 @@ struct ImplementArgs {
     workflow: String,
 }
 
-const IMPLEMENT_USAGE: &str =
-    "usage: a2a-bridge implement <task> --repo <path> [--base-ref <ref>] [--config <path>] [--workflow <id>]";
+const IMPLEMENT_USAGE: &str = "\
+usage: a2a-bridge implement <task> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>]
+  <task>          what to implement (a sentence/paragraph the agent acts on)
+  --repo <path>   the repo to implement in; cloned into a quarantine under allowed_cwd_root (required)
+  --config <path> registry config defining the impl agent + [implement]/[verify]/[review] (default: ./a2a-bridge.toml)
+  --base-ref      branch/SHA to start from (default: the repo HEAD)
+  --workflow <id> the edit workflow (default: implement-edit)
+Clones --repo, runs the warm containerized impl agent (edit+fix turns share one container+session),
+verifies, reviews the diff, and hands off a branch to merge.";
 
 fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     let mut iter = args.iter();
@@ -746,6 +785,10 @@ impl tweak::TweakEffects for ProdEffects<'_> {
 /// workflow on the ContainerRw `impl` agent (session_cwd = the clone), then commit + the bounded
 /// review→tweak loop (B2b-3b) + the operator hand-off. The agent owns staging; the bridge owns the commit.
 async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{IMPLEMENT_USAGE}");
+        return Ok(());
+    }
     bridge_observ::init();
     let a = parse_implement_args(args)?;
 
@@ -1033,6 +1076,10 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
 /// prints NodeStarted/NodeFinished to stderr and the terminal output to stdout
 /// (or `--out <file>`).
 async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{RUN_WORKFLOW_USAGE}");
+        return Ok(());
+    }
     bridge_observ::init();
     let (workflow_id, input_path, out_path, config_path, session_cwd) =
         parse_run_workflow_args(args)?;
@@ -1663,10 +1710,12 @@ fn init_cmd(args: &[String]) -> Result<(), BoxError> {
         if selected.len() == 1 { "" } else { "s" },
         selected.join(", ")
     );
+    let cfg_path = dir.join("a2a-bridge.toml").display().to_string();
+    println!("Serve:         a2a-bridge serve --config {cfg_path}");
     println!(
-        "Run: a2a-bridge serve --config {}",
-        dir.join("a2a-bridge.toml").display()
+        "Run a workflow: a2a-bridge run-workflow code-review --input <file> --session-cwd <repo> --config {cfg_path}"
     );
+    println!("More:          a2a-bridge help  (and `a2a-bridge <subcommand> --help`); quickstart in AGENTS.md");
     Ok(())
 }
 
@@ -1680,13 +1729,17 @@ async fn main() -> Result<(), BoxError> {
         Some("submit") => return submit_cmd(&raw_args[2..]).await,
         Some("task") => return task_cmd(&raw_args[2..]).await,
         Some("init") => return init_cmd(&raw_args[2..]),
+        Some("help") | Some("--help") | Some("-h") => {
+            println!("{TOP_USAGE}");
+            return Ok(());
+        }
         // `serve` (explicit) and the bare invocation fall through to the server path.
         Some("serve") | None => {}
         // An unknown first token must NOT silently serve (a typo'd subcommand or flag
         // would otherwise be swallowed and the default served).
         Some(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | implement | submit | task | init)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | implement | submit | task | init | help)"
             )
             .into());
         }
@@ -2287,6 +2340,34 @@ mod cli_tests {
         let base = path.parent().unwrap();
         let wf = cfg.load_workflows(base).unwrap();
         assert_eq!(wf.len(), 4);
+    }
+
+    #[test]
+    fn reference_containerized_config_parses_and_loads() {
+        // The config `implement` uses — parses, snapshot-validates (kind-aware), and its workflows load.
+        // Also pins the codex impl default (effort=high) so a bad edit to that agent fails loud here.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/a2a-bridge.containerized.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let cfg = config::RegistryConfig::parse(&raw).unwrap();
+        let base = path.parent().unwrap();
+        let wf = cfg.load_workflows(base).unwrap();
+        // The named workflows agents reach for are present (count is incidental).
+        for id in ["design", "code-review", "implement-edit", "implement-fix"] {
+            assert!(
+                wf.keys().any(|k| k.as_str() == id),
+                "workflow {id:?} missing"
+            );
+        }
+        let snap = cfg.into_snapshot().unwrap();
+        let impl_agent = snap
+            .entries
+            .iter()
+            .find(|e| e.id.as_str() == "impl")
+            .expect("impl agent present");
+        assert_eq!(impl_agent.cmd.as_deref(), Some("codex-acp"));
+        assert_eq!(impl_agent.effort, Some(bridge_core::domain::Effort::High));
+        assert_eq!(impl_agent.kind, bridge_core::domain::AgentKind::ContainerRw);
     }
 
     // ---- Task 10: task watch <id> arg-parsing ----

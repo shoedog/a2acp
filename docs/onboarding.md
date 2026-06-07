@@ -5,6 +5,15 @@ claude) — or an OpenAI-compatible HTTP backend — behind the A2A protocol, an
 run multi-agent **review workflows**. This guide gets an external project from zero
 to a running multi-agent bridge.
 
+> **Just want to run a design/review/implement against another repo (e.g. from an agent)?**
+> See [`AGENTS.md`](../AGENTS.md) for the copy-paste quickstart, and `a2a-bridge help` /
+> `a2a-bridge <subcommand> --help` for flags. You do not need to read the source.
+>
+> **Running several in parallel?** A containerized run's container owner is
+> `hash(config_path, mount, agent_id)` — **not** the target repo. Parallel runs are safe only with a
+> **distinct config file** (or distinct impl agent id) each; the same config pointed at two repos at once
+> will collide on the container name + boot-sweep. Give each concurrent project its own config.
+
 ## Quick start
 
 ```sh

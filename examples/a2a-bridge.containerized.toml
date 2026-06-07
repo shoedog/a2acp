@@ -114,13 +114,20 @@ network = "a2a-egress-internal"
 proxy   = "http://a2a-egress-proxy:8888"
 volumes = ["a2a-kiro-data:/root/.local/share"]
 
-# ── impl: WRITE-capable per-turn container (Slice B2a). kind="container_rw" PERMITS access="rw".
-#    A FRESH :rw container per turn, reaped after; the :rw mount is the per-request session cwd
-#    (a scratch dir; in B2b a per-task git clone) under allowed_cwd_root, canonicalized + is_under-gated.
+# ── impl: WRITE-capable containerized agent (kind="container_rw" PERMITS access="rw"). Under `implement`
+#    it runs WARM (one container + one ACP session across the edit+fix turns, reaped at the end — ADR-0024);
+#    under `serve`/`run-workflow` it's per-turn. The :rw mount is the per-request session cwd (a per-task
+#    git clone) under allowed_cwd_root, canonicalized + is_under-gated.
+#    DEFAULT IMPLEMENTOR = codex (gpt-5.5, effort=high). `sandbox_mode=danger-full-access` disables codex's
+#    OWN bubblewrap sandbox (absent from the image) so it can edit the :rw clone — the Docker container IS
+#    the sandbox. effort=high is now honored by the warm session (the ADR-0024 effective_config fold).
+#    To use claude instead: cmd="claude-agent-acp", drop the codex args, and mount the claude creds.
 [[agents]]
-id   = "impl"
-kind = "container_rw"
-cmd  = "claude-agent-acp"
+id     = "impl"
+kind   = "container_rw"
+cmd    = "codex-acp"
+effort = "high"
+args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
 [agents.sandbox]
 image   = "a2a-toolchain:latest"               # B2b-2: toolchain so the agent (and verify) has cargo
 mount   = "/Users/wesleyjinks/code"            # == allowed_cwd_root (S2); :rw target is the session cwd under it
@@ -128,7 +135,7 @@ access  = "rw"
 egress  = "locked"
 network = "a2a-egress-internal"
 proxy   = "http://a2a-egress-proxy:8888"
-volumes = ["/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json"]
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
 
 # ── ollama: non-process api agent (kind="api"). Uncontainerized by design — no mount/proxy/creds.
 #    NOT tool-free — it advertises a deterministic side-effect-free stub tool (no fs/shell).
