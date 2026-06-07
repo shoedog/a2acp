@@ -929,3 +929,181 @@ merge + push, memory, ADR-0024.
   the `{"input": …}` map, mirroring the executor) and `Part { text: String }` are both confirmed against the
   code.
 - **No placeholders:** every code step has complete code.
+
+---
+
+## rev2 — dual-review folds (AUTHORITATIVE where it supersedes the tasks above)
+
+Containerized plan-review (claude coverage verified + codex executability) + a2a-local codex backstop, both
+fix-before-building. The items below SUPERSEDE the cited steps.
+
+### Fold A — Task 2 Step 1: the `StubInner` stub (compiles)
+`fail_prompt` MUST be atomic (mutated through `&self` in `prompt`):
+```rust
+    struct StubInner {
+        canceled: AtomicBool,
+        prompts: AtomicUsize,
+        sessions: Mutex<std::collections::HashSet<String>>,
+        fail_prompt: AtomicBool,
+    }
+```
+`CountingSpawn` gains `fail_prompt: bool` (default false; `new_prompt_fail()` sets true) and builds
+`StubInner { canceled: AtomicBool::new(false), prompts: AtomicUsize::new(0), sessions: Mutex::new(HashSet::new()), fail_prompt: AtomicBool::new(self.fail_prompt) }`.
+`StubInner::prompt`: `self.prompts.fetch_add(1, SeqCst); self.sessions.lock().await.insert(s.as_str().into());
+if self.fail_prompt.load(SeqCst) { return Err(BridgeError::agent_crashed("prompt boom")); } Ok(... one Done ...)`.
+The reuse-error test flips it with `inner.fail_prompt.store(true, Ordering::SeqCst)` (no `store_relaxed`).
+**Drop** the weak `inner.sessions.lock().len()==1` assertion — assert `spawn.count==1` + `inner.prompts==2` +
+same inner instead; the one-`session/new` guarantee is covered at the AcpBackend layer (`new_session_calls`).
+
+### Fold B — Task 2 Step 3: `prompt_warm` (cache-miss vs reuse; SYNCHRONOUS error cleanup; no double-configure)
+Construct the `TurnGuard` ONLY on success (so error paths clear `turn_active` synchronously, not via the
+detached `Drop`). Cache-miss reaps its just-opened container on a prompt error; reuse does NOT.
+```rust
+    async fn prompt_warm(&self, session: &SessionId, parts: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        let spec = self.session_cfg.lock().await.get(session).cloned()
+            .ok_or(BridgeError::ConfigInvalid { reason: "missing session cwd".into() })?;
+        { // concurrency reject + mark active
+            let mut ta = self.turn_active.lock().await;
+            if ta.contains(session) {
+                return Err(BridgeError::ConfigInvalid {
+                    reason: format!("session {} already has an in-flight turn", session.as_str()) });
+            }
+            ta.insert(session.clone());
+        }
+        // helper: clear turn_active synchronously on every pre-stream error path.
+        macro_rules! fail { ($e:expr) => {{ self.turn_active.lock().await.remove(session); return Err($e); }} }
+
+        let cache_miss = !self.warm.lock().await.contains_key(session);
+        if cache_miss {
+            let wi = match self.open_inner(session, &spec).await {   // open_inner already reaps on its own failure
+                Ok(wi) => wi, Err(e) => fail!(e),
+            };
+            self.warm.lock().await.insert(session.clone(), wi);
+            // NO re-configure on cache-miss: open_inner already configured with the canonical cwd.
+        } else {
+            // reuse: re-apply the cached canonical cwd (deterministic; minted_cwd guard passes).
+            let (inner, rw_canon) = {
+                let w = self.warm.lock().await; let wi = w.get(session).unwrap();
+                (wi.inner.clone(), wi.rw_canon.clone())
+            };
+            let mut spec_canon = spec.clone(); spec_canon.cwd = Some(rw_canon);
+            if let Err(e) = inner.configure_session(session, &spec_canon).await { fail!(e) } // reuse: no reap
+        }
+        let (inner, name, reaped) = {
+            let w = self.warm.lock().await; let wi = w.get(session).unwrap();
+            (wi.inner.clone(), wi.name.clone(), wi.reaped.clone())
+        };
+        let inner_stream = match inner.prompt(session, parts).await {
+            Ok(s) => s,
+            Err(e) => {
+                if cache_miss { // first-turn failure → reap + remove (no cumulative work to protect)
+                    self.warm.lock().await.remove(session);
+                    reap_once(&self.reap_fn, self.cfg.sandbox.runtime(), &name, &reaped);
+                }
+                fail!(e) // reuse: keep the warm entry, do NOT reap
+            }
+        };
+        let guard = TurnGuard { turn_active: self.turn_active.clone(), session: session.clone(), armed: true };
+        Ok(wrap_with_turn_guard(inner, inner_stream, guard))
+    }
+```
+`wrap_with_turn_guard` clears `turn_active` synchronously on normal stream end (sets `armed=false`); the
+detached `Drop` only covers the early-consumer-drop case (acceptable, matches the per-turn `ContainerReaper`).
+
+### Fold C — Task 3: `retire_warm` clears `turn_active` for drained sessions
+After draining `warm`, also clear the markers (a held/raced stream could leave a stale marker):
+```rust
+    async fn retire_warm(&self) -> Result<(), BridgeError> {
+        let entries: Vec<(SessionId, WarmInner)> = { self.warm.lock().await.drain().collect() };
+        let runtime = self.cfg.sandbox.runtime().to_string();
+        for (s, wi) in entries {
+            let _ = wi.inner.cancel(&s).await;
+            reap_once(&self.reap_fn, &runtime, &wi.name, &wi.reaped);
+            self.turn_active.lock().await.remove(&s);
+        }
+        Ok(())
+    }
+```
+
+### Fold D — Task 2/3 extra tests (spec-named; add them)
+- **edit-turn open-failure** (cache-miss): `warm_backend` with `CountingSpawn::new(true)` (spawn fails) →
+  `prompt_err` → asserts `reaps==1`, `warm` empty, `turn_active` empty.
+- **shared-owner equality** (spec §5 silent-leak guard): a unit assertion that
+  `container_owner(cfg, mount, "impl") == rw_sweep_targets(&snapshot, cfg)`'s owner for the impl entry.
+- **config-identity** (Fold F's `resolve_impl_identity`): unit-test all reject arms (edit multi-node; fix
+  multi-node; fix agent != edit; impl not ContainerRw; impl absent) + the happy path.
+
+### Fold E — Task 8 is split: NEW Task 8a (pure helper) + rewritten Task 8b (wiring)
+**Task 8a — `resolve_impl_identity` (pure, unit-tested):**
+```rust
+/// Resolve the single ContainerRw agent that drives BOTH the edit and fix turns of one warm session, or a
+/// fail-loud reason. Edit & fix workflows must each be single-node and name the SAME ContainerRw agent.
+fn resolve_impl_identity(
+    edit_graph: &bridge_workflow::graph::WorkflowGraph,
+    fix_graph: Option<&bridge_workflow::graph::WorkflowGraph>,
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+) -> Result<bridge_core::domain::AgentEntry, String> {
+    let edit_node = match edit_graph.nodes.as_slice() {
+        [n] => n, _ => return Err("edit workflow must be single-node for the warm session".into()) };
+    let id = &edit_node.agent;
+    if let Some(fg) = fix_graph {
+        match fg.nodes.as_slice() {
+            [n] if &n.agent == id => {}
+            [_] => return Err("fix workflow agent must match the edit agent (one warm session)".into()),
+            _ => return Err("fix workflow must be single-node".into()),
+        }
+    }
+    let entry = snapshot.entries.iter().find(|e| &e.id == id)
+        .ok_or_else(|| format!("impl agent {} not found in snapshot", id.as_str()))?.clone();
+    if entry.kind != bridge_core::domain::AgentKind::ContainerRw {
+        return Err(format!("warm session requires a container_rw impl agent, got {:?}", entry.kind));
+    }
+    Ok(entry)
+}
+```
+Unit tests cover all five reject arms + happy path (Docker-free; build graphs/snapshot in-test).
+
+**Task 8b — wiring, COMPLETE ORDERING (fixes the borrow-after-move ×2 + the placeholder):** all warm setup
+goes ABOVE the `make_spawn_fn`/`Registry::new` moves (beside the existing `ro_sweep_targets`/`_ro_guard`),
+because `snapshot` moves into `Registry::new` (~`main.rs:757`) and `owner_config_path` into `make_spawn_fn`
+(~`:755`). Order inside `implement_cmd`, right after `snapshot` is built + `owner_config_path` canonicalized:
+```rust
+    // (already present) let ro_targets = ro_sweep_targets(&snapshot, &owner_config_path); ro_sweep(&ro_targets);
+    // (already present) let _ro_guard = RoSweepGuard(ro_targets);
+    let _rw_guard = RwSweepGuard(rw_sweep_targets(&snapshot, &owner_config_path)); // declared with _ro_guard → drops after backends
+    rw_sweep(&rw_sweep_targets(&snapshot, &owner_config_path));                    // boot-sweep (or reuse one Vec)
+    let impl_entry = resolve_impl_identity(&graph, fix_graph.as_deref(), &snapshot)
+        .map_err(|e| format!("implement: {e}"))?;                                  // reads &snapshot BEFORE the move
+    let edit_template = graph.nodes[0].prompt_template.clone();
+    let fix_template: Option<String> = fix_graph.as_ref().map(|g| g.nodes[0].prompt_template.clone());
+    let warm_owner = container_owner(&owner_config_path, impl_entry.sandbox.as_ref().unwrap().mount.as_str(), impl_entry.id.as_str());
+    let warm = bridge_container::ContainerRwBackend::new_warm(
+        container_rw_cfg_from_entry(&impl_entry)?,
+        Arc::new(AcpContainerSpawn { policy: Arc::clone(&policy) }) as Arc<dyn bridge_container::ContainerSpawn>,
+        warm_owner,
+    ).await?;
+    let impl_session = bridge_core::ids::SessionId::parse(format!("implement-{task_id}"))
+        .map_err(|e| format!("implement: session id: {e:?}"))?;
+    warm.configure_session(&impl_session, &SessionSpec { config: Default::default(), cwd: Some(clone_cwd.clone()) }).await?;
+    // THEN (unchanged): policy_for_spawn = Arc::clone(&policy) as ...; spawn = make_spawn_fn(policy_for_spawn, owner_config_path);
+    //                   registry = Registry::new(snapshot, spawn); executor = ... (review still uses these).
+```
+- `policy` (the `Arc<AutoPolicy>`) is cloned for BOTH the warm `AcpContainerSpawn` AND the existing
+  `policy_for_spawn` — NO `policy_for_spawn_or_equivalent` placeholder.
+- Edit turn (replaces the executor edit call): render `edit_template` with `{"input": &a.task}` →
+  `warm.prompt(&impl_session, vec![Part{text}])` → `drain_turn`; on `Err` → `completed=false` (decide aborts).
+- `ProdEffects`: `{ impl_backend: &'a dyn AgentBackend, impl_session: &'a SessionId, fix_template: Option<String>,
+  + the unchanged verify/review fields }`; `fix` renders `self.fix_template.as_deref().expect("fix_available")`
+  (run_tweak_loop only calls `fix` when `fix_available==true`); drop the `fix_graph` field.
+- **`retire()` on EVERY terminal arm:** the warm container is opened before `decide`, so the `Abort` /
+  `NoCommitClean` / `NoCommitDirty` arms must each `let _ = warm.retire().await;` before returning, and the
+  `Commit` arm does `println!(handoff); let _ = warm.retire().await; Ok(())` (print BEFORE retire). M4
+  retire-error coverage is **by-construction ordering** (print precedes retire; the `let _` swallows) — NOT a
+  separate test (no fake-backend seam in `implement_cmd`); state this honestly.
+
+### Fold F — minors
+- **lib.rs module doc** (`lib.rs:3-4`): drop "Warm reuse across turns is a separate future slice"; replace
+  with a one-line note that warm reuse is now supported via `new_warm` (do this in Task 1 or 3).
+- **Task 10 `git add`**: stage an explicit scoped list (the files this slice touches), not `$(git diff --name-only)`.
+- **NEW Task 12 — ADR-0024** (promoted from prose): write `docs/adr/0024-warm-loop-session.md` post-merge
+  (carries the `Co-Authored-By` trailer).
