@@ -1,7 +1,8 @@
-//! Per-turn write-capable containerized ACP agent (Slice B2a). [`ContainerRwBackend`] spawns a fresh
-//! `:rw` container per `prompt` turn (composing [`bridge_acp::acp_backend::AcpBackend`] via the
-//! [`ContainerSpawn`] seam) and reaps it on every terminal path. Warm reuse across turns is a separate
-//! future slice (see `docs/superpowers/specs/2026-06-05-containerized-agents-warm-pool-slice.md`).
+//! Write-capable containerized ACP agent (Slice B2a + B2b-3c). [`ContainerRwBackend`] composes
+//! [`bridge_acp::acp_backend::AcpBackend`] via the [`ContainerSpawn`] seam. Default `PerTurn` mode spawns
+//! a fresh `:rw` container per `prompt` turn and reaps it on every terminal path. `Warm` mode
+//! (`new_warm`) reuses ONE container + ONE ACP session across the turns of a session, reaping ONLY at
+//! `retire()` — used by the `implement` review→tweak loop so edit + fix turns share continuity.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -54,6 +55,16 @@ struct InflightTurn {
     inner: Arc<dyn AgentBackend>,
     name: String,
     reaped: Arc<AtomicBool>,
+}
+
+/// A spawned, configured inner backend + its container identity. Shared shape for per-turn (promoted to
+/// [`InflightState::Live`]) and warm (cached in `warm`). `rw_canon` is the canonicalized `:rw` target the
+/// session was configured with (re-applied on a warm reuse turn).
+struct WarmInner {
+    inner: Arc<dyn AgentBackend>,
+    name: String,
+    reaped: Arc<AtomicBool>,
+    rw_canon: SessionCwd,
 }
 
 /// One entry per session: `Reserving` is held across the (async) spawn so a concurrent second prompt is
@@ -128,44 +139,23 @@ impl ContainerRwBackend {
         check_rw_target(&mount_canon, &rw_canon)?;
         Ok(rw_canon)
     }
-}
 
-#[async_trait]
-impl AgentBackend for ContainerRwBackend {
-    async fn prompt(
+    /// Spawn + configure ONE inner container for `session`. On ANY failure the just-started container is
+    /// reaped by name (the `docker run` client can be up before the handshake fails) and `Err` is
+    /// returned. The caller owns the cache bookkeeping + the cwd strict-reject. `session/new` is lazy
+    /// (inside the inner's first `prompt`), so this method does NOT mint the ACP session. Shared by the
+    /// per-turn `prompt` and the warm `prompt_warm` cache-miss path; it touches neither
+    /// `inflight`/`warm`/`turn_active`.
+    async fn open_inner(
         &self,
         session: &SessionId,
-        parts: Vec<Part>,
-    ) -> Result<BackendStream, BridgeError> {
-        // Strict-reject: a writer MUST name its :rw target (no fallback to the broad root).
-        let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
-            BridgeError::ConfigInvalid {
-                reason: "missing session cwd".into(),
-            },
-        )?;
+        spec: &SessionSpec,
+    ) -> Result<WarmInner, BridgeError> {
+        let runtime = self.cfg.sandbox.runtime().to_string();
         let cwd = spec.cwd.clone().ok_or(BridgeError::ConfigInvalid {
             reason: "missing session cwd".into(),
         })?;
-
-        // Atomic check-and-reserve: reject a second concurrent prompt on a live session under ONE lock.
-        {
-            let mut m = self.inflight.lock().await;
-            if m.contains_key(session) {
-                return Err(BridgeError::ConfigInvalid {
-                    reason: format!("session {} already has an in-flight turn", session.as_str()),
-                });
-            }
-            m.insert(session.clone(), InflightState::Reserving);
-        }
-        // From here, EVERY error path must remove the reservation (and reap if a container started).
-        let runtime = self.cfg.sandbox.runtime().to_string();
-        let rw_canon = match self.resolve_rw_target(&cwd) {
-            Ok(c) => c,
-            Err(e) => {
-                self.inflight.lock().await.remove(session);
-                return Err(e);
-            }
-        };
+        let rw_canon = self.resolve_rw_target(&cwd)?;
         let n = self.turn_seq.fetch_add(1, Ordering::Relaxed);
         let name = format!("a2a-rw-{}-{}", self.owner, n);
         let (program, argv) = compose_container_rw(
@@ -182,59 +172,101 @@ impl AgentBackend for ContainerRwBackend {
             auth_method: self.cfg.auth_method.clone(),
             handshake_timeout: self.cfg.handshake_timeout,
             cancel_grace: self.cfg.cancel_grace,
-            // :rw has its own ContainerReaper (this crate); the inner AcpBackend's :ro reaper stays off.
+            // :rw has its own reaper (this crate); the inner AcpBackend's :ro reaper stays off.
             container: None,
         };
-
-        // Spawn — the `docker run` client may be up before the handshake fails → reap by name on error.
         let inner = match self.spawn.spawn(&program, &argv, acp).await {
             Ok(i) => i,
             Err(e) => {
-                self.inflight.lock().await.remove(session);
-                (self.reap_fn)(runtime.clone(), name.clone()); // spawn-failure reap
+                (self.reap_fn)(runtime.clone(), name.clone()); // spawn-failure reap (never inserted)
                 return Err(e);
             }
         };
         let reaped = Arc::new(AtomicBool::new(false));
-
-        // Forward the CANONICAL cwd to the inner: AcpBackend prefers the stashed SessionSpec.cwd over
-        // AcpConfig.cwd, so the ACP session cwd must equal the mounted path.
+        // The inner prefers the stashed SessionSpec.cwd over AcpConfig.cwd → configure with CANONICAL cwd.
         let mut spec_canon = spec.clone();
         spec_canon.cwd = Some(rw_canon.clone());
         if let Err(e) = inner.configure_session(session, &spec_canon).await {
-            self.inflight.lock().await.remove(session);
             reap_once(&self.reap_fn, &runtime, &name, &reaped);
             return Err(e);
         }
+        Ok(WarmInner {
+            inner,
+            name,
+            reaped,
+            rw_canon,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentBackend for ContainerRwBackend {
+    async fn prompt(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        // Strict-reject: a writer MUST name its :rw target (no fallback to the broad root). The early
+        // presence check keeps reject-before-reserve; `open_inner` re-resolves the same cwd.
+        let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
+            BridgeError::ConfigInvalid {
+                reason: "missing session cwd".into(),
+            },
+        )?;
+        if spec.cwd.is_none() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "missing session cwd".into(),
+            });
+        }
+
+        // Atomic check-and-reserve: reject a second concurrent prompt on a live session under ONE lock.
+        {
+            let mut m = self.inflight.lock().await;
+            if m.contains_key(session) {
+                return Err(BridgeError::ConfigInvalid {
+                    reason: format!("session {} already has an in-flight turn", session.as_str()),
+                });
+            }
+            m.insert(session.clone(), InflightState::Reserving);
+        }
+        // From here every error path must remove the reservation (open_inner reaps on its own failure).
+        let runtime = self.cfg.sandbox.runtime().to_string();
+        let wi = match self.open_inner(session, &spec).await {
+            Ok(wi) => wi,
+            Err(e) => {
+                self.inflight.lock().await.remove(session);
+                return Err(e);
+            }
+        };
 
         // Promote the reservation to Live (the cancel handle), sharing the `reaped` bool.
         self.inflight.lock().await.insert(
             session.clone(),
             InflightState::Live(InflightTurn {
-                inner: inner.clone(),
-                name: name.clone(),
-                reaped: reaped.clone(),
+                inner: wi.inner.clone(),
+                name: wi.name.clone(),
+                reaped: wi.reaped.clone(),
             }),
         );
 
-        let inner_stream = match inner.prompt(session, parts).await {
+        let inner_stream = match wi.inner.prompt(session, parts).await {
             Ok(s) => s,
             Err(e) => {
                 self.inflight.lock().await.remove(session);
-                reap_once(&self.reap_fn, &runtime, &name, &reaped);
+                reap_once(&self.reap_fn, &runtime, &wi.name, &wi.reaped);
                 return Err(e);
             }
         };
 
         let reaper = ContainerReaper {
             runtime,
-            name,
+            name: wi.name,
             reap_fn: self.reap_fn.clone(),
-            reaped,
+            reaped: wi.reaped,
             inflight: self.inflight.clone(),
             session: session.clone(),
         };
-        Ok(wrap_with_reaper(inner, inner_stream, reaper))
+        Ok(wrap_with_reaper(wi.inner, inner_stream, reaper))
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
