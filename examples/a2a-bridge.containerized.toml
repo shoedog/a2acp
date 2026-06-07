@@ -18,7 +18,10 @@ allowed_cwd_root = "/Users/wesleyjinks/code"
 # surfaced in the hand-off. ADVISORY (the operator accepts at merge). Absent -> skipped.
 [review]
 workflow = "implement-review"
-# timeout_secs = 300   # bound the review; absent -> 300
+# Two thorough reviewers navigating + reviewing a REAL diff routinely exceed the 300s default and trip a
+# spurious timeout (looks like an agent failure but is just the bound). 900s gives room while still capping
+# a runaway review (bridge agents are full coding agents). Raise further for very large diffs.
+timeout_secs = 900
 
 # B2b-3b: the review->tweak loop. After the first commit, the bridge runs verify+review each attempt; on a
 # verify-FAIL or review-REJECT it re-prompts the `impl` agent (the `implement-fix` workflow) to fix on the
