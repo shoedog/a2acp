@@ -4,7 +4,7 @@
 //! (`new_warm`) reuses ONE container + ONE ACP session across the turns of a session, reaping ONLY at
 //! `retire()` — used by the `implement` review→tweak loop so edit + fix turns share continuity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -76,6 +76,13 @@ enum InflightState {
 
 type Inflight = Arc<Mutex<HashMap<SessionId, InflightState>>>;
 
+/// Per-turn (cold) vs warm (one container + session reused across turns, reaped only at `retire`).
+#[derive(Clone, Copy, PartialEq)]
+enum Lifecycle {
+    PerTurn,
+    Warm,
+}
+
 pub struct ContainerRwBackend {
     cfg: ContainerRwConfig,
     spawn: Arc<dyn ContainerSpawn>,
@@ -85,6 +92,11 @@ pub struct ContainerRwBackend {
     session_cfg: Mutex<HashMap<SessionId, SessionSpec>>,
     inflight: Inflight,
     turn_seq: AtomicU64,
+    lifecycle: Lifecycle,
+    /// Warm mode only: the authoritative cached container/session per `SessionId` (drained at `retire`).
+    warm: Mutex<HashMap<SessionId, WarmInner>>,
+    /// Warm mode only: sessions with an in-flight turn (concurrency reject); cleared by `TurnGuard`/cancel.
+    turn_active: Arc<Mutex<HashSet<SessionId>>>,
 }
 
 impl ContainerRwBackend {
@@ -108,7 +120,39 @@ impl ContainerRwBackend {
             session_cfg: Mutex::new(HashMap::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             turn_seq: AtomicU64::new(0),
+            lifecycle: Lifecycle::PerTurn,
+            warm: Mutex::new(HashMap::new()),
+            turn_active: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    /// Warm hook-injectable constructor: identical to [`Self::new_with_hooks`] but flips the lifecycle to
+    /// `Warm` (reuse one container/session across turns; reap only at `retire`).
+    pub async fn new_warm_with_hooks(
+        cfg: ContainerRwConfig,
+        spawn: Arc<dyn ContainerSpawn>,
+        owner: String,
+        reap_fn: ReapFn,
+        sweep_fn: SweepFn,
+    ) -> Result<Self, BridgeError> {
+        let mut be = Self::new_with_hooks(cfg, spawn, owner, reap_fn, sweep_fn).await?;
+        be.lifecycle = Lifecycle::Warm;
+        Ok(be)
+    }
+
+    /// Warm production constructor (detached reaper + boot sweep, like [`Self::new`]).
+    pub async fn new_warm(
+        cfg: ContainerRwConfig,
+        spawn: Arc<dyn ContainerSpawn>,
+        owner: String,
+    ) -> Result<Self, BridgeError> {
+        let runtime = cfg.sandbox.runtime().to_string();
+        Self::new_warm_with_hooks(cfg, spawn, owner, production_reap_fn(), production_sweep_fn(runtime))
+            .await
+    }
+
+    fn is_warm(&self) -> bool {
+        self.lifecycle == Lifecycle::Warm
     }
 
     /// Production constructor: detached `docker rm -f` reaper + a runtime-parametric `docker ps`/`rm`
@@ -197,6 +241,87 @@ impl ContainerRwBackend {
             rw_canon,
         })
     }
+
+    /// Warm turn: reuse ONE cached container/session across prompts. Concurrency-reject via `turn_active`.
+    /// Cache-miss opens (and reaps on its own failure); reuse re-applies the cached canonical cwd. A
+    /// REUSE-turn error (configure/prompt) clears `turn_active`, does NOT reap, and returns `Err` — a
+    /// transient error must not nuke the warm container (the loop converts it to `FixIncomplete`). A
+    /// cache-MISS prompt error reaps + removes the just-opened entry (no cumulative work to protect). The
+    /// stream's `TurnGuard` clears `turn_active` on end/early-drop and NEVER reaps; the sole warm reap site
+    /// is `retire_warm`.
+    async fn prompt_warm(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
+            BridgeError::ConfigInvalid {
+                reason: "missing session cwd".into(),
+            },
+        )?;
+        // Concurrency reject + mark active.
+        {
+            let mut ta = self.turn_active.lock().await;
+            if ta.contains(session) {
+                return Err(BridgeError::ConfigInvalid {
+                    reason: format!("session {} already has an in-flight turn", session.as_str()),
+                });
+            }
+            ta.insert(session.clone());
+        }
+        // Clear `turn_active` synchronously on every pre-stream error path.
+        macro_rules! fail {
+            ($e:expr) => {{
+                self.turn_active.lock().await.remove(session);
+                return Err($e);
+            }};
+        }
+
+        let cache_miss = !self.warm.lock().await.contains_key(session);
+        if cache_miss {
+            // `open_inner` already reaps on its own failure; nothing inserted yet.
+            let wi = match self.open_inner(session, &spec).await {
+                Ok(wi) => wi,
+                Err(e) => fail!(e),
+            };
+            self.warm.lock().await.insert(session.clone(), wi);
+            // NO re-configure on cache-miss: open_inner already configured with the canonical cwd.
+        } else {
+            // Reuse: re-apply the cached canonical cwd (deterministic; minted_cwd guard passes).
+            let (inner, rw_canon) = {
+                let w = self.warm.lock().await;
+                let wi = w.get(session).unwrap();
+                (wi.inner.clone(), wi.rw_canon.clone())
+            };
+            let mut spec_canon = spec.clone();
+            spec_canon.cwd = Some(rw_canon);
+            if let Err(e) = inner.configure_session(session, &spec_canon).await {
+                fail!(e) // reuse: no reap
+            }
+        }
+        let (inner, name, reaped) = {
+            let w = self.warm.lock().await;
+            let wi = w.get(session).unwrap();
+            (wi.inner.clone(), wi.name.clone(), wi.reaped.clone())
+        };
+        let inner_stream = match inner.prompt(session, parts).await {
+            Ok(s) => s,
+            Err(e) => {
+                if cache_miss {
+                    // First-turn failure → reap + remove (no cumulative work to protect).
+                    self.warm.lock().await.remove(session);
+                    reap_once(&self.reap_fn, self.cfg.sandbox.runtime(), &name, &reaped);
+                }
+                fail!(e) // reuse: keep the warm entry, do NOT reap
+            }
+        };
+        let guard = TurnGuard {
+            turn_active: self.turn_active.clone(),
+            session: session.clone(),
+            armed: true,
+        };
+        Ok(wrap_with_turn_guard(inner, inner_stream, guard))
+    }
 }
 
 #[async_trait]
@@ -206,6 +331,10 @@ impl AgentBackend for ContainerRwBackend {
         session: &SessionId,
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
+        if self.is_warm() {
+            return self.prompt_warm(session, parts).await;
+        }
+
         // Strict-reject: a writer MUST name its :rw target (no fallback to the broad root). The early
         // presence check keeps reject-before-reserve; `open_inner` re-resolves the same cwd.
         let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
@@ -376,6 +505,48 @@ fn wrap_with_reaper(
     })
 }
 
+/// Warm-turn guard: clears `turn_active` on normal stream end (synchronously, in `wrap_with_turn_guard`)
+/// OR on early consumer-drop (detached, here). NEVER reaps — the only warm reap site is `retire_warm`.
+struct TurnGuard {
+    turn_active: Arc<Mutex<HashSet<SessionId>>>,
+    session: SessionId,
+    armed: bool,
+}
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let ta = self.turn_active.clone();
+        let s = self.session.clone();
+        spawn_detached(async move {
+            ta.lock().await.remove(&s);
+        });
+    }
+}
+
+/// Wrap a warm turn stream so its state OWNS `inner` (keeps the ACP child alive) and the [`TurnGuard`].
+/// On NORMAL completion the active marker is cleared synchronously (awaited) so a sequential next turn
+/// isn't spuriously rejected; `armed` is then cleared so the `Drop` doesn't detach a SECOND clear that
+/// could race (and erase) the next turn's marker. The `armed = false` write IS read — by `TurnGuard::drop`
+/// — but the `unused_assignments` lint doesn't count destructor reads, hence the allow.
+#[allow(unused_assignments)]
+fn wrap_with_turn_guard(
+    inner: Arc<dyn AgentBackend>,
+    inner_stream: BackendStream,
+    mut guard: TurnGuard,
+) -> BackendStream {
+    Box::pin(async_stream::stream! {
+        let _inner = inner;
+        let mut s = inner_stream;
+        while let Some(item) = s.next().await {
+            yield item;
+        }
+        guard.turn_active.lock().await.remove(&guard.session);
+        guard.armed = false;
+    })
+}
+
 /// Canonicalize `path`, resolving symlinks. If it doesn't exist yet (a fresh scratch dir), canonicalize
 /// the nearest existing ancestor and re-append the missing tail.
 fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
@@ -415,17 +586,27 @@ mod tests {
 
     // ---- stubs -------------------------------------------------------------
 
-    /// Stub inner backend: emits one `Done`, records cancel.
+    /// Stub inner backend: emits one `Done`, records cancel + prompt count + the sessions it served.
+    /// `fail_prompt` (atomic, flippable through `&self`) makes the NEXT `prompt` error — used to drive the
+    /// warm reuse-error path.
     struct StubInner {
         canceled: AtomicBool,
+        prompts: AtomicUsize,
+        sessions: Mutex<HashSet<String>>,
+        fail_prompt: AtomicBool,
     }
     #[async_trait]
     impl AgentBackend for StubInner {
         async fn prompt(
             &self,
-            _s: &SessionId,
+            s: &SessionId,
             _p: Vec<Part>,
         ) -> Result<BackendStream, BridgeError> {
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            self.sessions.lock().await.insert(s.as_str().to_string());
+            if self.fail_prompt.load(Ordering::SeqCst) {
+                return Err(BridgeError::agent_crashed("prompt boom"));
+            }
             Ok(Box::pin(tokio_stream::iter(vec![Ok(
                 bridge_core::ports::Update::Done {
                     stop_reason: "end_turn".into(),
@@ -441,6 +622,7 @@ mod tests {
     struct CountingSpawn {
         count: AtomicUsize,
         fail: bool,
+        fail_prompt: bool,
         last_argv: Mutex<Vec<String>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
     }
@@ -449,6 +631,7 @@ mod tests {
             Arc::new(Self {
                 count: AtomicUsize::new(0),
                 fail,
+                fail_prompt: false,
                 last_argv: Mutex::new(vec![]),
                 last_inner: Mutex::new(None),
             })
@@ -469,6 +652,9 @@ mod tests {
             }
             let inner = Arc::new(StubInner {
                 canceled: AtomicBool::new(false),
+                prompts: AtomicUsize::new(0),
+                sessions: Mutex::new(HashSet::new()),
+                fail_prompt: AtomicBool::new(self.fail_prompt),
             });
             *self.last_inner.lock().await = Some(inner.clone());
             Ok(inner)
@@ -513,6 +699,21 @@ mod tests {
         reap: ReapFn,
     ) -> ContainerRwBackend {
         ContainerRwBackend::new_with_hooks(
+            cfg_with_mount(mount),
+            spawn,
+            "inst".into(),
+            reap,
+            noop_sweep(),
+        )
+        .await
+        .unwrap()
+    }
+    async fn warm_backend(
+        mount: &str,
+        spawn: Arc<dyn ContainerSpawn>,
+        reap: ReapFn,
+    ) -> ContainerRwBackend {
+        ContainerRwBackend::new_warm_with_hooks(
             cfg_with_mount(mount),
             spawn,
             "inst".into(),
@@ -783,6 +984,119 @@ mod tests {
         assert_eq!(
             seen.lock().await.clone(),
             vec!["a2a-rw-inst42-".to_string()]
+        );
+    }
+
+    // ---- warm-mode tests (B2b-3c) -----------------------------------------
+
+    #[tokio::test]
+    async fn warm_reuses_one_inner_across_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, spawn.clone(), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        {
+            let mut a = be.prompt(&s, vec![]).await.unwrap();
+            while a.next().await.is_some() {}
+        }
+        {
+            let mut b = be.prompt(&s, vec![]).await.unwrap();
+            while b.next().await.is_some() {}
+        }
+        assert_eq!(
+            spawn.count.load(Ordering::SeqCst),
+            1,
+            "ONE container across both turns"
+        );
+        assert_eq!(reaps.load(Ordering::SeqCst), 0, "NOT reaped between turns");
+        let inner = spawn.last_inner.lock().await.clone().unwrap();
+        assert_eq!(
+            inner.prompts.load(Ordering::SeqCst),
+            2,
+            "both turns hit the SAME inner"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_reuse_turn_error_clears_turn_active_and_does_not_reap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false); // turn 1 ok
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, spawn.clone(), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        {
+            let mut a = be.prompt(&s, vec![]).await.unwrap();
+            while a.next().await.is_some() {}
+        }
+        // Make the cached inner fail its NEXT prompt (a transient reuse-turn error).
+        spawn
+            .last_inner
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .fail_prompt
+            .store(true, Ordering::SeqCst);
+        let err = prompt_err(&be, &s).await;
+        assert!(format!("{err:?}").contains("prompt boom"), "got {err:?}");
+        assert_eq!(
+            reaps.load(Ordering::SeqCst),
+            0,
+            "a transient reuse error must NOT reap the warm container"
+        );
+        assert!(
+            be.warm.lock().await.contains_key(&s),
+            "warm entry retained across a reuse error"
+        );
+        assert!(
+            !be.turn_active.lock().await.contains(&s),
+            "turn_active cleared after the error"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_rejects_second_concurrent_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, _) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(false), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let _held = be.prompt(&s, vec![]).await.unwrap(); // hold the stream
+        let err = prompt_err(&be, &s).await;
+        assert!(
+            format!("{err:?}").contains("in-flight turn"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_edit_turn_open_failure_reaps_and_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(true), reap).await; // spawn fails (cache-miss open)
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let err = prompt_err(&be, &s).await;
+        assert!(format!("{err:?}").contains("boom"), "got {err:?}");
+        assert_eq!(
+            reaps.load(Ordering::SeqCst),
+            1,
+            "cache-miss spawn failure reaps the just-started container"
+        );
+        assert!(
+            be.warm.lock().await.is_empty(),
+            "no warm entry inserted on open failure"
+        );
+        assert!(
+            !be.turn_active.lock().await.contains(&s),
+            "turn_active cleared on open failure"
         );
     }
 }
