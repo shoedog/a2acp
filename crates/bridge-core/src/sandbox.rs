@@ -155,6 +155,20 @@ pub fn ro_sweep_filter_argv(runtime: &str, owner: &str) -> (String, Vec<String>)
     )
 }
 
+/// PURE. `(program, argv)` for the owner-scoped `:rw` sweep: `ps -aq --filter name=a2a-rw-<owner>-`.
+/// Sibling of [`ro_sweep_filter_argv`] for the write-capable (ContainerRw) warm/per-turn containers.
+pub fn rw_sweep_filter_argv(runtime: &str, owner: &str) -> (String, Vec<String>) {
+    (
+        runtime.to_string(),
+        vec![
+            "ps".into(),
+            "-aq".into(),
+            "--filter".into(),
+            format!("name=a2a-rw-{owner}-"),
+        ],
+    )
+}
+
 /// PURE. The reap command for a named per-turn container: `<runtime> rm -f <name>`. Idempotent at the
 /// Docker layer (`rm -f` of a gone container is a harmless error the caller ignores).
 pub fn reap_argv(runtime: &str, name: &str) -> (String, Vec<String>) {
@@ -353,6 +367,13 @@ mod tests {
             argv,
             vec!["ps", "-aq", "--filter", "name=a2a-ro-deadbeef0badf00d-"]
         );
+    }
+
+    #[test]
+    fn rw_sweep_filter_argv_is_owner_scoped() {
+        let (prog, argv) = rw_sweep_filter_argv("docker", "abc");
+        assert_eq!(prog, "docker");
+        assert_eq!(argv, vec!["ps", "-aq", "--filter", "name=a2a-rw-abc-"]);
     }
 
     #[test]

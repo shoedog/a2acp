@@ -227,6 +227,53 @@ impl Drop for RoSweepGuard {
     }
 }
 
+/// `(runtime, owner)` sweep targets for THIS instance's `:rw` (ContainerRw) agents — mirrors
+/// [`ro_sweep_targets`]. The owner is computed from the SAME `(config_path, mount, agent_id)` triple as
+/// the warm backend's spawn-time owner (via [`container_owner`]), so the guard sweeps the right containers
+/// (spec §5 silent-leak guard).
+fn rw_sweep_targets(
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    config_path: &std::path::Path,
+) -> Vec<(String, String)> {
+    use bridge_core::domain::AgentKind;
+    let mut targets = Vec::new();
+    for entry in &snapshot.entries {
+        let Some(sb) = entry.sandbox.as_ref() else {
+            continue;
+        };
+        if entry.kind != AgentKind::ContainerRw {
+            continue;
+        }
+        let owner = container_owner(config_path, &sb.mount, entry.id.as_str());
+        targets.push((sb.runtime().to_string(), owner));
+    }
+    targets
+}
+
+/// SYNCHRONOUS owner-scoped reap of `a2a-rw-<owner>-` containers (best-effort, blocking) — `:rw` sibling
+/// of [`ro_sweep`]. Used as the warm backend's boot-sweep + the one-shot END-sweep backstop.
+fn rw_sweep(targets: &[(String, String)]) {
+    for (runtime, owner) in targets {
+        let (prog, argv) = bridge_core::sandbox::rw_sweep_filter_argv(runtime, owner);
+        if let Ok(out) = std::process::Command::new(&prog).args(&argv).output() {
+            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                let _ = std::process::Command::new(runtime)
+                    .args(["rm", "-f", id])
+                    .output();
+            }
+        }
+    }
+}
+
+/// RAII end-sweep for one-shot commands' `:rw` containers — `:rw` sibling of [`RoSweepGuard`]. Declared
+/// BEFORE the warm backend so it drops AFTER it (the warm `retire` reaps first; this is the backstop).
+struct RwSweepGuard(Vec<(String, String)>);
+impl Drop for RwSweepGuard {
+    fn drop(&mut self) {
+        rw_sweep(&self.0);
+    }
+}
+
 /// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
 /// `implement` subcommand so their registry builds can't drift. `owner_config_path` seeds the ContainerRw
 /// owner token.
