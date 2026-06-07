@@ -532,6 +532,29 @@ async fn drain_impl(mut stream: bridge_workflow::executor::WorkflowStream) -> bo
     completed
 }
 
+/// Drain a warm-session turn's raw `Update` stream → `completed`. STRICTER than the executor (which leaves
+/// `ok=true` on a clean end — `executor.rs`): complete IFF a `Done { stop_reason != CANCELLED }` arrived; a
+/// stream `Err(_)` or a clean end without `Done` → incomplete. Polls to the end so the inner runs its
+/// cancel/cleanup. Used for the off-executor edit + fix turns.
+async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> bool {
+    use bridge_core::ports::{Update, STOP_REASON_CANCELLED};
+    use futures::StreamExt;
+    let mut completed = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(Update::Done { stop_reason }) => {
+                completed = stop_reason != STOP_REASON_CANCELLED;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[implement] turn: stream error: {e:?}");
+                completed = false;
+            }
+        }
+    }
+    completed
+}
+
 /// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
 /// fails (a runner error becomes a failed result); a config error reduces to `ConfigError`.
 fn run_verify_step(
@@ -1849,6 +1872,31 @@ async fn main() -> Result<(), BoxError> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drain_turn_outcomes() {
+        use bridge_core::ports::{BackendStream, Update};
+        let done = |sr: &str| Ok(Update::Done {
+            stop_reason: sr.into(),
+        });
+        // end_turn → complete
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("end_turn")]));
+        assert!(drain_turn(s).await);
+        // cancelled → incomplete
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("cancelled")]));
+        assert!(!drain_turn(s).await);
+        // clean end without Done → incomplete (the executor-divergence guard)
+        let s: BackendStream =
+            Box::pin(tokio_stream::iter(Vec::<
+                Result<Update, bridge_core::error::BridgeError>,
+            >::new()));
+        assert!(!drain_turn(s).await);
+        // stream error → incomplete
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![Err(
+            bridge_core::error::BridgeError::agent_crashed("x"),
+        )]));
+        assert!(!drain_turn(s).await);
+    }
 
     fn acp_entry(id: &str) -> AgentEntry {
         use bridge_core::ids::AgentId;
