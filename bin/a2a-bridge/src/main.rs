@@ -555,6 +555,43 @@ async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> bool {
     completed
 }
 
+/// Resolve the single ContainerRw agent that drives BOTH the edit and fix turns of one warm session, or a
+/// fail-loud reason. Edit & fix workflows must each be single-node and name the SAME ContainerRw agent (one
+/// warm container/session can't serve two agents). Pure + Docker-free (validated pre-first-commit).
+fn resolve_impl_identity(
+    edit_graph: &bridge_workflow::graph::WorkflowGraph,
+    fix_graph: Option<&bridge_workflow::graph::WorkflowGraph>,
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+) -> Result<bridge_core::domain::AgentEntry, String> {
+    let edit_node = match edit_graph.nodes.as_slice() {
+        [n] => n,
+        _ => return Err("edit workflow must be single-node for the warm session".into()),
+    };
+    let id = &edit_node.agent;
+    if let Some(fg) = fix_graph {
+        match fg.nodes.as_slice() {
+            [n] if &n.agent == id => {}
+            [_] => {
+                return Err("fix workflow agent must match the edit agent (one warm session)".into())
+            }
+            _ => return Err("fix workflow must be single-node".into()),
+        }
+    }
+    let entry = snapshot
+        .entries
+        .iter()
+        .find(|e| &e.id == id)
+        .ok_or_else(|| format!("impl agent {} not found in snapshot", id.as_str()))?
+        .clone();
+    if entry.kind != bridge_core::domain::AgentKind::ContainerRw {
+        return Err(format!(
+            "warm session requires a container_rw impl agent, got {:?}",
+            entry.kind
+        ));
+    }
+    Ok(entry)
+}
+
 /// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
 /// fails (a runner error becomes a failed result); a config error reduces to `ConfigError`.
 fn run_verify_step(
@@ -1896,6 +1933,103 @@ mod cli_tests {
             bridge_core::error::BridgeError::agent_crashed("x"),
         )]));
         assert!(!drain_turn(s).await);
+    }
+
+    fn cr_entry(id: &str, mount: &str) -> AgentEntry {
+        let mut e = acp_entry(id);
+        e.kind = bridge_core::domain::AgentKind::ContainerRw;
+        e.sandbox = Some(bridge_core::domain::SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: mount.into(),
+            access: bridge_core::domain::MountAccess::Rw,
+            egress: bridge_core::domain::EgressPolicy::Open,
+            volumes: vec![],
+        });
+        e
+    }
+    fn snap(entries: Vec<AgentEntry>) -> bridge_core::domain::RegistrySnapshot {
+        use bridge_core::ids::AgentId;
+        bridge_core::domain::RegistrySnapshot {
+            default: AgentId::parse("d").unwrap(),
+            entries,
+            allowed_cmds: vec![],
+        }
+    }
+    fn wf(id: &str, agents: &[&str]) -> bridge_workflow::graph::WorkflowGraph {
+        use bridge_core::ids::{AgentId, NodeId, WorkflowId};
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+        let nodes = agents
+            .iter()
+            .enumerate()
+            .map(|(i, a)| WorkflowNode {
+                id: NodeId::parse(format!("n{i}")).unwrap(),
+                agent: AgentId::parse(*a).unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+            })
+            .collect();
+        WorkflowGraph {
+            id: WorkflowId::parse(id).unwrap(),
+            nodes,
+        }
+    }
+
+    #[test]
+    fn resolve_impl_identity_happy_and_rejects() {
+        let s = snap(vec![cr_entry("impl", "/root")]);
+        let edit = wf("edit", &["impl"]);
+        let fix = wf("fix", &["impl"]);
+        // happy with + without fix
+        assert_eq!(
+            resolve_impl_identity(&edit, Some(&fix), &s)
+                .unwrap()
+                .id
+                .as_str(),
+            "impl"
+        );
+        assert!(resolve_impl_identity(&edit, None, &s).is_ok());
+        // edit multi-node
+        assert!(resolve_impl_identity(&wf("edit", &["impl", "impl"]), Some(&fix), &s)
+            .unwrap_err()
+            .contains("single-node"));
+        // fix multi-node
+        assert!(
+            resolve_impl_identity(&edit, Some(&wf("fix", &["impl", "impl"])), &s)
+                .unwrap_err()
+                .contains("fix workflow must be single-node")
+        );
+        // fix agent != edit agent
+        assert!(
+            resolve_impl_identity(&edit, Some(&wf("fix", &["other"])), &s)
+                .unwrap_err()
+                .contains("must match the edit agent")
+        );
+        // impl absent from snapshot
+        assert!(resolve_impl_identity(&edit, Some(&fix), &snap(vec![]))
+            .unwrap_err()
+            .contains("not found"));
+        // impl present but not ContainerRw
+        assert!(
+            resolve_impl_identity(&edit, Some(&fix), &snap(vec![acp_entry("impl")]))
+                .unwrap_err()
+                .contains("container_rw")
+        );
+    }
+
+    #[test]
+    fn rw_sweep_owner_matches_container_owner() {
+        // spec §5 silent-leak guard: the RwSweepGuard owner MUST equal the warm backend's spawn-time owner
+        // (both derive from container_owner over the SAME (config_path, mount, agent_id) triple).
+        let cfg = std::path::Path::new("/cfg/a2a.toml");
+        let s = snap(vec![cr_entry("impl", "/root")]);
+        let targets = rw_sweep_targets(&s, cfg);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].1,
+            container_owner(cfg, "/root", "impl"),
+            "RwSweepGuard owner must equal the backend spawn-time owner"
+        );
     }
 
     fn acp_entry(id: &str) -> AgentEntry {
