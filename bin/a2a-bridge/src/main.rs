@@ -227,6 +227,76 @@ impl Drop for RoSweepGuard {
     }
 }
 
+/// `(runtime, owner)` sweep targets for THIS instance's `:rw` (ContainerRw) agents — mirrors
+/// [`ro_sweep_targets`]. The owner is computed from the SAME `(config_path, mount, agent_id)` triple as
+/// the warm backend's spawn-time owner (via [`container_owner`]), so the guard sweeps the right containers
+/// (spec §5 silent-leak guard).
+fn rw_sweep_targets(
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    config_path: &std::path::Path,
+) -> Vec<(String, String)> {
+    use bridge_core::domain::AgentKind;
+    let mut targets = Vec::new();
+    for entry in &snapshot.entries {
+        let Some(sb) = entry.sandbox.as_ref() else {
+            continue;
+        };
+        if entry.kind != AgentKind::ContainerRw {
+            continue;
+        }
+        let owner = container_owner(config_path, &sb.mount, entry.id.as_str());
+        targets.push((sb.runtime().to_string(), owner));
+    }
+    targets
+}
+
+/// SYNCHRONOUS owner-scoped reap of `a2a-rw-<owner>-` containers (best-effort, blocking) — `:rw` sibling
+/// of [`ro_sweep`]. Used as the warm backend's boot-sweep + the one-shot END-sweep backstop.
+fn rw_sweep(targets: &[(String, String)]) {
+    for (runtime, owner) in targets {
+        let (prog, argv) = bridge_core::sandbox::rw_sweep_filter_argv(runtime, owner);
+        if let Ok(out) = std::process::Command::new(&prog).args(&argv).output() {
+            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                let _ = std::process::Command::new(runtime)
+                    .args(["rm", "-f", id])
+                    .output();
+            }
+        }
+    }
+}
+
+/// RAII end-sweep for one-shot commands' `:rw` containers — `:rw` sibling of [`RoSweepGuard`]. Declared
+/// BEFORE the warm backend so it drops AFTER it (the warm `retire` reaps first; this is the backstop).
+struct RwSweepGuard(Vec<(String, String)>);
+impl Drop for RwSweepGuard {
+    fn drop(&mut self) {
+        rw_sweep(&self.0);
+    }
+}
+
+/// Build a [`bridge_container::ContainerRwConfig`] from a ContainerRw agent entry — shared by
+/// [`make_spawn_fn`] (per-turn) and the warm `implement` path so both compose the SAME container.
+fn container_rw_cfg_from_entry(
+    entry: &AgentEntry,
+) -> Result<bridge_container::ContainerRwConfig, BridgeError> {
+    let sb = entry.sandbox.clone().ok_or(BridgeError::ConfigInvalid {
+        reason: format!("container_rw agent {} requires sandbox", entry.id.as_str()),
+    })?;
+    let cmd = entry.cmd.clone().ok_or(BridgeError::ConfigInvalid {
+        reason: format!("container_rw agent {} requires cmd", entry.id.as_str()),
+    })?;
+    Ok(bridge_container::ContainerRwConfig {
+        sandbox: sb,
+        cmd,
+        args: entry.args.clone(),
+        model: entry.model.clone(),
+        mode: entry.mode.clone(),
+        auth_method: entry.auth_method.clone(),
+        handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
+        cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+    })
+}
+
 /// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
 /// `implement` subcommand so their registry builds can't drift. `owner_config_path` seeds the ContainerRw
 /// owner token.
@@ -276,27 +346,16 @@ fn make_spawn_fn(
                     Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
                 }
                 AgentKind::ContainerRw => {
-                    let sb = entry.sandbox.clone().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!(
-                            "container_rw agent {} requires sandbox",
-                            entry.id.as_str()
-                        ),
-                    })?;
-                    let cmd = entry.cmd.clone().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!("container_rw agent {} requires cmd", entry.id.as_str()),
-                    })?;
-                    let owner = container_owner(&owner_config_path, &sb.mount, entry.id.as_str());
-                    let ccfg = bridge_container::ContainerRwConfig {
-                        sandbox: sb,
-                        cmd,
-                        args: entry.args.clone(),
-                        model: entry.model.clone(),
-                        mode: entry.mode.clone(),
-                        auth_method: entry.auth_method.clone(),
-                        handshake_timeout: bridge_acp::acp_backend::AcpConfig::default()
-                            .handshake_timeout,
-                        cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+                    let owner = {
+                        let sb = entry.sandbox.as_ref().ok_or(BridgeError::ConfigInvalid {
+                            reason: format!(
+                                "container_rw agent {} requires sandbox",
+                                entry.id.as_str()
+                            ),
+                        })?;
+                        container_owner(&owner_config_path, &sb.mount, entry.id.as_str())
                     };
+                    let ccfg = container_rw_cfg_from_entry(&entry)?;
                     let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
                         Arc::new(AcpContainerSpawn {
                             policy: Arc::clone(&policy),
@@ -448,29 +507,68 @@ async fn drain_review(
     review::reduce(&events)
 }
 
-/// Drain the implement-edit / implement-fix workflow stream → `completed`. Shared by the first edit turn and
-/// every fix turn; polls to the end so the executor runs its cancel cleanup. Total (no `?`).
-async fn drain_impl(mut stream: bridge_workflow::executor::WorkflowStream) -> bool {
-    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+/// Drain a warm-session turn's raw `Update` stream → `completed`. STRICTER than the executor (which leaves
+/// `ok=true` on a clean end — `executor.rs`): complete IFF a `Done { stop_reason != CANCELLED }` arrived; a
+/// clean end without `Done` or an error-only stream → incomplete. Completion LATCHES — a trailing teardown
+/// `Err(_)` after a successful `Done` does not un-complete the turn. Polls to the end so the inner runs its
+/// cancel/cleanup. Used for the off-executor edit + fix turns.
+async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> bool {
+    use bridge_core::ports::{Update, STOP_REASON_CANCELLED};
     use futures::StreamExt;
     let mut completed = false;
     while let Some(item) = stream.next().await {
         match item {
-            Ok(WorkflowEvent::NodeStarted { node }) => {
-                eprintln!("[implement] node {} started", node.as_str())
+            // Latch: a non-cancelled Done completes the turn; later events can't un-complete it.
+            Ok(Update::Done { stop_reason }) => {
+                if stop_reason != STOP_REASON_CANCELLED {
+                    completed = true;
+                }
             }
-            Ok(WorkflowEvent::NodeFinished { node, ok, .. }) => eprintln!(
-                "[implement] node {} {}",
-                node.as_str(),
-                if ok { "ok" } else { "failed" }
-            ),
-            Ok(WorkflowEvent::Terminal { outcome, .. }) => {
-                completed = matches!(outcome, WorkflowOutcome::Completed)
-            }
-            Err(e) => eprintln!("[implement] error: {e:?}"),
+            Ok(_) => {}
+            // Log, but do NOT flip a prior success — a teardown error after Done shouldn't fail the turn.
+            Err(e) => eprintln!("[implement] turn: stream error: {e:?}"),
         }
     }
     completed
+}
+
+/// Resolve the single ContainerRw agent that drives BOTH the edit and fix turns of one warm session, or a
+/// fail-loud reason. Edit & fix workflows must each be single-node and name the SAME ContainerRw agent (one
+/// warm container/session can't serve two agents). Pure + Docker-free (validated pre-first-commit).
+fn resolve_impl_identity(
+    edit_graph: &bridge_workflow::graph::WorkflowGraph,
+    fix_graph: Option<&bridge_workflow::graph::WorkflowGraph>,
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+) -> Result<bridge_core::domain::AgentEntry, String> {
+    let edit_node = match edit_graph.nodes.as_slice() {
+        [n] => n,
+        _ => return Err("edit workflow must be single-node for the warm session".into()),
+    };
+    let id = &edit_node.agent;
+    if let Some(fg) = fix_graph {
+        match fg.nodes.as_slice() {
+            [n] if &n.agent == id => {}
+            [_] => {
+                return Err(
+                    "fix workflow agent must match the edit agent (one warm session)".into(),
+                )
+            }
+            _ => return Err("fix workflow must be single-node".into()),
+        }
+    }
+    let entry = snapshot
+        .entries
+        .iter()
+        .find(|e| &e.id == id)
+        .ok_or_else(|| format!("impl agent {} not found in snapshot", id.as_str()))?
+        .clone();
+    if entry.kind != bridge_core::domain::AgentKind::ContainerRw {
+        return Err(format!(
+            "warm session requires a container_rw impl agent, got {:?}",
+            entry.kind
+        ));
+    }
+    Ok(entry)
 }
 
 /// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
@@ -592,7 +690,11 @@ struct ProdEffects<'a> {
         std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
     >,
     executor: &'a bridge_workflow::executor::WorkflowExecutor,
-    fix_graph: Option<std::sync::Arc<bridge_workflow::graph::WorkflowGraph>>,
+    /// B2b-3c: the warm `:rw` backend + its ONE stable session — fix turns continue it (not the executor).
+    impl_backend: &'a dyn bridge_core::ports::AgentBackend,
+    impl_session: &'a bridge_core::ids::SessionId,
+    /// The fix node's prompt template (rendered with `{{input}}`); `None` ⇒ fix is never called.
+    fix_template: Option<String>,
     clone_cwd: &'a bridge_core::SessionCwd,
     repo: &'a std::path::Path,
     task: &'a str,
@@ -619,21 +721,24 @@ impl tweak::TweakEffects for ProdEffects<'_> {
         )
         .await
     }
-    async fn fix(&mut self, attempt: u32, input: &str) -> bool {
-        let graph = self
-            .fix_graph
-            .clone()
+    async fn fix(&mut self, _attempt: u32, input: &str) -> bool {
+        // Continue the SAME warm session — no new container, no new ACP session (the continuity).
+        let template = self
+            .fix_template
+            .as_deref()
             .expect("fix only called when fix_available");
-        drain_impl(self.executor.run_with_context(
-            graph,
-            input.to_string(),
-            format!("impl-fix-{}-{}", self.task_id, attempt),
-            tokio_util::sync::CancellationToken::new(),
-            bridge_workflow::executor::WorkflowRunContext {
-                session_cwd: Some(self.clone_cwd.clone()),
-            },
-        ))
-        .await
+        let vars: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("input", input)]);
+        let parts = vec![bridge_core::domain::Part {
+            text: bridge_workflow::template::render(template, &vars),
+        }];
+        match self.impl_backend.prompt(self.impl_session, parts).await {
+            Ok(stream) => drain_turn(stream).await,
+            Err(e) => {
+                eprintln!("[implement] fix turn failed: {e:?}");
+                false // → FixIncomplete
+            }
+        }
     }
 }
 
@@ -751,6 +856,48 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     ro_sweep(&ro_targets); // boot-sweep (crash recovery)
     let _ro_guard = RoSweepGuard(ro_targets); // synchronous END-sweep on any return (one-shot reliability)
     let policy = Arc::new(AutoPolicy);
+
+    // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
+    // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
+    // still uses the registry/executor built afterward. All reads of `snapshot`/`owner_config_path` happen
+    // here, before the moves.
+    let rw_targets = rw_sweep_targets(&snapshot, &owner_config_path);
+    rw_sweep(&rw_targets); // boot-sweep (crash recovery)
+    let _rw_guard = RwSweepGuard(rw_targets); // END-sweep backstop; declared BEFORE `warm` → drops AFTER it
+    let impl_entry = resolve_impl_identity(&graph, fix_graph.as_deref(), &snapshot)
+        .map_err(|e| format!("implement: {e}"))?;
+    let edit_template = graph.nodes[0].prompt_template.clone();
+    let fix_template: Option<String> = fix_graph
+        .as_ref()
+        .map(|g| g.nodes[0].prompt_template.clone());
+    let ccfg = container_rw_cfg_from_entry(&impl_entry)?; // validates sandbox + cmd (no unwrap below)
+    let warm_owner = container_owner(
+        &owner_config_path,
+        ccfg.sandbox.mount.as_str(),
+        impl_entry.id.as_str(),
+    );
+    let warm = bridge_container::ContainerRwBackend::new_warm(
+        ccfg,
+        Arc::new(AcpContainerSpawn {
+            policy: Arc::clone(&policy) as Arc<dyn PolicyEngine>,
+        }) as Arc<dyn bridge_container::ContainerSpawn>,
+        warm_owner,
+    )
+    .await?;
+    let impl_session = bridge_core::ids::SessionId::parse(format!("implement-{task_id}"))
+        .map_err(|e| format!("implement: session id: {e:?}"))?;
+    warm.configure_session(
+        &impl_session,
+        &bridge_core::domain::SessionSpec {
+            // Mirror the executor: stash the agent's EFFECTIVE config (model/mode/effort), else the warm
+            // edit/fix turns would silently run with defaults (AcpBackend prefers the stashed spec).
+            config: bridge_core::domain::effective_config(&impl_entry, None),
+            cwd: Some(clone_cwd.clone()),
+        },
+    )
+    .await?;
+
+    // The registry + executor are still built — REVIEW runs through them (edit/fix are off-executor).
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
     let spawn = make_spawn_fn(policy_for_spawn, owner_config_path);
     let registry = Arc::new(
@@ -760,24 +907,35 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
-    let run_id = format!("impl-{task_id}");
-    let ctx = bridge_workflow::executor::WorkflowRunContext {
-        session_cwd: Some(clone_cwd.clone()),
-    };
-    // First edit turn; the per-turn ContainerRw container is reaped (detached) when the stream drops.
-    let completed = drain_impl(executor.run_with_context(
-        graph,
-        a.task.clone(),
-        run_id,
-        tokio_util::sync::CancellationToken::new(),
-        ctx,
-    ))
-    .await;
 
-    // 5. the pure soft-gate decision, then execute its Action.
+    // First edit turn — on the WARM session (off the executor). Render the single-node `{{input}}` template.
+    let edit_vars: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::from([("input", a.task.as_str())]);
+    let edit_input = bridge_workflow::template::render(&edit_template, &edit_vars);
+    let completed = match warm
+        .prompt(
+            &impl_session,
+            vec![bridge_core::domain::Part { text: edit_input }],
+        )
+        .await
+    {
+        Ok(stream) => drain_turn(stream).await,
+        Err(e) => {
+            eprintln!("[implement] edit turn failed: {e:?}");
+            false // pre-commit → decide() aborts
+        }
+    };
+
+    // 5. the pure soft-gate decision, then execute its Action. A container exists now, so any post-edit
+    // early-return must `retire()` (the RwSweepGuard is only the backstop).
     let guard = implement::head_guard(&clone, &branch, &pre);
-    let stage =
-        implement::stage_state(&clone).map_err(|e| format!("implement: stage check: {e}"))?;
+    let stage = match implement::stage_state(&clone) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = warm.retire().await;
+            return Err(format!("implement: stage check: {e}").into());
+        }
+    };
     let msg = implement::commit_message(implement::read_commit_msg_file(&clone), &a.task);
     if msg.1 {
         eprintln!("[implement] no .git/A2A_COMMIT_MSG — using task-derived message");
@@ -788,6 +946,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 "[implement] {reason} — NO commit; clone left at {}",
                 clone.display()
             );
+            let _ = warm.retire().await; // sole warm reap site; RwSweepGuard is the backstop
             Err(format!("implement: {reason}").into())
         }
         implement::Action::NoCommitClean => {
@@ -795,6 +954,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 "implement: made no changes; clone left at {}",
                 clone.display()
             );
+            let _ = warm.retire().await;
             Ok(())
         }
         implement::Action::NoCommitDirty => {
@@ -803,18 +963,28 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                  Clone left at {} for inspection.",
                 clone.display()
             );
+            let _ = warm.retire().await;
             Ok(())
         }
         implement::Action::Commit(message) => {
-            // Phase 1 → 2 boundary: the ONLY post-commit `?`. After this, the loop body is lossy (no `?`).
-            let sha = implement::host_commit(&clone, &message)?;
+            // Phase 1 → 2 boundary: the LAST fallible setup step. Retire the warm container on its error
+            // path too (a container exists); after this the loop body is lossy (no `?`).
+            let sha = match implement::host_commit(&clone, &message) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = warm.retire().await;
+                    return Err(e.into());
+                }
+            };
             let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13 hygiene
             let mut effects = ProdEffects {
                 verify_cfg: &verify_cfg,
                 review_cfg: &review_cfg,
                 wf_map: &wf_map,
                 executor: &executor,
-                fix_graph: fix_graph.clone(),
+                impl_backend: &warm,
+                impl_session: &impl_session,
+                fix_template,
                 clone_cwd: &clone_cwd,
                 repo: &a.repo,
                 task: &a.task,
@@ -850,6 +1020,9 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             handoff.push('\n');
             handoff.push_str(&tweak::loop_outcome_suffix(&final_.report));
             println!("{handoff}");
+            // Print BEFORE retire so a retire error never suppresses the hand-off; log-only, never alters
+            // the result (post-commit, no `?`). M4 retire-error coverage is by-construction ordering here.
+            let _ = warm.retire().await;
             Ok(())
         }
     }
@@ -1618,27 +1791,16 @@ async fn main() -> Result<(), BoxError> {
                     Ok(Arc::new(be) as Arc<dyn AgentBackend>)
                 }
                 AgentKind::ContainerRw => {
-                    let sb = entry.sandbox.clone().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!(
-                            "container_rw agent {} requires sandbox",
-                            entry.id.as_str()
-                        ),
-                    })?;
-                    let cmd = entry.cmd.clone().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!("container_rw agent {} requires cmd", entry.id.as_str()),
-                    })?;
-                    let owner = container_owner(&owner_config_path, &sb.mount, entry.id.as_str());
-                    let ccfg = bridge_container::ContainerRwConfig {
-                        sandbox: sb,
-                        cmd,
-                        args: entry.args.clone(),
-                        model: entry.model.clone(),
-                        mode: entry.mode.clone(),
-                        auth_method: entry.auth_method.clone(),
-                        handshake_timeout: bridge_acp::acp_backend::AcpConfig::default()
-                            .handshake_timeout,
-                        cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+                    let owner = {
+                        let sb = entry.sandbox.as_ref().ok_or(BridgeError::ConfigInvalid {
+                            reason: format!(
+                                "container_rw agent {} requires sandbox",
+                                entry.id.as_str()
+                            ),
+                        })?;
+                        container_owner(&owner_config_path, &sb.mount, entry.id.as_str())
                     };
+                    let ccfg = container_rw_cfg_from_entry(&entry)?;
                     let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
                         Arc::new(AcpContainerSpawn {
                             policy: Arc::clone(&policy),
@@ -1801,6 +1963,137 @@ async fn main() -> Result<(), BoxError> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drain_turn_outcomes() {
+        use bridge_core::ports::{BackendStream, Update};
+        let done = |sr: &str| {
+            Ok(Update::Done {
+                stop_reason: sr.into(),
+            })
+        };
+        // end_turn → complete
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("end_turn")]));
+        assert!(drain_turn(s).await);
+        // cancelled → incomplete
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("cancelled")]));
+        assert!(!drain_turn(s).await);
+        // clean end without Done → incomplete (the executor-divergence guard)
+        let s: BackendStream = Box::pin(tokio_stream::iter(Vec::<
+            Result<Update, bridge_core::error::BridgeError>,
+        >::new()));
+        assert!(!drain_turn(s).await);
+        // stream error → incomplete
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![Err(
+            bridge_core::error::BridgeError::agent_crashed("x"),
+        )]));
+        assert!(!drain_turn(s).await);
+        // Done then a trailing teardown Err → STILL complete (completion latches)
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![
+            done("end_turn"),
+            Err(bridge_core::error::BridgeError::agent_crashed("teardown")),
+        ]));
+        assert!(drain_turn(s).await);
+    }
+
+    fn cr_entry(id: &str, mount: &str) -> AgentEntry {
+        let mut e = acp_entry(id);
+        e.kind = bridge_core::domain::AgentKind::ContainerRw;
+        e.sandbox = Some(bridge_core::domain::SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: mount.into(),
+            access: bridge_core::domain::MountAccess::Rw,
+            egress: bridge_core::domain::EgressPolicy::Open,
+            volumes: vec![],
+        });
+        e
+    }
+    fn snap(entries: Vec<AgentEntry>) -> bridge_core::domain::RegistrySnapshot {
+        use bridge_core::ids::AgentId;
+        bridge_core::domain::RegistrySnapshot {
+            default: AgentId::parse("d").unwrap(),
+            entries,
+            allowed_cmds: vec![],
+        }
+    }
+    fn wf(id: &str, agents: &[&str]) -> bridge_workflow::graph::WorkflowGraph {
+        use bridge_core::ids::{AgentId, NodeId, WorkflowId};
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+        let nodes = agents
+            .iter()
+            .enumerate()
+            .map(|(i, a)| WorkflowNode {
+                id: NodeId::parse(format!("n{i}")).unwrap(),
+                agent: AgentId::parse(*a).unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+            })
+            .collect();
+        WorkflowGraph {
+            id: WorkflowId::parse(id).unwrap(),
+            nodes,
+        }
+    }
+
+    #[test]
+    fn resolve_impl_identity_happy_and_rejects() {
+        let s = snap(vec![cr_entry("impl", "/root")]);
+        let edit = wf("edit", &["impl"]);
+        let fix = wf("fix", &["impl"]);
+        // happy with + without fix
+        assert_eq!(
+            resolve_impl_identity(&edit, Some(&fix), &s)
+                .unwrap()
+                .id
+                .as_str(),
+            "impl"
+        );
+        assert!(resolve_impl_identity(&edit, None, &s).is_ok());
+        // edit multi-node
+        assert!(
+            resolve_impl_identity(&wf("edit", &["impl", "impl"]), Some(&fix), &s)
+                .unwrap_err()
+                .contains("single-node")
+        );
+        // fix multi-node
+        assert!(
+            resolve_impl_identity(&edit, Some(&wf("fix", &["impl", "impl"])), &s)
+                .unwrap_err()
+                .contains("fix workflow must be single-node")
+        );
+        // fix agent != edit agent
+        assert!(
+            resolve_impl_identity(&edit, Some(&wf("fix", &["other"])), &s)
+                .unwrap_err()
+                .contains("must match the edit agent")
+        );
+        // impl absent from snapshot
+        assert!(resolve_impl_identity(&edit, Some(&fix), &snap(vec![]))
+            .unwrap_err()
+            .contains("not found"));
+        // impl present but not ContainerRw
+        assert!(
+            resolve_impl_identity(&edit, Some(&fix), &snap(vec![acp_entry("impl")]))
+                .unwrap_err()
+                .contains("container_rw")
+        );
+    }
+
+    #[test]
+    fn rw_sweep_owner_matches_container_owner() {
+        // spec §5 silent-leak guard: the RwSweepGuard owner MUST equal the warm backend's spawn-time owner
+        // (both derive from container_owner over the SAME (config_path, mount, agent_id) triple).
+        let cfg = std::path::Path::new("/cfg/a2a.toml");
+        let s = snap(vec![cr_entry("impl", "/root")]);
+        let targets = rw_sweep_targets(&s, cfg);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].1,
+            container_owner(cfg, "/root", "impl"),
+            "RwSweepGuard owner must equal the backend spawn-time owner"
+        );
+    }
 
     fn acp_entry(id: &str) -> AgentEntry {
         use bridge_core::ids::AgentId;

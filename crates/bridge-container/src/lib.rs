@@ -1,7 +1,8 @@
-//! Per-turn write-capable containerized ACP agent (Slice B2a). [`ContainerRwBackend`] spawns a fresh
-//! `:rw` container per `prompt` turn (composing [`bridge_acp::acp_backend::AcpBackend`] via the
-//! [`ContainerSpawn`] seam) and reaps it on every terminal path. Warm reuse across turns is a separate
-//! future slice (see `docs/superpowers/specs/2026-06-05-containerized-agents-warm-pool-slice.md`).
+//! Write-capable containerized ACP agent (Slice B2a + B2b-3c). [`ContainerRwBackend`] composes
+//! [`bridge_acp::acp_backend::AcpBackend`] via the [`ContainerSpawn`] seam. Default `PerTurn` mode spawns
+//! a fresh `:rw` container per `prompt` turn and reaps it on every terminal path. `Warm` mode
+//! (`new_warm`) reuses ONE container + ONE ACP session across the turns of a session, reaping ONLY at
+//! `retire()` — used by the `implement` review→tweak loop so edit + fix turns share continuity.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -56,6 +57,16 @@ struct InflightTurn {
     reaped: Arc<AtomicBool>,
 }
 
+/// A spawned, configured inner backend + its container identity. Shared shape for per-turn (promoted to
+/// [`InflightState::Live`]) and warm (cached in `warm`). `rw_canon` is the canonicalized `:rw` target the
+/// session was configured with (re-applied on a warm reuse turn).
+struct WarmInner {
+    inner: Arc<dyn AgentBackend>,
+    name: String,
+    reaped: Arc<AtomicBool>,
+    rw_canon: SessionCwd,
+}
+
 /// One entry per session: `Reserving` is held across the (async) spawn so a concurrent second prompt is
 /// rejected atomically (no check-then-insert race); `Live` carries the cancel handle.
 enum InflightState {
@@ -64,6 +75,13 @@ enum InflightState {
 }
 
 type Inflight = Arc<Mutex<HashMap<SessionId, InflightState>>>;
+
+/// Per-turn (cold) vs warm (one container + session reused across turns, reaped only at `retire`).
+#[derive(Clone, Copy, PartialEq)]
+enum Lifecycle {
+    PerTurn,
+    Warm,
+}
 
 pub struct ContainerRwBackend {
     cfg: ContainerRwConfig,
@@ -74,6 +92,15 @@ pub struct ContainerRwBackend {
     session_cfg: Mutex<HashMap<SessionId, SessionSpec>>,
     inflight: Inflight,
     turn_seq: AtomicU64,
+    lifecycle: Lifecycle,
+    /// Warm mode only: the authoritative cached container/session per `SessionId` (drained at `retire`).
+    warm: Mutex<HashMap<SessionId, WarmInner>>,
+    /// Warm mode only: sessions with an in-flight turn → the turn's monotonic epoch (concurrency reject).
+    /// The epoch lets a stale (early-drop) detached clear remove ONLY its own turn's marker, never a later
+    /// turn's (review finding: a bare `HashSet` clear could erase the next turn's marker).
+    turn_active: Arc<Mutex<HashMap<SessionId, u64>>>,
+    /// Warm mode only: monotonic per-turn epoch source for `turn_active`.
+    turn_epoch: AtomicU64,
 }
 
 impl ContainerRwBackend {
@@ -97,7 +124,46 @@ impl ContainerRwBackend {
             session_cfg: Mutex::new(HashMap::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             turn_seq: AtomicU64::new(0),
+            lifecycle: Lifecycle::PerTurn,
+            warm: Mutex::new(HashMap::new()),
+            turn_active: Arc::new(Mutex::new(HashMap::new())),
+            turn_epoch: AtomicU64::new(0),
         })
+    }
+
+    /// Warm hook-injectable constructor: identical to [`Self::new_with_hooks`] but flips the lifecycle to
+    /// `Warm` (reuse one container/session across turns; reap only at `retire`).
+    pub async fn new_warm_with_hooks(
+        cfg: ContainerRwConfig,
+        spawn: Arc<dyn ContainerSpawn>,
+        owner: String,
+        reap_fn: ReapFn,
+        sweep_fn: SweepFn,
+    ) -> Result<Self, BridgeError> {
+        let mut be = Self::new_with_hooks(cfg, spawn, owner, reap_fn, sweep_fn).await?;
+        be.lifecycle = Lifecycle::Warm;
+        Ok(be)
+    }
+
+    /// Warm production constructor (detached reaper + boot sweep, like [`Self::new`]).
+    pub async fn new_warm(
+        cfg: ContainerRwConfig,
+        spawn: Arc<dyn ContainerSpawn>,
+        owner: String,
+    ) -> Result<Self, BridgeError> {
+        let runtime = cfg.sandbox.runtime().to_string();
+        Self::new_warm_with_hooks(
+            cfg,
+            spawn,
+            owner,
+            production_reap_fn(),
+            production_sweep_fn(runtime),
+        )
+        .await
+    }
+
+    fn is_warm(&self) -> bool {
+        self.lifecycle == Lifecycle::Warm
     }
 
     /// Production constructor: detached `docker rm -f` reaper + a runtime-parametric `docker ps`/`rm`
@@ -128,44 +194,23 @@ impl ContainerRwBackend {
         check_rw_target(&mount_canon, &rw_canon)?;
         Ok(rw_canon)
     }
-}
 
-#[async_trait]
-impl AgentBackend for ContainerRwBackend {
-    async fn prompt(
+    /// Spawn + configure ONE inner container for `session`. On ANY failure the just-started container is
+    /// reaped by name (the `docker run` client can be up before the handshake fails) and `Err` is
+    /// returned. The caller owns the cache bookkeeping + the cwd strict-reject. `session/new` is lazy
+    /// (inside the inner's first `prompt`), so this method does NOT mint the ACP session. Shared by the
+    /// per-turn `prompt` and the warm `prompt_warm` cache-miss path; it touches neither
+    /// `inflight`/`warm`/`turn_active`.
+    async fn open_inner(
         &self,
         session: &SessionId,
-        parts: Vec<Part>,
-    ) -> Result<BackendStream, BridgeError> {
-        // Strict-reject: a writer MUST name its :rw target (no fallback to the broad root).
-        let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
-            BridgeError::ConfigInvalid {
-                reason: "missing session cwd".into(),
-            },
-        )?;
+        spec: &SessionSpec,
+    ) -> Result<WarmInner, BridgeError> {
+        let runtime = self.cfg.sandbox.runtime().to_string();
         let cwd = spec.cwd.clone().ok_or(BridgeError::ConfigInvalid {
             reason: "missing session cwd".into(),
         })?;
-
-        // Atomic check-and-reserve: reject a second concurrent prompt on a live session under ONE lock.
-        {
-            let mut m = self.inflight.lock().await;
-            if m.contains_key(session) {
-                return Err(BridgeError::ConfigInvalid {
-                    reason: format!("session {} already has an in-flight turn", session.as_str()),
-                });
-            }
-            m.insert(session.clone(), InflightState::Reserving);
-        }
-        // From here, EVERY error path must remove the reservation (and reap if a container started).
-        let runtime = self.cfg.sandbox.runtime().to_string();
-        let rw_canon = match self.resolve_rw_target(&cwd) {
-            Ok(c) => c,
-            Err(e) => {
-                self.inflight.lock().await.remove(session);
-                return Err(e);
-            }
-        };
+        let rw_canon = self.resolve_rw_target(&cwd)?;
         let n = self.turn_seq.fetch_add(1, Ordering::Relaxed);
         let name = format!("a2a-rw-{}-{}", self.owner, n);
         let (program, argv) = compose_container_rw(
@@ -182,62 +227,240 @@ impl AgentBackend for ContainerRwBackend {
             auth_method: self.cfg.auth_method.clone(),
             handshake_timeout: self.cfg.handshake_timeout,
             cancel_grace: self.cfg.cancel_grace,
-            // :rw has its own ContainerReaper (this crate); the inner AcpBackend's :ro reaper stays off.
+            // :rw has its own reaper (this crate); the inner AcpBackend's :ro reaper stays off.
             container: None,
         };
-
-        // Spawn — the `docker run` client may be up before the handshake fails → reap by name on error.
         let inner = match self.spawn.spawn(&program, &argv, acp).await {
             Ok(i) => i,
             Err(e) => {
-                self.inflight.lock().await.remove(session);
-                (self.reap_fn)(runtime.clone(), name.clone()); // spawn-failure reap
+                (self.reap_fn)(runtime.clone(), name.clone()); // spawn-failure reap (never inserted)
                 return Err(e);
             }
         };
         let reaped = Arc::new(AtomicBool::new(false));
-
-        // Forward the CANONICAL cwd to the inner: AcpBackend prefers the stashed SessionSpec.cwd over
-        // AcpConfig.cwd, so the ACP session cwd must equal the mounted path.
+        // The inner prefers the stashed SessionSpec.cwd over AcpConfig.cwd → configure with CANONICAL cwd.
         let mut spec_canon = spec.clone();
         spec_canon.cwd = Some(rw_canon.clone());
         if let Err(e) = inner.configure_session(session, &spec_canon).await {
-            self.inflight.lock().await.remove(session);
             reap_once(&self.reap_fn, &runtime, &name, &reaped);
             return Err(e);
         }
+        Ok(WarmInner {
+            inner,
+            name,
+            reaped,
+            rw_canon,
+        })
+    }
+
+    /// Warm turn: reuse ONE cached container/session across prompts. Concurrency-reject via `turn_active`.
+    /// Cache-miss opens (and reaps on its own failure); reuse re-applies the cached canonical cwd. A
+    /// REUSE-turn error (configure/prompt) clears `turn_active`, does NOT reap, and returns `Err` — a
+    /// transient error must not nuke the warm container (the loop converts it to `FixIncomplete`). A
+    /// cache-MISS prompt error reaps + removes the just-opened entry (no cumulative work to protect). The
+    /// stream's `TurnGuard` clears `turn_active` on end/early-drop and NEVER reaps; the sole warm reap site
+    /// is `retire_warm`.
+    async fn prompt_warm(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
+            BridgeError::ConfigInvalid {
+                reason: "missing session cwd".into(),
+            },
+        )?;
+        // Concurrency reject + mark active with a fresh monotonic epoch — the epoch lets the eventual
+        // clear (sync or detached) target ONLY this turn's marker, never a later turn's.
+        let epoch = self.turn_epoch.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut ta = self.turn_active.lock().await;
+            if ta.contains_key(session) {
+                return Err(BridgeError::ConfigInvalid {
+                    reason: format!("session {} already has an in-flight turn", session.as_str()),
+                });
+            }
+            ta.insert(session.clone(), epoch);
+        }
+        // Clear THIS turn's marker synchronously on every pre-stream error path (epoch-guarded).
+        macro_rules! fail {
+            ($e:expr) => {{
+                let mut ta = self.turn_active.lock().await;
+                if ta.get(session) == Some(&epoch) {
+                    ta.remove(session);
+                }
+                return Err($e);
+            }};
+        }
+
+        let cache_miss = !self.warm.lock().await.contains_key(session);
+        if cache_miss {
+            // `open_inner` already reaps on its own failure; nothing inserted yet.
+            let wi = match self.open_inner(session, &spec).await {
+                Ok(wi) => wi,
+                Err(e) => fail!(e),
+            };
+            self.warm.lock().await.insert(session.clone(), wi);
+            // NO re-configure on cache-miss: open_inner already configured with the canonical cwd.
+        } else {
+            // Reuse: re-apply the cached canonical cwd. A concurrent `retire` can drain the entry after the
+            // cache-hit check above → treat absence as "retired under me" (Err, NOT a panic on unwrap).
+            let reuse = {
+                let w = self.warm.lock().await;
+                w.get(session)
+                    .map(|wi| (wi.inner.clone(), wi.rw_canon.clone()))
+            };
+            let (inner, rw_canon) = match reuse {
+                Some(t) => t,
+                None => fail!(BridgeError::agent_crashed(
+                    "warm session retired during prompt"
+                )),
+            };
+            let mut spec_canon = spec.clone();
+            spec_canon.cwd = Some(rw_canon);
+            if let Err(e) = inner.configure_session(session, &spec_canon).await {
+                fail!(e) // reuse: no reap
+            }
+        }
+        let got = {
+            let w = self.warm.lock().await;
+            w.get(session)
+                .map(|wi| (wi.inner.clone(), wi.name.clone(), wi.reaped.clone()))
+        };
+        let (inner, name, reaped) = match got {
+            Some(t) => t,
+            None => fail!(BridgeError::agent_crashed(
+                "warm session retired during prompt"
+            )),
+        };
+        let inner_stream = match inner.prompt(session, parts).await {
+            Ok(s) => s,
+            Err(e) => {
+                if cache_miss {
+                    // First-turn failure → reap + remove (no cumulative work to protect).
+                    self.warm.lock().await.remove(session);
+                    reap_once(&self.reap_fn, self.cfg.sandbox.runtime(), &name, &reaped);
+                }
+                fail!(e) // reuse: keep the warm entry, do NOT reap
+            }
+        };
+        let guard = TurnGuard {
+            turn_active: self.turn_active.clone(),
+            session: session.clone(),
+            epoch,
+            armed: true,
+        };
+        Ok(wrap_with_turn_guard(inner, inner_stream, guard))
+    }
+
+    /// Warm cancel: cancel the cached inner's current turn + clear `turn_active`. Does NOT reap (the warm
+    /// container survives for the next turn; `retire` owns reaping).
+    async fn cancel_warm(&self, session: &SessionId) -> Result<(), BridgeError> {
+        let inner = self
+            .warm
+            .lock()
+            .await
+            .get(session)
+            .map(|wi| wi.inner.clone());
+        if let Some(inner) = inner {
+            let _ = inner.cancel(session).await;
+        }
+        self.turn_active.lock().await.remove(session);
+        Ok(())
+    }
+
+    /// Warm retire — the SOLE warm reap site. Drain the cache; per entry: cancel the inner, reap once,
+    /// and clear any stale `turn_active` marker (a held/raced stream could leave one behind).
+    async fn retire_warm(&self) -> Result<(), BridgeError> {
+        let entries: Vec<(SessionId, WarmInner)> = { self.warm.lock().await.drain().collect() };
+        let runtime = self.cfg.sandbox.runtime().to_string();
+        for (s, wi) in entries {
+            let _ = wi.inner.cancel(&s).await;
+            reap_once(&self.reap_fn, &runtime, &wi.name, &wi.reaped);
+            self.turn_active.lock().await.remove(&s);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AgentBackend for ContainerRwBackend {
+    async fn prompt(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        if self.is_warm() {
+            return self.prompt_warm(session, parts).await;
+        }
+
+        // Strict-reject: a writer MUST name its :rw target (no fallback to the broad root). The early
+        // presence check keeps reject-before-reserve; `open_inner` re-resolves the same cwd.
+        let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
+            BridgeError::ConfigInvalid {
+                reason: "missing session cwd".into(),
+            },
+        )?;
+        if spec.cwd.is_none() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "missing session cwd".into(),
+            });
+        }
+
+        // Atomic check-and-reserve: reject a second concurrent prompt on a live session under ONE lock.
+        {
+            let mut m = self.inflight.lock().await;
+            if m.contains_key(session) {
+                return Err(BridgeError::ConfigInvalid {
+                    reason: format!("session {} already has an in-flight turn", session.as_str()),
+                });
+            }
+            m.insert(session.clone(), InflightState::Reserving);
+        }
+        // From here every error path must remove the reservation (open_inner reaps on its own failure).
+        let runtime = self.cfg.sandbox.runtime().to_string();
+        let wi = match self.open_inner(session, &spec).await {
+            Ok(wi) => wi,
+            Err(e) => {
+                self.inflight.lock().await.remove(session);
+                return Err(e);
+            }
+        };
 
         // Promote the reservation to Live (the cancel handle), sharing the `reaped` bool.
         self.inflight.lock().await.insert(
             session.clone(),
             InflightState::Live(InflightTurn {
-                inner: inner.clone(),
-                name: name.clone(),
-                reaped: reaped.clone(),
+                inner: wi.inner.clone(),
+                name: wi.name.clone(),
+                reaped: wi.reaped.clone(),
             }),
         );
 
-        let inner_stream = match inner.prompt(session, parts).await {
+        let inner_stream = match wi.inner.prompt(session, parts).await {
             Ok(s) => s,
             Err(e) => {
                 self.inflight.lock().await.remove(session);
-                reap_once(&self.reap_fn, &runtime, &name, &reaped);
+                reap_once(&self.reap_fn, &runtime, &wi.name, &wi.reaped);
                 return Err(e);
             }
         };
 
         let reaper = ContainerReaper {
             runtime,
-            name,
+            name: wi.name,
             reap_fn: self.reap_fn.clone(),
-            reaped,
+            reaped: wi.reaped,
             inflight: self.inflight.clone(),
             session: session.clone(),
         };
-        Ok(wrap_with_reaper(inner, inner_stream, reaper))
+        Ok(wrap_with_reaper(wi.inner, inner_stream, reaper))
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
+        if self.is_warm() {
+            return self.cancel_warm(session).await;
+        }
         let turn = {
             let mut m = self.inflight.lock().await;
             match m.remove(session) {
@@ -275,6 +498,9 @@ impl AgentBackend for ContainerRwBackend {
     }
 
     async fn retire(&self) -> Result<(), BridgeError> {
+        if self.is_warm() {
+            return self.retire_warm().await;
+        }
         let turns: Vec<(SessionId, InflightTurn)> = {
             let mut m = self.inflight.lock().await;
             m.drain()
@@ -344,6 +570,61 @@ fn wrap_with_reaper(
     })
 }
 
+/// Warm-turn guard: clears THIS turn's `turn_active` marker on normal stream end (synchronously, in
+/// `wrap_with_turn_guard`) OR on early consumer-drop (detached, here). The clear is EPOCH-GUARDED — it only
+/// removes the marker if it still carries this turn's epoch — so a late detached clear can never erase a
+/// subsequent turn's marker. NEVER reaps — the only warm reap site is `retire_warm`.
+struct TurnGuard {
+    turn_active: Arc<Mutex<HashMap<SessionId, u64>>>,
+    session: SessionId,
+    epoch: u64,
+    armed: bool,
+}
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let ta = self.turn_active.clone();
+        let s = self.session.clone();
+        let epoch = self.epoch;
+        spawn_detached(async move {
+            let mut m = ta.lock().await;
+            if m.get(&s) == Some(&epoch) {
+                m.remove(&s);
+            }
+        });
+    }
+}
+
+/// Wrap a warm turn stream so its state OWNS `inner` (keeps the ACP child alive) and the [`TurnGuard`].
+/// On NORMAL completion the active marker is cleared synchronously (awaited) so a sequential next turn
+/// isn't spuriously rejected; `armed` is then cleared so the `Drop` doesn't detach a SECOND clear that
+/// could race (and erase) the next turn's marker. The `armed = false` write IS read — by `TurnGuard::drop`
+/// — but the `unused_assignments` lint doesn't count destructor reads, hence the allow.
+#[allow(unused_assignments)]
+fn wrap_with_turn_guard(
+    inner: Arc<dyn AgentBackend>,
+    inner_stream: BackendStream,
+    mut guard: TurnGuard,
+) -> BackendStream {
+    Box::pin(async_stream::stream! {
+        let _inner = inner;
+        let mut s = inner_stream;
+        while let Some(item) = s.next().await {
+            yield item;
+        }
+        // Epoch-guarded synchronous clear so a sequential next turn isn't spuriously rejected.
+        {
+            let mut m = guard.turn_active.lock().await;
+            if m.get(&guard.session) == Some(&guard.epoch) {
+                m.remove(&guard.session);
+            }
+        }
+        guard.armed = false;
+    })
+}
+
 /// Canonicalize `path`, resolving symlinks. If it doesn't exist yet (a fresh scratch dir), canonicalize
 /// the nearest existing ancestor and re-append the missing tail.
 fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
@@ -379,21 +660,28 @@ fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
 mod tests {
     use super::*;
     use bridge_core::domain::{EffectiveConfig, EgressPolicy, MountAccess};
+    use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
 
     // ---- stubs -------------------------------------------------------------
 
-    /// Stub inner backend: emits one `Done`, records cancel.
+    /// Stub inner backend: emits one `Done`, records cancel + prompt count + the sessions it served.
+    /// `fail_prompt` (atomic, flippable through `&self`) makes the NEXT `prompt` error — used to drive the
+    /// warm reuse-error path.
     struct StubInner {
         canceled: AtomicBool,
+        prompts: AtomicUsize,
+        sessions: Mutex<HashSet<String>>,
+        fail_prompt: AtomicBool,
     }
     #[async_trait]
     impl AgentBackend for StubInner {
-        async fn prompt(
-            &self,
-            _s: &SessionId,
-            _p: Vec<Part>,
-        ) -> Result<BackendStream, BridgeError> {
+        async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            self.sessions.lock().await.insert(s.as_str().to_string());
+            if self.fail_prompt.load(Ordering::SeqCst) {
+                return Err(BridgeError::agent_crashed("prompt boom"));
+            }
             Ok(Box::pin(tokio_stream::iter(vec![Ok(
                 bridge_core::ports::Update::Done {
                     stop_reason: "end_turn".into(),
@@ -409,6 +697,7 @@ mod tests {
     struct CountingSpawn {
         count: AtomicUsize,
         fail: bool,
+        fail_prompt: bool,
         last_argv: Mutex<Vec<String>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
     }
@@ -417,6 +706,7 @@ mod tests {
             Arc::new(Self {
                 count: AtomicUsize::new(0),
                 fail,
+                fail_prompt: false,
                 last_argv: Mutex::new(vec![]),
                 last_inner: Mutex::new(None),
             })
@@ -437,6 +727,9 @@ mod tests {
             }
             let inner = Arc::new(StubInner {
                 canceled: AtomicBool::new(false),
+                prompts: AtomicUsize::new(0),
+                sessions: Mutex::new(HashSet::new()),
+                fail_prompt: AtomicBool::new(self.fail_prompt),
             });
             *self.last_inner.lock().await = Some(inner.clone());
             Ok(inner)
@@ -481,6 +774,21 @@ mod tests {
         reap: ReapFn,
     ) -> ContainerRwBackend {
         ContainerRwBackend::new_with_hooks(
+            cfg_with_mount(mount),
+            spawn,
+            "inst".into(),
+            reap,
+            noop_sweep(),
+        )
+        .await
+        .unwrap()
+    }
+    async fn warm_backend(
+        mount: &str,
+        spawn: Arc<dyn ContainerSpawn>,
+        reap: ReapFn,
+    ) -> ContainerRwBackend {
+        ContainerRwBackend::new_warm_with_hooks(
             cfg_with_mount(mount),
             spawn,
             "inst".into(),
@@ -751,6 +1059,231 @@ mod tests {
         assert_eq!(
             seen.lock().await.clone(),
             vec!["a2a-rw-inst42-".to_string()]
+        );
+    }
+
+    // ---- warm-mode tests (B2b-3c) -----------------------------------------
+
+    #[tokio::test]
+    async fn warm_reuses_one_inner_across_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, spawn.clone(), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        {
+            let mut a = be.prompt(&s, vec![]).await.unwrap();
+            while a.next().await.is_some() {}
+        }
+        {
+            let mut b = be.prompt(&s, vec![]).await.unwrap();
+            while b.next().await.is_some() {}
+        }
+        assert_eq!(
+            spawn.count.load(Ordering::SeqCst),
+            1,
+            "ONE container across both turns"
+        );
+        assert_eq!(reaps.load(Ordering::SeqCst), 0, "NOT reaped between turns");
+        let inner = spawn.last_inner.lock().await.clone().unwrap();
+        assert_eq!(
+            inner.prompts.load(Ordering::SeqCst),
+            2,
+            "both turns hit the SAME inner"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_reuse_turn_error_clears_turn_active_and_does_not_reap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false); // turn 1 ok
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, spawn.clone(), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        {
+            let mut a = be.prompt(&s, vec![]).await.unwrap();
+            while a.next().await.is_some() {}
+        }
+        // Make the cached inner fail its NEXT prompt (a transient reuse-turn error).
+        spawn
+            .last_inner
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .fail_prompt
+            .store(true, Ordering::SeqCst);
+        let err = prompt_err(&be, &s).await;
+        assert!(format!("{err:?}").contains("prompt boom"), "got {err:?}");
+        assert_eq!(
+            reaps.load(Ordering::SeqCst),
+            0,
+            "a transient reuse error must NOT reap the warm container"
+        );
+        assert!(
+            be.warm.lock().await.contains_key(&s),
+            "warm entry retained across a reuse error"
+        );
+        assert!(
+            !be.turn_active.lock().await.contains_key(&s),
+            "turn_active cleared after the error"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_rejects_second_concurrent_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, _) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(false), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let _held = be.prompt(&s, vec![]).await.unwrap(); // hold the stream
+        let err = prompt_err(&be, &s).await;
+        assert!(format!("{err:?}").contains("in-flight turn"), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn warm_retire_is_the_sole_reap_site() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, spawn.clone(), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        {
+            let mut a = be.prompt(&s, vec![]).await.unwrap();
+            while a.next().await.is_some() {}
+        }
+        {
+            let mut b = be.prompt(&s, vec![]).await.unwrap();
+            while b.next().await.is_some() {}
+        }
+        assert_eq!(reaps.load(Ordering::SeqCst), 0, "no reap across turns");
+        be.retire().await.unwrap();
+        let inner = spawn.last_inner.lock().await.clone().unwrap();
+        assert!(
+            inner.canceled.load(Ordering::SeqCst),
+            "retire cancels the inner"
+        );
+        assert_eq!(
+            reaps.load(Ordering::SeqCst),
+            1,
+            "reaped exactly once at retire"
+        );
+        assert!(be.warm.lock().await.is_empty(), "warm cache drained");
+    }
+
+    #[tokio::test]
+    async fn warm_cancel_clears_turn_active_without_reaping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(false), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let _held = be.prompt(&s, vec![]).await.unwrap();
+        be.cancel(&s).await.unwrap();
+        assert_eq!(reaps.load(Ordering::SeqCst), 0, "warm cancel does NOT reap");
+        assert!(
+            !be.turn_active.lock().await.contains_key(&s),
+            "cancel cleared turn_active"
+        );
+        be.retire().await.unwrap(); // retire still reaps the cached container
+        assert_eq!(reaps.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn warm_edit_turn_open_failure_reaps_and_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(true), reap).await; // spawn fails (cache-miss open)
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let err = prompt_err(&be, &s).await;
+        assert!(format!("{err:?}").contains("boom"), "got {err:?}");
+        assert_eq!(
+            reaps.load(Ordering::SeqCst),
+            1,
+            "cache-miss spawn failure reaps the just-started container"
+        );
+        assert!(
+            be.warm.lock().await.is_empty(),
+            "no warm entry inserted on open failure"
+        );
+        assert!(
+            !be.turn_active.lock().await.contains_key(&s),
+            "turn_active cleared on open failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_stale_turn_guard_clear_is_epoch_scoped() {
+        // The core of the review fix: a stale (early-drop) TurnGuard's detached clear must remove ONLY its
+        // own turn's marker, never a later turn's.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, _) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(false), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        // A later turn owns the marker at epoch 5.
+        be.turn_active.lock().await.insert(s.clone(), 5);
+        // A STALE guard from an earlier turn (epoch 0) drops → its clear must NOT erase epoch 5.
+        drop(TurnGuard {
+            turn_active: be.turn_active.clone(),
+            session: s.clone(),
+            epoch: 0,
+            armed: true,
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            be.turn_active.lock().await.get(&s),
+            Some(&5),
+            "stale clear must not erase a later turn's marker"
+        );
+        // A guard whose epoch MATCHES does clear it.
+        drop(TurnGuard {
+            turn_active: be.turn_active.clone(),
+            session: s.clone(),
+            epoch: 5,
+            armed: true,
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !be.turn_active.lock().await.contains_key(&s),
+            "matching-epoch clear removes the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_cancel_then_reprompt_survives_old_stream_drop() {
+        // cancel clears turn 1's marker; turn 2 takes a fresh epoch; dropping the OLD (turn 1) stream must
+        // not erase turn 2's marker (review MAJOR: cancel-while-held + stale detached clear).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(false), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let h1 = be.prompt(&s, vec![]).await.unwrap(); // turn 1 (epoch 0), held un-drained
+        be.cancel(&s).await.unwrap(); // clears turn 1 marker, no reap
+        assert_eq!(reaps.load(Ordering::SeqCst), 0, "cancel does not reap warm");
+        let _h2 = be.prompt(&s, vec![]).await.unwrap(); // turn 2 (epoch 1), accepted + held
+        assert!(
+            be.turn_active.lock().await.contains_key(&s),
+            "turn 2 is active"
+        );
+        drop(h1); // old stream drop → epoch-0 detached clear (must be a no-op vs turn 2's epoch 1)
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            be.turn_active.lock().await.contains_key(&s),
+            "turn 2's marker survives the stale drop of turn 1"
         );
     }
 }

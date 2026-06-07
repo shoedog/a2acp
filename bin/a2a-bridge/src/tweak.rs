@@ -95,9 +95,9 @@ pub fn build_fix_input(
     max_bytes: usize,
 ) -> String {
     let header = format!(
-        "{task}\n\nThe previous attempt did not pass. FIX the issues below on the current clone (it already \
-         has your prior commit); re-stage your fixes with `git add`; do NOT run `git commit` and do NOT write \
-         a commit message.\n"
+        "{task}\n\nThe previous attempt did not pass. FIX the issues below; re-stage your fixes with \
+         `git add` (the bridge folds ONLY staged changes); do NOT run `git commit` and do NOT write a commit \
+         message.\n"
     );
     let remaining = max_bytes.saturating_sub(header.len());
     let v = verify_digest.trim();
@@ -413,6 +413,9 @@ mod tests {
         let i = build_fix_input("do X", "### clippy\nerr", Some("BLOCKER: bug"), 4096);
         assert!(i.contains("do X") && i.contains("## Verify failures") && i.contains("### clippy"));
         assert!(i.contains("## Review findings (REJECTED)") && i.contains("BLOCKER: bug"));
+        // Warm-session framing: self-sufficient (task + git-add mandate), no "prior commit" assumption.
+        assert!(i.contains("git add"));
+        assert!(!i.contains("prior commit"));
         let v = build_fix_input("do X", "### test\nfail", None, 4096);
         assert!(v.contains("## Verify failures") && !v.contains("Review findings"));
         let r = build_fix_input("do X", "", Some("MAJOR: y"), 4096);

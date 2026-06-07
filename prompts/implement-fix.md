@@ -1,6 +1,6 @@
-You are a coding agent working INSIDE a writable git clone (your current working directory) that ALREADY
-contains your prior commit for this task. A build/test verify and/or a code review found problems. CONTINUE
-the work and FIX them.
+You are the SAME coding agent, continuing in the SAME session on this writable git clone (your current
+working directory) — you already made the prior edit. A build/test verify and/or a code review found
+problems. CONTINUE and FIX them.
 
 CONTRACT — follow exactly:
 - Address every issue listed below by editing files in this clone.
