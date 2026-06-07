@@ -509,7 +509,8 @@ async fn drain_review(
 
 /// Drain a warm-session turn's raw `Update` stream → `completed`. STRICTER than the executor (which leaves
 /// `ok=true` on a clean end — `executor.rs`): complete IFF a `Done { stop_reason != CANCELLED }` arrived; a
-/// stream `Err(_)` or a clean end without `Done` → incomplete. Polls to the end so the inner runs its
+/// clean end without `Done` or an error-only stream → incomplete. Completion LATCHES — a trailing teardown
+/// `Err(_)` after a successful `Done` does not un-complete the turn. Polls to the end so the inner runs its
 /// cancel/cleanup. Used for the off-executor edit + fix turns.
 async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> bool {
     use bridge_core::ports::{Update, STOP_REASON_CANCELLED};
@@ -517,14 +518,15 @@ async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> bool {
     let mut completed = false;
     while let Some(item) = stream.next().await {
         match item {
+            // Latch: a non-cancelled Done completes the turn; later events can't un-complete it.
             Ok(Update::Done { stop_reason }) => {
-                completed = stop_reason != STOP_REASON_CANCELLED;
+                if stop_reason != STOP_REASON_CANCELLED {
+                    completed = true;
+                }
             }
             Ok(_) => {}
-            Err(e) => {
-                eprintln!("[implement] turn: stream error: {e:?}");
-                completed = false;
-            }
+            // Log, but do NOT flip a prior success — a teardown error after Done shouldn't fail the turn.
+            Err(e) => eprintln!("[implement] turn: stream error: {e:?}"),
         }
     }
     completed
@@ -887,7 +889,9 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     warm.configure_session(
         &impl_session,
         &bridge_core::domain::SessionSpec {
-            config: Default::default(),
+            // Mirror the executor: stash the agent's EFFECTIVE config (model/mode/effort), else the warm
+            // edit/fix turns would silently run with defaults (AcpBackend prefers the stashed spec).
+            config: bridge_core::domain::effective_config(&impl_entry, None),
             cwd: Some(clone_cwd.clone()),
         },
     )
@@ -922,10 +926,16 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         }
     };
 
-    // 5. the pure soft-gate decision, then execute its Action.
+    // 5. the pure soft-gate decision, then execute its Action. A container exists now, so any post-edit
+    // early-return must `retire()` (the RwSweepGuard is only the backstop).
     let guard = implement::head_guard(&clone, &branch, &pre);
-    let stage =
-        implement::stage_state(&clone).map_err(|e| format!("implement: stage check: {e}"))?;
+    let stage = match implement::stage_state(&clone) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = warm.retire().await;
+            return Err(format!("implement: stage check: {e}").into());
+        }
+    };
     let msg = implement::commit_message(implement::read_commit_msg_file(&clone), &a.task);
     if msg.1 {
         eprintln!("[implement] no .git/A2A_COMMIT_MSG — using task-derived message");
@@ -957,8 +967,15 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             Ok(())
         }
         implement::Action::Commit(message) => {
-            // Phase 1 → 2 boundary: the ONLY post-commit `?`. After this, the loop body is lossy (no `?`).
-            let sha = implement::host_commit(&clone, &message)?;
+            // Phase 1 → 2 boundary: the LAST fallible setup step. Retire the warm container on its error
+            // path too (a container exists); after this the loop body is lossy (no `?`).
+            let sha = match implement::host_commit(&clone, &message) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = warm.retire().await;
+                    return Err(e.into());
+                }
+            };
             let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13 hygiene
             let mut effects = ProdEffects {
                 verify_cfg: &verify_cfg,
@@ -1971,6 +1988,12 @@ mod cli_tests {
             bridge_core::error::BridgeError::agent_crashed("x"),
         )]));
         assert!(!drain_turn(s).await);
+        // Done then a trailing teardown Err → STILL complete (completion latches)
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![
+            done("end_turn"),
+            Err(bridge_core::error::BridgeError::agent_crashed("teardown")),
+        ]));
+        assert!(drain_turn(s).await);
     }
 
     fn cr_entry(id: &str, mount: &str) -> AgentEntry {

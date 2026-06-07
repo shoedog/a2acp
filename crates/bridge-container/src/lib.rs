@@ -4,7 +4,7 @@
 //! (`new_warm`) reuses ONE container + ONE ACP session across the turns of a session, reaping ONLY at
 //! `retire()` — used by the `implement` review→tweak loop so edit + fix turns share continuity.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -95,8 +95,12 @@ pub struct ContainerRwBackend {
     lifecycle: Lifecycle,
     /// Warm mode only: the authoritative cached container/session per `SessionId` (drained at `retire`).
     warm: Mutex<HashMap<SessionId, WarmInner>>,
-    /// Warm mode only: sessions with an in-flight turn (concurrency reject); cleared by `TurnGuard`/cancel.
-    turn_active: Arc<Mutex<HashSet<SessionId>>>,
+    /// Warm mode only: sessions with an in-flight turn → the turn's monotonic epoch (concurrency reject).
+    /// The epoch lets a stale (early-drop) detached clear remove ONLY its own turn's marker, never a later
+    /// turn's (review finding: a bare `HashSet` clear could erase the next turn's marker).
+    turn_active: Arc<Mutex<HashMap<SessionId, u64>>>,
+    /// Warm mode only: monotonic per-turn epoch source for `turn_active`.
+    turn_epoch: AtomicU64,
 }
 
 impl ContainerRwBackend {
@@ -122,7 +126,8 @@ impl ContainerRwBackend {
             turn_seq: AtomicU64::new(0),
             lifecycle: Lifecycle::PerTurn,
             warm: Mutex::new(HashMap::new()),
-            turn_active: Arc::new(Mutex::new(HashSet::new())),
+            turn_active: Arc::new(Mutex::new(HashMap::new())),
+            turn_epoch: AtomicU64::new(0),
         })
     }
 
@@ -265,20 +270,25 @@ impl ContainerRwBackend {
                 reason: "missing session cwd".into(),
             },
         )?;
-        // Concurrency reject + mark active.
+        // Concurrency reject + mark active with a fresh monotonic epoch — the epoch lets the eventual
+        // clear (sync or detached) target ONLY this turn's marker, never a later turn's.
+        let epoch = self.turn_epoch.fetch_add(1, Ordering::Relaxed);
         {
             let mut ta = self.turn_active.lock().await;
-            if ta.contains(session) {
+            if ta.contains_key(session) {
                 return Err(BridgeError::ConfigInvalid {
                     reason: format!("session {} already has an in-flight turn", session.as_str()),
                 });
             }
-            ta.insert(session.clone());
+            ta.insert(session.clone(), epoch);
         }
-        // Clear `turn_active` synchronously on every pre-stream error path.
+        // Clear THIS turn's marker synchronously on every pre-stream error path (epoch-guarded).
         macro_rules! fail {
             ($e:expr) => {{
-                self.turn_active.lock().await.remove(session);
+                let mut ta = self.turn_active.lock().await;
+                if ta.get(session) == Some(&epoch) {
+                    ta.remove(session);
+                }
                 return Err($e);
             }};
         }
@@ -293,11 +303,18 @@ impl ContainerRwBackend {
             self.warm.lock().await.insert(session.clone(), wi);
             // NO re-configure on cache-miss: open_inner already configured with the canonical cwd.
         } else {
-            // Reuse: re-apply the cached canonical cwd (deterministic; minted_cwd guard passes).
-            let (inner, rw_canon) = {
+            // Reuse: re-apply the cached canonical cwd. A concurrent `retire` can drain the entry after the
+            // cache-hit check above → treat absence as "retired under me" (Err, NOT a panic on unwrap).
+            let reuse = {
                 let w = self.warm.lock().await;
-                let wi = w.get(session).unwrap();
-                (wi.inner.clone(), wi.rw_canon.clone())
+                w.get(session)
+                    .map(|wi| (wi.inner.clone(), wi.rw_canon.clone()))
+            };
+            let (inner, rw_canon) = match reuse {
+                Some(t) => t,
+                None => fail!(BridgeError::agent_crashed(
+                    "warm session retired during prompt"
+                )),
             };
             let mut spec_canon = spec.clone();
             spec_canon.cwd = Some(rw_canon);
@@ -305,10 +322,16 @@ impl ContainerRwBackend {
                 fail!(e) // reuse: no reap
             }
         }
-        let (inner, name, reaped) = {
+        let got = {
             let w = self.warm.lock().await;
-            let wi = w.get(session).unwrap();
-            (wi.inner.clone(), wi.name.clone(), wi.reaped.clone())
+            w.get(session)
+                .map(|wi| (wi.inner.clone(), wi.name.clone(), wi.reaped.clone()))
+        };
+        let (inner, name, reaped) = match got {
+            Some(t) => t,
+            None => fail!(BridgeError::agent_crashed(
+                "warm session retired during prompt"
+            )),
         };
         let inner_stream = match inner.prompt(session, parts).await {
             Ok(s) => s,
@@ -324,6 +347,7 @@ impl ContainerRwBackend {
         let guard = TurnGuard {
             turn_active: self.turn_active.clone(),
             session: session.clone(),
+            epoch,
             armed: true,
         };
         Ok(wrap_with_turn_guard(inner, inner_stream, guard))
@@ -546,11 +570,14 @@ fn wrap_with_reaper(
     })
 }
 
-/// Warm-turn guard: clears `turn_active` on normal stream end (synchronously, in `wrap_with_turn_guard`)
-/// OR on early consumer-drop (detached, here). NEVER reaps — the only warm reap site is `retire_warm`.
+/// Warm-turn guard: clears THIS turn's `turn_active` marker on normal stream end (synchronously, in
+/// `wrap_with_turn_guard`) OR on early consumer-drop (detached, here). The clear is EPOCH-GUARDED — it only
+/// removes the marker if it still carries this turn's epoch — so a late detached clear can never erase a
+/// subsequent turn's marker. NEVER reaps — the only warm reap site is `retire_warm`.
 struct TurnGuard {
-    turn_active: Arc<Mutex<HashSet<SessionId>>>,
+    turn_active: Arc<Mutex<HashMap<SessionId, u64>>>,
     session: SessionId,
+    epoch: u64,
     armed: bool,
 }
 impl Drop for TurnGuard {
@@ -560,8 +587,12 @@ impl Drop for TurnGuard {
         }
         let ta = self.turn_active.clone();
         let s = self.session.clone();
+        let epoch = self.epoch;
         spawn_detached(async move {
-            ta.lock().await.remove(&s);
+            let mut m = ta.lock().await;
+            if m.get(&s) == Some(&epoch) {
+                m.remove(&s);
+            }
         });
     }
 }
@@ -583,7 +614,13 @@ fn wrap_with_turn_guard(
         while let Some(item) = s.next().await {
             yield item;
         }
-        guard.turn_active.lock().await.remove(&guard.session);
+        // Epoch-guarded synchronous clear so a sequential next turn isn't spuriously rejected.
+        {
+            let mut m = guard.turn_active.lock().await;
+            if m.get(&guard.session) == Some(&guard.epoch) {
+                m.remove(&guard.session);
+            }
+        }
         guard.armed = false;
     })
 }
@@ -623,6 +660,7 @@ fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
 mod tests {
     use super::*;
     use bridge_core::domain::{EffectiveConfig, EgressPolicy, MountAccess};
+    use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
 
     // ---- stubs -------------------------------------------------------------
@@ -1091,7 +1129,7 @@ mod tests {
             "warm entry retained across a reuse error"
         );
         assert!(
-            !be.turn_active.lock().await.contains(&s),
+            !be.turn_active.lock().await.contains_key(&s),
             "turn_active cleared after the error"
         );
     }
@@ -1153,7 +1191,7 @@ mod tests {
         be.cancel(&s).await.unwrap();
         assert_eq!(reaps.load(Ordering::SeqCst), 0, "warm cancel does NOT reap");
         assert!(
-            !be.turn_active.lock().await.contains(&s),
+            !be.turn_active.lock().await.contains_key(&s),
             "cancel cleared turn_active"
         );
         be.retire().await.unwrap(); // retire still reaps the cached container
@@ -1180,8 +1218,72 @@ mod tests {
             "no warm entry inserted on open failure"
         );
         assert!(
-            !be.turn_active.lock().await.contains(&s),
+            !be.turn_active.lock().await.contains_key(&s),
             "turn_active cleared on open failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_stale_turn_guard_clear_is_epoch_scoped() {
+        // The core of the review fix: a stale (early-drop) TurnGuard's detached clear must remove ONLY its
+        // own turn's marker, never a later turn's.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, _) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(false), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        // A later turn owns the marker at epoch 5.
+        be.turn_active.lock().await.insert(s.clone(), 5);
+        // A STALE guard from an earlier turn (epoch 0) drops → its clear must NOT erase epoch 5.
+        drop(TurnGuard {
+            turn_active: be.turn_active.clone(),
+            session: s.clone(),
+            epoch: 0,
+            armed: true,
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            be.turn_active.lock().await.get(&s),
+            Some(&5),
+            "stale clear must not erase a later turn's marker"
+        );
+        // A guard whose epoch MATCHES does clear it.
+        drop(TurnGuard {
+            turn_active: be.turn_active.clone(),
+            session: s.clone(),
+            epoch: 5,
+            armed: true,
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !be.turn_active.lock().await.contains_key(&s),
+            "matching-epoch clear removes the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_cancel_then_reprompt_survives_old_stream_drop() {
+        // cancel clears turn 1's marker; turn 2 takes a fresh epoch; dropping the OLD (turn 1) stream must
+        // not erase turn 2's marker (review MAJOR: cancel-while-held + stale detached clear).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(false), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let h1 = be.prompt(&s, vec![]).await.unwrap(); // turn 1 (epoch 0), held un-drained
+        be.cancel(&s).await.unwrap(); // clears turn 1 marker, no reap
+        assert_eq!(reaps.load(Ordering::SeqCst), 0, "cancel does not reap warm");
+        let _h2 = be.prompt(&s, vec![]).await.unwrap(); // turn 2 (epoch 1), accepted + held
+        assert!(
+            be.turn_active.lock().await.contains_key(&s),
+            "turn 2 is active"
+        );
+        drop(h1); // old stream drop → epoch-0 detached clear (must be a no-op vs turn 2's epoch 1)
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            be.turn_active.lock().await.contains_key(&s),
+            "turn 2's marker survives the stale drop of turn 1"
         );
     }
 }
