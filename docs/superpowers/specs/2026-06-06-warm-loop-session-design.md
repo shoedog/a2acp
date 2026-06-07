@@ -149,11 +149,12 @@ what it did, not a re-read digest). The live gate showed exactly this multi-cold
 
 ## Risks (re-scored after the cross-check)
 
-- **Idle-survival across the verify+review gap (RISKIEST, empirical — the central bet).** The warm `:rw`
-  container + its ACP child/stdio sit idle for MINUTES (cargo verify + codex/claude review) between turns. If
-  the child or stdio does NOT survive that idle, every attempt-2 fix turn finds a dead session → the loop
-  degrades to a single fix (strict stop) until slice 3. **No code reading can settle this** → a quick spike
-  against a real `claude-agent-acp` container is warranted before committing to slice 2 (see Owner Decisions).
+- **Idle-survival across the verify+review gap — VALIDATED (was the riskiest bet).** A pre-build spike
+  (`/tmp/idle_spike.py`, recorded) drove a real `:rw` `claude-agent-acp` container (toolchain image, fresh
+  creds, egress): `initialize` → `session/new` → prompt → **420s (7 min) idle** → re-prompt the SAME session
+  → **PASS** (container still running; the warm session answered `end_turn`). So a multi-minute gap survives
+  and the feature is viable. CAVEAT: a pathological gap (cold cargo verify + a slow review) could exceed 7
+  min; that tail (and a mid-loop crash) is covered by strict-stop + the optional slice-3 self-heal.
 - **Mechanism complexity** in warm `prompt`/`TurnGuard`/`retire` (splitting the reap trigger from the turn
   marker) — the genuinely new code; contained by the acceptance test + byte-identical per-turn path.
 - **Reap leak** — contained by `retire()` + `RwSweepGuard` + `reaped` idempotence + boot sweep.
@@ -166,10 +167,8 @@ what it did, not a re-read digest). The live gate showed exactly this multi-cold
 1. **Idle-death policy = strict-stop (MVP).** If the warm session dies across the gap, fail cleanly with the
    hand-off rather than silently cold-reopening. (Already this spec's choice — confirmed by both architects.)
    The self-heal (slice 3) is gated on actually observing idle-death.
-2. **Idle-survival spike BEFORE slice 2.** The whole feature rests on the ACP child surviving a multi-minute
-   idle. Recommendation: a quick spike (open a warm `:rw` claude session, idle it minutes, prompt again)
-   against a real container first — if it fails, every multi-attempt loop degrades to a single fix until slice
-   3, which changes whether slice 2 is worth shipping standalone.
+2. **Idle-survival spike BEFORE slice 2 — DONE, PASS.** The spike (7-min idle, real container) survived (see
+   Risks). Slice 2 is worth shipping standalone; slice 3 (self-heal) stays DEFERRED (idle-death not observed).
 3. **(minor) Measure continuity quality before slice 3** — ship 1+2, measure whether warm fixes beat cold
    re-prime on real runs, then decide slice 3.
 
