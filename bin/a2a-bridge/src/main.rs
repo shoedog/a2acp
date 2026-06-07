@@ -507,31 +507,6 @@ async fn drain_review(
     review::reduce(&events)
 }
 
-/// Drain the implement-edit / implement-fix workflow stream → `completed`. Shared by the first edit turn and
-/// every fix turn; polls to the end so the executor runs its cancel cleanup. Total (no `?`).
-async fn drain_impl(mut stream: bridge_workflow::executor::WorkflowStream) -> bool {
-    use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
-    use futures::StreamExt;
-    let mut completed = false;
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(WorkflowEvent::NodeStarted { node }) => {
-                eprintln!("[implement] node {} started", node.as_str())
-            }
-            Ok(WorkflowEvent::NodeFinished { node, ok, .. }) => eprintln!(
-                "[implement] node {} {}",
-                node.as_str(),
-                if ok { "ok" } else { "failed" }
-            ),
-            Ok(WorkflowEvent::Terminal { outcome, .. }) => {
-                completed = matches!(outcome, WorkflowOutcome::Completed)
-            }
-            Err(e) => eprintln!("[implement] error: {e:?}"),
-        }
-    }
-    completed
-}
-
 /// Drain a warm-session turn's raw `Update` stream → `completed`. STRICTER than the executor (which leaves
 /// `ok=true` on a clean end — `executor.rs`): complete IFF a `Done { stop_reason != CANCELLED }` arrived; a
 /// stream `Err(_)` or a clean end without `Done` → incomplete. Polls to the end so the inner runs its
@@ -711,7 +686,11 @@ struct ProdEffects<'a> {
         std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
     >,
     executor: &'a bridge_workflow::executor::WorkflowExecutor,
-    fix_graph: Option<std::sync::Arc<bridge_workflow::graph::WorkflowGraph>>,
+    /// B2b-3c: the warm `:rw` backend + its ONE stable session — fix turns continue it (not the executor).
+    impl_backend: &'a dyn bridge_core::ports::AgentBackend,
+    impl_session: &'a bridge_core::ids::SessionId,
+    /// The fix node's prompt template (rendered with `{{input}}`); `None` ⇒ fix is never called.
+    fix_template: Option<String>,
     clone_cwd: &'a bridge_core::SessionCwd,
     repo: &'a std::path::Path,
     task: &'a str,
@@ -738,21 +717,24 @@ impl tweak::TweakEffects for ProdEffects<'_> {
         )
         .await
     }
-    async fn fix(&mut self, attempt: u32, input: &str) -> bool {
-        let graph = self
-            .fix_graph
-            .clone()
+    async fn fix(&mut self, _attempt: u32, input: &str) -> bool {
+        // Continue the SAME warm session — no new container, no new ACP session (the continuity).
+        let template = self
+            .fix_template
+            .as_deref()
             .expect("fix only called when fix_available");
-        drain_impl(self.executor.run_with_context(
-            graph,
-            input.to_string(),
-            format!("impl-fix-{}-{}", self.task_id, attempt),
-            tokio_util::sync::CancellationToken::new(),
-            bridge_workflow::executor::WorkflowRunContext {
-                session_cwd: Some(self.clone_cwd.clone()),
-            },
-        ))
-        .await
+        let vars: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("input", input)]);
+        let parts = vec![bridge_core::domain::Part {
+            text: bridge_workflow::template::render(template, &vars),
+        }];
+        match self.impl_backend.prompt(self.impl_session, parts).await {
+            Ok(stream) => drain_turn(stream).await,
+            Err(e) => {
+                eprintln!("[implement] fix turn failed: {e:?}");
+                false // → FixIncomplete
+            }
+        }
     }
 }
 
@@ -870,6 +852,45 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     ro_sweep(&ro_targets); // boot-sweep (crash recovery)
     let _ro_guard = RoSweepGuard(ro_targets); // synchronous END-sweep on any return (one-shot reliability)
     let policy = Arc::new(AutoPolicy);
+
+    // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
+    // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
+    // still uses the registry/executor built afterward. All reads of `snapshot`/`owner_config_path` happen
+    // here, before the moves.
+    let rw_targets = rw_sweep_targets(&snapshot, &owner_config_path);
+    rw_sweep(&rw_targets); // boot-sweep (crash recovery)
+    let _rw_guard = RwSweepGuard(rw_targets); // END-sweep backstop; declared BEFORE `warm` → drops AFTER it
+    let impl_entry = resolve_impl_identity(&graph, fix_graph.as_deref(), &snapshot)
+        .map_err(|e| format!("implement: {e}"))?;
+    let edit_template = graph.nodes[0].prompt_template.clone();
+    let fix_template: Option<String> =
+        fix_graph.as_ref().map(|g| g.nodes[0].prompt_template.clone());
+    let ccfg = container_rw_cfg_from_entry(&impl_entry)?; // validates sandbox + cmd (no unwrap below)
+    let warm_owner = container_owner(
+        &owner_config_path,
+        ccfg.sandbox.mount.as_str(),
+        impl_entry.id.as_str(),
+    );
+    let warm = bridge_container::ContainerRwBackend::new_warm(
+        ccfg,
+        Arc::new(AcpContainerSpawn {
+            policy: Arc::clone(&policy) as Arc<dyn PolicyEngine>,
+        }) as Arc<dyn bridge_container::ContainerSpawn>,
+        warm_owner,
+    )
+    .await?;
+    let impl_session = bridge_core::ids::SessionId::parse(format!("implement-{task_id}"))
+        .map_err(|e| format!("implement: session id: {e:?}"))?;
+    warm.configure_session(
+        &impl_session,
+        &bridge_core::domain::SessionSpec {
+            config: Default::default(),
+            cwd: Some(clone_cwd.clone()),
+        },
+    )
+    .await?;
+
+    // The registry + executor are still built — REVIEW runs through them (edit/fix are off-executor).
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
     let spawn = make_spawn_fn(policy_for_spawn, owner_config_path);
     let registry = Arc::new(
@@ -879,19 +900,24 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
-    let run_id = format!("impl-{task_id}");
-    let ctx = bridge_workflow::executor::WorkflowRunContext {
-        session_cwd: Some(clone_cwd.clone()),
+
+    // First edit turn — on the WARM session (off the executor). Render the single-node `{{input}}` template.
+    let edit_vars: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::from([("input", a.task.as_str())]);
+    let edit_input = bridge_workflow::template::render(&edit_template, &edit_vars);
+    let completed = match warm
+        .prompt(
+            &impl_session,
+            vec![bridge_core::domain::Part { text: edit_input }],
+        )
+        .await
+    {
+        Ok(stream) => drain_turn(stream).await,
+        Err(e) => {
+            eprintln!("[implement] edit turn failed: {e:?}");
+            false // pre-commit → decide() aborts
+        }
     };
-    // First edit turn; the per-turn ContainerRw container is reaped (detached) when the stream drops.
-    let completed = drain_impl(executor.run_with_context(
-        graph,
-        a.task.clone(),
-        run_id,
-        tokio_util::sync::CancellationToken::new(),
-        ctx,
-    ))
-    .await;
 
     // 5. the pure soft-gate decision, then execute its Action.
     let guard = implement::head_guard(&clone, &branch, &pre);
@@ -907,6 +933,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 "[implement] {reason} — NO commit; clone left at {}",
                 clone.display()
             );
+            let _ = warm.retire().await; // sole warm reap site; RwSweepGuard is the backstop
             Err(format!("implement: {reason}").into())
         }
         implement::Action::NoCommitClean => {
@@ -914,6 +941,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 "implement: made no changes; clone left at {}",
                 clone.display()
             );
+            let _ = warm.retire().await;
             Ok(())
         }
         implement::Action::NoCommitDirty => {
@@ -922,6 +950,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                  Clone left at {} for inspection.",
                 clone.display()
             );
+            let _ = warm.retire().await;
             Ok(())
         }
         implement::Action::Commit(message) => {
@@ -933,7 +962,9 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 review_cfg: &review_cfg,
                 wf_map: &wf_map,
                 executor: &executor,
-                fix_graph: fix_graph.clone(),
+                impl_backend: &warm,
+                impl_session: &impl_session,
+                fix_template,
                 clone_cwd: &clone_cwd,
                 repo: &a.repo,
                 task: &a.task,
@@ -969,6 +1000,9 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             handoff.push('\n');
             handoff.push_str(&tweak::loop_outcome_suffix(&final_.report));
             println!("{handoff}");
+            // Print BEFORE retire so a retire error never suppresses the hand-off; log-only, never alters
+            // the result (post-commit, no `?`). M4 retire-error coverage is by-construction ordering here.
+            let _ = warm.retire().await;
             Ok(())
         }
     }
