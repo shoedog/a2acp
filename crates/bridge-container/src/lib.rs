@@ -147,8 +147,14 @@ impl ContainerRwBackend {
         owner: String,
     ) -> Result<Self, BridgeError> {
         let runtime = cfg.sandbox.runtime().to_string();
-        Self::new_warm_with_hooks(cfg, spawn, owner, production_reap_fn(), production_sweep_fn(runtime))
-            .await
+        Self::new_warm_with_hooks(
+            cfg,
+            spawn,
+            owner,
+            production_reap_fn(),
+            production_sweep_fn(runtime),
+        )
+        .await
     }
 
     fn is_warm(&self) -> bool {
@@ -326,7 +332,12 @@ impl ContainerRwBackend {
     /// Warm cancel: cancel the cached inner's current turn + clear `turn_active`. Does NOT reap (the warm
     /// container survives for the next turn; `retire` owns reaping).
     async fn cancel_warm(&self, session: &SessionId) -> Result<(), BridgeError> {
-        let inner = self.warm.lock().await.get(session).map(|wi| wi.inner.clone());
+        let inner = self
+            .warm
+            .lock()
+            .await
+            .get(session)
+            .map(|wi| wi.inner.clone());
         if let Some(inner) = inner {
             let _ = inner.cancel(session).await;
         }
@@ -627,11 +638,7 @@ mod tests {
     }
     #[async_trait]
     impl AgentBackend for StubInner {
-        async fn prompt(
-            &self,
-            s: &SessionId,
-            _p: Vec<Part>,
-        ) -> Result<BackendStream, BridgeError> {
+        async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
             self.prompts.fetch_add(1, Ordering::SeqCst);
             self.sessions.lock().await.insert(s.as_str().to_string());
             if self.fail_prompt.load(Ordering::SeqCst) {
@@ -1099,10 +1106,7 @@ mod tests {
         be.configure_session(&s, &spec_cwd(root)).await.unwrap();
         let _held = be.prompt(&s, vec![]).await.unwrap(); // hold the stream
         let err = prompt_err(&be, &s).await;
-        assert!(
-            format!("{err:?}").contains("in-flight turn"),
-            "got {err:?}"
-        );
+        assert!(format!("{err:?}").contains("in-flight turn"), "got {err:?}");
     }
 
     #[tokio::test]

@@ -547,7 +547,9 @@ fn resolve_impl_identity(
         match fg.nodes.as_slice() {
             [n] if &n.agent == id => {}
             [_] => {
-                return Err("fix workflow agent must match the edit agent (one warm session)".into())
+                return Err(
+                    "fix workflow agent must match the edit agent (one warm session)".into(),
+                )
             }
             _ => return Err("fix workflow must be single-node".into()),
         }
@@ -863,8 +865,9 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let impl_entry = resolve_impl_identity(&graph, fix_graph.as_deref(), &snapshot)
         .map_err(|e| format!("implement: {e}"))?;
     let edit_template = graph.nodes[0].prompt_template.clone();
-    let fix_template: Option<String> =
-        fix_graph.as_ref().map(|g| g.nodes[0].prompt_template.clone());
+    let fix_template: Option<String> = fix_graph
+        .as_ref()
+        .map(|g| g.nodes[0].prompt_template.clone());
     let ccfg = container_rw_cfg_from_entry(&impl_entry)?; // validates sandbox + cmd (no unwrap below)
     let warm_owner = container_owner(
         &owner_config_path,
@@ -1947,9 +1950,11 @@ mod cli_tests {
     #[tokio::test]
     async fn drain_turn_outcomes() {
         use bridge_core::ports::{BackendStream, Update};
-        let done = |sr: &str| Ok(Update::Done {
-            stop_reason: sr.into(),
-        });
+        let done = |sr: &str| {
+            Ok(Update::Done {
+                stop_reason: sr.into(),
+            })
+        };
         // end_turn → complete
         let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("end_turn")]));
         assert!(drain_turn(s).await);
@@ -1957,10 +1962,9 @@ mod cli_tests {
         let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("cancelled")]));
         assert!(!drain_turn(s).await);
         // clean end without Done → incomplete (the executor-divergence guard)
-        let s: BackendStream =
-            Box::pin(tokio_stream::iter(Vec::<
-                Result<Update, bridge_core::error::BridgeError>,
-            >::new()));
+        let s: BackendStream = Box::pin(tokio_stream::iter(Vec::<
+            Result<Update, bridge_core::error::BridgeError>,
+        >::new()));
         assert!(!drain_turn(s).await);
         // stream error → incomplete
         let s: BackendStream = Box::pin(tokio_stream::iter(vec![Err(
@@ -2024,9 +2028,11 @@ mod cli_tests {
         );
         assert!(resolve_impl_identity(&edit, None, &s).is_ok());
         // edit multi-node
-        assert!(resolve_impl_identity(&wf("edit", &["impl", "impl"]), Some(&fix), &s)
-            .unwrap_err()
-            .contains("single-node"));
+        assert!(
+            resolve_impl_identity(&wf("edit", &["impl", "impl"]), Some(&fix), &s)
+                .unwrap_err()
+                .contains("single-node")
+        );
         // fix multi-node
         assert!(
             resolve_impl_identity(&edit, Some(&wf("fix", &["impl", "impl"])), &s)
