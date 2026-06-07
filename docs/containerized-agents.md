@@ -55,6 +55,17 @@ mount breaks refresh):
 > ```
 > (claude/codex are host-file copies; **kiro** is the `a2a-kiro-data` volume — re-run its device-flow
 > login if it has fully expired, not a host sync.)
+>
+> **Automate it (optional, macOS launchd).** Instead of running the pre-flight sync by hand, keep the
+> copies continuously fresh with a LaunchAgent that runs `sync-creds.sh` every 5 min (token TTLs are hours,
+> so the copy is always valid; short container turns don't refresh, so no rotation). A version-controlled
+> template lives at `deploy/containers/com.a2a-bridge.creds-refresh.plist`:
+> ```bash
+> cp deploy/containers/com.a2a-bridge.creds-refresh.plist ~/Library/LaunchAgents/
+> launchctl load -w ~/Library/LaunchAgents/com.a2a-bridge.creds-refresh.plist   # runs now + every 5 min
+> # logs: /tmp/a2a-creds-refresh.log   •   remove: launchctl unload -w … && rm ~/Library/LaunchAgents/com.a2a-bridge.creds-refresh.plist
+> ```
+> (Edit the `sync-creds.sh` path in the plist if your checkout isn't at `~/code/a2a-bridge`.)
 - **kiro** — a one-time in-container **device-flow** login (the host's macOS auth is NOT portable to
   Linux). Auth lives in `~/.local/share/kiro-cli/data.sqlite3`, persisted to a named volume:
   ```bash

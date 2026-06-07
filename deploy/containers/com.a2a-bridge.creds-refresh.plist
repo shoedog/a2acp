@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Optional launchd LaunchAgent: keep the containerized-agent cred COPIES fresh by running
+     sync-creds.sh on a timer, so a containerized claude/codex session never starts with a stale
+     (rotated-out) token. INSTALL it yourself (a standing daemon is a deliberate host change):
+
+       cp deploy/containers/com.a2a-bridge.creds-refresh.plist ~/Library/LaunchAgents/
+       launchctl load -w ~/Library/LaunchAgents/com.a2a-bridge.creds-refresh.plist
+
+     REMOVE:
+       launchctl unload -w ~/Library/LaunchAgents/com.a2a-bridge.creds-refresh.plist
+       rm ~/Library/LaunchAgents/com.a2a-bridge.creds-refresh.plist
+
+     Adjust the sync-creds.sh path below if your checkout isn't at ~/code/a2a-bridge. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.a2a-bridge.creds-refresh</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/wesleyjinks/code/a2a-bridge/deploy/containers/sync-creds.sh</string>
+        <string>all</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/tmp/a2a-creds-refresh.log</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/a2a-creds-refresh.log</string>
+</dict>
+</plist>
