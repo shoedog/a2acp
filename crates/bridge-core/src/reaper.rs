@@ -1,15 +1,12 @@
 //! Shared container-reaping primitives (used by the :rw ContainerRwBackend and the :ro AcpBackend path).
 //! Detached + idempotent so a `Drop` (which may fire off-runtime at process shutdown) never blocks/panics.
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// `(runtime, name) -> fire-and-forget reap`. Injectable so tests don't spawn Docker.
 pub type ReapFn = Arc<dyn Fn(String, String) + Send + Sync>;
-/// `(name-filter) -> async sweep`. Boot-time orphan sweep over a `name=<filter>` filter.
-pub type SweepFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Reap a named container exactly once (idempotent via the shared `reaped` flag).
 pub fn reap_once(reap_fn: &ReapFn, runtime: &str, name: &str, reaped: &Arc<AtomicBool>) {
@@ -50,30 +47,6 @@ pub fn production_reap_fn() -> ReapFn {
             )
             .await;
         });
-    })
-}
-
-/// Production boot-sweep: `<runtime> ps -aq --filter name=<filter>` then `rm -f` each id. Best-effort.
-pub fn production_sweep_fn(runtime: String) -> SweepFn {
-    Arc::new(move |filter: String| {
-        let runtime = runtime.clone();
-        Box::pin(async move {
-            let ps = tokio::process::Command::new(&runtime)
-                .args(["ps", "-aq", "--filter", &format!("name={filter}")])
-                .output()
-                .await;
-            let Ok(ps) = ps else {
-                tracing::warn!(runtime = %runtime, "container boot sweep: runtime unavailable");
-                return;
-            };
-            let ids = String::from_utf8_lossy(&ps.stdout);
-            for id in ids.split_whitespace() {
-                let _ = tokio::process::Command::new(&runtime)
-                    .args(["rm", "-f", id])
-                    .output()
-                    .await;
-            }
-        })
     })
 }
 
