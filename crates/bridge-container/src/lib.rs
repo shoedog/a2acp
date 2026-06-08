@@ -16,10 +16,9 @@ use bridge_core::domain::{Part, SandboxConfig, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{AgentBackend, BackendStream};
-use bridge_core::reaper::{
-    production_reap_fn, production_sweep_fn, reap_once, spawn_detached, ReapFn, SweepFn,
-};
-use bridge_core::sandbox::{check_rw_target, compose_container_rw};
+use bridge_core::reaper::{production_reap_fn, reap_once, spawn_detached, ReapFn};
+use bridge_core::run_identity::RunHandle;
+use bridge_core::sandbox::{a2a_name, check_rw_target, compose_container_rw};
 use bridge_core::session_cwd::SessionCwd;
 use futures::StreamExt;
 use tokio::sync::Mutex;
@@ -36,7 +35,8 @@ pub trait ContainerSpawn: Send + Sync {
     ) -> Result<Arc<dyn AgentBackend>, BridgeError>;
 }
 
-/// Static config for a `ContainerRw` agent (cheap, no Docker at construction beyond the boot sweep).
+/// Static config for a `ContainerRw` agent (cheap, no Docker at construction — crash-orphan recovery is
+/// process-level now, see `main.rs`).
 pub struct ContainerRwConfig {
     pub sandbox: SandboxConfig,
     /// The inner ACP CLI (e.g. `claude-agent-acp`) — runs contained.
@@ -47,6 +47,11 @@ pub struct ContainerRwConfig {
     pub auth_method: Option<String>,
     pub handshake_timeout: Duration,
     pub cancel_grace: Duration,
+    /// Increment A: the per-process run identity — stamps the `a2a.run`/`a2a.host`/`a2a.lease` labels +
+    /// the `run_id` segment of each container name (so a concurrent same-owner run never name-clashes).
+    pub run: RunHandle,
+    /// Increment A: the agent id (stamps the display-only `a2a.agent` label).
+    pub agent: String,
 }
 
 /// A live per-turn container handle, kept so `cancel` can reach the inner. Its `reaped` is SHARED with
@@ -104,18 +109,17 @@ pub struct ContainerRwBackend {
 }
 
 impl ContainerRwBackend {
-    /// Hook-injectable constructor (the ONE constructor — tests inject `reap_fn`/`sweep_fn`). AWAITS the
-    /// boot-orphan sweep BEFORE returning: the sweep is scoped by the stable `owner`, and because
-    /// `turn_seq` restarts at 0 a surviving orphan would collide with the first mint's `--name`, so the
-    /// sweep MUST complete before any mint (blocking-at-construction invariant).
+    /// Hook-injectable constructor (the ONE constructor — tests inject `reap_fn`). Crash-orphan recovery
+    /// is NOT done here: Increment A moved it to the process-level before-first-use `classify_sweep`
+    /// (`main.rs`), which is lease/host-scoped (only DEAD same-host orphans are reaped) so it never touches
+    /// a CONCURRENT run's containers. The unique per-run name segment (`a2a.run`) means a surviving orphan
+    /// can no longer collide with this run's first mint, so construction is now pure bookkeeping.
     pub async fn new_with_hooks(
         cfg: ContainerRwConfig,
         spawn: Arc<dyn ContainerSpawn>,
         owner: String,
         reap_fn: ReapFn,
-        sweep_fn: SweepFn,
     ) -> Result<Self, BridgeError> {
-        sweep_fn(format!("a2a-rw-{owner}-")).await;
         Ok(Self {
             cfg,
             spawn,
@@ -138,50 +142,33 @@ impl ContainerRwBackend {
         spawn: Arc<dyn ContainerSpawn>,
         owner: String,
         reap_fn: ReapFn,
-        sweep_fn: SweepFn,
     ) -> Result<Self, BridgeError> {
-        let mut be = Self::new_with_hooks(cfg, spawn, owner, reap_fn, sweep_fn).await?;
+        let mut be = Self::new_with_hooks(cfg, spawn, owner, reap_fn).await?;
         be.lifecycle = Lifecycle::Warm;
         Ok(be)
     }
 
-    /// Warm production constructor (detached reaper + boot sweep, like [`Self::new`]).
+    /// Warm production constructor (detached reaper, like [`Self::new`]).
     pub async fn new_warm(
         cfg: ContainerRwConfig,
         spawn: Arc<dyn ContainerSpawn>,
         owner: String,
     ) -> Result<Self, BridgeError> {
-        let runtime = cfg.sandbox.runtime().to_string();
-        Self::new_warm_with_hooks(
-            cfg,
-            spawn,
-            owner,
-            production_reap_fn(),
-            production_sweep_fn(runtime),
-        )
-        .await
+        Self::new_warm_with_hooks(cfg, spawn, owner, production_reap_fn()).await
     }
 
     fn is_warm(&self) -> bool {
         self.lifecycle == Lifecycle::Warm
     }
 
-    /// Production constructor: detached `docker rm -f` reaper + a runtime-parametric `docker ps`/`rm`
-    /// boot sweep, both keyed on the configured runtime (docker|podman).
+    /// Production constructor: detached `docker rm -f` reaper (crash-orphan recovery is process-level now —
+    /// see `new_with_hooks`).
     pub async fn new(
         cfg: ContainerRwConfig,
         spawn: Arc<dyn ContainerSpawn>,
         owner: String,
     ) -> Result<Self, BridgeError> {
-        let runtime = cfg.sandbox.runtime().to_string();
-        Self::new_with_hooks(
-            cfg,
-            spawn,
-            owner,
-            production_reap_fn(),
-            production_sweep_fn(runtime),
-        )
-        .await
+        Self::new_with_hooks(cfg, spawn, owner, production_reap_fn()).await
     }
 
     /// Canonicalize BOTH the mount anchor and the rw target (resolving symlinks — the writable-mount
@@ -212,14 +199,30 @@ impl ContainerRwBackend {
         })?;
         let rw_canon = self.resolve_rw_target(&cwd)?;
         let n = self.turn_seq.fetch_add(1, Ordering::Relaxed);
-        let name = format!("a2a-rw-{}-{}", self.owner, n);
+        // Increment A: the run-id segment defeats same-owner concurrent name clashes; the label set is
+        // built PER MINT so `kind` (warm|perturn) is never stale and `repo`/`cwd` reflect this :rw target.
+        let name = a2a_name("rw", &self.owner, &self.cfg.run.instance_id, &n.to_string());
+        let kind = if self.is_warm() { "warm" } else { "perturn" };
+        let repo = rw_canon.as_str();
+        let labels = self
+            .cfg
+            .run
+            .labels(
+                "rw",
+                kind,
+                &self.cfg.agent,
+                &self.owner,
+                Some(repo),
+                Some(repo),
+            )
+            .to_arg_pairs();
         let (program, argv) = compose_container_rw(
             &self.cfg.sandbox,
             &rw_canon,
             &name,
             &self.cfg.cmd,
             &self.cfg.args,
-            &[],
+            &labels,
         );
         let acp = AcpConfig {
             cwd: PathBuf::from(rw_canon.as_str()),
@@ -745,10 +748,6 @@ mod tests {
         });
         (f, n)
     }
-    fn noop_sweep() -> SweepFn {
-        Arc::new(|_filter| Box::pin(async {}))
-    }
-
     fn cfg_with_mount(mount: &str) -> ContainerRwConfig {
         ContainerRwConfig {
             sandbox: SandboxConfig {
@@ -766,6 +765,13 @@ mod tests {
             auth_method: None,
             handshake_timeout: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(5),
+            run: RunHandle {
+                instance_id: "run0".into(),
+                host: "h".into(),
+                lease: "/l/run0.lock".into(),
+                start: "0".into(),
+            },
+            agent: "impl".into(),
         }
     }
 
@@ -774,30 +780,18 @@ mod tests {
         spawn: Arc<dyn ContainerSpawn>,
         reap: ReapFn,
     ) -> ContainerRwBackend {
-        ContainerRwBackend::new_with_hooks(
-            cfg_with_mount(mount),
-            spawn,
-            "inst".into(),
-            reap,
-            noop_sweep(),
-        )
-        .await
-        .unwrap()
+        ContainerRwBackend::new_with_hooks(cfg_with_mount(mount), spawn, "inst".into(), reap)
+            .await
+            .unwrap()
     }
     async fn warm_backend(
         mount: &str,
         spawn: Arc<dyn ContainerSpawn>,
         reap: ReapFn,
     ) -> ContainerRwBackend {
-        ContainerRwBackend::new_warm_with_hooks(
-            cfg_with_mount(mount),
-            spawn,
-            "inst".into(),
-            reap,
-            noop_sweep(),
-        )
-        .await
-        .unwrap()
+        ContainerRwBackend::new_warm_with_hooks(cfg_with_mount(mount), spawn, "inst".into(), reap)
+            .await
+            .unwrap()
     }
     fn spec_cwd(p: &str) -> SessionSpec {
         SessionSpec {
@@ -1035,31 +1029,6 @@ mod tests {
         assert!(
             format!("{err:?}").contains("escapes mount root"),
             "got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn boot_sweep_runs_at_construction_with_owner_filter() {
-        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen2 = seen.clone();
-        let sweep: SweepFn = Arc::new(move |filter| {
-            let seen2 = seen2.clone();
-            Box::pin(async move {
-                seen2.lock().await.push(filter);
-            })
-        });
-        let _be = ContainerRwBackend::new_with_hooks(
-            cfg_with_mount("/root"),
-            CountingSpawn::new(false),
-            "inst42".into(),
-            counting_reap().0,
-            sweep,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            seen.lock().await.clone(),
-            vec!["a2a-rw-inst42-".to_string()]
         );
     }
 

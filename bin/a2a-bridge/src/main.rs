@@ -110,6 +110,7 @@ fn resolve_static_session_cwd(session_cwd: Option<&str>, cwd: Option<&str>) -> S
 fn acp_program_argv(
     entry: &AgentEntry,
     container_name: Option<&str>,
+    labels: &[(String, String)],
 ) -> Result<(String, Vec<String>), BridgeError> {
     let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
         reason: format!("acp agent {} missing cmd", entry.id.as_str()),
@@ -117,9 +118,9 @@ fn acp_program_argv(
     Ok(match (&entry.sandbox, container_name) {
         // Named (`:ro` reaper) container when the caller supplied a name.
         (Some(sb), Some(name)) => {
-            bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &entry.args, &[])
+            bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &entry.args, labels)
         }
-        (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &entry.args, &[]),
+        (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &entry.args, labels),
         (None, _) => (cmd.to_string(), entry.args.clone()),
     })
 }
@@ -131,17 +132,40 @@ fn acp_spawn_inputs(
     entry: &AgentEntry,
     cwd: PathBuf,
     owner_config_path: &std::path::Path,
+    run: &bridge_core::run_identity::RunHandle,
 ) -> Result<(String, Vec<String>, bridge_acp::acp_backend::AcpConfig), BridgeError> {
     use bridge_core::domain::MountAccess;
-    let ro_name = entry
+    // Increment A: a `:ro` reader carries the run-id in its name (no same-owner concurrent clash) + the
+    // full managed label set (so `recover_orphans`/`containers` classify it). `repo`/`cwd` are display-only.
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let (ro_name, labels) = match entry
         .sandbox
         .as_ref()
         .filter(|sb| matches!(sb.access, MountAccess::Ro))
-        .map(|sb| {
+    {
+        Some(sb) => {
             let owner = container_owner(owner_config_path, &sb.mount, entry.id.as_str());
-            bridge_core::sandbox::ro_container_name(&owner, &implement::nonce(8))
-        });
-    let (program, argv) = acp_program_argv(entry, ro_name.as_deref())?;
+            let name = bridge_core::sandbox::a2a_name(
+                "ro",
+                &owner,
+                &run.instance_id,
+                &implement::nonce(8),
+            );
+            let labels = run
+                .labels(
+                    "ro",
+                    "oneshot",
+                    entry.id.as_str(),
+                    &owner,
+                    Some(cwd_str.as_str()),
+                    Some(cwd_str.as_str()),
+                )
+                .to_arg_pairs();
+            (Some(name), labels)
+        }
+        None => (None, Vec::new()),
+    };
+    let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels)?;
     let container = ro_name.map(|name| bridge_acp::acp_backend::ContainerReap {
         runtime: entry
             .sandbox
@@ -196,6 +220,15 @@ fn container_owner(config_path: &std::path::Path, mount: &str, agent_id: &str) -
     format!("{:016x}", h.finish())
 }
 
+/// Epoch-seconds string for the display-only `a2a.start` label (no RFC3339 dep; `containers list` shows
+/// `age = now - start`).
+fn epoch_secs() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
 /// The `(runtime, owner)` sweep targets for THIS bridge instance's `:ro` agents. Reads the SNAPSHOT
 /// (normalized mount + typed kind/access) so the owner matches the spawn-time owner; `config_path` must be
 /// the SAME (canonical) value `make_spawn_fn` is given. Scoped per (config, mount, agent) owner so a
@@ -217,33 +250,6 @@ fn ro_sweep_targets(
         targets.push((sb.runtime().to_string(), owner));
     }
     targets
-}
-
-/// SYNCHRONOUS owner-scoped reap of `a2a-ro-<owner>-` containers (best-effort, blocking). Used for both
-/// the boot-sweep (crash recovery) and the one-shot END-sweep — the latter must be synchronous because the
-/// per-backend Drop reaper detaches its `docker rm -f`, which races process exit on a one-shot command
-/// (run-workflow/implement) where the runtime dies before the detached task runs (live-gate finding).
-fn ro_sweep(targets: &[(String, String)]) {
-    for (runtime, owner) in targets {
-        let (prog, argv) = bridge_core::sandbox::ro_sweep_filter_argv(runtime, owner);
-        if let Ok(out) = std::process::Command::new(&prog).args(&argv).output() {
-            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-                let _ = std::process::Command::new(runtime)
-                    .args(["rm", "-f", id])
-                    .output();
-            }
-        }
-    }
-}
-
-/// RAII end-sweep for one-shot commands: on drop (any return path) it synchronously reaps this run's `:ro`
-/// containers, so a clean `run-workflow`/`implement` exit doesn't leak (the detached Drop reaper races the
-/// process exit). Declared early so it drops AFTER the registry/backends (whose detached reaps fire first).
-struct RoSweepGuard(Vec<(String, String)>);
-impl Drop for RoSweepGuard {
-    fn drop(&mut self) {
-        ro_sweep(&self.0);
-    }
 }
 
 /// `(runtime, owner)` sweep targets for THIS instance's `:rw` (ContainerRw) agents — mirrors
@@ -269,27 +275,58 @@ fn rw_sweep_targets(
     targets
 }
 
-/// SYNCHRONOUS owner-scoped reap of `a2a-rw-<owner>-` containers (best-effort, blocking) — `:rw` sibling
-/// of [`ro_sweep`]. Used as the warm backend's boot-sweep + the one-shot END-sweep backstop.
-fn rw_sweep(targets: &[(String, String)]) {
-    for (runtime, owner) in targets {
-        let (prog, argv) = bridge_core::sandbox::rw_sweep_filter_argv(runtime, owner);
-        if let Ok(out) = std::process::Command::new(&prog).args(&argv).output() {
-            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-                let _ = std::process::Command::new(runtime)
-                    .args(["rm", "-f", id])
-                    .output();
-            }
-        }
+/// Increment A before-first-use crash-orphan recovery (replaces the owner-name boot sweeps). For every
+/// owner THIS process can spawn (`:rw` ContainerRw ∪ `:ro` sandboxed Acp), [`classify_sweep`] inspects the
+/// owner's MANAGED containers and reaps ONLY the DEAD ones (same host + a FREE flock lease). A live
+/// concurrent run holds its lease → its containers classify Alive → spared. Idempotent + best-effort, so
+/// it's safe to call at every entry point (one-shots once; serve at startup AND on each hot-reload).
+fn recover_orphans(
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    config_path: &std::path::Path,
+    host: &str,
+) {
+    use bridge_core::liveness::FsLeaseProbe;
+    let mut owners: Vec<(String, String)> = Vec::new();
+    owners.extend(rw_sweep_targets(snapshot, config_path));
+    owners.extend(ro_sweep_targets(snapshot, config_path));
+    owners.sort();
+    owners.dedup();
+    for (runtime, owner) in owners {
+        bridge_core::reaper::classify_sweep(&runtime, &owner, host, &FsLeaseProbe);
     }
 }
 
-/// RAII end-sweep for one-shot commands' `:rw` containers — `:rw` sibling of [`RoSweepGuard`]. Declared
-/// BEFORE the warm backend so it drops AFTER it (the warm `retire` reaps first; this is the backstop).
-struct RwSweepGuard(Vec<(String, String)>);
-impl Drop for RwSweepGuard {
+/// The DISTINCT container runtimes this process uses (across its `:rw` + `:ro` owners) — the set the
+/// [`RunEndGuard`] must sweep this run's `a2a.run` label over.
+fn run_guard_runtimes(
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    config_path: &std::path::Path,
+) -> Vec<String> {
+    let mut rts: Vec<String> = rw_sweep_targets(snapshot, config_path)
+        .into_iter()
+        .chain(ro_sweep_targets(snapshot, config_path))
+        .map(|(runtime, _owner)| runtime)
+        .collect();
+    rts.sort();
+    rts.dedup();
+    rts
+}
+
+/// RAII END-sweep for one-shot commands (`implement`/`run-workflow`): on drop (any return path) it
+/// synchronously reaps THIS run's containers — both `:rw` and `:ro` — by the `a2a.run` label, across every
+/// runtime in use. Label-scoped (not owner-name), so a CONCURRENT run's containers (a different `a2a.run`)
+/// are NEVER touched. Synchronous because the per-backend Drop reaper detaches its `docker rm -f`, which
+/// races process exit on a one-shot (the runtime can die before the detached task runs — live-gate finding).
+/// Declared BEFORE the warm backend so it drops AFTER it (warm `retire` reaps first; this is the backstop).
+struct RunEndGuard {
+    runtimes: Vec<String>,
+    instance_id: String,
+}
+impl Drop for RunEndGuard {
     fn drop(&mut self) {
-        rw_sweep(&self.0);
+        for runtime in &self.runtimes {
+            bridge_core::reaper::run_scoped_reap(runtime, &self.instance_id);
+        }
     }
 }
 
@@ -297,6 +334,7 @@ impl Drop for RwSweepGuard {
 /// [`make_spawn_fn`] (per-turn) and the warm `implement` path so both compose the SAME container.
 fn container_rw_cfg_from_entry(
     entry: &AgentEntry,
+    run: &bridge_core::run_identity::RunHandle,
 ) -> Result<bridge_container::ContainerRwConfig, BridgeError> {
     let sb = entry.sandbox.clone().ok_or(BridgeError::ConfigInvalid {
         reason: format!("container_rw agent {} requires sandbox", entry.id.as_str()),
@@ -313,6 +351,8 @@ fn container_rw_cfg_from_entry(
         auth_method: entry.auth_method.clone(),
         handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
         cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
+        run: run.clone(),
+        agent: entry.id.as_str().to_string(),
     })
 }
 
@@ -322,10 +362,12 @@ fn container_rw_cfg_from_entry(
 fn make_spawn_fn(
     policy_for_spawn: Arc<dyn bridge_core::ports::PolicyEngine>,
     owner_config_path: PathBuf,
+    run: bridge_core::run_identity::RunHandle,
 ) -> bridge_registry::registry::SpawnFn {
     Arc::new(move |entry: Arc<AgentEntry>| {
         let policy = Arc::clone(&policy_for_spawn);
         let owner_config_path = owner_config_path.clone();
+        let run = run.clone();
         Box::pin(async move {
             // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
             // Resolution chain: session_cwd → cwd → "."; then absolutize relative values.
@@ -347,7 +389,8 @@ fn make_spawn_fn(
             match entry.kind {
                 AgentKind::Acp => {
                     // Compose-or-raw + the `:ro` reaper via the shared helper (both factories agree).
-                    let (program, argv, acp) = acp_spawn_inputs(&entry, cwd, &owner_config_path)?;
+                    let (program, argv, acp) =
+                        acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)?;
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
                     let be = bridge_acp::acp_backend::AcpBackend::spawn(&program, &argv_ref, acp)
                         .await?
@@ -374,7 +417,7 @@ fn make_spawn_fn(
                         })?;
                         container_owner(&owner_config_path, &sb.mount, entry.id.as_str())
                     };
-                    let ccfg = container_rw_cfg_from_entry(&entry)?;
+                    let ccfg = container_rw_cfg_from_entry(&entry, &run)?;
                     let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
                         Arc::new(AcpContainerSpawn {
                             policy: Arc::clone(&policy),
@@ -895,25 +938,41 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         .map_err(|e| format!("implement: snapshot: {e}"))?;
     // Canonical config path: the owner token must match between the sweeps and the spawn factory.
     let owner_config_path = std::fs::canonicalize(&a.config).unwrap_or_else(|_| a.config.clone());
-    let ro_targets = ro_sweep_targets(&snapshot, &owner_config_path);
-    ro_sweep(&ro_targets); // boot-sweep (crash recovery)
-    let _ro_guard = RoSweepGuard(ro_targets); // synchronous END-sweep on any return (one-shot reliability)
+    // Increment A: ONE run identity + its flock lease for the whole command. The held lease IS the
+    // liveness signal a concurrent/later run's `classify_sweep` reads (lock free ⇒ this run died). Mint
+    // BEFORE recovery so our own lease is held while we sweep crash-orphans (we never self-classify Dead).
+    let host = bridge_core::liveness::host_id();
+    let instance_id = format!("{}-{}", std::process::id(), implement::nonce(8));
+    let _lease = bridge_core::liveness::acquire_lease(&instance_id)
+        .map_err(|e| format!("implement: acquire run lease: {e}"))?;
+    let run = bridge_core::run_identity::RunHandle {
+        instance_id: instance_id.clone(),
+        host: host.clone(),
+        lease: _lease.path().to_string_lossy().to_string(),
+        start: epoch_secs(),
+    };
+    // Before-first-use crash recovery: reap only DEAD (same host + free lease) orphans of THIS process's
+    // owners (`:rw` ∪ `:ro`); a live concurrent run's lease is held → its containers are spared.
+    recover_orphans(&snapshot, &owner_config_path, &host);
+    // Label-scoped END-sweep backstop (THIS run's `a2a.run` only). Declared BEFORE `warm` → drops AFTER it
+    // (the warm `retire` reaps first; this catches anything it missed, including the `:ro` reviewers).
+    let _run_guard = RunEndGuard {
+        runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
+        instance_id: instance_id.clone(),
+    };
     let policy = Arc::new(AutoPolicy);
 
     // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
     // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
     // still uses the registry/executor built afterward. All reads of `snapshot`/`owner_config_path` happen
     // here, before the moves.
-    let rw_targets = rw_sweep_targets(&snapshot, &owner_config_path);
-    rw_sweep(&rw_targets); // boot-sweep (crash recovery)
-    let _rw_guard = RwSweepGuard(rw_targets); // END-sweep backstop; declared BEFORE `warm` → drops AFTER it
     let impl_entry = resolve_impl_identity(&graph, fix_graph.as_deref(), &snapshot)
         .map_err(|e| format!("implement: {e}"))?;
     let edit_template = graph.nodes[0].prompt_template.clone();
     let fix_template: Option<String> = fix_graph
         .as_ref()
         .map(|g| g.nodes[0].prompt_template.clone());
-    let ccfg = container_rw_cfg_from_entry(&impl_entry)?; // validates sandbox + cmd (no unwrap below)
+    let ccfg = container_rw_cfg_from_entry(&impl_entry, &run)?; // validates sandbox + cmd (no unwrap below)
     let warm_owner = container_owner(
         &owner_config_path,
         ccfg.sandbox.mount.as_str(),
@@ -942,7 +1001,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
 
     // The registry + executor are still built — REVIEW runs through them (edit/fix are off-executor).
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
-    let spawn = make_spawn_fn(policy_for_spawn, owner_config_path);
+    let spawn = make_spawn_fn(policy_for_spawn, owner_config_path, run);
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
             .map_err(|e| format!("implement: registry: {e:?}"))?,
@@ -970,7 +1029,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     };
 
     // 5. the pure soft-gate decision, then execute its Action. A container exists now, so any post-edit
-    // early-return must `retire()` (the RwSweepGuard is only the backstop).
+    // early-return must `retire()` (the RunEndGuard is only the backstop).
     let guard = implement::head_guard(&clone, &branch, &pre);
     let stage = match implement::stage_state(&clone) {
         Ok(s) => s,
@@ -989,7 +1048,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 "[implement] {reason} — NO commit; clone left at {}",
                 clone.display()
             );
-            let _ = warm.retire().await; // sole warm reap site; RwSweepGuard is the backstop
+            let _ = warm.retire().await; // sole warm reap site; RunEndGuard is the backstop
             Err(format!("implement: {reason}").into())
         }
         implement::Action::NoCommitClean => {
@@ -1115,12 +1174,26 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     // Canonical config path: the owner token must match between the sweeps and the spawn factory.
     let owner_config_path =
         std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
-    let ro_targets = ro_sweep_targets(&snapshot, &owner_config_path);
-    ro_sweep(&ro_targets); // boot-sweep (crash recovery)
-    let _ro_guard = RoSweepGuard(ro_targets); // synchronous END-sweep on any return (one-shot reliability)
+    // Increment A: one run identity + flock lease for the command; before-first-use crash recovery + a
+    // label-scoped END-sweep (THIS run only — concurrent runs are untouched).
+    let host = bridge_core::liveness::host_id();
+    let instance_id = format!("{}-{}", std::process::id(), implement::nonce(8));
+    let _lease = bridge_core::liveness::acquire_lease(&instance_id)
+        .map_err(|e| format!("run-workflow: acquire run lease: {e}"))?;
+    let run = bridge_core::run_identity::RunHandle {
+        instance_id: instance_id.clone(),
+        host: host.clone(),
+        lease: _lease.path().to_string_lossy().to_string(),
+        start: epoch_secs(),
+    };
+    recover_orphans(&snapshot, &owner_config_path, &host);
+    let _run_guard = RunEndGuard {
+        runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
+        instance_id: instance_id.clone(),
+    };
     let policy = Arc::new(bridge_policy::permission::AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
-    let spawn = make_spawn_fn(policy_for_spawn, owner_config_path);
+    let spawn = make_spawn_fn(policy_for_spawn, owner_config_path, run);
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
             .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
@@ -1786,6 +1859,21 @@ async fn main() -> Result<(), BoxError> {
         )
     })?;
 
+    // Increment A: ONE run identity + flock lease for the serve lifetime (the lease — held until this
+    // process exits — is what a future run's `classify_sweep` reads to decide we're alive). serve is
+    // long-running with NO END-sweep: per-backend `retire` reaps with the runtime alive, and the next
+    // run's before-first-use recovery catches anything a crash leaves behind.
+    let host = bridge_core::liveness::host_id();
+    let instance_id = format!("{}-{}", std::process::id(), implement::nonce(8));
+    let _lease = bridge_core::liveness::acquire_lease(&instance_id)
+        .map_err(|e| format!("serve: acquire run lease: {e}"))?;
+    let run = bridge_core::run_identity::RunHandle {
+        instance_id,
+        host: host.clone(),
+        lease: _lease.path().to_string_lossy().to_string(),
+        start: epoch_secs(),
+    };
+
     // 3. Build the policy engine FIRST so the SAME engine drives both the inbound
     //    server's permission decisions AND each backend's REVERSE
     //    `session/request_permission` decisions (threaded via `with_policy`), so
@@ -1799,9 +1887,11 @@ async fn main() -> Result<(), BoxError> {
     //    per-session `configure_session` overrides them at dispatch (Task 6).
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
     let owner_config_path = config_path.clone();
+    let run_for_spawn = run.clone();
     let spawn: SpawnFn = Arc::new(move |entry: Arc<AgentEntry>| {
         let policy = Arc::clone(&policy_for_spawn);
         let owner_config_path = owner_config_path.clone();
+        let run = run_for_spawn.clone();
         Box::pin(async move {
             // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
             // Resolution chain: session_cwd → cwd → ".". A relative resolved value is joined
@@ -1824,7 +1914,8 @@ async fn main() -> Result<(), BoxError> {
             match entry.kind {
                 AgentKind::Acp => {
                     // Compose-or-raw + the `:ro` reaper via the shared helper (same as run-workflow).
-                    let (program, argv, acp) = acp_spawn_inputs(&entry, cwd, &owner_config_path)?;
+                    let (program, argv, acp) =
+                        acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)?;
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
                     let be = AcpBackend::spawn(&program, &argv_ref, acp)
                         .await?
@@ -1853,7 +1944,7 @@ async fn main() -> Result<(), BoxError> {
                         })?;
                         container_owner(&owner_config_path, &sb.mount, entry.id.as_str())
                     };
-                    let ccfg = container_rw_cfg_from_entry(&entry)?;
+                    let ccfg = container_rw_cfg_from_entry(&entry, &run)?;
                     let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
                         Arc::new(AcpContainerSpawn {
                             policy: Arc::clone(&policy),
@@ -1870,12 +1961,13 @@ async fn main() -> Result<(), BoxError> {
     //    the RegistryConfig we re-read below for the non-registry fields.
     let source = FileConfigSource::new(config_path.clone());
     let snapshot = source.load().await?; // initial desired state
-                                         // :ro reaper boot-sweep: reap this instance's orphaned :ro
-                                         // containers (config_path is already canonical, matching the
-                                         // owner the spawn factory uses). serve is long-running, so it
-                                         // needs no END-sweep — per-backend retire reaps run with the
-                                         // runtime alive, and the next boot-sweep catches any leftover.
-    ro_sweep(&ro_sweep_targets(&snapshot, &config_path));
+                                         // Increment A before-first-use crash recovery: reap only DEAD
+                                         // (same host + free lease) orphans of this instance's owners
+                                         // (`:rw` ∪ `:ro`); a live concurrent run holds its lease and is
+                                         // spared. serve is long-running with no END-sweep — per-backend
+                                         // retire reaps with the runtime alive, and the next run's recovery
+                                         // catches any crash leftover.
+    recover_orphans(&snapshot, &config_path, &host);
     // Fan-out source label (wire-observable in fan-out artifacts): the default
     // entry's `name` if set, else the default agent id, so a non-Kiro default
     // (e.g. codex) isn't mislabeled "kiro".
@@ -1894,9 +1986,14 @@ async fn main() -> Result<(), BoxError> {
     {
         let reg = Arc::clone(&registry);
         let mut watch = source.watch();
+        let recover_config = config_path.clone();
+        let recover_host = host.clone();
         tokio::spawn(async move {
             use futures::StreamExt;
             while let Some(snap) = watch.next().await {
+                // Increment A: recover crash-orphans for any owners a hot-reload introduces, BEFORE
+                // applying (idempotent; only DEAD same-host orphans are reaped, never a live run's).
+                recover_orphans(&snap, &recover_config, &recover_host);
                 if let Err(e) = reg.apply(snap).await {
                     tracing::error!(error = ?e, "registry reconcile failed");
                 }
@@ -2135,8 +2232,8 @@ mod cli_tests {
 
     #[test]
     fn rw_sweep_owner_matches_container_owner() {
-        // spec §5 silent-leak guard: the RwSweepGuard owner MUST equal the warm backend's spawn-time owner
-        // (both derive from container_owner over the SAME (config_path, mount, agent_id) triple).
+        // spec §5 silent-leak guard: the recovery sweep owner MUST equal the warm backend's spawn-time
+        // owner (both derive from container_owner over the SAME (config_path, mount, agent_id) triple).
         let cfg = std::path::Path::new("/cfg/a2a.toml");
         let s = snap(vec![cr_entry("impl", "/root")]);
         let targets = rw_sweep_targets(&s, cfg);
@@ -2144,7 +2241,7 @@ mod cli_tests {
         assert_eq!(
             targets[0].1,
             container_owner(cfg, "/root", "impl"),
-            "RwSweepGuard owner must equal the backend spawn-time owner"
+            "recovery-sweep owner must equal the backend spawn-time owner"
         );
     }
 
@@ -2180,7 +2277,7 @@ mod cli_tests {
         // raw: program = cmd, argv = args (Slice A compat).
         let raw = acp_entry("a");
         assert_eq!(
-            acp_program_argv(&raw, None).unwrap(),
+            acp_program_argv(&raw, None, &[]).unwrap(),
             ("claude-agent-acp".to_string(), Vec::<String>::new())
         );
         // sandbox: program = runtime (docker), argv wraps the inner cli with the :ro mount.
@@ -2193,19 +2290,19 @@ mod cli_tests {
             egress: EgressPolicy::Open,
             volumes: vec![],
         });
-        let (program, argv) = acp_program_argv(&sb, None).unwrap();
+        let (program, argv) = acp_program_argv(&sb, None, &[]).unwrap();
         assert_eq!(program, "docker");
         assert_eq!(argv.last().unwrap(), "claude-agent-acp");
         assert!(argv.contains(&"/work:/work:ro".to_string()));
         // sandbox + a container name → the `--name` is spliced in (the :ro reaper path).
-        let (_p, named) = acp_program_argv(&sb, Some("a2a-ro-owner-nonce")).unwrap();
+        let (_p, named) = acp_program_argv(&sb, Some("a2a-ro-owner-nonce"), &[]).unwrap();
         assert!(named
             .windows(2)
             .any(|w| w == ["--name", "a2a-ro-owner-nonce"]));
         // missing cmd → ConfigInvalid.
         let mut nocmd = acp_entry("c");
         nocmd.cmd = None;
-        assert!(acp_program_argv(&nocmd, None).is_err());
+        assert!(acp_program_argv(&nocmd, None, &[]).is_err());
     }
 
     #[test]
@@ -2525,8 +2622,17 @@ mod cli_tests {
         // called here — reuse it to avoid hand-rolling a typed no-op SpawnFn.
         let policy: std::sync::Arc<dyn bridge_core::ports::PolicyEngine> =
             std::sync::Arc::new(AutoPolicy);
-        let spawn =
-            super::make_spawn_fn(policy, root.join("examples/a2a-bridge.containerized.toml"));
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "t".into(),
+            host: "h".into(),
+            lease: "/l/t.lock".into(),
+            start: "0".into(),
+        };
+        let spawn = super::make_spawn_fn(
+            policy,
+            root.join("examples/a2a-bridge.containerized.toml"),
+            run,
+        );
         bridge_registry::registry::Registry::new(snap, spawn)
             .expect("containerized config (incl. the impl container_rw agent) validates");
     }
