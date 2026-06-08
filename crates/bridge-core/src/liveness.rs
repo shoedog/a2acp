@@ -77,6 +77,7 @@ pub fn acquire_lease_in(dir: &Path, run_id: &str) -> std::io::Result<LeaseGuard>
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false) // a lease file is a lock handle; never clobber its (irrelevant) content
         .open(&path)?;
     if !flock_nb(&file, true)? {
         return Err(std::io::Error::new(
@@ -142,6 +143,7 @@ mod tests {
                 .create(true)
                 .read(true)
                 .write(true)
+                .truncate(false)
                 .open(&path)
                 .unwrap();
             assert!(flock_nb(&f, true).unwrap());
