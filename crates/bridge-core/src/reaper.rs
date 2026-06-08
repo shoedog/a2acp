@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn plan_recovery_reaps_only_dead_same_host() {
         let probe = MapProbe(std::collections::HashMap::from([
-            ("/l/dead.lock".to_string(), Some(true)),  // free ⇒ dead
+            ("/l/dead.lock".to_string(), Some(true)),   // free ⇒ dead
             ("/l/alive.lock".to_string(), Some(false)), // held ⇒ alive
             ("/l/gone.lock".to_string(), None),         // absent ⇒ unknown
         ]));
