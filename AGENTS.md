@@ -55,6 +55,21 @@ a2a-bridge init --agents codex,claude   # scaffold ./a2a-bridge.toml + prompts
 a2a-bridge serve --config ./a2a-bridge.toml
 ```
 
+## 5. Inspect / clean up containers
+
+```bash
+a2a-bridge containers list  --config examples/a2a-bridge.containerized.toml          # this config's containers
+a2a-bridge containers list  --config examples/a2a-bridge.containerized.toml --all    # every managed container
+a2a-bridge containers reap  --config examples/a2a-bridge.containerized.toml          # reap DEAD (crashed) only
+a2a-bridge containers reap  --config … --all-dead                                    # every owner's DEAD
+a2a-bridge containers reap  --config … --force a2a-rw-<owner>-<run>-0                 # reap one by name (any state)
+```
+
+`list` classifies each container **alive / dead / unknown** by probing its run's `flock` lease (a free lock
+⇒ the owning run crashed) and flags **stale** ones (no output within `--older-than`, default `1h`). Reap is
+**Dead-only** by default — a live concurrent run is never touched; `--stale` reaps idle-but-alive,
+`--force <name>` is the only override (also how you clear legacy pre-Increment-A containers).
+
 ## cwd, configs, creds, concurrency
 
 - **cwd:** `run-workflow` → `--session-cwd`; `implement` → derived from `--repo` (it clones it). `serve` →
@@ -65,13 +80,15 @@ a2a-bridge serve --config ./a2a-bridge.toml
 - **Creds (containerized agents):** WRITABLE single-file copies in `~/.config/a2a-creds/{claude,codex}` —
   `cp ~/.codex/auth.json ~/.config/a2a-creds/codex/auth.json`, likewise claude (its OAuth token expires
   ~hourly, so re-copy if a claude node starts failing). See `docs/containerized-agents.md`.
-- **Concurrency:** a containerized run's container owner is `hash(config_path, mount, agent_id)` — **not the
-  target repo/cwd**. Two runs are safe in parallel only with **distinct config files** (or distinct impl
-  agent ids); the *same* config + agent against two repos at once will collide (shared container name +
-  boot-sweep). To parallelize across projects, give each its own config.
+- **Concurrency:** concurrent containerized runs are **safe with one shared config** — same repo twice or
+  different repos at once. Each run stamps a unique `a2a.run` id into its container names (no clash) and
+  holds an OS `flock` lease that marks it alive, so a peer's before-first-use recovery reaps only **crashed**
+  (Dead) orphans, never a live run's containers (ADR-0025). Crash leftovers are auto-recovered before the
+  next run and inspectable via `a2a-bridge containers list|reap`. (Distinct configs are still fine, just no
+  longer required to parallelize.)
 
 ## More
 
 - `docs/onboarding.md` — running the bridge with your own agents, end to end.
 - `docs/containerized-agents.md` — the egress-locked container setup + creds.
-- `docs/adr/` — design decisions (ADR-0014 cwd, ADR-0024 warm `implement` session, …).
+- `docs/adr/` — design decisions (ADR-0014 cwd, ADR-0024 warm `implement` session, ADR-0025 concurrent runs, …).
