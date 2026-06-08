@@ -29,8 +29,10 @@ mod config;
 mod containers;
 mod implement;
 mod implement_resume;
+mod resilient;
 mod review;
 mod route;
+mod turn;
 mod tweak;
 mod verify;
 
@@ -503,7 +505,7 @@ fn parse_run_workflow_args(
             other => {
                 return Err(
                     format!("run-workflow: unknown flag {other:?}\n{RUN_WORKFLOW_USAGE}").into(),
-                )
+                );
             }
         }
     }
@@ -566,7 +568,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
                     return Err(format!(
                         "implement --resume: unexpected arg {other:?}\n{IMPLEMENT_USAGE}"
                     )
-                    .into())
+                    .into());
                 }
             }
         }
@@ -614,7 +616,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
                 )
             }
             other => {
-                return Err(format!("implement: unknown flag {other:?}\n{IMPLEMENT_USAGE}").into())
+                return Err(format!("implement: unknown flag {other:?}\n{IMPLEMENT_USAGE}").into());
             }
         }
     }
@@ -649,78 +651,6 @@ async fn drain_review(
     review::reduce(&events)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct TurnOutcome {
-    completed: bool,
-    last_err: Option<bridge_core::error::BridgeError>,
-}
-
-/// Drain a warm-session turn's raw `Update` stream → `TurnOutcome`. STRICTER than the executor (which leaves
-/// `ok=true` on a clean end — `executor.rs`): complete IFF a `Done { stop_reason != CANCELLED }` arrived; a
-/// clean end without `Done` or an error-only stream → incomplete. Completion LATCHES — a trailing teardown
-/// `Err(_)` after a successful `Done` does not un-complete the turn and does not replace the last
-/// pre-completion error. Polls to the end so the inner runs its cancel/cleanup. Used for the off-executor
-/// edit + fix turns.
-async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> TurnOutcome {
-    use bridge_core::ports::{Update, STOP_REASON_CANCELLED};
-    use futures::StreamExt;
-    let mut completed = false;
-    let mut last_err = None;
-    while let Some(item) = stream.next().await {
-        match item {
-            // Latch: a non-cancelled Done completes the turn; later events can't un-complete it.
-            Ok(Update::Done { stop_reason }) => {
-                if stop_reason != STOP_REASON_CANCELLED {
-                    completed = true;
-                }
-            }
-            Ok(_) => {}
-            // Log, but do NOT flip a prior success — a teardown error after Done shouldn't fail the turn.
-            Err(e) => {
-                eprintln!("[implement] turn: stream error: {e:?}");
-                if !completed {
-                    last_err = Some(e);
-                }
-            }
-        }
-    }
-    TurnOutcome {
-        completed,
-        last_err,
-    }
-}
-
-#[async_trait::async_trait]
-trait TurnRunner: Send + Sync {
-    async fn run_turn(
-        &self,
-        session: &bridge_core::ids::SessionId,
-        parts: Vec<bridge_core::domain::Part>,
-    ) -> bool;
-}
-
-struct WarmTurnRunner<'a> {
-    backend: &'a dyn bridge_core::ports::AgentBackend,
-    label: &'static str,
-}
-
-#[async_trait::async_trait]
-impl TurnRunner for WarmTurnRunner<'_> {
-    async fn run_turn(
-        &self,
-        session: &bridge_core::ids::SessionId,
-        parts: Vec<bridge_core::domain::Part>,
-    ) -> bool {
-        match self.backend.prompt(session, parts).await {
-            Ok(stream) => drain_turn(stream).await.completed,
-            Err(e) => {
-                eprintln!("[implement] {} turn failed: {e:?}", self.label);
-                false
-            }
-        }
-    }
-}
-
 /// Resolve the single ContainerRw agent that drives BOTH the edit and fix turns of one warm session, or a
 /// fail-loud reason. Edit & fix workflows must each be single-node and name the SAME ContainerRw agent (one
 /// warm container/session can't serve two agents). Pure + Docker-free (validated pre-first-commit).
@@ -740,7 +670,7 @@ fn resolve_impl_identity(
             [_] => {
                 return Err(
                     "fix workflow agent must match the edit agent (one warm session)".into(),
-                )
+                );
             }
             _ => return Err("fix workflow must be single-node".into()),
         }
@@ -880,7 +810,7 @@ struct ProdEffects<'a> {
     >,
     executor: &'a bridge_workflow::executor::WorkflowExecutor,
     /// B2b-3c: the warm turn runner + its ONE stable session — fix turns continue it (not the executor).
-    runner: &'a dyn TurnRunner,
+    runner: &'a dyn turn::TurnRunner,
     impl_session: &'a bridge_core::ids::SessionId,
     /// The fix node's prompt template (rendered with `{{input}}`); `None` ⇒ fix is never called.
     fix_template: Option<String>,
@@ -926,10 +856,31 @@ impl tweak::TweakEffects for ProdEffects<'_> {
 }
 
 struct WarmImpl {
-    warm: bridge_container::ContainerRwBackend,
+    warm: Arc<dyn bridge_core::ports::AgentBackend>,
+    rebuild: Arc<dyn resilient::WarmRebuild>,
     impl_session: bridge_core::ids::SessionId,
+    session_spec: bridge_core::domain::SessionSpec,
     edit_template: String,
     fix_template: Option<String>,
+}
+
+struct ContainerWarmRebuild {
+    ccfg: bridge_container::ContainerRwConfig,
+    spawn: Arc<dyn bridge_container::ContainerSpawn>,
+    owner: String,
+}
+
+#[async_trait::async_trait]
+impl resilient::WarmRebuild for ContainerWarmRebuild {
+    async fn rebuild(&self) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
+        let warm = bridge_container::ContainerRwBackend::new_warm(
+            self.ccfg.clone(),
+            self.spawn.clone(),
+            self.owner.clone(),
+        )
+        .await?;
+        Ok(Arc::new(warm) as Arc<dyn bridge_core::ports::AgentBackend>)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -954,10 +905,12 @@ async fn build_warm_impl(
         ccfg.sandbox.mount.as_str(),
         impl_entry.id.as_str(),
     );
+    let cspawn =
+        Arc::new(AcpContainerSpawn { policy }) as Arc<dyn bridge_container::ContainerSpawn>;
     let warm = bridge_container::ContainerRwBackend::new_warm(
-        ccfg,
-        Arc::new(AcpContainerSpawn { policy }) as Arc<dyn bridge_container::ContainerSpawn>,
-        warm_owner,
+        ccfg.clone(),
+        cspawn.clone(),
+        warm_owner.clone(),
     )
     .await?;
     let session_id = match session_suffix {
@@ -966,18 +919,21 @@ async fn build_warm_impl(
     };
     let impl_session = bridge_core::ids::SessionId::parse(session_id)
         .map_err(|e| format!("implement: session id: {e:?}"))?;
-    warm.configure_session(
-        &impl_session,
-        &bridge_core::domain::SessionSpec {
-            config: bridge_core::domain::effective_config(&impl_entry, None),
-            cwd: Some(clone_cwd.clone()),
-        },
-    )
-    .await?;
+    let session_spec = bridge_core::domain::SessionSpec {
+        config: bridge_core::domain::effective_config(&impl_entry, None),
+        cwd: Some(clone_cwd.clone()),
+    };
+    warm.configure_session(&impl_session, &session_spec).await?;
 
     Ok(WarmImpl {
-        warm,
+        warm: Arc::new(warm) as Arc<dyn bridge_core::ports::AgentBackend>,
+        rebuild: Arc::new(ContainerWarmRebuild {
+            ccfg,
+            spawn: cspawn,
+            owner: warm_owner,
+        }),
         impl_session,
+        session_spec,
         edit_template,
         fix_template,
     })
@@ -997,7 +953,7 @@ async fn run_warm_loop(
     start_attempt: u32,
     max_attempts: u32,
     fix_available: bool,
-    warm: &bridge_container::ContainerRwBackend,
+    runner: &resilient::ResilientWarm,
     impl_session: &bridge_core::ids::SessionId,
     clone_cwd: &bridge_core::SessionCwd,
     verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
@@ -1011,16 +967,12 @@ async fn run_warm_loop(
     prod_ckpt: &mut implement_resume::ProdCheckpoint,
 ) {
     let final_ = {
-        let runner = WarmTurnRunner {
-            backend: warm,
-            label: "fix",
-        };
         let mut effects = ProdEffects {
             verify_cfg,
             review_cfg,
             wf_map,
             executor,
-            runner: &runner,
+            runner,
             impl_session,
             fix_template,
             clone_cwd,
@@ -1065,7 +1017,7 @@ async fn run_warm_loop(
         implement_resume::ImplementPhase::LoopStopped
     };
     implement_resume::write_terminal(clone, prod_ckpt.ck.clone(), terminal);
-    let _ = warm.retire().await;
+    let _ = runner.retire().await;
 }
 
 /// `a2a-bridge implement <task> --repo <path>` — clone a quarantine, run the 1-node `implement-edit`
@@ -1234,6 +1186,16 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
     )
     .await?;
+    let warm_runner = Arc::new(resilient::ResilientWarm::new(
+        warm_impl.warm.clone(),
+        warm_impl.rebuild.clone(),
+        warm_impl.session_spec.clone(),
+        loop_cfg.max_session_respawns,
+        {
+            let clone = clone.clone();
+            Arc::new(move || implement::reset_worktree_to_head(&clone))
+        },
+    ));
 
     // The registry + executor are still built — REVIEW runs through them (edit/fix are off-executor).
     let spawn = make_spawn_fn(Arc::clone(&policy), owner_config_path, run);
@@ -1249,16 +1211,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let edit_vars: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::from([("input", task.as_str())]);
     let edit_input = bridge_workflow::template::render(&warm_impl.edit_template, &edit_vars);
-    let edit_runner = WarmTurnRunner {
-        backend: &warm_impl.warm,
-        label: "edit",
-    };
-    let completed = edit_runner
-        .run_turn(
-            &warm_impl.impl_session,
-            vec![bridge_core::domain::Part { text: edit_input }],
-        )
-        .await;
+    let completed = turn::TurnRunner::run_turn(
+        warm_runner.as_ref(),
+        &warm_impl.impl_session,
+        vec![bridge_core::domain::Part { text: edit_input }],
+    )
+    .await;
 
     // 5. the pure soft-gate decision, then execute its Action. A container exists now, so any post-edit
     // early-return must `retire()` (the RunEndGuard is only the backstop).
@@ -1266,7 +1224,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let stage = match implement::stage_state(&clone) {
         Ok(s) => s,
         Err(e) => {
-            let _ = warm_impl.warm.retire().await;
+            let _ = warm_runner.retire().await;
             return Err(format!("implement: stage check: {e}").into());
         }
     };
@@ -1280,7 +1238,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 "[implement] {reason} — NO commit; clone left at {}",
                 clone.display()
             );
-            let _ = warm_impl.warm.retire().await; // sole warm reap site; RunEndGuard is the backstop
+            let _ = warm_runner.retire().await; // sole warm reap site; RunEndGuard is the backstop
             Err(format!("implement: {reason}").into())
         }
         implement::Action::NoCommitClean => {
@@ -1288,7 +1246,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 "implement: made no changes; clone left at {}",
                 clone.display()
             );
-            let _ = warm_impl.warm.retire().await;
+            let _ = warm_runner.retire().await;
             Ok(())
         }
         implement::Action::NoCommitDirty => {
@@ -1297,7 +1255,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                  Clone left at {} for inspection.",
                 clone.display()
             );
-            let _ = warm_impl.warm.retire().await;
+            let _ = warm_runner.retire().await;
             Ok(())
         }
         implement::Action::Commit(message) => {
@@ -1306,7 +1264,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             let sha = match implement::host_commit(&clone, &message) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = warm_impl.warm.retire().await;
+                    let _ = warm_runner.retire().await;
                     return Err(e.into());
                 }
             };
@@ -1339,7 +1297,6 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
             let subject = message.lines().next().unwrap_or("").to_string();
             let WarmImpl {
-                warm,
                 impl_session,
                 fix_template,
                 ..
@@ -1357,7 +1314,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 1, // start_attempt (fresh run)
                 loop_cfg.max_attempts,
                 fix_graph.is_some(),
-                &warm,
+                warm_runner.as_ref(),
                 &impl_session,
                 &clone_cwd,
                 &verify_cfg,
@@ -1378,6 +1335,13 @@ async fn implement_resume_cmd(resume_id: &str, config_path: &Path) -> Result<(),
         .map_err(|e| format!("implement --resume: read config {config_path:?}: {e}"))?;
     let cfg = config::RegistryConfig::parse(&raw)
         .map_err(|e| format!("implement --resume: config parse: {e}"))?;
+    let loop_cfg = cfg
+        .implement
+        .as_ref()
+        .map(|t| t.to_config())
+        .transpose()
+        .map_err(|e| format!("implement --resume: [implement] config: {e}"))?
+        .unwrap_or_default();
     let root = cfg
         .allowed_cwd_root
         .clone()
@@ -1462,6 +1426,16 @@ async fn implement_resume_cmd(resume_id: &str, config_path: &Path) -> Result<(),
         Some(&suffix),
     )
     .await?;
+    let warm_runner = Arc::new(resilient::ResilientWarm::new(
+        warm_impl.warm.clone(),
+        warm_impl.rebuild.clone(),
+        warm_impl.session_spec.clone(),
+        loop_cfg.max_session_respawns,
+        {
+            let clone = clone.clone();
+            Arc::new(move || implement::reset_worktree_to_head(&clone))
+        },
+    ));
 
     let spawn = make_spawn_fn(Arc::clone(&policy), owner_config_path, run);
     let registry = Arc::new(
@@ -1492,7 +1466,6 @@ async fn implement_resume_cmd(resume_id: &str, config_path: &Path) -> Result<(),
         ck.task_brief
     );
     let WarmImpl {
-        warm,
         impl_session,
         fix_template,
         ..
@@ -1510,7 +1483,7 @@ async fn implement_resume_cmd(resume_id: &str, config_path: &Path) -> Result<(),
         ck.attempt_next,
         ck.loop_max_attempts,
         fix_graph.is_some(),
-        &warm,
+        warm_runner.as_ref(),
         &impl_session,
         &clone_cwd,
         &verify_cfg,
@@ -1958,10 +1931,18 @@ fn known_init_agents() -> [(&'static str, Option<&'static str>); 4] {
 /// `mode` is intentionally omitted (a bad `mode` HARD-fails session/set_mode).
 fn agent_fragment(name: &str) -> &'static str {
     match name {
-        "kiro" => "\n# kiro: zero-auth local default (kiro-cli acp).\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\nmodel = \"auto\"\n",
-        "codex" => "\n# codex: gpt-5.5 with reasoning_effort (effort is codex-only).\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n",
-        "claude" => "\n# claude: subscription. NOTE: claude's model is NOT observable through the\n# bridge (claude-agent-acp uses the subscription default; set_model is best-effort).\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n",
-        "api" => "\n# api: OpenAI-compatible non-process backend. `api_key_env` is the NAME of an\n# env var holding the token (never the secret itself). Effort is not applied for api.\n[[agents]]\nid          = \"api\"\nkind        = \"api\"\nbase_url    = \"https://api.openai.com/v1\"\napi_key_env = \"OPENAI_API_KEY\"\nmodel       = \"gpt-4o-mini\"\n",
+        "kiro" => {
+            "\n# kiro: zero-auth local default (kiro-cli acp).\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\nmodel = \"auto\"\n"
+        }
+        "codex" => {
+            "\n# codex: gpt-5.5 with reasoning_effort (effort is codex-only).\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
+        }
+        "claude" => {
+            "\n# claude: subscription. NOTE: claude's model is NOT observable through the\n# bridge (claude-agent-acp uses the subscription default; set_model is best-effort).\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n"
+        }
+        "api" => {
+            "\n# api: OpenAI-compatible non-process backend. `api_key_env` is the NAME of an\n# env var holding the token (never the secret itself). Effort is not applied for api.\n[[agents]]\nid          = \"api\"\nkind        = \"api\"\nbase_url    = \"https://api.openai.com/v1\"\napi_key_env = \"OPENAI_API_KEY\"\nmodel       = \"gpt-4o-mini\"\n"
+        }
         _ => "",
     }
 }
@@ -2182,7 +2163,9 @@ fn init_cmd(args: &[String]) -> Result<(), BoxError> {
     println!(
         "Run a workflow: a2a-bridge run-workflow code-review --input <file> --session-cwd <repo> --config {cfg_path}"
     );
-    println!("More:          a2a-bridge help  (and `a2a-bridge <subcommand> --help`); quickstart in AGENTS.md");
+    println!(
+        "More:          a2a-bridge help  (and `a2a-bridge <subcommand> --help`); quickstart in AGENTS.md"
+    );
     Ok(())
 }
 
@@ -2247,7 +2230,7 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
                     "containers: unknown flag {other:?}\n{}",
                     containers::CONTAINERS_USAGE
                 )
-                .into())
+                .into());
             }
         }
     }
@@ -2359,7 +2342,9 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
             legacy.sort();
             legacy.dedup();
             for name in legacy {
-                println!("{name:<28} -    legacy   -          -        -      -     (reap with --force {name})");
+                println!(
+                    "{name:<28} -    legacy   -          -        -      -     (reap with --force {name})"
+                );
             }
             Ok(())
         }
@@ -2710,6 +2695,7 @@ async fn main() -> Result<(), BoxError> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    use crate::turn::TurnRunner;
 
     #[tokio::test]
     async fn drain_turn_outcomes() {
@@ -2722,8 +2708,8 @@ mod cli_tests {
         // end_turn → complete
         let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("end_turn")]));
         assert_eq!(
-            drain_turn(s).await,
-            TurnOutcome {
+            turn::drain_turn(s).await,
+            turn::TurnOutcome {
                 completed: true,
                 last_err: None,
             }
@@ -2731,8 +2717,8 @@ mod cli_tests {
         // cancelled → incomplete
         let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("cancelled")]));
         assert_eq!(
-            drain_turn(s).await,
-            TurnOutcome {
+            turn::drain_turn(s).await,
+            turn::TurnOutcome {
                 completed: false,
                 last_err: None,
             }
@@ -2742,8 +2728,8 @@ mod cli_tests {
             Result<Update, bridge_core::error::BridgeError>,
         >::new()));
         assert_eq!(
-            drain_turn(s).await,
-            TurnOutcome {
+            turn::drain_turn(s).await,
+            turn::TurnOutcome {
                 completed: false,
                 last_err: None,
             }
@@ -2752,8 +2738,8 @@ mod cli_tests {
         let crashed = bridge_core::error::BridgeError::agent_crashed("x");
         let s: BackendStream = Box::pin(tokio_stream::iter(vec![Err(crashed.clone())]));
         assert_eq!(
-            drain_turn(s).await,
-            TurnOutcome {
+            turn::drain_turn(s).await,
+            turn::TurnOutcome {
                 completed: false,
                 last_err: Some(crashed),
             }
@@ -2767,8 +2753,8 @@ mod cli_tests {
             done("cancelled"),
         ]));
         assert_eq!(
-            drain_turn(s).await,
-            TurnOutcome {
+            turn::drain_turn(s).await,
+            turn::TurnOutcome {
                 completed: false,
                 last_err: Some(last),
             }
@@ -2779,8 +2765,8 @@ mod cli_tests {
             Err(bridge_core::error::BridgeError::agent_crashed("teardown")),
         ]));
         assert_eq!(
-            drain_turn(s).await,
-            TurnOutcome {
+            turn::drain_turn(s).await,
+            turn::TurnOutcome {
                 completed: true,
                 last_err: None,
             }
@@ -2793,8 +2779,8 @@ mod cli_tests {
             Err(bridge_core::error::BridgeError::agent_crashed("teardown")),
         ]));
         assert_eq!(
-            drain_turn(s).await,
-            TurnOutcome {
+            turn::drain_turn(s).await,
+            turn::TurnOutcome {
                 completed: true,
                 last_err: Some(pre_done),
             }
@@ -2807,7 +2793,7 @@ mod cli_tests {
     }
 
     #[async_trait::async_trait]
-    impl TurnRunner for FakeTurnRunner {
+    impl turn::TurnRunner for FakeTurnRunner {
         async fn run_turn(
             &self,
             session: &bridge_core::ids::SessionId,

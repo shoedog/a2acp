@@ -345,6 +345,8 @@ pub struct ImplementToml {
     pub max_attempts: Option<u32>,
     #[serde(default)]
     pub fix_workflow: Option<String>,
+    #[serde(default)]
+    pub max_session_respawns: Option<u32>,
 }
 
 /// Parsed `[implement]`: a validated max + a parsed fix-workflow id (so the post-commit lookup is a soft
@@ -353,6 +355,7 @@ pub struct ImplementToml {
 pub struct LoopConfig {
     pub max_attempts: u32,
     pub fix_workflow: bridge_core::ids::WorkflowId,
+    pub max_session_respawns: u32,
 }
 
 fn default_fix_workflow_id() -> bridge_core::ids::WorkflowId {
@@ -360,12 +363,14 @@ fn default_fix_workflow_id() -> bridge_core::ids::WorkflowId {
 }
 
 const IMPLEMENT_HARD_MAX: u32 = 10;
+pub const RESPAWN_HARD_MAX: u32 = 20;
 
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             max_attempts: 3,
             fix_workflow: default_fix_workflow_id(),
+            max_session_respawns: 3,
         }
     }
 }
@@ -377,7 +382,7 @@ impl ImplementToml {
             Some(0) => {
                 return Err(ConfigError::Registry(
                     "[implement] max_attempts must be >= 1".into(),
-                ))
+                ));
             }
             Some(n) if n > IMPLEMENT_HARD_MAX => {
                 eprintln!(
@@ -393,9 +398,21 @@ impl ImplementToml {
             })?,
             None => default_fix_workflow_id(),
         };
+        let max_session_respawns = match self.max_session_respawns {
+            None => 3,
+            Some(0) => 0, // explicit opt-out: disables in-process warm-session respawns.
+            Some(n) if n > RESPAWN_HARD_MAX => {
+                eprintln!(
+                    "[implement] max_session_respawns {n} > {RESPAWN_HARD_MAX}; clamping to {RESPAWN_HARD_MAX}"
+                );
+                RESPAWN_HARD_MAX
+            }
+            Some(n) => n,
+        };
         Ok(LoopConfig {
             max_attempts,
             fix_workflow,
+            max_session_respawns,
         })
     }
 }
@@ -566,19 +583,19 @@ impl RegistryConfig {
                     return Err(ConfigError::Registry(format!(
                         "acp agent {:?} requires cmd",
                         id.as_str()
-                    )))
+                    )));
                 }
                 AgentKind::Api if a.base_url.is_none() => {
                     return Err(ConfigError::Registry(format!(
                         "api agent {:?} requires base_url",
                         id.as_str()
-                    )))
+                    )));
                 }
                 AgentKind::Api if a.cmd.is_some() => {
                     return Err(ConfigError::Registry(format!(
                         "api agent {:?} must not set cmd",
                         id.as_str()
-                    )))
+                    )));
                 }
                 _ => {}
             }
@@ -663,7 +680,7 @@ fn parse_effort(s: &str) -> Result<Effort, ConfigError> {
         other => {
             return Err(ConfigError::Registry(format!(
                 "invalid effort: {other:?} (expected minimal/low/medium/high/max)"
-            )))
+            )));
         }
     })
 }
@@ -677,7 +694,7 @@ fn parse_kind(s: &str) -> Result<AgentKind, ConfigError> {
         other => {
             return Err(ConfigError::Registry(format!(
                 "invalid kind: {other:?} (expected acp|api|container_rw)"
-            )))
+            )));
         }
     })
 }
@@ -1307,13 +1324,16 @@ addr="127.0.0.1:8080"
         let lc = ImplementToml {
             max_attempts: None,
             fix_workflow: None,
+            max_session_respawns: None,
         }
         .to_config()
         .unwrap();
         assert_eq!(lc.max_attempts, 3);
         assert_eq!(lc.fix_workflow.as_str(), "implement-fix");
+        assert_eq!(lc.max_session_respawns, 3);
         assert_eq!(LoopConfig::default().max_attempts, 3);
         assert_eq!(LoopConfig::default().fix_workflow.as_str(), "implement-fix");
+        assert_eq!(LoopConfig::default().max_session_respawns, 3);
     }
 
     #[test]
@@ -1321,6 +1341,7 @@ addr="127.0.0.1:8080"
         assert!(ImplementToml {
             max_attempts: Some(0),
             fix_workflow: None,
+            max_session_respawns: None,
         }
         .to_config()
         .is_err());
@@ -1331,6 +1352,7 @@ addr="127.0.0.1:8080"
         let lc = ImplementToml {
             max_attempts: Some(99),
             fix_workflow: None,
+            max_session_respawns: None,
         }
         .to_config()
         .unwrap();
@@ -1342,6 +1364,7 @@ addr="127.0.0.1:8080"
         let lc = ImplementToml {
             max_attempts: Some(2),
             fix_workflow: Some("my-fix".into()),
+            max_session_respawns: None,
         }
         .to_config()
         .unwrap();
@@ -1350,27 +1373,43 @@ addr="127.0.0.1:8080"
         assert!(ImplementToml {
             max_attempts: None,
             fix_workflow: Some("".into()),
+            max_session_respawns: None,
         }
         .to_config()
         .is_err());
     }
 
     #[test]
+    fn implement_config_max_session_respawns_defaults_and_clamps() {
+        let lc = ImplementToml {
+            max_attempts: None,
+            fix_workflow: None,
+            max_session_respawns: Some(99),
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(lc.max_session_respawns, RESPAWN_HARD_MAX);
+
+        let lc = ImplementToml {
+            max_attempts: None,
+            fix_workflow: None,
+            max_session_respawns: Some(0),
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(lc.max_session_respawns, 0);
+    }
+
+    #[test]
     fn implement_block_parses_from_toml() {
         let c = RegistryConfig::parse(
             "default=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n\
-             [implement]\nmax_attempts=2\nfix_workflow=\"implement-fix\"\n",
+             [implement]\nmax_attempts=2\nfix_workflow=\"implement-fix\"\nmax_session_respawns=4\n",
         )
         .unwrap();
-        assert_eq!(
-            c.implement
-                .as_ref()
-                .unwrap()
-                .to_config()
-                .unwrap()
-                .max_attempts,
-            2
-        );
+        let lc = c.implement.as_ref().unwrap().to_config().unwrap();
+        assert_eq!(lc.max_attempts, 2);
+        assert_eq!(lc.max_session_respawns, 4);
         let c2 = RegistryConfig::parse(
             "default=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n",
         )

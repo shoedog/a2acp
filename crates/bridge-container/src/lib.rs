@@ -37,6 +37,7 @@ pub trait ContainerSpawn: Send + Sync {
 
 /// Static config for a `ContainerRw` agent (cheap, no Docker at construction — crash-orphan recovery is
 /// process-level now, see `main.rs`).
+#[derive(Clone)]
 pub struct ContainerRwConfig {
     pub sandbox: SandboxConfig,
     /// The inner ACP CLI (e.g. `claude-agent-acp`) — runs contained.
