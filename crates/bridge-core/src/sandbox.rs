@@ -3,6 +3,16 @@
 
 use crate::domain::{EgressPolicy, MountAccess, SandboxConfig};
 
+/// PURE. `--label k=v` argv tokens for a managed container's label set (Increment A).
+pub fn a2a_label_args(pairs: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::with_capacity(pairs.len() * 2);
+    for (k, v) in pairs {
+        out.push("--label".into());
+        out.push(format!("{k}={v}"));
+    }
+    out
+}
+
 /// Expand a `[sandbox]` declaration into `(runtime program, argv)`. PURE + TOTAL — the egress data
 /// lives in the [`EgressPolicy`] variant, so no `unwrap`/panic. NO cwd / `--workdir`: the identical-path
 /// `:ro` mount makes the ACP `session/new` cwd resolve in-container (Slice A).
@@ -201,6 +211,15 @@ pub fn check_rw_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a2a_label_args_pairs_each_as_two_tokens() {
+        let a = a2a_label_args(&[
+            ("a2a.run".into(), "r1".into()),
+            ("a2a.managed".into(), "1".into()),
+        ]);
+        assert_eq!(a, vec!["--label", "a2a.run=r1", "--label", "a2a.managed=1"]);
+    }
 
     fn ro_locked() -> SandboxConfig {
         SandboxConfig {

@@ -6,6 +6,7 @@ pub mod ids;
 pub mod ports;
 pub mod process;
 pub mod reaper;
+pub mod run_identity;
 pub mod sandbox;
 pub mod session;
 pub mod session_cwd;
