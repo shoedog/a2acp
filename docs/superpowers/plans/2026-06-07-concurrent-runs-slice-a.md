@@ -635,3 +635,136 @@ needed. Then inline/subagent TDD build (S1→S5), the gate (T13), live gate (T14
 - **No placeholders:** the pure cores carry complete code; the S3 wiring tasks give exact mint sites +
   signatures (the one intentional prose stub is `last_output_age_secs`'s docker shell-out, with its PURE
   parse split out + tested — T6).
+
+---
+
+## rev2 — dual plan-review folds (AUTHORITATIVE where it supersedes the tasks above)
+
+Containerized plan-review (codex+claude→synth) + a2a-local codex backstop (both repo-grounded), verdict
+"not executable as-is." The items below SUPERSEDE the cited tasks.
+
+### Fold A — Liveness uses `libc::flock` (NO new dep); `tempfile` dev-dep (Task 4)
+`fs2` is not a workspace dep. Use **`libc::flock`** — `bridge-core` already has `libc = { workspace = true }`.
+Add `tempfile = "3"` to `crates/bridge-core/Cargo.toml` `[dev-dependencies]` (matches `bridge-container`).
+```rust
+// liveness.rs — acquire (held until the File drops) + probe, via libc::flock
+use std::os::unix::io::AsRawFd;
+fn flock_nb(file: &std::fs::File, exclusive: bool) -> std::io::Result<bool> {
+    let op = (if exclusive { libc::LOCK_EX } else { libc::LOCK_SH }) | libc::LOCK_NB;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
+    if rc == 0 { return Ok(true); }                       // acquired
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) { return Ok(false); } // held by another
+    Err(e)
+}
+pub struct LeaseGuard { path: std::path::PathBuf, _file: std::fs::File } // lock released when _file drops
+impl Drop for LeaseGuard { fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); } }
+pub fn acquire_lease_in(dir: &std::path::Path, run_id: &str) -> std::io::Result<LeaseGuard> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{run_id}.lock"));
+    let file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&path)?;
+    if !flock_nb(&file, true)? { return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "lease held")); }
+    Ok(LeaseGuard { path, _file: file })
+}
+pub fn acquire_lease(run_id: &str) -> std::io::Result<LeaseGuard> { acquire_lease_in(&lease_dir(), run_id) }
+// FsLeaseProbe::try_state: open the path (None if absent/err), flock_nb(exclusive): Ok(true)→Some(true)
+// (free⇒dead, then drop the fd to release), Ok(false)→Some(false) (held⇒alive), Err→None.
+```
+`lease_dir()` = `$A2A_LEASE_DIR` else `$HOME/.a2a-bridge/leases`. **Tests take an explicit dir** via
+`acquire_lease_in(tmp.path(), …)` / `FsLeaseProbe` against that path — **never mutate `A2A_LEASE_DIR`**
+(avoids the cross-test env race). `host_id()` stays shell-based but is only unit-tested for its
+empty/fallback branch (inject the raw output into a pure `parse_host(out) -> String`).
+
+### Fold B — Staleness via `docker logs --since` (drop the rfc3339 placeholder) (Task 6, D5)
+Replace `last_output_age_secs`/`parse_log_ts` with a boolean, no timestamp parsing:
+```rust
+/// True iff the container has produced NO log line within `window` (⇒ stale). `docker logs --since <window>
+/// --tail 1 <name>` empty ⇒ stale. Best-effort: any error ⇒ false (not stale — bias against false-stale).
+pub fn is_stale(runtime: &str, name: &str, window: &str) -> bool {
+    match std::process::Command::new(runtime)
+        .args(["logs", "--since", window, "--tail", "1", name]).output() {
+        Ok(o) => o.stdout.is_empty() && o.stderr.is_empty(),
+        Err(_) => false,
+    }
+}
+```
+`window` default `"1h"` (operator `--older-than` overrides). No `uuid`/`time`/`chrono` needed anywhere.
+
+### Fold C — `instance_id` + `start` without new deps (Task 9, naming MINOR)
+Mint the process identity as **`instance_id`** (label `a2a.run`), distinct from the executor/task `run_id`:
+```rust
+let instance_id = format!("{}-{}", std::process::id(), implement::nonce(8)); // existing nonce helper
+let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_secs().to_string()).unwrap_or_default();                   // epoch secs (display-only)
+let host = bridge_core::liveness::host_id();
+let _lease = bridge_core::liveness::acquire_lease(&instance_id)?;            // MUST live the whole command
+```
+`RunHandle.start` is epoch-secs string; `containers list` shows `age = now - start`. No RFC3339.
+
+### Fold D — Task 8 retargets to `main.rs` (`:ro` is named/composed there, NOT `acp_backend.rs`)
+The `:ro` container is named in `acp_spawn_inputs` (`ro_container_name`, `main.rs:130+`) and composed in
+`acp_program_argv` via `compose_sandbox_named` (`main.rs:120`). Retarget: thread `RunHandle`+labels through
+`acp_spawn_inputs → acp_program_argv → compose_sandbox_named(sb, name, cmd, args, &labels)`. **Drop the
+`acp_backend.rs` edit entirely.** Name via `a2a_name("ro", &owner, &instance_id, &nonce)`.
+
+### Fold E — S1 arity break covers ALL callers + the in-module tests + ONE argv order (Task 2)
+Adding `labels: &[(String,String)]` to `compose_sandbox_named`/`compose_container_rw` is an arity change that
+must update **at S1**: the 3 `bridge-core/src/sandbox.rs` in-module tests; `bin/a2a-bridge/src/main.rs:120`
+(`acp_program_argv`); `crates/bridge-container/src/lib.rs` (`compose_container_rw` call). All pass `&[]` at
+S1. **Argv order is fixed:** `run -i --rm --name <N> --label k=v …` — splice `--name` at `3..3` first, then
+splice the labels at `5..5` (after the name pair). Golden test on both fns asserting this exact order.
+
+### Fold F — `classify_sweep` filters `a2a.managed=1` AND removes dead leases (Task 6, MAJORs)
+`managed_inspect_argv` filters BOTH labels: `--filter label=a2a.owner=<owner> --filter label=a2a.managed=1`.
+After reaping a Dead container, collect its `a2a.lease` and `std::fs::remove_file` it **once per distinct
+lease** (a run's containers share one lease) at the end of the sweep:
+```rust
+// managed_inspect_argv emits ID\tHOST\tLEASE; classify Dead → rm -f the ID; push lease to a dedup set;
+// after the loop, for each lease in the set: let _ = std::fs::remove_file(lease);
+```
+
+### Fold G — serve before-first-use `:rw` recovery (Task 9, MAJOR)
+A startup-only sweep misses `serve` lazy-spawn + `Registry::apply` hot-reload owners (serve's existing sweep
+is `:ro`-only; `rw_sweep_targets` is never called in serve). Put the recovery **in the shared spawn closure**
+(`make_spawn_fn`'s `ContainerRw` arm), gated to run once per owner: just before `ContainerRwBackend::new`,
+call `reaper::classify_sweep(runtime, &owner, &host, &FsLeaseProbe)`. This covers implement (one owner at
+first spawn), run-workflow, AND serve (each owner on its first use / after reload) uniformly — and lets us
+delete the per-process startup sweep entirely (one site, before-first-use, by construction).
+
+### Fold H — drop the `sweep_fn` ripple, enumerated (Task 7/S3)
+Removing the construction boot-sweep deletes `sweep_fn` from `new_with_hooks`/`new_warm_with_hooks` (+ `new`/
+`new_warm` which build it via `production_sweep_fn`). Exact removals: the `production_sweep_fn`/`SweepFn`
+imports in `bridge-container/src/lib.rs`; the `noop_sweep()` test helper + its uses in `backend`/`warm_backend`
+helpers; the `boot_sweep_runs_at_construction_with_owner_filter` test (delete — replaced by the live-gate
+crash-recovery test); every `new_with_hooks`/`new_warm_with_hooks` call site (tests + the bin's
+`make_spawn_fn` `ContainerRwBackend::new`). `production_sweep_fn` stays in `bridge-core::reaper` (still used?
+if not, `#[allow(dead_code)]`-free: remove it too — grep first).
+
+### Fold I — `ContainerRwBackend` builds labels PER MINT (Task 7)
+Store a base `RunHandle` + `owner` + `repo`/`cwd` on the backend; build the `ContainerLabels` **inside
+`open_inner`** with `kind = if warm {"warm"} else {"perturn"}` (from `self.lifecycle`), so `kind` is never
+stale. `a2a.run = self.run.instance_id`, `a2a.owner = self.owner`.
+
+### Fold J — `containers list|reap` take `--config` to derive owners (Tasks 11/12)
+`containers_cmd` loads `--config` (default `./a2a-bridge.toml`), canonicalizes it (as `implement_cmd` does),
+`into_snapshot()`, and computes the owner set via `container_owner(config_path, sb.mount, agent_id)` over the
+ContainerRw + sandboxed-ACP entries (reuse the existing `rw_sweep_targets`/`ro_sweep_targets` shape). `list`
++ `reap` default scope to THESE owners; `--all-dead` ignores the owner set (every `a2a.managed` container,
+this host). `list --format` is an exact Go template:
+```
+docker ps -a --filter label=a2a.managed=1 --format '{{.Label "a2a.run"}}\t{{.Label "a2a.role"}}\t{{.Label "a2a.kind"}}\t{{.Label "a2a.agent"}}\t{{.Label "a2a.host"}}\t{{.Label "a2a.lease"}}\t{{.Label "a2a.start"}}\t{{.Label "a2a.repo"}}\t{{.Names}}'
+```
+Parse into a `record { run, role, kind, agent, host, lease, start, repo, name }` (split on `\t`, exactly 9
+fields; skip malformed lines); empty label → `"-"`. Pure `format_row(record, verdict, stale) -> String` +
+tests; pure `reap_plan(records, flags, my_owners) -> Vec<name>` + tests (Dead-only unless `--stale`/`--force`).
+Legacy pass: `docker ps -a --format '{{.Names}}'` filtered to `^a2a-(ro|rw)-` lacking `a2a.managed` → listed
+`legacy (list-only)`; reapable only via `--force <name>`.
+
+### Fold K — minors
+- **Test commands:** one filter per `cargo test` (`cargo test -p bridge-core run_identity` then `… a2a_label`
+  separately; same for `reaper`/`sandbox`).
+- **Task 13:** `cargo test --workspace` INCLUDES `bridge-container` (members = `crates/*`) — don't claim it's
+  excluded; run the full workspace. Coverage floors are **ci.yml** (workspace 85; bridge-core/acp/api/workflow
+  90) — assert against those, not a stale README.
+- **AGENTS.md:** add a step (fold into Task 15) documenting `a2a-bridge containers list|reap`.
+- **`instance_id`** everywhere internally; the docker label stays `a2a.run`.
