@@ -200,6 +200,32 @@ pub fn current_branch(clone: &Path) -> Result<String, String> {
     git_ok(Some(clone), &["symbolic-ref", "--short", "HEAD"])
 }
 
+/// True iff the worktree has staged or unstaged changes (untracked-aware via --porcelain).
+pub fn is_worktree_dirty(clone: &Path) -> Result<bool, String> {
+    let out =
+        run_git(Some(clone), &["status", "--porcelain"]).map_err(|e| format!("git status: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git status: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
+/// The subject (first line) of HEAD's commit message, recomputed for hand-off after resume.
+pub fn commit_subject(clone: &Path) -> Result<String, String> {
+    let out =
+        run_git(Some(clone), &["log", "-1", "--format=%s"]).map_err(|e| format!("git log: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git log: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// The agent has :rw + git and could switch branches or commit despite the contract. Assert HEAD is still
 /// `expect_branch` and hasn't advanced past `pre_sha`. Returns a human error for the subcommand.
 pub fn head_guard(clone: &Path, expect_branch: &str, pre_sha: &str) -> Result<(), String> {

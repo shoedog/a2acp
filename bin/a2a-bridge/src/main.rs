@@ -34,7 +34,7 @@ mod route;
 mod tweak;
 mod verify;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -517,25 +517,65 @@ fn parse_run_workflow_args(
 // `implement` subcommand (Slice B2b-1)
 // ---------------------------------------------------------------------------
 
+enum ImplementMode {
+    Fresh {
+        task: String,
+        repo: PathBuf,
+        base_ref: Option<String>,
+        workflow: String,
+    },
+    Resume {
+        resume_id: String,
+    },
+}
+
 struct ImplementArgs {
-    task: String,
-    repo: PathBuf,
-    base_ref: Option<String>,
+    mode: ImplementMode,
     config: PathBuf,
-    workflow: String,
 }
 
 const IMPLEMENT_USAGE: &str = "\
 usage: a2a-bridge implement <task> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>]
+       a2a-bridge implement --resume <id> [--config <path>]
   <task>          what to implement (a sentence/paragraph the agent acts on)
   --repo <path>   the repo to implement in; cloned into a quarantine under allowed_cwd_root (required)
   --config <path> registry config defining the impl agent + [implement]/[verify]/[review] (default: ./a2a-bridge.toml)
   --base-ref      branch/SHA to start from (default: the repo HEAD)
   --workflow <id> the edit workflow (default: implement-edit)
+  --resume <id>   resume a stranded run by its <id> (the clone dir name)
 Clones --repo, runs the warm containerized impl agent (edit+fix turns share one container+session),
 verifies, reviews the diff, and hands off a branch to merge.";
 
 fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
+    if args.first().map(String::as_str) == Some("--resume") {
+        let resume_id = args
+            .get(1)
+            .cloned()
+            .ok_or("implement: --resume needs an <id>")?;
+        let mut config = None;
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--config" => {
+                    config = Some(PathBuf::from(
+                        args.get(i + 1).ok_or("implement: --config needs a value")?,
+                    ));
+                    i += 2;
+                }
+                other => {
+                    return Err(format!(
+                        "implement --resume: unexpected arg {other:?}\n{IMPLEMENT_USAGE}"
+                    )
+                    .into())
+                }
+            }
+        }
+        return Ok(ImplementArgs {
+            mode: ImplementMode::Resume { resume_id },
+            config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
+        });
+    }
+
     let mut iter = args.iter();
     let task = iter
         .next()
@@ -579,12 +619,15 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
         }
     }
     Ok(ImplementArgs {
-        task,
-        repo: repo
-            .ok_or_else(|| format!("implement: --repo <path> is required\n{IMPLEMENT_USAGE}"))?,
-        base_ref,
+        mode: ImplementMode::Fresh {
+            task,
+            repo: repo.ok_or_else(|| {
+                format!("implement: --repo <path> is required\n{IMPLEMENT_USAGE}")
+            })?,
+            base_ref,
+            workflow: workflow.unwrap_or_else(|| "implement-edit".into()),
+        },
         config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
-        workflow: workflow.unwrap_or_else(|| "implement-edit".into()),
     })
 }
 
@@ -841,6 +884,145 @@ impl tweak::TweakEffects for ProdEffects<'_> {
     }
 }
 
+struct WarmImpl {
+    warm: bridge_container::ContainerRwBackend,
+    impl_session: bridge_core::ids::SessionId,
+    edit_template: String,
+    fix_template: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_warm_impl(
+    graph: &bridge_workflow::graph::WorkflowGraph,
+    fix_graph: Option<&bridge_workflow::graph::WorkflowGraph>,
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    owner_config_path: &Path,
+    run: &bridge_core::run_identity::RunHandle,
+    policy: Arc<dyn PolicyEngine>,
+    clone_cwd: &bridge_core::SessionCwd,
+    task_id: &str,
+    session_suffix: Option<&str>,
+) -> Result<WarmImpl, BoxError> {
+    let impl_entry =
+        resolve_impl_identity(graph, fix_graph, snapshot).map_err(|e| format!("implement: {e}"))?;
+    let edit_template = graph.nodes[0].prompt_template.clone();
+    let fix_template = fix_graph.map(|g| g.nodes[0].prompt_template.clone());
+    let ccfg = container_rw_cfg_from_entry(&impl_entry, run)?;
+    let warm_owner = container_owner(
+        owner_config_path,
+        ccfg.sandbox.mount.as_str(),
+        impl_entry.id.as_str(),
+    );
+    let warm = bridge_container::ContainerRwBackend::new_warm(
+        ccfg,
+        Arc::new(AcpContainerSpawn { policy }) as Arc<dyn bridge_container::ContainerSpawn>,
+        warm_owner,
+    )
+    .await?;
+    let session_id = match session_suffix {
+        Some(suffix) => format!("implement-{task_id}-{suffix}"),
+        None => format!("implement-{task_id}"),
+    };
+    let impl_session = bridge_core::ids::SessionId::parse(session_id)
+        .map_err(|e| format!("implement: session id: {e:?}"))?;
+    warm.configure_session(
+        &impl_session,
+        &bridge_core::domain::SessionSpec {
+            config: bridge_core::domain::effective_config(&impl_entry, None),
+            cwd: Some(clone_cwd.clone()),
+        },
+    )
+    .await?;
+
+    Ok(WarmImpl {
+        warm,
+        impl_session,
+        edit_template,
+        fix_template,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_warm_loop(
+    clone: &Path,
+    repo: &Path,
+    branch: &str,
+    task: &str,
+    base_sha: &str,
+    task_id: &str,
+    sha: String,
+    original_message: &str,
+    handoff_subject: &str,
+    start_attempt: u32,
+    max_attempts: u32,
+    fix_available: bool,
+    warm: &bridge_container::ContainerRwBackend,
+    impl_session: &bridge_core::ids::SessionId,
+    clone_cwd: &bridge_core::SessionCwd,
+    verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    review_cfg: &Option<Result<config::ReviewConfig, config::ConfigError>>,
+    wf_map: &std::collections::HashMap<
+        bridge_core::ids::WorkflowId,
+        std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
+    >,
+    executor: &bridge_workflow::executor::WorkflowExecutor,
+    fix_template: Option<String>,
+    prod_ckpt: &mut implement_resume::ProdCheckpoint,
+) {
+    let final_ = {
+        let mut effects = ProdEffects {
+            verify_cfg,
+            review_cfg,
+            wf_map,
+            executor,
+            impl_backend: warm,
+            impl_session,
+            fix_template,
+            clone_cwd,
+            repo,
+            task,
+            base_sha,
+            task_id,
+        };
+        tweak::run_tweak_loop(
+            clone,
+            branch,
+            task,
+            sha,
+            original_message,
+            start_attempt,
+            max_attempts,
+            fix_available,
+            &mut effects,
+            prod_ckpt,
+        )
+        .await
+    };
+
+    let mut handoff = implement::handoff_text(
+        &clone.to_string_lossy(),
+        branch,
+        &final_.sha,
+        handoff_subject,
+        &repo.to_string_lossy(),
+    );
+    handoff.push('\n');
+    handoff.push_str(&verify::outcome_suffix(&final_.last_verify));
+    handoff.push('\n');
+    handoff.push_str(&review::outcome_suffix(&final_.last_review));
+    handoff.push('\n');
+    handoff.push_str(&tweak::loop_outcome_suffix(&final_.report));
+    println!("{handoff}");
+
+    let terminal = if final_.report.stop_reason == tweak::StopReason::Success {
+        implement_resume::ImplementPhase::Approved
+    } else {
+        implement_resume::ImplementPhase::LoopStopped
+    };
+    implement_resume::write_terminal(clone, prod_ckpt.ck.clone(), terminal);
+    let _ = warm.retire().await;
+}
+
 /// `a2a-bridge implement <task> --repo <path>` — clone a quarantine, run the 1-node `implement-edit`
 /// workflow on the ContainerRw `impl` agent (session_cwd = the clone), then commit + the bounded
 /// review→tweak loop (B2b-3b) + the operator hand-off. The agent owns staging; the bridge owns the commit.
@@ -851,10 +1033,22 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     }
     bridge_observ::init();
     let a = parse_implement_args(args)?;
+    let config_path = a.config.clone();
+    let (task, repo, base_ref, workflow) = match a.mode {
+        ImplementMode::Fresh {
+            task,
+            repo,
+            base_ref,
+            workflow,
+        } => (task, repo, base_ref, workflow),
+        ImplementMode::Resume { resume_id } => {
+            return implement_resume_cmd(&resume_id, &config_path).await;
+        }
+    };
 
     // 1. config + canonical allowed_cwd_root (the ContainerRw mount anchor).
-    let raw = std::fs::read_to_string(&a.config)
-        .map_err(|e| format!("implement: read config {:?}: {e}", a.config))?;
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("implement: read config {:?}: {e}", config_path))?;
     let cfg =
         config::RegistryConfig::parse(&raw).map_err(|e| format!("implement: config parse: {e}"))?;
     let root = cfg
@@ -897,9 +1091,9 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     };
 
     // R9: resolve the base ref (or the source HEAD) to a SHA for determinism.
-    let refname = a.base_ref.clone().unwrap_or_else(|| "HEAD".into());
-    let rp = implement::run_git(Some(&a.repo), &["rev-parse", &refname])
-        .map_err(|e| format!("implement: rev-parse {refname:?} in {:?}: {e}", a.repo))?;
+    let refname = base_ref.clone().unwrap_or_else(|| "HEAD".into());
+    let rp = implement::run_git(Some(&repo), &["rev-parse", &refname])
+        .map_err(|e| format!("implement: rev-parse {refname:?} in {:?}: {e}", repo))?;
     if !rp.status.success() {
         return Err(format!(
             "implement: base-ref {refname:?}: {}",
@@ -910,7 +1104,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let base_sha = String::from_utf8_lossy(&rp.stdout).trim().to_string();
 
     // 3. clone (committed-only) + checkout the base SHA + the task branch.
-    implement::do_clone(&a.repo.to_string_lossy(), &clone.to_string_lossy())?;
+    implement::do_clone(&repo.to_string_lossy(), &clone.to_string_lossy())?;
     let co = implement::run_git(Some(&clone), &["checkout", "-q", &base_sha])
         .map_err(|e| format!("implement: checkout {base_sha}: {e}"))?;
     if !co.status.success() {
@@ -930,8 +1124,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13: strip before
 
     // 4. run the 1-node implement-edit workflow with session_cwd = the clone.
-    let base = a
-        .config
+    let base = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -939,12 +1132,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let wf_map = cfg
         .load_workflows(&base)
         .map_err(|e| format!("implement: workflow load: {e}"))?;
-    let wf_id = bridge_core::ids::WorkflowId::parse(a.workflow.clone())
-        .map_err(|e| format!("implement: workflow id {:?}: {e:?}", a.workflow))?;
+    let wf_id = bridge_core::ids::WorkflowId::parse(workflow.clone())
+        .map_err(|e| format!("implement: workflow id {:?}: {e:?}", workflow))?;
     let graph = wf_map
         .get(&wf_id)
         .cloned()
-        .ok_or_else(|| format!("implement: unknown workflow {:?}", a.workflow))?;
+        .ok_or_else(|| format!("implement: unknown workflow {:?}", workflow))?;
     // B2b-3b: resolve the fix workflow against the loaded map (None → FixUnavailable, a soft loop stop).
     let fix_graph = wf_map.get(&loop_cfg.fix_workflow).cloned();
     // B2b-2: parse [verify] NOW, before into_snapshot moves cfg. Owned + Clone, survives the move.
@@ -954,7 +1147,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
     // Canonical config path: the owner token must match between the sweeps and the spawn factory.
-    let owner_config_path = std::fs::canonicalize(&a.config).unwrap_or_else(|_| a.config.clone());
+    let owner_config_path =
+        std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
     // Increment A: ONE run identity + its flock lease for the whole command. The held lease IS the
     // liveness signal a concurrent/later run's `classify_sweep` reads (lock free ⇒ this run died). Mint
     // BEFORE recovery so our own lease is held while we sweep crash-orphans (we never self-classify Dead).
@@ -977,48 +1171,27 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
         instance_id: instance_id.clone(),
     };
-    let policy = Arc::new(AutoPolicy);
+    let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
 
     // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
     // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
     // still uses the registry/executor built afterward. All reads of `snapshot`/`owner_config_path` happen
     // here, before the moves.
-    let impl_entry = resolve_impl_identity(&graph, fix_graph.as_deref(), &snapshot)
-        .map_err(|e| format!("implement: {e}"))?;
-    let edit_template = graph.nodes[0].prompt_template.clone();
-    let fix_template: Option<String> = fix_graph
-        .as_ref()
-        .map(|g| g.nodes[0].prompt_template.clone());
-    let ccfg = container_rw_cfg_from_entry(&impl_entry, &run)?; // validates sandbox + cmd (no unwrap below)
-    let warm_owner = container_owner(
+    let warm_impl = build_warm_impl(
+        &graph,
+        fix_graph.as_deref(),
+        &snapshot,
         &owner_config_path,
-        ccfg.sandbox.mount.as_str(),
-        impl_entry.id.as_str(),
-    );
-    let warm = bridge_container::ContainerRwBackend::new_warm(
-        ccfg,
-        Arc::new(AcpContainerSpawn {
-            policy: Arc::clone(&policy) as Arc<dyn PolicyEngine>,
-        }) as Arc<dyn bridge_container::ContainerSpawn>,
-        warm_owner,
-    )
-    .await?;
-    let impl_session = bridge_core::ids::SessionId::parse(format!("implement-{task_id}"))
-        .map_err(|e| format!("implement: session id: {e:?}"))?;
-    warm.configure_session(
-        &impl_session,
-        &bridge_core::domain::SessionSpec {
-            // Mirror the executor: stash the agent's EFFECTIVE config (model/mode/effort), else the warm
-            // edit/fix turns would silently run with defaults (AcpBackend prefers the stashed spec).
-            config: bridge_core::domain::effective_config(&impl_entry, None),
-            cwd: Some(clone_cwd.clone()),
-        },
+        &run,
+        Arc::clone(&policy),
+        &clone_cwd,
+        &task_id,
+        None,
     )
     .await?;
 
     // The registry + executor are still built — REVIEW runs through them (edit/fix are off-executor).
-    let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
-    let spawn = make_spawn_fn(policy_for_spawn, owner_config_path, run);
+    let spawn = make_spawn_fn(Arc::clone(&policy), owner_config_path, run);
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
             .map_err(|e| format!("implement: registry: {e:?}"))?,
@@ -1029,11 +1202,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
 
     // First edit turn — on the WARM session (off the executor). Render the single-node `{{input}}` template.
     let edit_vars: std::collections::HashMap<&str, &str> =
-        std::collections::HashMap::from([("input", a.task.as_str())]);
-    let edit_input = bridge_workflow::template::render(&edit_template, &edit_vars);
-    let completed = match warm
+        std::collections::HashMap::from([("input", task.as_str())]);
+    let edit_input = bridge_workflow::template::render(&warm_impl.edit_template, &edit_vars);
+    let completed = match warm_impl
+        .warm
         .prompt(
-            &impl_session,
+            &warm_impl.impl_session,
             vec![bridge_core::domain::Part { text: edit_input }],
         )
         .await
@@ -1051,11 +1225,11 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let stage = match implement::stage_state(&clone) {
         Ok(s) => s,
         Err(e) => {
-            let _ = warm.retire().await;
+            let _ = warm_impl.warm.retire().await;
             return Err(format!("implement: stage check: {e}").into());
         }
     };
-    let msg = implement::commit_message(implement::read_commit_msg_file(&clone), &a.task);
+    let msg = implement::commit_message(implement::read_commit_msg_file(&clone), &task);
     if msg.1 {
         eprintln!("[implement] no .git/A2A_COMMIT_MSG — using task-derived message");
     }
@@ -1065,7 +1239,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 "[implement] {reason} — NO commit; clone left at {}",
                 clone.display()
             );
-            let _ = warm.retire().await; // sole warm reap site; RunEndGuard is the backstop
+            let _ = warm_impl.warm.retire().await; // sole warm reap site; RunEndGuard is the backstop
             Err(format!("implement: {reason}").into())
         }
         implement::Action::NoCommitClean => {
@@ -1073,7 +1247,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 "implement: made no changes; clone left at {}",
                 clone.display()
             );
-            let _ = warm.retire().await;
+            let _ = warm_impl.warm.retire().await;
             Ok(())
         }
         implement::Action::NoCommitDirty => {
@@ -1082,7 +1256,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                  Clone left at {} for inspection.",
                 clone.display()
             );
-            let _ = warm.retire().await;
+            let _ = warm_impl.warm.retire().await;
             Ok(())
         }
         implement::Action::Commit(message) => {
@@ -1091,7 +1265,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             let sha = match implement::host_commit(&clone, &message) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = warm.retire().await;
+                    let _ = warm_impl.warm.retire().await;
                     return Err(e.into());
                 }
             };
@@ -1103,16 +1277,16 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     schema_version: implement_resume::SCHEMA_VERSION,
                     resume_id: task_id.clone(),
                     task_id: task_id.clone(),
-                    task_brief: a.task.clone(),
-                    source_repo: a.repo.clone(),
+                    task_brief: task.clone(),
+                    source_repo: repo.clone(),
                     clone_path: clone.clone(),
-                    config_path: a.config.clone(),
+                    config_path: config_path.clone(),
                     branch: branch.clone(),
-                    base_ref: a.base_ref.clone(),
+                    base_ref: base_ref.clone(),
                     base_commit: base_sha.clone(),
                     current_commit: Some(sha.clone()),
                     original_message: Some(message.clone()),
-                    edit_workflow: a.workflow.clone(),
+                    edit_workflow: workflow.clone(),
                     fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
                     loop_max_attempts: loop_cfg.max_attempts,
                     attempt_next: 1,
@@ -1122,63 +1296,191 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 },
             };
             let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
-            let mut effects = ProdEffects {
-                verify_cfg: &verify_cfg,
-                review_cfg: &review_cfg,
-                wf_map: &wf_map,
-                executor: &executor,
-                impl_backend: &warm,
-                impl_session: &impl_session,
+            let subject = message.lines().next().unwrap_or("").to_string();
+            let WarmImpl {
+                warm,
+                impl_session,
                 fix_template,
-                clone_cwd: &clone_cwd,
-                repo: &a.repo,
-                task: &a.task,
-                base_sha: &base_sha,
-                task_id: &task_id,
-            };
-            let final_ = tweak::run_tweak_loop(
+                ..
+            } = warm_impl;
+            run_warm_loop(
                 &clone,
+                &repo,
                 &branch,
-                &a.task,
+                &task,
+                &base_sha,
+                &task_id,
                 sha,
                 &message,
+                &subject,
                 1, // start_attempt (fresh run)
                 loop_cfg.max_attempts,
                 fix_graph.is_some(),
-                &mut effects,
+                &warm,
+                &impl_session,
+                &clone_cwd,
+                &verify_cfg,
+                &review_cfg,
+                &wf_map,
+                &executor,
+                fix_template,
                 &mut prod_ckpt,
             )
             .await;
-
-            // Hand-off: the FINAL sha (patches the stale committed line) + the ORIGINAL subject, then the
-            // verify + review + loop suffixes. Always prints (the invariant).
-            let subject = message.lines().next().unwrap_or("").to_string();
-            let mut handoff = implement::handoff_text(
-                &clone.to_string_lossy(),
-                &branch,
-                &final_.sha,
-                &subject,
-                &a.repo.to_string_lossy(),
-            );
-            handoff.push('\n');
-            handoff.push_str(&verify::outcome_suffix(&final_.last_verify));
-            handoff.push('\n');
-            handoff.push_str(&review::outcome_suffix(&final_.last_review));
-            handoff.push('\n');
-            handoff.push_str(&tweak::loop_outcome_suffix(&final_.report));
-            println!("{handoff}");
-            let terminal = if final_.report.stop_reason == tweak::StopReason::Success {
-                implement_resume::ImplementPhase::Approved
-            } else {
-                implement_resume::ImplementPhase::LoopStopped
-            };
-            implement_resume::write_terminal(&clone, prod_ckpt.ck.clone(), terminal);
-            // Print BEFORE retire so a retire error never suppresses the hand-off; log-only, never alters
-            // the result (post-commit, no `?`). M4 retire-error coverage is by-construction ordering here.
-            let _ = warm.retire().await;
             Ok(())
         }
     }
+}
+
+async fn implement_resume_cmd(resume_id: &str, config_path: &Path) -> Result<(), BoxError> {
+    let raw = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("implement --resume: read config {config_path:?}: {e}"))?;
+    let cfg = config::RegistryConfig::parse(&raw)
+        .map_err(|e| format!("implement --resume: config parse: {e}"))?;
+    let root = cfg
+        .allowed_cwd_root
+        .clone()
+        .ok_or("implement --resume: config needs allowed_cwd_root")?;
+    let root = std::fs::canonicalize(&root)
+        .map_err(|e| format!("implement --resume: allowed_cwd_root {root:?}: {e}"))?;
+    let clone = implement_resume::resolve_clone(&root, resume_id)?;
+    let ck = implement_resume::load_checkpoint(&clone)?;
+    implement_resume::validate_resumable(&ck)?;
+
+    let lock_dir = clone.join(".git").join("a2a-bridge").join("locks");
+    std::fs::create_dir_all(&lock_dir)
+        .map_err(|e| format!("implement --resume: mkdir {lock_dir:?}: {e}"))?;
+    let _takeover = bridge_core::liveness::acquire_lease_in(&lock_dir, "implement-resume")
+        .map_err(|e| format!("implement --resume: another resume holds {resume_id} ({e})"))?;
+
+    let resume_sha = implement_resume::reconcile_head(&clone, &ck)?;
+    let clone_cwd = bridge_core::SessionCwd::parse(&clone.to_string_lossy())?;
+
+    let base = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let wf_map = cfg
+        .load_workflows(&base)
+        .map_err(|e| format!("implement --resume: workflow load: {e}"))?;
+    let wf_id = bridge_core::ids::WorkflowId::parse(ck.edit_workflow.clone()).map_err(|e| {
+        format!(
+            "implement --resume: workflow id {:?}: {e:?}",
+            ck.edit_workflow
+        )
+    })?;
+    let graph = wf_map.get(&wf_id).cloned().ok_or_else(|| {
+        format!(
+            "implement --resume: unknown workflow {:?}",
+            ck.edit_workflow
+        )
+    })?;
+    let fix_wf_id = bridge_core::ids::WorkflowId::parse(ck.fix_workflow.clone()).map_err(|e| {
+        format!(
+            "implement --resume: fix workflow id {:?}: {e:?}",
+            ck.fix_workflow
+        )
+    })?;
+    let fix_graph = wf_map.get(&fix_wf_id).cloned();
+    let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
+    let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
+    let snapshot = cfg
+        .into_snapshot()
+        .map_err(|e| format!("implement --resume: snapshot: {e}"))?;
+
+    let owner_config_path =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let host = bridge_core::liveness::host_id();
+    let instance_id = format!("{}-{}", std::process::id(), implement::nonce(8));
+    let _lease = bridge_core::liveness::acquire_lease(&instance_id)
+        .map_err(|e| format!("implement --resume: acquire run lease: {e}"))?;
+    let run = bridge_core::run_identity::RunHandle {
+        instance_id: instance_id.clone(),
+        host: host.clone(),
+        lease: _lease.path().to_string_lossy().to_string(),
+        start: epoch_secs(),
+    };
+    recover_orphans(&snapshot, &owner_config_path, &host);
+    let _run_guard = RunEndGuard {
+        runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
+        instance_id: instance_id.clone(),
+    };
+
+    let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
+    let suffix = format!("r{}", implement::nonce(6));
+    let warm_impl = build_warm_impl(
+        &graph,
+        fix_graph.as_deref(),
+        &snapshot,
+        &owner_config_path,
+        &run,
+        Arc::clone(&policy),
+        &clone_cwd,
+        &ck.task_id,
+        Some(&suffix),
+    )
+    .await?;
+
+    let spawn = make_spawn_fn(Arc::clone(&policy), owner_config_path, run);
+    let registry = Arc::new(
+        bridge_registry::registry::Registry::new(snapshot, spawn)
+            .map_err(|e| format!("implement --resume: registry: {e:?}"))?,
+    );
+    let executor = bridge_workflow::executor::WorkflowExecutor::new(
+        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
+    );
+
+    let mut prod_ckpt = implement_resume::ProdCheckpoint {
+        clone: clone.clone(),
+        ck: ck.clone(),
+    };
+    let subject = implement::commit_subject(&clone).unwrap_or_else(|_| {
+        ck.original_message
+            .as_deref()
+            .and_then(|m| m.lines().next())
+            .unwrap_or("")
+            .to_string()
+    });
+    let original_message = ck
+        .original_message
+        .clone()
+        .unwrap_or_else(|| subject.clone());
+    let task = format!(
+        "{}\n\nPrior session state is unavailable; the repository tree and committed diff are authoritative.",
+        ck.task_brief
+    );
+    let WarmImpl {
+        warm,
+        impl_session,
+        fix_template,
+        ..
+    } = warm_impl;
+    run_warm_loop(
+        &clone,
+        &ck.source_repo,
+        &ck.branch,
+        &task,
+        &ck.base_commit,
+        &ck.task_id,
+        resume_sha,
+        &original_message,
+        &subject,
+        ck.attempt_next,
+        ck.loop_max_attempts,
+        fix_graph.is_some(),
+        &warm,
+        &impl_session,
+        &clone_cwd,
+        &verify_cfg,
+        &review_cfg,
+        &wf_map,
+        &executor,
+        fix_template,
+        &mut prod_ckpt,
+    )
+    .await;
+    Ok(())
 }
 
 /// Execute the `run-workflow` subcommand.
@@ -2835,11 +3137,21 @@ mod cli_tests {
         .map(|s| s.to_string())
         .collect();
         let p = super::parse_implement_args(&a).unwrap();
-        assert_eq!(p.task, "Add a FOO file");
-        assert_eq!(p.repo, std::path::PathBuf::from("/src/repo"));
-        assert_eq!(p.base_ref.as_deref(), Some("main"));
+        match p.mode {
+            ImplementMode::Fresh {
+                task,
+                repo,
+                base_ref,
+                workflow,
+            } => {
+                assert_eq!(task, "Add a FOO file");
+                assert_eq!(repo, std::path::PathBuf::from("/src/repo"));
+                assert_eq!(base_ref.as_deref(), Some("main"));
+                assert_eq!(workflow, "implement-edit");
+            }
+            ImplementMode::Resume { .. } => panic!("expected Fresh"),
+        }
         assert_eq!(p.config, std::path::PathBuf::from("c.toml"));
-        assert_eq!(p.workflow, "implement-edit"); // default
     }
 
     #[test]
@@ -2848,6 +3160,44 @@ mod cli_tests {
         assert!(super::parse_implement_args(&["--repo".into(), "/r".into()]).is_err());
         // task present but no --repo
         assert!(super::parse_implement_args(&["task".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_implement_fresh_and_resume() {
+        let fresh = super::parse_implement_args(&[
+            "do X".into(),
+            "--repo".into(),
+            "/r".into(),
+            "--config".into(),
+            "/c.toml".into(),
+        ])
+        .unwrap();
+        match fresh.mode {
+            ImplementMode::Fresh { task, repo, .. } => {
+                assert_eq!(task, "do X");
+                assert_eq!(repo, std::path::PathBuf::from("/r"));
+            }
+            ImplementMode::Resume { .. } => panic!("expected Fresh"),
+        }
+        assert_eq!(fresh.config, std::path::PathBuf::from("/c.toml"));
+
+        let res = super::parse_implement_args(&["--resume".into(), "impl-1-ab".into()]).unwrap();
+        match res.mode {
+            ImplementMode::Resume { resume_id } => assert_eq!(resume_id, "impl-1-ab"),
+            ImplementMode::Fresh { .. } => panic!("expected Resume"),
+        }
+    }
+
+    #[test]
+    fn parse_implement_resume_rejects_repo() {
+        assert!(super::parse_implement_args(&[
+            "--resume".into(),
+            "x".into(),
+            "--repo".into(),
+            "/r".into()
+        ])
+        .is_err());
+        assert!(super::parse_implement_args(&["do X".into()]).is_err());
     }
 
     // R11: the example containerized config (the `impl` ContainerRw agent + the implement-edit workflow)

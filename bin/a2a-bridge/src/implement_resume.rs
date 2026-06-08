@@ -105,9 +105,91 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Resolve `<id>` to its clone dir: `allowed_cwd_root/.a2a-implement/<id>`, rejecting traversal. The dir
+/// must exist and contain a `.git`. Direct resolution is sufficient because the clone dir is named by the
+/// unique task_id.
+pub fn resolve_clone(allowed_cwd_root: &Path, resume_id: &str) -> Result<PathBuf, String> {
+    if resume_id.is_empty() || resume_id.contains('/') || resume_id.contains("..") {
+        return Err(format!("invalid resume id {resume_id:?}"));
+    }
+    let dir = allowed_cwd_root.join(".a2a-implement").join(resume_id);
+    if !dir.join(".git").is_dir() {
+        return Err(format!(
+            "no resumable clone for id {resume_id:?} at {dir:?}"
+        ));
+    }
+    Ok(dir)
+}
+
+/// A checkpoint is resumable iff it is not terminal and still has loop budget.
+pub fn validate_resumable(ck: &ImplementCheckpoint) -> Result<(), String> {
+    match ck.phase {
+        ImplementPhase::Approved | ImplementPhase::LoopStopped => {
+            return Err("run already handed off (terminal phase) — nothing to resume".into());
+        }
+        _ => {}
+    }
+    if ck.attempt_next > ck.loop_max_attempts {
+        return Err(format!(
+            "attempt_next {} exceeds frozen max_attempts {} — nothing to resume",
+            ck.attempt_next, ck.loop_max_attempts
+        ));
+    }
+    Ok(())
+}
+
+/// Reconcile the clone's HEAD with the checkpoint, returning the sha to resume from. Refuses a dirty
+/// worktree because the loop's reset/clean would silently discard a half-finished fix.
+///
+/// Rules:
+/// - HEAD == current_commit: resume from HEAD.
+/// - Else exactly one commit over base: accept the tip; an amend may have landed before checkpoint record.
+/// - Else fail loud for manual recovery.
+pub fn reconcile_head(clone: &Path, ck: &ImplementCheckpoint) -> Result<String, String> {
+    let branch = crate::implement::current_branch(clone)?;
+    if branch != ck.branch {
+        return Err(format!(
+            "clone {clone:?} is on branch {branch:?}, expected {:?} — refusing to resume",
+            ck.branch
+        ));
+    }
+    if crate::implement::is_worktree_dirty(clone)? {
+        return Err(format!(
+            "clone {clone:?} has a dirty worktree — refusing to resume (a half-finished fix would be \
+             discarded). Inspect it, then discard or commit the work manually."
+        ));
+    }
+    let head = crate::implement::head_sha(clone)?;
+    if ck.current_commit.as_deref() == Some(head.as_str()) {
+        return Ok(head);
+    }
+    let range = format!("{}..HEAD", ck.base_commit);
+    let out = crate::implement::run_git(Some(clone), &["rev-list", "--count", &range])
+        .map_err(|e| format!("git rev-list: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-list {range}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let ahead: u32 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    if ahead == 1 {
+        return Ok(head);
+    }
+    Err(format!(
+        "HEAD {head} does not match the checkpoint ({:?}) and is not a single commit over base {} \
+         ({ahead} commits ahead) — refusing to resume; inspect the clone manually.",
+        ck.current_commit, ck.base_commit
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn sample(clone: &Path) -> ImplementCheckpoint {
         ImplementCheckpoint {
@@ -170,5 +252,80 @@ mod tests {
         assert_eq!(back.attempt_next, 2);
         assert_eq!(back.current_commit.as_deref(), Some("sha-two"));
         assert_eq!(back.phase, ImplementPhase::InLoop);
+    }
+
+    #[test]
+    fn resolve_resume_id_finds_clone_under_root() {
+        let root = tempfile::tempdir().unwrap();
+        let impl_dir = root.path().join(".a2a-implement").join("impl-9-zz");
+        std::fs::create_dir_all(impl_dir.join(".git")).unwrap();
+        let got = resolve_clone(root.path(), "impl-9-zz").unwrap();
+        assert_eq!(got, root.path().join(".a2a-implement").join("impl-9-zz"));
+        assert!(resolve_clone(root.path(), "no-such").is_err());
+        assert!(resolve_clone(root.path(), "../etc").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_handed_off_and_overflow() {
+        let mut ck = sample(std::path::Path::new("/x"));
+        ck.phase = ImplementPhase::FirstCommitCreated;
+        ck.attempt_next = 2;
+        ck.loop_max_attempts = 3;
+        assert!(validate_resumable(&ck).is_ok());
+
+        let mut done = ck.clone();
+        done.phase = ImplementPhase::Approved;
+        assert!(validate_resumable(&done).is_err());
+
+        let mut stopped = ck.clone();
+        stopped.phase = ImplementPhase::LoopStopped;
+        assert!(validate_resumable(&stopped).is_err());
+
+        let mut over = ck.clone();
+        over.attempt_next = 4;
+        assert!(validate_resumable(&over).is_err());
+    }
+
+    fn git(p: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_head_matches_current_commit() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["config", "user.email", "t@t"]);
+        git(p, &["config", "user.name", "t"]);
+        std::fs::write(p.join("a"), "1").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-qm", "base"]);
+        let base = crate::implement::head_sha(p).unwrap();
+        git(p, &["checkout", "-q", "-b", "implement/x"]);
+        std::fs::write(p.join("b"), "1").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-qm", "feat"]);
+        let tip = crate::implement::head_sha(p).unwrap();
+
+        let mut ck = sample(p);
+        ck.branch = "implement/x".into();
+        ck.base_commit = base;
+        ck.current_commit = Some(tip.clone());
+        assert_eq!(reconcile_head(p, &ck).unwrap(), tip);
+
+        ck.current_commit = None;
+        assert_eq!(reconcile_head(p, &ck).unwrap(), tip);
+
+        std::fs::write(p.join("dirty"), "x").unwrap();
+        assert!(reconcile_head(p, &ck).is_err());
     }
 }
