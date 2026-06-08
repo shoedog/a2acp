@@ -649,15 +649,23 @@ async fn drain_review(
     review::reduce(&events)
 }
 
-/// Drain a warm-session turn's raw `Update` stream → `completed`. STRICTER than the executor (which leaves
+#[derive(Debug, PartialEq, Eq)]
+struct TurnOutcome {
+    completed: bool,
+    last_err: Option<bridge_core::error::BridgeError>,
+}
+
+/// Drain a warm-session turn's raw `Update` stream → `TurnOutcome`. STRICTER than the executor (which leaves
 /// `ok=true` on a clean end — `executor.rs`): complete IFF a `Done { stop_reason != CANCELLED }` arrived; a
 /// clean end without `Done` or an error-only stream → incomplete. Completion LATCHES — a trailing teardown
-/// `Err(_)` after a successful `Done` does not un-complete the turn. Polls to the end so the inner runs its
-/// cancel/cleanup. Used for the off-executor edit + fix turns.
-async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> bool {
+/// `Err(_)` after a successful `Done` does not un-complete the turn and does not replace the last
+/// pre-completion error. Polls to the end so the inner runs its cancel/cleanup. Used for the off-executor
+/// edit + fix turns.
+async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> TurnOutcome {
     use bridge_core::ports::{Update, STOP_REASON_CANCELLED};
     use futures::StreamExt;
     let mut completed = false;
+    let mut last_err = None;
     while let Some(item) = stream.next().await {
         match item {
             // Latch: a non-cancelled Done completes the turn; later events can't un-complete it.
@@ -668,10 +676,49 @@ async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> bool {
             }
             Ok(_) => {}
             // Log, but do NOT flip a prior success — a teardown error after Done shouldn't fail the turn.
-            Err(e) => eprintln!("[implement] turn: stream error: {e:?}"),
+            Err(e) => {
+                eprintln!("[implement] turn: stream error: {e:?}");
+                if !completed {
+                    last_err = Some(e);
+                }
+            }
         }
     }
-    completed
+    TurnOutcome {
+        completed,
+        last_err,
+    }
+}
+
+#[async_trait::async_trait]
+trait TurnRunner: Send + Sync {
+    async fn run_turn(
+        &self,
+        session: &bridge_core::ids::SessionId,
+        parts: Vec<bridge_core::domain::Part>,
+    ) -> bool;
+}
+
+struct WarmTurnRunner<'a> {
+    backend: &'a dyn bridge_core::ports::AgentBackend,
+    label: &'static str,
+}
+
+#[async_trait::async_trait]
+impl TurnRunner for WarmTurnRunner<'_> {
+    async fn run_turn(
+        &self,
+        session: &bridge_core::ids::SessionId,
+        parts: Vec<bridge_core::domain::Part>,
+    ) -> bool {
+        match self.backend.prompt(session, parts).await {
+            Ok(stream) => drain_turn(stream).await.completed,
+            Err(e) => {
+                eprintln!("[implement] {} turn failed: {e:?}", self.label);
+                false
+            }
+        }
+    }
 }
 
 /// Resolve the single ContainerRw agent that drives BOTH the edit and fix turns of one warm session, or a
@@ -832,8 +879,8 @@ struct ProdEffects<'a> {
         std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
     >,
     executor: &'a bridge_workflow::executor::WorkflowExecutor,
-    /// B2b-3c: the warm `:rw` backend + its ONE stable session — fix turns continue it (not the executor).
-    impl_backend: &'a dyn bridge_core::ports::AgentBackend,
+    /// B2b-3c: the warm turn runner + its ONE stable session — fix turns continue it (not the executor).
+    runner: &'a dyn TurnRunner,
     impl_session: &'a bridge_core::ids::SessionId,
     /// The fix node's prompt template (rendered with `{{input}}`); `None` ⇒ fix is never called.
     fix_template: Option<String>,
@@ -874,13 +921,7 @@ impl tweak::TweakEffects for ProdEffects<'_> {
         let parts = vec![bridge_core::domain::Part {
             text: bridge_workflow::template::render(template, &vars),
         }];
-        match self.impl_backend.prompt(self.impl_session, parts).await {
-            Ok(stream) => drain_turn(stream).await,
-            Err(e) => {
-                eprintln!("[implement] fix turn failed: {e:?}");
-                false // → FixIncomplete
-            }
-        }
+        self.runner.run_turn(self.impl_session, parts).await
     }
 }
 
@@ -970,12 +1011,16 @@ async fn run_warm_loop(
     prod_ckpt: &mut implement_resume::ProdCheckpoint,
 ) {
     let final_ = {
+        let runner = WarmTurnRunner {
+            backend: warm,
+            label: "fix",
+        };
         let mut effects = ProdEffects {
             verify_cfg,
             review_cfg,
             wf_map,
             executor,
-            impl_backend: warm,
+            runner: &runner,
             impl_session,
             fix_template,
             clone_cwd,
@@ -1204,20 +1249,16 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let edit_vars: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::from([("input", task.as_str())]);
     let edit_input = bridge_workflow::template::render(&warm_impl.edit_template, &edit_vars);
-    let completed = match warm_impl
-        .warm
-        .prompt(
+    let edit_runner = WarmTurnRunner {
+        backend: &warm_impl.warm,
+        label: "edit",
+    };
+    let completed = edit_runner
+        .run_turn(
             &warm_impl.impl_session,
             vec![bridge_core::domain::Part { text: edit_input }],
         )
-        .await
-    {
-        Ok(stream) => drain_turn(stream).await,
-        Err(e) => {
-            eprintln!("[implement] edit turn failed: {e:?}");
-            false // pre-commit → decide() aborts
-        }
-    };
+        .await;
 
     // 5. the pure soft-gate decision, then execute its Action. A container exists now, so any post-edit
     // early-return must `retire()` (the RunEndGuard is only the backstop).
@@ -2680,26 +2721,128 @@ mod cli_tests {
         };
         // end_turn → complete
         let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("end_turn")]));
-        assert!(drain_turn(s).await);
+        assert_eq!(
+            drain_turn(s).await,
+            TurnOutcome {
+                completed: true,
+                last_err: None,
+            }
+        );
         // cancelled → incomplete
         let s: BackendStream = Box::pin(tokio_stream::iter(vec![done("cancelled")]));
-        assert!(!drain_turn(s).await);
+        assert_eq!(
+            drain_turn(s).await,
+            TurnOutcome {
+                completed: false,
+                last_err: None,
+            }
+        );
         // clean end without Done → incomplete (the executor-divergence guard)
         let s: BackendStream = Box::pin(tokio_stream::iter(Vec::<
             Result<Update, bridge_core::error::BridgeError>,
         >::new()));
-        assert!(!drain_turn(s).await);
-        // stream error → incomplete
-        let s: BackendStream = Box::pin(tokio_stream::iter(vec![Err(
-            bridge_core::error::BridgeError::agent_crashed("x"),
-        )]));
-        assert!(!drain_turn(s).await);
+        assert_eq!(
+            drain_turn(s).await,
+            TurnOutcome {
+                completed: false,
+                last_err: None,
+            }
+        );
+        // stream error → incomplete, with the last pre-completion error preserved
+        let crashed = bridge_core::error::BridgeError::agent_crashed("x");
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![Err(crashed.clone())]));
+        assert_eq!(
+            drain_turn(s).await,
+            TurnOutcome {
+                completed: false,
+                last_err: Some(crashed),
+            }
+        );
+        // multiple pre-completion errors → the last one wins
+        let first = bridge_core::error::BridgeError::agent_crashed("first");
+        let last = bridge_core::error::BridgeError::AgentOverloaded;
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![
+            Err(first),
+            Err(last.clone()),
+            done("cancelled"),
+        ]));
+        assert_eq!(
+            drain_turn(s).await,
+            TurnOutcome {
+                completed: false,
+                last_err: Some(last),
+            }
+        );
         // Done then a trailing teardown Err → STILL complete (completion latches)
         let s: BackendStream = Box::pin(tokio_stream::iter(vec![
             done("end_turn"),
             Err(bridge_core::error::BridgeError::agent_crashed("teardown")),
         ]));
-        assert!(drain_turn(s).await);
+        assert_eq!(
+            drain_turn(s).await,
+            TurnOutcome {
+                completed: true,
+                last_err: None,
+            }
+        );
+        // Pre-completion error remains observable even if the turn later completes.
+        let pre_done = bridge_core::error::BridgeError::agent_crashed("before-done");
+        let s: BackendStream = Box::pin(tokio_stream::iter(vec![
+            Err(pre_done.clone()),
+            done("end_turn"),
+            Err(bridge_core::error::BridgeError::agent_crashed("teardown")),
+        ]));
+        assert_eq!(
+            drain_turn(s).await,
+            TurnOutcome {
+                completed: true,
+                last_err: Some(pre_done),
+            }
+        );
+    }
+
+    struct FakeTurnRunner {
+        completed: bool,
+        seen: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnRunner for FakeTurnRunner {
+        async fn run_turn(
+            &self,
+            session: &bridge_core::ids::SessionId,
+            parts: Vec<bridge_core::domain::Part>,
+        ) -> bool {
+            self.seen.lock().unwrap().push((
+                session.as_str().to_string(),
+                parts.into_iter().map(|p| p.text).collect(),
+            ));
+            self.completed
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_runner_fake() {
+        let runner = FakeTurnRunner {
+            completed: true,
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let session = bridge_core::ids::SessionId::parse("implement-test").unwrap();
+
+        assert!(
+            runner
+                .run_turn(
+                    &session,
+                    vec![bridge_core::domain::Part {
+                        text: "hello".into()
+                    }]
+                )
+                .await
+        );
+        assert_eq!(
+            runner.seen.lock().unwrap().as_slice(),
+            &[("implement-test".to_string(), vec!["hello".to_string()])]
+        );
     }
 
     fn cr_entry(id: &str, mount: &str) -> AgentEntry {
