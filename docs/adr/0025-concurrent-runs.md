@@ -96,3 +96,18 @@ does not GC lease files** — only the auto path (`recover_orphans`) does — so
 stale free-lock `.lock` file behind; it's harmless (0-byte, never re-probed since `instance_id`s are
 unique) but a dir-hygiene follow-up (the manual path must only GC genuinely-dead leases, never a
 `--force`/`--stale` reap's still-held lease).
+
+### Addendum (2026-06-08) — *automatic* staleness reaping verified UNNECESSARY
+
+A short verification increment closed the *automatic staleness reaping* item. A host-wide
+`containers list --all` taken while the heavy-usage peer projects (`~/code/slicing`, `~/code/stockTrading`)
+were actively driving the bridge showed **zero** dead / stale / unknown / legacy — and zero *exited* —
+bridge containers; the only managed containers were one live run's, and a prior run had self-cleaned
+between two snapshots 2 min apart. The reaping that landed since the remembered (pre-A) pile-up — ADR-0021
+(`:ro` reaper), ADR-0024 (warm `retire`), this ADR's `recover_orphans` + `RunEndGuard`, and the cross-owner
+lease fix `90d1e4f` — already bounds accumulation, so a periodic staleness sweep would be dead weight
+(YAGNI), and reaping an idle-but-alive container risks killing a quiet-but-busy effort=high agent. **Do not
+build it; reopen only if accumulation reappears.** One residual note: verify-step containers
+(`compose_verify`) are *unmanaged* (no labels, untracked by `containers list`) but self-clean via `--rm` +
+the per-command timeout, so they are not an accumulation vector. Increment B's first build slice is instead
+**`--resume` of a long warm run** (the next item to brainstorm).
