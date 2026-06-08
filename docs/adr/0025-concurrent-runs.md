@@ -49,7 +49,12 @@ operator visibility/cleanup surface, and **no database**.
      a single `RunEndGuard`, label-scoped so a concurrent run is never touched).
   2. **Before-first-use crash recovery** — `classify_sweep` over each owner's MANAGED containers, **Dead
      only**, at every entry point (implement / run-workflow start, serve startup AND hot-reload), over the
-     UNION of `:rw` + `:ro` owners. Replaces the construction/start boot sweeps.
+     UNION of `:rw` + `:ro` owners. Replaces the construction/start boot sweeps. **Lease deletion is
+     DEFERRED to after every owner is swept** (live-gate finding): a crashed run's containers span multiple
+     owners (the `:rw` implementor + per-reviewer `:ro` readers) but share ONE lease, so deleting it
+     per-owner would leave the later owners' sweeps probing an ABSENT lease → `Unknown` → spared → leak.
+     `classify_sweep` therefore *returns* its dead leases (pure `plan_recovery` decides the batch in one
+     pass) and `recover_orphans` removes them once at the end.
   3. The unchanged per-turn specific-name reaper + warm `retire` (ADR-0021/0024).
 - **`containers list|reap`** — the operator surface over the label/lease registry. `list` classifies every
   managed container (alive/dead/unknown + stale + age), scoped to *this config's* owners by default
@@ -71,9 +76,11 @@ operator visibility/cleanup surface, and **no database**.
   via `containers`. A live peer's containers (held lease) are never reaped.
 - **No DB, no new dependency.** `libc::flock` + docker labels only.
 - **The reaper's docker shell-out** (`run_scoped_reap` / `classify_sweep` / `is_stale`) is exercised by the
-  live gate, not unit tests; the *pure* decision (`classify`) and the `containers` pure cores
-  (record parse / reap plan / row format) are unit-tested (`run_identity` 99%, `sandbox` 100%, the
-  `containers` module fully covered). `cargo llvm-cov`: bridge-core 93.4% line, workspace 88.5% line.
+  live gate, not unit tests; the *pure* decisions (`classify`, and the `plan_recovery` batch planner that
+  decides reaps + dead leases before any deletion) and the `containers` pure cores (record parse / reap
+  plan / row format) are unit-tested (`run_identity` 99%, `sandbox` 100%, the `containers` module fully
+  covered; `plan_recovery` covers Dead/Alive/Unknown/other-host + the shared-lease-across-owners keystone).
+  `cargo llvm-cov`: bridge-core 93.4% line, workspace 88.5% line.
 - **serve has no END-sweep** — it's long-running, so per-backend `retire` (runtime alive) + the next run's
   before-first-use recovery cover any leftover. The serve process holds its lease for its whole life.
 - **Lease files** live under `$A2A_LEASE_DIR` (else `$HOME/.a2a-bridge/leases`); a clean exit removes the
@@ -84,4 +91,8 @@ operator visibility/cleanup surface, and **no database**.
 A SQLite run registry; ACP-stream-driven `last_activity` (vs the `docker logs --since` staleness probe);
 *automatic* staleness reaping (A only reports + offers manual `--stale`); `--resume` of a long warm run at
 the ~1h cache horizon; serve per-request isolation; non-container path coverage; same-target write locks.
-Legacy (pre-A unlabeled) containers stay list-only (reap via `--force <name>`).
+Legacy (pre-A unlabeled) containers stay list-only (reap via `--force <name>`). **Manual `containers reap`
+does not GC lease files** — only the auto path (`recover_orphans`) does — so a manual reap can leave a
+stale free-lock `.lock` file behind; it's harmless (0-byte, never re-probed since `instance_id`s are
+unique) but a dir-hygiene follow-up (the manual path must only GC genuinely-dead leases, never a
+`--force`/`--stale` reap's still-held lease).
