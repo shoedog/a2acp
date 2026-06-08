@@ -117,9 +117,9 @@ fn acp_program_argv(
     Ok(match (&entry.sandbox, container_name) {
         // Named (`:ro` reaper) container when the caller supplied a name.
         (Some(sb), Some(name)) => {
-            bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &entry.args)
+            bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &entry.args, &[])
         }
-        (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &entry.args),
+        (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &entry.args, &[]),
         (None, _) => (cmd.to_string(), entry.args.clone()),
     })
 }

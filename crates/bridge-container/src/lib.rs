@@ -219,6 +219,7 @@ impl ContainerRwBackend {
             &name,
             &self.cfg.cmd,
             &self.cfg.args,
+            &[],
         );
         let acp = AcpConfig {
             cwd: PathBuf::from(rw_canon.as_str()),

@@ -23,8 +23,12 @@ pub fn compose_sandbox(
     sb: &SandboxConfig,
     agent_cmd: &str,
     agent_args: &[String],
+    labels: &[(String, String)],
 ) -> (String, Vec<String>) {
     let mut argv: Vec<String> = vec!["run".into(), "-i".into(), "--rm".into()];
+    // Increment A: `--label`s right after the `run -i --rm` prefix (the `--name` splice in the named
+    // variants lands at `3..3`, BEFORE these → `run -i --rm --name N --label …`).
+    argv.extend(a2a_label_args(labels));
 
     if let EgressPolicy::Locked {
         network,
@@ -76,13 +80,14 @@ pub fn compose_container_rw(
     name: &str,
     cmd: &str,
     args: &[String],
+    labels: &[(String, String)],
 ) -> (String, Vec<String>) {
     let derived = SandboxConfig {
         mount: rw_target.as_str().to_string(),
         access: MountAccess::Rw,
         ..sb.clone()
     };
-    let (program, mut argv) = compose_sandbox(&derived, cmd, args);
+    let (program, mut argv) = compose_sandbox(&derived, cmd, args, labels);
     // INVARIANT: compose_sandbox always emits ["run","-i","--rm", ...] (this module, ~line 17).
     debug_assert_eq!(
         &argv[0..3],
@@ -123,7 +128,7 @@ pub fn compose_verify(
         egress: egress.clone(),
         volumes: vec![format!("{cache_vol}:/cache")],
     };
-    compose_sandbox(&sb, "sh", &["-c".to_string(), script])
+    compose_sandbox(&sb, "sh", &["-c".to_string(), script], &[])
 }
 
 /// PURE+TOTAL. Like [`compose_sandbox`] but NAMES the container so a reaper can `docker rm -f` it
@@ -134,8 +139,9 @@ pub fn compose_sandbox_named(
     name: &str,
     cmd: &str,
     args: &[String],
+    labels: &[(String, String)],
 ) -> (String, Vec<String>) {
-    let (program, mut argv) = compose_sandbox(sb, cmd, args);
+    let (program, mut argv) = compose_sandbox(sb, cmd, args, labels);
     debug_assert_eq!(
         &argv[0..3],
         &["run", "-i", "--rm"],
@@ -213,6 +219,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compose_container_rw_splices_name_then_labels_in_order() {
+        let mut sb = ro_locked();
+        sb.access = MountAccess::Rw;
+        let rw = crate::session_cwd::SessionCwd::parse("/Users/w/code").unwrap();
+        let labels = vec![
+            ("a2a.managed".into(), "1".into()),
+            ("a2a.run".into(), "r1".into()),
+        ];
+        let (_p, argv) =
+            compose_container_rw(&sb, &rw, "a2a-rw-own-r1-0", "claude-agent-acp", &[], &labels);
+        // fixed order: run -i --rm --name N --label k=v …
+        assert_eq!(&argv[0..5], &["run", "-i", "--rm", "--name", "a2a-rw-own-r1-0"]);
+        assert_eq!(
+            &argv[5..9],
+            &["--label", "a2a.managed=1", "--label", "a2a.run=r1"]
+        );
+    }
+
+    #[test]
     fn a2a_label_args_pairs_each_as_two_tokens() {
         let a = a2a_label_args(&[
             ("a2a.run".into(), "r1".into()),
@@ -238,7 +263,7 @@ mod tests {
 
     #[test]
     fn ro_locked_argv_shape() {
-        let (program, argv) = compose_sandbox(&ro_locked(), "codex-acp", &[]);
+        let (program, argv) = compose_sandbox(&ro_locked(), "codex-acp", &[], &[]);
         assert_eq!(program, "docker");
         assert_eq!(
             argv,
@@ -266,7 +291,7 @@ mod tests {
     fn open_emits_no_egress_flags() {
         let mut sb = ro_locked();
         sb.egress = EgressPolicy::Open;
-        let (_p, argv) = compose_sandbox(&sb, "claude-agent-acp", &[]);
+        let (_p, argv) = compose_sandbox(&sb, "claude-agent-acp", &[], &[]);
         assert!(!argv
             .iter()
             .any(|a| a == "--network" || a.starts_with("HTTPS_PROXY")));
@@ -281,7 +306,7 @@ mod tests {
             proxy: "p".into(),
             no_proxy: Some("localhost,127.0.0.1".into()),
         };
-        let (_p, argv) = compose_sandbox(&sb, "kiro-cli", &["acp".into()]);
+        let (_p, argv) = compose_sandbox(&sb, "kiro-cli", &["acp".into()], &[]);
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "-e" && w[1] == "NO_PROXY=localhost,127.0.0.1"));
@@ -354,7 +379,7 @@ mod tests {
     #[test]
     fn compose_sandbox_named_splices_name_after_rm() {
         let (prog, argv) =
-            compose_sandbox_named(&ro_locked(), "a2a-ro-deadbeef-abcd", "codex-acp", &[]);
+            compose_sandbox_named(&ro_locked(), "a2a-ro-deadbeef-abcd", "codex-acp", &[], &[]);
         assert_eq!(prog, "docker");
         // --name lands immediately after `run -i --rm` (same position as compose_container_rw)
         assert_eq!(
@@ -362,7 +387,7 @@ mod tests {
             &["run", "-i", "--rm", "--name", "a2a-ro-deadbeef-abcd"]
         );
         // everything else identical to compose_sandbox spliced
-        let (_p, plain) = compose_sandbox(&ro_locked(), "codex-acp", &[]);
+        let (_p, plain) = compose_sandbox(&ro_locked(), "codex-acp", &[], &[]);
         let mut spliced = plain.clone();
         spliced.splice(
             3..3,
@@ -399,7 +424,7 @@ mod tests {
     fn rw_emits_no_ro_suffix() {
         let mut sb = ro_locked();
         sb.access = MountAccess::Rw;
-        let (_p, argv) = compose_sandbox(&sb, "x", &[]);
+        let (_p, argv) = compose_sandbox(&sb, "x", &[], &[]);
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "-v" && w[1] == "/Users/w/code:/Users/w/code"));
@@ -409,9 +434,9 @@ mod tests {
     fn runtime_override_and_default() {
         let mut sb = ro_locked();
         sb.runtime = Some("podman".into());
-        assert_eq!(compose_sandbox(&sb, "x", &[]).0, "podman");
+        assert_eq!(compose_sandbox(&sb, "x", &[], &[]).0, "podman");
         sb.runtime = None;
-        assert_eq!(compose_sandbox(&sb, "x", &[]).0, "docker");
+        assert_eq!(compose_sandbox(&sb, "x", &[], &[]).0, "docker");
     }
 
     // --- B2a pure composers --------------------------------------------------
@@ -421,7 +446,7 @@ mod tests {
         let sb = ro_locked(); // egress=Locked, volumes=[creds]; access overridden inside
         let rw = crate::session_cwd::SessionCwd::parse("/Users/w/code/.scratch").unwrap();
         let (program, argv) =
-            compose_container_rw(&sb, &rw, "a2a-rw-inst-0", "claude-agent-acp", &[]);
+            compose_container_rw(&sb, &rw, "a2a-rw-inst-0", "claude-agent-acp", &[], &[]);
         assert_eq!(program, "docker");
         // --name spliced immediately after --rm
         assert_eq!(
@@ -445,7 +470,7 @@ mod tests {
     fn container_rw_appends_agent_args_tail() {
         let sb = ro_locked();
         let rw = crate::session_cwd::SessionCwd::parse("/m/t").unwrap();
-        let (_p, argv) = compose_container_rw(&sb, &rw, "n", "kiro-cli", &["acp".into()]);
+        let (_p, argv) = compose_container_rw(&sb, &rw, "n", "kiro-cli", &["acp".into()], &[]);
         assert_eq!(argv.last().unwrap(), "acp");
     }
 
