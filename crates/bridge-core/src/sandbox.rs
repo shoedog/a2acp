@@ -3,6 +3,11 @@
 
 use crate::domain::{EgressPolicy, MountAccess, SandboxConfig};
 
+/// PURE. Managed container name: `a2a-<role>-<owner>-<run_id>-<tail>` (run_id defeats same-owner clashes).
+pub fn a2a_name(role: &str, owner: &str, run_id: &str, tail: &str) -> String {
+    format!("a2a-{role}-{owner}-{run_id}-{tail}")
+}
+
 /// PURE. `--label k=v` argv tokens for a managed container's label set (Increment A).
 pub fn a2a_label_args(pairs: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::with_capacity(pairs.len() * 2);
@@ -235,6 +240,12 @@ mod tests {
             &argv[5..9],
             &["--label", "a2a.managed=1", "--label", "a2a.run=r1"]
         );
+    }
+
+    #[test]
+    fn a2a_name_carries_owner_and_run() {
+        assert_eq!(a2a_name("rw", "own", "r1", "0"), "a2a-rw-own-r1-0");
+        assert_eq!(a2a_name("ro", "own", "r1", "abcd"), "a2a-ro-own-r1-abcd");
     }
 
     #[test]

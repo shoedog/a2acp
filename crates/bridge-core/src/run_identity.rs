@@ -43,6 +43,51 @@ impl ContainerLabels {
     }
 }
 
+/// One per bridge PROCESS (a one-shot `implement`/`run-workflow`, or a `serve`). `instance_id` is the
+/// process-identity (label `a2a.run`) — deliberately distinct from the executor/task `run_id` execution id.
+#[derive(Clone, Debug)]
+pub struct RunHandle {
+    pub instance_id: String,
+    pub host: String,
+    pub lease: String,
+    pub start: String, // epoch seconds
+}
+
+impl RunHandle {
+    /// Build the per-container label set for one mint. `kind` is set PER MINT by the caller (warm/perturn/
+    /// oneshot) so it's never stale; `owner` is the per-agent `container_owner` hash.
+    pub fn labels(
+        &self,
+        role: &str,
+        kind: &str,
+        agent: &str,
+        owner: &str,
+        repo: Option<&str>,
+        cwd: Option<&str>,
+    ) -> ContainerLabels {
+        ContainerLabels {
+            role: role.into(),
+            kind: kind.into(),
+            agent: agent.into(),
+            owner: owner.into(),
+            run_id: self.instance_id.clone(),
+            host: self.host.clone(),
+            lease: self.lease.clone(),
+            repo: repo.map(sanitize_display),
+            cwd: cwd.map(sanitize_display),
+            start: self.start.clone(),
+        }
+    }
+}
+
+/// Display-label hygiene: printable ASCII + space + `/`, length-capped — never breaks label syntax.
+fn sanitize_display(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ' || *c == '/')
+        .take(200)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +129,21 @@ mod tests {
         };
         let args = l.to_arg_pairs();
         assert!(!args.iter().any(|(k, _)| k == "a2a.repo" || k == "a2a.cwd"));
+    }
+
+    #[test]
+    fn run_handle_builds_label_with_instance_id_as_run() {
+        let h = RunHandle {
+            instance_id: "r1".into(),
+            host: "h1".into(),
+            lease: "/l/r1.lock".into(),
+            start: "1700".into(),
+        };
+        let l = h.labels("rw", "warm", "impl", "owner9", Some("/repo"), Some("/cwd"));
+        assert_eq!(l.run_id, "r1"); // instance_id flows into the a2a.run label
+        assert_eq!(l.owner, "owner9");
+        assert_eq!(l.role, "rw");
+        assert_eq!(l.kind, "warm");
+        assert_eq!(l.host, "h1");
     }
 }
