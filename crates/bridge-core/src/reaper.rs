@@ -94,7 +94,12 @@ pub fn run_scoped_reap(runtime: &str, run_id: &str) {
 /// Owner-scoped crash-recovery: inspect each MANAGED container in `owner`, [`crate::run_identity::classify`]
 /// it, and reap ONLY `Dead` (same host + free lease lock). After reaping, remove each dead run's lease file
 /// (deduped — a run's containers share one lease). Never touches Alive/Unknown. Best-effort.
-pub fn classify_sweep(runtime: &str, owner: &str, my_host: &str, probe: &dyn crate::liveness::LeaseProbe) {
+pub fn classify_sweep(
+    runtime: &str,
+    owner: &str,
+    my_host: &str,
+    probe: &dyn crate::liveness::LeaseProbe,
+) {
     use crate::run_identity::{classify, Verdict};
     let (p, argv) = crate::sandbox::managed_inspect_argv(runtime, owner);
     let Ok(out) = std::process::Command::new(&p).args(&argv).output() else {

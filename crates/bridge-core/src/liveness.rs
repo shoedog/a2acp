@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 /// Non-blocking flock. `Ok(true)` = acquired, `Ok(false)` = held by another open file description,
 /// `Err` = a real error.
 fn flock_nb(file: &std::fs::File, exclusive: bool) -> std::io::Result<bool> {
-    let op = (if exclusive { libc::LOCK_EX } else { libc::LOCK_SH }) | libc::LOCK_NB;
+    let op = (if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    }) | libc::LOCK_NB;
     let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
     if rc == 0 {
         return Ok(true);
@@ -130,7 +134,11 @@ mod tests {
         let path = guard.path().to_string_lossy().into_owned();
         assert_eq!(probe.try_state(&path), Some(false), "held ⇒ alive");
         drop(guard);
-        assert_eq!(probe.try_state(&path), None, "removed on clean drop ⇒ absent");
+        assert_eq!(
+            probe.try_state(&path),
+            None,
+            "removed on clean drop ⇒ absent"
+        );
     }
 
     #[test]

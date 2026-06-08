@@ -3,9 +3,9 @@
 pub mod domain;
 pub mod error;
 pub mod ids;
+pub mod liveness;
 pub mod ports;
 pub mod process;
-pub mod liveness;
 pub mod reaper;
 pub mod run_identity;
 pub mod sandbox;

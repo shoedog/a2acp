@@ -277,10 +277,19 @@ mod tests {
             ("a2a.managed".into(), "1".into()),
             ("a2a.run".into(), "r1".into()),
         ];
-        let (_p, argv) =
-            compose_container_rw(&sb, &rw, "a2a-rw-own-r1-0", "claude-agent-acp", &[], &labels);
+        let (_p, argv) = compose_container_rw(
+            &sb,
+            &rw,
+            "a2a-rw-own-r1-0",
+            "claude-agent-acp",
+            &[],
+            &labels,
+        );
         // fixed order: run -i --rm --name N --label k=v …
-        assert_eq!(&argv[0..5], &["run", "-i", "--rm", "--name", "a2a-rw-own-r1-0"]);
+        assert_eq!(
+            &argv[0..5],
+            &["run", "-i", "--rm", "--name", "a2a-rw-own-r1-0"]
+        );
         assert_eq!(
             &argv[5..9],
             &["--label", "a2a.managed=1", "--label", "a2a.run=r1"]

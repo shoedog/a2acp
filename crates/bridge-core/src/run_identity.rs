@@ -7,16 +7,16 @@
 /// (docker-label-safe); `repo`/`cwd` are display-only (sanitize at the call site; `None` ⇒ omitted).
 #[derive(Clone, Debug)]
 pub struct ContainerLabels {
-    pub role: String,   // "rw" | "ro"
-    pub kind: String,   // "warm" | "perturn" | "oneshot"
+    pub role: String, // "rw" | "ro"
+    pub kind: String, // "warm" | "perturn" | "oneshot"
     pub agent: String,
     pub owner: String,
     pub run_id: String, // holds the process `instance_id`; emitted as `a2a.run`
     pub host: String,
-    pub lease: String,  // absolute lease-file path
+    pub lease: String, // absolute lease-file path
     pub repo: Option<String>,
     pub cwd: Option<String>,
-    pub start: String,  // epoch seconds (display-only)
+    pub start: String, // epoch seconds (display-only)
 }
 
 impl ContainerLabels {
@@ -183,15 +183,28 @@ mod tests {
         use Verdict::*;
         let me = "h1";
         // other host → Unknown (even if lease would look free)
-        assert_eq!(classify(&labels_for("h2", "/l"), me, &probe_with(Some(true))), Unknown);
+        assert_eq!(
+            classify(&labels_for("h2", "/l"), me, &probe_with(Some(true))),
+            Unknown
+        );
         // same host, lease free → Dead
-        assert_eq!(classify(&labels_for("h1", "/l"), me, &probe_with(Some(true))), Dead);
+        assert_eq!(
+            classify(&labels_for("h1", "/l"), me, &probe_with(Some(true))),
+            Dead
+        );
         // same host, lease held → Alive
-        assert_eq!(classify(&labels_for("h1", "/l"), me, &probe_with(Some(false))), Alive);
+        assert_eq!(
+            classify(&labels_for("h1", "/l"), me, &probe_with(Some(false))),
+            Alive
+        );
         // same host, lease absent/unreadable → Unknown
-        assert_eq!(classify(&labels_for("h1", "/l"), me, &probe_with(None)), Unknown);
+        assert_eq!(
+            classify(&labels_for("h1", "/l"), me, &probe_with(None)),
+            Unknown
+        );
         // missing host label → Unknown
-        let no_host = std::collections::HashMap::from([("a2a.lease".to_string(), "/l".to_string())]);
+        let no_host =
+            std::collections::HashMap::from([("a2a.lease".to_string(), "/l".to_string())]);
         assert_eq!(classify(&no_host, me, &probe_with(Some(true))), Unknown);
     }
 
