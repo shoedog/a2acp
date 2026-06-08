@@ -80,6 +80,37 @@ impl RunHandle {
     }
 }
 
+/// Liveness verdict for a managed container's owner. Only `Dead` permits an automatic reap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+/// PURE. Classify a container's owner from its labels + a lease probe. Fail-safe toward SPARING: a different
+/// host, a missing `a2a.lease`, or an unreadable lease all yield `Unknown` (treated as Alive by callers).
+/// Only same-host + a FREE lease lock yields `Dead`.
+pub fn classify(
+    labels: &std::collections::HashMap<String, String>,
+    my_host: &str,
+    probe: &dyn crate::liveness::LeaseProbe,
+) -> Verdict {
+    match labels.get("a2a.host") {
+        Some(h) if h != my_host => return Verdict::Unknown, // another machine
+        None => return Verdict::Unknown,
+        _ => {}
+    }
+    let Some(lease) = labels.get("a2a.lease") else {
+        return Verdict::Unknown;
+    };
+    match probe.try_state(lease) {
+        Some(true) => Verdict::Dead,   // lock free ⇒ owner gone
+        Some(false) => Verdict::Alive, // lock held ⇒ owner alive
+        None => Verdict::Unknown,      // absent/unreadable ⇒ spare
+    }
+}
+
 /// Display-label hygiene: printable ASCII + space + `/`, length-capped — never breaks label syntax.
 fn sanitize_display(s: &str) -> String {
     s.chars()
@@ -129,6 +160,39 @@ mod tests {
         };
         let args = l.to_arg_pairs();
         assert!(!args.iter().any(|(k, _)| k == "a2a.repo" || k == "a2a.cwd"));
+    }
+
+    struct FakeProbe(std::collections::HashMap<String, Option<bool>>);
+    impl crate::liveness::LeaseProbe for FakeProbe {
+        fn try_state(&self, p: &str) -> Option<bool> {
+            self.0.get(p).copied().flatten()
+        }
+    }
+    fn labels_for(host: &str, lease: &str) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            ("a2a.host".into(), host.into()),
+            ("a2a.lease".into(), lease.into()),
+        ])
+    }
+    fn probe_with(state: Option<bool>) -> FakeProbe {
+        FakeProbe(std::collections::HashMap::from([("/l".to_string(), state)]))
+    }
+
+    #[test]
+    fn classify_covers_all_verdicts() {
+        use Verdict::*;
+        let me = "h1";
+        // other host → Unknown (even if lease would look free)
+        assert_eq!(classify(&labels_for("h2", "/l"), me, &probe_with(Some(true))), Unknown);
+        // same host, lease free → Dead
+        assert_eq!(classify(&labels_for("h1", "/l"), me, &probe_with(Some(true))), Dead);
+        // same host, lease held → Alive
+        assert_eq!(classify(&labels_for("h1", "/l"), me, &probe_with(Some(false))), Alive);
+        // same host, lease absent/unreadable → Unknown
+        assert_eq!(classify(&labels_for("h1", "/l"), me, &probe_with(None)), Unknown);
+        // missing host label → Unknown
+        let no_host = std::collections::HashMap::from([("a2a.lease".to_string(), "/l".to_string())]);
+        assert_eq!(classify(&no_host, me, &probe_with(Some(true))), Unknown);
     }
 
     #[test]
