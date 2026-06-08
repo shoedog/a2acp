@@ -190,6 +190,51 @@ pub fn rw_sweep_filter_argv(runtime: &str, owner: &str) -> (String, Vec<String>)
     )
 }
 
+/// PURE (Increment A). `ps -aq --filter label=a2a.run=<run_id>` — THIS run's containers (END-sweep scope).
+pub fn by_run_filter_argv(runtime: &str, run_id: &str) -> (String, Vec<String>) {
+    (
+        runtime.to_string(),
+        vec![
+            "ps".into(),
+            "-aq".into(),
+            "--filter".into(),
+            format!("label=a2a.run={run_id}"),
+        ],
+    )
+}
+
+/// PURE (Increment A). `ps -aq --filter label=a2a.owner=<owner>` — one owner's managed containers.
+pub fn by_owner_filter_argv(runtime: &str, owner: &str) -> (String, Vec<String>) {
+    (
+        runtime.to_string(),
+        vec![
+            "ps".into(),
+            "-aq".into(),
+            "--filter".into(),
+            format!("label=a2a.owner={owner}"),
+        ],
+    )
+}
+
+/// PURE (Increment A). Inspect one owner's MANAGED containers, emitting `ID\tHOST\tLEASE` per container.
+/// Filters BOTH `a2a.owner` AND `a2a.managed=1` (so an unmanaged container carrying the owner label is
+/// never classified/reaped).
+pub fn managed_inspect_argv(runtime: &str, owner: &str) -> (String, Vec<String>) {
+    (
+        runtime.to_string(),
+        vec![
+            "ps".into(),
+            "-a".into(),
+            "--filter".into(),
+            format!("label=a2a.owner={owner}"),
+            "--filter".into(),
+            "label=a2a.managed=1".into(),
+            "--format".into(),
+            "{{.ID}}\t{{.Label \"a2a.host\"}}\t{{.Label \"a2a.lease\"}}".into(),
+        ],
+    )
+}
+
 /// PURE. The reap command for a named per-turn container: `<runtime> rm -f <name>`. Idempotent at the
 /// Docker layer (`rm -f` of a gone container is a harmless error the caller ignores).
 pub fn reap_argv(runtime: &str, name: &str) -> (String, Vec<String>) {
@@ -240,6 +285,30 @@ mod tests {
             &argv[5..9],
             &["--label", "a2a.managed=1", "--label", "a2a.run=r1"]
         );
+    }
+
+    #[test]
+    fn label_filter_argvs() {
+        assert_eq!(
+            by_run_filter_argv("docker", "r1").1,
+            vec!["ps", "-aq", "--filter", "label=a2a.run=r1"]
+        );
+        assert_eq!(
+            by_owner_filter_argv("docker", "own").1,
+            vec!["ps", "-aq", "--filter", "label=a2a.owner=own"]
+        );
+    }
+
+    #[test]
+    fn managed_inspect_argv_filters_owner_and_managed() {
+        let (_p, a) = managed_inspect_argv("docker", "own9");
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "--filter" && w[1] == "label=a2a.owner=own9"));
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "--filter" && w[1] == "label=a2a.managed=1"));
+        assert!(a.iter().any(|t| t.contains("{{.Label \"a2a.lease\"}}")));
     }
 
     #[test]
