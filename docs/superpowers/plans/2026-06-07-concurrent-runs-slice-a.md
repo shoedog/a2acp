@@ -768,3 +768,79 @@ Legacy pass: `docker ps -a --format '{{.Names}}'` filtered to `^a2a-(ro|rw)-` la
   90) — assert against those, not a stale README.
 - **AGENTS.md:** add a step (fold into Task 15) documenting `a2a-bridge containers list|reap`.
 - **`instance_id`** everywhere internally; the docker label stays `a2a.run`.
+
+---
+
+## rev3 — plan re-review folds (AUTHORITATIVE; supersedes rev2 + the base tasks where cited)
+
+> **EXECUTOR DIRECTIVE.** Read the Folds (rev2 + rev3) FIRST. Where a base task's code/prose conflicts, the
+> Fold WINS. Base tasks whose code is SUPERSEDED: **T1/T3/T7/T9** use `instance_id` (label stays `a2a.run`),
+> never the literal `run_id` field/`uuid()`; **T4** uses `libc::flock` + `acquire_lease_in` (NOT `fs2`); **T6**
+> uses `is_stale(runtime,name,window)` (NOT `last_output_age_secs`/`parse_log_ts`/RFC3339); **T2** splices
+> labels directly into `compose_*` (NO `compose_sandbox_labeled`); **T8** edits `main.rs` only (NOT
+> `acp_backend.rs`); **T9/T11/T12** scope to `my_owners` from `--config`. If you implement a base snippet
+> verbatim where a Fold supersedes it, that's a bug.
+
+### Fold G′ (REWRITES Fold G) — one `recover_orphans` over the UNION of owners, at every entry point
+Fold G's single-arm placement misses implement-warm (`new_warm` `main.rs:922`), serve's inline spawn closure,
+and ALL `:ro` owners. Replace it with a process-level **before-first-use** sweep over both roles, called at
+each entry point — NOT inside any spawn arm (no per-spawn gate needed):
+```rust
+// main.rs — sweep crash-orphans for ALL of this process's owners (rw + ro), Dead-only. Idempotent.
+fn recover_orphans(snapshot: &RegistrySnapshot, config_path: &Path, host: &str) {
+    use bridge_core::liveness::FsLeaseProbe;
+    let mut owners: Vec<(String /*runtime*/, String /*owner*/)> = Vec::new();
+    owners.extend(rw_sweep_targets(snapshot, config_path)); // existing helper: (runtime, owner) for ContainerRw
+    owners.extend(ro_sweep_targets(snapshot, config_path)); // existing helper: (runtime, owner) for sandboxed Acp
+    owners.sort(); owners.dedup();
+    for (runtime, owner) in owners {
+        bridge_core::reaper::classify_sweep(&runtime, &owner, host, &FsLeaseProbe);
+    }
+}
+```
+Call sites (each replaces the OLD `ro_sweep`/`rw_sweep` boot calls + the deleted construction boot-sweep):
+- `implement_cmd` — once, after `snapshot` is built + `owner_config_path` canonicalized, BEFORE the warm
+  `new_warm` (922) / registry build. Covers implement `:rw` (warm) + its `:ro` reviewers.
+- `run_workflow_cmd` — once, after snapshot, before the registry/spawn.
+- **serve** — once at startup (after the initial snapshot), AND inside the `Registry::apply` hot-reload path
+  so owners introduced by reload get recovered (re-run over the new snapshot's owners; idempotent).
+This makes the per-process sweep cover BOTH roles and ALL paths by construction; **delete** the in-spawn-arm
+`classify_sweep` + the "once per owner" gate from Fold G entirely.
+
+### Fold E′ (supersedes Fold E + Task 2) — splice labels DIRECTLY into `compose_*`; no `compose_sandbox_labeled`
+Spec D1 wants labels in the compose fns, not a parallel fn. Add `labels: &[(String, String)]` directly to
+`compose_sandbox`, `compose_container_rw`, `compose_sandbox_named` (thread `compose_sandbox`'s into the body;
+the named variants pass theirs through). **Do NOT create `compose_sandbox_labeled`.** Argv order is fixed:
+`run -i --rm --name <N> --label k=v …` (named variants: splice `--name` at `3..3`, then labels at `5..5`;
+bare `compose_sandbox`: labels at `3..3`). At S1 every caller passes `&[]`: `main.rs:120` (`acp_program_argv`),
+the `bridge-container` `compose_container_rw` call, and the **3 in-module `sandbox.rs` tests** (update their
+arity). Re-point Task 2's `compose_sandbox_includes_label_args` test at `compose_sandbox_named` (or
+`compose_container_rw`). Golden test pins the exact order for both named fns.
+
+### Fold D′ — drop `acp_backend.rs` from the File Structure table + Task 8 files
+Task 8 / the file table still list `crates/bridge-acp/src/acp_backend.rs`. The `:ro` naming/composition is
+entirely in `main.rs` (`acp_spawn_inputs` → `acp_program_argv` → `compose_sandbox_named`). **Remove the
+`acp_backend.rs` row + Task 8 file entry**; Task 8 modifies `main.rs` only.
+
+### Fold F′ — golden test for the two-filter `managed_inspect_argv`
+`managed_inspect_argv` filters `a2a.owner=<owner>` AND `a2a.managed=1`. Add a `sandbox.rs` golden test:
+```rust
+#[test]
+fn managed_inspect_argv_filters_owner_and_managed() {
+    let (_p, a) = managed_inspect_argv("docker", "own9");
+    assert!(a.windows(2).any(|w| w[0] == "--filter" && w[1] == "label=a2a.owner=own9"));
+    assert!(a.windows(2).any(|w| w[0] == "--filter" && w[1] == "label=a2a.managed=1"));
+}
+```
+
+### Fold L — `containers list|reap` parse against `my_owners` (supersedes T11/T12 base scoping)
+`containers_cmd` loads `--config` (default `./a2a-bridge.toml`, canonicalized like `implement_cmd`),
+`into_snapshot()`, derives `my_owners = rw_sweep_targets ∪ ro_sweep_targets` owners. `list` parses ALL
+managed records (`docker ps -a --filter label=a2a.managed=1 --format <Fold-J template>`) but **filters to
+`my_owners` by default** (shows others only under `--all`); `reap_plan(records, flags, my_owners)` defaults
+to `my_owners` Dead-only (`--all-dead` ignores `my_owners`). Add a test asserting a managed container whose
+`a2a.owner ∉ my_owners` is hidden/untouched by default.
+
+(All prior rev2 Folds A–K stand except E/G as superseded above. Verified-solid by the re-review: `libc`
+present + no `fs2`/`tempfile` in bridge-core needing add beyond Fold A; the `lib.rs:860` `starts_with`
+fixture survives `run_id` insertion.)
