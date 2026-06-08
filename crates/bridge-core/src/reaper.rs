@@ -64,42 +64,73 @@ pub fn run_scoped_reap(runtime: &str, run_id: &str) {
     }
 }
 
-/// Owner-scoped crash-recovery: inspect each MANAGED container in `owner`, [`crate::run_identity::classify`]
-/// it, and reap ONLY `Dead` (same host + free lease lock). After reaping, remove each dead run's lease file
-/// (deduped — a run's containers share one lease). Never touches Alive/Unknown. Best-effort.
+/// PURE recovery planner: classify a batch of inspected managed records `(id, host, lease)` against the
+/// CURRENT lease state and return `(reap_ids, dead_leases)` — the container ids to `rm -f` (DEAD only:
+/// same host + a FREE lease lock) and the DISTINCT dead lease files (order-preserving, deduped).
+///
+/// Classifying the WHOLE batch BEFORE any lease file is removed is the correctness keystone: a crashed run's
+/// containers span MULTIPLE owners (e.g. a `:rw` implementor + per-reviewer `:ro` readers) but share ONE
+/// lease file. If a sibling reap deleted that lease mid-recovery, every later owner's sweep would probe an
+/// ABSENT lease → [`crate::run_identity::classify`] returns `Unknown` → spared → the orphan LEAKS (live-gate
+/// finding). So lease DELETION is the caller's job, performed ONCE after EVERY owner has been swept.
+pub fn plan_recovery(
+    records: &[(String, String, String)],
+    my_host: &str,
+    probe: &dyn crate::liveness::LeaseProbe,
+) -> (Vec<String>, Vec<String>) {
+    use crate::run_identity::{classify, Verdict};
+    let mut reap_ids = Vec::new();
+    let mut dead_leases: Vec<String> = Vec::new();
+    for (id, host, lease) in records {
+        let labels = std::collections::HashMap::from([
+            ("a2a.host".to_string(), host.clone()),
+            ("a2a.lease".to_string(), lease.clone()),
+        ]);
+        if classify(&labels, my_host, probe) == Verdict::Dead {
+            reap_ids.push(id.clone());
+            if !lease.is_empty() && !dead_leases.contains(lease) {
+                dead_leases.push(lease.clone());
+            }
+        }
+    }
+    (reap_ids, dead_leases)
+}
+
+/// Owner-scoped crash-recovery: inspect each MANAGED container in `owner`, [`plan_recovery`] the batch, and
+/// reap ONLY `Dead` (same host + free lease lock). RETURNS the dead lease files (deduped) for the caller to
+/// delete ONCE, after EVERY owner has been swept — NOT here: a crashed run's containers span multiple owners
+/// but share one lease, so deleting it per-owner would blind the later owners' sweeps (see [`plan_recovery`]).
+/// Never touches Alive/Unknown. Best-effort (any docker error ⇒ no reaps, no dead leases).
+#[must_use]
 pub fn classify_sweep(
     runtime: &str,
     owner: &str,
     my_host: &str,
     probe: &dyn crate::liveness::LeaseProbe,
-) {
-    use crate::run_identity::{classify, Verdict};
+) -> Vec<String> {
     let (p, argv) = crate::sandbox::managed_inspect_argv(runtime, owner);
     let Ok(out) = std::process::Command::new(&p).args(&argv).output() else {
-        return;
+        return Vec::new();
     };
-    let mut dead_leases: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut it = line.split('\t');
-        let (Some(id), Some(host), Some(lease)) = (it.next(), it.next(), it.next()) else {
-            continue;
-        };
-        let labels = std::collections::HashMap::from([
-            ("a2a.host".to_string(), host.to_string()),
-            ("a2a.lease".to_string(), lease.to_string()),
-        ]);
-        if classify(&labels, my_host, probe) == Verdict::Dead {
-            let _ = std::process::Command::new(runtime)
-                .args(["rm", "-f", id])
-                .output();
-            if !lease.is_empty() {
-                dead_leases.insert(lease.to_string());
+    let records: Vec<(String, String, String)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split('\t');
+            match (it.next(), it.next(), it.next()) {
+                (Some(id), Some(host), Some(lease)) => {
+                    Some((id.to_string(), host.to_string(), lease.to_string()))
+                }
+                _ => None,
             }
-        }
+        })
+        .collect();
+    let (reap_ids, dead_leases) = plan_recovery(&records, my_host, probe);
+    for id in reap_ids {
+        let _ = std::process::Command::new(runtime)
+            .args(["rm", "-f", &id])
+            .output();
     }
-    for lease in dead_leases {
-        let _ = std::fs::remove_file(&lease);
-    }
+    dead_leases
 }
 
 /// True iff the container produced NO log line within `window` (⇒ stale). `docker logs --since <window>
@@ -146,5 +177,73 @@ mod tests {
         .join()
         .unwrap();
         // No panic = pass (the detached work runs on its own thread; we don't join it).
+    }
+
+    // ---- plan_recovery (pure crash-recovery planner) ---------------------------------------------------
+    use crate::liveness::LeaseProbe;
+
+    /// Map `lease_path -> Some(true)=free/dead | Some(false)=held/alive | None=absent`.
+    struct MapProbe(std::collections::HashMap<String, Option<bool>>);
+    impl LeaseProbe for MapProbe {
+        fn try_state(&self, lease_path: &str) -> Option<bool> {
+            self.0.get(lease_path).copied().flatten()
+        }
+    }
+    fn rec(id: &str, host: &str, lease: &str) -> (String, String, String) {
+        (id.to_string(), host.to_string(), lease.to_string())
+    }
+
+    #[test]
+    fn plan_recovery_reaps_only_dead_same_host() {
+        let probe = MapProbe(std::collections::HashMap::from([
+            ("/l/dead.lock".to_string(), Some(true)),  // free ⇒ dead
+            ("/l/alive.lock".to_string(), Some(false)), // held ⇒ alive
+            ("/l/gone.lock".to_string(), None),         // absent ⇒ unknown
+        ]));
+        let records = vec![
+            rec("c_dead", "h1", "/l/dead.lock"),
+            rec("c_alive", "h1", "/l/alive.lock"),
+            rec("c_absent", "h1", "/l/gone.lock"),
+            rec("c_otherhost", "h2", "/l/dead.lock"), // free lock but DIFFERENT host ⇒ spared
+        ];
+        let (reap, leases) = plan_recovery(&records, "h1", &probe);
+        assert_eq!(reap, vec!["c_dead".to_string()]);
+        assert_eq!(leases, vec!["/l/dead.lock".to_string()]);
+    }
+
+    #[test]
+    fn plan_recovery_shared_lease_across_owners_reaps_all_and_dedups_lease() {
+        // The live-gate keystone: a crashed run's :rw + :ro containers (distinct ids, DIFFERENT owners) share
+        // ONE free lease. Classified as a single batch BEFORE any deletion ⇒ ALL reaped, the lease returned
+        // EXACTLY ONCE for the caller to delete after every owner is swept (no mid-pass blinding).
+        let probe = MapProbe(std::collections::HashMap::from([(
+            "/l/run.lock".to_string(),
+            Some(true),
+        )]));
+        let records = vec![
+            rec("c_rw", "h1", "/l/run.lock"),
+            rec("c_ro_codex", "h1", "/l/run.lock"),
+            rec("c_ro_claude", "h1", "/l/run.lock"),
+        ];
+        let (reap, leases) = plan_recovery(&records, "h1", &probe);
+        assert_eq!(
+            reap,
+            vec![
+                "c_rw".to_string(),
+                "c_ro_codex".to_string(),
+                "c_ro_claude".to_string()
+            ]
+        );
+        assert_eq!(leases, vec!["/l/run.lock".to_string()]); // deduped to one
+    }
+
+    #[test]
+    fn plan_recovery_blank_lease_label_is_spared() {
+        // A blank a2a.lease label probes to None ⇒ classify spares (Unknown): never reaped, no dead lease.
+        let probe = MapProbe(std::collections::HashMap::new());
+        let records = vec![rec("c", "h1", "")];
+        let (reap, leases) = plan_recovery(&records, "h1", &probe);
+        assert!(reap.is_empty());
+        assert!(leases.is_empty());
     }
 }

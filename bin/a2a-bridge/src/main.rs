@@ -293,8 +293,22 @@ fn recover_orphans(
     owners.extend(ro_sweep_targets(snapshot, config_path));
     owners.sort();
     owners.dedup();
+    // Reap every owner's DEAD orphans FIRST, collecting their (shared) lease files; delete the leases ONCE
+    // at the end. A crashed run's containers span multiple owners but share one lease — deleting it per-owner
+    // would blind the later owners' sweeps (absent lease → Unknown → spared → leak; live-gate finding).
+    let mut dead_leases: Vec<String> = Vec::new();
     for (runtime, owner) in owners {
-        bridge_core::reaper::classify_sweep(&runtime, &owner, host, &FsLeaseProbe);
+        dead_leases.extend(bridge_core::reaper::classify_sweep(
+            &runtime,
+            &owner,
+            host,
+            &FsLeaseProbe,
+        ));
+    }
+    dead_leases.sort();
+    dead_leases.dedup();
+    for lease in dead_leases {
+        let _ = std::fs::remove_file(&lease);
     }
 }
 
