@@ -26,6 +26,7 @@
 //                                                        — stream a task's progress (SSE)
 
 mod config;
+mod containers;
 mod implement;
 mod review;
 mod route;
@@ -88,6 +89,7 @@ SUBCOMMANDS:
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>]
   init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
   serve               Run the A2A server.  [--config <path>]
+  containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
   submit | task       Detached workflow submit + durable task store.
 
 Run `a2a-bridge <subcommand> --help` for details. Quickstart + cwd/creds/concurrency notes: AGENTS.md.";
@@ -1792,6 +1794,208 @@ fn init_cmd(args: &[String]) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Execute `a2a-bridge containers <list|reap>` — the operator view/cleanup over Increment A's managed
+/// containers. Reads the docker labels + probes the per-run `flock` lease to classify each container
+/// (Alive/Dead/Unknown), scoped (by default) to the owners THIS `--config` would spawn. Pure cores live in
+/// the `containers` module; this orchestrates the config load + docker shell-out + lease probe. Synchronous
+/// (no async I/O — just `std::process` + filesystem lease probes).
+fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", containers::CONTAINERS_USAGE);
+        return Ok(());
+    }
+    // Subcommand: list (default) | reap (a leading non-flag token).
+    let has_sub = args.first().map(|a| !a.starts_with("--")).unwrap_or(false);
+    let sub = if has_sub { args[0].as_str() } else { "list" };
+
+    let mut config: Option<PathBuf> = None;
+    let mut all = false;
+    let mut older_than: Option<String> = None;
+    let mut flags = containers::ReapFlags::default();
+    let mut it = args.iter();
+    if has_sub {
+        it.next(); // consume the subcommand positional
+    }
+    while let Some(f) = it.next() {
+        match f.as_str() {
+            "--config" => {
+                config = Some(PathBuf::from(
+                    it.next().ok_or("containers: --config needs a value")?,
+                ))
+            }
+            "--all" => all = true,
+            "--all-dead" => flags.all_dead = true,
+            "--stale" => flags.stale = true,
+            "--older-than" => {
+                older_than = Some(
+                    it.next()
+                        .ok_or("containers: --older-than needs a value")?
+                        .clone(),
+                )
+            }
+            "--run" => {
+                flags.run = Some(it.next().ok_or("containers: --run needs a value")?.clone())
+            }
+            "--owner" => {
+                flags.owner = Some(
+                    it.next()
+                        .ok_or("containers: --owner needs a value")?
+                        .clone(),
+                )
+            }
+            "--force" => {
+                flags.force = Some(
+                    it.next()
+                        .ok_or("containers: --force needs a value")?
+                        .clone(),
+                )
+            }
+            other => {
+                return Err(format!(
+                    "containers: unknown flag {other:?}\n{}",
+                    containers::CONTAINERS_USAGE
+                )
+                .into())
+            }
+        }
+    }
+    let window = older_than.as_deref().unwrap_or("1h");
+    let config_path = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
+
+    // Derive THIS config's owners + runtimes (the default scope), exactly as the spawn factory does.
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("containers: read config {config_path:?}: {e}"))?;
+    let cfg = config::RegistryConfig::parse(&raw)
+        .map_err(|e| format!("containers: config parse: {e}"))?;
+    let snapshot = cfg
+        .into_snapshot()
+        .map_err(|e| format!("containers: snapshot: {e}"))?;
+    let owner_config_path =
+        std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
+    let mut my_owners: Vec<String> = rw_sweep_targets(&snapshot, &owner_config_path)
+        .into_iter()
+        .chain(ro_sweep_targets(&snapshot, &owner_config_path))
+        .map(|(_runtime, owner)| owner)
+        .collect();
+    my_owners.sort();
+    my_owners.dedup();
+    let runtimes = {
+        let r = run_guard_runtimes(&snapshot, &owner_config_path);
+        if r.is_empty() {
+            vec!["docker".to_string()]
+        } else {
+            r
+        }
+    };
+    let my_host = bridge_core::liveness::host_id();
+    let probe = bridge_core::liveness::FsLeaseProbe;
+
+    // Read + classify every managed container across this config's runtimes (a record's host+lease drive
+    // the liveness verdict; `is_stale` is only meaningful — and only probed — for Alive ones).
+    let mut classified: Vec<containers::ClassifiedRecord> = Vec::new();
+    let mut managed_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for runtime in &runtimes {
+        let Ok(out) = std::process::Command::new(runtime)
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                "label=a2a.managed=1",
+                "--format",
+                containers::LIST_FORMAT,
+            ])
+            .output()
+        else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some(rec) = containers::parse_record(line) else {
+                continue;
+            };
+            managed_names.insert(rec.name.clone());
+            let labels = std::collections::HashMap::from([
+                ("a2a.host".to_string(), rec.host.clone()),
+                ("a2a.lease".to_string(), rec.lease.clone()),
+            ]);
+            let verdict = bridge_core::run_identity::classify(&labels, &my_host, &probe);
+            let stale = verdict == bridge_core::run_identity::Verdict::Alive
+                && bridge_core::reaper::is_stale(runtime, &rec.name, window);
+            classified.push(containers::ClassifiedRecord {
+                rec,
+                verdict,
+                stale,
+            });
+        }
+    }
+
+    match sub {
+        "list" => {
+            let now = epoch_secs().parse::<u64>().unwrap_or(0);
+            println!("{}", containers::LIST_HEADER);
+            let mut shown = 0;
+            for c in &classified {
+                if containers::list_visible(&c.rec, all, &my_owners) {
+                    println!("{}", containers::format_row(c, now));
+                    shown += 1;
+                }
+            }
+            if shown == 0 {
+                println!(
+                    "(no managed containers{})",
+                    if all {
+                        ""
+                    } else {
+                        " for this config — pass --all to show every owner"
+                    }
+                );
+            }
+            // Legacy pass: pre-Increment-A unlabeled `a2a-(ro|rw)-*` names (no `a2a.managed`), list-only.
+            let mut legacy: Vec<String> = Vec::new();
+            for runtime in &runtimes {
+                if let Ok(out) = std::process::Command::new(runtime)
+                    .args(["ps", "-a", "--format", "{{.Names}}"])
+                    .output()
+                {
+                    for name in String::from_utf8_lossy(&out.stdout).lines() {
+                        let name = name.trim();
+                        if containers::is_legacy_name(name) && !managed_names.contains(name) {
+                            legacy.push(name.to_string());
+                        }
+                    }
+                }
+            }
+            legacy.sort();
+            legacy.dedup();
+            for name in legacy {
+                println!("{name:<28} -    legacy   -          -        -      -     (reap with --force {name})");
+            }
+            Ok(())
+        }
+        "reap" => {
+            let plan = containers::reap_plan(&classified, &flags, &my_owners);
+            if plan.is_empty() {
+                println!("containers reap: nothing to reap");
+                return Ok(());
+            }
+            for name in &plan {
+                // Reap on every runtime (idempotent — `rm -f` of a gone/absent name is harmless).
+                for runtime in &runtimes {
+                    let _ = std::process::Command::new(runtime)
+                        .args(["rm", "-f", name])
+                        .output();
+                }
+                println!("reaped {name}");
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "containers: unknown action {other:?} (expected: list | reap)\n{}",
+            containers::CONTAINERS_USAGE
+        )
+        .into()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     // Dispatch subcommands BEFORE the server path touches the filesystem.
@@ -1799,6 +2003,7 @@ async fn main() -> Result<(), BoxError> {
     match raw_args.get(1).map(|s| s.as_str()) {
         Some("run-workflow") => return run_workflow_cmd(&raw_args[2..]).await,
         Some("implement") => return implement_cmd(&raw_args[2..]).await,
+        Some("containers") => return containers_cmd(&raw_args[2..]),
         Some("submit") => return submit_cmd(&raw_args[2..]).await,
         Some("task") => return task_cmd(&raw_args[2..]).await,
         Some("init") => return init_cmd(&raw_args[2..]),
@@ -1812,7 +2017,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         Some(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | implement | submit | task | init | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | implement | containers | submit | task | init | help)"
             )
             .into());
         }
