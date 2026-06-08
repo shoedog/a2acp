@@ -151,6 +151,21 @@ pub trait TweakEffects {
     async fn fix(&mut self, attempt: u32, input: &str) -> bool;
 }
 
+/// Injected progress sink: the loop reports `(attempt, sha)` at the entry and after each successful amend.
+/// The loop only ever reports IN-PROGRESS state; the TERMINAL phase is written by the caller after the loop
+/// returns. Kept separate from `TweakEffects` (no filesystem I/O in that seam). `Send` so the loop future is.
+pub trait CheckpointSink: Send {
+    fn record(&mut self, attempt: u32, sha: &str);
+}
+
+/// A no-op sink for callers that do not persist checkpoint progress (used in tests + by non-persisting callers).
+#[allow(dead_code)]
+pub struct NoopCheckpointSink;
+
+impl CheckpointSink for NoopCheckpointSink {
+    fn record(&mut self, _attempt: u32, _sha: &str) {}
+}
+
 /// The bounded review→tweak loop. Git ops run on a REAL clone; the workflow effects are injected via `eff`
 /// (so the no-work-loss wiring is fake-executor testable). Phase 2: NO `?` — every fallible op → a StopReason.
 #[allow(clippy::too_many_arguments)]
@@ -160,12 +175,15 @@ pub async fn run_tweak_loop(
     task: &str,
     mut sha: String,
     original_message: &str,
+    start_attempt: u32,
     max_attempts: u32,
     fix_available: bool,
     eff: &mut dyn TweakEffects,
+    ckpt: &mut dyn CheckpointSink,
 ) -> LoopFinal {
     use crate::implement;
-    let mut attempt: u32 = 1;
+    let mut attempt: u32 = start_attempt;
+    ckpt.record(attempt, &sha); // entry: covers a crash during the first verify of this (re)start
     let mut last_verify = VerifyOutcome::Incomplete;
     let mut last_review = ReviewOutcome::Incomplete;
     let report = loop {
@@ -239,6 +257,7 @@ pub async fn run_tweak_loop(
                         Ok(s) => {
                             sha = s;
                             attempt += 1;
+                            ckpt.record(attempt, &sha); // post-amend: crash-exact max_attempts across resumes
                         } // no break → loop continues
                         Err(_) => {
                             break LoopReport {
@@ -482,6 +501,14 @@ mod tests {
         (td, p, base, sha0)
     }
 
+    #[derive(Default)]
+    struct RecSink(Vec<(u32, String)>);
+    impl CheckpointSink for RecSink {
+        fn record(&mut self, attempt: u32, sha: &str) {
+            self.0.push((attempt, sha.to_string()));
+        }
+    }
+
     #[derive(Clone)]
     enum FixAct {
         Stage(&'static str),
@@ -550,7 +577,19 @@ mod tests {
             review: vec![rev(Verdict::Reject, 0), rev(Verdict::Approve, 0)],
             fixes: vec![FixAct::Stage("B.md")],
         };
-        let f = run_tweak_loop(&p, "implement/x", "task", sha0, "feat", 3, true, &mut fake).await;
+        let f = run_tweak_loop(
+            &p,
+            "implement/x",
+            "task",
+            sha0,
+            "feat",
+            1,
+            3,
+            true,
+            &mut fake,
+            &mut NoopCheckpointSink,
+        )
+        .await;
         assert_eq!(f.report.stop_reason, StopReason::Success);
         assert_eq!(f.report.attempts, 2);
         assert_eq!(ahead(&p, &base), 1); // amended, still one commit
@@ -568,7 +607,19 @@ mod tests {
             review: vec![rev(Verdict::Approve, 0)],
             fixes: vec![FixAct::Stage("B.md"), FixAct::SelfCommit("rogue.md")],
         };
-        let f = run_tweak_loop(&p, "implement/x", "task", sha0, "feat", 3, true, &mut fake).await;
+        let f = run_tweak_loop(
+            &p,
+            "implement/x",
+            "task",
+            sha0,
+            "feat",
+            1,
+            3,
+            true,
+            &mut fake,
+            &mut NoopCheckpointSink,
+        )
+        .await;
         assert_eq!(f.report.stop_reason, StopReason::HeadMutated);
         assert_eq!(f.report.attempts, 2);
         assert_eq!(ahead(&p, &base), 1); // one commit (rogue reset away)
@@ -592,9 +643,11 @@ mod tests {
             "task",
             sha0.clone(),
             "feat",
+            1,
             3,
             true,
             &mut fake,
+            &mut NoopCheckpointSink,
         )
         .await;
         assert_eq!(f.report.stop_reason, StopReason::HeadMutated);
@@ -613,10 +666,21 @@ mod tests {
             fixes: vec![FixAct::Nothing],
         };
         assert_eq!(
-            run_tweak_loop(&p, "implement/x", "t", sha0, "feat", 3, true, &mut f1)
-                .await
-                .report
-                .stop_reason,
+            run_tweak_loop(
+                &p,
+                "implement/x",
+                "t",
+                sha0,
+                "feat",
+                1,
+                3,
+                true,
+                &mut f1,
+                &mut NoopCheckpointSink,
+            )
+            .await
+            .report
+            .stop_reason,
             StopReason::NoProgress
         );
         // fix-incomplete: fix returns completed=false (NOT HeadMutated).
@@ -628,10 +692,21 @@ mod tests {
             fixes: vec![FixAct::Incomplete],
         };
         assert_eq!(
-            run_tweak_loop(&p2, "implement/x", "t", s2, "feat", 3, true, &mut f2)
-                .await
-                .report
-                .stop_reason,
+            run_tweak_loop(
+                &p2,
+                "implement/x",
+                "t",
+                s2,
+                "feat",
+                1,
+                3,
+                true,
+                &mut f2,
+                &mut NoopCheckpointSink,
+            )
+            .await
+            .report
+            .stop_reason,
             StopReason::FixIncomplete
         );
         // fix-unavailable: actionable but no fix workflow.
@@ -643,10 +718,21 @@ mod tests {
             fixes: vec![FixAct::Nothing],
         };
         assert_eq!(
-            run_tweak_loop(&p3, "implement/x", "t", s3, "feat", 3, false, &mut f3)
-                .await
-                .report
-                .stop_reason,
+            run_tweak_loop(
+                &p3,
+                "implement/x",
+                "t",
+                s3,
+                "feat",
+                1,
+                3,
+                false,
+                &mut f3,
+                &mut NoopCheckpointSink,
+            )
+            .await
+            .report
+            .stop_reason,
             StopReason::FixUnavailable
         );
         // bound: max=1, persistent fail.
@@ -657,8 +743,81 @@ mod tests {
             review: vec![rev(Verdict::Approve, 0)],
             fixes: vec![FixAct::Stage("B.md")],
         };
-        let r4 = run_tweak_loop(&p4, "implement/x", "t", s4, "feat", 1, true, &mut f4).await;
+        let r4 = run_tweak_loop(
+            &p4,
+            "implement/x",
+            "t",
+            s4,
+            "feat",
+            1,
+            1,
+            true,
+            &mut f4,
+            &mut NoopCheckpointSink,
+        )
+        .await;
         assert_eq!(r4.report.stop_reason, StopReason::BoundReached);
         assert_eq!(r4.report.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_records_entry_and_post_amend_crash_exact() {
+        // attempt 1 rejects → fix stages B → amend (attempt 2) → approve → Success.
+        let (_g, p, _base, sha0) = loop_repo();
+        let mut fake = Fake {
+            clone: p.clone(),
+            verify: vec![ran_pass()],
+            review: vec![rev(Verdict::Reject, 0), rev(Verdict::Approve, 0)],
+            fixes: vec![FixAct::Stage("B.md")],
+        };
+        let mut rec = RecSink::default();
+        let f = run_tweak_loop(
+            &p,
+            "implement/x",
+            "t",
+            sha0.clone(),
+            "feat",
+            1,
+            3,
+            true,
+            &mut fake,
+            &mut rec,
+        )
+        .await;
+        assert_eq!(f.report.stop_reason, StopReason::Success);
+        // entry (1, sha0) then post-amend (2, amended-sha != sha0); exactly two records.
+        assert_eq!(rec.0.len(), 2);
+        assert_eq!(rec.0[0].0, 1);
+        assert_eq!(rec.0[0].1, sha0);
+        assert_eq!(rec.0[1].0, 2);
+        assert_ne!(rec.0[1].1, sha0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_start_attempt_is_honored_on_resume() {
+        // Resume at attempt 2 with an immediately-passing tree → one iteration, one entry record at 2.
+        let (_g, p, _base, sha0) = loop_repo();
+        let mut fake = Fake {
+            clone: p.clone(),
+            verify: vec![ran_pass()],
+            review: vec![rev(Verdict::Approve, 0)],
+            fixes: vec![FixAct::Nothing],
+        };
+        let mut rec = RecSink::default();
+        let f = run_tweak_loop(
+            &p,
+            "implement/x",
+            "t",
+            sha0.clone(),
+            "feat",
+            2,
+            3,
+            true,
+            &mut fake,
+            &mut rec,
+        )
+        .await;
+        assert_eq!(f.report.stop_reason, StopReason::Success);
+        assert_eq!(rec.0, vec![(2, sha0)]); // start_attempt threaded through
     }
 }

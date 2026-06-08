@@ -28,6 +28,7 @@
 mod config;
 mod containers;
 mod implement;
+mod implement_resume;
 mod review;
 mod route;
 mod tweak;
@@ -1095,6 +1096,32 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 }
             };
             let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13 hygiene
+                                                                                     // ADR-0026: build the resume checkpoint (FirstCommitCreated) before the loop.
+            let mut prod_ckpt = implement_resume::ProdCheckpoint {
+                clone: clone.clone(),
+                ck: implement_resume::ImplementCheckpoint {
+                    schema_version: implement_resume::SCHEMA_VERSION,
+                    resume_id: task_id.clone(),
+                    task_id: task_id.clone(),
+                    task_brief: a.task.clone(),
+                    source_repo: a.repo.clone(),
+                    clone_path: clone.clone(),
+                    config_path: a.config.clone(),
+                    branch: branch.clone(),
+                    base_ref: a.base_ref.clone(),
+                    base_commit: base_sha.clone(),
+                    current_commit: Some(sha.clone()),
+                    original_message: Some(message.clone()),
+                    edit_workflow: a.workflow.clone(),
+                    fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
+                    loop_max_attempts: loop_cfg.max_attempts,
+                    attempt_next: 1,
+                    phase: implement_resume::ImplementPhase::FirstCommitCreated,
+                    created_at_ms: implement_resume::now_ms(),
+                    updated_at_ms: implement_resume::now_ms(),
+                },
+            };
+            let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
             let mut effects = ProdEffects {
                 verify_cfg: &verify_cfg,
                 review_cfg: &review_cfg,
@@ -1115,9 +1142,11 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 &a.task,
                 sha,
                 &message,
+                1, // start_attempt (fresh run)
                 loop_cfg.max_attempts,
                 fix_graph.is_some(),
                 &mut effects,
+                &mut prod_ckpt,
             )
             .await;
 
@@ -1138,6 +1167,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             handoff.push('\n');
             handoff.push_str(&tweak::loop_outcome_suffix(&final_.report));
             println!("{handoff}");
+            let terminal = if final_.report.stop_reason == tweak::StopReason::Success {
+                implement_resume::ImplementPhase::Approved
+            } else {
+                implement_resume::ImplementPhase::LoopStopped
+            };
+            implement_resume::write_terminal(&clone, prod_ckpt.ck.clone(), terminal);
             // Print BEFORE retire so a retire error never suppresses the hand-off; log-only, never alters
             // the result (post-commit, no `?`). M4 retire-error coverage is by-construction ordering here.
             let _ = warm.retire().await;
