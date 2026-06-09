@@ -66,3 +66,11 @@ start in ~0.18s. First-run on a new repo must pre-warm the cache (or the timeout
   bridge until prism speaks HTTP (then all three agents + api agents ride the param uniformly).
 - **api-kind agents (ollama)** get no MCP here — they need HTTP (provider connector) or a bridge-hosted MCP
   client; recorded for the HTTP work.
+- **Orchestrator discovery + usage.** The bridge's own workflows leverage prism via a clause in the review/
+  design prompts. For **external A2A orchestrators** driving the bridge over `serve`, MCP is config-time
+  (the operator wires `[[agents.mcp]]`), not request-time — an orchestrator can't add prism per request. To make
+  it discoverable, the **agent card advertises MCP servers** as a `capabilities.extensions` entry
+  (`uri=…/ext/mcp-servers/v1`, `params.servers = {agent_id: [names]}`); `AgentRegistry::mcp_advertisement()`
+  reads the config (no spawn). The usage contract an orchestrator follows: target a listed agent, set
+  `message.metadata.cwd` to the repo, and prompt the agent to use its `mcp__<server>__*` tools. claude is
+  multi-repo (re-targeted per request); codex/kiro are single-repo under serve.

@@ -7,7 +7,8 @@
 //   - `a2a::VERSION = "1.0"` is the A2A v1 protocol version string the crate uses.
 
 use a2a::{
-    AgentCapabilities, AgentCard, AgentInterface, AgentSkill, TRANSPORT_PROTOCOL_JSONRPC, VERSION,
+    AgentCapabilities, AgentCard, AgentExtension, AgentInterface, AgentSkill,
+    TRANSPORT_PROTOCOL_JSONRPC, VERSION,
 };
 
 use bridge_core::error::BridgeError;
@@ -19,8 +20,16 @@ pub const A2A_PINNED_VERSION: &str = VERSION;
 /// Build the AgentCard advertising the fixed skills (`code`, `delegate`,
 /// `fan-out`) plus one `workflow`-tagged skill per configured workflow id.
 ///
+/// `mcp_servers` is `(agent_id, [server names])` for each agent that exposes MCP servers; when
+/// non-empty it is advertised as a `capabilities.extensions` entry so A2A orchestrators can discover
+/// e.g. prism without out-of-band knowledge (ADR-0028).
+///
 /// The card exposes a single JSONRPC interface at `<base_url>`.
-pub fn agent_card(base_url: &str, workflow_ids: &[&str]) -> AgentCard {
+pub fn agent_card(
+    base_url: &str,
+    workflow_ids: &[&str],
+    mcp_servers: &[(String, Vec<String>)],
+) -> AgentCard {
     let code_skill = AgentSkill {
         id: "code".to_string(),
         name: "Code".to_string(),
@@ -83,6 +92,32 @@ pub fn agent_card(base_url: &str, workflow_ids: &[&str]) -> AgentCard {
         });
     }
 
+    // MCP advertisement (ADR-0028): one extension listing each agent's MCP server names, so an A2A
+    // orchestrator can discover (e.g.) prism and the usage contract without out-of-band knowledge.
+    let extensions = if mcp_servers.is_empty() {
+        None
+    } else {
+        let servers: serde_json::Map<String, serde_json::Value> = mcp_servers
+            .iter()
+            .map(|(agent, names)| (agent.clone(), serde_json::json!(names)))
+            .collect();
+        let mut params = std::collections::HashMap::new();
+        params.insert("servers".to_string(), serde_json::Value::Object(servers));
+        Some(vec![AgentExtension {
+            uri: "https://github.com/shoedog/a2acp/ext/mcp-servers/v1".to_string(),
+            description: Some(
+                "MCP servers exposed to this bridge's agents (per ADR-0028). `params.servers` maps \
+                 agent id -> server names. To use: target one of those agents, set \
+                 `message.metadata.cwd` to the target repo, and prompt the agent to use its \
+                 `mcp__<server>__*` tools. claude is multi-repo (re-targeted per request); \
+                 codex/kiro are single-repo under serve (the agent's configured cwd)."
+                    .to_string(),
+            ),
+            required: Some(false),
+            params: Some(params),
+        }])
+    };
+
     AgentCard {
         name: "a2a-bridge".to_string(),
         description: "A2A↔ACP bridge that routes agent tasks to the configured local \
@@ -93,7 +128,7 @@ pub fn agent_card(base_url: &str, workflow_ids: &[&str]) -> AgentCard {
         capabilities: AgentCapabilities {
             streaming: Some(true),
             push_notifications: None,
-            extensions: None,
+            extensions,
             extended_agent_card: None,
         },
         default_input_modes: vec!["text/plain".to_string()],
@@ -128,7 +163,7 @@ mod tests {
 
     #[test]
     fn card_has_two_skills_and_pinned_version() {
-        let c = agent_card("http://localhost:8080", &[]);
+        let c = agent_card("http://localhost:8080", &[], &[]);
         // Updated for Task 5a: three skills now (code, delegate, fan-out).
         assert!(c.skills.len() >= 2);
         assert!(c.skills.iter().any(|s| s.id == "code"));
@@ -156,7 +191,7 @@ mod tests {
 
     #[test]
     fn card_advertises_two_skills() {
-        let c = agent_card("http://localhost:8080", &[]);
+        let c = agent_card("http://localhost:8080", &[], &[]);
         // Updated for Task 5a: three skills now.
         assert!(c.skills.len() >= 2);
         assert!(c.skills.iter().any(|s| s.id == "delegate"));
@@ -167,7 +202,7 @@ mod tests {
 
     #[test]
     fn card_has_three_skills_incl_fanout() {
-        let c = agent_card("http://x", &[]);
+        let c = agent_card("http://x", &[], &[]);
         assert_eq!(c.skills.len(), 3);
         assert!(c.skills.iter().any(|s| s.id == "fan-out"));
     }
@@ -177,7 +212,7 @@ mod tests {
     #[test]
     fn card_appends_one_skill_per_workflow_id() {
         let ids = ["code-review", "triage"];
-        let c = agent_card("http://x", &ids);
+        let c = agent_card("http://x", &ids, &[]);
         // 3 fixed skills + one per workflow id.
         assert_eq!(c.skills.len(), 3 + ids.len());
         let wf = c.skills.iter().find(|s| s.id == "code-review").unwrap();
@@ -190,7 +225,7 @@ mod tests {
 
     #[test]
     fn agent_card_marks_workflow_skills_detached() {
-        let card = agent_card("http://x", &["code-review"]);
+        let card = agent_card("http://x", &["code-review"], &[]);
         let skill = card
             .skills
             .iter()
@@ -203,12 +238,42 @@ mod tests {
 
     #[test]
     fn base_skills_are_not_marked_detached() {
-        let card = agent_card("http://x", &["code-review"]);
+        let card = agent_card("http://x", &["code-review"], &[]);
         for id in &["code", "delegate", "fan-out"] {
             let skill = card.skills.iter().find(|s| s.id == *id).unwrap();
             let marked = skill.tags.iter().any(|x| x == "detached")
                 || skill.description.to_lowercase().contains("detached");
             assert!(!marked, "base skill '{id}' must NOT be marked detached");
         }
+    }
+
+    // ---- ADR-0028: MCP server advertisement extension ----
+
+    #[test]
+    fn card_advertises_mcp_servers_as_extension() {
+        let mcp = vec![
+            ("claude".to_string(), vec!["prism".to_string()]),
+            ("codex".to_string(), vec!["prism".to_string()]),
+        ];
+        let c = agent_card("http://x", &[], &mcp);
+        let exts = c
+            .capabilities
+            .extensions
+            .expect("capabilities.extensions present when MCP servers exist");
+        assert_eq!(exts.len(), 1);
+        assert!(exts[0].uri.contains("mcp-servers"), "uri: {}", exts[0].uri);
+        let servers = exts[0]
+            .params
+            .as_ref()
+            .and_then(|p| p.get("servers"))
+            .expect("params.servers");
+        assert_eq!(servers["claude"], serde_json::json!(["prism"]));
+        assert_eq!(servers["codex"], serde_json::json!(["prism"]));
+    }
+
+    #[test]
+    fn card_has_no_extension_without_mcp() {
+        let c = agent_card("http://x", &["code-review"], &[]);
+        assert!(c.capabilities.extensions.is_none());
     }
 }
