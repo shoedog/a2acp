@@ -103,15 +103,18 @@ fn replay(frame: &Value) -> Option<ReplayOutcome> {
             // `SessionNotification` (the real parse boundary) and map via the
             // production helper.
             //
-            // TOLERANT DROP on parse failure: a `session/update` whose `sessionUpdate`
-            // variant is unknown to the SDK 0.12.1 `SessionNotification` type (e.g.
-            // codex-acp's `usage_update`, absent from this SDK version) fails to
-            // deserialize. The live SDK dispatch (`typed.rs` `handle_if`) treats this
-            // exact case as `Some(Err)` → `send_error_notification` and CONTINUES the
-            // connection without invoking our `on_receive_notification` handler — i.e.
-            // the frame is dropped, not fatal. We mirror that here: a deser failure is
-            // a tolerant DROP (`None`), NOT a panic, so the corpus reflects real
-            // production behavior against the real agent.
+            // MODELED DROP (`Ok` arm): a variant the SDK knows but the backend doesn't
+            // surface (e.g. `usage_update`, now modeled via the `unstable_session_usage`
+            // feature) deserializes fine and `map_session_update` returns `None` → dropped.
+            //
+            // `Err` arm = a GENUINELY unmodeled variant. CAVEAT (live-found): the real SDK
+            // is NOT benign here — on a deser failure its typed dispatch auto-emits a
+            // `-32602` error notification BACK to the agent, which a real agent reacts to
+            // by stalling the turn (the `end_turn` result never arrives → hang). That is
+            // exactly what `usage_update{cost}` did before we enabled `unstable_session_usage`.
+            // So a genuinely-unknown `session/update` variant must be MODELED (feature/version
+            // bump), not relied on to "drop" here. We keep the tolerant `None` only so the
+            // corpus never panics on a future unknown — it does NOT mean production is safe.
             "session/update" => {
                 return match serde_json::from_value::<SessionNotification>(params) {
                     Ok(notif) => AcpBackend::map_session_update(notif).map(ReplayOutcome::Update),
@@ -336,6 +339,34 @@ fn gemini_available_commands_update_is_modeled_not_parse_error() {
     assert!(
         AcpBackend::map_session_update(notif).is_none(),
         "available_commands_update is modeled but carries no assistant text → maps to None (dropped at the map layer)"
+    );
+}
+
+#[test]
+fn usage_update_is_modeled_and_dropped_not_a_minus_32602() {
+    // Regression for the live HANG: claude-agent-acp emits a `session/update` of variant
+    // `usage_update` (with a `cost`). WITHOUT the `unstable_session_usage` feature the SDK's
+    // internally-tagged `SessionUpdate` enum (no `#[serde(other)]`) HARD-FAILS to deserialize it,
+    // the live SDK auto-emits a spurious `-32602` to the agent, and the turn stalls (multi-minute
+    // hang). With the feature on, it deserializes into the modeled `UsageUpdate` variant and
+    // `map_session_update` drops it (no assistant text) → None. MUST be a MODELED drop (Ok), not a
+    // parse error (Err).
+    let params = serde_json::json!({
+        "sessionId": "s1",
+        "update": {
+            "sessionUpdate": "usage_update",
+            "used": 55011,
+            "size": 1000000,
+            "cost": { "amount": 0.74405, "currency": "USD" }
+        }
+    });
+    let notif = serde_json::from_value::<SessionNotification>(params).expect(
+        "usage_update MUST deserialize (modeled via unstable_session_usage) — a parse error here \
+         is the live-hang bug (the SDK would emit a turn-stalling -32602)",
+    );
+    assert!(
+        AcpBackend::map_session_update(notif).is_none(),
+        "usage_update carries no assistant text → dropped at the map layer (None)"
     );
 }
 
