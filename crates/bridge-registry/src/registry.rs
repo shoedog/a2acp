@@ -327,6 +327,29 @@ impl AgentRegistry for Registry {
         self.state.load().default.clone()
     }
 
+    fn mcp_advertisement(&self) -> Vec<(String, Vec<String>)> {
+        // Read each slot's (swappable) entry config — NO spawn — and report the MCP server names
+        // for agents that have any. Sorted for a stable agent-card (ADR-0028).
+        let st = self.state.load();
+        let mut out: Vec<(String, Vec<String>)> = st
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| {
+                let entry = slot.entry.load();
+                if entry.mcp.is_empty() {
+                    None
+                } else {
+                    Some((
+                        id.as_str().to_string(),
+                        entry.mcp.iter().map(|m| m.name.clone()).collect(),
+                    ))
+                }
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     async fn apply(&self, desired: RegistrySnapshot) -> Result<(), BridgeError> {
         // Atomic reconcile [spec §7]:
         //  - validate first → malformed config is rejected before any state change.
@@ -473,6 +496,8 @@ mod tests {
             description: None,
             tags: vec![],
             version: None,
+            mcp: vec![],
+            mcp_delivery: Default::default(),
             extensions: BTreeMap::new(),
         }
     }
@@ -528,6 +553,8 @@ mod tests {
                 description: None,
                 tags: vec![],
                 version: None,
+                mcp: vec![],
+                mcp_delivery: Default::default(),
                 extensions: Default::default(),
             }],
             allowed_cmds: vec![],

@@ -39,6 +39,8 @@ pub fn single_agent_registry(id: &str, backend: Arc<dyn AgentBackend>) -> Arc<dy
         description: None,
         tags: vec![],
         version: None,
+        mcp: vec![],
+        mcp_delivery: Default::default(),
         extensions: Default::default(),
     };
     let snap = RegistrySnapshot {

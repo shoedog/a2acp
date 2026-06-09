@@ -1,0 +1,92 @@
+# Self-hosted review/design WITH the prism code-graph MCP server (ADR-0028).
+#
+# Host-run codex + claude (NO [agents.sandbox] => they run on the host, using their real ~/.codex /
+# claude auth). This is the containerization BYPASS: for your OWN codebases you accept that `:ro` is
+# prompt-only and there is no egress lockdown, in exchange for prism + full nav depth and no
+# blind-codex. For untrusted repos, keep the containerized config instead.
+#
+# prism delivery (auto-detected per agent from `cmd`):
+#   - claude (claude-agent-acp) -> the ACP `mcpServers` param (in-protocol).
+#   - codex  (codex-acp)        -> native `-c mcp_servers.*` override args (keeps real ~/.codex auth).
+#   - kiro   (kiro-cli)         -> a bridge-written ~/.kiro/agents/<a2a-mcp-id>.json + `--agent` (host-only;
+#                                   add a host kiro agent with its own [[agents.mcp]] the same way). kiro
+#                                   names the tools BARE (nav_repo_map), not mcp__prism__*.
+#
+# PREREQS:
+#   1. Build prism for your host:  (in ~/code/slicing)
+#        cargo build --release --bin prism-mcp --features mcp
+#      and set `command` below to the built binary (default: ~/code/slicing/target/release/prism-mcp).
+#   2. WARM the cache once per repo (a cold CPG build ~35s exceeds the 30s ACP handshake timeout).
+#      Use the EXACT CANONICAL path — prism's cache is keyed by the --repo path, so a non-canonical
+#      path (trailing slash, symlink, relative) hashes to a DIFFERENT entry and cold-rebuilds:
+#        prism-mcp --repo "$(cd <REPO> && pwd -P)" --cache-dir ~/.local/share/a2a/prism-cache-host < /dev/null
+#      (The bridge canonicalizes {cwd} before passing --repo, so it deterministically hits this entry.)
+#   3. Run:  a2a-bridge run-workflow code-review --input <diff/file> \
+#              --session-cwd <REPO> --config examples/a2a-bridge.slicing-review.toml --out review.md
+#      ({cwd} in the args below is substituted with --session-cwd.)
+
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+# codex runs blind under its own bwrap sandbox when the tool can't reach the host; on the host with
+# your repos, disable it (Docker/containment isn't the boundary here — you accepted host-run).
+args = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp" # ← adjust to your prism build
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+
+[[agents]]
+id = "claude"
+cmd = "claude-agent-acp"
+
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp" # ← adjust to your prism build
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+
+# code-review: correctness (codex) + architecture (claude) -> synth. Both navigate the code under
+# review; prism gives them CPG-precise callers/callees/impact beyond read/grep.
+[[workflows]]
+id = "code-review"
+[[workflows.nodes]]
+id = "correctness"
+agent = "codex"
+prompt_file = "../prompts/review-correctness.md"
+inputs = []
+[[workflows.nodes]]
+id = "architecture"
+agent = "claude"
+prompt_file = "../prompts/review-architecture.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-synth.md"
+inputs = ["correctness", "architecture"]
+
+# design: two clean-room architects (structure + executability) -> merge synth. They ground the
+# design in the ACTUAL code; prism makes that grounding CPG-aware.
+[[workflows]]
+id = "design"
+[[workflows.nodes]]
+id = "structure"
+agent = "claude"
+prompt_file = "../prompts/design-structure.md"
+inputs = []
+[[workflows.nodes]]
+id = "executability"
+agent = "codex"
+prompt_file = "../prompts/design-executability.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/design-synth.md"
+inputs = ["structure", "executability"]
+
+[server]
+addr = "127.0.0.1:8080"

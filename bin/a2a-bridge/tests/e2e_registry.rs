@@ -244,6 +244,8 @@ fn entry(
         description: None,
         tags: vec![],
         version: None,
+        mcp: vec![],
+        mcp_delivery: Default::default(),
         extensions: std::collections::BTreeMap::new(),
     }
 }
@@ -578,6 +580,8 @@ async fn api_entry_resolves_and_serves_through_registry() {
         description: None,
         tags: vec![],
         version: None,
+        mcp: vec![],
+        mcp_delivery: Default::default(),
         extensions: Default::default(),
     };
     let snap = RegistrySnapshot {
@@ -635,6 +639,8 @@ async fn registry_rejects_api_entry_with_cmd() {
         description: None,
         tags: vec![],
         version: None,
+        mcp: vec![],
+        mcp_delivery: Default::default(),
         extensions: Default::default(),
     };
     let snap = RegistrySnapshot {

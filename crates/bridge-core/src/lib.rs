@@ -4,6 +4,7 @@ pub mod domain;
 pub mod error;
 pub mod ids;
 pub mod liveness;
+pub mod mcp;
 pub mod ports;
 pub mod process;
 pub mod reaper;

@@ -116,18 +116,63 @@ fn acp_program_argv(
     entry: &AgentEntry,
     container_name: Option<&str>,
     labels: &[(String, String)],
+    mcp_cwd: &str,
 ) -> Result<(String, Vec<String>), BridgeError> {
     let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
         reason: format!("acp agent {} missing cmd", entry.id.as_str()),
     })?;
+    // Native MCP delivery to the argv (ADR-0028): codex gets `-c mcp_servers.*` overrides; kiro gets
+    // `--agent <name>` pointing at the agent-config the bridge writes in `acp_spawn_inputs`. claude
+    // (Acp) gets MCP via the session/new param, not here. Empty `mcp` → unchanged args.
+    use bridge_core::mcp::McpDelivery;
+    let args = if entry.mcp.is_empty() {
+        entry.args.clone()
+    } else {
+        match entry.mcp_delivery {
+            McpDelivery::CodexNative => {
+                let mut a = entry.args.clone();
+                a.extend(bridge_core::mcp::render_codex_mcp_args(&entry.mcp, mcp_cwd));
+                a
+            }
+            McpDelivery::KiroNative => {
+                // `--agent` follows the `acp` subcommand already in `entry.args`; the named config
+                // (with prism) is written host-side at spawn. kiro MCP is host-only (config guard).
+                let mut a = entry.args.clone();
+                a.push("--agent".to_string());
+                a.push(bridge_core::mcp::kiro_agent_name(entry.id.as_str()));
+                a
+            }
+            McpDelivery::Acp => entry.args.clone(),
+        }
+    };
     Ok(match (&entry.sandbox, container_name) {
         // Named (`:ro` reaper) container when the caller supplied a name.
         (Some(sb), Some(name)) => {
-            bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &entry.args, labels)
+            bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &args, labels)
         }
-        (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &entry.args, labels),
-        (None, _) => (cmd.to_string(), entry.args.clone()),
+        (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &args, labels),
+        (None, _) => (cmd.to_string(), args),
     })
+}
+
+/// Write the bridge-managed kiro agent-config to `~/.kiro/agents/<name>.json` for `KiroNative` delivery
+/// (ADR-0028). Overwrites a stable per-agent name each spawn (no cleanup — a benign managed config).
+/// `{cwd}` is the spawn cwd; kiro is host-only for MCP (the config guard rejects `KiroNative` + sandbox).
+fn write_kiro_agent_config(entry: &AgentEntry, cwd: &str) -> Result<(), BridgeError> {
+    let name = bridge_core::mcp::kiro_agent_name(entry.id.as_str());
+    let home = std::env::var("HOME").map_err(|_| BridgeError::ConfigInvalid {
+        reason: "kiro MCP delivery needs $HOME to locate ~/.kiro/agents".into(),
+    })?;
+    let dir = std::path::Path::new(&home).join(".kiro").join("agents");
+    std::fs::create_dir_all(&dir).map_err(|e| BridgeError::ConfigInvalid {
+        reason: format!("kiro agents dir {dir:?}: {e}"),
+    })?;
+    let path = dir.join(format!("{name}.json"));
+    let cfg = bridge_core::mcp::render_kiro_agent_config(&entry.mcp, cwd, &name);
+    std::fs::write(&path, cfg).map_err(|e| BridgeError::ConfigInvalid {
+        reason: format!("write kiro agent config {path:?}: {e}"),
+    })?;
+    Ok(())
 }
 
 /// Build `(program, argv, AcpConfig)` for a `kind=acp` agent, attaching the `:ro` container reaper when the
@@ -143,6 +188,22 @@ fn acp_spawn_inputs(
     // Increment A: a `:ro` reader carries the run-id in its name (no same-owner concurrent clash) + the
     // full managed label set (so `recover_orphans`/`containers` classify it). `repo`/`cwd` are display-only.
     let cwd_str = cwd.to_string_lossy().to_string();
+    // prism's CPG cache is keyed by the --repo PATH: a NON-canonical path hashes to a different (cold,
+    // possibly stale) entry. Canonicalize the cwd used for MCP `{cwd}` so the agent deterministically
+    // hits the warmed entry (warm the SAME canonical path). The `:rw` implementor already does this via
+    // `rw_canon`. Falls back to the raw cwd if canonicalize fails (e.g. unit tests, missing dir).
+    let mcp_cwd = std::fs::canonicalize(&cwd)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cwd_str.clone());
+    // kiro MCP delivery (ADR-0028): write the named agent-config (prism, {cwd}-substituted) to
+    // ~/.kiro/agents/<name>.json BEFORE spawn; `acp_program_argv` points kiro at it via `--agent`.
+    if matches!(
+        entry.mcp_delivery,
+        bridge_core::mcp::McpDelivery::KiroNative
+    ) && !entry.mcp.is_empty()
+    {
+        write_kiro_agent_config(entry, &mcp_cwd)?;
+    }
     let (ro_name, labels) = match entry
         .sandbox
         .as_ref()
@@ -170,7 +231,7 @@ fn acp_spawn_inputs(
         }
         None => (None, Vec::new()),
     };
-    let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels)?;
+    let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels, &mcp_cwd)?;
     let container = ro_name.map(|name| bridge_acp::acp_backend::ContainerReap {
         runtime: entry
             .sandbox
@@ -186,6 +247,13 @@ fn acp_spawn_inputs(
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
         container,
+        // ACP-param MCP delivery (claude): the entry's MCP servers ride `session/new`. Codex/kiro
+        // native delivery leaves this empty (they get MCP via their native channel, not the param).
+        mcp: if matches!(entry.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
+            entry.mcp.clone()
+        } else {
+            Vec::new()
+        },
         ..bridge_acp::acp_backend::AcpConfig::default()
     };
     Ok((program, argv, acp))
@@ -365,6 +433,8 @@ fn container_rw_cfg_from_entry(
         sandbox: sb,
         cmd,
         args: entry.args.clone(),
+        mcp: entry.mcp.clone(),
+        mcp_delivery: entry.mcp_delivery,
         model: entry.model.clone(),
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
@@ -1535,9 +1605,19 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .ok_or_else(|| format!("run-workflow: unknown workflow {workflow_id:?}"))?;
 
     // Build the registry + executor using the same SpawnFn the server uses.
-    let snapshot = cfg
+    let mut snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
+    // MAJOR 4 (ADR-0028): stamp --session-cwd into every entry's `session_cwd` so the ONE resolution
+    // chain (`resolve_static_session_cwd`) feeds BOTH the agent's ACP session cwd AND the codex native
+    // MCP `-c` args' `{cwd}` from the same value — prism then indexes exactly the repo the agent works
+    // in (no silent wrong-repo). Acp-kind agents read this at spawn; container_rw gets the per-turn cwd
+    // via the run context instead. run-workflow targets one repo, so stamping all entries is correct.
+    if let Some(ref dir) = session_cwd {
+        for e in &mut snapshot.entries {
+            e.session_cwd = Some(dir.clone());
+        }
+    }
     // Canonical config path: the owner token must match between the sweeps and the spawn factory.
     let owner_config_path =
         std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
@@ -2947,6 +3027,8 @@ mod cli_tests {
             cwd: None,
             session_cwd: None,
             sandbox: None,
+            mcp: vec![],
+            mcp_delivery: Default::default(),
             auth_method: None,
             name: None,
             description: None,
@@ -2962,7 +3044,7 @@ mod cli_tests {
         // raw: program = cmd, argv = args (Slice A compat).
         let raw = acp_entry("a");
         assert_eq!(
-            acp_program_argv(&raw, None, &[]).unwrap(),
+            acp_program_argv(&raw, None, &[], "/cwd").unwrap(),
             ("claude-agent-acp".to_string(), Vec::<String>::new())
         );
         // sandbox: program = runtime (docker), argv wraps the inner cli with the :ro mount.
@@ -2975,19 +3057,52 @@ mod cli_tests {
             egress: EgressPolicy::Open,
             volumes: vec![],
         });
-        let (program, argv) = acp_program_argv(&sb, None, &[]).unwrap();
+        let (program, argv) = acp_program_argv(&sb, None, &[], "/cwd").unwrap();
         assert_eq!(program, "docker");
         assert_eq!(argv.last().unwrap(), "claude-agent-acp");
         assert!(argv.contains(&"/work:/work:ro".to_string()));
         // sandbox + a container name → the `--name` is spliced in (the :ro reaper path).
-        let (_p, named) = acp_program_argv(&sb, Some("a2a-ro-owner-nonce"), &[]).unwrap();
+        let (_p, named) = acp_program_argv(&sb, Some("a2a-ro-owner-nonce"), &[], "/cwd").unwrap();
         assert!(named
             .windows(2)
             .any(|w| w == ["--name", "a2a-ro-owner-nonce"]));
         // missing cmd → ConfigInvalid.
         let mut nocmd = acp_entry("c");
         nocmd.cmd = None;
-        assert!(acp_program_argv(&nocmd, None, &[]).is_err());
+        assert!(acp_program_argv(&nocmd, None, &[], "/cwd").is_err());
+    }
+
+    #[test]
+    fn acp_program_argv_appends_codex_native_mcp_args() {
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+        // A CodexNative-delivery agent gets `-c mcp_servers.*` args appended ({cwd}-substituted);
+        // an Acp-delivery agent (claude) does NOT (it gets MCP via the session/new param).
+        let mut codex = acp_entry("codex");
+        codex.cmd = Some("codex-acp".into());
+        codex.mcp_delivery = McpDelivery::CodexNative;
+        codex.mcp = vec![McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+        let (_p, argv) = acp_program_argv(&codex, None, &[], "/repo/z").unwrap();
+        assert!(argv.iter().any(|a| a == "-c"), "argv has -c: {argv:?}");
+        assert!(
+            argv.iter()
+                .any(|a| a == r#"mcp_servers.prism.command="/opt/prism""#),
+            "command override present: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a.contains("/repo/z")) && !argv.iter().any(|a| a.contains("{cwd}")),
+            "{{cwd}} substituted: {argv:?}"
+        );
+        // Acp delivery (claude) does NOT append -c args here.
+        let mut claude = acp_entry("claude");
+        claude.mcp_delivery = McpDelivery::Acp;
+        claude.mcp = codex.mcp.clone();
+        let (_p, argv) = acp_program_argv(&claude, None, &[], "/repo/z").unwrap();
+        assert!(!argv.iter().any(|a| a == "-c"), "no -c for Acp: {argv:?}");
     }
 
     #[test]

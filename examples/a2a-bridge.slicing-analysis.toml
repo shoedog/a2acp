@@ -1,0 +1,72 @@
+# Clean-room SUBSTRATE-ANALYSIS config: prism-wired, 5-node design (draft→refine→synth).
+#
+# Holds everything constant vs the no-MCP baseline producer (examples/a2a-bridge.multi-agent.toml `design`)
+# — SAME 5-node shape, SAME prompt files, SAME host-run repo-reading architects — and adds ONLY the prism
+# [[agents.mcp]] wiring. Single-variable A/B: re-run the substrate brief here and diff vs
+# docs/prism-query-layer/substrate-analysis-baseline-noMCP-2026-06-09.md to isolate what prism adds.
+#
+# Host-run codex + claude (real ~/.codex / claude auth, prism + full nav depth; containerization bypass —
+# OWN codebase only). The design-*draft* prompts already carry the conditional prism tool-catalog clause
+# ("if mcp__prism__* tools are present ..."), so the exploration phase uses prism here and ignores it in the
+# no-MCP baseline — exactly the variable under test.
+#
+# PREREQS (same as a2a-bridge.slicing-review.toml):
+#   1. cargo build --release --bin prism-mcp --features mcp   (in ~/code/slicing)
+#   2. WARM once per repo:  prism-mcp --repo <REPO> --cache-dir ~/.local/share/a2a/prism-cache-host < /dev/null
+#   3. a2a-bridge run-workflow design --input <brief> --session-cwd <REPO> \
+#        --config examples/a2a-bridge.slicing-analysis.toml --out <out.md>
+
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+args = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp" # ← adjust to your prism build
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+
+[[agents]]
+id = "claude"
+cmd = "claude-agent-acp"
+
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp" # ← adjust to your prism build
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+
+# design: 5-node draft→refine→synth — IDENTICAL shape to the no-MCP baseline producer
+# (examples/a2a-bridge.multi-agent.toml). draft = clean-room (inputs=[]); refine = grounded second pass on
+# OWN draft (firewall preserved); synth consumes the refined lenses. Only difference vs baseline: prism wired.
+[[workflows]]
+id = "design"
+[[workflows.nodes]]
+id = "executabilitydraft"
+agent = "codex"
+prompt_file = "../prompts/design-executability.md"
+inputs = []
+[[workflows.nodes]]
+id = "structuredraft"
+agent = "claude"
+prompt_file = "../prompts/design-structure.md"
+inputs = []
+[[workflows.nodes]]
+id = "executability"
+agent = "codex"
+prompt_file = "../prompts/design-executability-refine.md"
+inputs = ["executabilitydraft"]
+[[workflows.nodes]]
+id = "structure"
+agent = "claude"
+prompt_file = "../prompts/design-structure-refine.md"
+inputs = ["structuredraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/design-synth.md"
+inputs = ["executability", "structure"]
+
+[server]
+addr = "127.0.0.1:8080"

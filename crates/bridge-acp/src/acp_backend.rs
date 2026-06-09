@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::{
     AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification,
-    ContentBlock, CreateTerminalRequest, CreateTerminalResponse, InitializeRequest,
-    InitializeResponse, KillTerminalRequest, KillTerminalResponse, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
+    ContentBlock, CreateTerminalRequest, CreateTerminalResponse, EnvVariable, InitializeRequest,
+    InitializeResponse, KillTerminalRequest, KillTerminalResponse, McpServer, McpServerStdio,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId as AgentSessionId,
@@ -89,6 +89,10 @@ pub struct AcpConfig {
     /// Reaper for a containerized agent's `docker run` container (`:ro` sandbox). `None` for local-process
     /// and in-process (test) backends — reaping is then a no-op.
     pub container: Option<ContainerReap>,
+    /// MCP servers to offer via the ACP `session/new` `mcpServers` param (ADR-0028). Populated ONLY for
+    /// `McpDelivery::Acp` agents (claude); `{cwd}` in args/env is substituted per session at mint.
+    /// Codex/kiro native delivery leaves this empty (they ignore the param).
+    pub mcp: Vec<bridge_core::mcp::McpServerSpec>,
 }
 
 /// Reaper handle for a containerized (`:ro` sandbox) agent: the named `docker run` container is removed
@@ -121,6 +125,7 @@ impl Default for AcpConfig {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             cancel_grace: DEFAULT_CANCEL_GRACE,
             container: None,
+            mcp: Vec::new(),
         }
     }
 }
@@ -373,14 +378,35 @@ impl AcpBackend {
 
     /// Build the `session/new` request this backend sends to mint an agent
     /// session for a bridge session. `cwd` MUST be an absolute path (ACP §11A);
-    /// `mcpServers` is sent as an explicit empty array, never omitted.
+    /// `mcpServers` is sent as an explicit array (empty when no MCP servers),
+    /// never omitted. `mcp` specs have their `{cwd}` args/env substituted with
+    /// this session's `cwd` and are converted to `McpServer::Stdio` (ADR-0028).
     ///
     /// Exposed so the wire-golden test can assert the serialized `params` shape
-    /// (`{"cwd":<abs>,"mcpServers":[]}`) against the SAME value `ensure_session`
-    /// transmits — not a re-derivation of the SDK type.
+    /// against the SAME value `ensure_session` transmits — not a re-derivation
+    /// of the SDK type.
     #[must_use]
-    pub fn new_session_request(cwd: impl Into<PathBuf>) -> NewSessionRequest {
-        NewSessionRequest::new(cwd).mcp_servers(vec![])
+    pub fn new_session_request(
+        cwd: impl Into<PathBuf>,
+        mcp: &[bridge_core::mcp::McpServerSpec],
+    ) -> NewSessionRequest {
+        let cwd = cwd.into();
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let servers: Vec<McpServer> = mcp
+            .iter()
+            .map(|spec| {
+                let s = spec.substituted(&cwd_str);
+                McpServer::Stdio(
+                    McpServerStdio::new(s.name, s.command).args(s.args).env(
+                        s.env
+                            .into_iter()
+                            .map(|(name, value)| EnvVariable::new(name, value))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
+        NewSessionRequest::new(cwd).mcp_servers(servers)
     }
 
     /// Build the `session/prompt` request the backend sends for a turn: the
@@ -958,12 +984,20 @@ impl AcpBackend {
         // the post-init latch drain below.
         let mut newly_minted = false;
         let cwd_for_mint = desired_cwd.clone();
+        // MCP servers to offer at session/new (ADR-0028). Static per agent (the entry's `mcp`);
+        // `{cwd}` is substituted with `cwd_for_mint` inside `new_session_request`. Empty for
+        // non-Acp delivery (codex/kiro get MCP via their native channel, not this param).
+        let mcp_for_mint: Vec<bridge_core::mcp::McpServerSpec> = self
+            .config
+            .as_ref()
+            .map(|c| c.mcp.clone())
+            .unwrap_or_default();
         let id = entry
             .agent_id
             .get_or_try_init(|| async {
                 newly_minted = true;
                 // (1) session/new — mint the agent session id.
-                let req = Self::new_session_request(PathBuf::from(&cwd_for_mint));
+                let req = Self::new_session_request(PathBuf::from(&cwd_for_mint), &mcp_for_mint);
                 let resp = cx
                     .send_request(req)
                     .block_task()

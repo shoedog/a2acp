@@ -145,6 +145,12 @@ pub trait AgentRegistry: Send + Sync {
     async fn apply(&self, snapshot: RegistrySnapshot) -> Result<(), BridgeError>;
     /// List all registered agent ids.
     fn list(&self) -> Vec<crate::ids::AgentId>;
+    /// Per-agent MCP server names, for agent-card advertisement (ADR-0028) — `(agent_id, [server
+    /// names])` for each agent that has any `[[agents.mcp]]`. Read-only over the config (no spawn).
+    /// Defaults to empty (test/mocked registries advertise nothing).
+    fn mcp_advertisement(&self) -> Vec<(String, Vec<String>)> {
+        Vec::new()
+    }
 }
 
 #[async_trait::async_trait]
