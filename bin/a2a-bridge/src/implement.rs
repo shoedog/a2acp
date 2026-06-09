@@ -33,7 +33,10 @@ pub fn checkout_new_branch_argv(branch: &str) -> Vec<String> {
 /// The host commit argv (run with `git -C <clone>`). Hooks neutralized THREE ways (`--no-verify` alone
 /// still runs prepare-commit-msg/post-commit and the agent can set core.hooksPath); signing off;
 /// safe.directory pins the dubious-ownership guard for the container-root→host round-trip; bot identity.
-pub fn commit_argv(clone: &str, msg: &str) -> Vec<String> {
+/// The identity-FREE git `-c` pins shared by every bridge-driven commit: dubious-ownership guard,
+/// hook suppression, no signing. Identity is attached per-caller (`-c user.*` for `commit`,
+/// `GIT_*` env for `commit-tree`) — NOT shared, so callers can't accidentally cross identities.
+pub fn pin_prefix_argv(clone: &str) -> Vec<String> {
     vec![
         "-c".into(),
         format!("safe.directory={clone}"),
@@ -41,6 +44,12 @@ pub fn commit_argv(clone: &str, msg: &str) -> Vec<String> {
         "core.hooksPath=/dev/null".into(),
         "-c".into(),
         "commit.gpgsign=false".into(),
+    ]
+}
+
+pub fn commit_argv(clone: &str, msg: &str) -> Vec<String> {
+    let mut v = pin_prefix_argv(clone);
+    v.extend([
         "-c".into(),
         format!("user.name={BOT_NAME}"),
         "-c".into(),
@@ -49,7 +58,8 @@ pub fn commit_argv(clone: &str, msg: &str) -> Vec<String> {
         "--no-verify".into(),
         "-m".into(),
         msg.into(),
-    ]
+    ]);
+    v
 }
 
 // ─── Commit message ──────────────────────────────────────────────────────────
@@ -282,13 +292,8 @@ pub fn host_commit(clone: &Path, msg: &str) -> Result<String, String> {
 /// the freshly-staged fix into the single commit, KEEPING the stored message + parent — so the operator
 /// hand-off (`cherry-pick -n FETCH_HEAD`) stays byte-identical across attempts.
 pub fn commit_amend_argv(clone: &str) -> Vec<String> {
-    vec![
-        "-c".into(),
-        format!("safe.directory={clone}"),
-        "-c".into(),
-        "core.hooksPath=/dev/null".into(),
-        "-c".into(),
-        "commit.gpgsign=false".into(),
+    let mut v = pin_prefix_argv(clone);
+    v.extend([
         "-c".into(),
         format!("user.name={BOT_NAME}"),
         "-c".into(),
@@ -297,7 +302,8 @@ pub fn commit_amend_argv(clone: &str) -> Vec<String> {
         "--no-verify".into(),
         "--amend".into(),
         "--no-edit".into(),
-    ]
+    ]);
+    v
 }
 
 /// Amend the agent-staged fix into the single commit (keeps the original message + parent + bot identity).
@@ -422,6 +428,16 @@ mod tests {
                 "/root/.a2a-implement/impl-1-ab"
             ]
         );
+    }
+
+    #[test]
+    fn pin_prefix_is_identity_free_and_complete() {
+        let p = pin_prefix_argv("/root/.a2a-implement/impl-1-ab");
+        let joined = p.join(" ");
+        assert_eq!(joined, "-c safe.directory=/root/.a2a-implement/impl-1-ab -c core.hooksPath=/dev/null -c commit.gpgsign=false");
+        // identity-free: no user.name / user.email here
+        assert!(!joined.contains("user.name"));
+        assert!(!joined.contains("user.email"));
     }
 
     #[test]
