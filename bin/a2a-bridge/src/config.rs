@@ -1921,7 +1921,7 @@ path = "/tmp/x.db"
     #[test]
     fn merge_config_validation() {
         // both identity halves -> Some
-        let raw = "allowed_cwd_root = \"/x\"\n[merge]\ntarget_ref = \"main\"\n\
+        let raw = "default = \"x\"\nallowed_cwd_root = \"/x\"\n[server]\n[merge]\ntarget_ref = \"main\"\n\
                    author_name = \"Op\"\nauthor_email = \"op@x.com\"\n";
         let cfg = super::RegistryConfig::parse(raw).unwrap();
         let m = cfg.merge.as_ref().unwrap().to_config().unwrap();
@@ -1929,7 +1929,7 @@ path = "/tmp/x.db"
         assert_eq!(m.author.as_ref().unwrap().email, "op@x.com");
 
         // half identity -> error
-        let half = "[merge]\nauthor_name = \"Op\"\n";
+        let half = "default = \"x\"\n[server]\n[merge]\nauthor_name = \"Op\"\n";
         assert!(super::RegistryConfig::parse(half)
             .unwrap()
             .merge
@@ -1939,7 +1939,7 @@ path = "/tmp/x.db"
             .is_err());
 
         // empty target_ref -> error
-        let empty = "[merge]\ntarget_ref = \"\"\n";
+        let empty = "default = \"x\"\n[server]\n[merge]\ntarget_ref = \"\"\n";
         assert!(super::RegistryConfig::parse(empty)
             .unwrap()
             .merge
@@ -1949,7 +1949,7 @@ path = "/tmp/x.db"
             .is_err());
 
         // absent [merge] -> None
-        let none = "allowed_cwd_root = \"/x\"\n";
+        let none = "default = \"x\"\nallowed_cwd_root = \"/x\"\n[server]\n";
         assert!(super::RegistryConfig::parse(none).unwrap().merge.is_none());
     }
 }

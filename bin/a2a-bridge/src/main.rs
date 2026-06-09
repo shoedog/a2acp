@@ -607,6 +607,10 @@ enum ImplementMode {
 struct ImplementArgs {
     mode: ImplementMode,
     config: PathBuf,
+    /// `--merge`: after the run, land an Approved result into source_repo (ADR-0027). Approved-only sugar.
+    merge: bool,
+    /// `--onto <branch>`: the merge target (when `--merge`); else `[merge].target_ref` / `base_ref`.
+    onto: Option<String>,
 }
 
 const IMPLEMENT_USAGE: &str = "\
@@ -628,6 +632,8 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
             .cloned()
             .ok_or("implement: --resume needs an <id>")?;
         let mut config = None;
+        let mut merge = false;
+        let mut onto = None;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
@@ -635,6 +641,18 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
                     config = Some(PathBuf::from(
                         args.get(i + 1).ok_or("implement: --config needs a value")?,
                     ));
+                    i += 2;
+                }
+                "--merge" => {
+                    merge = true;
+                    i += 1;
+                }
+                "--onto" => {
+                    onto = Some(
+                        args.get(i + 1)
+                            .ok_or("implement: --onto needs a value")?
+                            .clone(),
+                    );
                     i += 2;
                 }
                 other => {
@@ -648,6 +666,8 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
         return Ok(ImplementArgs {
             mode: ImplementMode::Resume { resume_id },
             config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
+            merge,
+            onto,
         });
     }
 
@@ -662,8 +682,18 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
         );
     }
     let (mut repo, mut base_ref, mut config, mut workflow) = (None, None, None, None);
+    let mut merge = false;
+    let mut onto = None;
     while let Some(f) = iter.next() {
         match f.as_str() {
+            "--merge" => merge = true,
+            "--onto" => {
+                onto = Some(
+                    iter.next()
+                        .ok_or("implement: --onto needs a value")?
+                        .clone(),
+                )
+            }
             "--repo" => {
                 repo = Some(PathBuf::from(
                     iter.next().ok_or("implement: --repo needs a value")?,
@@ -703,6 +733,8 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
             workflow: workflow.unwrap_or_else(|| "implement-edit".into()),
         },
         config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
+        merge,
+        onto,
     })
 }
 
@@ -1038,7 +1070,7 @@ async fn run_warm_loop(
     executor: &bridge_workflow::executor::WorkflowExecutor,
     fix_template: Option<String>,
     prod_ckpt: &mut implement_resume::ProdCheckpoint,
-) {
+) -> implement_resume::ImplementPhase {
     let final_ = {
         let mut effects = ProdEffects {
             verify_cfg,
@@ -1091,6 +1123,38 @@ async fn run_warm_loop(
     };
     implement_resume::write_terminal(clone, prod_ckpt.ck.clone(), terminal);
     let _ = runner.retire().await;
+    terminal
+}
+
+/// `implement --merge` sugar (ADR-0027): when the run ended `Approved`, land it via `merge_clone`
+/// (Approved-only, `--force` n/a — `implement` has no `--force`) and exit with its code; a non-Approved
+/// run prints `not merged:` and exits 2. Without `--merge`, returns `Ok(())` (plain implement unchanged).
+fn merge_after_loop(
+    merge_requested: bool,
+    outcome_phase: implement_resume::ImplementPhase,
+    merge_cfg: Option<Result<config::MergeConfig, config::ConfigError>>,
+    clone: &Path,
+    root: &Path,
+    onto: Option<&str>,
+) -> Result<(), BoxError> {
+    if !merge_requested {
+        return Ok(());
+    }
+    match outcome_phase {
+        implement_resume::ImplementPhase::Approved => {
+            let mcfg = merge_cfg
+                .transpose()
+                .map_err(|e| format!("implement --merge: {e}"))?;
+            let outcome = merge::merge_clone(mcfg.as_ref(), clone, root, onto, false);
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            std::process::exit(outcome.code());
+        }
+        other => {
+            eprintln!("not merged: run ended {other:?}, not Approved — resume/re-run the agent");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// `a2a-bridge implement <task> --repo <path>` — clone a quarantine, run the 1-node `implement-edit`
@@ -1104,6 +1168,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     bridge_observ::init();
     let a = parse_implement_args(args)?;
     let config_path = a.config.clone();
+    let merge_requested = a.merge;
+    let onto = a.onto.clone();
     let (task, repo, base_ref, workflow) = match a.mode {
         ImplementMode::Fresh {
             task,
@@ -1112,7 +1178,13 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             workflow,
         } => (task, repo, base_ref, workflow),
         ImplementMode::Resume { resume_id } => {
-            return implement_resume_cmd(&resume_id, &config_path).await;
+            return implement_resume_cmd(
+                &resume_id,
+                &config_path,
+                merge_requested,
+                onto.as_deref(),
+            )
+            .await;
         }
     };
 
@@ -1213,6 +1285,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // B2b-2: parse [verify] NOW, before into_snapshot moves cfg. Owned + Clone, survives the move.
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config()); // B2b-3a: parsed pre-commit (beside verify)
+    let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
@@ -1374,7 +1447,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 fix_template,
                 ..
             } = warm_impl;
-            run_warm_loop(
+            let outcome_phase = run_warm_loop(
                 &clone,
                 &repo,
                 &branch,
@@ -1398,12 +1471,24 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 &mut prod_ckpt,
             )
             .await;
-            Ok(())
+            merge_after_loop(
+                merge_requested,
+                outcome_phase,
+                merge_cfg,
+                &clone,
+                &root,
+                onto.as_deref(),
+            )
         }
     }
 }
 
-async fn implement_resume_cmd(resume_id: &str, config_path: &Path) -> Result<(), BoxError> {
+async fn implement_resume_cmd(
+    resume_id: &str,
+    config_path: &Path,
+    merge_requested: bool,
+    onto: Option<&str>,
+) -> Result<(), BoxError> {
     let raw = std::fs::read_to_string(config_path)
         .map_err(|e| format!("implement --resume: read config {config_path:?}: {e}"))?;
     let cfg = config::RegistryConfig::parse(&raw)
@@ -1463,6 +1548,7 @@ async fn implement_resume_cmd(resume_id: &str, config_path: &Path) -> Result<(),
     let fix_graph = wf_map.get(&fix_wf_id).cloned();
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
+    let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement --resume: snapshot: {e}"))?;
@@ -1543,7 +1629,7 @@ async fn implement_resume_cmd(resume_id: &str, config_path: &Path) -> Result<(),
         fix_template,
         ..
     } = warm_impl;
-    run_warm_loop(
+    let outcome_phase = run_warm_loop(
         &clone,
         &ck.source_repo,
         &ck.branch,
@@ -1567,7 +1653,14 @@ async fn implement_resume_cmd(resume_id: &str, config_path: &Path) -> Result<(),
         &mut prod_ckpt,
     )
     .await;
-    Ok(())
+    merge_after_loop(
+        merge_requested,
+        outcome_phase,
+        merge_cfg,
+        &clone,
+        &root,
+        onto,
+    )
 }
 
 /// Execute the `run-workflow` subcommand.

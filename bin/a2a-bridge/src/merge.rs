@@ -630,6 +630,13 @@ mod tests {
             assert_eq!(resolve_target(Some(good), None, None), Ok(good.to_string()));
         }
     }
+
+    #[test]
+    fn merge_outcome_exit_codes() {
+        assert_eq!(MergeOutcome::Merged.code(), 0);
+        assert_eq!(MergeOutcome::UsageOrPreflight.code(), 1);
+        assert_eq!(MergeOutcome::Unlanded.code(), 3);
+    }
 }
 
 #[cfg(test)]
