@@ -8,13 +8,19 @@
 # prism delivery (auto-detected per agent from `cmd`):
 #   - claude (claude-agent-acp) -> the ACP `mcpServers` param (in-protocol).
 #   - codex  (codex-acp)        -> native `-c mcp_servers.*` override args (keeps real ~/.codex auth).
+#   - kiro   (kiro-cli)         -> a bridge-written ~/.kiro/agents/<a2a-mcp-id>.json + `--agent` (host-only;
+#                                   add a host kiro agent with its own [[agents.mcp]] the same way). kiro
+#                                   names the tools BARE (nav_repo_map), not mcp__prism__*.
 #
 # PREREQS:
 #   1. Build prism for your host:  (in ~/code/slicing)
 #        cargo build --release --bin prism-mcp --features mcp
 #      and set `command` below to the built binary (default: ~/code/slicing/target/release/prism-mcp).
-#   2. WARM the cache once per repo (a cold CPG build ~35s exceeds the 30s ACP handshake timeout):
-#        prism-mcp --repo <REPO> --cache-dir ~/.local/share/a2a/prism-cache-host < /dev/null
+#   2. WARM the cache once per repo (a cold CPG build ~35s exceeds the 30s ACP handshake timeout).
+#      Use the EXACT CANONICAL path — prism's cache is keyed by the --repo path, so a non-canonical
+#      path (trailing slash, symlink, relative) hashes to a DIFFERENT entry and cold-rebuilds:
+#        prism-mcp --repo "$(cd <REPO> && pwd -P)" --cache-dir ~/.local/share/a2a/prism-cache-host < /dev/null
+#      (The bridge canonicalizes {cwd} before passing --repo, so it deterministically hits this entry.)
 #   3. Run:  a2a-bridge run-workflow code-review --input <diff/file> \
 #              --session-cwd <REPO> --config examples/a2a-bridge.slicing-review.toml --out review.md
 #      ({cwd} in the args below is substituted with --session-cwd.)

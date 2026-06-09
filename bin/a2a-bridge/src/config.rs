@@ -778,6 +778,19 @@ impl RegistryConfig {
                 !mcp.is_empty(),
                 id.as_str(),
             )?;
+            // kiro MCP is host-only: the bridge writes ~/.kiro/agents/<name>.json on the HOST and points
+            // kiro at it via `--agent`; a containerized kiro has its own home, so the config wouldn't reach
+            // it (ADR-0028). Reject the combination rather than silently delivering nothing.
+            if matches!(mcp_delivery, bridge_core::mcp::McpDelivery::KiroNative)
+                && sandbox.is_some()
+                && !mcp.is_empty()
+            {
+                return Err(ConfigError::Registry(format!(
+                    "agent {:?}: kiro MCP delivery is host-only — remove [agents.sandbox] (kiro reads \
+                     ~/.kiro/agents on the host), or use claude/codex for a containerized agent",
+                    id.as_str()
+                )));
+            }
             entries.push(AgentEntry {
                 id,
                 cmd: a.cmd,
@@ -1826,5 +1839,31 @@ path = "/tmp/x.db"
         assert!(!super::is_toml_bare_key(""));
         assert!(!super::is_toml_bare_key("a.b"));
         assert!(!super::is_toml_bare_key("a b"));
+    }
+
+    #[test]
+    fn kiro_native_mcp_with_sandbox_is_rejected_host_only() {
+        // A containerized kiro (sandbox) + MCP servers -> host-only error (the bridge writes
+        // ~/.kiro/agents on the host, which a container can't read).
+        let toml = "default=\"k\"\nallowed_cwd_root=\"/work\"\n[[agents]]\nid=\"k\"\ncmd=\"kiro-cli\"\n\
+                    [agents.sandbox]\nimage=\"img\"\nmount=\"/work\"\naccess=\"ro\"\negress=\"open\"\n\
+                    [[agents.mcp]]\nname=\"prism\"\ncommand=\"/p\"\nargs=[\"--repo\",\"{cwd}\"]\n[server]\n";
+        let cfg = super::RegistryConfig::parse(toml).expect("parses");
+        let err = cfg.into_snapshot().unwrap_err();
+        assert!(format!("{err:?}").contains("host-only"), "got: {err:?}");
+    }
+
+    #[test]
+    fn kiro_native_mcp_host_run_is_accepted() {
+        // Same kiro + MCP but NO sandbox (host-run) -> accepted, delivery resolved to KiroNative.
+        let toml = "default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"kiro-cli\"\n\
+                    [[agents.mcp]]\nname=\"prism\"\ncommand=\"/p\"\nargs=[\"--repo\",\"{cwd}\"]\n[server]\n";
+        let snap = super::RegistryConfig::parse(toml)
+            .expect("parses")
+            .into_snapshot()
+            .expect("host kiro + mcp is valid");
+        let k = snap.entries.iter().find(|e| e.id.as_str() == "k").unwrap();
+        assert_eq!(k.mcp_delivery, bridge_core::mcp::McpDelivery::KiroNative);
+        assert_eq!(k.mcp.len(), 1);
     }
 }

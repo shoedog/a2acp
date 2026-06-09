@@ -121,19 +121,29 @@ fn acp_program_argv(
     let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
         reason: format!("acp agent {} missing cmd", entry.id.as_str()),
     })?;
-    // Native codex MCP delivery (ADR-0028): append `-c mcp_servers.*` override args to the codex-acp
-    // argv ({cwd}-substituted). Applies to BOTH host and `:ro`-container codex (the args ride the
-    // codex-acp command line either way). claude (Acp delivery) gets MCP via the session/new param, not here.
-    let args = if matches!(
-        entry.mcp_delivery,
-        bridge_core::mcp::McpDelivery::CodexNative
-    ) && !entry.mcp.is_empty()
-    {
-        let mut a = entry.args.clone();
-        a.extend(bridge_core::mcp::render_codex_mcp_args(&entry.mcp, mcp_cwd));
-        a
-    } else {
+    // Native MCP delivery to the argv (ADR-0028): codex gets `-c mcp_servers.*` overrides; kiro gets
+    // `--agent <name>` pointing at the agent-config the bridge writes in `acp_spawn_inputs`. claude
+    // (Acp) gets MCP via the session/new param, not here. Empty `mcp` → unchanged args.
+    use bridge_core::mcp::McpDelivery;
+    let args = if entry.mcp.is_empty() {
         entry.args.clone()
+    } else {
+        match entry.mcp_delivery {
+            McpDelivery::CodexNative => {
+                let mut a = entry.args.clone();
+                a.extend(bridge_core::mcp::render_codex_mcp_args(&entry.mcp, mcp_cwd));
+                a
+            }
+            McpDelivery::KiroNative => {
+                // `--agent` follows the `acp` subcommand already in `entry.args`; the named config
+                // (with prism) is written host-side at spawn. kiro MCP is host-only (config guard).
+                let mut a = entry.args.clone();
+                a.push("--agent".to_string());
+                a.push(bridge_core::mcp::kiro_agent_name(entry.id.as_str()));
+                a
+            }
+            McpDelivery::Acp => entry.args.clone(),
+        }
     };
     Ok(match (&entry.sandbox, container_name) {
         // Named (`:ro` reaper) container when the caller supplied a name.
@@ -143,6 +153,26 @@ fn acp_program_argv(
         (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &args, labels),
         (None, _) => (cmd.to_string(), args),
     })
+}
+
+/// Write the bridge-managed kiro agent-config to `~/.kiro/agents/<name>.json` for `KiroNative` delivery
+/// (ADR-0028). Overwrites a stable per-agent name each spawn (no cleanup — a benign managed config).
+/// `{cwd}` is the spawn cwd; kiro is host-only for MCP (the config guard rejects `KiroNative` + sandbox).
+fn write_kiro_agent_config(entry: &AgentEntry, cwd: &str) -> Result<(), BridgeError> {
+    let name = bridge_core::mcp::kiro_agent_name(entry.id.as_str());
+    let home = std::env::var("HOME").map_err(|_| BridgeError::ConfigInvalid {
+        reason: "kiro MCP delivery needs $HOME to locate ~/.kiro/agents".into(),
+    })?;
+    let dir = std::path::Path::new(&home).join(".kiro").join("agents");
+    std::fs::create_dir_all(&dir).map_err(|e| BridgeError::ConfigInvalid {
+        reason: format!("kiro agents dir {dir:?}: {e}"),
+    })?;
+    let path = dir.join(format!("{name}.json"));
+    let cfg = bridge_core::mcp::render_kiro_agent_config(&entry.mcp, cwd, &name);
+    std::fs::write(&path, cfg).map_err(|e| BridgeError::ConfigInvalid {
+        reason: format!("write kiro agent config {path:?}: {e}"),
+    })?;
+    Ok(())
 }
 
 /// Build `(program, argv, AcpConfig)` for a `kind=acp` agent, attaching the `:ro` container reaper when the
@@ -158,6 +188,22 @@ fn acp_spawn_inputs(
     // Increment A: a `:ro` reader carries the run-id in its name (no same-owner concurrent clash) + the
     // full managed label set (so `recover_orphans`/`containers` classify it). `repo`/`cwd` are display-only.
     let cwd_str = cwd.to_string_lossy().to_string();
+    // prism's CPG cache is keyed by the --repo PATH: a NON-canonical path hashes to a different (cold,
+    // possibly stale) entry. Canonicalize the cwd used for MCP `{cwd}` so the agent deterministically
+    // hits the warmed entry (warm the SAME canonical path). The `:rw` implementor already does this via
+    // `rw_canon`. Falls back to the raw cwd if canonicalize fails (e.g. unit tests, missing dir).
+    let mcp_cwd = std::fs::canonicalize(&cwd)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cwd_str.clone());
+    // kiro MCP delivery (ADR-0028): write the named agent-config (prism, {cwd}-substituted) to
+    // ~/.kiro/agents/<name>.json BEFORE spawn; `acp_program_argv` points kiro at it via `--agent`.
+    if matches!(
+        entry.mcp_delivery,
+        bridge_core::mcp::McpDelivery::KiroNative
+    ) && !entry.mcp.is_empty()
+    {
+        write_kiro_agent_config(entry, &mcp_cwd)?;
+    }
     let (ro_name, labels) = match entry
         .sandbox
         .as_ref()
@@ -185,7 +231,7 @@ fn acp_spawn_inputs(
         }
         None => (None, Vec::new()),
     };
-    let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels, &cwd_str)?;
+    let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels, &mcp_cwd)?;
     let container = ro_name.map(|name| bridge_acp::acp_backend::ContainerReap {
         runtime: entry
             .sandbox

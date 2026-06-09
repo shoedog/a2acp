@@ -42,8 +42,12 @@ the one channel each agent honors, `{cwd}`-correct for the repo the agent works 
   opt-out for own-codebase use: `:ro` becomes prompt-only and there's no egress lockdown, in exchange for prism
   + full nav depth, no blind-codex (the `:ro` reader image lacks `bwrap`), and no native-mount-into-container
   machinery. The `:rw` **implementor** stays contained (it writes) and gets prism via the same `-c` args.
-- **kiro → deferred.** The `KiroNative` delivery variant + auto-detect exist; its `settings/mcp.json` mechanism
-  is a follow-up (needs its own probe). codex covers the reviewer/implementor roles.
+- **kiro → a bridge-written agent-config + `--agent`.** kiro honors neither the ACP param (stdio) nor `-c`
+  overrides; it loads MCP from a *named agent*. The bridge renders `~/.kiro/agents/<a2a-mcp-id>.json`
+  (`mcpServers` + `{cwd}`-substituted, `@server`-included/-trusted tools) at spawn and appends `--agent <name>`
+  to the kiro argv. **Host-only** (the config lives in the host `~/.kiro`; the config layer rejects
+  `KiroNative` + `[sandbox]`). **Probe finding: kiro registers MCP tools BARE** (`nav_repo_map`), not
+  `mcp__<server>__*` — the review/design prompts now state both namings.
 
 **One cwd, one source of truth (MAJOR 4).** A divergence between the native `{cwd}` and the agent's ACP session
 cwd would index prism on repo A while the agent works in repo B (silent). run-workflow **stamps `--session-cwd`
@@ -54,6 +58,10 @@ path.)
 **Warm cache is load-bearing.** prism builds its CPG eagerly at startup (~35s cold on a2a-bridge), which exceeds
 the 30s ACP `handshake_timeout` → `AgentCrashed`. A warm `--cache-dir` (host dir or named volume) makes prism
 start in ~0.18s. First-run on a new repo must pre-warm the cache (or the timeout must be raised for MCP agents).
+prism's cache is keyed by the `--repo` **path**, so a non-canonical path (trailing slash, symlink, relative)
+hashes to a *different* (cold/stale) entry — the bridge **canonicalizes** `{cwd}` before passing `--repo`
+(`acp_spawn_inputs`; the `:rw` implementor already used the canonical clone), and operators must warm the same
+canonical path (`--repo "$(cd <repo> && pwd -P)"`).
 
 ## Consequences
 

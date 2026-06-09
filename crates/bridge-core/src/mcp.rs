@@ -137,6 +137,47 @@ pub fn render_codex_mcp_args(mcp: &[McpServerSpec], cwd: &str) -> Vec<String> {
     out
 }
 
+/// The bridge-managed kiro agent name for an agent id — the basename of the `~/.kiro/agents/<name>.json`
+/// config the bridge writes AND the value passed to `kiro-cli acp --agent <name>` (kept in sync).
+pub fn kiro_agent_name(agent_id: &str) -> String {
+    format!("a2a-mcp-{agent_id}")
+}
+
+/// Render a kiro **agent-config JSON** (written to `~/.kiro/agents/<agent_name>.json`) carrying `mcp`
+/// as `mcpServers`, with `{cwd}` substituted. kiro honors neither the ACP `mcpServers` param (stdio)
+/// nor codex `-c` overrides; it loads MCP servers from a named agent via `kiro-cli acp --agent
+/// <agent_name>`. NOTE: kiro registers the tools **bare** (e.g. `nav_repo_map`), NOT `mcp__<server>__*`.
+/// See ADR-0028.
+pub fn render_kiro_agent_config(mcp: &[McpServerSpec], cwd: &str, agent_name: &str) -> String {
+    use serde_json::{json, Map, Value};
+    let mut servers = Map::new();
+    let mut tools: Vec<Value> = vec![json!("*")];
+    let mut allowed: Vec<Value> = Vec::new();
+    for spec in mcp {
+        let s = spec.substituted(cwd);
+        let mut entry = Map::new();
+        entry.insert("command".into(), json!(s.command));
+        entry.insert("args".into(), json!(s.args));
+        if !s.env.is_empty() {
+            let env: Map<String, Value> = s.env.into_iter().map(|(k, v)| (k, json!(v))).collect();
+            entry.insert("env".into(), Value::Object(env));
+        }
+        servers.insert(s.name.clone(), Value::Object(entry));
+        // `@<server>` includes ALL of that server's tools; also auto-trust them (non-interactive ACP).
+        tools.push(json!(format!("@{}", s.name)));
+        allowed.push(json!(format!("@{}", s.name)));
+    }
+    let config = json!({
+        "name": agent_name,
+        "description": "a2a-bridge managed agent (MCP delivery, ADR-0028)",
+        "mcpServers": Value::Object(servers),
+        "tools": tools,
+        "allowedTools": allowed,
+        "includeMcpJson": false,
+    });
+    serde_json::to_string_pretty(&config).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +292,31 @@ mod tests {
             render_codex_mcp_args(&[spec], "/r")[1],
             r#"mcp_servers.x.command="/a/\"q\"\\b""#
         );
+    }
+
+    #[test]
+    fn kiro_agent_name_is_namespaced() {
+        assert_eq!(kiro_agent_name("kiro"), "a2a-mcp-kiro");
+    }
+
+    #[test]
+    fn kiro_agent_config_carries_mcp_servers_cwd_substituted() {
+        let cfg = render_kiro_agent_config(&[prism()], "/repo", "a2a-mcp-kiro");
+        let v: serde_json::Value = serde_json::from_str(&cfg).expect("valid JSON");
+        assert_eq!(v["name"], "a2a-mcp-kiro");
+        assert_eq!(v["mcpServers"]["prism"]["command"], "/opt/prism");
+        assert_eq!(
+            v["mcpServers"]["prism"]["args"],
+            serde_json::json!(["--repo", "/repo", "--cache-dir", "/cache"])
+        );
+        assert_eq!(v["mcpServers"]["prism"]["env"]["RUST_LOG"], "warn");
+        // `@prism` in tools + allowedTools so kiro registers + auto-trusts the server's tools.
+        assert!(v["tools"].as_array().unwrap().iter().any(|t| t == "@prism"));
+        assert!(v["allowedTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "@prism"));
+        assert!(!cfg.contains("{cwd}"));
     }
 }
