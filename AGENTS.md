@@ -48,6 +48,23 @@ Clones the repo into a quarantine under `allowed_cwd_root`, runs the **warm** co
 (edit + fix turns share ONE container + session), build/test-verifies, reviews the diff, and hands off a
 branch for you to merge. The default `impl` agent is **codex (gpt-5.5, effort=high)**.
 
+**Land it (`merge`, ADR-0027).** Integrate an **Approved** run's commit into its source repo, re-authored to
+**you** (the operator), without touching your working checkout:
+
+```bash
+a2a-bridge merge <id> --onto main          # land run <id> onto `main` (fast-forward off its base_commit)
+a2a-bridge implement "…" --repo … --merge --onto main   # implement + auto-merge when Approved
+```
+
+`merge` re-authors the clone's commit via `git commit-tree` and lands it with
+`git push --force-with-lease=refs/heads/<target>:<base_commit>` (the lease IS the concurrency CAS — one of N
+concurrent merges wins, the rest get a stale-lease refusal). Operator identity comes from the source repo's
+`git config user.name/email` (or a `[merge]` `author_name/author_email` override). **Exit codes:** `0` merged ·
+`1` usage/preflight · `2` (`--merge`) run not Approved · `3` (`--merge`) Approved but couldn't land (target
+moved / checked out). **Mode A only** (fast-forward `--onto`); a target moved off `base_commit` refuses (re-run
+off the moved target). **Caveat:** a source repo with `receive.denyCurrentBranch=updateInstead`/`ignore` is out
+of scope (the default `refuse` is the no-touch backstop).
+
 ## 4. Serve (A2A server)
 
 ```bash
