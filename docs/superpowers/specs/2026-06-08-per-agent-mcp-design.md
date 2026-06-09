@@ -1,4 +1,4 @@
-# Per-agent MCP servers (`[[agents.mcp]]`) — Design Spec (v2, post spec-review)
+# Per-agent MCP servers (`[[agents.mcp]]`) — Design Spec (v3, contracts pinned)
 
 **Date:** 2026-06-08
 **Status:** Approved (brainstorm). Plan + ADR-0028 to follow.
@@ -26,6 +26,30 @@ tool; (c) the result is documented as a support matrix. Agents that **honor** th
 reference config; agents that **ignore** it are documented as unsupported-via-ACP, and their **native-config
 fallback is an explicit deferred follow-up — NOT v1**. (So "kiro fallback" is removed from the build order.)
 The keystone risk is retired by slice 0 *before* the mechanism is built.
+
+### Live-probe harness — mechanized acceptance (resolves BLOCKER round-2)
+
+The probe and the slice-5 gate are FALSIFIABLE, not "usable tool":
+- **Server + tool:** `prism-mcp --repo {cwd} --cache-dir /tmp/prism`; tool **`nodes_at`** (prism exposes
+  `nodes_at`/`callers`/`callees`/`ego-graph`). Confirm the exact arg schema from `prism::mcp` at build.
+- **Fixture:** a committed file:line in THIS repo, e.g. `crates/bridge-core/src/domain.rs:89` (the `AgentEntry`
+  struct) — a stable target.
+- **Prompt (tool-forcing, no other work):** *"Call ONLY the `nodes_at` MCP tool with file
+  `crates/bridge-core/src/domain.rs` line `89`. Reply with the raw tool result and nothing else. Do not read
+  files or use any other tool."*
+- **Success signal (observable in the ACP session stream):** a `tool_call` whose server is `prism` and tool is
+  `nodes_at`, FOLLOWED by a `tool_call_update`/result with a non-error payload naming a node at that location.
+  (The bridge's `Translator`/container logs already carry these `session/update` frames.)
+- **Failure taxonomy (the matrix records EXACTLY one per agent):**
+  1. **param-ignored** — no prism tool ever appears in the agent's tool list / it never offers `nodes_at`
+     (the agent didn't honor the ACP `mcpServers`).
+  2. **spawn-failed** — the agent tried to start `prism-mcp` but it errored (binary-not-found / arch-mismatch /
+     bwrap-block) — visible as an MCP-server start error in the agent/container logs.
+  3. **call-failed** — `nodes_at` is offered and called, but the tool returns an error result.
+  4. **not-called** — the tool is available but the agent never calls it (prompt/behavior; re-prompt once).
+- **Pass = case "success"; cases 1–4 are documented per agent.** Only "success" agents get wired in the
+  reference config; 1/2 (if codex) trigger the `sandbox_mode` fix and a re-probe; a persistent 1 → that agent
+  is "unsupported via ACP" (native-config fallback deferred).
 
 ## Why this is small
 
@@ -62,7 +86,9 @@ reader and the `:rw container_rw` clone both see `{cwd}` and `/opt/prism/prism-m
 the container. The mechanism is generic, so a **raw host ACP agent** could also carry `[[agents.mcp]]` — there
 `{cwd}` and `command` are host paths (also same-namespace). The invariant is the operator's contract; the
 bridge does not cross-namespace-translate. **V1 acceptance covers BOTH the `:ro` reader and the `:rw` clone
-paths** (raw-host MCP is supported-but-not-dogfooded).
+paths** (raw-host MCP is supported-but-not-dogfooded). **To be explicit (round-2 MAJOR 5):** the parser and
+runtime plumbing thread `[[agents.mcp]]` for ANY ACP agent (host or containerized); "out of scope" applies
+only to the v1 reference config + docs (they dogfood the containerized config), NOT to the code path.
 
 ## Domain type + config schema
 
@@ -119,13 +145,35 @@ The spec/docs state this; the bridge does NOT validate the mount (volumes are tr
 cheap **load-time lint** (warn when `command` is not the RHS of any `volumes` entry) would turn a first-tool-
 call failure into a startup error — **deferred** with a note (MINOR 9), not v1.
 
-**Validation (`McpToml::to_config`, MAJOR 7) — deterministic, fail-loud:**
-- `name` non-empty; **`name` unique within an agent** (duplicate server names → error).
-- `command` non-empty (a relative path is ALLOWED — it's an in-namespace path, the operator's responsibility —
-  but documented).
-- every `args`/`env`-value `{…}` token must be exactly `{cwd}` (any other placeholder → error, so a typo'd
-  `{repo}` fails at config load, not silently at runtime).
-- `env` keys non-empty and **unique within a server**; a malformed env entry → error.
+**TOML structs (pinned — round-2 MAJOR):**
+```rust
+#[derive(serde::Deserialize)] pub struct EnvToml { pub name: String, pub value: String }
+#[derive(serde::Deserialize)] pub struct McpToml {
+    pub name: String, pub command: String,
+    #[serde(default)] pub args: Vec<String>,
+    #[serde(default)] pub env: Vec<EnvToml>,
+}
+// `[[agents.mcp]]` deserializes to Vec<McpToml>; `env = [{ name, value }]` (inline tables). serde rejects
+// any other env shape (string/map) at parse. `McpToml::to_config(cwd_or_unresolved) -> Result<McpServerSpec>`.
+```
+
+**Validation (`McpToml::to_config`) — deterministic, fail-loud:**
+- `name` non-empty; **unique within an agent** (duplicate server names → error).
+- `command` non-empty; **MUST contain NO `{…}` placeholder** (round-2: `command="{cwd}/bin/x"` would load clean
+  and fail at exec — reject braces in `command` at load; the coupling invariant wants `command` == a fixed
+  mount RHS anyway). A relative `command` is allowed (an in-namespace path) but documented.
+- **Placeholder scanner (`args` + `env` values):** scan left→right; at each `{`, the substring through the
+  next `}` MUST be exactly `{cwd}` → substituted; an unterminated `{` (no `}`) or any other `{…}` → error.
+  | input | result |
+  |---|---|
+  | `--repo={cwd}` , `/c/{cwd}` | OK → substituted |
+  | `{cwd}` | OK |
+  | `{repo}` , `{{cwd}}` , `{cwd` , `{"k":"v"}` | ERROR (config-load) |
+  | `nodes_at` , `--flag` (no brace) | OK verbatim |
+  (Literal braces / JSON args are unsupported in v1 — documented; an escape mechanism is a deferred seam.)
+- `env`: `name` non-empty and **unique within a server (case-sensitive** — Linux env vars are); `value` MAY be
+  empty (a var set to `""` is valid). Both `name` and `value` run through the placeholder scanner (value only;
+  names are literal).
 
 ## Templating + transport scope (YAGNI)
 
@@ -158,9 +206,14 @@ If an agent ignores the ACP param, the documented fallback is that agent's nativ
   (`cargo build --release --bin prism-mcp --features mcp`; **linux/arm64** on Apple-Silicon Docker Desktop — a
   macOS host binary will NOT run) and bind-mount it `:ro` (like the creds mounts). Baking into the image is a
   later option (decoupling the bridge image from `~/code/slicing` source is why we mount first).
-- **Cache:** the repo mount is `:ro`, so `--cache-dir /tmp/prism` (container-writable tmpfs) — recomputed per
-  session. For agents that mint MANY sessions (or the per-turn `:rw` impl), a named volume persists the CPG
-  cache across runs (a config choice, not bridge code). `--no-cache` is the simplest fallback.
+- **Cache:** the repo mount is `:ro`, so `--cache-dir` points at container-writable space. **Per-repo
+  correctness (round-2 MINOR 8):** `{cwd}` is per-session, but a fixed `--cache-dir /tmp/prism` is shared, so
+  ONE reader minting sessions across DIFFERENT repos would point every prism instance at one cache. Resolution:
+  either (a) **verify prism keys its CPG cache by repo internally** (the README reuses one `--cache-dir` across
+  diffs of the *same* repo — confirm cross-repo safety), or (b) **template the cache per repo** —
+  `--cache-dir /tmp/prism/{cwd}` (cheap; args already substitute `{cwd}`). The reference config uses (b) unless
+  (a) is confirmed. A named volume (not `/tmp`) persists the CPG across runs for many-session/cold paths.
+  `--no-cache` is the simplest fallback.
 
 ## Egress posture (unchanged — stated explicitly)
 
@@ -263,7 +316,36 @@ quoted syntax + scoped to the `:ro` agents (`:rw` impl already has them) + split
 **MINOR 9/13** → deferred (above). **MINOR 10** → the `ContainerRwConfig.mcp` seam named. **MINOR 11** →
 wire-golden gains env + two servers. **MINOR 12** → `{cwd}` substitution now also applies to `env`.
 
+## Spec-review resolutions (round 2 — codex+claude, v2→v3)
+
+Design **affirmed, no rework**; "pin testable contracts". Folded: **BLOCKER** → the mechanized Live-probe
+harness (server/tool/fixture/prompt/success-signal + the 4-way failure taxonomy). **MAJOR 2** → the placeholder
+scanner algorithm + accepted/rejected table + **reject `{…}` in `command`**. **MAJOR 3** → pinned
+`McpToml`/`EnvToml` structs (inline tables; empty value OK; case-sensitive unique keys). **MAJOR 4** → ADR
+§codex-sandbox below. **MAJOR 5** → the explicit "plumbing supports any ACP agent; only config/docs are
+containerized-only" sentence. **MINOR 6** → mechanical-literal rule (below). **MINOR 7** → the threading test is
+an in-file `main.rs` unit test (the `acp_spawn_inputs` builder is private — keep the test in-module rather than
+exposing it). **MINOR 8** → per-repo cache (template or verify prism's keying). **MINOR 9** → docs must
+distinguish the `command`≠mount typo (case "spawn-failed") from "param-ignored"; the load-time lint is
+reconsidered for v1 given the diagnostic cost.
+
+**Mechanical-literal rule (MINOR 6):** adding `mcp` to `AgentEntry` / `AcpConfig` / `ContainerRwConfig` breaks
+every existing struct literal + test that builds them (verified: none carry the field — `domain.rs:89`,
+`acp_backend.rs:68`, `lib.rs:41`; literals across bin/crates/tests e.g. `route.rs`, `registry.rs`, `lib.rs`
+tests). Each task that adds the field MUST update all existing literals with `mcp: vec![]` (or add a
+`Default`/builder) in the SAME commit so the workspace compiles — this is part of the task, not an afterthought.
+
 ## ADR
 
-This increment gets **ADR-0028** (per-agent MCP servers), with a **§codex-sandbox** sub-decision recording the
-`:ro` codex `sandbox_mode`/`approval_policy` change (Docker-is-the-sandbox rationale, `:ro`-vs-`:rw` scope).
+This increment gets **ADR-0028** (per-agent MCP servers).
+
+**§codex-sandbox (MAJOR 4).** Records the `:ro` codex `sandbox_mode="danger-full-access"` +
+`approval_policy="never"` change. (a) **Premise verified:** codex `:ro` review/design agents run BLIND today —
+the merge plan-review showed codex failing every command with `bubblewrap unavailable` (the reader image has no
+bwrap). So the change is independently motivated, not a cost MCP imposes. (b) **Considered-and-REJECTED —
+bake bwrap into the reader image:** bwrap-in-Docker needs unprivileged user-namespaces or `CAP_SYS_ADMIN` +
+seccomp relaxation — a *broader* privilege grant than the targeted per-agent disable, and a worse posture.
+(c) **Scope:** the `:ro` codex agents only (Docker is the sandbox — `:ro` mount + egress lock); the `:rw` impl
+already ships these flags (ADR-0024) → no new `:rw` decision. (d) **Future cross-namespace agents** that would
+force a CORE change (not a config fix): docker-in-docker, a remote agent, or a non-disableable re-sandboxing
+wrapper — named so a later such agent isn't misdiagnosed as a config bug.
