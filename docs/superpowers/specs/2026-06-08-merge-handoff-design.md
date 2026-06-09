@@ -1,19 +1,15 @@
-# `a2a-bridge merge <id>` — Design Spec (v5, post 3rd spec-review)
+# `a2a-bridge merge <id>` — Design Spec (v6, Mode-A-only, consolidated)
 
 **Date:** 2026-06-08
 **Status:** Approved (brainstorm). Plan + ADR-0027 to follow.
-**Builds on:** ADR-0026 (resume — `resolve_clone`/`load_checkpoint`/`ImplementCheckpoint`), ADR-0019
-(B2b-1 — host-commits + the `commit_argv` pin set + bot-identity-pre-merge), ADR-0025 (concurrent runs).
-**Reviewed by:** the bridge's own clean-room `design` workflow (codex+claude) AND a dual `spec-review`
-(codex *rigor* + claude *soundness*); **v4 folds a SECOND dual `spec-review` (codex+claude, run after the
-`usage_update` fix so the claude lens no longer hangs) — see "Spec-review resolutions (round 2)" below.**
-**v5 folds a THIRD (confirmation) review that caught a REGRESSION in v4's own BLOCKER fix — the source
-preflight was gated `mode == Onto`, so Mode B `--as-branch <live-branch> --force` still pushed onto the
-operator's checkout — see "Spec-review resolutions (round 3)".**
-**v2 adopts claude's push-based redesign** — it removes the detached
-worktree, `WorktreeGuard`, `.a2a-merge/` dirs, `cas_advance`/`update-ref`, the `refs/a2a/merge/<id>` temp
-ref, **and** the per-target lock, while fixing the BLOCKER that the worktree path could silently corrupt the
-operator's checkout.
+**Scope:** **Mode A only** — `--onto <branch>`, fast-forward an accumulating line. Mode B (`--as-branch`,
+parallel staging branches) is a **deferred fast-follow** — see "Deferred: Mode B".
+**Builds on:** ADR-0026 (resume — `resolve_clone`/`load_checkpoint`/`ImplementCheckpoint`), ADR-0019 (B2b-1 —
+host-commits + the `commit_argv` pin set + bot-identity-pre-merge), ADR-0025 (concurrent runs).
+**Review provenance:** brainstormed, then **4 dual `spec-review` rounds** (codex *rigor* + claude *soundness*)
+run on the bridge's OWN containerized `spec-review` workflow. Both lenses converged on the decomposition being
+"sound to plan"; the regression-prone Mode B surface (where all 3 review-found regressions clustered) is
+deferred. Condensed round log in the Appendix.
 
 ---
 
@@ -25,170 +21,134 @@ the operator's working checkout** and **safely under concurrent authors**. *(Mod
 run's `base_commit`: if the target advanced past `base_commit` since the clone was made, the merge **refuses**
 rather than rewriting — nothing is lost, the operator re-runs off the moved target.)*
 
-## Why push-based (the v1→v2 change)
+## Design: re-author the clone's commit, land it with a lease
 
-The clone is already a private, single-author repo whose `branch` holds exactly one commit (`current_commit`,
-bot-authored) over `base_commit`. So we don't need a worktree to host an index:
+The clone (`<allowed_cwd_root>/.a2a-implement/<id>`) is a private, single-author repo whose `branch` holds the
+run's work as one effective change over `base_commit` (`current_commit` is its tip, bot-authored). We do NOT
+need a worktree to host an index — we re-author in place and push:
 
-1. **Re-author with `git commit-tree`** (NOT `commit --amend`): in the clone, with BOTH the author AND the
-   committer set to the operator via explicit env (so `commit-tree`'s committer can't fall back to the
-   ambient git config) plus the host-commit pins:
+1. **Re-author with `git commit-tree`** (NOT `commit --amend`): author AND committer set to the operator via
+   explicit env (so the committer can't fall back to ambient git config), reusing the host-commit pins:
    ```
    T=<one captured timestamp>   # set BOTH dates to the SAME T so author date == committer date EXACTLY
    GIT_AUTHOR_NAME=<OP> GIT_AUTHOR_EMAIL=<OP> GIT_AUTHOR_DATE=$T \
    GIT_COMMITTER_NAME=<OP> GIT_COMMITTER_EMAIL=<OP> GIT_COMMITTER_DATE=$T \
      git -C <clone> -c safe.directory=<clone> -c core.hooksPath=/dev/null -c commit.gpgsign=false \
-         commit-tree <current_commit^{tree}> -p <base_commit> -F -   # message on STDIN → byte-for-byte
+         commit-tree <current_commit>^{tree} -p <base_commit> -F -    # message on STDIN
    ```
-   → a new commit object, **author == committer == operator** with FRESH author/committer dates both set to
-   the SAME captured `T` (a clean re-authorship, not a preserved bot date), same tree, parent `base_commit`,
-   **without moving the clone's branch** (so a failed push leaves the clone pristine → retry-safe;
-   `commit --amend` would move the branch and break the `head_sha == current_commit` preflight on retry).
-   *(On the `commit-tree` path only `safe.directory` is load-bearing: `commit-tree` runs NO hooks
-   (`core.hooksPath` inert) and signs only on an explicit `-S` (`commit.gpgsign` inert). The pins are kept
-   anyway — harmless + uniform with the `commit` path — and the build confirms `gpgsign` behavior on the
-   pinned git version. The reused message goes on stdin via `-F -` so a multi-line body/trailers survive.)*
-2. **Push it** from the clone to `source_repo`:
-   `git -C <clone> push <source_repo> <reauthored>:refs/heads/<target> --force-with-lease=refs/heads/<target>:<base_commit>`.
-   - `--force-with-lease=<target>:<base_commit>` **IS the CAS**: the push fast-forwards `target` from
-     `base_commit` to `reauthored` ONLY if `target` is still at `base_commit`. If `target` moved → lease
-     fails → **refuse** (the v1 "CAS-stale → refuse" decision). Atomic on the receiving side → **no external
-     lock needed** (concurrent pushes to one target: one wins, the rest get a stale-lease rejection).
-   - **Source-side no-touch guard — the BRIDGE enforces it, not the remote (round-2 BLOCKER fix).** Before
-     any Mode-A push the bridge runs a source preflight: confirm `source_repo` is a git repo
-     (`git -C <source_repo> rev-parse --git-dir`) and read its checked-out branch
-     (`git -C <source_repo> symbolic-ref --short -q HEAD`); if the source is **non-bare and its checked-out
-     branch == the resolved target**, **refuse with `CheckedOutTarget` BEFORE pushing**. This is the PRIMARY
-     defense for the "without touching the operator's checkout" guarantee — it must NOT rest on the remote's
-     `receive.denyCurrentBranch`, which is only a *default*: `updateInstead` would move the operator's
-     worktree+HEAD outright, and `warn`/`ignore` would silently desync `refs/heads/<target>` from the
-     worktree (the exact ref-vs-worktree corruption the push redesign exists to kill). git's
-     `denyCurrentBranch=refuse` stays a **backstop only**; its reject stderr varies by git version, so that
-     path is classified conservatively (fallback `Other`). Surfaced as "target is checked out in <source> —
-     switch off it or pick another target".
-3. **Reap the clone on success**; on any failure keep it + print a recovery command (NOT `rm -rf`).
+   → a new commit object: **author == committer == operator**, fresh dates (both `T`), `current_commit`'s tree,
+   parent `base_commit`, **without moving the clone's branch** (a failed push leaves the clone pristine →
+   retry-safe; `commit --amend` would move the branch and break the `head_sha == current_commit` preflight on
+   retry). *(On `commit-tree` only `safe.directory` is load-bearing — it runs NO hooks and signs only on `-S`;
+   the other pins are kept for uniformity; the build confirms `gpgsign` behavior on the pinned git.)*
+2. **Push it** into `source_repo` with the lease as the CAS:
+   `git -C <clone> push <source_repo> <reauthored>:refs/heads/<target> --force-with-lease=refs/heads/<target>:<base_commit>`
+   The lease fast-forwards `target` from `base_commit` to `reauthored` ONLY if `target` is still at
+   `base_commit`. If it moved → lease fails → **refuse** (`StaleLease`). Atomic on the receiving side → **no
+   external lock** (concurrent pushes to one target: one wins, the rest get a stale-lease rejection).
+3. **Reap the clone on success** (guarded); on any failure keep it + print a targeted recovery line (never a
+   bare `rm -rf`).
 
-Nothing is created in `source_repo` except the atomic ref update — so the worktree/ref-leak concerns
-(needing `git worktree prune`) **evaporate**.
+Nothing is created in `source_repo` except the atomic ref update — so worktree/ref-leak concerns evaporate.
+*(Approach comparison, recorded: push-`commit-tree` beats cherry-pick-in-a-worktree — no worktree/lock/CAS-ref
+machinery, force-with-lease is the CAS — beats `git merge` (no merge bubbles, re-authors), beats
+`format-patch`/`am` (3-way fidelity). `git bundle` is a cross-host transport, a deferred seam; `do_clone` is
+same-host so a local push suffices.)*
 
-**Integration-approach comparison (recorded):** push-`commit-tree` beats cherry-pick-in-a-worktree (no
-worktree/lock/CAS-ref/temp-ref machinery, force-with-lease is the CAS, the bridge's source preflight +
-denyCurrentBranch backstop give checkout safety),
-beats `git merge` (no merge bubbles, re-authors), beats `format-patch`/`am` (3-way fidelity, no `.rej`).
-`git bundle` is a *transport* (cross-host), kept as a deferred seam — `do_clone` is same-host so a local
-push suffices.
+## The gate (`decide_merge`)
 
-## Two modes (selectable by work pattern)
+Runs before any landing, and **before** the clone HEAD preflight (so an `Option` `current_commit` is resolved
+to a hard refusal here, never a misleading "HEAD moved" error later):
 
-Both run the SAME phase gate (`decide_merge`) first; they differ only in **where** `reauthored` is pushed.
-
-- **Mode A — `--onto <branch>` (DEFAULT).** Push to `refs/heads/<target>` with the `base_commit` lease
-  (fast-forward an accumulating line); if the target moved past `base_commit` the lease refuses (re-run off
-  the moved target). For *sequential* tasks across slices.
-- **Mode B — `--as-branch [<name>]`.** Push to a **new** `refs/heads/<name>` (default `implement/<task_id>`,
-  which is unique per run); **refuse if the branch already exists** unless `--force` (a fresh staging
-  branch). **No `base_commit` lease against an accumulating target — but Mode B STILL uses leases** (round-3):
-  a *lease-expects-absent* refspec for the atomic create, and `--force-with-lease=tip` for the checked
-  replace. For *parallel* tasks in one slice. Also operator-re-authored (no "deferred re-author" promise).
-
-When neither flag is given → **mode A onto the resolved target**.
-
-## The gate — applies to BOTH modes (fixes the v1 "mode B bypasses the gate" bug)
-
-`decide_merge` runs before either landing:
-- `phase == Approved` → `Merge`.
+- `phase == Approved` **and** `current_commit.is_some()` → `Merge`.
 - `phase == LoopStopped` (finished, not approved) → `Refuse` unless `--force`.
 - `phase ∈ {Cloned, EditStarted, FirstCommitCreated, InLoop}` (not finished) → **`RefuseHard`** — `--force`
-  cannot override ("not finished — `resume` it first"). *(Mode B must NOT short-circuit before this — the v1
-  bug published empty/unconverged branches.)*
-- `current_commit == None` (no commit exists) → `RefuseHard`. *(The checkpoint stores
-  `current_commit: Option`; an `Approved` run always has `Some`, but refuse defensively.)*
+  cannot override ("not finished — `resume` it first").
+- `current_commit == None` → **`RefuseHard`** (defensive — an `Approved` run always has `Some`).
+- unresolvable `target` → `Refuse`.
+
+On the `Merge` path `current_commit` is guaranteed `Some`, so the clone preflight unwraps it safely.
+
+## Source no-touch guard (best-effort preflight + atomic backstop)
+
+The "without touching the operator's checkout" guarantee has two layers, honestly scoped:
+
+- **Best-effort early refusal (the bridge, UX).** Before the push: confirm `source_repo` is a git repo
+  (`git -C <src> rev-parse --git-dir`), then read its checked-out branch
+  (`git -C <src> symbolic-ref --short -q HEAD`). If `src` is **non-bare and its checked-out branch == the
+  resolved target**, refuse `CheckedOutTarget` BEFORE pushing. Failure-case rules (no silent passes):
+  bare `src` → no worktree → proceed; detached HEAD (`symbolic-ref -q` exits 1, no branch) → no branch
+  checked out → proceed; branch read OK and `!= target` → proceed.
+- **Atomic guarantee (git, the real safety).** git's **default** `receive.denyCurrentBranch=refuse` refuses a
+  push to a branch checked out in ANY worktree (main *or* linked) — so the preflight-to-push TOCTOU and
+  linked-worktree checkouts are covered by the receive side, not the single `symbolic-ref` read. The preflight
+  is the friendly early refusal; **`denyCurrentBranch=refuse` is the guarantee.**
+- **Out of scope (documented):** a `source_repo` deliberately configured with a permissive receive policy —
+  `receive.denyCurrentBranch=updateInstead` (push-to-deploy, moves the worktree) or `=ignore`/`warn`. If the
+  operator chose those semantics, merge does not defend against them; this limitation is stated in the docs.
 
 ## Components & file boundaries
 
 | File | Change |
 |---|---|
 | `bin/a2a-bridge/src/merge.rs` | **NEW** — pure gate (`MergePlan`/`decide_merge`/`resolve_target`) + impure git ops (`operator_from`, `reauthor_commit`, `push_landing`), mirroring `implement_resume.rs` (pure-tested + temp-repo-tested, docker-free). |
-| `bin/a2a-bridge/src/main.rs` | `mod merge;`; `merge_cmd` + the `merge` dispatch arm; `run_warm_loop` returns a typed terminal outcome so `implement --merge` calls `merge_run` **only on `Approved`**. |
-| `bin/a2a-bridge/src/config.rs` | optional `[merge]` block (`MergeToml`/`MergeConfig`), fail-loud pre-flight parse like `ImplementToml`. |
-| `bin/a2a-bridge/src/implement.rs` | **extract the IDENTITY-FREE git-config pin prefix** from `commit_argv` into a shared helper — just `safe.directory`/`core.hooksPath=/dev/null`/`commit.gpgsign=false`. Identity is NOT shared (round-2 #11): `commit_argv` attaches `BOT` via `-c user.name/email` for `commit`; `reauthor_commit` attaches the OPERATOR via `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env for `commit-tree`. Both call the shared identity-free prefix and attach identity their own way. |
+| `bin/a2a-bridge/src/main.rs` | `mod merge;`; `merge_cmd` + the `merge` dispatch arm; `run_warm_loop` gains a **typed terminal outcome** so `implement --merge` runs `merge_run` only on `Approved`. |
+| `bin/a2a-bridge/src/config.rs` | optional `[merge]` block (`MergeToml`/`MergeConfig`) with a fail-loud `to_config` like `ImplementToml`. |
+| `bin/a2a-bridge/src/implement.rs` | **extract the IDENTITY-FREE git-config pin prefix** from `commit_argv` (just `safe.directory`/`core.hooksPath=/dev/null`/`commit.gpgsign=false`). Identity is NOT shared: `commit_argv` attaches `BOT` via `-c user.name/email` for `commit`; `reauthor_commit` attaches the OPERATOR via `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env for `commit-tree`. Reuse `commit_message` for the re-author message (below). |
 
 `merge` runs **no agent**: it must NOT touch the run lease / `RunHandle` / `recover_orphans` / `RunEndGuard`
-/ registry / policy / warm session. Its only side effects are the clone-local `commit-tree`, the push, and
-the on-success clone reap. **Concurrency caveat (round-3, MINOR):** because `merge` takes no run lease, it
-must not run concurrently with `resume <id>` or a second `merge <id>` on the SAME `<id>`. A *partial* guard
-already exists — the clone preflight refuses if a concurrent `resume` has moved the clone HEAD off
-`current_commit` — but a first-class per-`<id>` advisory lock shared by `merge`+`resume` is **deferred**;
-until then the operator serializes operations on one `<id>`.
+/ registry / policy / warm session. Its only side effects are the clone-local `commit-tree`, the push, and the
+on-success guarded reap. **Concurrency caveat:** because `merge` takes no run lease, it must not run
+concurrently with `resume <id>` or a second `merge <id>` on the SAME `<id>`. A *partial* guard exists (the
+clone preflight refuses if a concurrent `resume` moved the clone HEAD off `current_commit`); a first-class
+per-`<id>` advisory lock shared by `merge`+`resume` is **deferred** — until then the operator serializes
+operations on one `<id>`.
 
 ## Pure core (unit-tested, git-free)
 
 ```rust
 pub enum MergePlan {
-    Merge { target: String, mode: Mode },
+    Merge { target: String },
     Refuse(String),     // recoverable: LoopStopped w/o --force; unresolvable target
     RefuseHard(String), // non-terminal phase or current_commit==None — --force CANNOT override
 }
-#[derive(Clone, Copy)] pub enum Mode { Onto, AsBranch }
 
-/// Returns a validated SHORT BRANCH NAME (e.g. `main`, `feature/x`) — NEVER a full ref. The single
-/// `refs/heads/{branch}` is constructed ONLY at the git boundary (`push_landing`), so `MergePlan.target`,
-/// `push_landing.dst_branch`, the config, and the output text all carry the SAME short-name representation
-/// (avoids `refs/heads/refs/heads/main`).
-/// Precedence: --onto > [merge].target_ref > checkpoint.base_ref. None ⇒ Err ("pass a target / --onto").
-/// Validation is a PURE, BEST-EFFORT UX pre-check (round-2 #2) — NOT a claim of full `check-ref-format`
-/// parity, and it CANNOT decide repository state (e.g. whether a valid branch name ALSO names an existing
-/// TAG — that is the receiver's job, not string grammar). It rejects only what is decidable from the STRING:
-/// empty, `HEAD`, raw SHAs (40-hex), any `refs/…` prefix (incl. literal `refs/tags/…`, `refs/remotes/…`), an
-/// `origin/…`-style remote prefix, `..`, a component starting with `.` or ending `.lock`, a trailing `/` or
-/// `.`, a leading `-`, and any of space/control/`~^:?*[`/`@{`/backslash. **git is the AUTHORITATIVE validator
-/// at the push boundary** — an odd name that slips this pre-check fails cleanly there (`Other`). `base_ref`
-/// from a checkpoint is run through the same pre-check (it is already a branch name).
-pub fn resolve_target(cli_onto: Option<&str>, cfg: Option<&str>, base_ref: Option<&str>)
-    -> Result<String, String>;
+/// Returns a validated SHORT BRANCH NAME (e.g. `main`, `feature/x`) — NEVER a full ref. `refs/heads/{branch}`
+/// is built ONLY at the git boundary (`push_landing`), so `MergePlan.target`, config, and output text all
+/// carry the same short-name representation. Precedence: --onto > [merge].target_ref > checkpoint.base_ref;
+/// None ⇒ Err. Validation is a PURE, BEST-EFFORT UX pre-check — NOT full `check-ref-format` parity, and it
+/// canNOT decide repo state (a valid name may also be a tag — git decides that at the push boundary). Rejects
+/// only string-decidable forms: empty, `HEAD`, raw SHAs (40-hex), any `refs/…` prefix (incl. `refs/tags/…`,
+/// `refs/remotes/…`), an `origin/…`-style prefix, `..`, a component starting `.` or ending `.lock`, a trailing
+/// `/` or `.`, a leading `-`, and any of space/control/`~^:?*[`/`@{`/backslash. git is authoritative at push.
+pub fn resolve_target(cli_onto: Option<&str>, cfg: Option<&str>, base_ref: Option<&str>) -> Result<String, String>;
 
-pub fn decide_merge(phase: ImplementPhase, has_commit: bool, force: bool,
-                    target: &Result<String, String>, mode: Mode) -> MergePlan;
+/// Mode-independent. (Mode B's fast-follow reuses it unchanged.)
+pub fn decide_merge(phase: ImplementPhase, has_commit: bool, force: bool, target: &Result<String, String>) -> MergePlan;
 ```
-`decide_merge` matrix (mode-independent): `Approved`+`has_commit`→`Merge`; `LoopStopped`→`Refuse` unless
-`force`; non-terminal **or** `!has_commit`→`RefuseHard`; `target` Err→`Refuse`.
 
 ## Impure ops (temp-repo tested, docker-free)
 
 ```rust
 pub struct OperatorIdent { name: String, email: String }
-/// source_repo git config user.name+user.email (or [merge] override). FAIL LOUD if EITHER half is missing
-/// (no committing as nobody on headless/CI). A config override must supply BOTH or it's a parse error.
+/// source_repo git config user.name+user.email (or [merge] override). FAIL LOUD if EITHER half is missing.
+/// A config override must supply BOTH halves or it's a parse error.
 pub fn operator_from(repo: &Path, cfg_override: Option<&OperatorIdent>) -> Result<OperatorIdent, String>;
 
-/// commit-tree the implement commit's tree over base_commit as the operator → the re-authored sha. Does NOT
-/// move the clone's branch (retry-safe). Reuses the extracted commit pin prefix.
-pub fn reauthor_commit(clone: &Path, current_commit: &str, base_commit: &str, msg: &str, op: &OperatorIdent)
-    -> Result<String, String>;
+/// commit-tree current_commit's tree over base_commit as the operator → the re-authored sha. Same `T` for
+/// both dates; message via `-F -`. Does NOT move the clone's branch (retry-safe). Reuses the identity-free pin
+/// prefix. The CALLER first runs the clone shape/ancestry preflight (below).
+pub fn reauthor_commit(clone: &Path, current_commit: &str, base_commit: &str, msg: &str, op: &OperatorIdent) -> Result<String, String>;
 
-pub enum PushError { StaleLease, CheckedOutTarget, BranchExists, Other(String) }
-/// Push `reauthored` from the clone into source_repo. `dst_branch` is a SHORT name; `push_landing` builds the
-/// single `refs/heads/{dst_branch}` itself. The `intent` carries the mode-specific safety; there is NO bare
-/// `force` param (so `--force` can never silently weaken a lease):
-///   - `LandOnto { base }` (Mode A): always `--force-with-lease=refs/heads/{dst}:{base}` → FF iff the target
-///     is still at `base`; else `StaleLease`. `--force` does NOT change this — it only flips the gate
-///     (`LoopStopped`) earlier, never the lease.
-///   - `CreateBranch` (Mode B, default): non-existence is enforced ATOMICALLY at the receiver via the push
-///     refspec asserting an EMPTY/ZERO expected old-value for `refs/heads/{dst}` (a force-with-lease whose
-///     lease is "absent") — NOT a separate `branch_exists` read then a plain push (round-2 #3: that races,
-///     and a plain push would silently fast-forward an already-existing branch). Exists/raced → `BranchExists`.
-///     The exact git invocation for "lease-expects-absent" is verified during the build; the design CONTRACT
-///     is: two concurrent Mode-B creates to one name → exactly one creates, the other refuses WITHOUT
-///     advancing the branch.
-///   - `ReplaceBranch { expect }` (Mode B + `--force`): `--force-with-lease=refs/heads/{dst}:{expect}` where
-///     `expect` is the branch's CURRENT tip — a CHECKED replace, never an unconditional `+dst` overwrite (so
-///     a concurrent writer is detected → `StaleLease`). Delete races (round-2 #5): if the branch is deleted
-///     AFTER `expect` is read, the checked replace fails stale (`StaleLease`) and must NOT recreate it; if
-///     deleted BEFORE (so the tip read returns absent), the caller falls back to `CreateBranch`.
-/// Pushing onto a checked-out branch in `source_repo` → git's `receive.denyCurrentBranch` → `CheckedOutTarget`.
-pub enum PushIntent<'a> { LandOnto { base: &'a str }, CreateBranch, ReplaceBranch { expect: &'a str } }
-pub fn push_landing(clone: &Path, source_repo: &Path, reauthored: &str, dst_branch: &str,
-                    intent: PushIntent<'_>) -> Result<(), PushError>;
+pub enum PushError { StaleLease, CheckedOutTarget, Other(String) }
+/// Push `reauthored` into source_repo as `refs/heads/{target}` (built here from the short name) with
+/// `--force-with-lease=refs/heads/{target}:{base_commit}` — FF iff the target is still at base_commit.
+/// CLASSIFICATION (no stderr parsing): on a non-zero push, read `refs/heads/{target}` in source_repo —
+///   • target != reauthored AND != base_commit (it moved) → `StaleLease`.
+///   • the rare denyCurrentBranch backstop race (target == source HEAD, slipped the preflight) → `Other`
+///     (conservative; its stderr varies by git version). `CheckedOutTarget` is produced by the PREFLIGHT,
+///     deterministically, never by parsing push stderr.
+pub fn push_landing(clone: &Path, source_repo: &Path, reauthored: &str, target: &str, base_commit: &str) -> Result<(), PushError>;
 ```
 
 ## Config
@@ -204,273 +164,191 @@ target_ref   = "main"   # optional; CLI --onto wins over this
 #[serde(default)] pub merge: Option<MergeToml>,
 pub struct MergeConfig { pub target_ref: Option<String>, pub author: Option<OperatorIdent> }
 ```
-**`MergeToml::to_config` validation (round-3 #).** `target_ref`, if present, must be a non-empty string that
-passes `resolve_target`'s best-effort pre-check (empty/blank → parse error). The identity override is
-**both-or-neither**: `author_name` XOR `author_email` → parse error; both absent → `author = None` (fall back
-to `source_repo` git config at run time). **No env-var expansion** — merge takes literal branch/identity
-strings (unlike `[delegation]`, the only block that expands `${…}`). Unknown keys are IGNORED, matching the
-rest of `RegistryConfig` (no `deny_unknown_fields`) — stated so a reader doesn't expect strict rejection.
-(No `lock_wait_secs` — there is no lock in v2.)
+**`MergeToml::to_config` validation:** `target_ref`, if present, is a non-empty string passing `resolve_target`'s
+pre-check (empty/blank → parse error). Identity override is **both-or-neither**: `author_name` XOR
+`author_email` → parse error; both absent → `author = None`. **No env-var expansion** (merge takes literal
+strings — unlike `[delegation]`, the only block that expands `${…}`). Unknown keys are IGNORED, matching the
+rest of `RegistryConfig` (no `deny_unknown_fields`). (No `lock_wait_secs` — there is no lock.)
 
 ## Command surface
 
 ```
-a2a-bridge merge <id> [--config <path>] [--force] [--onto <branch> | --as-branch [<name>]]
-a2a-bridge implement <task> --repo <path> … [--merge [--onto <branch>]]   # Approved-only mode-A sugar
+a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--force]
+a2a-bridge implement <task> --repo <path> … [--merge [--onto <branch>]]   # Approved-only sugar
 a2a-bridge implement --resume <id> …       [--merge [--onto <branch>]]
 ```
-`merge <id> --as-branch` takes an **optional value** (round-3): the next token is consumed as the branch name
-ONLY if it is not itself a flag — so `merge id --as-branch --force` → default `implement/<task_id>` + `--force`
-(never a branch literally named `--force`); an explicit name is `merge id --as-branch staging/x`.
+`--onto` target selection: `--onto` if present, else `[merge].target_ref`, else `checkpoint.base_ref`;
+`base_ref == None` (HEAD-based run) with no config target → fail loud.
 
-`implement --merge` target selection: `--onto` if present, else `[merge].target_ref`, else `base_ref`;
-`base_ref == None` (HEAD-based run) with no config target → fail loud. `--merge` only does mode A (no
-`--as-branch` sugar — stage-as-branch is an explicit `merge <id> --as-branch` step).
+**`implement --merge` contract.** Valid on BOTH fresh and `--resume`. `--force` is NOT accepted alongside
+`--merge` (the sugar merges only when the run ends `Approved`, where the `LoopStopped`+force path can't arise;
+explicit `merge <id> --force` is the escape hatch). The mapping is enabled by the new typed terminal outcome
+from `run_warm_loop` (TODAY it returns `()` and prints the hand-off internally, both callers `Ok(())` — the
+spec ADDS the typed return). **Plain `implement` without `--merge` keeps its current exit behavior unchanged**
+— the typed outcome only drives the `--merge` path.
 
-**`implement --merge` contract (round-2 #8, round-3 exit fix).** Valid on BOTH fresh and `--resume`. It is
-**mode A only**: combining `--merge` with `--as-branch` is a parse-time usage error. `--force` is NOT accepted
-alongside `--merge` (the sugar merges only when the run ends `Approved`, where the `LoopStopped`+force path
-can't arise; the explicit `merge <id> --force` is the escape hatch). The mapping is enabled by slice 6's
-**typed terminal outcome** from `run_warm_loop` (TODAY it returns `()` and prints the hand-off internally, and
-both callers return `Ok(())` — the spec ADDS the typed return; **plain `implement` without `--merge` keeps its
-current exit behavior unchanged** — the typed outcome only drives the `--merge` path). With `--merge`:
-`Approved` → run the merge → the command's exit IS the merge's exit (0 on land; nonzero on any
-refuse/preflight, clone KEPT with recovery text); `LoopStopped`/non-terminal → no merge, print
-"not merged: <phase reason>" and exit nonzero; `Approved` but the merge refuses → nonzero, clone kept, the
-refusal recovery line printed.
+**Exit codes** (so a CI caller can branch on `$?`):
+
+| code | meaning |
+|---|---|
+| `0` | merged (or, without `--merge`, implement succeeded per existing semantics) |
+| `1` | usage / config / preflight error (bad args, schema mismatch, source gone, clone preflight, operator unset) |
+| `2` | under `--merge`: the run did NOT reach `Approved` (LoopStopped/non-terminal) — *re-run/resume the agent* |
+| `3` | under `--merge`: `Approved` but the merge could not land (`StaleLease`/`CheckedOutTarget`) — *retry the land off a fresh target* |
 
 ## Control flow
 
 ```
-merge_cmd(cfg, id, force, onto, as_branch):
-  root  = canonicalize(allowed_cwd_root)?; clone = resolve_clone(root, id)?; ck = load_checkpoint(clone)?
-  # load_checkpoint REFUSES an unsupported `schema_version` (reuses the resume validation) — a non-overridable
-  # refusal printed BEFORE the clone/source preflight (round-3 MAJOR: schema handling was unspecified).
-  src   = canonicalize(ck.source_repo)?  AND THEN  git -C src rev-parse --git-dir   (round-2 #9:
-          canonicalize proves the PATH resolves; rev-parse proves it is still a GIT repo — a dir can
-          canonicalize yet be non-git). Either failing ⇒ PreflightFail: "source repo {ck.source_repo}
-          gone/moved/not-a-git-repo — keep clone, exit nonzero" (the checkpoint persists the user-supplied
-          path; a non-overrideable refusal). NO [merge] override of the stored source.
-  # CLONE PREFLIGHT (cheap, impure) — each failure is a NON-overridable refusal (force ignored), KEEP clone,
-  # exit nonzero, with DISTINCT recovery text; this guards retry-safety so it must run before any push:
-  #   current_branch(clone) != ck.branch        → "clone on wrong branch — inspect {clone}, do not merge"
-  #   head_sha(clone)       != ck.current_commit → "clone HEAD moved off the checkpoint — re-run from a clean clone"
-  #   is_worktree_dirty(clone)                   → "clone worktree dirty — a half-finished fix; inspect {clone}"
-  mode  = if as_branch.is_some() { AsBranch } else { Onto }
-  target = match mode { Onto => resolve_target(onto, cfg.target_ref, ck.base_ref.as_deref()),
-                        AsBranch => validate_branch(as_branch.unwrap_or(format!("implement/{}", ck.task_id))) }
-  match decide_merge(ck.phase, ck.current_commit.is_some(), force, &target, mode):
-     Refuse(m)|RefuseHard(m) => eprintln(m) + exit nonzero (KEEP clone; no rm -rf in the text)
-     Merge{target, mode}     => merge_run(cfg, ck, src, &target, mode, force, clone, root)
+merge_cmd(cfg, id, onto, force):
+  root = canonicalize(allowed_cwd_root)?; clone = resolve_clone(root, id)?; ck = load_checkpoint(clone)?
+  # SCHEMA GATE (NEW — load_checkpoint only deserializes; resume does not gate this either; merge is the first
+  # consumer). Non-overridable:
+  if ck.schema_version != SCHEMA_VERSION:
+       eprintln "checkpoint schema {ck.schema_version} unsupported (merge expects {SCHEMA_VERSION}) — rebuild
+                 with a current run"; exit 1
+  src = canonicalize(ck.source_repo)?  AND THEN  git -C src rev-parse --git-dir   (canonicalize proves the
+        PATH resolves; rev-parse proves it is still a GIT repo — a dir can canonicalize yet be non-git). Either
+        failing ⇒ "source repo {ck.source_repo} gone/moved/not-a-git-repo — keep clone, exit 1". NO override.
+  target = resolve_target(onto, cfg.target_ref, ck.base_ref.as_deref())
+  match decide_merge(ck.phase, ck.current_commit.is_some(), force, &target):    # gate FIRST (resolves None)
+     Refuse(m)    => eprintln(m); exit 1      # (under --merge: phase!=Approved ⇒ exit 2)
+     RefuseHard(m)=> eprintln(m); exit 1      # (under --merge: non-terminal/None ⇒ exit 2)
+     Merge{target}=> # current_commit is now guaranteed Some
+       # CLONE PREFLIGHT (cheap, impure) — each a NON-overridable refusal (force ignored), KEEP clone, exit 1,
+       # DISTINCT recovery text; guards retry-safety so it runs before any push:
+       #   current_branch(clone) != ck.branch                       → "clone on wrong branch — inspect {clone}"
+       #   head_sha(clone)       != ck.current_commit               → "clone HEAD moved off the checkpoint"
+       #   is_worktree_dirty(clone)                                 → "clone worktree dirty — inspect {clone}"
+       # CLONE SHAPE / ANCESTRY (guards the commit-tree graft against a corrupted/unexpected clone — the bridge
+       # owns the dir, this is integrity not adversarial defense):
+       #   git -C clone cat-file -e base_commit^{commit}  AND  current_commit^{commit}   (objects exist)
+       #   git -C clone merge-base --is-ancestor base_commit current_commit              (base ⊑ current)
+       #     any failing → "clone history unexpected (base not an ancestor of the run commit) — inspect {clone}"
+       merge_run(cfg, ck, src, &target, clone, root)
 
-merge_run(cfg, ck, src, target, mode, force, clone, root):
-  op  = operator_from(src, cfg.author.as_ref())?                # fail loud if unset (BOTH halves)
-  # round-3 BLOCKER — SOURCE no-touch preflight (PRIMARY guard, not the remote's denyCurrentBranch). Keyed
-  # off the RESOLVED TARGET vs the source's checked-out branch for EVERY mode/intent (NOT `mode == Onto`):
-  # Mode B `--as-branch <live-branch> --force` → ReplaceBranch would otherwise push onto the operator's
-  # checkout. A Mode-B CreateBranch to a brand-new name can't equal the live branch, so this is a no-op there.
+merge_run(cfg, ck, src, target, clone, root):
+  op  = operator_from(src, cfg.author.as_ref())?                     # fail loud if unset (BOTH halves)
+  # SOURCE no-touch preflight — keyed off resolved-target vs the source's checked-out branch (best-effort;
+  # denyCurrentBranch=refuse is the atomic backstop):
   if !is_bare(src) && source_head(src) == Some(target):
-       keep clone; return CheckedOutTarget("‹target› checked out in {src} — switch off it / pick another")
-  msg = ck.original_message.as_deref().unwrap_or(&fallback_subject(ck))   # round-2 #6: reused BYTE-FOR-BYTE
-  rt  = reauthor_commit(clone, &ck.current_commit?, &ck.base_commit, msg, &op)?   # commit-tree; clone unmoved
-  intent = match mode {
-     Onto     => PushIntent::LandOnto { base: &ck.base_commit },          # lease=base; --force NEVER weakens
-     AsBranch => match rev_parse(src, target) {                           # read the dst tip ONCE (#5)
-        None             => PushIntent::CreateBranch,                     #   absence enforced AT THE PUSH (#3)
-        Some(tip) if force => PushIntent::ReplaceBranch { expect: &tip }, #   CHECKED replace (lease=tip)
-        Some(_)          => return BranchExists path,                     #   exists && !force
-     }
-  }
-  match push_landing(clone, src, &rt, target, intent):
-     Ok(())                => reap_clone(clone, src, root)?; println!("merged {rt} into {target}")  # guarded
-     Err(StaleLease)       => keep clone; "‹target› moved off {base_commit} since the clone was made. The
-                              clone's base is FIXED and the clone preflight refuses a moved HEAD, so re-running
-                              `merge`/`resume` can't land it (a manual rebase would itself trip that preflight).
-                              Recovery: start a FRESH `implement` run off the moved ‹target›. (A first-class,
-                              checkpoint-updating replay is deferred.)"   # round-3 BLOCKER (recovery dead-end)
-     Err(CheckedOutTarget) => keep clone; "‹target› is checked out in {src} — switch off it / pick --onto"
-     Err(BranchExists)     => keep clone; "branch ‹target› exists — pick a name or pass --force"
-     Err(Other(e))         => keep clone; "merge failed: {e}; clone kept at {clone}"
+       keep clone; eprintln "‹target› checked out in {src} — switch off it / pick another"; exit 3
+  msg = commit_message(ck.original_message.clone(), &ck.task_brief).0  # ONE call: reuse-or-fallback (no
+                                                                       # fabricated helper; Some→trimmed verbatim,
+                                                                       # None/empty→`implement: <brief ≤120>`)
+  rt  = reauthor_commit(clone, &ck.current_commit?, &ck.base_commit, &msg, &op)?      # commit-tree; clone unmoved
+  match push_landing(clone, src, &rt, target, &ck.base_commit):
+     Ok(())                => reap_clone(clone, src, root)?; println!("merged {rt:.12} into {target}")  # exit 0
+     Err(StaleLease)       => keep clone; eprintln "‹target› moved off {base_commit} since the clone was made.
+                              The clone's base is FIXED and the clone preflight refuses a moved HEAD, so re-
+                              running `merge`/`resume` can't land it. Recovery: start a FRESH `implement` run
+                              off the moved ‹target›. (A checkpoint-updating replay is deferred.)"; exit 3
+     Err(CheckedOutTarget) => keep clone; eprintln "‹target› is checked out in {src} — switch off it"; exit 3
+     Err(Other(e))         => keep clone; eprintln "merge failed: {e}; clone kept at {clone}"; exit 3
 
-reap_clone(clone, src, root):   # round-2 #7 — guarded delete; NEVER a bare `rm -rf {clone}`
-  assert clone.join(".git").exists()  AND  is_under(canonical root, clone)  AND  clone != src
-         AND  clone.parent matches the resolve_clone layout dir (`…/.a2a-implement/`)
-  → only then remove_dir_all(clone); any assert failing ⇒ KEEP clone + warn (no delete)
+reap_clone(clone, src, root):   # guarded delete; NEVER a bare `rm -rf {clone}`
+  croot = canonical(root); cclone = canonical(clone)?; csrc = canonical(src)?
+  assert cclone == croot.join(".a2a-implement").join(id)  AND  cclone.join(".git").is_dir()
+         AND  is_under(croot, cclone)  AND  cclone != csrc     # symlinks resolved by canonicalize on both sides
+  → only then remove_dir_all(cclone); any assert failing ⇒ KEEP clone + warn (no delete)
 ```
-Exit non-zero on any `Err`/`Refuse`/preflight failure. `ck.current_commit`/`original_message` are `Option` —
-the gate refuses `current_commit==None`. The reused message is `ck.original_message` when `Some` — passed
-**verbatim** via `-F -`. It is ALREADY trimmed when captured from `.git/A2A_COMMIT_MSG` (`implement.rs`), so
-there is **no second trim** (round-3: removes the "byte-for-byte yet trimmed" contradiction); a multi-line
-body/trailers survive. When `None`, the fallback is obtained by **calling the existing
-`commit_message`/`fallback_subject` helper** — NOT re-deriving the rule in prose (avoids drift) — i.e. the
-B2b-1 `implement: <first task line ≤120 chars>`, else `implement: changes`.
-
-## Resolved decisions (carried from v1, still valid)
-
-1. **CAS-stale → refuse** (the `force-with-lease` rejection is the refusal); bounded retry-replay (cherry-pick
-   the changes onto the moved tip in the clone, then push) deferred.
-2. **Transport: local push only.** Keep a `Transport` notion for `git bundle` cross-host, unexercised in v1.
-3. **Operator identity:** `[merge]` override (BOTH halves) **and** fail-loud when neither config nor
-   `source_repo` git config supplies it.
 
 ## Testing strategy
 
 Pure core unit-tested; git ops over temp repos (docker-free); `merge_cmd` + `--merge` sugar live-gated.
-- **`decide_merge`** — full phase × `has_commit` × force matrix; **keystones:** non-terminal+force →
-  `RefuseHard`; `current_commit==None` → `RefuseHard`; mode does not change the gate.
-- **`resolve_target`** — precedence, normalization, `None`→Err, reject HEAD/SHA/remote/tag.
-- **`reauthor_commit`** — author==committer==operator (NOT bot); same tree as `current_commit`; the clone's
-  branch is **unmoved** (retry-safe).
-- **`push_landing`** over temp repos — mode A FF when `target==base_commit`; **StaleLease** when the target
-  moved; mode B creates a new branch; **BranchExists** refusal; `--force` overrides BranchExists. **Assert
-  OBSERVABLE behavior, not stderr-derived enum labels** (round-3 MAJOR): the deterministic refusals
-  (StaleLease, BranchExists, lease-expects-absent) are checked by post-failure ref state (did
-  `refs/heads/<dst>` move?); the **`CheckedOutTarget`** case is exercised via the bridge SOURCE PREFLIGHT
-  (deterministic), while the `denyCurrentBranch` BACKSTOP — whose stderr varies by git version — is classified
-  conservatively (`Other`) and tested only by "the ref did NOT move", never by matching stderr text.
+- **`decide_merge`** — full phase × `has_commit` × force matrix; keystones: non-terminal+force → `RefuseHard`;
+  `current_commit==None` → `RefuseHard` (and refused BEFORE the clone HEAD comparison); target Err → `Refuse`.
+- **`resolve_target`** — precedence; best-effort rejects (HEAD/SHA/`refs/…`/`origin/…`/trailing `.lock`/leading `-`); None→Err.
+- **`reauthor_commit`** — author==committer==operator (NOT bot); `current_commit`'s tree; parent==`base_commit`;
+  the clone's branch is **unmoved** (retry-safe); author date == committer date (both the captured `T`), FRESH.
+- **message reuse** — `commit_message` reproduces `ck.original_message` verbatim incl. a multi-line body/trailer
+  (already trimmed at capture, no second trim); `None`/empty → the `implement:` fallback subject.
+- **clone shape/ancestry** — a clone whose `base_commit` is NOT an ancestor of `current_commit`, or with a
+  missing object, refuses (force ignored), keeps the clone.
+- **`push_landing`** over temp repos — FF when `target == base_commit`; **StaleLease** when the target moved
+  (asserted by OBSERVABLE post-failure ref state — did `refs/heads/<target>` move? — not by stderr text).
+- **source HEAD preflight** — non-bare `src` whose checked-out branch == target → `CheckedOutTarget` BEFORE any
+  push (`src` `rev-parse HEAD` + `status --porcelain` byte-identical after); a DIFFERENT checked-out branch
+  lands; a **bare** src and a **detached-HEAD** src both proceed.
+- **concurrency** — two `push_landing` to ONE target over a temp repo: exactly one succeeds, the other
+  StaleLease (no lock; force-with-lease is the CAS).
+- **source-unchanged invariant** — non-bare temp `src` only: capture `git rev-parse HEAD` +
+  `git status --porcelain=v1 --untracked-files=all` before/after; assert byte-identical; ONLY
+  `refs/heads/<target>` may move.
 - **`operator_from`** — sources repo git config; fail-loud when unset; `[merge]` override (both halves) wins;
   half-override → error.
-- **concurrency** — two `push_landing` to ONE target over a temp repo: exactly one succeeds, the other
-  StaleLease (no lock, force-with-lease is the CAS); two to DISTINCT targets both succeed.
-- **source-unchanged invariant (testable)** — after a merge, `source_repo`'s `git rev-parse HEAD` is
-  unchanged AND `git status --porcelain=v1 --untracked-files=all` is byte-identical to before (no index/
-  worktree write); ONLY the pushed `refs/heads/<target>` may have moved.
-- **clone preflight** — wrong-branch / moved-HEAD / dirty each refuse (force ignored), keep the clone, exit
-  nonzero, with distinct messages; a gone/non-git `source_repo` likewise refuses.
-- **`reauthor_commit` dates** — author date == committer date (both set to one captured `T`), and FRESH
-  (not the bot commit's date).
-- **source HEAD preflight (ANY mode, round-3 BLOCKER)** — over a temp `source_repo` whose checked-out branch
-  == target: `merge` refuses `CheckedOutTarget` BEFORE any push (source `rev-parse HEAD` + worktree
-  byte-identical after) for **both** Mode A `--onto <live-branch>` **and** Mode B
-  `--as-branch <live-branch> --force` (the v4-regression case); a DIFFERENT checked-out branch lands normally;
-  a **bare** source is not treated as checked-out.
-- **Mode B atomic absence (round-2 #3)** — two concurrent `CreateBranch` pushes to ONE new name over a temp
-  repo: exactly one creates, the other refuses (`BranchExists`) WITHOUT advancing; a `CreateBranch` to a name
-  that already exists (even a fast-forwardable one) refuses, never silently FFs.
-- **message reuse (round-2 #6)** — `reauthor_commit` reproduces `ck.original_message` byte-for-byte incl. a
-  multi-line body/trailer (via `-F -`); `original_message==None` → the exact `implement:` fallback subject.
-- **guarded clone reap (round-2 #7)** — `reap_clone` deletes only when clone has `.git` ∧ is under canonical
-  root ∧ != source ∧ sits under `.a2a-implement/`; a path failing any guard is KEPT (not deleted).
-- **non-git source (round-2 #9)** — a source dir that canonicalizes but is not a git repo refuses
-  (`rev-parse --git-dir`), keep clone.
+- **`MergeToml::to_config`** — empty `target_ref` → error; half identity override → error; both absent →
+  `author=None`; unknown keys ignored; no env expansion.
+- **clone preflight + schema + non-git source** — wrong-branch / moved-HEAD / dirty each refuse (force ignored,
+  exit 1, distinct messages); a schema-version mismatch refuses (exit 1); a gone/non-git `source_repo` refuses.
+- **guarded reap** — `reap_clone` deletes only when `cclone == <root>/.a2a-implement/<id>` (post-canonicalize) ∧
+  has `.git` ∧ under root ∧ != source; a path failing any guard is KEPT.
+- **exit codes** — landed → 0; preflight/schema/usage → 1; `--merge` non-Approved → 2; `--merge` Approved-but-
+  unlanded → 3.
+- **CLI/output contract** — success stdout includes `merged <sha> into <target>`; every keep-clone failure
+  emits a stderr cause line + the clone path. Tests assert these FIELDS, not full wording.
 - **Live gate** — operator-run: a real `Approved` run → `merge <id>` lands on the target re-authored, clone
-  reaped; a `LoopStopped` run refuses without `--force`; merging onto the **checked-out** branch refuses
-  cleanly; `--as-branch` lands a branch; two merges to distinct targets succeed in parallel.
+  reaped (exit 0); a `LoopStopped` run refuses without `--force`; merging onto the **checked-out** branch
+  refuses cleanly (exit 3); a moved target → StaleLease recovery line (exit 3); `implement --merge` lands.
 
 ## Build order (smallest shippable slices, docker-free until the live gate)
 
 1. **Pin-prefix extraction** in `implement.rs` (`commit_argv` → shared IDENTITY-FREE prefix; identity stays
    per-caller) + its existing tests stay green.
-2. **Pure core** — `MergePlan`/`Mode`/`decide_merge`/`resolve_target` (best-effort pre-check) + the full
-   matrix tests.
-3. **`reauthor_commit`** (commit-tree, retry-safe, same-`T` dates, `-F -` byte-for-byte message) + temp-repo
-   tests.
-4. **`push_landing`** (mode A FF + lease; mode B CreateBranch via lease-expects-absent + exists-refusal +
-   ReplaceBranch checked) + temp-repo tests incl. the concurrency (two-push) + atomic-absence (two-create)
-   tests + source-unchanged invariant. (denyCurrentBranch is the backstop here; the PRIMARY checked-out guard
-   is the source preflight in slice 5.)
-5. **`merge <id>`** — `merge_cmd` + dispatch + `[merge]` config (`MergeToml::to_config` fail-loud parse +
-   validation tests) + `operator_from` fail-loud; `load_checkpoint` schema-version refusal; the **source
-   preflight** (non-git refusal + checked-out refusal for ANY mode) and **guarded `reap_clone`**; clone reaped
-   on success / kept on failure (recovery text, no bare `rm -rf`).
-6. **`run_warm_loop` typed outcome + `implement --merge`** sugar (Approved-only, mode A).
-7. **Bundle transport** — deferred seam.
+2. **Pure core** — `MergePlan`/`decide_merge`/`resolve_target` + the full matrix tests.
+3. **`reauthor_commit`** (commit-tree, retry-safe, same-`T` dates, `-F -`, reuses `commit_message`) +
+   clone shape/ancestry preflight + temp-repo tests.
+4. **`push_landing`** (FF + lease; observable-state classification) + temp-repo tests incl. the concurrency
+   (two-push) test + the source-unchanged invariant.
+5. **`merge <id>`** — `merge_cmd` + dispatch + `[merge]` `MergeToml::to_config` (fail-loud + validation tests) +
+   `operator_from` fail-loud + the schema gate + the source no-touch preflight + guarded `reap_clone` + the exit
+   codes; clone reaped on success / kept on failure (recovery text, no bare `rm -rf`).
+6. **`run_warm_loop` typed outcome + `implement --merge`** sugar (Approved-only).
 
 ## Risks
 
 - **Operator identity unset on headless hosts** — fail-loud + `[merge]` override + an unset test.
 - **`base_ref == None`** — `resolve_target` errs explicitly; `--onto`/`[merge].target_ref` make it turnkey.
 - **Re-author idempotency** — `commit-tree` (not amend) leaves the clone unmoved, so a failed push is cleanly
-  retryable; the preflight `head_sha == current_commit` still holds on retry.
-- **Recovery text** — never reuses `handoff_text`'s `rm -rf "{clone}"`; each `PushError` prints a targeted,
-  reap-free recovery line.
+  retryable; the `head_sha == current_commit` preflight still holds on retry.
+- **Discarded work under concurrency** — under genuine concurrency, target-moved (`StaleLease`) is the *common*
+  case, and each collision discards an `Approved` run's agent/container cost. The architecture keeps the replay
+  seam open (clone retained + `commit-tree` pristine) but does NOT auto-replay yet → a bounded retry-replay
+  (cherry-pick onto the moved tip in the clone, then push) is the motivated follow-up. Do not read Mode A as
+  production-resilient under heavy concurrency.
+- **Permissive `receive.denyCurrentBranch`** — `updateInstead`/`ignore`/`warn` on `source_repo` are out of
+  scope (see the no-touch guard); documented, not defended.
 
-## Spec-review resolutions (codex rigor, v2→v3)
+## Deferred: Mode B (`--as-branch`) — fast-follow
 
-- **BLOCKER target double-wrap** → `resolve_target` returns a SHORT branch name; `refs/heads/{}` built only
-  inside `push_landing`. One representation across `MergePlan.target` / `dst_branch` / config / output.
-- **BLOCKER `--force` weakening the lease** → no bare `force` in `push_landing`; a `PushIntent` enum carries
-  the mode-specific safety. Mode A is ALWAYS `LandOnto{base}` (lease unconditional); `--force` only flips the
-  `LoopStopped` gate. Mode B `--force` = `ReplaceBranch{expect=current tip}` (a CHECKED replace, not a racy
-  `+dst`).
-- **ref grammar** → a PURE best-effort pre-check (NOT full `check-ref-format` parity — round-3 aligns this
-  wording to the resolve_target contract) for `--onto`/`[merge].target_ref`/`--as-branch` (reject `refs/…`,
-  `HEAD`, SHAs, `origin/*`, literal `refs/tags/…`, `..`, `.lock`, trailing `/`/`.`, leading `-`); git is the
-  authoritative validator at the push boundary.
-- **clone-preflight classification** → distinct non-overridable refusals (wrong branch / moved HEAD / dirty),
-  keep clone, exit nonzero.
-- **re-author identity** → explicit `GIT_AUTHOR_*` + `GIT_COMMITTER_*` env (author==committer==operator) with
-  fresh dates, plus the host-commit pins.
-- **`source_repo` canon failure** → non-overridable refusal (gone/moved/non-git), keep clone; no override.
-- **MINORs** → `merge_run` takes `cfg`; `implement --merge [--onto]` surface; testable source-unchanged
-  invariant; `[merge].target_ref` accepts short names only (`refs/heads/main` rejected by the grammar).
-
-## Spec-review resolutions (round 2 — codex+claude, v3→v4)
-
-A 2nd dual `spec-review` (run on the bridge's own containerized workflow AFTER the `usage_update` fix, so the
-claude soundness lens no longer hangs) returned "not yet ready to plan". All 12 findings folded:
-
-- **BLOCKER #1 — no-touch rested on the remote's default.** The "without touching the operator's checkout"
-  guarantee was enforced ONLY by git's default `receive.denyCurrentBranch` on `source_repo`; `updateInstead`
-  (moves worktree+HEAD) or `warn`/`ignore` (silent ref↔worktree desync) defeat it. Fix: the BRIDGE now runs a
-  **Mode-A source HEAD preflight** (`symbolic-ref --short HEAD` == target on a non-bare repo → refuse
-  `CheckedOutTarget` BEFORE pushing); `denyCurrentBranch` is a backstop only.
-- **#2 — `resolve_target` "pure ∧ reject tags" was self-contradictory** (tags are repo state, not string
-  grammar; "pure check-ref-format parity" overpromised). Reworded to a PURE best-effort UX pre-check (rejects
-  only string-decidable forms, incl. literal `refs/tags/…`), with git as the authoritative push-boundary
-  validator.
-- **#3 — Mode B `CreateBranch` was a TOCTOU** (read-then-push could FF an existing branch). Now absence is
-  enforced ATOMICALLY at the receiver via a lease-expects-absent refspec; contract test = two concurrent
-  creates, one wins without advancing.
-- **#4 — StaleLease recovery text pointed at dead ends** (`re-run merge`/`resume` both replay the SAME fixed
-  base lease; `reconcile_head` can't rebase onto a moved tip). Rewritten to the honest recovery (manual rebase
-  of the clone, or a fresh `implement`; auto-replay deferred).
-- **#5 — Mode B `--force` delete races** classified (delete after tip-read → `StaleLease`, never recreate;
-  before → fall back to `CreateBranch`).
-- **#6 — reauthored message source** pinned: reuse `ck.original_message` byte-for-byte via `-F -` (multi-line
-  body/trailers preserved); explicit `implement:`-prefixed fallback when absent.
-- **#7 — success `rm -rf clone` lacked a safety contract.** Added `reap_clone` (delete only when the path is
-  the resolved clone: has `.git`, under canonical root, != source, under `.a2a-implement/`).
-- **#8 — `implement --merge` surface** pinned: mode-A-only (`--as-branch` is a parse error), `--force`
-  rejected, full outcome→exit/print mapping.
-- **#9 — non-git `source_repo`** detected by `rev-parse --git-dir` (canonicalize alone can't prove git-ness).
-- **#10 — date equality mechanics** — set both `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` to one captured `T`.
-- **#11 — shared prefix is IDENTITY-FREE** (label fixed; each caller attaches identity its own way).
-- **#12 — pins largely inert on `commit-tree`** (only `safe.directory` load-bearing; comment + build-time
-  `gpgsign` check noted).
-
-## Spec-review resolutions (round 3 — codex+claude confirmation, v4→v5)
-
-A 3rd dual `spec-review` (confirming the v4 fold) returned "not ready to plan — 3 BLOCKERs". The pass earned
-its keep by catching a **regression in v4's own BLOCKER-#1 fix**. All folded:
-
-- **BLOCKER (regression) — preflight was mode-gated.** v4 keyed the source no-touch preflight on
-  `mode == Onto`, but Mode B `merge <id> --as-branch <operator's-live-branch> --force` → `ReplaceBranch` would
-  push onto the checked-out branch with no bridge guard, back to the `denyCurrentBranch` the round-2 BLOCKER
-  deemed insufficient. Fix: key the preflight off **resolved-target == source HEAD on a non-bare source for
-  EVERY mode/intent**.
-- **BLOCKER — StaleLease recovery was unfollowable.** "manually rebase {clone} then `merge`" dead-ends: the
-  rebase moves clone HEAD → the clone preflight (`head_sha != current_commit`) then refuses. Fix: recovery is
-  a FRESH `implement` run off the moved target; a checkpoint-updating replay is deferred.
-- **BLOCKER — Mode B "No lease/CAS" summary contradicted its own `PushIntent`.** The §"Two modes" summary
-  said no lease while `PushIntent` requires lease-expects-absent (create) + `--force-with-lease` (replace).
-  Reworded to "no *base-commit* lease against the target; Mode B still uses leases for atomic create / checked
-  replace."
-- **MAJOR — `implement --merge` exit relied on a non-existent "own nonzero exit"** (`run_warm_loop` returns
-  `()` today). Pinned: slice 6's typed outcome drives the `--merge` mapping; plain `implement` exit is
-  unchanged; `LoopStopped`/non-terminal under `--merge` prints "not merged: <reason>" + nonzero.
-- **MAJOR — `--as-branch [<name>]` parse ambiguity** → consume the next token only if it is not a flag.
-- **MAJOR — `[merge]` validation** → `MergeToml::to_config` contract (non-empty `target_ref`, both-or-neither
-  identity, no env expansion, unknown keys ignored).
-- **MAJOR — `PushError` tested by unstable stderr labels** → assert observable ref state; `CheckedOutTarget`
-  comes from the deterministic bridge preflight, `denyCurrentBranch` is a conservatively-classified backstop.
-- **MAJOR — checkpoint `schema_version` unhandled** → `load_checkpoint` refuses an unsupported version (reuses
-  the resume validation) before any preflight.
-- **MINORs** — `base_commit` liveness now stated in the Goal + `--onto` surface; the agentless-`merge` reap
-  race documented (serialize ops per `<id>`; first-class lock deferred); message preservation contradiction
-  removed (the stored message is already trimmed; fallback sourced from the existing helper); the leftover
-  "`check-ref-format --branch` semantics" wording aligned to the best-effort pre-check.
+A separate slice (its own review) adds **Mode B**: push the re-authored commit to a **new**
+`refs/heads/<name>` (default `implement/<task_id>`) for *parallel* tasks in one slice. It re-introduces a
+`PushIntent { LandOnto, CreateBranch, ReplaceBranch }` enum (the gate stays mode-independent), where
+`CreateBranch` enforces non-existence ATOMICALLY at the push (lease-expects-absent — the exact git refspec
+verified during that slice's build, with a two-create concurrency test) and `--force` = `ReplaceBranch{expect=tip}`
+(a checked replace, with delete-race classification). It is deferred because all three regressions the review
+rounds found lived in this surface; Mode A ships first and clean.
 
 ## ADR
 
-This increment gets **ADR-0027** (merge hand-off).
+This increment gets **ADR-0027** (merge hand-off — Mode A).
+
+## Appendix: revision history (condensed)
+
+- **v1** — worktree + cherry-pick + `cas_advance`/temp-ref + per-target lock.
+- **v2** — claude's push-based redesign (`commit-tree` + `--force-with-lease`); removed the worktree /
+  `WorktreeGuard` / `.a2a-merge/` / CAS-ref / temp-ref / per-target lock; fixed the silent checkout-corruption
+  BLOCKER.
+- **v3** — folded codex rigor round 1 (short branch-name invariant; ref grammar; classified clone-preflight
+  refusals; explicit `GIT_AUTHOR_*`/`GIT_COMMITTER_*` re-author).
+- **Round 2 (→v4)** — BLOCKER: the no-touch guarantee can't rest on the *default* `denyCurrentBranch` → added a
+  source HEAD preflight; +11 precision folds. (Run after the `usage_update` SDK fix, so the claude lens stopped
+  hanging.)
+- **Round 3 (→v5)** — caught a REGRESSION: the v4 preflight was mode-gated (`mode == Onto`), so Mode B
+  `--as-branch <live-branch> --force` slipped onto the operator's checkout → ungated the preflight; + StaleLease
+  dead-end recovery, the Mode B "No lease/CAS" self-contradiction, the `--merge` exit mapping, etc.
+- **Round 4 (→v6)** — both lenses "sound to plan". **Deferred Mode B** (all 3 regressions clustered there) and
+  **consolidated** this doc. Folded: clone shape/ancestry preflight; a REAL `schema_version` gate (v5 wrongly
+  claimed `load_checkpoint` already validates it — it doesn't); `current_commit==None` ordering; the preflight
+  reframed best-effort + `denyCurrentBranch=refuse` atomic + `updateInstead` out-of-scope; `PushError`
+  observable-state classification; `reap_clone` canonicalization; distinct exit codes (2 vs 3); the
+  discarded-work Risk; and fixed a fabricated `fallback_subject` → the real `commit_message(raw, task)`.
