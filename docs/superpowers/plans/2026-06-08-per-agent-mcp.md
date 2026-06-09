@@ -24,6 +24,8 @@
 
 **Mechanical-literal rule (spec MINOR 6):** adding a field to `AgentEntry`/`AcpConfig`/`ContainerRwConfig` breaks every existing struct literal + test. In the SAME commit that adds the field, `rg 'AgentEntry \{'` (resp. `AcpConfig \{`, `ContainerRwConfig \{`) and add `mcp: vec![]` to each, so the workspace compiles. This is part of the task.
 
+**Preconditions (external — verify before Task 0):** `~/code/slicing` builds `prism-mcp` (`cargo build --bin prism-mcp --features mcp`); Docker is up with the egress stack + reader image; host paths in the reference config (`~/.local/share/a2a/prism-mcp-linux`, the creds mounts) exist. The untracked `examples/a2a-bridge.slicing-implement.toml` in the tree is **unrelated to this increment** — leave it; the prism wiring lands in `containerized.toml` (Task 5), not there.
+
 ---
 
 ### Task 0: Front-loaded probe (manual spike — de-risks the keystone, NOT committed)
@@ -71,12 +73,17 @@ cargo build --release --bin a2a-bridge
 
 For each agent, classify EXACTLY one (spec failure taxonomy): **success** / **param-ignored** / **spawn-failed** / **call-failed** / **not-called**. Success = a `tool_call` (server `prism`, tool `nodes_at`) + a non-error `tool_call_update` in the session stream (`docker logs <container>`). Write the result into the spec's matrix and decide which agents the reference config wires.
 
-- [ ] **Step 5: Revert the hardcode**
+- [ ] **Step 5: Revert the hardcode (safely)**
 
+Before editing in Step 2, capture the pristine blobs so the revert can't discard unrelated edits:
 ```bash
-git checkout crates/bridge-acp/src/acp_backend.rs examples/a2a-bridge.containerized.toml
+git stash push -- crates/bridge-acp/src/acp_backend.rs examples/a2a-bridge.containerized.toml 2>/dev/null || true
+# ... (Steps 2-4 happen on a clean copy) ...
+# Revert ONLY the probe's edits:
+git checkout -- crates/bridge-acp/src/acp_backend.rs examples/a2a-bridge.containerized.toml
+git stash pop 2>/dev/null || true   # restore any pre-existing edits
 ```
-Expected: clean tree. **Do not commit anything from Task 0.** If NO agent succeeded, STOP and reconsider (the native-config path is a different increment).
+(Equivalently: confirm `git diff --exit-code -- <files>` is clean BEFORE Step 2, so the later `git checkout` only ever discards the probe.) Keep `~/.local/share/a2a/prism-mcp-linux` (slices 5/6 reuse it). Expected: clean tree. **Do not commit anything from Task 0.** If NO agent succeeded, STOP and reconsider (the native-config path is a different increment).
 
 ---
 
@@ -174,15 +181,15 @@ pub struct McpServerSpec {
     pub env: Vec<(String, String)>,
 }
 ```
-Add to `AgentEntry` (after `sandbox`): `pub mcp: Vec<McpServerSpec>,`. Then `rg 'AgentEntry \{'` across the workspace and add `mcp: vec![]` to every literal (e.g. `domain.rs` tests, `config.rs:637`, route/registry tests) — the build won't compile until all are fixed.
+Add to `AgentEntry` (after `sandbox`): `pub mcp: Vec<McpServerSpec>,`. Then `rg 'AgentEntry \{'` and add `mcp: vec![]` to EVERY literal — the field-add breaks 11 files across 5 crates (verified): `crates/bridge-core/src/domain.rs`, `bin/a2a-bridge/src/{config.rs:637, main.rs, route.rs}`, `bin/a2a-bridge/tests/{e2e_registry.rs, integration_run_workflow.rs, common/mod.rs}`, `crates/bridge-registry/src/registry.rs`, `crates/bridge-workflow/src/executor.rs`, `crates/bridge-a2a-inbound/{src/server.rs, tests/workflow_producer.rs}`. The workspace won't compile until ALL are fixed — so this commit stages all of them (Step 6).
 
 - [ ] **Step 6: Build + test + fmt/clippy + commit**
 
-Run: `cargo build --workspace 2>&1 | tail -5 && cargo test -p bridge-core 2>&1 | tail -5`
-Expected: build OK; tests PASS.
+Run: `cargo build --workspace 2>&1 | tail -5 && cargo test --workspace 2>&1 | tail -5`
+Expected: build OK; tests PASS (the whole workspace — the literal fixes span 5 crates).
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/bridge-core
+git add -A   # the field-add + every `mcp: vec![]` literal fix (11 files, 5 crates) — self-contained commit
 git commit -m "feat(mcp): McpServerSpec domain type + {cwd} template helpers + AgentEntry.mcp"
 ```
 
@@ -328,12 +335,12 @@ fn new_session_request_maps_specs_and_substitutes_cwd() {
 
 - [ ] **Step 2: Run it (fails)**
 
-Run: `cargo test -p bridge-acp new_session_request_maps_specs -- --exact 2>&1 | tail -5`
+Run: `cargo test -p bridge-acp new_session_request_maps_specs_and_substitutes_cwd -- --exact 2>&1 | tail -5`
 Expected: FAIL — `new_session_request` takes 1 arg.
 
 - [ ] **Step 3: Add `AcpConfig.mcp` + map in `new_session_request`**
 
-Add `pub mcp: Vec<bridge_core::domain::McpServerSpec>,` to `AcpConfig` (68); add `mcp: vec![]` to its `Default` impl (114). Rewrite `new_session_request` (382):
+Add `pub mcp: Vec<bridge_core::domain::McpServerSpec>,` to `AcpConfig` (68); add `mcp: vec![]` to its `Default` impl (114). **Stopgap (BLOCKER — keeps the workspace compiling at this commit):** the EXHAUSTIVE production literal at `crates/bridge-container/src/lib.rs:228` (7 fields, no `..default()`) breaks the instant the field is added — add `mcp: vec![]` there NOW (Task 4 upgrades it to `self.cfg.mcp.clone()`). Cross-crate `AcpConfig` *test* literals use `..default()`, so they need no touch — confirm with `rg 'AcpConfig \{'`. Rewrite `new_session_request` (382):
 ```rust
 pub fn new_session_request(
     cwd: impl Into<PathBuf>,
@@ -363,10 +370,15 @@ In `tests/golden_frames.rs` (~59-96), the empty-`mcpServers` golden uses `new_se
 
 - [ ] **Step 6: Run, fmt/clippy, commit**
 
-Run: `cargo test -p bridge-acp new_session_request_maps_specs golden 2>&1 | tail -8` (Expected: PASS)
+Run (cargo does NOT AND two bare filters — run them separately):
+```
+cargo test -p bridge-acp new_session_request_maps_specs_and_substitutes_cwd -- --exact
+cargo test -p bridge-acp golden
+```
+Expected: both PASS.
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/bridge-acp
+git add crates/bridge-acp crates/bridge-container   # incl. the lib.rs:228 stopgap so the commit compiles
 git commit -m "feat(mcp): map McpServerSpec -> ACP McpServer::Stdio at mint with {cwd} substitution"
 ```
 
@@ -390,11 +402,11 @@ At `main.rs:183`, add `mcp: entry.mcp.clone(),` AND replace `..bridge_acp::acp_b
         auth_method: entry.auth_method.clone(),
         container,
         mcp: entry.mcp.clone(),
-        handshake_timeout: bridge_acp::acp_backend::DEFAULT_HANDSHAKE_TIMEOUT,
-        cancel_grace: bridge_acp::acp_backend::DEFAULT_CANCEL_GRACE,
+        handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
+        cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
     };
 ```
-(Confirm the `DEFAULT_*` const names/visibility in `acp_backend.rs`; if private, `pub` them or keep `..default()` AND add `mcp:` explicitly above it — but prefer the exhaustive literal.)
+(`DEFAULT_HANDSHAKE_TIMEOUT`/`DEFAULT_CANCEL_GRACE` are crate-PRIVATE — don't reference them from `bin`. The `AcpConfig::default().<field>` pattern is exactly what the `:rw` builder already ships at `main.rs:371-372`, so it's the proven, visibility-safe way to keep the exhaustive literal.)
 
 - [ ] **Step 2: Thread into `ContainerRwConfig` + the per-turn `AcpConfig`**
 
@@ -402,17 +414,26 @@ Add `pub mcp: Vec<bridge_core::domain::McpServerSpec>,` to `ContainerRwConfig` (
 
 - [ ] **Step 3: Write + run the threading test (drives the REAL main.rs builder)**
 
-In `main.rs` in-file tests, build an `AgentEntry` with one `McpServerSpec` and assert the `:ro` builder (`acp_spawn_inputs` / the fn holding the `main.rs:183` literal) yields an `AcpConfig` whose `mcp` carries it:
+In `main.rs` in-file tests, reuse the existing `acp_entry(id)` helper (it builds a `sandbox: None` `AgentEntry` — the raw path still constructs the `main.rs:183` `AcpConfig`), set `.mcp`, and assert `acp_spawn_inputs` carries it. Signature: `acp_spawn_inputs(entry: &AgentEntry, cwd: PathBuf, owner_config_path: &Path, run: &RunHandle)`:
 ```rust
 #[test]
 fn ro_builder_threads_mcp() {
-    let entry = /* minimal AgentEntry with mcp: vec![McpServerSpec{ name:"prism".into(), command:"/x".into(), args:vec![], env:vec![] }] */;
-    let (_p, _argv, acp) = acp_spawn_inputs(&entry /*, …*/).unwrap();
-    assert_eq!(acp.mcp.len(), 1);
-    assert_eq!(acp.mcp[0].name, "prism");
+    use bridge_core::domain::McpServerSpec;
+    let mut entry = acp_entry("a");
+    entry.mcp = vec![McpServerSpec {
+        name: "prism".into(), command: "/opt/prism/prism-mcp".into(),
+        args: vec!["--repo".into(), "{cwd}".into()], env: vec![],
+    }];
+    let run = bridge_core::run_identity::RunHandle {
+        instance_id: "t".into(), host: "h".into(), lease: "l".into(), start: 0,
+    };
+    let (_p, _argv, acp) = acp_spawn_inputs(
+        &entry, std::path::PathBuf::from("/tmp"), std::path::Path::new("/tmp/cfg.toml"), &run,
+    ).unwrap();
+    assert_eq!(acp.mcp, entry.mcp);   // the spec reached AcpConfig.mcp verbatim ({cwd} is substituted later, at mint)
 }
 ```
-(Use the real builder fn name + args from `main.rs:160-191`; construct the minimal `AgentEntry` the same way other `main.rs` tests do.)
+(`RunHandle` fields confirmed: `{ instance_id, host, lease, start }`. If `acp_spawn_inputs` rejects `/tmp` for an unsandboxed entry, mirror the cwd a nearby `acp_spawn_inputs` test uses.)
 
 Run: `cargo test -p a2a-bridge ro_builder_threads_mcp -- --exact 2>&1 | tail -5` → PASS.
 
