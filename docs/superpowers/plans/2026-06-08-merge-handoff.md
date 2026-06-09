@@ -20,6 +20,23 @@
 
 ---
 
+## Plan-review fixes (FOLD — apply before executing)
+
+A dual `plan-review` (codex exec-feasibility + claude coverage) ran on this plan. The **Coverage lens verified every claim against the source**; the **Executability lens ran blind** (`bubblewrap unavailable` in the container, so codex couldn't read the repo — its findings were conditional). Net verdict: **not executable as-is** — apply these before building:
+
+- **FIX 1 (BLOCKER, Task 7) — thread `--merge`/`--onto` through `ImplementArgs`, not a non-existent loop.** Parsing lives in `parse_implement_args` (`main.rs:551`) → `ImplementArgs { mode: ImplementMode::{Fresh,Resume}, config }`. Add two SIBLING fields `merge: bool` + `onto: Option<String>` to `ImplementArgs` (NOT to the `ImplementMode` variants — that keeps the exhaustive binds at `main.rs:3270/3305/3315` intact). Parse `--merge` (flag) and `--onto <v>` in BOTH the `--resume` loop (~556) and the fresh loop (~593). Change `implement_resume_cmd` (`main.rs:1333`, currently `(resume_id: &str, config_path: &Path)`) to also take `merge: bool, onto: Option<&str>`, and update the dispatch at `main.rs:1042` to pass `args.merge`/`args.onto`. The after-loop merge block then uses those in-scope values in BOTH `implement_cmd` and `implement_resume_cmd`.
+- **FIX 2 (BLOCKER, Task 4) — drop `PushError::CheckedOutTarget`** (matched in `merge_clone` but NEVER constructed by `push_landing` → `dead_code` → fails the `clippy -D warnings` gate the plan runs before every commit). `push_landing` returns only `Ok`/`StaleLease`/`Other`; the checked-out case is owned by the pre-push `source_head` preflight (returns `Unlanded`/3). So `PushError = { StaleLease, Other(String) }`; remove the `CheckedOutTarget` arm from `merge_clone`'s `match push_landing` (the preflight already returned before the push). The `denyCurrentBranch` backstop race maps to `Other`.
+- **FIX 3 (MAJOR, Task 6) — the four `implement` helpers are ALREADY `pub`** (`head_sha` 196, `current_branch` 199, `is_worktree_dirty` 204, `commit_message` 60), so `use crate::implement::{...}` compiles. No visibility change needed — confirmed, drop the hedge.
+- **FIX 4 (MAJOR, Task 6) — add a `merge_clone` orchestrator test.** It returns `MergeOutcome` (no `process::exit`), so it is unit-testable over the temp-repo helpers. Add a happy-path test (write an `Approved` checkpoint into a temp clone via `implement_resume` helpers → `merge_clone` → `Merged`, target landed, clone reaped) and a refuse-path test (`LoopStopped` w/o force → `UsageOrPreflight`). Pulls target precedence + the exit-code split + the `commit_message` wiring off the live gate.
+- **FIX 5 (MINOR, Task 5) — follow the existing config idiom.** `verify`/`review`/`implement` are raw `Option<*Toml>` fields with `.to_config()` called at the USE site (NO `*_config()` accessor); `to_config` returns `Result<_, ConfigError>`. So: drop the `merge_config()` accessor, expose `pub merge: Option<MergeToml>`, return `Result<MergeConfig, ConfigError>`, and call `cfg.merge.as_ref().map(|m| m.to_config()).transpose()?` at the use sites. Delete the contradictory "don't introduce a new pattern" note + fix the test.
+- **FIX 6 (MINOR, Task 7) — drop "reject `--merge` with `--force`"** — `implement` has no `--force` flag (unknown flags rejected at `main.rs:618`), so the check is a no-op.
+- **FIX 7 (MINOR, Task 8) — Task 8 is an operator/human docs commit** → the repo-default `Co-Authored-By` trailer applies (unlike trailer-free subagent commits). Replace "Capture/Document" with concrete ADR sections (Context / Decision / Alternatives considered / Consequences) + the literal trailer.
+- **Cosmetic:** drop the `Box<dyn Error>` fallback hedge in Task 6 (lacks `Send+Sync`, mis-unifies); `terminal` is already used via `write_terminal` (`main.rs:1019`) — the "instead of discarding" wording is loose.
+
+> **Status: PARKED 2026-06-08** after this fold, to prioritize the per-agent MCP increment. Resume by applying the fixes above task-by-task, then dogfood-implement (peers idle).
+
+---
+
 ### Task 1: Extract the identity-free git-config pin prefix
 
 Extract the three pins shared by `commit_argv` (and the second commit-builder in `implement.rs`) into one helper, so `reauthor_commit` (Task 3) reuses the EXACT pins with a different identity mechanism. Identity stays per-caller (`commit_argv` keeps `-c user.name/email`; `reauthor_commit` will use `GIT_*` env).
