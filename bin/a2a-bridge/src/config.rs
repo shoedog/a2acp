@@ -125,6 +125,9 @@ pub struct RegistryConfig {
     /// `[implement]` (Slice B2b-3b): the review→tweak loop config. Absent → `LoopConfig::default()`.
     #[serde(default)]
     pub implement: Option<ImplementToml>,
+    /// `[merge]` (ADR-0027): merge hand-off target + operator identity override. Absent → defaults.
+    #[serde(default)]
+    pub merge: Option<MergeToml>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -548,6 +551,52 @@ impl ImplementToml {
             max_attempts,
             fix_workflow,
             max_session_respawns,
+        })
+    }
+}
+
+/// `[merge]` (ADR-0027) raw TOML: target branch + optional operator identity override. No env expansion
+/// (merge takes literal strings); unknown keys ignored (matching the rest of `RegistryConfig`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MergeToml {
+    pub target_ref: Option<String>,
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+}
+
+/// Validated `[merge]` config.
+#[derive(Debug, Clone)]
+pub struct MergeConfig {
+    pub target_ref: Option<String>,
+    pub author: Option<crate::merge::OperatorIdent>,
+}
+
+impl MergeToml {
+    /// Fail-loud validation (mirrors `ImplementToml::to_config`): non-empty `target_ref`; identity is
+    /// both-or-neither (`author_name` XOR `author_email` → error).
+    pub fn to_config(&self) -> Result<MergeConfig, ConfigError> {
+        if let Some(t) = &self.target_ref {
+            if t.trim().is_empty() {
+                return Err(ConfigError::Registry(
+                    "[merge].target_ref must be non-empty".into(),
+                ));
+            }
+        }
+        let author = match (&self.author_name, &self.author_email) {
+            (Some(n), Some(e)) => Some(crate::merge::OperatorIdent {
+                name: n.clone(),
+                email: e.clone(),
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(ConfigError::Registry(
+                    "[merge] author_name and author_email must BOTH be set or both omitted".into(),
+                ))
+            }
+        };
+        Ok(MergeConfig {
+            target_ref: self.target_ref.clone(),
+            author,
         })
     }
 }
@@ -1865,5 +1914,42 @@ path = "/tmp/x.db"
         let k = snap.entries.iter().find(|e| e.id.as_str() == "k").unwrap();
         assert_eq!(k.mcp_delivery, bridge_core::mcp::McpDelivery::KiroNative);
         assert_eq!(k.mcp.len(), 1);
+    }
+
+    // ---- [merge] config (ADR-0027) ----
+
+    #[test]
+    fn merge_config_validation() {
+        // both identity halves -> Some
+        let raw = "allowed_cwd_root = \"/x\"\n[merge]\ntarget_ref = \"main\"\n\
+                   author_name = \"Op\"\nauthor_email = \"op@x.com\"\n";
+        let cfg = super::RegistryConfig::parse(raw).unwrap();
+        let m = cfg.merge.as_ref().unwrap().to_config().unwrap();
+        assert_eq!(m.target_ref.as_deref(), Some("main"));
+        assert_eq!(m.author.as_ref().unwrap().email, "op@x.com");
+
+        // half identity -> error
+        let half = "[merge]\nauthor_name = \"Op\"\n";
+        assert!(super::RegistryConfig::parse(half)
+            .unwrap()
+            .merge
+            .as_ref()
+            .unwrap()
+            .to_config()
+            .is_err());
+
+        // empty target_ref -> error
+        let empty = "[merge]\ntarget_ref = \"\"\n";
+        assert!(super::RegistryConfig::parse(empty)
+            .unwrap()
+            .merge
+            .as_ref()
+            .unwrap()
+            .to_config()
+            .is_err());
+
+        // absent [merge] -> None
+        let none = "allowed_cwd_root = \"/x\"\n";
+        assert!(super::RegistryConfig::parse(none).unwrap().merge.is_none());
     }
 }

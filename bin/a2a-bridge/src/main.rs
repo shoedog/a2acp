@@ -29,6 +29,7 @@ mod config;
 mod containers;
 mod implement;
 mod implement_resume;
+mod merge;
 mod resilient;
 mod review;
 mod route;
@@ -89,7 +90,9 @@ SUBCOMMANDS:
   run-workflow <id>   Run a workflow against a repo (design | code-review | spec-review | plan-review | …).
                       --input <file> --session-cwd <repo> [--config <f>] [--out <f>]
   implement <task>    Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
-                      --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>]
+                      --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
+  merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
+                      (Mode A: fast-forward --onto). [--config <f>] [--onto <branch>] [--force]
   init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
   serve               Run the A2A server.  [--config <path>]
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
@@ -2460,6 +2463,7 @@ async fn main() -> Result<(), BoxError> {
     match raw_args.get(1).map(|s| s.as_str()) {
         Some("run-workflow") => return run_workflow_cmd(&raw_args[2..]).await,
         Some("implement") => return implement_cmd(&raw_args[2..]).await,
+        Some("merge") => return merge::merge_cmd(&raw_args[2..]).await,
         Some("containers") => return containers_cmd(&raw_args[2..]),
         Some("submit") => return submit_cmd(&raw_args[2..]).await,
         Some("task") => return task_cmd(&raw_args[2..]).await,
@@ -2474,7 +2478,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         Some(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | implement | containers | submit | task | init | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | implement | merge | containers | submit | task | init | help)"
             )
             .into());
         }
