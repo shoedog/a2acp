@@ -20,9 +20,9 @@ off containers**:
   bridge-rendered native config delivered into that one container (`container_rw_cfg_from_entry`, the shared seam
   for all 3 ContainerRw sites). One repo per `implement` run (the clone) → `{cwd}`-correct.
 - **codex reviewer / clean-room / design — HOST-side (containerization bypassed):** an explicit operator opt-out
-  (own-codebase, accepted-risk) runs these agents on the host instead of a `:ro` container, so prism rides the
-  host's own codex config via a **per-invocation `CODEX_HOME`** (no clobber of the user's real `~/.codex`). This
-  **deletes** the `:ro` reader native-mount path and the blind-codex-in-`:ro` problem entirely.
+  (own-codebase, accepted-risk) runs these agents on the host instead of a `:ro` container, so prism rides
+  codex-acp's **`-c mcp_servers.*` override args** while codex keeps its real `~/.codex` (auth). This **deletes**
+  the `:ro` reader native-mount path and the blind-codex-in-`:ro` problem entirely.
 - **kiro:** deferred (codex is the reviewer/implementor). claude+codex cover the dogfood.
 
 **Decided (review MAJOR 8):** build this narrow stdio path now; **prism is evaluating** HTTP + multi-repo (the
@@ -40,14 +40,14 @@ keystone unknown. **All three agents can use prism over stdio — but via DIFFER
 | agent | channel | repo targeting | required knobs |
 |---|---|---|---|
 | **claude** (`claude-agent-acp`) | the **ACP `mcpServers` param** (`session/new`) — the bridge's seam | **`{cwd}`-templated** | a **persisted CPG cache** (cold 35s → warm 1.3s) |
-| **codex** (`codex-acp`) | **native `config.toml [mcp_servers.<name>]`** (via `CODEX_HOME`) | static `--repo` arg | `startup_timeout_sec` (default drops prism) + cache |
+| **codex** (`codex-acp`) | **native `mcp_servers.*`** via **`-c` override args** on the argv (v6.1) | `{cwd}`-subst in the `-c` args | `startup_timeout_sec` (default drops prism) + **warm** cache |
 | **kiro** (`kiro-cli`) | **native `settings/mcp.json`** | static `--repo` arg | cache |
 
 **codex and kiro do not honor the ACP `mcpServers` param for stdio** — their `initialize` advertises
-`mcpCapabilities:{http:true, sse:false}` (no stdio). The bridge reaches them through their **native config**
-instead — which, per the v6 conformance reframe, is the out-of-protocol leak we now **minimize**: claude rides
-the param (in-protocol); codex native is scoped to the `:rw` implementor + **host-side** reviewers (no
-container mount needed — `CODEX_HOME`); kiro is deferred. prism builds the CPG eagerly at startup (~35s cold,
+`mcpCapabilities:{http:true, sse:false}` (no stdio). The bridge reaches codex through its **native config via
+`-c` override args** instead — which, per the v6 conformance reframe, is the out-of-protocol leak we now
+**minimize**: claude rides the param (in-protocol); codex native is scoped to the `:rw` implementor + **host-side**
+reviewers (probe-proven, no file, real `~/.codex` auth preserved); kiro is deferred. prism builds the CPG eagerly at startup (~35s cold,
 blocking the handshake → "still connecting"), so a **`--cache-dir`** (host dir or named volume; warm ~1.3s) is
 mandatory. prism runs as a linux/arm64 glibc binary in the reader image (container) or directly on the host.
 
@@ -61,8 +61,8 @@ of three channels its (kind, containment, cmd) dictates, `{cwd}`-correct for the
 | channel | agent / role | how prism is delivered | `{cwd}` source |
 |---|---|---|---|
 | **acp** | claude, any role | ACP `mcpServers` param → `McpServer::Stdio`, re-sent per `session/new` | `cwd_for_mint` (per-session) |
-| **codex_native (container)** | codex **implementor** (`kind=container_rw`, `:rw`) | rendered `config.toml` placed via `CODEX_HOME` (env+file) into the container at `container_rw_cfg_from_entry` | the implement clone (one repo / run) |
-| **codex_native (host)** | codex **reviewer / design / clean-room**, host-side (sandbox bypassed) | rendered `config.toml` in a per-invocation `CODEX_HOME` dir, env-injected into the host process | the review target (`--session-cwd`) |
+| **codex_native (container)** | codex **implementor** (`kind=container_rw`, `:rw`) | `-c mcp_servers.*` override args appended to the container's codex-acp argv (`container_rw_cfg_from_entry`) | the implement clone (one repo / run) |
+| **codex_native (host)** | codex **reviewer / design / clean-room**, host-side (sandbox bypassed) | `-c mcp_servers.*` override args appended to the host codex-acp argv; real `~/.codex` (auth) | the review target (`--session-cwd`) |
 
 claude is fully in-protocol (zero throwaway). codex native is the accepted-bridge code (prism is evaluating HTTP,
 which would replace it). kiro is deferred. **No egress change** — prism is a local subprocess (in the `:rw`
@@ -83,21 +83,30 @@ workflows are re-run with prism available. kiro and `serve`-multi-repo are expli
         ├─ Acp           → at session/new: new_session_request(cwd_for_mint,&mcp) → McpServer::Stdio
         │                  (claude; {cwd}-subst per session; correct everywhere incl. serve)
         │
-        └─ CodexNative   → render config.toml ({cwd}-subst) into a per-invocation CODEX_HOME dir, then:
-              ├─ host  (reviewer/design, sandbox bypassed) → set CODEX_HOME in the host child's env
-              └─ :rw   (implementor)                       → place under CODEX_HOME inside the container
+        └─ CodexNative   → render `-c mcp_servers.<name>.{command,args,startup_timeout_sec}=…` OVERRIDE
+                           args ({cwd}-subst), APPENDED to codex-acp's argv. (PROBE-PROVEN, v6.1.)
+              ├─ host (reviewer/design, sandbox bypassed) → argv of the host child; real ~/.codex (AUTH)
+              └─ :rw  (implementor)                        → argv of codex-acp inside the container
                         cwd = resolve_static_session_cwd(entry…) — ONE source, stamped per invocation
         ▼
-   codex spawns prism-mcp as a local subprocess (no network); cache via --cache-dir
+   codex spawns prism-mcp as a local subprocess (no network); WARM --cache-dir mandatory (cold build
+   ~35s > the 30s handshake_timeout → pre-warm or bump the timeout)
 ```
+
+**Why `-c` args, not `CODEX_HOME`/a config file (probe finding, supersedes the v6 CODEX_HOME plan).** Pointing
+`CODEX_HOME` at a fresh dir **orphans codex's auth** (`~/.codex/auth.json`) → codex stalls on bootstrap and the
+ACP handshake times out. The `-c mcp_servers.*` overrides instead let codex use the **real `~/.codex` (auth +
+the user's own config)** and merely *add* prism — **no config file written, no clobber, no `CODEX_HOME`**. This
+also dissolves review BLOCKER 3 (there is no host file to own/lifetime/clean up) and unifies host + container
+(both just append args to the codex-acp argv; `acp_program_argv` is the single injection point).
 
 **Delivery on the domain type (review BLOCKER 2).** `AgentEntry` carries `mcp_delivery: McpDelivery
 { Acp, CodexNative }`, resolved at config build from `cmd` (basename match: `claude-agent-acp`→`Acp`;
 `codex-acp`→`CodexNative`) with an explicit `[[agents]].mcp_delivery` override; an unknown cmd carrying
 `[[agents.mcp]]` with no override is a config error. The spawn branches on this enum — `AcpConfig.mcp` is
-populated **only** for `Acp` deliveries; `CodexNative` renders a config + injects `CODEX_HOME` and leaves
-`AcpConfig.mcp` empty. (No more "thread `entry.mcp` into every `AcpConfig`" — that v4 line handed MCP to agents
-that ignore the param.)
+populated **only** for `Acp` deliveries; `CodexNative` appends `-c mcp_servers.*` args to the codex-acp argv and
+leaves `AcpConfig.mcp` empty. (No more "thread `entry.mcp` into every `AcpConfig`" — that v4 line handed MCP to
+agents that ignore the param.)
 
 **One cwd, one source of truth (review MAJOR 4).** The native render's `{cwd}` and the agent's ACP session cwd
 must be the same value, or prism indexes repo A while codex edits repo B (silent wrong-answer). Both derive from
@@ -108,12 +117,12 @@ per-invocation snapshot, so they **stamp the invocation cwd (`--session-cwd` / c
 (no per-invocation snapshot), `CodexNative` resolves to the static `entry.cwd`; a `CodexNative` agent under serve
 with neither `session_cwd` nor `cwd` set is a **config error** (review MINOR 9 — else `{cwd}`→`.`→ the wrong dir).
 
-**Host-config lifetime (review BLOCKER 3).** The rendered `config.toml` lives in a **per-invocation, bridge-owned
-`CODEX_HOME` dir** (named by the run id + agent), never the user's real `~/.codex`, and is cleaned up at
-teardown. `CODEX_HOME` isolation means concurrent host codex agents can't collide on a shared file (the v4
-"overwrite `/root/.codex/config.toml`" hazard is gone). The container path mounts/places the same rendered file
-under the container's `CODEX_HOME`; the rendered `[mcp_servers.<name>]` carries the required
-`startup_timeout_sec` (probe-proven) and the `--cache-dir`.
+**No host config file (review BLOCKER 3 — dissolved by the `-c`-args mechanism).** The v6.1 probe finding
+eliminates the rendered file entirely: prism rides codex-acp's **argv** as `-c mcp_servers.*` overrides, so there
+is **no host file to own, version, or clean up**, and concurrent host codex agents can't collide on a shared
+config (each has its own argv). codex reads its **real `~/.codex`** for auth + the user's own config; the `-c`
+args merely add prism (carrying the required `startup_timeout_sec` + `--cache-dir`). The cache itself is a shared
+`--cache-dir` (a host dir or named volume) and is safe to share read-mostly across agents.
 
 ## Containerization bypass for `:ro` reader agents (the host-side reviewers)
 
@@ -156,17 +165,19 @@ non-empty + unique (case-sensitive); empty env value allowed. `{cwd}` substituti
 values. (Scanner: left→right, each `{` must open `{cwd}`; unterminated/other `{…}` → error. JSON/literal
 braces unsupported in v1.)
 
-## Native-config rendering (the bridge-code surface — codex only in v6)
+## Native rendering (the bridge-code surface — codex `-c` args, v6.1)
 
 One small, total renderer:
-- **`render_codex_config(&[McpServerSpec], cwd) -> String`** → `[mcp_servers.<name>]\ncommand=…\nargs=[…]\n
-  […env…]\nstartup_timeout_sec = 120` (the probe proved `startup_timeout_sec` is REQUIRED). Serialized via `toml`
-  to avoid escaping bugs; unit-tested against golden text + a `toml` round-trip.
+- **`render_codex_mcp_args(&[McpServerSpec], cwd) -> Vec<String>`** → the codex override pairs, one `-c key=val`
+  per setting, TOML-valued:
+  `-c mcp_servers.<name>.command="…"`, `-c mcp_servers.<name>.args=["…", "{cwd}→repo", …]`,
+  `-c mcp_servers.<name>.env.<K>="…"`, `-c mcp_servers.<name>.startup_timeout_sec=120` (the probe proved the
+  timeout is REQUIRED). `{cwd}`-substituted; unit-tested against golden argv.
 
-The bridge writes the rendered `config.toml` into a **per-invocation, bridge-owned `CODEX_HOME` dir** (named by
-run id + agent) and makes codex read it by setting **`CODEX_HOME`** — env-injected into the host child (reviewer)
-or placed under the container's `CODEX_HOME` (implementor). Never the user's real `~/.codex`. (kiro's
-`render_kiro_json` + its native path are **deferred** with the kiro agent.)
+These args are **appended to codex-acp's argv** at `acp_program_argv` (host) / the container argv (implementor) —
+the single injection point for both. **No file is written**; codex reads its real `~/.codex` (auth + user config)
+and the `-c` overrides just add prism. (kiro's native path — a `settings/mcp.json` or its own `-c` equivalent —
+is **deferred** with the kiro agent.)
 
 ## Components & file boundaries
 
@@ -175,25 +186,25 @@ or placed under the container's `CODEX_HOME` (implementor). Never the user's rea
 | `crates/bridge-core/src/domain.rs` + `src/mcp.rs` | `McpServerSpec{name,command,args,env}` + `AgentEntry.mcp` + **`AgentEntry.mcp_delivery: McpDelivery{Acp,CodexNative}`** + pure `validate_cwd_template`/`substitute_cwd` (SDK-free). |
 | `bin/a2a-bridge/src/config.rs` | `[[agents.mcp]]` (`McpToml`/`EnvToml`) + validation; `mcp_delivery` parse + basename auto-detect + unknown-cmd error; **`[agents.sandbox] enabled=false`** (explicit containerization opt-out); the `AgentEntry` build (`:637`) incl. stamping the resolved delivery. |
 | `crates/bridge-acp/src/acp_backend.rs` | `AcpConfig.mcp` + `new_session_request(cwd,&mcp)` → `McpServer::Stdio` ({cwd}-subst); wire-golden. **Acp delivery only**; populated solely for `McpDelivery::Acp`. |
-| **NEW** `bin/a2a-bridge/src/mcp_native.rs` | pure `render_codex_config(&[McpServerSpec], cwd) -> String` + golden tests; a helper that writes it into a per-invocation `CODEX_HOME` dir and returns the dir + an env pair. |
-| `bin/a2a-bridge/src/main.rs` (`acp_spawn_inputs`) | host-side `CodexNative`: render → `CODEX_HOME` dir → inject the env into the host child's spawn. Covers BOTH Acp arms (make_spawn_fn + serve) via the shared helper. claude (`Acp`) → `AcpConfig.mcp`. cwd = `resolve_static_session_cwd(entry…)` (stamped per invocation). |
-| `bin/a2a-bridge/src/main.rs` (`container_rw_cfg_from_entry`) + `crates/bridge-container/src/lib.rs` | `:rw` implementor `CodexNative`: render → place under the container's `CODEX_HOME`; thread the clone cwd in (the helper currently takes no cwd — add it). Covers all 3 ContainerRw sites (make_spawn_fn, build_warm_impl, serve). |
+| **NEW** `bin/a2a-bridge/src/mcp_native.rs` | pure `render_codex_mcp_args(&[McpServerSpec], cwd) -> Vec<String>` (the `-c mcp_servers.*` override pairs, `{cwd}`-subst) + golden-argv tests. No file I/O. |
+| `bin/a2a-bridge/src/main.rs` (`acp_program_argv` / `acp_spawn_inputs`) | `CodexNative`: append `render_codex_mcp_args(entry.mcp, cwd)` to codex-acp's argv. Single injection point — covers host (no-sandbox) AND the `:ro` container path; both Acp arms (make_spawn_fn + serve) via the shared builder. claude (`Acp`) → `AcpConfig.mcp`. cwd = `resolve_static_session_cwd(entry…)` (stamped per invocation). |
+| `bin/a2a-bridge/src/main.rs` (`container_rw_cfg_from_entry`) | `:rw` implementor `CodexNative`: append the same `-c` args to `ContainerRwConfig.args`; thread the clone cwd in (the helper currently takes no cwd — add it). Covers all 3 ContainerRw sites (make_spawn_fn, build_warm_impl, serve). |
 | run-workflow/implement snapshot build | **stamp the invocation cwd** (`--session-cwd` / clone) into the fresh snapshot's `entry.session_cwd` so the existing resolution feeds both the ACP session and the native render (MAJOR 4). |
 | `examples/a2a-bridge.workflows.toml` (host reviewers) + `…containerized.toml` (impl) | wire prism: claude `[[agents.mcp]]` (acp) + host codex `[[agents.mcp]]` (CodexNative, no sandbox) in the review/design workflows; the `:rw` codex implementor `[[agents.mcp]]`. Host + container `--cache-dir`. |
-| docs | the 3-channel matrix, the host-bypass trade, the CODEX_HOME mechanism, build-prism-for-linux, the cache requirement, egress note. |
+| docs | the 3-channel matrix, the host-bypass trade, the `-c`-args mechanism (+ real-`~/.codex` auth), build-prism-for-host+linux, the warm-cache requirement, egress note. |
 
 ## Testing strategy
 
 - pure: `validate_cwd_template`/`substitute_cwd`; `McpToml` validation (unique names, `{cwd}`-only, no-brace
   command, env keys); `mcp_delivery` basename auto-detect + unknown-cmd error + the serve `CodexNative`-without-cwd
   config error.
-- renderer: `render_codex_config` golden text with `{cwd}` substituted + `startup_timeout_sec` present; the
-  rendered toml round-trips through a `toml` parse.
+- renderer: `render_codex_mcp_args` golden argv with `{cwd}` substituted + `startup_timeout_sec` present + the
+  `args` array TOML-encoded correctly (escaping).
 - acp wire-golden: `mcpServers` populated for `McpDelivery::Acp` (env + two servers, `{cwd}`-subst) and **empty
   for `CodexNative`** (the param must NOT carry MCP for codex).
-- delivery branch: `acp_spawn_inputs` for a `CodexNative` host agent renders a `CODEX_HOME` dir + returns the env
-  pair (no container mount); for an `Acp` agent it does not. `container_rw_cfg_from_entry` for a `CodexNative`
-  implementor places the config under the container `CODEX_HOME` with the threaded clone cwd.
+- delivery branch: `acp_program_argv` for a `CodexNative` agent appends the `-c mcp_servers.*` args (host AND
+  `:ro` container); for an `Acp` agent it does not. `container_rw_cfg_from_entry` for a `CodexNative` implementor
+  appends them to `ContainerRwConfig.args` with the threaded clone cwd.
 - one-cwd: the stamped `entry.session_cwd` is what both the spawn cwd and the render see (no divergence).
 - **Live gate:** (a) a **host codex reviewer/design** agent calls `nav_nodes_at` against `--session-cwd`;
   (b) **claude** via the ACP param against the session repo; (c) the **`:rw` codex implementor** calls a prism
@@ -204,11 +215,11 @@ or placed under the container's `CODEX_HOME` (implementor). Never the user's rea
 1. Domain `McpServerSpec` + `McpDelivery` + `{cwd}` helpers + `AgentEntry.{mcp,mcp_delivery}` (+ mechanical-literal fixes).
 2. `[[agents.mcp]]` + `mcp_delivery` config + validation + `[agents.sandbox] enabled=false`.
 3. **acp delivery** — `AcpConfig.mcp` + `new_session_request(cwd,&mcp)` + wire-golden (claude). Un-gates claude prism.
-4. **codex renderer** — `render_codex_config` + the `CODEX_HOME`-dir writer (pure + golden).
-5. **host CodexNative** — `acp_spawn_inputs` renders + env-injects `CODEX_HOME` for a host (no-sandbox) codex
-   agent; stamp the invocation cwd into the snapshot. **Un-gates the dogfood host reviewers** (fastest path).
-6. **:rw CodexNative** — thread the clone cwd into `container_rw_cfg_from_entry` + place the config under the
-   container `CODEX_HOME`. Un-gates the codex implementor.
+4. **codex renderer** — `render_codex_mcp_args(&[McpServerSpec], cwd) -> Vec<String>` (pure + golden argv).
+5. **host CodexNative** — append the `-c` args at `acp_program_argv` for a host (no-sandbox) codex agent; stamp
+   the invocation cwd into the snapshot. **Un-gates the dogfood host reviewers** (fastest path; probe-proven).
+6. **:rw CodexNative** — thread the clone cwd into `container_rw_cfg_from_entry` + append the same `-c` args to
+   `ContainerRwConfig.args`. Un-gates the codex implementor.
 7. Reference configs (host review/design + impl) + docs; live gate (a–d) + ADR-0028.
 
 ## Risks
@@ -219,9 +230,13 @@ or placed under the container's `CODEX_HOME` (implementor). Never the user's rea
   use; **documented**, opt-in per agent; keep `:ro` for untrusted repos.
 - **prism cold-start** — mandatory `--cache-dir` (host dir or named volume); document the first-build cost.
 - **codex `startup_timeout_sec`** — REQUIRED in the rendered toml (probe-proven).
-- **`CODEX_HOME` support** — relies on codex honoring `CODEX_HOME`; the live gate (a/c) catches drift. The
-  `command` path must resolve in the agent's namespace (host path for host codex; mounted path for the `:rw`
-  container) — `command`≠path surfaces as "tool unavailable"; docs spell out symptom→cause.
+- **codex `-c` override support** — relies on codex honoring `-c mcp_servers.*` (probe-proven on the host;
+  re-verify in-container for the implementor). The `command` path must resolve in the agent's namespace (host
+  path for host codex; mounted path for the `:rw` container) — `command`≠path surfaces as "tool unavailable";
+  docs spell out symptom→cause.
+- **Warm cache is load-bearing** — a cold CPG build (~35s) exceeds the 30s `handshake_timeout` → AgentCrashed.
+  Pre-warm `--cache-dir` (run prism once over the repo) before first use, or raise `handshake_timeout` for
+  MCP-enabled agents. (`DEFAULT_HANDSHAKE_TIMEOUT = 30s`, `acp_backend.rs:48`.)
 
 ## Deferred
 
@@ -242,7 +257,9 @@ the param is the conformant all-3-agent + api-capable path → handed to prism; 
 throwaway bridge); a **§probe** sub-section (claude=acp stdio; codex/kiro advertise `mcpCapabilities:{http:true,
 sse:false}` — http-via-param *unproven*; the cache + `startup_timeout_sec` findings); a **§host-bypass**
 sub-section (the `:ro`→host reviewer opt-out, the `:ro`-becomes-prompt-only + no-egress trade, accepted for
-own-codebase use, `CODEX_HOME` isolation); and **§one-cwd** (stamp the invocation cwd into the per-invocation
+own-codebase use); a **§mechanism** sub-section (codex `-c mcp_servers.*` override args, NOT `CODEX_HOME` — a
+fresh `CODEX_HOME` orphans `~/.codex/auth.json` → handshake stall; `-c` keeps real auth, no file, no clobber;
+warm `--cache-dir` mandatory vs the 30s handshake); and **§one-cwd** (stamp the invocation cwd into the per-invocation
 snapshot's `entry.session_cwd` so the ACP session and the native render never diverge; the v5
 `spawn_cwd_override` was rejected as a second path). The v5 lifecycle finding (once-per-slot `OnceCell` spawn;
 serve single-repo) is retained as the reason native is scoped to per-invocation paths + the implementor clone.
