@@ -146,7 +146,7 @@ config files), and whether its internal sandbox blocks the child spawn:
 | agent | honors ACP `mcpServers`? | spawn sandbox | action |
 |---|---|---|---|
 | claude-agent-acp | expected yes (ACP-native) | none | probe; should work as-is |
-| codex-acp | unknown | bubblewrap (absent from image) | `args=["-c","sandbox_mode=danger-full-access"]` (also fixes review blindness); probe |
+| codex-acp | unknown | bubblewrap (absent from image) | append the quoted `sandbox_mode`/`approval_policy` flags (see config; also fixes review blindness); probe |
 | kiro-cli acp | unknown | unknown | probe; if it ignores the param, fall back to its native config (deferred) |
 
 If an agent ignores the ACP param, the documented fallback is that agent's native MCP config file
