@@ -43,6 +43,10 @@ pub struct ContainerRwConfig {
     /// The inner ACP CLI (e.g. `claude-agent-acp`) — runs contained.
     pub cmd: String,
     pub args: Vec<String>,
+    /// MCP servers for `McpDelivery::CodexNative` — rendered to `-c mcp_servers.*` args and appended
+    /// to the inner codex-acp argv at open (with `{cwd}` = the per-turn `:rw` clone). Empty otherwise.
+    pub mcp: Vec<bridge_core::mcp::McpServerSpec>,
+    pub mcp_delivery: bridge_core::mcp::McpDelivery,
     pub model: Option<String>,
     pub mode: Option<String>,
     pub auth_method: Option<String>,
@@ -217,12 +221,29 @@ impl ContainerRwBackend {
                 Some(repo),
             )
             .to_arg_pairs();
+        // Native codex MCP (ADR-0028): append `-c mcp_servers.*` args to the inner codex-acp argv,
+        // `{cwd}`-substituted with THIS turn's `:rw` clone (identical-path mount → the same path
+        // resolves inside the container). claude/non-codex leave `mcp` empty.
+        let inner_args: Vec<String> = if matches!(
+            self.cfg.mcp_delivery,
+            bridge_core::mcp::McpDelivery::CodexNative
+        ) && !self.cfg.mcp.is_empty()
+        {
+            let mut a = self.cfg.args.clone();
+            a.extend(bridge_core::mcp::render_codex_mcp_args(
+                &self.cfg.mcp,
+                rw_canon.as_str(),
+            ));
+            a
+        } else {
+            self.cfg.args.clone()
+        };
         let (program, argv) = compose_container_rw(
             &self.cfg.sandbox,
             &rw_canon,
             &name,
             &self.cfg.cmd,
-            &self.cfg.args,
+            &inner_args,
             &labels,
         );
         let acp = AcpConfig {
@@ -764,6 +785,8 @@ mod tests {
             },
             cmd: "claude-agent-acp".into(),
             args: vec![],
+            mcp: vec![],
+            mcp_delivery: Default::default(),
             model: None,
             mode: None,
             auth_method: None,
@@ -869,6 +892,47 @@ mod tests {
             argv.iter().any(|a| a == &format!("{canon}:{canon}")),
             "identical-path canonical mount {canon}:{canon} not in {argv:?}"
         );
+        while stream.next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn codex_native_appends_mcp_c_args_with_clone_cwd() {
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let mut cfg = cfg_with_mount(root);
+        cfg.cmd = "codex-acp".into();
+        cfg.mcp_delivery = McpDelivery::CodexNative;
+        cfg.mcp = vec![McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+        let spawn = CountingSpawn::new(false);
+        let (reap, _) = counting_reap();
+        let be = ContainerRwBackend::new_with_hooks(cfg, spawn.clone(), "inst".into(), reap)
+            .await
+            .unwrap();
+        let s = SessionId::parse("s1").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let mut stream = be.prompt(&s, vec![]).await.unwrap();
+        let argv = spawn.last_argv.lock().await.clone();
+        let canon = std::fs::canonicalize(root).unwrap();
+        let canon = canon.to_str().unwrap();
+        assert!(argv.iter().any(|a| a == "-c"), "argv has -c: {argv:?}");
+        assert!(
+            argv.iter()
+                .any(|a| a == r#"mcp_servers.prism.command="/opt/prism""#),
+            "command override present: {argv:?}"
+        );
+        // {cwd} substituted to THIS turn's canonical clone path (identical-path mount).
+        assert!(
+            argv.iter()
+                .any(|a| a == &format!(r#"mcp_servers.prism.args=["--repo", "{canon}"]"#)),
+            "args {{cwd}}->{canon}: {argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a.contains("{cwd}")));
         while stream.next().await.is_some() {}
     }
 

@@ -116,17 +116,32 @@ fn acp_program_argv(
     entry: &AgentEntry,
     container_name: Option<&str>,
     labels: &[(String, String)],
+    mcp_cwd: &str,
 ) -> Result<(String, Vec<String>), BridgeError> {
     let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
         reason: format!("acp agent {} missing cmd", entry.id.as_str()),
     })?;
+    // Native codex MCP delivery (ADR-0028): append `-c mcp_servers.*` override args to the codex-acp
+    // argv ({cwd}-substituted). Applies to BOTH host and `:ro`-container codex (the args ride the
+    // codex-acp command line either way). claude (Acp delivery) gets MCP via the session/new param, not here.
+    let args = if matches!(
+        entry.mcp_delivery,
+        bridge_core::mcp::McpDelivery::CodexNative
+    ) && !entry.mcp.is_empty()
+    {
+        let mut a = entry.args.clone();
+        a.extend(bridge_core::mcp::render_codex_mcp_args(&entry.mcp, mcp_cwd));
+        a
+    } else {
+        entry.args.clone()
+    };
     Ok(match (&entry.sandbox, container_name) {
         // Named (`:ro` reaper) container when the caller supplied a name.
         (Some(sb), Some(name)) => {
-            bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &entry.args, labels)
+            bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &args, labels)
         }
-        (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &entry.args, labels),
-        (None, _) => (cmd.to_string(), entry.args.clone()),
+        (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &args, labels),
+        (None, _) => (cmd.to_string(), args),
     })
 }
 
@@ -170,7 +185,7 @@ fn acp_spawn_inputs(
         }
         None => (None, Vec::new()),
     };
-    let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels)?;
+    let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels, &cwd_str)?;
     let container = ro_name.map(|name| bridge_acp::acp_backend::ContainerReap {
         runtime: entry
             .sandbox
@@ -372,6 +387,8 @@ fn container_rw_cfg_from_entry(
         sandbox: sb,
         cmd,
         args: entry.args.clone(),
+        mcp: entry.mcp.clone(),
+        mcp_delivery: entry.mcp_delivery,
         model: entry.model.clone(),
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
@@ -2971,7 +2988,7 @@ mod cli_tests {
         // raw: program = cmd, argv = args (Slice A compat).
         let raw = acp_entry("a");
         assert_eq!(
-            acp_program_argv(&raw, None, &[]).unwrap(),
+            acp_program_argv(&raw, None, &[], "/cwd").unwrap(),
             ("claude-agent-acp".to_string(), Vec::<String>::new())
         );
         // sandbox: program = runtime (docker), argv wraps the inner cli with the :ro mount.
@@ -2984,19 +3001,52 @@ mod cli_tests {
             egress: EgressPolicy::Open,
             volumes: vec![],
         });
-        let (program, argv) = acp_program_argv(&sb, None, &[]).unwrap();
+        let (program, argv) = acp_program_argv(&sb, None, &[], "/cwd").unwrap();
         assert_eq!(program, "docker");
         assert_eq!(argv.last().unwrap(), "claude-agent-acp");
         assert!(argv.contains(&"/work:/work:ro".to_string()));
         // sandbox + a container name → the `--name` is spliced in (the :ro reaper path).
-        let (_p, named) = acp_program_argv(&sb, Some("a2a-ro-owner-nonce"), &[]).unwrap();
+        let (_p, named) = acp_program_argv(&sb, Some("a2a-ro-owner-nonce"), &[], "/cwd").unwrap();
         assert!(named
             .windows(2)
             .any(|w| w == ["--name", "a2a-ro-owner-nonce"]));
         // missing cmd → ConfigInvalid.
         let mut nocmd = acp_entry("c");
         nocmd.cmd = None;
-        assert!(acp_program_argv(&nocmd, None, &[]).is_err());
+        assert!(acp_program_argv(&nocmd, None, &[], "/cwd").is_err());
+    }
+
+    #[test]
+    fn acp_program_argv_appends_codex_native_mcp_args() {
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+        // A CodexNative-delivery agent gets `-c mcp_servers.*` args appended ({cwd}-substituted);
+        // an Acp-delivery agent (claude) does NOT (it gets MCP via the session/new param).
+        let mut codex = acp_entry("codex");
+        codex.cmd = Some("codex-acp".into());
+        codex.mcp_delivery = McpDelivery::CodexNative;
+        codex.mcp = vec![McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+        let (_p, argv) = acp_program_argv(&codex, None, &[], "/repo/z").unwrap();
+        assert!(argv.iter().any(|a| a == "-c"), "argv has -c: {argv:?}");
+        assert!(
+            argv.iter()
+                .any(|a| a == r#"mcp_servers.prism.command="/opt/prism""#),
+            "command override present: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a.contains("/repo/z")) && !argv.iter().any(|a| a.contains("{cwd}")),
+            "{{cwd}} substituted: {argv:?}"
+        );
+        // Acp delivery (claude) does NOT append -c args here.
+        let mut claude = acp_entry("claude");
+        claude.mcp_delivery = McpDelivery::Acp;
+        claude.mcp = codex.mcp.clone();
+        let (_p, argv) = acp_program_argv(&claude, None, &[], "/repo/z").unwrap();
+        assert!(!argv.iter().any(|a| a == "-c"), "no -c for Acp: {argv:?}");
     }
 
     #[test]

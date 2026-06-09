@@ -230,6 +230,14 @@ pub struct EnvToml {
 
 /// Convert + validate `[[agents.mcp]]` into domain `McpServerSpec`s: non-empty/unique names, a
 /// brace-free `command`, and `{cwd}`-only templating in args/env values (ADR-0028).
+/// A TOML bare key (`A-Za-z0-9_-`, non-empty) — usable unquoted in a dotted `-c mcp_servers.<k>.*`
+/// path. MCP server + env names must satisfy this so the codex `-c` override paths are well-formed.
+fn is_toml_bare_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn build_mcp_specs(
     mcp: &[McpToml],
     agent_id: &str,
@@ -241,6 +249,12 @@ fn build_mcp_specs(
     for m in mcp {
         if m.name.trim().is_empty() {
             return Err(err("mcp.name must be non-empty".into()));
+        }
+        if !is_toml_bare_key(&m.name) {
+            return Err(err(format!(
+                "mcp name {:?} must be a bare key (A-Za-z0-9_-) — it forms a `mcp_servers.<name>` config path",
+                m.name
+            )));
         }
         if !names.insert(m.name.clone()) {
             return Err(err(format!("duplicate mcp name {:?}", m.name)));
@@ -262,6 +276,12 @@ fn build_mcp_specs(
         for e in &m.env {
             if e.name.trim().is_empty() {
                 return Err(err(format!("mcp {:?}: env name must be non-empty", m.name)));
+            }
+            if !is_toml_bare_key(&e.name) {
+                return Err(err(format!(
+                    "mcp {:?}: env name {:?} must be a bare key (A-Za-z0-9_-)",
+                    m.name, e.name
+                )));
             }
             if !env_names.insert(e.name.clone()) {
                 return Err(err(format!(
@@ -1724,5 +1744,87 @@ path = "/tmp/x.db"
             format!("{err:?}").contains("acp|api|container_rw"),
             "got: {err:?}"
         );
+    }
+
+    // ---- MCP (ADR-0028) ----------------------------------------------------
+
+    fn mcp_toml(name: &str, command: &str, args: &[&str]) -> super::McpToml {
+        super::McpToml {
+            name: name.into(),
+            command: command.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: vec![],
+        }
+    }
+
+    #[test]
+    fn mcp_delivery_auto_detects_from_cmd_basename() {
+        use bridge_core::mcp::McpDelivery;
+        let r = |cmd: &str| super::resolve_mcp_delivery(None, Some(cmd), true, "a").unwrap();
+        assert_eq!(r("claude-agent-acp"), McpDelivery::Acp);
+        assert_eq!(r("/usr/bin/codex-acp"), McpDelivery::CodexNative); // path-qualified → basename
+        assert_eq!(r("kiro-cli"), McpDelivery::KiroNative);
+    }
+
+    #[test]
+    fn mcp_delivery_explicit_override_and_invalid() {
+        use bridge_core::mcp::McpDelivery;
+        assert_eq!(
+            super::resolve_mcp_delivery(Some("kiro_native"), Some("codex-acp"), true, "a").unwrap(),
+            McpDelivery::KiroNative
+        );
+        assert!(super::resolve_mcp_delivery(Some("bogus"), None, true, "a").is_err());
+    }
+
+    #[test]
+    fn mcp_delivery_unknown_cmd_errors_only_when_mcp_present() {
+        // With MCP servers + an unrecognized cmd and no override → hard error (don't guess).
+        assert!(super::resolve_mcp_delivery(None, Some("weird-agent"), true, "a").is_err());
+        // No MCP servers → delivery is irrelevant, defaults to Acp (no error).
+        assert_eq!(
+            super::resolve_mcp_delivery(None, Some("weird-agent"), false, "a").unwrap(),
+            bridge_core::mcp::McpDelivery::Acp
+        );
+    }
+
+    #[test]
+    fn build_mcp_specs_accepts_valid_and_substitutes_later() {
+        let specs = super::build_mcp_specs(
+            &[mcp_toml("prism", "/opt/prism", &["--repo", "{cwd}"])],
+            "a",
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "prism");
+        assert_eq!(
+            specs[0].args,
+            vec!["--repo".to_string(), "{cwd}".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_mcp_specs_rejects_bad_inputs() {
+        // duplicate name
+        assert!(
+            super::build_mcp_specs(&[mcp_toml("p", "/a", &[]), mcp_toml("p", "/b", &[])], "a")
+                .is_err()
+        );
+        // brace in command
+        assert!(super::build_mcp_specs(&[mcp_toml("p", "/a/{cwd}", &[])], "a").is_err());
+        // non-{cwd} template in args
+        assert!(super::build_mcp_specs(&[mcp_toml("p", "/a", &["{repo}"])], "a").is_err());
+        // non-bare-key name (dot would break the `-c mcp_servers.<name>` path)
+        assert!(super::build_mcp_specs(&[mcp_toml("p.x", "/a", &[])], "a").is_err());
+        // empty name
+        assert!(super::build_mcp_specs(&[mcp_toml("", "/a", &[])], "a").is_err());
+    }
+
+    #[test]
+    fn is_toml_bare_key_rules() {
+        assert!(super::is_toml_bare_key("prism"));
+        assert!(super::is_toml_bare_key("a-b_9"));
+        assert!(!super::is_toml_bare_key(""));
+        assert!(!super::is_toml_bare_key("a.b"));
+        assert!(!super::is_toml_bare_key("a b"));
     }
 }

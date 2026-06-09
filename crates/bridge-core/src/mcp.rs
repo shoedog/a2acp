@@ -84,6 +84,59 @@ pub fn validate_cwd_template(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// codex silently drops an MCP server whose startup exceeds the default timeout (probe finding on a
+/// cold prism build) — set it high so a warm prism always connects.
+const CODEX_MCP_STARTUP_TIMEOUT_SEC: u32 = 120;
+
+/// A TOML basic-string literal for `s` (double-quoted, with `\`, `"`, newline and tab escaped).
+fn toml_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Render the flattened `-c`/value override pairs that inject `mcp` into codex via the argv
+/// (`McpDelivery::CodexNative`), with `{cwd}` substituted to `cwd`. Appended to the codex-acp argv
+/// host-side and in the `:rw` container alike. Empty input → empty output. Server/env names are
+/// restricted to TOML bare keys at config validation, so the dotted `mcp_servers.<name>.env.<KEY>`
+/// paths are well-formed. codex keeps its real `~/.codex` (auth) — these args only *add* prism (ADR-0028).
+pub fn render_codex_mcp_args(mcp: &[McpServerSpec], cwd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for spec in mcp {
+        let s = spec.substituted(cwd);
+        let p = format!("mcp_servers.{}", s.name);
+        out.push("-c".to_string());
+        out.push(format!("{p}.command={}", toml_str(&s.command)));
+        let args = s
+            .args
+            .iter()
+            .map(|a| toml_str(a))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push("-c".to_string());
+        out.push(format!("{p}.args=[{args}]"));
+        for (k, v) in &s.env {
+            out.push("-c".to_string());
+            out.push(format!("{p}.env.{k}={}", toml_str(v)));
+        }
+        out.push("-c".to_string());
+        out.push(format!(
+            "{p}.startup_timeout_sec={CODEX_MCP_STARTUP_TIMEOUT_SEC}"
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +186,70 @@ mod tests {
     #[test]
     fn mcp_delivery_defaults_to_acp() {
         assert_eq!(McpDelivery::default(), McpDelivery::Acp);
+    }
+
+    fn prism() -> McpServerSpec {
+        McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec![
+                "--repo".into(),
+                "{cwd}".into(),
+                "--cache-dir".into(),
+                "/cache".into(),
+            ],
+            env: vec![("RUST_LOG".into(), "warn".into())],
+        }
+    }
+
+    #[test]
+    fn codex_args_render_flattened_pairs_with_cwd_substituted() {
+        let args = render_codex_mcp_args(&[prism()], "/repo");
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[1], r#"mcp_servers.prism.command="/opt/prism""#);
+        assert_eq!(args[2], "-c");
+        assert_eq!(
+            args[3],
+            r#"mcp_servers.prism.args=["--repo", "/repo", "--cache-dir", "/cache"]"#
+        );
+        assert_eq!(args[4], "-c");
+        assert_eq!(args[5], r#"mcp_servers.prism.env.RUST_LOG="warn""#);
+        assert_eq!(args[6], "-c");
+        assert_eq!(args[7], "mcp_servers.prism.startup_timeout_sec=120");
+        assert_eq!(args.len(), 8);
+        assert!(!args.iter().any(|a| a.contains("{cwd}")));
+    }
+
+    #[test]
+    fn codex_args_empty_in_empty_out() {
+        assert!(render_codex_mcp_args(&[], "/r").is_empty());
+    }
+
+    #[test]
+    fn codex_args_empty_args_renders_empty_toml_array() {
+        let spec = McpServerSpec {
+            name: "x".into(),
+            command: "/x".into(),
+            args: vec![],
+            env: vec![],
+        };
+        assert_eq!(
+            render_codex_mcp_args(&[spec], "/r")[3],
+            "mcp_servers.x.args=[]"
+        );
+    }
+
+    #[test]
+    fn codex_args_escape_quotes_and_backslashes() {
+        let spec = McpServerSpec {
+            name: "x".into(),
+            command: r#"/a/"q"\b"#.into(),
+            args: vec![],
+            env: vec![],
+        };
+        assert_eq!(
+            render_codex_mcp_args(&[spec], "/r")[1],
+            r#"mcp_servers.x.command="/a/\"q\"\\b""#
+        );
     }
 }
