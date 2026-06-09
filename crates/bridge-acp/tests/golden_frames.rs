@@ -62,8 +62,8 @@ fn initialize_request_is_wire_conformant() {
 // exactly it (so a regression to `{}` or a string-typed array is caught here).
 #[test]
 fn new_session_request_params_are_wire_conformant() {
-    // The exact request value `ensure_session` transmits, for an absolute cwd.
-    let req = AcpBackend::new_session_request("/work/dir");
+    // The exact request value `ensure_session` transmits, for an absolute cwd (no MCP servers).
+    let req = AcpBackend::new_session_request("/work/dir", &[]);
     let v: Value = serde_json::to_value(&req).expect("NewSessionRequest serializes");
 
     // Hand-authored expected `params` per ACP §11A: absolute cwd + empty array.
@@ -95,6 +95,48 @@ fn new_session_request_params_are_wire_conformant() {
     );
     // Must NOT be a degenerate empty object — guards the `params: {}` regression.
     assert_ne!(v, serde_json::json!({}), "params must not collapse to {{}}");
+}
+
+// session/new wire-golden WITH MCP servers (ADR-0028): the entry's MCP specs ride `mcpServers` as
+// stdio servers with `{cwd}` substituted to the session repo and env carried. Asserted robustly
+// (count + substitution + env) so it isn't coupled to the SDK enum's exact serde tagging.
+#[test]
+fn new_session_request_includes_substituted_mcp_servers() {
+    use bridge_core::mcp::McpServerSpec;
+    let specs = vec![
+        McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![("RUST_LOG".into(), "warn".into())],
+        },
+        McpServerSpec {
+            name: "two".into(),
+            command: "/bin/two".into(),
+            args: vec![],
+            env: vec![],
+        },
+    ];
+    let req = AcpBackend::new_session_request("/repo/x", &specs);
+    let v: Value = serde_json::to_value(&req).expect("serializes");
+    let servers = v
+        .get("mcpServers")
+        .and_then(Value::as_array)
+        .expect("mcpServers array");
+    assert_eq!(servers.len(), 2, "both MCP servers present: {v:?}");
+    let s = serde_json::to_string(&v).expect("to_string");
+    assert!(s.contains("/repo/x"), "{{cwd}} substituted into args: {s}");
+    assert!(
+        !s.contains("{cwd}"),
+        "no literal {{cwd}} token remains: {s}"
+    );
+    assert!(
+        s.contains("prism") && s.contains("RUST_LOG") && s.contains("warn"),
+        "server name + env name/value present: {s}"
+    );
+    // Empty input still yields an explicit empty array (the no-MCP path).
+    let empty = serde_json::to_value(AcpBackend::new_session_request("/r", &[])).unwrap();
+    assert_eq!(empty.get("mcpServers").unwrap(), &serde_json::json!([]));
 }
 
 // session/prompt wire-golden (ACP §11A). The bridge must send the prompt body

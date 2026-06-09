@@ -197,8 +197,123 @@ pub struct AgentEntryToml {
     pub tags: Vec<String>,
     #[serde(default)]
     pub version: Option<String>,
+    /// `[[agents.mcp]]` — MCP servers to offer this agent (ADR-0028). Converted + validated in `into_snapshot`.
+    #[serde(default)]
+    pub mcp: Vec<McpToml>,
+    /// Override the auto-detected MCP delivery channel: `acp` | `codex_native` | `kiro_native`.
+    #[serde(default)]
+    pub mcp_delivery: Option<String>,
     #[serde(default)]
     pub extensions: BTreeMap<String, toml::Value>,
+}
+
+/// `[[agents.mcp]]` — one MCP server offered to an agent. `args`/`env` values may contain `{cwd}`
+/// (the session repo); `command` must be a literal path (no `{...}`).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpToml {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<EnvToml>,
+}
+
+/// `[[agents.mcp.env]]` — a name/value env pair for an MCP server (value may contain `{cwd}`).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvToml {
+    pub name: String,
+    pub value: String,
+}
+
+/// Convert + validate `[[agents.mcp]]` into domain `McpServerSpec`s: non-empty/unique names, a
+/// brace-free `command`, and `{cwd}`-only templating in args/env values (ADR-0028).
+fn build_mcp_specs(
+    mcp: &[McpToml],
+    agent_id: &str,
+) -> Result<Vec<bridge_core::mcp::McpServerSpec>, ConfigError> {
+    use bridge_core::mcp::{validate_cwd_template, McpServerSpec};
+    let err = |m: String| ConfigError::Registry(format!("agent {agent_id:?}: {m}"));
+    let mut names = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(mcp.len());
+    for m in mcp {
+        if m.name.trim().is_empty() {
+            return Err(err("mcp.name must be non-empty".into()));
+        }
+        if !names.insert(m.name.clone()) {
+            return Err(err(format!("duplicate mcp name {:?}", m.name)));
+        }
+        if m.command.trim().is_empty() {
+            return Err(err(format!("mcp {:?}: command must be non-empty", m.name)));
+        }
+        if m.command.contains('{') || m.command.contains('}') {
+            return Err(err(format!(
+                "mcp {:?}: command must be a literal path (no `{{...}}`)",
+                m.name
+            )));
+        }
+        for a in &m.args {
+            validate_cwd_template(a).map_err(|e| err(format!("mcp {:?} arg: {e}", m.name)))?;
+        }
+        let mut env_names = std::collections::HashSet::new();
+        let mut env = Vec::with_capacity(m.env.len());
+        for e in &m.env {
+            if e.name.trim().is_empty() {
+                return Err(err(format!("mcp {:?}: env name must be non-empty", m.name)));
+            }
+            if !env_names.insert(e.name.clone()) {
+                return Err(err(format!(
+                    "mcp {:?}: duplicate env name {:?}",
+                    m.name, e.name
+                )));
+            }
+            validate_cwd_template(&e.value)
+                .map_err(|x| err(format!("mcp {:?} env {:?}: {x}", m.name, e.name)))?;
+            env.push((e.name.clone(), e.value.clone()));
+        }
+        out.push(McpServerSpec {
+            name: m.name.clone(),
+            command: m.command.clone(),
+            args: m.args.clone(),
+            env,
+        });
+    }
+    Ok(out)
+}
+
+/// Resolve the MCP delivery channel: explicit `mcp_delivery` override wins; else auto-detect from the
+/// `cmd` basename. Only required when the agent actually has MCP servers (`has_mcp`).
+fn resolve_mcp_delivery(
+    explicit: Option<&str>,
+    cmd: Option<&str>,
+    has_mcp: bool,
+    agent_id: &str,
+) -> Result<bridge_core::mcp::McpDelivery, ConfigError> {
+    use bridge_core::mcp::McpDelivery;
+    if let Some(s) = explicit {
+        return match s {
+            "acp" => Ok(McpDelivery::Acp),
+            "codex_native" => Ok(McpDelivery::CodexNative),
+            "kiro_native" => Ok(McpDelivery::KiroNative),
+            other => Err(ConfigError::Registry(format!(
+                "agent {agent_id:?}: invalid mcp_delivery {other:?} (acp|codex_native|kiro_native)"
+            ))),
+        };
+    }
+    let base = cmd
+        .and_then(|c| std::path::Path::new(c).file_name())
+        .and_then(|s| s.to_str());
+    match base {
+        Some("claude-agent-acp") => Ok(McpDelivery::Acp),
+        Some("codex-acp") => Ok(McpDelivery::CodexNative),
+        Some("kiro-cli") => Ok(McpDelivery::KiroNative),
+        _ if has_mcp => Err(ConfigError::Registry(format!(
+            "agent {agent_id:?}: cannot auto-detect mcp_delivery from cmd {cmd:?}; set mcp_delivery explicitly"
+        ))),
+        _ => Ok(McpDelivery::Acp),
+    }
 }
 
 /// `[agents.sandbox]` TOML mirror. Flat for ergonomics; converted to the typed (data-carrying)
@@ -634,6 +749,15 @@ impl RegistryConfig {
                     })
                 }
             };
+            // MCP servers + delivery channel (ADR-0028). Validate {cwd} templating; resolve the
+            // delivery from cmd basename (override via `mcp_delivery`).
+            let mcp = build_mcp_specs(&a.mcp, id.as_str())?;
+            let mcp_delivery = resolve_mcp_delivery(
+                a.mcp_delivery.as_deref(),
+                a.cmd.as_deref(),
+                !mcp.is_empty(),
+                id.as_str(),
+            )?;
             entries.push(AgentEntry {
                 id,
                 cmd: a.cmd,
@@ -648,6 +772,8 @@ impl RegistryConfig {
                 cwd: a.cwd,
                 session_cwd: a.session_cwd,
                 sandbox,
+                mcp,
+                mcp_delivery,
                 auth_method: a.auth_method,
                 name: a.name,
                 description: a.description,

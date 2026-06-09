@@ -55,6 +55,8 @@ fn minimal_entry(id: &AgentId) -> AgentEntry {
         description: None,
         tags: vec![],
         version: None,
+        mcp: vec![],
+        mcp_delivery: Default::default(),
         extensions: Default::default(),
     }
 }

@@ -234,6 +234,9 @@ impl ContainerRwBackend {
             cancel_grace: self.cfg.cancel_grace,
             // :rw has its own reaper (this crate); the inner AcpBackend's :ro reaper stays off.
             container: None,
+            // Codex implementor MCP rides the container's codex-acp argv (`-c` args), NOT the ACP
+            // `mcpServers` param — so the inner backend's ACP-param MCP list stays empty (ADR-0028).
+            mcp: Vec::new(),
         };
         let inner = match self.spawn.spawn(&program, &argv, acp).await {
             Ok(i) => i,

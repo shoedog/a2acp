@@ -407,6 +407,8 @@ mod tests {
             description: None,
             tags: vec![],
             version: None,
+            mcp: vec![],
+            mcp_delivery: Default::default(),
             extensions: Default::default(),
         }
     }

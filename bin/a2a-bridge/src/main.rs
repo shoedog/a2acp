@@ -186,6 +186,13 @@ fn acp_spawn_inputs(
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
         container,
+        // ACP-param MCP delivery (claude): the entry's MCP servers ride `session/new`. Codex/kiro
+        // native delivery leaves this empty (they get MCP via their native channel, not the param).
+        mcp: if matches!(entry.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
+            entry.mcp.clone()
+        } else {
+            Vec::new()
+        },
         ..bridge_acp::acp_backend::AcpConfig::default()
     };
     Ok((program, argv, acp))
@@ -2947,6 +2954,8 @@ mod cli_tests {
             cwd: None,
             session_cwd: None,
             sandbox: None,
+            mcp: vec![],
+            mcp_delivery: Default::default(),
             auth_method: None,
             name: None,
             description: None,

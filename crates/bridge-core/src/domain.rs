@@ -108,6 +108,11 @@ pub struct AgentEntry {
     pub session_cwd: Option<String>,
     /// The enforced `[sandbox]` block (B1): how to containerize this agent. `None` = raw `cmd`/`args`.
     pub sandbox: Option<SandboxConfig>,
+    /// MCP servers to offer this agent (ADR-0028). Empty = none. Delivered via [`Self::mcp_delivery`].
+    pub mcp: Vec<crate::mcp::McpServerSpec>,
+    /// Which channel delivers `mcp` to this agent (resolved at config build from `cmd`). Irrelevant
+    /// when `mcp` is empty; defaults to `Acp`.
+    pub mcp_delivery: crate::mcp::McpDelivery,
     pub auth_method: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -314,6 +319,8 @@ mod tests {
             description: None,
             tags: vec![],
             version: None,
+            mcp: vec![],
+            mcp_delivery: Default::default(),
             extensions: Default::default(),
         };
         assert!(e.cmd.is_none());
@@ -342,6 +349,8 @@ mod tests {
             description: None,
             tags: vec![],
             version: None,
+            mcp: vec![],
+            mcp_delivery: Default::default(),
             extensions: Default::default(),
         };
         assert_eq!(e.kind, AgentKind::Acp);
@@ -368,6 +377,8 @@ mod tests {
             description: None,
             tags: vec![],
             version: None,
+            mcp: vec![],
+            mcp_delivery: Default::default(),
             extensions: Default::default(),
         };
         let ov = AgentOverride {

@@ -473,6 +473,8 @@ mod tests {
             description: None,
             tags: vec![],
             version: None,
+            mcp: vec![],
+            mcp_delivery: Default::default(),
             extensions: BTreeMap::new(),
         }
     }
@@ -528,6 +530,8 @@ mod tests {
                 description: None,
                 tags: vec![],
                 version: None,
+                mcp: vec![],
+                mcp_delivery: Default::default(),
                 extensions: Default::default(),
             }],
             allowed_cmds: vec![],

@@ -1,0 +1,345 @@
+# Containerized :ro readers (claude + codex + kiro) behind the egress lock, + the non-process ollama.
+# Run:  a2a-bridge serve --config examples/a2a-bridge.containerized.toml   (from the repo root)
+# Prereqs (see docs/containerized-agents.md):
+#   - docker compose -f deploy/containers/compose.egress.yaml up -d --build
+#   - the reader image built (deploy/containers/reader.Containerfile)
+#   - per-agent creds: WRITABLE single-file copies in ~/.config/a2a-creds/{claude,codex}, and a
+#     one-time `kiro-cli login --use-device-flow` into the `a2a-kiro-data` volume.
+#
+# MUST-FIX (dual-review): allowed_cwd_root is OPT-IN and MUST equal the mount root, or readers ship
+# with NO cwd gate. Identical-path :ro mount makes the session/new cwd resolve inside the container.
+
+default = "claude"
+
+allowed_cwd_root = "/Users/wesleyjinks/code"
+
+# B2b-3a: the review-the-diff run after `implement` commits + verifies. Two folded reviewers (codex+claude)
+# review `git diff base..HEAD` in the clone (read-only nav tools) -> a synth emits VERDICT: APPROVE|REJECT,
+# surfaced in the hand-off. ADVISORY (the operator accepts at merge). Absent -> skipped.
+[review]
+workflow = "implement-review"
+timeout_secs = 900   # 15 min: 300s was too tight for the 2-lens diff review (it timed out on Task 1 attempt-2)
+
+# B2b-3b: the review->tweak loop. After the first commit, the bridge runs verify+review each attempt; on a
+# verify-FAIL or review-REJECT it re-prompts the `impl` agent (the `implement-fix` workflow) to fix on the
+# SAME clone, then AMENDs the fix into the single commit. Bounded by max_attempts (commit turns: the initial
+# commit + up to max_attempts-1 fix amends). Advisory -> the operator still accepts at merge. Absent -> 3.
+[implement]
+max_attempts = 3
+fix_workflow = "implement-fix"
+
+# B2b-2: the build+test verify run after `a2a-bridge implement` commits. Bridge-deterministic (the
+# agent can't fake it), REPORTED not gating. Separate egress (registries only; NO creds) so creds and
+# registry-egress never coexist. Coverage is opt-in (commented) — it can't reuse the warm non-instrumented
+# cache. Default gates are fmt/clippy/build/test, all --locked against the :ro clone.
+[verify]
+image    = "a2a-toolchain:latest"
+cache    = "a2a-verify-cache"                  # per-repo: the bridge appends a hash of the source path
+egress   = "locked"
+network  = "a2a-verify-egress"
+proxy    = "http://a2a-verify-proxy:8888"
+# NO_PROXY=localhost so `cargo test`'s local HTTP servers (wiremock etc.) aren't hijacked by the cargo-
+# fetch proxy. Without it, any test that binds 127.0.0.1 spuriously fails verify (live-gate finding).
+no_proxy = "localhost,127.0.0.1"
+# SLICING repo verify gates. No clippy gate: this repo is not clippy-`-D warnings` clean, and gating on
+# it would send the fix loop chasing pre-existing warnings. fmt + build + full test suite is the contract.
+[[verify.commands]]
+name = "fmt"
+cmd  = "cargo fmt --all -- --check"
+[[verify.commands]]
+name = "build"
+cmd  = "cargo build --locked"
+[[verify.commands]]
+name = "test"
+cmd  = "cargo test --locked"
+# opt-in coverage (instrumented recompile; reported, never gates):
+# [[verify.commands]]
+# name = "coverage"
+# cmd  = "cargo llvm-cov --workspace --locked --summary-only"
+# gate = false
+
+[registry]
+# The spawned program is `docker`; validate() requires it allowlisted (also defaults to the union of
+# entry cmds, but state it explicitly as a tightening).
+allowed_cmds = ["docker"]
+
+[server]
+addr = "127.0.0.1:8080"
+
+# ── claude: the proven containerized agent (ADR-0013). Default + first to validate. ──
+[[agents]]
+id  = "claude"
+cmd = "claude-agent-acp"
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"            # == allowed_cwd_root (S2)
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json"]
+
+# ── codex: gpt-5.5 (auth + openai egress validated in-container). ──
+[[agents]]
+id  = "codex"
+cmd = "codex-acp"
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
+
+# ── kiro: Linux build baked into the image. VERIFIED: Linux auth is ~/.local/share/kiro-cli/data.sqlite3
+#    (NOT ~/.aws); minted once via `kiro-cli login --use-device-flow` into the a2a-kiro-data volume. ──
+[[agents]]
+id   = "kiro"
+cmd  = "kiro-cli"
+args = ["acp"]
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["a2a-kiro-data:/root/.local/share"]
+
+# ── impl: WRITE-capable containerized agent (kind="container_rw" PERMITS access="rw"). Under `implement`
+#    it runs WARM (one container + one ACP session across the edit+fix turns, reaped at the end — ADR-0024);
+#    under `serve`/`run-workflow` it's per-turn. The :rw mount is the per-request session cwd (a per-task
+#    git clone) under allowed_cwd_root, canonicalized + is_under-gated.
+#    DEFAULT IMPLEMENTOR = codex (gpt-5.5, effort=high). `sandbox_mode=danger-full-access` disables codex's
+#    OWN bubblewrap sandbox (absent from the image) so it can edit the :rw clone — the Docker container IS
+#    the sandbox. effort=high is now honored by the warm session (the ADR-0024 effective_config fold).
+#    To use claude instead: cmd="claude-agent-acp", drop the codex args, and mount the claude creds.
+[[agents]]
+id     = "impl"
+kind   = "container_rw"
+cmd    = "codex-acp"
+effort = "high"
+args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+[agents.sandbox]
+image   = "a2a-toolchain:latest"               # B2b-2: toolchain so the agent (and verify) has cargo
+mount   = "/Users/wesleyjinks/code"            # == allowed_cwd_root (S2); :rw target is the session cwd under it
+access  = "rw"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
+
+# ── ollama: non-process api agent (kind="api"). Uncontainerized by design — no mount/proxy/creds.
+#    NOT tool-free — it advertises a deterministic side-effect-free stub tool (no fs/shell).
+#    Local => no remote egress (a cloud base_url would egress host-direct, bypassing the proxy). ──
+[[agents]]
+id          = "ollama"
+kind        = "api"
+base_url    = "http://localhost:11434/v1"
+api_key_env = "OLLAMA_API_KEY"
+model       = "qwen2.5-coder:7b"
+
+# ── ollama-cloud: same api backend, ollama's hosted models. base_url is host-direct egress
+#    (ollama.com), bypassing the container egress proxy — fine: this is the BRIDGE calling out
+#    (non-process), not a contained agent. ──
+[[agents]]
+id          = "ollama-cloud"
+kind        = "api"
+base_url    = "https://ollama.com/v1"
+api_key_env = "OLLAMA_API_KEY"
+model       = "qwen3-coder:480b"
+
+# ── Review/design workflows (single-pass here; Phase D restructures design/spec/plan into two-pass) ──
+[[workflows]]
+id = "code-review"
+[[workflows.nodes]]
+id = "correctness"
+agent = "codex"
+prompt_file = "../prompts/review-correctness.md"
+inputs = []
+[[workflows.nodes]]
+id = "architecture"
+agent = "codex"
+prompt_file = "../prompts/review-architecture.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "codex"
+prompt_file = "../prompts/review-synth.md"
+inputs = ["correctness", "architecture"]
+
+# ── implement-review (B2b-3a): two folded reviewers of the committed diff → synth verdict. Driven by
+#    `a2a-bridge implement` after the commit + verify (via the [review] block above). ──
+[[workflows]]
+id = "implement-review"
+[[workflows.nodes]]
+id = "reviewer_codex"
+agent = "codex"
+prompt_file = "../prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "reviewer_claude"
+agent = "claude"
+prompt_file = "../prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-implement-synth.md"
+inputs = ["reviewer_codex", "reviewer_claude"]
+
+[[workflows]]
+# B2a acceptance gate: a single write-capable container_rw node. Run from under the mount with
+#   a2a-bridge run-workflow impl-smoke --input README.md --session-cwd /Users/wesleyjinks/code/.b2a-scratch
+id = "impl-smoke"
+[[workflows.nodes]]
+id = "write"
+agent = "impl"
+prompt_file = "../prompts/impl-smoke.md"
+inputs = []
+
+[[workflows]]
+# B2b-1: the write-capable edit node driven by `a2a-bridge implement`. The agent edits + stages + writes
+# .git/A2A_COMMIT_MSG; the bridge host-commits the staged index.
+id = "implement-edit"
+[[workflows.nodes]]
+id = "edit"
+agent = "impl"
+prompt_file = "../prompts/implement-edit.md"
+inputs = []
+
+# ── implement-fix (B2b-3b): one ContainerRw `impl` turn to FIX verify/review failures on the existing clone.
+#    EXAMPLE-ONLY (references `impl`, which is not in the `init` scaffold). ──
+[[workflows]]
+id = "implement-fix"
+[[workflows.nodes]]
+id = "fix"
+agent = "impl"
+prompt_file = "../prompts/implement-fix.md"
+inputs = []
+
+[[workflows]]
+id = "spec-review"
+[[workflows.nodes]]
+id = "rigordraft"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor.md"
+inputs = []
+[[workflows.nodes]]
+id = "soundnessdraft"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness.md"
+inputs = []
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor-refine.md"
+inputs = ["rigordraft"]
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness-refine.md"
+inputs = ["soundnessdraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/spec-review-synth.md"
+inputs = ["rigor", "soundness"]
+
+[[workflows]]
+id = "plan-review"
+[[workflows.nodes]]
+id = "execdraft"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec.md"
+inputs = []
+[[workflows.nodes]]
+id = "coveragedraft"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage.md"
+inputs = []
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec-refine.md"
+inputs = ["execdraft"]
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage-refine.md"
+inputs = ["coveragedraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/plan-review-synth.md"
+inputs = ["exec", "coverage"]
+
+[[workflows]]
+id = "design"
+[[workflows.nodes]]
+id = "executabilitydraft"
+agent = "codex"
+prompt_file = "../prompts/design-executability.md"
+inputs = []
+[[workflows.nodes]]
+id = "structuredraft"
+agent = "claude"
+prompt_file = "../prompts/design-structure.md"
+inputs = []
+[[workflows.nodes]]
+id = "executability"
+agent = "codex"
+prompt_file = "../prompts/design-executability-refine.md"
+inputs = ["executabilitydraft"]
+[[workflows.nodes]]
+id = "structure"
+agent = "claude"
+prompt_file = "../prompts/design-structure-refine.md"
+inputs = ["structuredraft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/design-synth.md"
+inputs = ["executability", "structure"]
+
+# ── Single-agent auth smokes (one node, one agent) — the per-agent validation gates (Task 8) ──
+[[workflows]]
+id = "smoke-claude"
+[[workflows.nodes]]
+id = "go"
+agent = "claude"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-codex"
+[[workflows.nodes]]
+id = "go"
+agent = "codex"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-kiro"
+[[workflows.nodes]]
+id = "go"
+agent = "kiro"
+prompt_file = "../prompts/smoke-read.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-ollama"
+[[workflows.nodes]]
+id = "go"
+agent = "ollama"
+prompt_file = "../prompts/smoke-reply.md"
+inputs = []
+
+[[workflows]]
+id = "smoke-ollama-cloud"
+[[workflows.nodes]]
+id = "go"
+agent = "ollama-cloud"
+prompt_file = "../prompts/smoke-reply.md"
+inputs = []
