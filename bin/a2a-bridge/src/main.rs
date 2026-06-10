@@ -3293,6 +3293,57 @@ mod cli_tests {
     }
 
     #[test]
+    fn podman_example_parses_validates_and_mirrors_docker() {
+        // The shipped podman example must parse, snapshot, satisfy the S3 runtime allowlist, and
+        // differ from the docker example ONLY on the runtime/allowlist axes (no structural drift).
+        let podman_src = include_str!("../../../examples/a2a-bridge.containerized.podman.toml");
+        let docker_src = include_str!("../../../examples/a2a-bridge.containerized.toml");
+
+        let cfg = config::RegistryConfig::parse(podman_src).expect("podman example parses");
+        let snap = cfg.into_snapshot().expect("podman example snapshots");
+        // S3 precondition (what Registry::new validates at boot): every sandbox runtime is allowlisted.
+        assert!(
+            snap.allowed_cmds.iter().any(|c| c == "podman"),
+            "allowed_cmds must list podman"
+        );
+        for e in &snap.entries {
+            if let Some(sb) = &e.sandbox {
+                assert!(
+                    snap.allowed_cmds.iter().any(|c| c == sb.runtime()),
+                    "S3: sandbox runtime {:?} must be allowlisted",
+                    sb.runtime()
+                );
+                assert_eq!(sb.runtime(), "podman", "every sandbox uses the podman runtime");
+            }
+        }
+
+        // Parity: every line that differs between the two examples must be on the runtime/allowlist
+        // axis (or a comment) — nothing structural drifts the artifact docs + the smoke point at.
+        let only_in = |a: &str, b: &str| -> Vec<String> {
+            let bset: std::collections::HashSet<_> = b.lines().map(str::trim).collect();
+            a.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !bset.contains(l))
+                .map(String::from)
+                .collect()
+        };
+        let diffs: Vec<String> = only_in(podman_src, docker_src)
+            .into_iter()
+            .chain(only_in(docker_src, podman_src))
+            .collect();
+        for line in &diffs {
+            assert!(
+                line.starts_with('#')
+                    || line.contains("runtime")
+                    || line.contains("allowed_cmds")
+                    || line.contains("podman")
+                    || line.contains("docker"),
+                "podman example diverges from docker example outside runtime/allowlist: {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn init_clobber_guard_and_force_and_unknown_agent() {
         let dir = std::env::temp_dir().join(format!("a2a-init-test-force-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
