@@ -127,9 +127,13 @@ resolve_model(want: Option<&str>, available: &[ModelInfo]) -> Result<Option<Mode
 
 ### 5.3 Effort resolution (`resolve_effort`)
 
-Effort is a **validated raw string** in config (`effort = "high"` / `"xhigh"` / `"max"` …). The
-existing `Effort` enum words remain accepted inputs for back-compat, but the value space is the
-agent's advertised `options[]` (the enum can't express `xhigh` vs `max` distinctly).
+Effort stays a **typed `Effort` enum**, extended with **`Xhigh`** (so it expresses the full
+vocabulary `Minimal/Low/Medium/High/Xhigh/Max`). The bridge maps a tier to a canonical level name
+(`Minimal/Low→"low"`, `Medium→"medium"`, `High→"high"`, `Xhigh→"xhigh"`, `Max→"max"`), then resolves
+that name against the active model's advertised `options[]` with the highest-≤-requested fallback.
+This keeps `effort=` type-safe (no `SessionSpec`/`effective_config` ripple) **and** subsumes both
+vendor vocabularies with one mapping: codex `Max`→(no `max` advertised)→falls back to `xhigh`; claude
+`Max`→`max`. (Refinement over an earlier "raw validated string" idea — less ripple, same coverage.)
 
 ```
 resolve_effort(want: &str, opt: &EffortOption /* {id, levels: Vec<String>} */, order: &[&str])
@@ -221,15 +225,18 @@ re-scopes valid levels); effort resolved against the **active** model's advertis
   `fallback_model` accepted + spawn-arg present. Confirm via adapter transcripts/rollouts, not
   self-report.
 
-## 10. Risk: Rust client SDK skew
+## 10. Rust client SDK skew — VERIFIED RETIRED
 
-The capability-driven design **requires the bridge's Rust `agent-client-protocol` 0.12.1 client to
-parse `NewSessionResponse.models` (availableModels/currentModelId), `configOptions`, and the
-`config_option_update` notification.** If 0.12.1 does not surface these (they are `unstable`
-fields), an SDK **bump** is a prerequisite — which must preserve the `unstable_session_usage`
-feature the usage-hang fix depends on (`cfc1ce3`). **Implementation Task 0:** verify 0.12.1 exposes
-these fields; if not, scope the bump (and re-pin) before the rest. (The node-side probes prove the
-*adapter* sends them; this is purely about the Rust client deserializing them.)
+The capability-driven design requires the bridge's Rust `agent-client-protocol` 0.12.1 client to
+parse `NewSessionResponse.models`, `config_options`, and the `config_option_update` notification.
+**Verified present** in the pinned 0.12.1 (schema crate 0.13.2) with the **already-enabled**
+`unstable_session_model` feature (`bridge-acp/Cargo.toml`): `NewSessionResponse.models:
+Option<SessionModelState>` + `config_options: Option<Vec<SessionConfigOption>>`; `SessionModelState
+{ current_model_id, available_models: Vec<ModelInfo{model_id,name}> }`; `SessionConfigOption { id,
+category: Mode|Model|ThoughtLevel|Other, kind: Select{current_value, options} }`;
+`SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate{config_options})`. **No SDK bump needed** —
+`unstable_session_usage` (the usage-hang fix `cfc1ce3`) is untouched. The effort option is found by
+`category == ThoughtLevel`, the model option by `category == Model` — no hardcoded ids.
 
 ## 11. Reference: effort level guidance (for config authors)
 
