@@ -1179,7 +1179,7 @@ impl AcpBackend {
                                     agent = %agent_id_for_mint,
                                     effort = %from,
                                     valid = ?advertised.levels,
-                                    "configured effort is higher than all advertised effort levels; skipping"
+                                    "configured effort is below the lowest advertised effort level; skipping"
                                 );
                                 EffortDecision::Unsupported { from }
                             }
