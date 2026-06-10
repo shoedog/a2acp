@@ -482,6 +482,7 @@ impl AcpBackend {
             Effort::Minimal | Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
+            Effort::Xhigh => "xhigh",
             Effort::Max => "xhigh",
         }
     }

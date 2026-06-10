@@ -2861,15 +2861,8 @@ fn task_id_from_params(params: &Value) -> Result<TaskId, BridgeError> {
 /// Parse an effort-level string into the `Effort` enum, returning
 /// `BridgeError::InvalidRequest{field:"effort"}` for unrecognised strings.
 fn parse_effort_meta(s: &str) -> Result<bridge_core::domain::Effort, BridgeError> {
-    use bridge_core::domain::Effort;
-    match s {
-        "minimal" => Ok(Effort::Minimal),
-        "low" => Ok(Effort::Low),
-        "medium" => Ok(Effort::Medium),
-        "high" => Ok(Effort::High),
-        "max" => Ok(Effort::Max),
-        _ => Err(BridgeError::InvalidRequest { field: "effort" }),
-    }
+    s.parse::<bridge_core::domain::Effort>()
+        .map_err(|_| BridgeError::InvalidRequest { field: "effort" })
 }
 
 /// Extract and validate the per-request `a2a-bridge.cwd` from `message.metadata`.
@@ -3915,6 +3908,20 @@ mod tests {
         assert_eq!(ov.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(ov.effort, Some(bridge_core::domain::Effort::High));
         assert_eq!(ov.mode.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn task_meta_accepts_xhigh_effort() {
+        let p = serde_json::json!({
+            "message": {
+                "metadata": {
+                    "a2a-bridge.effort": "xhigh"
+                }
+            }
+        });
+        let meta = task_meta_from_params(&p).unwrap();
+        let ov = meta.overrides.as_ref().expect("overrides should be Some");
+        assert_eq!(ov.effort, Some(bridge_core::domain::Effort::Xhigh));
     }
 
     #[test]
