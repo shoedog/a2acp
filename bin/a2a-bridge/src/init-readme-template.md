@@ -34,11 +34,15 @@ no command).
 
 ### model / effort / mode
 
-- `model` → `session/set_config_option(category="model")`, **VALIDATED at mint**:
+- `model` → set on whichever surface the agent advertises, **VALIDATED at mint**:
   pinning a value the agent does not advertise hard-fails the session (the error
-  lists the advertised values). Aliases resolve first (`fable`→`claude-fable-5[1m]`,
-  `opus`→`default`). claude's served model shows in claude's own transcript, not
-  the bridge's. **kiro advertises no model option — do not pin it.**
+  lists the advertised values). claude 0.44.0 / codex advertise it via
+  `session/set_config_option(category="model")`. Aliases resolve first
+  (`fable`→`claude-fable-5[1m]`, `opus`→`default`). claude's served model shows in
+  claude's own transcript, not
+  the bridge's. **kiro** advertises its model via the unstable `models` surface +
+  `session/set_model` (ids: `auto`, `claude-sonnet-4.5`, `claude-sonnet-4`,
+  `claude-haiku-4.5`, …) — pin an advertised id or leave it on the `auto` default.
 - `effort` (minimal/low/medium/high/xhigh/max) → `session/set_config_option`
   (thought-level) for **any** agent that advertises one (codex `reasoning_effort`,
   claude `effort`). Falls back to the highest supported level **≤** requested;

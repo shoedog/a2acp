@@ -11,7 +11,15 @@ license.workspace = true
 # stalls the turn → the `end_turn` result never arrives → a multi-minute hang (live-found vs claude-agent-acp,
 # which now sends `usage_update{cost}`). With the feature on, the variant deserializes and is dropped as an
 # unmodeled update by `map_session_update`. The variant already ships in the pinned 0.12.1 — feature only, no bump.
-agent-client-protocol = { workspace = true, features = ["unstable_session_usage"] }
+# `unstable_session_model` gates the `NewSessionResponse.models` field (`SessionModelState`:
+# current_model_id + available_models) and `session/set_model` (`SetSessionModelRequest`). This is
+# the model-selection surface kiro-cli uses: kiro returns `config_options: None` but DOES advertise
+# `models` and accepts `session/set_model`. claude 0.44.0 / codex moved model into `config_options`;
+# kiro did NOT, so the bridge must support BOTH surfaces. (Probed live 2026-06-10.)
+agent-client-protocol = { workspace = true, features = [
+    "unstable_session_usage",
+    "unstable_session_model",
+] }
 bridge-core = { path = "../bridge-core" }
 thiserror.workspace = true
 async-trait.workspace = true

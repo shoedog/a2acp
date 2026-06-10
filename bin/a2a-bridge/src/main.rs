@@ -2109,7 +2109,7 @@ fn known_init_agents() -> [(&'static str, Option<&'static str>); 4] {
 fn agent_fragment(name: &str) -> &'static str {
     match name {
         "kiro" => {
-            "\n# kiro: zero-auth local default (kiro-cli acp). No `model` pin: kiro advertises\n# no model config option, so a pin would hard-fail at mint.\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\n"
+            "\n# kiro: zero-auth local default (kiro-cli acp). Unpinned (default model `auto`).\n# kiro advertises its model via the `models` surface + session/set_model, so you MAY\n# pin an advertised id, e.g. model = \"claude-sonnet-4.5\".\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\n"
         }
         "codex" => {
             "\n# codex: gpt-5.5 with reasoning_effort.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"

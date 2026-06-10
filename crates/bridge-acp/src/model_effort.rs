@@ -2,7 +2,7 @@
 
 use agent_client_protocol::schema::{
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory as Cat,
-    SessionConfigSelectOptions,
+    SessionConfigSelectOptions, SessionModelState,
 };
 use bridge_core::domain::Effort;
 
@@ -98,6 +98,17 @@ fn find_select(
 
 pub fn model_values(opts: &[SessionConfigOption]) -> Option<(String, String, Vec<String>)> {
     find_select(opts, Cat::Model, &["model"])
+}
+
+/// Advertised model ids from the unstable `models` surface (`SessionModelState`).
+/// kiro-cli returns `config_options: None` but DOES advertise this + accepts
+/// `session/set_model`; claude 0.44.0 / codex use `config_options` instead.
+pub fn model_state_values(state: &SessionModelState) -> Vec<String> {
+    state
+        .available_models
+        .iter()
+        .map(|model| model.model_id.0.to_string())
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -282,6 +293,44 @@ mod tests {
             resolve_model(Some("haiku"), &claude_values()).unwrap(),
             ModelDecision::Apply("haiku".into())
         );
+    }
+
+    fn kiro_model_state() -> agent_client_protocol::schema::SessionModelState {
+        use agent_client_protocol::schema::{ModelInfo, SessionModelState};
+        SessionModelState::new(
+            "auto",
+            vec![
+                ModelInfo::new("auto", "auto"),
+                ModelInfo::new("claude-sonnet-4.5", "Claude Sonnet 4.5"),
+                ModelInfo::new("claude-haiku-4.5", "Claude Haiku 4.5"),
+            ],
+        )
+    }
+
+    #[test]
+    fn model_state_values_lists_available_model_ids() {
+        assert_eq!(
+            model_state_values(&kiro_model_state()),
+            strings(&["auto", "claude-sonnet-4.5", "claude-haiku-4.5"])
+        );
+    }
+
+    #[test]
+    fn models_surface_id_is_applied() {
+        // The kiro path reuses resolve_model against the `models` surface ids.
+        let values = model_state_values(&kiro_model_state());
+        assert_eq!(
+            resolve_model(Some("claude-sonnet-4.5"), &values).unwrap(),
+            ModelDecision::Apply("claude-sonnet-4.5".into())
+        );
+    }
+
+    #[test]
+    fn unadvertised_models_surface_id_errs_with_valid_list() {
+        let values = model_state_values(&kiro_model_state());
+        let err = resolve_model(Some("gpt-5.5"), &values).unwrap_err();
+        assert_eq!(err.want, "gpt-5.5");
+        assert!(err.valid.contains(&"claude-sonnet-4.5".to_string()));
     }
 
     #[test]

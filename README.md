@@ -109,7 +109,7 @@ addr = "127.0.0.1:8080"
 | `cmd` | yes | Agent binary to spawn (must be on PATH; must be in `allowed_cmds` if `[registry]` is set) |
 | `args` | no | Arguments passed to `cmd` (e.g. `["acp"]` for kiro-cli) |
 | `name` | no | Human-readable display name; drives the fan-out source label in artifacts (defaults to `id`) |
-| `model` | no | Model id set via `session/set_config_option(category="model")`; **validated** against the agent's advertised values — hard-fails at mint if not advertised. Aliases resolve first (`fable`→`claude-fable-5[1m]`, `opus`→`default`). kiro advertises no model option |
+| `model` | no | Model id set on the agent's advertised surface — `session/set_config_option(category="model")` for claude 0.44.0 / codex, or the unstable `models` + `session/set_model` for kiro (`auto`/`claude-sonnet-4.5`/…); **validated** against advertised values (hard-fails at mint if not advertised). Aliases resolve first (`fable`→`claude-fable-5[1m]`, `opus`→`default`) |
 | `model_provider` | no | LLM vendor label — descriptive/routing metadata only, never sent on the wire |
 | `effort` | no | Effort tier set via `session/set_config_option` for agents that advertise one (codex `reasoning_effort`, claude `effort`): `minimal` / `low` / `medium` / `high` / `xhigh` / `max`. Falls back to the highest supported level ≤ requested |
 | `mode` | no | Mode id for `session/set_mode` (hard error if agent rejects) |
