@@ -1,486 +1,228 @@
-# Capability-driven Model & Effort Pinning — Implementation Plan
+# Capability-driven Model & Effort Pinning — Implementation Plan (v2, for spec v2.1)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. Steps use checkbox (`- [ ]`).
+> **Supersedes** the v1 plan (which targeted the removed `session/set_model` + `models` surface). Implements `docs/superpowers/specs/2026-06-09-model-effort-pinning-design.md` (v2.1).
 
-**Goal:** Make the bridge validate model & effort against what each ACP agent *advertises* at mint, fix the silent claude-effort no-op, hard-error on a bad model pin, and log the resolved model/effort — plus an optional `fallback_model`.
+**Goal:** Pin & validate model + effort against each agent's advertised `config_options` at mint, via `set_config_option` (the unified 0.44.0/codex surface); fix the silent claude-effort no-op; hard-error on a bad model with the valid list; log the resolved model/effort.
 
-**Architecture:** A new pure module `crates/bridge-acp/src/model_effort.rs` holds total, unit-tested resolvers over the agent's advertised `SessionModelState` + effort `SessionConfigOption`. `AcpBackend`'s mint closure reads the advertised state from the `session/new` response (and the `ConfigOptionUpdate` notification the agent pushes after `set_model`), calls the resolvers, applies via the **discovered** config-id, and logs. `fallback_model` is a spawn-time arg (claude `--fallback-model`) wired in the `SpawnFn`/`acp_program_argv` path.
+**Architecture:** Pure `crates/bridge-acp/src/model_effort.rs` (alias map, discovery, resolvers, effort-error predicate — all total, unit-tested) + the `AcpBackend` mint closure doing only synchronous request/response I/O (`session/new` response, `set_config_option` response). No `session/set_model`, no notification capture, no `fallback_model` (descoped).
 
-**Tech Stack:** Rust, `agent-client-protocol =0.12.1` (schema 0.13.2, `unstable_session_model` already enabled), tokio, tracing.
-
-**Key SDK types (all present in 0.12.1, verified):**
-- `NewSessionResponse { session_id, modes, models: Option<SessionModelState>, config_options: Option<Vec<SessionConfigOption>> }`
-- `SessionModelState { current_model_id: ModelId, available_models: Vec<ModelInfo{model_id, name}> }`
-- `SessionConfigOption { id: SessionConfigId, category: Option<SessionConfigOptionCategory{Mode|Model|ThoughtLevel|Other}>, kind: SessionConfigKind::Select(SessionConfigSelect{ current_value: SessionConfigValueId, options: SessionConfigSelectOptions(Vec<SessionConfigSelectOption{value: SessionConfigValueId, name}>) }) }`
-- `SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate{ config_options: Vec<SessionConfigOption> })`
-- Newtypes wrap `Arc<str>`: `ModelId(pub Arc<str>)`, `SessionConfigId(pub Arc<str>)`, `SessionConfigValueId(pub Arc<str>)` — read via `&*x.0`.
-- Existing request builders in `acp_backend.rs`: `set_model_request`, `set_mode_request`, `set_effort_request` (to be replaced by a capability-driven config-option set), `EFFORT_CONFIG_ID`/`effort_value` (to be removed/relocated).
-
-**Probed ground truth (from the spec §3):** claude advertises `default/sonnet/sonnet[1m]/haiku`, effort id `effort`, levels model-dependent (Opus 4.8: low/medium/high/xhigh/max; Sonnet 4.6: low/medium/high/max). codex advertises `gpt-5.5/5.4/5.4-mini/5.3-codex-spark`, effort id `reasoning_effort`, levels low/medium/high/xhigh. Both accept `set_model` for ANY string (no validation) → the bridge must validate. Level order: `low < medium < high < xhigh < max`.
+**Surfaces (probed live 2026-06-09):** claude-agent-acp 0.44.0 & codex-acp both advertise `config_options` with `category ∈ {mode, model, thought_level}`, `kind=Select{currentValue, options}`. Model option values: claude `default|claude-fable-5[1m]|sonnet|sonnet[1m]|haiku`; codex `gpt-5.5|gpt-5.4|gpt-5.4-mini|gpt-5.3-codex-spark`. Effort id `effort` (claude) / `reasoning_effort` (codex); levels model-dependent; `set_config_option` **errors `-32603`** on an unsupported level and its **response carries refreshed `config_options`**. Rust `agent-client-protocol 0.12.1` (schema 0.13.2) already has `SessionConfigOptionCategory::{Mode,Model,ThoughtLevel,Other}`, `Select` (`options: Ungrouped|Grouped`), `set_config_option` + `SetSessionConfigOptionResponse.config_options`. No Rust SDK bump.
 
 ---
 
-## File Structure
+## Task 1: `Effort::Xhigh` (no `Ord`)
 
-- **Create** `crates/bridge-acp/src/model_effort.rs` — pure resolvers + types + unit tests. One responsibility: decide, given advertised capability + desired config, what to apply (or fail).
-- **Modify** `crates/bridge-core/src/domain.rs` (or wherever `Effort` lives) — add `Effort::Xhigh`.
-- **Modify** `crates/bridge-acp/src/lib.rs` — `mod model_effort;`.
-- **Modify** `crates/bridge-acp/src/acp_backend.rs` — mint closure integration; `AcpConfig.fallback_model`; capture `ConfigOptionUpdate`.
-- **Modify** `bin/a2a-bridge/src/config.rs` — `parse_effort` accepts `xhigh`; `AgentToml.fallback_model`; thread to `AcpConfig`.
-- **Modify** `bin/a2a-bridge/src/main.rs` (+ `crates/bridge-container/src/lib.rs`) — append claude `--fallback-model` in the spawn-arg path.
-- **Modify** `examples/a2a-bridge.slicing-*.toml` + `docs/` — effort guidance + fallback_model example.
-- **Create** `docs/adr/0029-model-effort-pinning.md`.
+**Files:** Modify `crates/bridge-core/src/domain.rs` (+ test mod).
 
----
-
-## Task 1: Add `Effort::Xhigh` variant
-
-**Files:**
-- Modify: `crates/bridge-core/src/domain.rs` (the `Effort` enum + any exhaustive `match`)
-- Test: same file's `#[cfg(test)]` mod
-
-- [ ] **Step 1: Locate the enum.** Run `grep -rn 'enum Effort' crates/bridge-core/src` to find the definition (variants today: `Minimal, Low, Medium, High, Max`).
-
-- [ ] **Step 2: Write the failing test** (in the domain test mod):
-
+- [ ] **Step 1: Failing test** — `parse`/round-trip of `Xhigh`. (Find the enum: `grep -n 'enum Effort' crates/bridge-core/src/domain.rs`; today `Minimal,Low,Medium,High,Max`.)
 ```rust
-#[test]
-fn effort_xhigh_orders_between_high_and_max() {
-    assert!(Effort::High < Effort::Xhigh);
-    assert!(Effort::Xhigh < Effort::Max);
-}
+#[test] fn effort_has_xhigh() { assert_eq!(Effort::Xhigh.as_str(), "xhigh"); }
 ```
+- [ ] **Step 2:** Run → FAIL. `cargo test -p bridge-core effort_has_xhigh`
+- [ ] **Step 3:** Add `Xhigh` between `High` and `Max`; add the `"xhigh"` arm to any `as_str`/`Display`/serde map. **Do NOT add `Ord`** (ordering lives in `model_effort`, per spec §5.3 — avoids `Minimal→low` rank shadowing). Fix exhaustive matches the compiler flags.
+- [ ] **Step 4:** Run → PASS.
+- [ ] **Step 5:** `git commit -m "feat(core): add Effort::Xhigh tier"`
 
-- [ ] **Step 3: Run it, expect FAIL** (`Xhigh` undefined): `cargo test -p bridge-core effort_xhigh`
+## Task 2: One `FromStr<Effort>` shared by both parsers (M7)
 
-- [ ] **Step 4: Add the variant** between `High` and `Max` (ordering matters — derive `PartialOrd`/`Ord` already present or add it):
+**Files:** `crates/bridge-core/src/domain.rs` (impl `FromStr`), `bin/a2a-bridge/src/config.rs` (`parse_effort`), `crates/bridge-a2a-inbound/src/server.rs` (`parse_effort_meta`).
 
+- [ ] **Step 1: Failing test** in domain: `"xhigh".parse::<Effort>() == Ok(Effort::Xhigh)`, plus `minimal/low/medium/high/max`.
+- [ ] **Step 2:** Implement `impl FromStr for Effort` (accepts `minimal,low,medium,high,xhigh,max`, case-insensitive; `Err(String)` otherwise).
+- [ ] **Step 3:** Repoint `config.rs::parse_effort` and `server.rs::parse_effort_meta` to delegate to `Effort::from_str` (so the two can't drift). Add a test in `server.rs` that `parse_effort_meta("xhigh")` ⇒ `Xhigh` (previously rejected).
+- [ ] **Step 4:** Run `cargo test -p bridge-core -p a2a-bridge -p bridge-a2a-inbound effort`.
+- [ ] **Step 5:** `git commit -m "refactor(core): single FromStr<Effort>; both parsers accept xhigh"`
+
+## Task 3: Pure `model_effort.rs` — alias map + `resolve_model`
+
+**Files:** Create `crates/bridge-acp/src/model_effort.rs`; modify `crates/bridge-acp/src/lib.rs` (`mod model_effort;`).
+
+- [ ] **Step 1: Write the module + failing tests:**
 ```rust
-pub enum Effort { Minimal, Low, Medium, High, Xhigh, Max }
-```
-Fix any non-exhaustive `match` the compiler flags (e.g. a `Display`/serde mapping) to handle `Xhigh => "xhigh"`.
+//! Pure capability-driven resolution of model & effort against advertised config options.
 
-- [ ] **Step 5: Run, expect PASS.** `cargo test -p bridge-core effort_xhigh`
-
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(core): add Effort::Xhigh tier"`
-
----
-
-## Task 2: Pure model resolver
-
-**Files:**
-- Create: `crates/bridge-acp/src/model_effort.rs`
-- Modify: `crates/bridge-acp/src/lib.rs` (add `mod model_effort;`)
-
-- [ ] **Step 1: Create the module skeleton + failing test.** Write `model_effort.rs`:
-
-```rust
-//! Pure, capability-driven resolution of model & effort against what an ACP agent
-//! advertises at mint. No I/O — the backend does the wire calls; this decides.
-
-/// A model id the agent advertises as selectable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdvertisedModels {
-    pub current: String,
-    pub available: Vec<String>, // model_id values
+/// Static shorthand → advertised-id map, applied BEFORE validation (spec §5.2).
+const MODEL_ALIASES: &[(&str, &str)] = &[("fable", "claude-fable-5[1m]"), ("opus", "default")];
+pub fn apply_alias(want: &str) -> &str {
+    MODEL_ALIASES.iter().find(|(a, _)| *a == want).map(|(_, v)| *v).unwrap_or(want)
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum ModelDecision {
-    /// Leave the agent's default (no `model=` configured).
-    Default,
-    /// Apply this advertised model id.
-    Apply(String),
-}
-
+pub enum ModelDecision { Default, Apply(String) }
 #[derive(Debug, PartialEq, Eq)]
-pub struct ModelNotAdvertised {
-    pub want: String,
-    pub valid: Vec<String>,
-}
+pub struct ModelNotAdvertised { pub want: String, pub valid: Vec<String> }
 
-/// Resolve a configured `model=` against the advertised list.
-/// `None` => Default. Present => Apply. Absent => Err (caller fails the mint).
-pub fn resolve_model(
-    want: Option<&str>,
-    adv: &AdvertisedModels,
-) -> Result<ModelDecision, ModelNotAdvertised> {
-    match want {
-        None => Ok(ModelDecision::Default),
-        Some(w) if adv.available.iter().any(|m| m == w) => Ok(ModelDecision::Apply(w.to_string())),
-        Some(w) => Err(ModelNotAdvertised { want: w.to_string(), valid: adv.available.clone() }),
-    }
+/// `want` None => Default. Else alias-map then exact-match against advertised values.
+pub fn resolve_model(want: Option<&str>, values: &[String]) -> Result<ModelDecision, ModelNotAdvertised> {
+    let raw = match want { None => return Ok(ModelDecision::Default), Some(w) => w };
+    let mapped = apply_alias(raw);
+    if values.iter().any(|v| v == mapped) { Ok(ModelDecision::Apply(mapped.to_string())) }
+    else { Err(ModelNotAdvertised { want: raw.to_string(), valid: values.to_vec() }) }
 }
 
 #[cfg(test)]
-mod tests {
+mod model_tests {
     use super::*;
-    fn claude() -> AdvertisedModels {
-        AdvertisedModels { current: "default".into(),
-            available: ["default","sonnet","sonnet[1m]","haiku"].iter().map(|s| s.to_string()).collect() }
-    }
-    #[test] fn none_is_default() { assert_eq!(resolve_model(None, &claude()).unwrap(), ModelDecision::Default); }
-    #[test] fn advertised_applies() { assert_eq!(resolve_model(Some("haiku"), &claude()).unwrap(), ModelDecision::Apply("haiku".into())); }
-    #[test] fn typo_errors_with_valid_list() {
-        let e = resolve_model(Some("bogus-zzz"), &claude()).unwrap_err();
-        assert_eq!(e.want, "bogus-zzz");
-        assert!(e.valid.contains(&"haiku".to_string()));
-    }
-    #[test] fn cli_alias_not_in_list_errors() {
-        // "opus" is not advertised (it's "default"); strict by design.
-        assert!(resolve_model(Some("opus"), &claude()).is_err());
-    }
+    fn claude() -> Vec<String> { ["default","claude-fable-5[1m]","sonnet","sonnet[1m]","haiku"].iter().map(|s| s.to_string()).collect() }
+    #[test] fn none_default() { assert_eq!(resolve_model(None,&claude()).unwrap(), ModelDecision::Default); }
+    #[test] fn advertised() { assert_eq!(resolve_model(Some("haiku"),&claude()).unwrap(), ModelDecision::Apply("haiku".into())); }
+    #[test] fn fable_alias_maps_to_1m() { assert_eq!(resolve_model(Some("fable"),&claude()).unwrap(), ModelDecision::Apply("claude-fable-5[1m]".into())); }
+    #[test] fn opus_alias_maps_to_default() { assert_eq!(resolve_model(Some("opus"),&claude()).unwrap(), ModelDecision::Apply("default".into())); }
+    #[test] fn typo_errs_with_valid_list() { let e=resolve_model(Some("bogus"),&claude()).unwrap_err(); assert_eq!(e.want,"bogus"); assert!(e.valid.contains(&"haiku".into())); }
+    #[test] fn alias_target_not_advertised_errs() { assert!(resolve_model(Some("fable"), &["sonnet".to_string()]).is_err()); } // vendor-rename safety
+    #[test] fn codex_base_id() { assert_eq!(resolve_model(Some("gpt-5.5"), &["gpt-5.5".to_string()]).unwrap(), ModelDecision::Apply("gpt-5.5".into())); }
 }
 ```
-Add `mod model_effort;` to `crates/bridge-acp/src/lib.rs`.
+- [ ] **Step 2:** Run → PASS. `cargo test -p bridge-acp model_effort::model_tests`
+- [ ] **Step 3:** `git commit -m "feat(acp): model_effort alias map + resolve_model"`
 
-- [ ] **Step 2: Run, expect FAIL→PASS as you fill in.** `cargo test -p bridge-acp model_effort::tests::`
+## Task 4: Option discovery from advertised config options (category/id, Grouped, Other)
 
-- [ ] **Step 3: Commit.** `git add -A && git commit -m "feat(acp): pure resolve_model (validate against advertised models)"`
+**Files:** Modify `crates/bridge-acp/src/model_effort.rs`.
 
----
-
-## Task 3: Pure effort resolver (with highest-≤-requested fallback)
-
-**Files:**
-- Modify: `crates/bridge-acp/src/model_effort.rs`
-
-- [ ] **Step 1: Write the failing tests** (append to the module):
-
+- [ ] **Step 1: Failing tests + functions** (uses SDK types):
 ```rust
-/// The advertised effort option for the ACTIVE model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdvertisedEffort {
-    pub config_id: String,        // e.g. "effort" (claude) / "reasoning_effort" (codex)
-    pub levels: Vec<String>,      // advertised values, e.g. ["low","medium","high","max"]
-}
+use agent_client_protocol::{SessionConfigOption, SessionConfigOptionCategory as Cat, SessionConfigKind, SessionConfigSelectOptions};
 
-/// Canonical ordering low<medium<high<xhigh<max. Levels outside this list sort last
-/// (defensive: unknown vendor level never wins a `<=` comparison).
-pub const EFFORT_ORDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-fn rank(level: &str) -> usize { EFFORT_ORDER.iter().position(|l| *l == level).unwrap_or(usize::MAX) }
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum EffortDecision {
-    /// No effort configured — leave the model default.
-    Skip,
-    /// Apply `level` via `config_id`.
-    Apply { config_id: String, level: String },
-    /// Requested unsupported; applying the highest advertised level <= requested.
-    FellBack { config_id: String, from: String, to: String },
-    /// Requested unsupported and nothing advertised <= requested; leave default.
-    Unsupported { from: String, levels: Vec<String> },
-}
-
-/// `want` is the canonical level string the bridge maps an `Effort` tier to
-/// (Minimal/Low->"low", Medium->"medium", High->"high", Xhigh->"xhigh", Max->"max").
-pub fn resolve_effort(want: Option<&str>, adv: &AdvertisedEffort) -> EffortDecision {
-    let want = match want { None => return EffortDecision::Skip, Some(w) => w };
-    if adv.levels.iter().any(|l| l == want) {
-        return EffortDecision::Apply { config_id: adv.config_id.clone(), level: want.to_string() };
-    }
-    // highest advertised level whose rank <= want's rank
-    let want_rank = rank(want);
-    let best = adv.levels.iter()
-        .filter(|l| rank(l) <= want_rank)
-        .max_by_key(|l| rank(l));
-    match best {
-        Some(to) => EffortDecision::FellBack { config_id: adv.config_id.clone(), from: want.to_string(), to: to.clone() },
-        None => EffortDecision::Unsupported { from: want.to_string(), levels: adv.levels.clone() },
+fn select_values(sel_options: &SessionConfigSelectOptions) -> Vec<String> {
+    // Select.options is untagged Ungrouped | Grouped — flatten groups (spec M2).
+    match sel_options {
+        SessionConfigSelectOptions::Ungrouped(v) => v.iter().map(|o| (*o.value.0).to_string()).collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups.iter().flat_map(|g| g.options.iter().map(|o| (*o.value.0).to_string())).collect(),
     }
 }
-
-#[cfg(test)]
-mod effort_tests {
-    use super::*;
-    fn sonnet() -> AdvertisedEffort { AdvertisedEffort { config_id: "effort".into(), levels: ["low","medium","high","max"].iter().map(|s| s.to_string()).collect() } }
-    fn codex() -> AdvertisedEffort { AdvertisedEffort { config_id: "reasoning_effort".into(), levels: ["low","medium","high","xhigh"].iter().map(|s| s.to_string()).collect() } }
-    #[test] fn none_skips() { assert_eq!(resolve_effort(None, &sonnet()), EffortDecision::Skip); }
-    #[test] fn exact_applies_with_discovered_id() {
-        assert_eq!(resolve_effort(Some("high"), &sonnet()), EffortDecision::Apply { config_id: "effort".into(), level: "high".into() });
+fn matches(opt: &SessionConfigOption, cat: Cat, ids: &[&str]) -> bool {
+    match &opt.category {
+        Some(c) if *c == cat => true,
+        None | Some(Cat::Other(_)) => ids.contains(&&*opt.id.0), // m2: id fallback when absent OR Other
+        _ => false,
     }
-    #[test] fn sonnet_xhigh_falls_back_to_high() {
-        assert_eq!(resolve_effort(Some("xhigh"), &sonnet()), EffortDecision::FellBack { config_id: "effort".into(), from: "xhigh".into(), to: "high".into() });
-    }
-    #[test] fn sonnet_max_applies() { // sonnet DOES advertise max
-        assert_eq!(resolve_effort(Some("max"), &sonnet()), EffortDecision::Apply { config_id: "effort".into(), level: "max".into() });
-    }
-    #[test] fn codex_max_falls_back_to_xhigh() { // codex has no "max"
-        assert_eq!(resolve_effort(Some("max"), &codex()), EffortDecision::FellBack { config_id: "reasoning_effort".into(), from: "max".into(), to: "xhigh".into() });
-    }
+}
+/// Returns (current_value, values) for the first matching Select option, flattening groups.
+fn find_select(opts: &[SessionConfigOption], cat: Cat, ids: &[&str]) -> Option<(String, String, Vec<String>)> {
+    opts.iter().find(|o| matches(o, cat.clone(), ids)).and_then(|o| match &o.kind {
+        SessionConfigKind::Select(sel) => Some(((*o.id.0).to_string(), (*sel.current_value.0).to_string(), select_values(&sel.options))),
+        _ => None,
+    })
+}
+pub fn model_values(opts: &[SessionConfigOption]) -> Option<(String, Vec<String>)> {
+    find_select(opts, Cat::Model, &["model"]).map(|(id,_cur,vals)| (id, vals))
+}
+pub struct AdvertisedEffort { pub config_id: String, pub levels: Vec<String> }
+pub fn effort_opt(opts: &[SessionConfigOption]) -> Option<AdvertisedEffort> {
+    find_select(opts, Cat::ThoughtLevel, &["effort","reasoning_effort"])
+        .map(|(id,_cur,vals)| AdvertisedEffort { config_id: id, levels: vals.into_iter().filter(|v| v != "default").collect() })
 }
 ```
+Tests: build SDK `SessionConfigOption`s — an Ungrouped model option (values match), a **Grouped** model option (assert flattened), an **`Other`-category** option with id `"model"` (assert found via id fallback), a non-`Select` kind (assert `None`).
+(Confirm the exact `SessionConfigSelectOptions` variant names + `group.options` field at impl time: `grep -n 'enum SessionConfigSelectOptions\|struct.*Group' ~/.cargo/registry/src/*/agent-client-protocol-schema-0.13.2/src/v1/agent.rs`.)
+- [ ] **Step 2:** Run → PASS.
+- [ ] **Step 3:** `git commit -m "feat(acp): discover model/effort options (category+id, grouped, Other)"`
 
-- [ ] **Step 2: Run, expect PASS.** `cargo test -p bridge-acp model_effort`
+## Task 5: Pure `resolve_effort` + `is_unsupported_effort_error`
 
-- [ ] **Step 3: Add the `Effort`→canonical-level mapping helper** (used by the backend; keep it in this module for testability):
+**Files:** Modify `crates/bridge-acp/src/model_effort.rs`.
 
+- [ ] **Step 1: Failing tests + code:**
 ```rust
 use bridge_core::domain::Effort;
+pub const EFFORT_ORDER: &[&str] = &["low","medium","high","xhigh","max"];
+fn rank(l: &str) -> Option<usize> { EFFORT_ORDER.iter().position(|x| *x == l) }
 pub fn effort_level_name(e: Effort) -> &'static str {
-    match e {
-        Effort::Minimal | Effort::Low => "low",
-        Effort::Medium => "medium",
-        Effort::High => "high",
-        Effort::Xhigh => "xhigh",
-        Effort::Max => "max",
-    }
+    match e { Effort::Minimal | Effort::Low => "low", Effort::Medium => "medium", Effort::High => "high", Effort::Xhigh => "xhigh", Effort::Max => "max" }
 }
-#[test] fn max_maps_to_max_not_xhigh() { assert_eq!(super::effort_level_name(Effort::Max), "max"); }
-```
-(Put the test inside an existing `#[cfg(test)] mod`.)
-
-- [ ] **Step 4: Commit.** `git add -A && git commit -m "feat(acp): pure resolve_effort with highest-<=-requested fallback"`
-
----
-
-## Task 4: Capability extraction from advertised config options
-
-**Files:**
-- Modify: `crates/bridge-acp/src/model_effort.rs`
-
-Extract `AdvertisedModels`/`AdvertisedEffort` from the SDK types so the backend stays thin. These take borrowed SDK structs; test with hand-built SDK values.
-
-- [ ] **Step 1: Write the failing test + functions:**
-
-```rust
-use agent_client_protocol::{SessionModelState, SessionConfigOption, SessionConfigOptionCategory, SessionConfigKind};
-
-pub fn models_from(state: &SessionModelState) -> AdvertisedModels {
-    AdvertisedModels {
-        current: (*state.current_model_id.0).to_string(),
-        available: state.available_models.iter().map(|m| (*m.model_id.0).to_string()).collect(),
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub enum EffortDecision { Skip, Apply{config_id:String, level:String}, FellBack{config_id:String, from:String, to:String}, Unsupported{from:String} }
+pub fn resolve_effort(want: Option<Effort>, adv: &AdvertisedEffort) -> EffortDecision {
+    let want = match want { None => return EffortDecision::Skip, Some(e) => effort_level_name(e) };
+    if adv.levels.iter().any(|l| l == want) { return EffortDecision::Apply{config_id: adv.config_id.clone(), level: want.into()}; }
+    let wr = rank(want);
+    let best = adv.levels.iter().filter(|l| rank(l).is_some() && rank(l) <= wr).max_by_key(|l| rank(l));
+    match best { Some(to) => EffortDecision::FellBack{config_id: adv.config_id.clone(), from: want.into(), to: to.clone()}, None => EffortDecision::Unsupported{from: want.into()} }
 }
-
-/// Find the effort option (category == ThoughtLevel) among advertised config options.
-pub fn effort_from(opts: &[SessionConfigOption]) -> Option<AdvertisedEffort> {
-    opts.iter().find(|o| matches!(o.category, Some(SessionConfigOptionCategory::ThoughtLevel)))
-        .and_then(|o| match &o.kind {
-            SessionConfigKind::Select(sel) => Some(AdvertisedEffort {
-                config_id: (*o.id.0).to_string(),
-                // exclude the synthetic "default" entry; keep concrete levels
-                levels: sel.options.iter().map(|v| (*v.value.0).to_string()).filter(|v| v != "default").collect(),
-            }),
-            _ => None,
-        })
+/// Walk-down predicate (spec MAJOR 4): -32603 AND an invalid/unsupported-value message.
+pub fn is_unsupported_effort_error(code: i64, message: &str) -> bool {
+    code == -32603 && (message.contains("Invalid value") || message.contains("not support") || message.contains("model_not_found"))
 }
 ```
-(Confirm `SessionConfigSelectOptions` iterates to `&SessionConfigSelectOption`; if it is a newtype wrapper, use `sel.options.0.iter()` — check the type at impl time.)
+Tests: `none→Skip`; sonnet `high→Apply{effort,high}`; sonnet `xhigh→FellBack to high`; sonnet `max→Apply` (sonnet has max); codex `max→FellBack to xhigh`; `effort_level_name(Max)=="max"`; `is_unsupported_effort_error(-32603,"Invalid value …")` true, `(-32603,"usage_update")` false, `(-32000,"Invalid value")` false.
+- [ ] **Step 2:** Run → PASS. **Step 3:** `git commit -m "feat(acp): resolve_effort + precise unsupported-effort predicate"`
 
+## Task 6: `BridgeError::config_invalid` (operator-facing list, redacted on wire)
+
+**Files:** Modify `crates/bridge-core/src/error.rs`.
+
+- [ ] **Step 1: Failing test** — a `config_invalid("model 'x' not advertised (valid: a, b)")`: `Display`/internal form contains the list; `client_message()` returns the **static** category (no list), matching the wire-leak split (`error.rs:74-86`).
+- [ ] **Step 2:** Add the variant + `client_message()` arm (static, e.g. `"agent configuration rejected"`). **Step 3:** Run → PASS. **Step 4:** `git commit -m "feat(core): BridgeError::config_invalid (list in logs, static on wire)"`
+
+## Task 7: Wire into the mint closure (validate model, apply via set_config_option, effort, log)
+
+**Files:** Modify `crates/bridge-acp/src/acp_backend.rs` (`configure_session` mint closure); add `AcpConfig.agent_id`.
+
+- [ ] **Step 1:** Add `pub agent_id: String` to `AcpConfig`; thread it at construction (`main.rs:247-261`, `crates/bridge-container/src/lib.rs:249-261`) — pass the registry `AgentEntry.id`. Build (fix call sites).
+- [ ] **Step 2:** In the closure, after `session/new`:
 ```rust
-#[test]
-fn effort_from_picks_thoughtlevel_and_strips_default() {
-    // build a SessionConfigOption with category ThoughtLevel, options [default, low, medium, high, max]
-    // assert config_id + levels == ["low","medium","high","max"]
-}
-```
-
-- [ ] **Step 2: Run, expect PASS.** `cargo test -p bridge-acp model_effort`
-
-- [ ] **Step 3: Commit.** `git add -A && git commit -m "feat(acp): extract advertised models/effort from SDK config options"`
-
----
-
-## Task 5: Capture `ConfigOptionUpdate` notifications per session
-
-**Files:**
-- Modify: `crates/bridge-acp/src/acp_backend.rs`
-
-The agent pushes a `SessionUpdate::ConfigOptionUpdate` after `set_model` (re-scoping the effort levels to the new model). The mint must read the **post-set_model** options. Store the latest per session in shared state the `Client` sessionUpdate handler writes.
-
-- [ ] **Step 1: Locate the session-update handler.** `grep -n 'SessionUpdate' crates/bridge-acp/src/acp_backend.rs` — find where the `Client` impl matches update variants.
-
-- [ ] **Step 2: Add shared latest-config-options state.** On the struct that handles updates (the `Client` impl / connection state), add:
-
-```rust
-latest_config_options: Arc<Mutex<HashMap<SessionId, Vec<agent_client_protocol::SessionConfigOption>>>>,
-```
-Initialize it in the constructor.
-
-- [ ] **Step 3: Record on `ConfigOptionUpdate`.** In the update match, add:
-
-```rust
-SessionUpdate::ConfigOptionUpdate(u) => {
-    self.latest_config_options.lock().await.insert(session_id.clone(), u.config_options.clone());
-}
-```
-(Use the existing locking idiom — match sync/async Mutex already in the file.)
-
-- [ ] **Step 4: Build, expect PASS.** `cargo test -p bridge-acp` (no behavior change yet; just storage).
-
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(acp): record latest config_options per session from ConfigOptionUpdate"`
-
----
-
-## Task 6: Wire resolvers into the mint closure (model fail-loud + effort via discovered id + log)
-
-**Files:**
-- Modify: `crates/bridge-acp/src/acp_backend.rs` (the `configure_session` mint closure, ~lines 1000-1075)
-
-- [ ] **Step 1: Read advertised models + initial config options from the `session/new` response.** After `let resp = cx.send_request(req)...?;` and `let id = resp.session_id;`, capture:
-
-```rust
-let adv_models = resp.models.as_ref().map(model_effort::models_from);
-let initial_opts = resp.config_options.clone().unwrap_or_default();
-```
-
-- [ ] **Step 2: Replace the model block with validation.** Where `set_model` is sent today (the `if let Some(model) = model.as_deref()` block), change to:
-
-```rust
-if let Some(adv) = &adv_models {
-    match model_effort::resolve_model(model.as_deref(), adv) {
-        Err(e) => {
-            tracing::error!(want = %e.want, valid = ?e.valid, "model not advertised by agent; failing session mint");
-            return Err(BridgeError::agent_crashed(format!(
-                "configured model '{}' is not advertised by this agent (valid: {})", e.want, e.valid.join(", "))));
+let opts0 = resp.config_options.clone().unwrap_or_default();
+// MODEL — validate then apply via set_config_option; M2/M3 loud-on-missing.
+let refreshed = if let Some((model_id_cfg, values)) = model_effort::model_values(&opts0) {
+    match model_effort::resolve_model(model.as_deref(), &values) {
+        Err(e) => return Err(BridgeError::config_invalid(format!("model '{}' is not advertised by agent '{}' (valid: {})", e.want, self.agent_id, e.valid.join(", ")))),
+        Ok(model_effort::ModelDecision::Apply(v)) => {
+            let r = Self::set_config_option(cx, &id, &model_id_cfg, &v).await
+                .map_err(|e| BridgeError::config_invalid(format!("set model '{v}' failed: {e}")))?;
+            r.config_options.unwrap_or_else(|| opts0.clone())
         }
-        Ok(model_effort::ModelDecision::Apply(m)) => {
-            // best-effort send is fine now that we've validated; on transport error, fail mint
-            cx.send_request(Self::set_model_request(id.clone(), m)).block_task().await
-                .map_err(|e| BridgeError::agent_crashed(format!("session/set_model failed: {e}")))?;
-        }
-        Ok(model_effort::ModelDecision::Default) => {}
+        Ok(model_effort::ModelDecision::Default) => opts0.clone(),
     }
 } else if model.is_some() {
-    tracing::warn!("model configured but agent advertises no models; leaving default");
-}
+    return Err(BridgeError::config_invalid(format!("agent '{}' advertised no model option but model='{}' was configured (possible adapter/schema skew)", self.agent_id, model.as_deref().unwrap())));
+} else { opts0.clone() };
 ```
-(Note: validation is the loud guard; we still `?` on transport failure. If `adv_models` is `None` but a model was requested, warn — can't validate.)
-
-- [ ] **Step 3: Resolve effort against the POST-set_model options.** Replace the old `apply_effort`/`reasoning_effort` block with:
-
+- [ ] **Step 3:** EFFORT — resolve against `refreshed` (warn if a model was applied but `refreshed` lacks the effort option), apply with precise walk-down:
 ```rust
-// Prefer the latest pushed options (post set_model); fall back to the initial ones.
-let opts = {
-    let map = self.latest_config_options.lock().await;
-    map.get(&id).cloned().unwrap_or(initial_opts)
-};
-if let Some(adv_eff) = model_effort::effort_from(&opts) {
-    let want = effort.map(model_effort::effort_level_name);
-    match model_effort::resolve_effort(want, &adv_eff) {
-        model_effort::EffortDecision::Apply { config_id, level } => {
-            Self::set_config_option(cx, &id, &config_id, &level).await;
+if let Some(adv) = model_effort::effort_opt(&refreshed) {
+    match model_effort::resolve_effort(effort, &adv) {
+        model_effort::EffortDecision::Apply{config_id, level} | model_effort::EffortDecision::FellBack{config_id, to: level, ..} => {
+            // (log FellBack with from→to before applying)
+            Self::apply_effort_walkdown(cx, &id, &config_id, &level, &adv.levels).await; // tries level, then walks down on is_unsupported_effort_error
         }
-        model_effort::EffortDecision::FellBack { config_id, from, to } => {
-            tracing::warn!(%from, %to, "requested effort unsupported by active model; using highest supported <= requested");
-            Self::set_config_option(cx, &id, &config_id, &to).await;
-        }
-        model_effort::EffortDecision::Unsupported { from, levels } => {
-            tracing::warn!(%from, ?levels, "requested effort has no supported level <= it; leaving model default");
-        }
+        model_effort::EffortDecision::Unsupported{from} => tracing::warn!(%from, levels=?adv.levels, "no supported effort level <= requested; leaving default"),
         model_effort::EffortDecision::Skip => {}
     }
-} else if effort.is_some() {
-    tracing::warn!("effort configured but agent advertises no thought-level option; skipping");
-}
+} else if effort.is_some() { tracing::warn!("effort configured but agent advertised no thought-level option; skipping"); }
+tracing::info!(agent=%self.agent_id, requested_model=?model, requested_effort=?effort, "model_effort_resolved");
 ```
-Add a small private async helper `set_config_option(cx, id, config_id, value)` that builds a `SetSessionConfigOptionRequest` from the **discovered** `config_id` (NOT the old constant) and sends it best-effort (log on error). Remove `EFFORT_CONFIG_ID`/`effort_value`/`set_effort_request`/`apply_effort` (now subsumed) — or keep `effort_value` only if a test references it; otherwise delete to avoid dead code.
+- [ ] **Step 4:** Add private helpers `set_config_option(cx,id,config_id,value) -> Result<SetSessionConfigOptionResponse,_>` (builds `SetSessionConfigOptionRequest` from the **discovered** id) and `apply_effort_walkdown(...)` (loop: try level; on err, if `is_unsupported_effort_error(code,msg)` drop to next-lower advertised level by `EFFORT_ORDER` and retry; else `warn` raw error and stop). **Remove** `EFFORT_CONFIG_ID`/`effort_value`/`set_effort_request`/`set_model_request` usage; delete now-dead items + their tests (or move assertions into `model_effort`).
+- [ ] **Step 5:** `cargo test -p bridge-acp` — fix golden/wire tests referencing the removed builders.
+- [ ] **Step 6:** `git commit -m "feat(acp): capability-driven model+effort at mint via set_config_option"`
 
-- [ ] **Step 4: Emit the resolved log line** after both applied:
+## Task 8: Config + migration + docs
 
-```rust
-tracing::info!(
-    agent = %self.agent_id_for_log(),
-    model = %adv_models.as_ref().map(|m| m.current.as_str()).unwrap_or("<default>"),
-    requested_model = ?model, requested_effort = ?effort,
-    "model_effort_resolved");
-```
-(The post-apply `current` from `adv_models` reflects the default; for the actually-set model, log `model.as_deref()`-or-current. Choose the most informative available — the requested + the advertised-current.)
+**Files:** `bin/a2a-bridge/src/config.rs` (agent_id thread-through if not done), `examples/*.toml`, `examples/a2a-bridge.multi-agent.toml`, `README.md`, `docs/onboarding.md`, `bin/a2a-bridge/src/init-readme-template.md`, `main.rs:2106-2118`.
 
-- [ ] **Step 5: Build + run.** `cargo test -p bridge-acp` — fix the unit/golden tests that referenced the removed `EFFORT_CONFIG_ID`/`set_effort_request` (update them to the new `set_config_option` path or move those assertions into `model_effort` tests).
+- [ ] **Step 1:** **Remove the kiro `model="auto"` pin** in `multi-agent.toml` (kiro advertises no model option → M2/M3 would hard-fail). Add a migration comment.
+- [ ] **Step 2:** Pin advertised model ids in the example review/implement configs; add one alias example (`model="fable"` with a comment "→ claude-fable-5[1m]").
+- [ ] **Step 3:** Fix stale docs: README (codex effort values; remove "claude gets no bridge effort"), onboarding, init template + `main.rs` init fragment. Add the effort-level guidance table (spec §11).
+- [ ] **Step 4:** `cargo test -p a2a-bridge` (config parse tests). **Step 5:** `git commit -m "docs+config: migrate kiro model pin, fix stale model/effort docs"`
 
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(acp): capability-driven model validation + effort at mint (fixes claude effort no-op)"`
+## Task 9: ADR-0029
 
----
+- [ ] **Step 1:** Write `docs/adr/0029-model-effort-pinning.md` — context (codex-shaped plumbing; claude effort no-op; 0.44.0 restabilized model into config options; two dogfooded spec-reviews incl. Fable-as-reviewer), decision (capability-driven config-option resolution; alias map; precise effort walk-down; hard-error+valid-list on logs/CLI; fallback_model descoped), consequences (migration: kiro pin removed, claude effort now applies, model pins validated). Co-Authored-By trailer.
+- [ ] **Step 2:** `git commit -m "docs: ADR-0029 capability-driven model & effort pinning"`
 
-## Task 7: `fallback_model` config surface
+## Task 10: Live gate (claude 0.44.0 + codex)
 
-**Files:**
-- Modify: `bin/a2a-bridge/src/config.rs` (`AgentToml`, `AcpConfig` build), `crates/bridge-acp/src/acp_backend.rs` (`AcpConfig.fallback_model`)
+- [ ] **a** `model="haiku"` → transcript `claude-haiku-4-5-*`.
+- [ ] **b** `model="fable"` → alias→`claude-fable-5[1m]` → transcript `claude-fable-5`.
+- [ ] **c** `model="bogus"` → mint fails; CLI stderr + log show "not advertised (valid: …)"; A2A wire stays the static category.
+- [ ] **d** `model="sonnet" effort="high"` → applies; no `Unknown config option`; `model_effort_resolved` logged.
+- [ ] **e** `model="sonnet" effort="xhigh"` → warn "fell back high"; mint ok.
+- [ ] **f** codex `model="gpt-5.5" effort="high"` → rollout `gpt-5.5`; effort via discovered `reasoning_effort`.
+- [ ] **Step:** record results in the ADR consequences + a memory update.
 
-- [ ] **Step 1: Add the field.** `AgentToml.fallback_model: Option<String>` and `AcpConfig.fallback_model: Option<String>`; thread it through where `AcpConfig` is built from `AgentToml`.
+## Self-review
 
-- [ ] **Step 2: Failing test** (config.rs test mod): a `[[agents]]` with `cmd="claude-agent-acp"` + `fallback_model="sonnet"` parses with `fallback_model == Some("sonnet")`; an agent without it parses `None`.
-
-- [ ] **Step 3: Implement to pass; run** `cargo test -p a2a-bridge config`.
-
-- [ ] **Step 4: `parse_effort` accepts `xhigh`.** Add the `"xhigh" => Effort::Xhigh` arm + a test `parse_effort("xhigh") == Effort::Xhigh`.
-
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(config): fallback_model field + parse_effort xhigh"`
-
----
-
-## Task 8: Wire claude `--fallback-model` into the spawn args
-
-**Files:**
-- Modify: `bin/a2a-bridge/src/main.rs` (the `acp_program_argv`/`SpawnFn` site), `crates/bridge-container/src/lib.rs` (the container spawn arg path)
-
-- [ ] **Step 1: Verify the adapter forwards `--fallback-model`.** Run, from a scratch dir:
-```bash
-claude-agent-acp --fallback-model sonnet </dev/null   # should not error on the flag (adapter forwards argv to claude)
-```
-Confirm via the Claude CLI reference that `--fallback-model <model>` is the right flag. If `claude-agent-acp` does NOT forward it, fall back to setting it via the documented env (`ANTHROPIC_*`)/spawn and adjust this task; record the finding in the ADR.
-
-- [ ] **Step 2: Append the arg when set.** In `acp_program_argv` (the function that assembles the ACP program argv per agent), when the agent `cmd` basename is `claude-agent-acp` and `fallback_model` is `Some(m)`, append `["--fallback-model", m]`. For a codex agent with `fallback_model` set, return a config error at load ("fallback_model is claude-only; codex uses …") unless Step-1 finds a codex equivalent.
-
-- [ ] **Step 3: Validate the `fallback_model` chain against advertised models at mint** (reuse `resolve_model`): `--fallback-model` accepts a **comma-separated chain** (verified: claude docs; up to 3, `"default"` expands). In the mint closure, if `fallback_model` is set and `adv_models` is present, split on `,`, and for each element (skip the literal `"default"`, which always resolves) run `resolve_model(Some(elem), adv)` and **fail the mint** on `Err`. This catches a typo'd fallback element. (codex: `fallback_model` is rejected at config load per Step 2 — no codex equivalent exists.)
-
-- [ ] **Step 4: Test.** Unit-test `acp_program_argv` includes `--fallback-model sonnet` for a claude agent and omits it otherwise. Run `cargo test -p a2a-bridge`.
-
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat: wire claude --fallback-model spawn arg + validate against advertised models"`
-
----
-
-## Task 9: Examples + docs
-
-**Files:**
-- Modify: `examples/a2a-bridge.slicing-review.toml`, `examples/a2a-bridge.slicing-implement.toml`
-- Modify/Create: `docs/onboarding.md` (or the config-reference doc) — model/effort/fallback_model section + the effort-level guidance table
-
-- [ ] **Step 1: Pin models explicitly in the examples** with comments, e.g. review reviewers `model="sonnet"`, implementor `model="gpt-5.5" effort="high"` (use advertised ids), and one `fallback_model="sonnet"` example on a claude agent.
-
-- [ ] **Step 2: Add the effort-level guidance table** (spec §11, verbatim) to the docs so config authors know low/medium/high/xhigh/max semantics + the model-dependent levels.
-
-- [ ] **Step 3: Commit.** `git add -A && git commit -m "docs: model/effort/fallback_model config guidance + pinned example models"`
-
----
-
-## Task 10: ADR-0029
-
-**Files:**
-- Create: `docs/adr/0029-model-effort-pinning.md`
-
-- [ ] **Step 1: Write the ADR** — Context (codex-shaped plumbing; claude effort silent no-op; unvalidated model pins; the live probes), Decision (capability-driven mint-time resolution; discover by `category` Model/ThoughtLevel; hard-error bad model; highest-≤-requested effort fallback; `fallback_model` spawn arg), Alternatives (hardcode per-agent table — rejected, brittle; stringly-typed effort — rejected, kept typed `Effort`+`Xhigh`), Consequences (the SDK 0.12.1 already exposes the types; CLI shorthand like `opus` no longer accepted — use advertised ids). End with the `Co-Authored-By` trailer.
-
-- [ ] **Step 2: Commit.** `git add -A && git commit -m "docs: ADR-0029 capability-driven model & effort pinning"`
-
----
-
-## Task 11: Live gate (real claude + codex)
-
-**Files:** none (validation)
-
-- [ ] **Step 1: claude model pin serves the pinned model.** A minimal config with a claude agent `model="haiku"`; drive one prompt through the bridge; confirm via the transcript `~/.claude/projects/<encoded-cwd>/*.jsonl` that `"model":"claude-haiku-4-5-*"` served. Expected PASS.
-
-- [ ] **Step 2: bad model fails loudly.** Set `model="bogus-zzz"` → the run fails the mint with the "not advertised (valid: …)" error. Expected non-zero exit + clear message.
-
-- [ ] **Step 3: claude effort now applies.** Set `model="sonnet" effort="high"` → no `Unknown config option` warning; the mint log shows `model_effort_resolved … effort` applied; (optional) confirm via transcript/usage the effort took.
-
-- [ ] **Step 4: effort fallback warns.** `model="sonnet" effort="xhigh"` → warn "using highest supported <= requested" and applies `high`; mint succeeds.
-
-- [ ] **Step 5: codex unchanged.** A codex agent `model="gpt-5.4-mini" effort="high"` → rollout serves `gpt-5.4-mini`; effort applied via discovered `reasoning_effort`. Expected PASS.
-
-- [ ] **Step 6: fallback_model accepted + present.** claude agent `model="sonnet" fallback_model="haiku"` mints; the spawned argv includes `--fallback-model haiku` (check process args / adapter behavior).
-
-- [ ] **Step 7: Record results** in the ADR's consequences / a memory update.
-
----
-
-## Self-Review notes (filled by author)
-
-- **Spec coverage:** §2 goals → model validation (T2,T6), claude effort fix (T3-T6), effort fallback+warn (T3,T6), observability log (T6), fallback_model (T7,T8). §5 surfaces → config (T7), spawn arg (T8). §10 SDK risk → retired (types confirmed present; no Task-0 bump). §11 guidance → T9.
-- **Refinement vs spec §5.3:** kept the typed `Effort` enum + added `Xhigh` (instead of a raw string) — less ripple through `SessionSpec`/`effective_config`, and the highest-≤-requested fallback subsumes both vendor vocabularies (codex `Max`→`xhigh`, claude `Max`→`max`). Spec §5.3 updated to match.
-- **Type consistency:** `AdvertisedModels`, `AdvertisedEffort`, `ModelDecision`, `EffortDecision`, `resolve_model`, `resolve_effort`, `effort_from`, `models_from`, `effort_level_name`, `set_config_option` used consistently T2-T8.
-- **Order:** mint applies mode → model (validate, fail-loud) → re-read options → effort (discovered id, fallback) → log.
-```
+- **Spec v2.1 coverage:** §5.1 discovery → T4 (grouped/Other); §5.2 model+alias → T3; §5.3 effort+predicate+order → T5; §6 mint order → T7; §8 error surface → T6+T7; §7 files (agent_id, both parsers, migration) → T1/T2/T7/T8; §11 guidance → T8. fallback_model: absent (descoped) ✓.
+- **Type consistency:** `ModelDecision`, `ModelNotAdvertised`, `AdvertisedEffort`, `EffortDecision`, `resolve_model`, `resolve_effort`, `model_values`, `effort_opt`, `effort_level_name`, `is_unsupported_effort_error`, `EFFORT_ORDER`, `apply_alias`, `BridgeError::config_invalid`, `AcpConfig.agent_id` — used consistently T3-T8.
+- **No `Ord` on `Effort`** (ordering in `EFFORT_ORDER`); both effort parsers via one `FromStr`.
