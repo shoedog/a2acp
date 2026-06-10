@@ -1,136 +1,284 @@
-# Podman Support — Design
+# Podman Support — Design (v2)
 
 **Date:** 2026-06-10
-**Status:** Draft (for review)
-**Slice:** 1 of the "container footprint" increment (podman first, then the memory slices: concurrency cap → per-container caps/throttle, which then let the OrbStack VM ceiling be *lowered*).
+**Status:** Draft (for review) — v2 folds a dogfooded **spec-review** (codex + claude-fable, prism-grounded:
+`docs/superpowers/reviews/2026-06-10-podman-spec-review.md`) and an independent **clean-room design**
+(codex + claude-fable, prism-grounded: `docs/superpowers/reviews/2026-06-10-podman-cleanroom-design.md`).
+Both passes converged on v1's architecture and enriched it; both blockers are resolved below.
+**Slice:** 1 of the "container footprint" increment (podman first; the memory slices — concurrency cap →
+`--memory` caps + cargo `-j` throttle → lower the OrbStack VM ceiling — follow as separate specs).
 
-**Goal:** Run the bridge's containerized backends (`:ro` readers, `:rw` implementor, verify) under **rootless podman** with **zero behavioral change on docker**, so the bridge can be used on a podman-only machine (the operator's work Mac → `podman machine` → Linux containers, same shape as this dev Mac).
+**Goal:** Run the bridge's containerized backends (`:ro` readers, `:rw` implementor, verify) under
+**podman on macOS (`podman machine`)** with **zero behavioral change on docker**, so the bridge runs on a
+podman-only Mac (the operator's work + dev Macs).
+
+**Owner decisions (locked):** (1) a disallowed `[verify].runtime` **rejects into `VerifyOutcome::ConfigError`**
+(verify never runs); (2) **Linux rootless podman is deferred** to a follow-up increment (uid/SELinux differ);
+this increment validates macOS `podman machine` only.
 
 ---
 
 ## Context & current state
 
-The bridge shells out to a container runtime for every sandboxed workload (spawn agent, verify, sweep, reap, staleness probe). An audit + live probing during the memory-measurement session established:
+The bridge shells out to a container runtime for every sandboxed workload (spawn agent, verify, sweep,
+reap, staleness probe, boot lease-recovery, the `containers` CLI). Two independent prism-grounded passes
+confirmed:
 
-- **The runtime is already a single configurable knob, threaded as a parameter everywhere.** `SandboxConfig.runtime: Option<String>` (`crates/bridge-core/src/domain.rs:67`) defaults to `"docker"` via `runtime()` (`:85`). The compose builders (`crates/bridge-core/src/sandbox.rs`), the reaper (`crates/bridge-core/src/reaper.rs` — `reap_once`/`production_reap_fn`/`run_scoped_reap`/`classify_sweep`/`is_stale` all take `runtime: &str`), the verify runner (`bin/a2a-bridge/src/verify.rs`), and the `containers` CLI (`bin/a2a-bridge/src/main.rs`) all receive the runtime name. The only non-test `"docker"` literal is the `unwrap_or("docker")` default. **No hardcoded bypass.**
-- **The runtime is also security-allowlisted.** `validate_sandbox` (`crates/bridge-registry/src/registry.rs:104`, the S3 invariant) rejects any sandbox whose resolved `runtime` is not in `allowed_cmds`. So selecting podman is two config facts: `runtime = "podman"` **and** `"podman"` ∈ `allowed_cmds`.
-- **Every command the bridge issues is podman-CLI-identical:** `run -i --rm`, `ps -aq --filter name=…`, `ps -a --filter label=… --format {{…}}`, `rm -f`, `logs --since … --tail 1`, `-v host:dst[:ro]`, `--network <name>`, `--label k=v`, `--name`. Podman matches Docker's CLI surface for all of these.
-
-**What is NOT done (this slice):**
-1. There is no shipped **podman example config**, so an operator must hand-edit `runtime`/`allowed_cmds` into every sandbox block.
-2. The **egress infrastructure** (`deploy/containers/compose.egress.yaml`) is `docker compose`-only — three networks (two `internal: true`) and two tinyproxy services. Podman needs an equivalent bring-up path.
-3. There is **no preflight** that the configured runtime binary actually exists/responds, so a missing or unstarted podman surfaces as a cryptic per-spawn failure instead of a clear boot error.
-4. **Docs** (`docs/containerized-agents.md`, `docs/onboarding.md`) describe docker only.
+- **The runtime is already the single seam, threaded as data with no branch anywhere.** `SandboxConfig.runtime`
+  (`crates/bridge-core/src/domain.rs`, `runtime()` defaults `"docker"`) flows through the S3 allowlist
+  (`crates/bridge-registry/src/registry.rs:96-106`), every pure argv composer (`compose_sandbox`,
+  `compose_container_rw`, `compose_verify`, `compose_sandbox_named`, the sweep/reap/inspect helpers in
+  `crates/bridge-core/src/sandbox.rs`), the reaper (`crates/bridge-core/src/reaper.rs`), the `:rw` backend,
+  and the `containers` CLI (`bin/a2a-bridge/src/main.rs:2449-2538`, which already iterates per-runtime and
+  reaps idempotently across engines). `docs/containerized-agents.md:7-9` already names rootless podman as a
+  target. **Podman enters as config; no Rust is required for it to *function*.**
+- **GAP — `[verify].runtime` bypasses the allowlist.** `allowed_cmds` has exactly one enforcement consumer
+  (`validate_sandbox`, S3), which covers agent sandbox blocks only. `VerifyConfig.runtime`
+  (`config.rs:397`, parsed `:378`/`:411`, consumed `verify.rs:147-154`) is never checked. Pre-existing, but
+  the podman increment makes it dangerous: a half-converted config silently runs verify on docker, and on a
+  dual-engine host can **false-pass against Docker's image store**. Closed in slice 4 (owner decision 1).
+- **RISK — Go-template dialect.** Two sites emit Docker's `{{.Label "key"}}`: `bin/a2a-bridge/src/containers.rs:25`
+  (`LIST_FORMAT`, operator CLI) and `crates/bridge-core/src/sandbox.rs:222-235` (`managed_inspect_argv`, used
+  by **boot-time lease recovery**, `reaper.rs:110-134`). If podman's template dialect diverges, `parse_record`/
+  `plan_recovery` skip malformed lines — failing *closed into invisibility* (stale containers unrecovered/
+  unreaped). Gated live (G4/G6); contingency designed, not pre-built (§6).
 
 ---
 
-## Non-goals
+## Scope & non-goals
 
+**In scope:** macOS `podman machine`; the podman example config + parse tests; podman image-build path; the
+egress bring-up script + contract; the verify-runtime allowlist gate + a warn-level runtime preflight; docs.
+
+**Non-goals / deferred:**
+- **Linux rootless podman** — a separate follow-up increment (carries the SELinux `:z`/`:Z` structured-mount
+  question and the differing uid semantics; same config + script, re-run gates). Owner decision 2.
 - **Re-architecting the runtime abstraction** — it already exists; this slice consumes it.
-- **Linux rootful docker** — already unsupported (the `:rw` implement design rejects rootful Docker on Linux due to bind-mount uid ownership); unchanged.
-- **The memory slices** (concurrency cap, `--memory` caps, `-j` throttle, VM-ceiling lowering) — separate specs, follow this one.
-- **podman as the default** — docker stays the default (`unwrap_or("docker")`); podman is opt-in.
-- **A cross-runtime abstraction layer / runtime auto-detection** — YAGNI; the operator names the runtime in config.
+- **podman as default** — docker stays the default (`unwrap_or("docker")`); podman is additive opt-in.
+- **`podman-compose` dependency** — avoided; a hand-rolled script is the supported egress path.
+- **Freeform per-runtime args / a `default_runtime` knob** — YAGNI; the runtime is named per sandbox/verify
+  block as today.
+- **The memory slices** (concurrency cap, `--memory` caps, `-j` throttle, VM-ceiling lowering) — later specs.
 
 ---
 
 ## Design
 
-### §1 — Podman example config
+### §1 — Podman example config + pinning tests
 
-Ship `examples/a2a-bridge.containerized.podman.toml`: a copy of `a2a-bridge.containerized.toml` with exactly two kinds of edit, so it's diff-obvious:
+`examples/a2a-bridge.containerized.podman.toml`: a copy of `a2a-bridge.containerized.toml` with exactly two
+kinds of edit, diff-obvious:
 
-- `allowed_cmds = [..., "podman"]` (the runtime joins the cmd allowlist).
-- `runtime = "podman"` added to **every** `[agents.sandbox]` block **and** the `[verify]` block.
+- `allowed_cmds = ["podman"]` (podman-only; the runtime is the allowlist's S3 entry).
+- `runtime = "podman"` in **every** `[agents.sandbox]` block (including `impl`) **and** the `[verify]` block.
 
-Everything else (mounts, egress nets, proxies, creds, workflows) is byte-identical to the docker config. A header comment states the two-line rule so operators can convert their own configs.
+Everything else (mounts, egress nets/proxy URLs, creds, workflows) is byte-identical. A header comment states
+the two-line rule. A distinct config path also yields a distinct `container_owner = hash(config_path, mount,
+agent_id)`, so docker-owned and podman-owned fleets coexist cleanly on a dual-engine host (the established
+per-project-concurrency mechanism).
 
-**Why a separate file, not a doc note:** the runtime appears in N sandbox blocks; a ready-to-run file is less error-prone than "add `runtime = "podman"` to each block" prose, and it's the artifact the live smoke and the docs both point at.
+**Pinning (repo convention — shipped examples have parse tests):** two sibling tests in `main.rs` (patterns at
+`:3341` and the full-`validate()` test at `:3548`). The latter live-exercises S3 with `allowed_cmds =
+["podman"]` at **zero runtime cost** (validation is pure), and asserts structural parity with the docker
+example (same blocks; diffs confined to `runtime`/`allowed_cmds`) so a future docker-example edit can't
+silently drift the artifact docs + the smoke point at.
 
-### §2 — Podman egress bring-up
+### §2 — Images (`FROM` qualification + build order)
 
-`compose.egress.yaml` uses Docker-Compose networks (`internal: true`) and two services built from `proxy.Containerfile`. Rather than depend on `podman-compose` (a third-party tool with its own version skew and quirks), ship a **hand-rolled, idempotent shell script** that uses podman primitives directly — the same surface the bridge itself uses:
+Podman's short-name resolution can prompt/refuse unqualified bases. Qualify **only the registry bases**, which
+are no-ops on Docker:
+- `deploy/containers/reader.Containerfile:3` → `FROM docker.io/library/node:24-slim`
+- `deploy/containers/proxy.Containerfile:1` → `FROM docker.io/library/debian:stable-slim`
 
-`deploy/containers/podman-egress-up.sh` (+ a `…-down.sh`):
-- `podman network create --internal a2a-egress-internal` (idempotent: ignore "already exists")
-- `podman network create a2a-egress-external`
-- `podman network create --internal a2a-verify-egress`
-- `podman build -t a2a-egress-proxy:latest -f proxy.Containerfile .`
-- `podman run -d --name a2a-egress-proxy --network a2a-egress-internal --restart unless-stopped a2a-egress-proxy:latest`, then `podman network connect a2a-egress-external a2a-egress-proxy` (podman attaches one network at `run`; additional nets via `network connect`).
-- `podman run -d --name a2a-verify-proxy --network a2a-verify-egress -v ./tinyproxy.verify.filter:/etc/tinyproxy/filter:ro --restart unless-stopped a2a-egress-proxy:latest`, then `podman network connect a2a-egress-external a2a-verify-proxy`.
+**Do NOT qualify `deploy/containers/toolchain.Containerfile:4`** — it is `FROM a2a-agent-reader:latest`, a
+**local** image reference; qualifying it would point at a nonexistent registry image and break both engines.
+The runbook documents the build order **reader → toolchain → proxy**; if podman ever refuses the local
+short-name, the podman-only fix is `localhost/a2a-agent-reader:latest` (not applied while the file also
+serves Docker).
 
-The script is the **tested** egress recipe; `podman-compose -f compose.egress.yaml up` is mentioned in docs as an untested convenience, not the supported path. The agent/verify images (`a2a-agent-reader`, `a2a-toolchain`) are built with `podman build` into podman's image store (separate from docker's) — the script (or docs) covers `podman build` for those too, since podman cannot see docker-built images.
+### §3 — Egress bring-up (`podman-egress.sh`, a tested contract)
 
-### §3 — Runtime preflight (small code, recommended)
+`compose.egress.yaml` stays the untouched Docker path. Ship one self-contained script
+`deploy/containers/podman-egress.sh` with `up | status | down`, that **self-locates** (`cd "$(dirname "$0")"`)
+and uses raw podman primitives — the same surface the bridge itself uses — reproducing the **same names** so
+the bridge config contract is unchanged:
 
-Add a boot-time check so a missing/unstarted runtime fails **loud and early** instead of deep in the first spawn.
+- Networks (idempotent — ignore "already exists"): `a2a-egress-internal` (`--internal`), `a2a-verify-egress`
+  (`--internal`), `a2a-egress-external` (routed).
+- Each proxy: `rm -f <name>` first (the reaper's own idiom — makes re-running `up` the recovery path) →
+  `create --name <name> --network <its-internal-net> [absolute -v for the verify filter]
+  a2a-egress-proxy:latest` → `network connect a2a-egress-external <name>` → `start`. (`run`/`create` take a
+  single `--network`; tinyproxy dials upstream lazily, so attach-then-start is safe.)
+- `status`: report the 3 networks + 2 proxies. `down`: tolerate-absent (proxies before networks).
 
-- Pure helper `preflight_runtimes(runtimes: &BTreeSet<String>, probe: &dyn Fn(&str) -> bool) -> Result<(), BridgeError>` (injectable probe → unit-testable). It returns `ConfigInvalid { reason }` naming the first runtime whose probe fails, with a hint (`"… not found or not responding; is the runtime installed and (for podman) is 'podman machine' started?"`).
-- The production probe runs `<runtime> version` with a short timeout; success = exit 0.
-- Collect the distinct runtimes from the snapshot's sandbox blocks **and** the verify config; call the preflight once at boot in the `serve` / `run-workflow` / `implement` paths, **only when at least one sandboxed workload exists** (host-only configs skip it entirely — no runtime needed).
-- This is the **only** Rust change in the slice; it is additive and runtime-neutral (it equally catches a missing docker).
+**Post-condition contract (G2 tests this — it doubles as the compose↔script drift detector):** three networks
+exist (two internal with no external route, one routed); both proxies run attached to their internal net +
+the external net; each proxy is reachable from its internal net at exactly the URL the bridge config states
+(`http://a2a-egress-proxy:8888`, `http://a2a-verify-proxy:8888`); the verify proxy serves the
+registries-only filter.
 
-### §4 — Docs
+**DNS caveat (aardvark-dns):** podman historically didn't serve DNS on `--internal` networks (fixed
+netavark ≥1.6 / podman ≥4.5). G2's **first** probe is name-resolution of `a2a-egress-proxy` from the internal
+net. If it fails on the operator's podman, the fallback is pure config (no code): create the internal nets
+with `--subnet`, pin the proxies with `--ip`, and set `proxy = "http://<ip>:8888"` in the podman example —
+`EgressPolicy::Locked{network, proxy, no_proxy}` carries the proxy as opaque data. Name-first
+(debuggability), IP-second. Docs state a minimum podman version.
 
-- `docs/containerized-agents.md`: a **Podman** section — the two-line config rule (§1), the egress script (§2), `podman build` for the images, the `podman machine` note for macOS, and the rootless caveats (§6).
-- `docs/onboarding.md`: one line pointing at the podman config + section.
+**Restart survival:** `--restart unless-stopped` does **not** survive `podman machine stop/start` (daemonless).
+The supported recovery is documented: re-run `podman-egress.sh up` after a machine restart (idempotent).
+A quadlet/systemd-managed proxy is deferred to the Linux increment.
+
+### §4 — Verify-runtime allowlist gate (slice 4 — the only Rust; owner decision 1: reject)
+
+Close the §Context gap so a disallowed verify runtime **never executes**:
+- `VerifyConfig::runtime() -> &str` (default `"docker"`), mirroring `SandboxConfig::runtime()`.
+- `RegistryConfig::effective_allowed_cmds()` — the **default** allowlist (no `[registry]`, currently agent-cmds
+  only at `config.rs:734-753`) must union agent raw commands + sandbox runtimes + the verify runtime when
+  `[verify]` exists; otherwise a `[registry]`-less podman-verify config would self-reject.
+- `VerifyToml::to_config_checked(&self, allowed_cmds)` called at **both** implement parse sites
+  (`main.rs:~1286` and the `--resume` path `~1550`) — verify is parsed separately from `into_snapshot()`,
+  so the check cannot live solely in `bridge-registry`.
+- A disallowed verify runtime **rejects into the existing `VerifyOutcome::ConfigError` path** (`main.rs:806`)
+  — no container spawns, no crash. Note the B2b-3b interaction: a `ConfigError` verify can't contribute a
+  PASS, so a misconfigured loop surfaces loudly rather than converging falsely.
+
+### §5 — Runtime preflight (warn-level, slice 4)
+
+A boot/start nicety, **not** the enforcement (the allowlist in §4 + S3 is the hard gate). A pure helper probes
+`<runtime> info` once at `serve` boot / `implement` start for the distinct runtimes actually used; on failure
+it **warns** (names the runtime, suggests `podman machine start`) but does not block — a genuinely missing
+runtime already degrades safely (ENOENT → `AgentCrashed` + reap no-op; verify → failed result). The bridge
+resolves `podman` via `PATH`; the docs note this for launchd-launched `serve`. Injected probe → unit-testable.
+
+### §6 — Template-dialect contingency (gate live; build only if a gate fails)
+
+Do **not** pre-build a fix for the `{{.Label "key"}}` risk. Gate it (G4 = the safety-relevant recovery site;
+G6 = the CLI). If a gate fails:
+- **only `.Label` diverges** → a per-runtime template fork inside the two pure builders (they already take
+  `runtime: &str`; smallest diff).
+- **anything else in the template surface diverges** → replace the label readers with an inspect-JSON path
+  (`ps -aq --filter label=…` → `inspect` IDs → parse labels from JSON), eliminating the dialect dependency
+  class. Either way the change is confined to `sandbox.rs`/`containers.rs`; zero domain movement.
+
+### §7 — Docs (`docs/containerized-agents.md` podman section + `docs/onboarding.md` pointer)
+
+- `podman machine init` sizing (`--cpus 6 --memory 8192 --disk-size 100`); confirm `/Users` is mounted so the
+  identical-path `-v {m}:{m}` bind works.
+- Image build order (reader → toolchain → proxy) with `podman build` commands.
+- The egress script (§3) + "re-run `up` after `podman machine start`".
+- **Disjoint image/volume stores:** podman cannot see docker-built images; the named volume `a2a-kiro-data`
+  does **not** carry over → **kiro device-flow re-mint is required** under podman.
+- **Verify containers are unmanaged** (no `a2a.managed=1` label — `sandbox.rs:136`): `containers list|reap`
+  never sees them; the runbook must **not** promise verify cleanup via `containers reap` (true on Docker too).
+- **podman `rm` is synchronous** — expect 0 containers immediately after a run, unlike Docker Desktop's ~2 s
+  async removal (so the reap gates assert 0 *immediately* under podman).
+- The `PATH` note (§5) for launchd `serve`.
+
+### §8 — `sync-creds.sh` message
+
+`deploy/containers/sync-creds.sh` is host-side and runtime-agnostic, **except** line 48 prints a hardcoded
+`docker run` hint for the kiro re-login. Make the message runtime-neutral (or honor `CONTAINER_RUNTIME`).
+Docs-slice nit, not a behavior change.
 
 ---
 
-## §5 — Runtime-parity audit (docker-ism → podman)
+## §9 — Runtime-parity audit (docker-ism → podman)
 
 | surface | bridge usage | podman | action |
 | --- | --- | --- | --- |
 | spawn | `run -i --rm --name --label -v --network <img> <cmd>` | identical | none |
-| sweep | `ps -aq --filter name=…`, `ps -a --filter label=… --format {{…}}` | identical | none |
-| reap | `rm -f <name>` | identical | none |
-| staleness | `logs --since <win> --tail 1 <name>` | identical | none |
-| `:ro`/`:rw` bind | `-v host:dst[:ro]` | identical | none |
-| internal net | `--network a2a-egress-internal` (no gateway) | `network create --internal` | §2 script |
-| uid on bind writes | container root → host user | **rootless podman: native userns remap** (Docker Desktop/OrbStack: VM remap) | none (handled by runtime); note in docs |
-| writable creds mount | token-refresh writes back into the mounted creds | works on both | docs caveat |
+| sweep | `ps -aq --filter name=…`, `ps -a --filter label=… --format {{…}}` | identical CLI; **template dialect is the risk** | §6 (gate) |
+| reap | `rm -f <name>` (synchronous on podman) | identical | docs note |
+| staleness | `logs --since <win> --tail 1 <name>` | identical; `is_stale` biases false on error → degrades safe | none |
+| `:ro`/`:rw` bind | `-v host:dst[:ro]`, identical-path | identical (confirm `/Users` mounted in machine) | docs |
+| internal net | `--network …-internal` + name-resolved proxy URL | `network create --internal`; **DNS caveat** | §3 (probe + IP fallback) |
+| uid on bind writes | container root → host user | macOS machine: **virtiofs VM-remap** (Docker-Desktop-like); the B2b-1 `safe.directory` round-trip absorbs it | G5 |
+| writable creds mount | token refresh writes back | works | G5 |
 
-No code path needs a docker-vs-podman branch; the parity is in the CLI surface, which is already parameterized.
-
----
-
-## §6 — Validation (live smoke on this Mac = representative of the work Mac)
-
-Because the operator's work machine is also a Mac, `podman machine` on this dev Mac is the representative environment (Mac host → podman VM → Linux containers), not Linux-rootful. The smoke runs here **after the operator frees host RAM** (pause Prism + stockTrading agents; stop the stockTrading dev stack — the host currently swaps ~7 GB, so a second VM needs that headroom).
-
-Smoke checklist (operator + controller):
-1. **Pre:** stockTrading dev stack stopped; `podman machine init` (modest size, e.g. 6 GiB / 6 CPU) + `podman machine start`.
-2. **Images:** `podman build` the `a2a-agent-reader` (and `a2a-toolchain` if testing verify) into podman's store.
-3. **Egress:** run `deploy/containers/podman-egress-up.sh`; confirm 3 networks + 2 proxies up (`podman ps`, `podman network ls`).
-4. **Preflight:** `run-workflow` with a host-only config → preflight skipped; with the podman config but `podman machine` stopped → boot fails with the clear runtime error (§3).
-5. **Spawn + egress-lock:** run a containerized `code-review` (or `design`) smoke with `…podman.toml` on a tiny input → readers spawn as podman containers; confirm an agent on `a2a-egress-internal` reaches the provider **only via the proxy** (egress lock holds — a direct-egress attempt fails).
-6. **Reap:** after the run, `podman ps -a` shows no leaked `a2a-ro-*`/`a2a-rw-*`; the `containers` CLI lists/reaps under podman.
-7. **Teardown:** `podman-egress-down.sh`; `podman machine stop`/`rm`. Operator restarts the stockTrading dev stack.
-
-A failure at step 5 (egress leak) or 6 (leak) is a real conformance gap; a step-1/2 failure is environmental.
+No code path needs a docker-vs-podman branch (the one possible exception, §6, is contingent and seam-local).
 
 ---
 
-## §7 — Risks & mitigations
+## §10 — Validation gates (macOS `podman machine`)
 
-- **podman multi-network attach at `run`:** podman attaches a single `--network` at run; the proxies need two. *Mitigation:* `run` with the primary net, then `network connect` the second (§2) — explicit in the script.
-- **Separate image store:** podman cannot see docker-built images. *Mitigation:* the script/docs build images with `podman build`; the smoke step 2 makes this explicit.
-- **`podman machine` VM resource pressure on a 24 GB host:** *Mitigation:* gated on the operator stopping the stockTrading stack; podman-machine sized modestly; torn down right after.
-- **podman-compose drift:** avoided by not depending on it (hand-rolled script is the supported path).
-- **Rootless port/permission differences:** the bridge binds no host ports for agents (stdio ACP) and mounts under the user's home; rootless podman handles both. The proxies expose no host ports either (container-to-container only). Low risk; covered by the smoke.
+- **G1 — build + spawn:** build reader→toolchain→proxy under podman; a **single-agent** workflow completes
+  (Slice-A finding: `design`/`code-review` fan out — use a single-agent workflow for the spawn gate). May use
+  `egress = "open"` as a diagnostic config (`domain.rs:105`, parse arm `config.rs:626`); the shipped example
+  stays locked-only.
+- **G2 — egress contract (the security gate):** from the internal net — proxy resolves+reachable **by name**
+  (else pin IPs + flip the config); allowlisted host via proxy OK; non-allowlisted refused by tinyproxy;
+  `curl --noproxy '*'` → no route. Repeat on `a2a-verify-egress` with the registries filter (hosts taken from
+  the checked `tinyproxy.filter`/`tinyproxy.verify.filter`: agent net allows `anthropic.com`, `chatgpt.com`
+  for codex — not `api.openai.com` — and kiro/cognito hosts; verify net allows registries only, creds-XOR-
+  registries preserved).
+- **G3 — allowlist negatives:** podman config + `allowed_cmds = ["docker"]` → `sandbox runtime not allowed:
+  podman` (live S3, mirrored by the parse test). Slice-4: verify-runtime mismatch → `ConfigError`, runner
+  never called; and a `[registry]`-less podman-verify config default-allows.
+- **G4 — reap + recovery:** `podman events`-asserted container **start** (not echo); kill mid-turn →
+  owner-scoped boot-sweep; end → 0 containers **immediately**; **includes a lease-recovery pass exercising
+  `managed_inspect_argv`'s template under podman** (the §6 gate).
+- **G5 — `:rw` + uid + creds:** a full `implement` e2e — container writes the clone, host commits the staged
+  index (the B2b-1 round-trip), ownership sane; a token refresh writes back through the writable creds bind.
+- **G6 — `containers` CLI:** list/classify/reap podman-owned containers (pins `LIST_FORMAT` + the per-runtime
+  loop; the §6 gate for the CLI template).
+
+A failure at G2 (egress leak) or G4/G6 (template invisibility) or G5 (uid round-trip) is a real conformance
+gap; a G1 build/machine failure is environmental.
 
 ---
 
-## §8 — Testing
+## §11 — Slices + build order
 
-- **Unit:** `preflight_runtimes` — passes when all probes succeed; returns `ConfigInvalid` naming the first failing runtime; skips cleanly for an empty runtime set (host-only config). Injected probe; no real process.
-- **Unit (parity, optional):** assert `compose_sandbox`/`compose_verify`/the sweep/reap argv builders emit the configured runtime verbatim as `argv[0]` when `runtime = "podman"` (most are already covered for `"docker"`; add a `"podman"` case).
-- **Live smoke:** §6, on podman-machine here.
-- No change to existing docker tests; docker remains the default and its paths are untouched.
+1. **Config + images + docs:** the podman example + two pinning tests; the two registry-`FROM` qualifications
+   (NOT toolchain); runbook section; `sync-creds.sh` message. *Exit: G3 + an open-egress spawn smoke (G1).*
+2. **Egress:** `podman-egress.sh` implementing the post-condition contract; name-vs-IP decided by the G2 probe.
+   *Exit: G2 in full, both nets.*
+3. **Full loop:** kiro re-mint, creds round-trip, `implement` e2e, reap/recovery, `containers` CLI.
+   *Exit: G4 + G5 + G6 → **podman support ships here**.*
+4. **Hardening (this increment):** the verify-runtime gate (§4, reject→`ConfigError`) + `effective_allowed_cmds()`
+   + the warn-level preflight (§5); the template fork (§6) **only if** G4/G6 demanded it.
+
+Effort ~2–3 days, dominated by validation.
 
 ---
 
-## §9 — Out of scope / follow-ups
+## §12 — Risks (ranked)
 
-- **Memory slices** (next specs): (a) a bridge-wide concurrent-sandbox-workload semaphore (the measured root cause of OOM: overlapping runs inside a fixed VM); (b) configurable `--memory`/`--memory-swap` caps + a `CARGO_BUILD_JOBS` verify throttle (the "slower-not-OOM" backstop); (c) lowering the OrbStack VM ceiling once the bridge's peak is bounded (frees host RAM, ends the 7 GB host swap). Measured anchors for those: VM ceiling 17.59 GiB; stockTrading idle ~1.1 GiB; `:ro` reviewer ~0.54 GiB (container) vs ~0.47 GiB (host) → ~70 MB container overhead; verify build peak `-j15` 1.89 GiB vs `-j2` 1.03 GiB.
-- **Disk:** the per-repo verify caches total ~67 GB; a `containers prune`/cache-GC command is a candidate follow-up.
+1. **Template-dialect divergence** — fails closed into recovery/CLI invisibility; gated twice (G4/G6);
+   contingency seam-local (§6).
+2. **Half-converted `[verify].runtime`** — false-pass on dual-engine hosts; closed by slice 4 (§4).
+3. **Internal-net DNS** — fails safe-but-down; config-only IP fallback (§3).
+4. **Compose↔script drift** — caught by G2-as-contract (§3).
+5. **Proxy loss across `podman machine` restart** — fails closed; idempotent re-up documented (§3).
+
+Failure modes already survivable in code: missing binary / stopped machine → ENOENT → `AgentCrashed` + reap
+no-op; verify → failed result; a `logs --since` quirk degrades staleness detection without breaking reap.
+
+---
+
+## §13 — Testing
+
+- **Unit:** the two example parse/parity tests (§1); the verify-gate — `effective_allowed_cmds()` unions
+  correctly, `to_config_checked` rejects a disallowed verify runtime into `ConfigError` and accepts an
+  allowlisted one, the `[registry]`-less default-allow path (§4); the preflight helper (warn on probe failure,
+  skip on empty runtime set) with an injected probe (§5). Optionally, a `"podman"` case on the argv builders
+  asserting `argv[0]` is the configured runtime.
+- **Live gates:** §10 G1–G6 on podman-machine here (the operator stops the stockTrading dev stack to free host
+  RAM for the machine VM; tear the machine down after).
+- Docker remains the default; its paths and tests are untouched.
+
+---
+
+## §14 — Out of scope / follow-ups
+
+- **Linux rootless podman increment** (owner decision 2): re-run G1–G6 on Linux rootless; first known concern
+  is SELinux relabeling (`:z`/`:Z`) — a narrow structured mount-label option only if validation demands it.
+  Same config + script; uid semantics differ (the macOS gate masks Linux breaks — B2b-1 lineage).
+- **Memory slices** (next specs): a bridge-wide concurrent-sandbox-workload cap (the measured OOM root cause);
+  `--memory`/`--memory-swap` caps + a `CARGO_BUILD_JOBS` verify throttle (slower-not-OOM); lowering the
+  OrbStack VM ceiling once the bridge's peak is bounded. Measured anchors: VM ceiling 17.59 GiB; stockTrading
+  idle ~1.1 GiB; `:ro` reviewer ~0.54 GiB (container) vs ~0.47 GiB (host) → ~70 MB container overhead; verify
+  build peak `-j15` 1.89 GiB vs `-j2` 1.03 GiB; rootless podman also lowers the baseline.
+- **Disk:** the per-repo verify caches total ~67 GB; a cache-GC command is a candidate follow-up.
+- **A third runtime (`nerdctl`)** would land as slices 1–2 of config work — the seam held under both
+  architects' independent inspection.
