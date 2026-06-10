@@ -176,7 +176,7 @@ pub struct AgentEntryToml {
     pub model_provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
-    /// Parsed to `Effort` in `into_snapshot`; valid values: minimal/low/medium/high/max.
+    /// Parsed to `Effort` in `into_snapshot`; valid values: minimal/low/medium/high/xhigh/max.
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
