@@ -29,7 +29,12 @@ pub struct ModelNotAdvertised {
     pub valid: Vec<String>,
 }
 
-/// `want == None` leaves the agent default. Otherwise alias-map then exact-match.
+/// `want == None` leaves the agent default. Otherwise: prefer the RAW id when the agent
+/// advertises it directly, then fall back to the alias map. The raw-first order matters
+/// because the advertised id is adapter-version-dependent — e.g. claude-agent-acp advertises
+/// the bare `fable`, while older builds advertised `claude-fable-5[1m]`; forcing the alias
+/// would make a now-advertised bare id fail validation. The alias remains the fallback so
+/// `fable`/`opus` keep working against adapters that only advertise the long id.
 pub fn resolve_model(
     want: Option<&str>,
     values: &[String],
@@ -37,6 +42,9 @@ pub fn resolve_model(
     let Some(raw) = want else {
         return Ok(ModelDecision::Default);
     };
+    if values.iter().any(|value| value == raw) {
+        return Ok(ModelDecision::Apply(raw.to_string()));
+    }
     let mapped = apply_alias(raw);
     if values.iter().any(|value| value == mapped) {
         Ok(ModelDecision::Apply(mapped.to_string()))
@@ -292,6 +300,18 @@ mod tests {
         assert_eq!(
             resolve_model(Some("haiku"), &claude_values()).unwrap(),
             ModelDecision::Apply("haiku".into())
+        );
+    }
+
+    #[test]
+    fn raw_advertised_id_preferred_over_alias() {
+        // claude-agent-acp advertises the BARE `fable` (not `claude-fable-5[1m]`). The raw id,
+        // being advertised, must win over the alias remap — else `model="fable"` hard-fails
+        // ("model=fable is not advertised") despite `fable` being a valid advertised value.
+        let values = strings(&["default", "fable", "sonnet", "sonnet[1m]", "haiku"]);
+        assert_eq!(
+            resolve_model(Some("fable"), &values).unwrap(),
+            ModelDecision::Apply("fable".into())
         );
     }
 
