@@ -1,281 +1,236 @@
-# Capability-driven model & effort pinning — design (v1)
+# Capability-driven model & effort pinning — design (v2)
 
 **Date:** 2026-06-09
-**Status:** Draft (brainstorming output; pending user spec-review)
-**Builds on:** ADR-0024 (effective_config fold for warm sessions), the existing `AcpBackend`
-mint-time `set_mode`/`set_model`/`set_effort` path (`crates/bridge-acp/src/acp_backend.rs`),
-ADR-0006 (claude via `claude-agent-acp`).
+**Status:** Draft v2 (revised after the bridge's own spec-review found 3 blockers, and after bumping
+`claude-agent-acp` → 0.44.0 / `claude-agent-sdk` 0.3.170, which restabilized the model API).
+**Builds on:** the existing `AcpBackend` mint-time config path (`crates/bridge-acp/src/acp_backend.rs`).
+**Supersedes:** v1 (which targeted the now-removed `session/set_model` + `models` surface).
 
 ---
 
 ## 1. Context
 
-The bridge already plumbs `model`, `effort`, and `mode` per `[[agents]]` (TOML → `AgentToml` →
-`AcpConfig` → applied at session mint via `session/set_model`, `session/set_config_option`,
-`session/set_mode`). That plumbing was built and validated against **codex-acp** and is
-**codex-shaped**: it hardcodes the effort config-id (`reasoning_effort`) and a codex value
-vocabulary (`Max → "xhigh"`). Live protocol probes (2026-06-09, see §3) showed this is **partly
-broken and entirely unvalidated** for the other agents — most importantly **claude effort is a
-silent no-op** and **model typos are silently accepted by every agent**.
+The bridge plumbs `model`/`effort`/`mode` per `[[agents]]`, applied at session mint. That path was
+**codex-shaped and partly broken**: it hardcoded the effort config-id (`reasoning_effort`) and a codex
+value vocabulary (`Max→xhigh`), so **claude effort was a silent no-op** (claude's id is `effort`) and
+**model pins were unvalidated** (typos silently accepted, then served by a fallback or died mid-turn).
 
-The root cause is uniform: the bridge **hardcodes** config-ids and value vocabularies instead of
-using what each agent **advertises at mint**. Every ACP adapter reports, in its `session/new`
-response and follow-up `config_option_update` notifications, the real config-option `id`, its
-valid `options[]`, the `currentValue`, and (for the model option) the `availableModels` list with
-the resolved `currentModelId`. The fix is to make the bridge **capability-driven**: discover,
-validate against, and report the advertised state.
+Two events reshaped the fix:
+1. The bridge's own **spec-review** (codex rigor + claude soundness) found 3 blockers in v1 — chiefly
+   that the v1 effort-capture mechanism was unbuildable and `fallback_model`'s argv seam was dead.
+2. We bumped **`claude-agent-acp` 0.39.0 → 0.44.0** (to get `claude-agent-sdk 0.3.170` / Fable 5),
+   which **restabilized model selection into the config-option framework**: the dedicated
+   `session/set_model` method and the `models`/`availableModels` field are **gone**; model is now a
+   `SessionConfigOption` with `category == "model"`, set via `session/set_config_option` exactly like
+   effort and mode.
+
+The new surface makes the right design *simpler and uniform*: **discover model + effort from the
+agent's advertised `config_options`, validate against the advertised values, apply via
+`set_config_option`, and read the refreshed options back from the synchronous response.** No
+hardcoded ids/vocabularies; no event-loop changes; no separate model method.
 
 ## 2. Goals / Non-goals
 
 **Goals**
-
-- **Validate** the configured `model=` against the agent's advertised `availableModels`; a typo or
-  non-advertised id **fails the session mint loudly** (no silent fallback to a default model).
-- **Fix claude effort** (today a silent no-op): apply effort via the **agent's advertised effort
-  config-id** (`effort` for claude, `reasoning_effort` for codex), discovered at mint.
-- **Validate/adapt effort** against the **active model's** advertised levels: when the requested
-  level is unsupported (e.g. `xhigh` on Sonnet 4.6), **fall back to the highest advertised level
-  ≤ requested** and **warn** (mirrors the Claude CLI; the ACP path errors rather than falling back,
-  so the bridge must do the mapping itself).
-- **Observability:** one mint-time log line per agent stating the **resolved** model and the
-  **applied** effort (and any fallback), so a pin is honest and auditable.
-- **`fallback_model`:** an optional, advertised-validated secondary model the agent uses when the
-  primary is unavailable/overloaded at runtime (the resilience lever — claude's `--fallback-model`).
+- **Validate** `model=` against the advertised **model config-option values**; a non-advertised id
+  **fails the session mint loudly** with the valid list (no silent default, no mid-turn death).
+- **Fix claude effort** (silent no-op today): apply via the agent's **advertised effort config-id**
+  (`effort` for claude; `reasoning_effort` for codex), discovered at mint.
+- **Adapt effort** to the active model's supported levels: on an unsupported level the ACP path
+  errors (`-32603`), so the bridge **walks down** the canonical order to the highest supported
+  ≤ requested and **warns** (mirrors the Claude CLI, which the ACP path does *not* do itself).
+- **Observability:** one mint-time log line per agent with the **resolved** model + **applied**
+  effort (and any fallback).
+- **Loud, not silent, on missing capability:** a *configured* pin whose advertised option is absent
+  is a loud warning/error — never the quiet "agent has no such knob" skip.
 
 **Non-goals**
+- `mode` handling (already a hard error on reject — correct).
+- `fallback_model` — **descoped to a follow-up** (spec-review B3): the claude adapter ignores argv for
+  model options in ACP mode, so the argv seam is dead; the real channel is `_meta.claudeCode.options`
+  on `session/new`, and the SDK shape (single `string` vs the CLI's comma chain) needs its own design.
+  Removing it keeps this increment to the core fix-and-validate goal.
+- A cross-vendor abstract effort tier (vocabularies differ: claude `max` vs codex `xhigh`).
+- `api`/ollama model (mandatory in the request body already) and kiro (advertises no model/effort knob).
+- Adding Fable serving — already delivered by the 0.44.0 bump; this increment makes it *pinnable+validated*.
 
-- Changing `mode` handling (already a hard error on reject — correct).
-- A cross-vendor abstract effort tier. Vocabularies genuinely differ (claude `max` vs codex
-  `xhigh`); effort is treated as a **validated raw string**, not an abstract enum (§5.3).
-- Pinning models for the `api`/ollama backend (already mandatory in the request body) or kiro
-  (no model/effort knobs advertised).
-- Auto-retry/resume orchestration beyond what `fallback_model` provides natively.
+## 3. Probed ground truth (live, 2026-06-09 — post-bump)
 
-## 3. Probed ground truth (reference — captured live 2026-06-09)
+Installed: **claude-agent-acp 0.44.0** (bundled `@anthropic-ai/claude-agent-sdk 0.3.170`, node ACP SDK
+0.25.0); **codex-cli 0.135.0**; Rust `agent-client-protocol =0.12.1` (schema 0.13.2,
+`unstable_session_model` enabled — still fine; see §10).
 
-Installed: **claude-agent-acp 0.39.0**, **codex-cli 0.135.0** (codex-acp), ACP SDK (node) 0.22.1.
-(The repo's `=0.12.1` pin is the **Rust** `agent-client-protocol` *client* SDK — unrelated to the
-node adapters. See §10 risk.)
+**Model is now a config option** (`category == "model"`, id `"model"`). Claude advertises:
+`default` (= Opus 4.8), `claude-fable-5[1m]`, `sonnet`, `sonnet[1m]`, `haiku`; `currentValue` = `default`.
+- `set_config_option(configId="model", value="fable")` resolves the **alias** to **`claude-fable-5`** and
+  serves it end-to-end (transcript-confirmed). So aliases resolve even when not in the advertised list;
+  the advertised list is the *picker* set, not the only acceptable input.
+- The dedicated `session/set_model` is **not routed** by 0.44.0 (the bridge's current call is a no-op).
+- **Fable now serves** (was `model_not_found` on 0.39.0's older bundled SDK).
 
-**Model** — both adapters behave identically:
+**Effort** (`category == "thought_level"`, id `"effort"` for claude / `"reasoning_effort"` for codex):
+claude levels are model-dependent — Opus 4.8/4.7 = low/medium/high/xhigh/max; Sonnet 4.6/Opus 4.6 =
+low/medium/high/max (no `xhigh`). Order: **low < medium < high < xhigh < max**. The ACP
+`set_config_option` **errors `-32603`** on an unsupported level (no graceful fallback). codex levels:
+low/medium/high/xhigh.
 
-| | claude-agent-acp | codex-acp |
-|---|---|---|
-| Reports `availableModels` at `session/new` | ✅ `default`, `sonnet`, `sonnet[1m]`, `haiku` | ✅ `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` (×`low/medium/high/xhigh`) |
-| Un-pinned **default float** | `default` = **Opus 4.8 · 1M** | `gpt-5.5/xhigh` |
-| `set_model` honored **end-to-end** | ✅ `haiku` → served `claude-haiku-4-5-20251001` (transcript) | ✅ `gpt-5.4-mini` → served `gpt-5.4-mini` (rollout) |
-| Validates the id? | ❌ `bogus-zzz` accepted | ❌ `o3`/`gpt-5.1`/`bogus-zzz` accepted |
-
-**Advertised-list provenance (verified):** the model list the bridge sees is reported by the
-**`claude-agent-acp` adapter from the SDK bundled inside it** (`@anthropic-ai/claude-agent-sdk
-0.3.156`), filtered by any `settings.json availableModels` allowlist, with `default` always forced
-in — it is **NOT** the interactive `claude` CLI's `/model` picker and can lag it. Probed: an account
-with **Fable 5 in the interactive CLI (2.1.170)** still advertises only `default/sonnet/sonnet[1m]/
-haiku` over ACP, and pinning `fable` is **accepted by `set_model` but the turn dies**
-`model_not_found` (the bundled SDK can't serve it). The advertised list is therefore **authoritative
-for what is actually serveable** — which is exactly why strict validation (§5.2) is right: it turns a
-cryptic mid-turn `model_not_found` into a clear mint-time error. (Serving fable through the bridge
-needs an adapter/bundled-SDK bump — §12, out of scope here.)
-
-**Effort** — claude broken through the bridge:
-
-- claude effort config-id = **`effort`**; the bridge sends **`reasoning_effort`** → live:
-  `-32603 Unknown config option: reasoning_effort` → swallowed (best-effort) → **never applied.**
-- claude effort levels are **model-dependent**: Opus 4.8/4.7 = `low/medium/high/xhigh/max`;
-  **Sonnet 4.6 / Opus 4.6 = `low/medium/high/max` (no `xhigh`)**.
-- The bridge maps `Max → "xhigh"`; on Sonnet that is live `-32603 Internal error` (no `xhigh`).
-- codex effort config-id = `reasoning_effort`, levels `low/medium/high/xhigh` → bridge works.
-- Level ordering (for fallback): **`low < medium < high < xhigh < max`**.
+**`set_config_option` response carries the refreshed options** — `SetSessionConfigOptionResponse
+.config_options: Vec<SessionConfigOption>` is populated (live-confirmed: a `set_config_option(effort,
+"high")` returned the 3 refreshed options). This is the in-band read-back the design relies on.
 
 ## 4. Architecture
 
-All resolution happens **at session mint**, inside `AcpBackend`'s `configure_session` closure,
-immediately after `session/new` returns — the only place that has the agent's advertised state.
-A new pure module `crates/bridge-acp/src/model_effort.rs` holds the **decision logic** (validation,
-level fallback, log-line construction) as total pure functions over the advertised data; the mint
-closure does the I/O (read response, send requests, log). Pure core ⇒ unit-testable without a live
-agent; the live gate covers the wiring.
+All resolution happens **at session mint**, inside the `AcpBackend` `configure_session` closure, using
+only the **synchronous request/response path** the closure already speaks (`session/new` response +
+`set_config_option` response) — **no event-loop / notification handler changes** (spec-review B2).
+
+A new pure module `crates/bridge-acp/src/model_effort.rs` holds the decision logic as total functions
+over the advertised `config_options`; the closure does the I/O. Order: `set_mode` (unchanged) →
+**model** (validate → `set_config_option(model)`) → **effort** (resolve against the refreshed options
+from the model response, apply via `set_config_option`, walk-down on `-32603`) → **log**.
 
 ```
-session/new ──► NewSessionResponse { models{availableModels,currentModelId},
-                                     configOptions[ {id, options[], currentValue, category} ] }
-        │
-        ├─ resolve_model(cfg.model, availableModels)         ─► Ok(modelId) | Err(NotAdvertised{valid})
-        │     └─ on Err: FAIL mint (loud)                     (§8)
-        ├─ set_model(modelId)                                 (existing request builder)
-        │     └─ capture config_option_update ► currentModelId, refreshed effort option
-        ├─ resolve_effort(cfg.effort, activeModelEffortOption) ─► Applied{level} | FellBack{from,to} | Unsupported
-        │     └─ apply via advertised effort id; warn on FellBack
-        ├─ (fallback_model) wire agent-native fallback         (§5.4)
-        └─ log: agent=… model=<currentModelId> effort=<applied> [fallback=…]
+session/new ─► config_options[ {id, category: Mode|Model|ThoughtLevel|Other, kind: Select{currentValue, options[]}} ]
+   │
+   ├─ find Model option ─► resolve_model(cfg.model, model_opt.values) ─► Apply(id) | Default | Err(NotAdvertised)  (Err ⇒ FAIL mint)
+   ├─ set_config_option(model_opt.id, id) ─► response.config_options  (refreshed, scoped to the new model)
+   ├─ find ThoughtLevel option in the REFRESHED options ─► resolve_effort(cfg.effort, effort_opt) ─► Apply|FellBack|Skip
+   │     └─ set_config_option(effort_opt.id, level); on -32603 walk DOWN order, retry; warn on fallback
+   └─ log: agent=… model=<resolved currentValue> effort=<applied> [fellback …]
 ```
 
 ## 5. Components
 
-### 5.1 Capability discovery (`AcpBackend`, mint closure)
+### 5.1 Capability discovery (`model_effort.rs`, called from the mint closure)
 
-After `session/new`, read from `NewSessionResponse`:
-- `models.availableModels` (`Vec<ModelInfo{modelId,name}>`) and `models.currentModelId`.
-- `configOptions`: locate the **model** option (`category == "model"` / `id == "model"`) and the
-  **effort** option (`category == "thought_level"`, or `id ∈ {"effort","reasoning_effort"}`) — by
-  advertised metadata, **not** a hardcoded id. Each option carries `id`, `currentValue`,
-  `options[]{value}`.
-- Effort options change with the active model and the adapter **pushes a `config_option_update`**
-  after `set_model`. The mint closure must **capture that notification** (it already receives
-  session updates) to read the **post-`set_model`** effort option before resolving effort.
+From `NewSessionResponse.config_options` (and later from `SetSessionConfigOptionResponse.config_options`),
+locate options by **`category`** (`SessionConfigOptionCategory::{Model, ThoughtLevel}`), falling back to
+**`id`** (`"model"`; `"effort"`/`"reasoning_effort"`) only if `category` is absent. Each option's
+`kind` must be `Select`; extract `current_value` + the `options[].value` list. Determinism rules
+(spec-review M6): first option matching the category wins; a non-`Select` kind or missing option ⇒ treat
+as "not advertised" for that dimension; never panic.
 
 ### 5.2 Model resolution (`resolve_model`)
 
 ```
-resolve_model(want: Option<&str>, available: &[ModelInfo]) -> Result<Option<ModelId>, ModelError>
+resolve_model(want: Option<&str>, values: &[String]) -> Result<ModelDecision, ModelNotAdvertised>
+// None => Default ; Some in values => Apply(value) ; Some absent => Err{want, valid: values}
 ```
-- `None` ⇒ `Ok(None)` (leave the agent's default — documented as the float, e.g. Opus 4.8 1M).
-- `Some(id)` present in `available` (exact match on `modelId`) ⇒ `Ok(Some(id))`.
-- `Some(id)` **absent** ⇒ `Err(NotAdvertised { want, valid: available ids })` ⇒ **fail the mint**
-  with a message listing valid ids. **Decision:** hard-error, no silent default (catches typos;
-  forces reproducible config-driven pins to use advertised canonical ids — `default`/`sonnet`/
-  `haiku`, not CLI shorthand like `opus`).
-- **Motivating example (`fable`):** pinning a model the adapter can't serve (e.g. `fable` on the
-  current adapter) is silently accepted by `set_model` then dies mid-turn `model_not_found`. Strict
-  validation converts that into an immediate, actionable mint error. The error message should hint
-  that an un-advertised-but-expected model (fable) may require updating the agent's adapter/SDK.
+- **Decision (hard-error, spec-review-aligned):** a configured `model=` not in the advertised values
+  **fails the mint** with the valid list. Reproducible; catches typos; converts the cryptic mid-turn
+  `model_not_found` (e.g. an un-serveable model on an old adapter) into a clear mint error.
+- **Alias note:** aliases (`fable`, `opus`) resolve at the adapter but are *not* in the advertised
+  values, so they are **rejected** — config must use advertised ids (`claude-fable-5[1m]`, `default`).
+  The error message lists them. (Documented; a future alias-map is a YAGNI follow-up.)
+- **Apply via `set_config_option(model_opt.id, value)`**, not `session/set_model` (gone). Capture the
+  response's `config_options` as the **refreshed** set for effort resolution.
+- **M2/M3 (loud-on-missing):** if `cfg.model.is_some()` but the agent advertised **no** Model option
+  (or `config_options`/`models` deserialized to `None` via the SDK's `DefaultOnError`), that is a
+  **distinct loud error** ("model pinned but agent advertised no model option — possible adapter/schema
+  skew"), never the silent skip. Only an *unconfigured* model dimension skips quietly.
 
-### 5.3 Effort resolution (`resolve_effort`)
+### 5.3 Effort resolution (`resolve_effort`) + Effort::Xhigh
 
-Effort stays a **typed `Effort` enum**, extended with **`Xhigh`** (so it expresses the full
-vocabulary `Minimal/Low/Medium/High/Xhigh/Max`). The bridge maps a tier to a canonical level name
-(`Minimal/Low→"low"`, `Medium→"medium"`, `High→"high"`, `Xhigh→"xhigh"`, `Max→"max"`), then resolves
-that name against the active model's advertised `options[]` with the highest-≤-requested fallback.
-This keeps `effort=` type-safe (no `SessionSpec`/`effective_config` ripple) **and** subsumes both
-vendor vocabularies with one mapping: codex `Max`→(no `max` advertised)→falls back to `xhigh`; claude
-`Max`→`max`. (Refinement over an earlier "raw validated string" idea — less ripple, same coverage.)
+Keep the typed `Effort` enum, **add `Xhigh`** → `Minimal/Low/Medium/High/Xhigh/Max`. Map a tier to a
+canonical level name (`Minimal/Low→"low"`, `Medium→"medium"`, `High→"high"`, `Xhigh→"xhigh"`,
+`Max→"max"`).
 
 ```
-resolve_effort(want: &str, opt: &EffortOption /* {id, levels: Vec<String>} */, order: &[&str])
-    -> EffortPlan
-// EffortPlan = Apply{id, level} | FellBack{id, from, to} | Unsupported{from, levels}
+resolve_effort(want: Option<&str>, opt: &AdvertisedEffort{config_id, levels}) -> EffortDecision
+// None => Skip ; want in levels => Apply{config_id, level} ; else highest level <= want by order => FellBack ; none => Unsupported
 ```
-- `want` in `opt.levels` ⇒ `Apply{ id: opt.id, level: want }`.
-- `want` absent ⇒ pick the **highest advertised level ≤ `want`** by `order`
-  (`low<medium<high<xhigh<max`) ⇒ `FellBack{...}` + **warn**. **Decision:** fallback + warn.
-- No level ≤ `want` advertised (shouldn't happen for real inputs) ⇒ `Unsupported` ⇒ warn, skip.
-- Applied via `session/set_config_option` using **`opt.id`** (the advertised id) — this is the
-  claude-effort fix.
+Resolve against the **refreshed** effort option (post-model `set_config_option` response). Because the
+adapter *errors* on an unsupported level rather than clamping, the closure also **walks down on
+`-32603`** as a belt-and-suspenders: try the resolved level; on `-32603`, drop to the next-lower
+advertised level and retry, until one applies or none remain (warn). Both `Effort` parsers must learn
+`xhigh` (see M7).
 
-### 5.4 `fallback_model` (resilience)
+### 5.4 Observability (`§5.6` of v1, kept)
 
-Optional `fallback_model =` on `[[agents]]`, **validated against `availableModels` exactly like the
-primary** (hard-error if not advertised). Wired to the agent's native runtime fallback:
-- **claude:** `--fallback-model <id>` (per the Claude CLI reference). Verify at implementation how
-  `claude-agent-acp` forwards argv to the underlying `claude` (the adapter reads `process.argv`);
-  pass it at spawn alongside the existing args.
-- **codex:** verify the codex-cli equivalent (user can provide codex CLI docs); if none, document
-  `fallback_model` as **claude-only** and reject it on a codex agent at config load.
+One `tracing::info` per agent at mint: `model_effort_resolved agent=<id> model=<resolved currentValue>
+requested_model=<cfg> effort=<applied|fellback from→to|default>`. `tracing::error` + mint-fail on a bad
+model; `tracing::warn` on effort fallback or a loud-missing-capability condition. **Agent-id threading
+(m1):** `AcpConfig` carries no id today — add an `agent_id` field to `AcpConfig` (or emit the line from
+the registry layer that holds `AgentEntry.id`).
 
-This is distinct from the typo case: a typo `model=` still hard-errors; `fallback_model` only
-engages when the (valid) primary is unavailable/overloaded at runtime.
+## 6. Data flow (mint, ordered)
 
-### 5.5 Config surface (`bin/a2a-bridge/src/config.rs`)
-
-`AgentToml` already has `model`, `effort`, `mode`. Add `fallback_model: Option<String>`. `effort`
-parsing widens to accept any string (validated later at mint against advertised levels) while still
-accepting the enum words. `AcpConfig` carries `model`, `effort` (string), `fallback_model`.
-
-### 5.6 Observability
-
-One `tracing::info` per agent at mint:
-`model_effort_resolved agent=<id> model=<currentModelId> effort=<applied|fellback:from→to|default> [fallback_model=<id>]`.
-On `NotAdvertised` model ⇒ `tracing::error` + mint failure. On effort fallback ⇒ `tracing::warn`.
-
-## 6. Data flow / order of operations (mint)
-
-1. `session/new` → capture `models` + `configOptions`.
-2. `set_mode` (unchanged, hard error on reject).
-3. `resolve_model` → on `Err` **fail mint**; else `set_model(id)`; capture the `config_option_update`
-   (new `currentModelId` + refreshed effort option).
-4. `resolve_effort` against the **post-`set_model`** effort option → `set_config_option(opt.id, level)`.
-5. Apply `fallback_model` at spawn (claude `--fallback-model`) — note this is a **spawn-arg**, so it
-   is wired in the `SpawnFn`/`acp_program_argv` path, not the session closure (§9).
-6. Emit the resolved log line.
-
-Order rationale: model **before** effort (switching model resets effort to the model default and
-re-scopes valid levels); effort resolved against the **active** model's advertised levels.
+1. `session/new` → `config_options`.
+2. `set_mode` (unchanged; hard error on reject).
+3. **Model:** `resolve_model` → on `Err` **fail mint**; else `set_config_option(model_opt.id, value)`;
+   keep the response's `config_options` as `refreshed`.
+4. **Effort:** locate the ThoughtLevel option in `refreshed` (fallback to the initial set if the
+   response omitted it); `resolve_effort`; `set_config_option(effort_opt.id, level)` with walk-down on
+   `-32603`.
+5. Emit the resolved log line.
 
 ## 7. Files touched
 
-- **Create** `crates/bridge-acp/src/model_effort.rs` — pure `resolve_model`, `resolve_effort`,
-  `EffortPlan`, `ModelError`, level-order constant, log-line builder + unit tests.
-- **Modify** `crates/bridge-acp/src/acp_backend.rs` — mint closure: capture advertised state, call
-  the pure resolvers, apply via advertised ids, capture `config_option_update`, log. Remove the
-  hardcoded `EFFORT_CONFIG_ID`/`effort_value` codex assumptions (move into capability-driven path;
-  keep codex behavior via discovery).
-- **Modify** `bin/a2a-bridge/src/config.rs` — `fallback_model` field; effort string passthrough;
-  `AcpConfig` wiring; both-or-neither/validation as needed.
-- **Modify** the `SpawnFn`/`acp_program_argv` site(s) (`bin/a2a-bridge/src/main.rs`,
-  `crates/bridge-container`) — append claude `--fallback-model` when set.
-- **Docs:** example config comments with the effort-level guidance (§11); ADR-00xx.
+- **Create** `crates/bridge-acp/src/model_effort.rs` — pure `resolve_model`/`resolve_effort`,
+  `AdvertisedEffort`, decisions, level order, option-discovery helpers, `effort_level_name`, log-line
+  builder + unit tests. **Modify** `crates/bridge-acp/src/lib.rs` (`mod model_effort;`).
+- **Modify** `crates/bridge-core/src/domain.rs` — add `Effort::Xhigh` (ordered High<Xhigh<Max); fix
+  exhaustive matches.
+- **Modify** `crates/bridge-acp/src/acp_backend.rs` — mint closure: discover from `config_options`, set
+  model+effort via `set_config_option` reading the response, walk-down, log; add `AcpConfig.agent_id`;
+  **remove** the `session/set_model`/`set_effort_request`/`EFFORT_CONFIG_ID`/`effort_value` path.
+- **Modify** `bin/a2a-bridge/src/config.rs` — `parse_effort` accepts `xhigh`; thread `agent_id`.
+- **Modify** `crates/bridge-a2a-inbound/src/server.rs` — **`parse_effort_meta` (M7)**: the second,
+  per-request A2A-metadata effort parser must also accept `xhigh`. Factor a single `FromStr for Effort`
+  so the two parsers can't drift.
+- **Docs:** example configs (pin advertised model ids; effort guidance §11); ADR-0029.
+- **NOT touched (descoped):** `fallback_model` config/spawn paths — follow-up.
 
-## 8. Error handling summary
+## 8. Error handling
 
 | Case | Behavior |
 |---|---|
-| `model=` not advertised (typo / non-advertised alias) | **Hard error**, fail mint, list valid ids |
-| `fallback_model=` not advertised | **Hard error** at validation, list valid ids |
-| `fallback_model=` on an agent with no native fallback | Hard error at config load (documented per-agent) |
-| `effort=` unsupported by active model | **Fall back** to highest advertised ≤ requested, **warn** |
-| `effort=` with no level ≤ requested advertised | Warn, leave model default (skip) |
-| advertised state missing (agent reports no `models`/effort option) | Skip that dimension, `info`-log "not advertised"; never fatal |
-| `mode=` rejected | Unchanged (hard error) |
+| `model=` not in advertised values | **Hard error**, fail mint, list valid ids |
+| `model=` set but agent advertised no Model option / `config_options` None | **Hard error** (loud skew), not silent skip (M2/M3) |
+| `effort=` unsupported by active model | **Walk down** to highest advertised ≤ requested, **warn** |
+| `effort=` set but no ThoughtLevel option | **Warn** (configured-but-unavailable), skip |
+| unconfigured model/effort dimension | quiet `info` skip (only when *not* configured) |
+| `set_config_option` transport/other error | model: fail mint; effort: best-effort warn |
+| `mode` rejected | unchanged (hard error) |
 
 ## 9. Testing
 
-- **Unit (pure `model_effort.rs`):** `resolve_model` (present/absent/none), `resolve_effort`
-  (exact / fallback `xhigh→high` on a sonnet-like level set / `max` present / no-≤ level), level
-  ordering, log-line text. Table-driven from the §3 probed vocabularies.
-- **Config:** `fallback_model` parse + both-agents validation; effort string passthrough.
-- **Live gate** (real claude + codex): (a) `model="haiku"` → transcript serves
-  `claude-haiku-4-5-*`; (b) `model="bogus"` → mint fails loudly; (c) `effort="high"` on a sonnet
-  pin actually applies (no `Unknown config option`); (d) `effort="xhigh"` on sonnet → warns +
-  applies `high`; (e) codex unchanged (`reasoning_effort` still works via discovery); (f)
-  `fallback_model` accepted + spawn-arg present. Confirm via adapter transcripts/rollouts, not
-  self-report.
+- **Unit (`model_effort.rs`):** `resolve_model` present/absent/none + NotAdvertised list; option
+  discovery by category then id, non-Select/missing ⇒ not-advertised; `resolve_effort` exact / fallback
+  (`xhigh`→`high` on a sonnet-like set) / `max` present / codex `max`→`xhigh` / none-≤; `effort_level_name`
+  (`Max`→`max`); log-line text. Table-driven from §3 vocabularies.
+- **Config:** `parse_effort("xhigh")`==`Xhigh`; both parsers (`config.rs` + `server.rs parse_effort_meta`)
+  accept `xhigh` (one `FromStr`).
+- **Live gate** (claude 0.44.0 + codex): (a) `model="haiku"` → transcript `claude-haiku-4-5-*`; (b)
+  `model="claude-fable-5[1m]"` → transcript `claude-fable-5`; (c) `model="bogus"` → mint fails loudly;
+  (d) `effort="high"` on a sonnet pin applies with no `Unknown config option`; (e) `effort="xhigh"` on
+  sonnet → warns + applies `high`; (f) codex `model="gpt-5.5"` + `effort="high"` unchanged. Confirm via
+  transcripts/rollouts.
 
-## 10. Rust client SDK skew — VERIFIED RETIRED
+## 10. Rust client SDK — still fine on 0.44.0
 
-The capability-driven design requires the bridge's Rust `agent-client-protocol` 0.12.1 client to
-parse `NewSessionResponse.models`, `config_options`, and the `config_option_update` notification.
-**Verified present** in the pinned 0.12.1 (schema crate 0.13.2) with the **already-enabled**
-`unstable_session_model` feature (`bridge-acp/Cargo.toml`): `NewSessionResponse.models:
-Option<SessionModelState>` + `config_options: Option<Vec<SessionConfigOption>>`; `SessionModelState
-{ current_model_id, available_models: Vec<ModelInfo{model_id,name}> }`; `SessionConfigOption { id,
-category: Mode|Model|ThoughtLevel|Other, kind: Select{current_value, options} }`;
-`SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate{config_options})`. **No SDK bump needed** —
-`unstable_session_usage` (the usage-hang fix `cfc1ce3`) is untouched. The effort option is found by
-`category == ThoughtLevel`, the model option by `category == Model` — no hardcoded ids.
+The pinned `agent-client-protocol 0.12.1` (schema 0.13.2) already has everything the new surface needs:
+`SessionConfigOptionCategory::{Mode,Model,ThoughtLevel,Other}`, `SessionConfigOption`/`Select`,
+`set_config_option` request + `SetSessionConfigOptionResponse.config_options`, and `config_options` on
+`NewSessionResponse`. The removed `models`/`session/set_model` are simply unused (the `models` field is
+`Optional`/`DefaultOnError` → `None`, harmless). **No Rust SDK bump.** (Tolerant `DefaultOnError`
+deserialization is why M3's loud-on-`None`-when-pinned guard matters.)
 
 ## 11. Reference: effort level guidance (for config authors)
 
 | Level | When to use |
-|---|---|
-| `low` | Short, scoped, latency-sensitive tasks that are not intelligence-sensitive |
+| --- | --- |
+| `low` | Short, scoped, latency-sensitive, not intelligence-sensitive |
 | `medium` | Cost-sensitive work that can trade off some intelligence |
-| `high` | Balances tokens and intelligence. **Default** on Fable 5, Opus 4.8, Opus 4.6, Sonnet 4.6 |
-| `xhigh` | Deeper reasoning at higher token spend. **Default** on Opus 4.7 |
-| `max` | Deepest reasoning, no token constraint; diminishing returns / overthinking risk — test first. **Session-only** (except via `CLAUDE_CODE_EFFORT_LEVEL`) |
+| `high` | Balances tokens & intelligence. Default on Fable 5, Opus 4.8, Opus 4.6, Sonnet 4.6 |
+| `xhigh` | Deeper reasoning, higher spend. Default on Opus 4.7 |
+| `max` | Deepest reasoning, no token constraint; diminishing returns — test first. Session-only (except via `CLAUDE_CODE_EFFORT_LEVEL`) |
 
-Defaults applied on first run of Fable 5 / Opus 4.8 / Opus 4.7 override a previously-set level —
-which is why the bridge **always sets effort explicitly per session** and logs what it applied.
+## 12. Open items / follow-ups
 
-## 12. Open items
-
-- **`fallback_model` is a chain (verified via docs):** the Claude CLI `--fallback-model` accepts a
-  **comma-separated list** (up to 3; `"default"` expands; engages only on overloaded/unavailable/
-  non-retryable server errors — not auth/billing/rate-limit). So `fallback_model` should accept a
-  comma-separated string and **validate each element** against advertised models. codex has **no
-  fallback-model equivalent** (docs) ⇒ claude-only; reject on codex at config load.
-- Exact `claude-agent-acp` argv forwarding for `--fallback-model` (§5.4) — verify at impl.
-- Rust SDK 0.12.1 field support — **VERIFIED present** (§10), no bump.
-- **Fable (follow-up, out of scope):** serving Fable 5 (or any newer model) through the bridge
-  requires bumping `claude-agent-acp` to a version whose bundled `@anthropic-ai/claude-agent-sdk`
-  has fable access. This increment makes the *gap legible* (strict mint error) but does not add
-  fable — that is a dependency bump tracked separately.
+- **`fallback_model` (descoped):** revisit via `_meta.claudeCode.options` on `session/new`; design the
+  chain shape (CLI uses a comma list; SDK field is a single string).
+- **Model aliases:** advertised ids only for now; an optional alias-map (`fable`→`claude-fable-5[1m]`) is
+  a YAGNI follow-up if the ergonomics bite.
+- **Fable:** delivered by the 0.44.0 bump; this increment makes it pinnable+validated. (The global
+  `claude-agent-acp` is now 0.44.0 — other bridge sessions spawn the new surface.)
