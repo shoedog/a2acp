@@ -119,6 +119,39 @@ addr = "127.0.0.1:8080"
 | `tags` | no | String tags (seamed for future per-entry Agent Cards) |
 | `version` | no | Config version string (seamed for future per-entry Agent Cards) |
 
+### Pinning model & effort (worked example)
+
+`model` and `effort` are resolved **per-agent at session mint** (ADR-0029): the model is
+validated against what the agent advertises — a non-advertised id **hard-fails the session
+before any prompt is sent** — and `effort` walks down to the highest supported level ≤
+requested. Both are optional and apply to **every workflow node** that uses the agent. A
+two-agent review config pinning each side to a specific model + reasoning level:
+
+```toml
+default = "codex"
+
+[[agents]]
+id     = "codex"
+cmd    = "codex-acp"
+model  = "gpt-5.5"   # advertised by codex-acp        -> rollout "model":"gpt-5.5"
+effort = "high"      # codex thought-level id          -> "reasoning_effort":"high"
+
+[[agents]]
+id     = "claude"
+cmd    = "claude-agent-acp"
+model  = "fable"     # advertised id, or alias -> claude-fable-5[1m]  (claude-agent-acp >= 0.44.0)
+effort = "high"      # claude thought-level id "effort" -> "effort":"high" (now actually applied)
+```
+
+A model id validates against what the agent advertises. The aliases `fable`
+(→ `claude-fable-5[1m]`) and `opus` (→ `default`) apply as a **fallback** when the raw id
+isn't advertised — so `model = "fable"` works whether the adapter advertises the bare `fable`
+or the long `claude-fable-5[1m]` (the advertised id varies by adapter version/session).
+`effort` maps to each agent's advertised thought-level id automatically (`reasoning_effort` for
+codex, `effort` for claude); a model that advertises no thought level (e.g. kiro) just skips it.
+To override per request instead of per agent, pass `a2a-bridge.model` / `a2a-bridge.effort` in
+the call metadata (see [Per-request agent selection and overrides](#per-request-agent-selection-and-overrides)).
+
 ### `[registry]` section
 
 | Key | Required | Description |
