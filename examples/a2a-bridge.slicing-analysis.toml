@@ -21,6 +21,8 @@ default = "codex"
 [[agents]]
 id = "codex"
 cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "high"
 args = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
 
 [[agents.mcp]]
@@ -31,6 +33,8 @@ args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/p
 [[agents]]
 id = "claude"
 cmd = "claude-agent-acp"
+model = "fable"
+effort = "high"
 
 [[agents.mcp]]
 name = "prism"
