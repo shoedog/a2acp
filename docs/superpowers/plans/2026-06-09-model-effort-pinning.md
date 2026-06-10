@@ -11,7 +11,72 @@
 
 ---
 
-## Task 1: `Effort::Xhigh` (no `Ord`)
+## Plan-review corrections (AUTHORITATIVE — supersede the task text below where they conflict)
+
+Dogfooded plan-review (Fable coverage + codex executability, 2026-06-09) found 6 compile-level errors
+in the task snippets and 4 coverage gaps, all verified against the repo. Apply these:
+
+- **[B6] Merge Task 1 into Task 2.** `Effort` has no impls today; `Effort::Xhigh.as_str()` invents a
+  method that conflicts with T5's `effort_level_name`. The red test is `"xhigh".parse::<Effort>()`.
+  Verify with a **workspace** check (`cargo test` / `cargo check -p bridge-acp`) — the exhaustive
+  `Effort` match in `effort_value` lives in `bridge-acp` (`acp_backend.rs:480`), not just `bridge-core`.
+- **[B1] Task 4 imports:** config types are `agent_client_protocol::schema::{SessionConfigOption,
+  SessionConfigOptionCategory, SessionConfigKind, SessionConfigSelectOptions, …}` (see
+  `acp_backend.rs:16`), **not** the crate root.
+- **[B2] Task 4 wildcards:** `SessionConfigSelectOptions` AND `SessionConfigKind` are both
+  `#[non_exhaustive]` (schema `agent.rs:2331`/`:2421`) — `select_values` needs a `_ => Vec::new()` arm
+  and `find_select` a `_ => None` arm or the snippets don't compile.
+- **[B5] Task 6 — DO NOT add the variant.** `BridgeError::ConfigInvalid { reason }` already exists
+  (`error.rs:61`) with the redacted `client_message()` arm (`:84`) + a split test (`:216`). Reframe T6
+  as **constructor-only**: add a `config_invalid(reason)` helper mirroring `agent_crashed`, or fold the
+  call sites into T7. Adding the variant duplicates it and breaks `resilient.rs::table_key`'s exhaustive
+  match.
+- **[B3] Task 7 Step 2:** `SetSessionConfigOptionResponse.config_options` is a **plain `Vec`** (with
+  `DefaultOnError`), not `Option` — use `let refreshed = if r.config_options.is_empty() { warn!(agent,
+  "model applied but agent returned no refreshed options; effort levels may be stale"); opts0.clone() }
+  else { r.config_options };`. (This also restores the spec §6.4 stale-refresh warn the snippet dropped.)
+  `NewSessionResponse.config_options` IS `Option<Vec>` → `unwrap_or_default()` there is correct.
+- **[B4] Task 7 agent id:** there is no `self.agent_id`. Add `AcpConfig.agent_id`, then **capture an
+  owned clone before the mint closure** (alongside `cwd_for_mint`/`mcp_for_mint`). Set it **explicitly**
+  at `main.rs:247` (`agent_id: entry.id.clone()`) — that site uses `..AcpConfig::default()` spread, so a
+  missed assignment silently ships `agent=""`. `ContainerRwConfig.agent` already exists → one-liner there.
+- **[M1] Split Task 7 → 7a (test harness) + 7b (rewiring).** The `Recorder` fake agent advertises **no**
+  `config_options` (`NewSessionResponse::new(id)`, `acp_backend.rs:2253`), so loud-on-missing breaks 5
+  tests: `set_model_error_is_non_fatal` (:3460, inverts to **hard-fail-by-design** — rewrite),
+  `configure_session_*` stash test (:3650), `per_session_config_is_isolated` (:3690 — the warm-SessionSpec
+  regression net, **must survive**), and the two effort tests (:3787/:3817 — `Max→"xhigh"` becomes
+  `Max→"max"`, the bug being fixed). **7a:** extend `Recorder` to advertise model+effort options at
+  `session/new`, return refreshed options from `set_config_option`, and accept a **configurable error
+  body + pinned `-32603`**. **7b:** rewire + enumerated new tests: bogus-model hard-fail-with-list,
+  no-model-option hard-fail, effort warn-skip, walk-down converges, walk-down **stops on a non-matching
+  error**, refreshed-set effort resolution, plus the rewritten stash/isolation tests.
+- **[M2] Walk-down predicate inspects `data`, not just `message`.** `respond_with_internal_error` puts the
+  supplied text in `data`; `message` stays the generic internal-error string. Signature:
+  `is_unsupported_effort_error(code: i64, message: &str, data: Option<&serde_json::Value>) -> bool` —
+  match `-32603` AND an invalid/unsupported-value marker in message **or** data. (The Recorder's reject
+  body must contain a matching substring — "unsupported" ≠ "not support"; align them in 7a.)
+- **[M3] Observability must log RESOLVED values + a tested builder.** Keep `current_value` in
+  `model_values` (return `(id, current, values)`); `apply_effort_walkdown` **returns the applied level**
+  (or terminal outcome); add a pure `model_effort::resolved_log_line(agent, model_current, effort_outcome)
+  -> String` with a text unit test (spec §7/§9) and log **that** in T7, not the requested values.
+- **[M4] Task 8 — the kiro pin is in TWO places.** Remove `model="auto"` from `multi-agent.toml` **and**
+  from the `init` scaffold `agent_fragment("kiro")` (`main.rs:2111`) — else `a2a-bridge init` scaffolds a
+  config that hard-fails at mint. Also fix the claude fragment's "model not observable / set_model
+  best-effort" comment and the `multi-agent.toml` header (lines 9-12). The `config.rs:1129` parse fixture
+  is parse-only → leave it (don't "fix" it).
+- **[m1] Pre-gate verification step:** before Task 10, run `cargo fmt --check`, `clippy`, and llvm-cov
+  floors **per `ci.yml`** (ws 85; core/acp/api/workflow 90 — not the stale README). After 7b lands, **drop
+  `unstable_session_model`** from `bridge-acp/Cargo.toml:17` (it gated only the removed `set_model`);
+  **keep `unstable_session_usage`** (the hang fix).
+- **[m2] Task 10** add: kiro still mints cleanly after the pin removal (unconfigured→quiet-skip), and one
+  **inbound** bogus-model request via the metadata path (`server.rs:2943`) asserting the **redacted static
+  wire text** (the wire claim is otherwise only CLI-tested).
+- **[m3]** T10 "record in the ADR" — the ADR is committed in T9; add a small follow-up docs commit in T10
+  (or finalize the ADR after the gate).
+
+---
+
+## Task 1: `Effort::Xhigh` (no `Ord`)  — NOTE [B6]: merge into Task 2; red test is `"xhigh".parse::<Effort>()`
 
 **Files:** Modify `crates/bridge-core/src/domain.rs` (+ test mod).
 
