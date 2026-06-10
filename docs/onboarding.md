@@ -56,12 +56,27 @@ Each `[[agents]]` entry is one backend:
 
 ### model / effort / mode
 
+All three are OPTIONAL and applied per session. Model and effort are
+**capability-driven**: at session start the bridge reads the config options the
+agent advertises, then sets the requested value via `session/set_config_option`.
+
 | knob     | how it's applied                              | caveat |
 |----------|-----------------------------------------------|--------|
-| `model`  | `session/set_model` (best-effort)             | **claude's model is NOT observable** through the bridge (subscription default wins) |
-| `effort` | codex-acp `reasoning_effort` config option    | **codex only**; kiro/claude/api get no bridge effort. Values: minimal/low/medium/high/max |
+| `model`  | `session/set_config_option(category="model")` | **VALIDATED at mint** — pinning a value the agent does not advertise hard-fails the session (the error lists the advertised values). Aliases resolve first (`fable`→`claude-fable-5[1m]`, `opus`→`default`). claude's served model shows in claude's own transcript, not the bridge's. **kiro advertises no model option — do not pin it.** |
+| `effort` | `session/set_config_option` (thought-level)   | Applied to **any** agent that advertises one (codex `reasoning_effort`, claude `effort`). Falls back to the highest supported level **≤** requested; skipped with a warn if the agent advertises none. Values: minimal/low/medium/high/xhigh/max |
 | `mode`   | `session/set_mode`                            | **HARD-fails** on an unknown/invalid mode id — set only to a mode your agent advertises (the reference config omits it) |
 | api      | only `model` is applied                       | `effort`/`mode` are ignored for `kind="api"` |
+
+**Effort levels are model-dependent.** If you set a level the active model does
+not support, the bridge falls back to the highest supported level **at or below**
+it (e.g. `xhigh` runs as `high` on Sonnet 4.6 / Opus 4.6). A level *below* the
+agent's lowest advertised level is skipped (with a warn), leaving the default.
+
+| model | supported effort levels |
+|-------|--------------------------|
+| Fable 5, Opus 4.8, Opus 4.7 | low, medium, high, xhigh, max |
+| Opus 4.6, Sonnet 4.6        | low, medium, high, max |
+| codex (gpt-5.x)             | low, medium, high, xhigh |
 
 Auth failures generally surface on the **first request** to an agent, not at
 serve boot.

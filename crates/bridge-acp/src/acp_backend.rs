@@ -20,20 +20,22 @@ use agent_client_protocol::schema::{
     NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId as AgentSessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    SetSessionModelRequest, StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
+    SessionId as AgentSessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent,
     WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo};
+use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo, ErrorCode};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use bridge_core::domain::{
-    Effort, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
+use crate::model_effort::{
+    effort_opt, is_unsupported_effort_error, model_values, resolve_effort, resolve_model,
+    resolved_log_line, EffortDecision, ModelDecision, EFFORT_ORDER,
 };
+use bridge_core::domain::{PermissionDecision, PermissionRequest, SessionContext, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{
@@ -61,14 +63,16 @@ const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(50
 /// Static configuration for an ACP agent connection.
 ///
 /// `mode` drives a HARD `session/set_mode` after each `session/new` (a rejected
-/// mode fails session setup); `model` drives a BEST-EFFORT `session/set_model`
-/// (a failure is logged and the session continues — see [`AcpBackend::ensure_session`]).
+/// mode fails session setup); `model` validates and applies the advertised model
+/// config option (a bad pin fails session setup).
 /// `auth_method` optionally pins which advertised auth method `connect` uses.
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
+    /// Registry id of the agent this config belongs to, used in operator-facing diagnostics.
+    pub agent_id: String,
     /// Absolute working directory the agent runs sessions in.
     pub cwd: PathBuf,
-    /// Optional model id to request via `session/set_model` (best-effort).
+    /// Optional model id to request via advertised `session/set_config_option`.
     pub model: Option<String>,
     /// Optional mode id to request via `session/set_mode` (hard error if rejected).
     pub mode: Option<String>,
@@ -118,6 +122,7 @@ impl std::fmt::Debug for ContainerReap {
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {
+            agent_id: String::new(),
             cwd: PathBuf::from("."),
             model: None,
             mode: None,
@@ -457,72 +462,191 @@ impl AcpBackend {
         SetSessionModeRequest::new(agent_id, mode_id.into())
     }
 
-    /// Build the `session/set_model` request the backend sends (BEST-EFFORT) after
-    /// `session/new` when [`AcpConfig::model`] is set. ACP §11A:
-    /// `params:{ "sessionId":<agent id>, "modelId":<model> }`, method
-    /// `session/set_model` (snake_case, behind the `unstable_session_model` feature).
+    /// Build a `session/set_config_option` request for the advertised config option.
     #[must_use]
-    pub fn set_model_request(
+    pub fn set_config_option_request(
         agent_id: AgentSessionId,
-        model_id: impl Into<String>,
-    ) -> SetSessionModelRequest {
-        SetSessionModelRequest::new(agent_id, model_id.into())
-    }
-
-    /// The `reasoning_effort` config-option id we set for adapters with a
-    /// structured effort knob (codex-acp). Exposed so a test can assert against the
-    /// SAME id the backend transmits.
-    const EFFORT_CONFIG_ID: &'static str = "reasoning_effort";
-
-    /// Map an [`Effort`] tier to codex-acp's `reasoning_effort` config-option value.
-    /// `Minimal→low`, `Max→xhigh`; the rest map 1:1. (codex-acp exposes
-    /// `low`/`medium`/`high`/`xhigh`; the bridge's `Minimal` folds to `low`.)
-    fn effort_value(effort: Effort) -> &'static str {
-        match effort {
-            Effort::Minimal | Effort::Low => "low",
-            Effort::Medium => "medium",
-            Effort::High => "high",
-            Effort::Max => "xhigh",
-        }
-    }
-
-    /// Build the best-effort `session/set_config_option` request that sets the
-    /// `reasoning_effort` option to the mapped [`Effort`] value. Exposed so the
-    /// wire/golden + effort tests can assert the serialized shape against the SAME
-    /// value the backend transmits.
-    #[must_use]
-    pub fn set_effort_request(
-        agent_id: AgentSessionId,
-        effort: Effort,
+        config_id: impl Into<String>,
+        value: impl Into<String>,
     ) -> SetSessionConfigOptionRequest {
         SetSessionConfigOptionRequest::new(
             agent_id,
-            SessionConfigId::new(Self::EFFORT_CONFIG_ID),
-            SessionConfigValueId::new(Self::effort_value(effort)),
+            SessionConfigId::new(config_id.into()),
+            SessionConfigValueId::new(value.into()),
         )
     }
 
-    /// Apply `effort` to the freshly minted agent session, BEST-EFFORT (NON-FATAL),
-    /// mirroring `set_model`'s handling. For codex-acp this drives a
-    /// `session/set_config_option(reasoning_effort=<low|medium|high|xhigh>)`; an
-    /// adapter without a structured effort knob (kiro) errors on the unknown option,
-    /// which we LOG and IGNORE. Never propagates an error — effort is best-effort by
-    /// spec, so a failure here must not fail session setup.
-    async fn apply_effort(cx: &ConnectionTo<Agent>, agent_id: &AgentSessionId, effort: Effort) {
-        let req = Self::set_effort_request(agent_id.clone(), effort);
-        if let Err(e) = cx
-            .send_request::<SetSessionConfigOptionRequest>(req)
+    async fn set_config_option(
+        cx: &ConnectionTo<Agent>,
+        agent_id: &AgentSessionId,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<SessionConfigOption>, agent_client_protocol::Error> {
+        Ok(cx
+            .send_request::<SetSessionConfigOptionRequest>(Self::set_config_option_request(
+                agent_id.clone(),
+                config_id,
+                value,
+            ))
             .block_task()
-            .await
-        {
-            tracing::warn!(
-                effort = ?effort,
-                error = ?e,
-                "session/set_config_option(reasoning_effort) failed; continuing with the \
-                 agent's default effort (effort is best-effort: e.g. an adapter without a \
-                 structured effort knob errors on the unknown option)"
-            );
+            .await?
+            .config_options)
+    }
+
+    fn error_code_i64(code: ErrorCode) -> i64 {
+        match code {
+            ErrorCode::ParseError => -32700,
+            ErrorCode::InvalidRequest => -32600,
+            ErrorCode::MethodNotFound => -32601,
+            ErrorCode::InvalidParams => -32602,
+            ErrorCode::InternalError => -32603,
+            ErrorCode::AuthRequired => -32000,
+            ErrorCode::ResourceNotFound => -32001,
+            ErrorCode::Other(code) => i64::from(code),
+            _ => 0,
         }
+    }
+
+    async fn configure_model_option(
+        cx: &ConnectionTo<Agent>,
+        agent_session_id: &AgentSessionId,
+        agent_id: &str,
+        opts0: &[SessionConfigOption],
+        model: Option<&str>,
+    ) -> Result<(Vec<SessionConfigOption>, String), BridgeError> {
+        let Some((config_id, current, values)) = model_values(opts0) else {
+            if let Some(model) = model {
+                return Err(BridgeError::config_invalid(format!(
+                    "agent {agent_id} advertised no model option but model={model} configured"
+                )));
+            }
+            return Ok((opts0.to_vec(), "unadvertised".to_string()));
+        };
+
+        let decision = resolve_model(model, &values).map_err(|err| {
+            BridgeError::config_invalid(format!(
+                "agent {agent_id} model={} is not advertised; valid models: {}",
+                err.want,
+                err.valid.join(", ")
+            ))
+        })?;
+
+        match decision {
+            ModelDecision::Default => Ok((opts0.to_vec(), current)),
+            ModelDecision::Apply(value) => {
+                let refreshed = Self::set_config_option(cx, agent_session_id, &config_id, &value)
+                    .await
+                    .map_err(|e| {
+                        BridgeError::agent_crashed(format!(
+                            "session/set_config_option({config_id}) rejected: {e}"
+                        ))
+                    })?;
+                let opts = if refreshed.is_empty() {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        model = %value,
+                        "model applied but agent returned no refreshed options; effort levels may be stale"
+                    );
+                    opts0.to_vec()
+                } else {
+                    refreshed
+                };
+                let model_current = model_values(&opts)
+                    .map(|(_, current, _)| current)
+                    .unwrap_or(value);
+                Ok((opts, model_current))
+            }
+        }
+    }
+
+    async fn apply_effort_walkdown(
+        cx: &ConnectionTo<Agent>,
+        agent_session_id: &AgentSessionId,
+        agent_id: &str,
+        initial: EffortDecision,
+        advertised_levels: &[String],
+    ) -> EffortDecision {
+        let (config_id, requested_from, mut level) = match initial {
+            EffortDecision::Apply { config_id, level } => (config_id, level.clone(), level),
+            EffortDecision::FellBack {
+                config_id,
+                from,
+                to,
+            } => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    from = %from,
+                    to = %to,
+                    "configured effort not advertised; falling back to nearest lower effort"
+                );
+                (config_id, from, to)
+            }
+            EffortDecision::Skip => return EffortDecision::Skip,
+            EffortDecision::Unsupported { from } => return EffortDecision::Unsupported { from },
+        };
+
+        loop {
+            match Self::set_config_option(cx, agent_session_id, &config_id, &level).await {
+                Ok(_) => {
+                    if level == requested_from {
+                        return EffortDecision::Apply { config_id, level };
+                    }
+                    return EffortDecision::FellBack {
+                        config_id,
+                        from: requested_from,
+                        to: level,
+                    };
+                }
+                Err(e) => {
+                    let code = Self::error_code_i64(e.code);
+                    if !is_unsupported_effort_error(code, &e.message, e.data.as_ref()) {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            config_id = %config_id,
+                            level = %level,
+                            error = ?e,
+                            "session/set_config_option(effort) failed; stopping effort walk-down"
+                        );
+                        return EffortDecision::Skip;
+                    }
+
+                    let Some(next) = Self::next_lower_effort(&level, advertised_levels) else {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            config_id = %config_id,
+                            level = %level,
+                            error = ?e,
+                            "session/set_config_option(effort) unsupported and no lower advertised level remains"
+                        );
+                        return EffortDecision::Unsupported {
+                            from: requested_from,
+                        };
+                    };
+                    tracing::warn!(
+                        agent = %agent_id,
+                        config_id = %config_id,
+                        from = %level,
+                        to = %next,
+                        error = ?e,
+                        "session/set_config_option(effort) unsupported; retrying next lower advertised level"
+                    );
+                    level = next;
+                }
+            }
+        }
+    }
+
+    fn next_lower_effort(current: &str, advertised_levels: &[String]) -> Option<String> {
+        let current_rank = EFFORT_ORDER.iter().position(|level| *level == current)?;
+        EFFORT_ORDER[..current_rank]
+            .iter()
+            .rev()
+            .find(|candidate| {
+                advertised_levels
+                    .iter()
+                    .any(|level| level.as_str() == **candidate)
+            })
+            .map(|level| (*level).to_string())
     }
 
     /// **Production** constructor: spawn `cmd args` as a `Supervised` child
@@ -978,6 +1102,11 @@ impl AcpBackend {
                 None,
             ),
         };
+        let agent_id_for_mint = self
+            .config
+            .as_ref()
+            .map(|c| c.agent_id.clone())
+            .unwrap_or_default();
 
         // Did THIS call mint the agent session? The init closure runs for at most
         // one caller (`OnceCell`); set the flag inside it so only the minter does
@@ -1005,6 +1134,7 @@ impl AcpBackend {
                     .inspect_err(|e| tracing::warn!(error = ?e, "session/new mint failed"))
                     .map_err(|e| BridgeError::agent_crashed(format!("session/new failed: {e}")))?;
                 let id = resp.session_id;
+                let opts0 = resp.config_options.unwrap_or_default();
 
                 // (2) set_mode — HARD error, configured INSIDE the closure (before
                 // returning the id). The operator asked for a specific mode; if the
@@ -1024,38 +1154,64 @@ impl AcpBackend {
                         })?;
                 }
 
-                // (3) set_model — BEST-EFFORT (NON-FATAL). Rationale: codex-acp's
-                // `set_model` is custom-provider-only; the builtin OpenAI provider
-                // returns `models:null` / errors on `session/set_model`. A model-set
-                // failure must therefore NOT kill the session — we LOG it and
-                // continue, running the agent's default model. (A configured model
-                // the agent silently ignores is acceptable; a hard failure here
-                // would make every session on such an agent unusable.)
-                if let Some(model) = model.as_deref() {
-                    if let Err(e) = cx
-                        .send_request(Self::set_model_request(id.clone(), model))
-                        .block_task()
-                        .await
-                    {
-                        tracing::warn!(
-                            model = %model,
-                            error = ?e,
-                            "session/set_model failed; continuing with the agent's default \
-                             model (set_model is best-effort: e.g. builtin OpenAI returns \
-                             models:null)"
-                        );
-                    }
-                }
+                // (3) model — HARD validation against the agent-advertised model
+                // config option, then apply through session/set_config_option. A
+                // configured model that the agent did not advertise is operator
+                // config drift, so mint fails before any prompt is sent.
+                let (refreshed_opts, model_current) = Self::configure_model_option(
+                    cx,
+                    &id,
+                    &agent_id_for_mint,
+                    &opts0,
+                    model.as_deref(),
+                )
+                .await?;
 
-                // (4) effort — BEST-EFFORT (NON-FATAL), mirroring set_model. For
-                // adapters with a structured effort knob (codex-acp) we map the
-                // `Effort` tier to the `reasoning_effort` config option via
-                // `session/set_config_option`; an agent that doesn't expose it (kiro)
-                // errors, which we LOG and ignore. Never fatal — effort is best-effort
-                // by spec; model/mode are the must-haves.
-                if let Some(effort) = effort {
-                    Self::apply_effort(cx, &id, effort).await;
-                }
+                // (4) effort — resolve against the refreshed post-model options.
+                // Applying effort is non-fatal, but only unsupported-effort internal
+                // errors trigger walk-down; unrelated errors stop immediately.
+                let effort_outcome = match effort_opt(&refreshed_opts) {
+                    Some(advertised) => {
+                        let decision = resolve_effort(effort, &advertised);
+                        match decision {
+                            EffortDecision::Unsupported { from } => {
+                                tracing::warn!(
+                                    agent = %agent_id_for_mint,
+                                    effort = %from,
+                                    valid = ?advertised.levels,
+                                    "configured effort is below the lowest advertised effort level; skipping"
+                                );
+                                EffortDecision::Unsupported { from }
+                            }
+                            EffortDecision::Skip => EffortDecision::Skip,
+                            decision @ (EffortDecision::Apply { .. }
+                            | EffortDecision::FellBack { .. }) => {
+                                Self::apply_effort_walkdown(
+                                    cx,
+                                    &id,
+                                    &agent_id_for_mint,
+                                    decision,
+                                    &advertised.levels,
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(effort) = effort {
+                            tracing::warn!(
+                                agent = %agent_id_for_mint,
+                                effort = ?effort,
+                                "agent advertised no effort option; skipping configured effort"
+                            );
+                        }
+                        EffortDecision::Skip
+                    }
+                };
+                tracing::info!(
+                    "{}",
+                    resolved_log_line(&agent_id_for_mint, &model_current, &effort_outcome)
+                );
 
                 // (5) Record the cwd that was actually used to mint this session so
                 // the immutability guard below can compare future requests against
@@ -1881,10 +2037,12 @@ mod tests {
     use agent_client_protocol::schema::{
         AuthenticateRequest, AuthenticateResponse, ContentChunk, NewSessionResponse,
         PermissionOption, PermissionOptionId, PromptRequest, PromptResponse,
-        RequestPermissionRequest, RequestPermissionResponse, SetSessionConfigOptionResponse,
-        SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
-        SetSessionModelResponse, StopReason, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        RequestPermissionRequest, RequestPermissionResponse, SessionConfigKind,
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+        ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
     };
+    use bridge_core::domain::Effort;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Notify;
 
@@ -1983,7 +2141,7 @@ mod tests {
         /// to be sent to the client), so a test can sequence deterministically.
         permission_requested: Arc<Notify>,
 
-        // ── Task 6: set_mode / set_model / authenticate ───────────────────────
+        // ── Task 6: set_mode / authenticate ───────────────────────────────────
         /// Mode ids observed via `session/set_mode` requests (in order).
         set_modes: Arc<Mutex<Vec<String>>>,
         /// Fires every time a `session/set_mode` is recorded.
@@ -1991,14 +2149,6 @@ mod tests {
         /// When set, the `session/set_mode` handler REJECTS the request with a
         /// JSON-RPC error (modeling an agent that does not know the mode id).
         reject_set_mode: Arc<AtomicBool>,
-        /// Model ids observed via `session/set_model` requests (in order).
-        set_models: Arc<Mutex<Vec<String>>>,
-        /// Fires every time a `session/set_model` is recorded.
-        set_model_seen: Arc<Notify>,
-        /// When set, the `session/set_model` handler REJECTS the request with a
-        /// JSON-RPC error (modeling an agent — e.g. builtin OpenAI — that errors
-        /// on set_model). The backend treats this as NON-FATAL.
-        reject_set_model: Arc<AtomicBool>,
         /// Auth-method ids observed via `authenticate` requests (in order).
         authenticates: Arc<Mutex<Vec<String>>>,
         /// When set, the `authenticate` handler REJECTS with a JSON-RPC error
@@ -2015,6 +2165,24 @@ mod tests {
         /// When set, the `session/set_config_option` handler REJECTS with a JSON-RPC
         /// error (modeling an adapter without a structured effort knob). NON-FATAL.
         reject_set_config: Arc<AtomicBool>,
+        /// Whether `session/new` advertises a model config option.
+        advertise_model_config: Arc<AtomicBool>,
+        /// Config id/current/options for the advertised model select.
+        model_config_id: Arc<Mutex<String>>,
+        model_config_current: Arc<Mutex<String>>,
+        model_config_values: Arc<Mutex<Vec<String>>>,
+        /// Whether `session/new` advertises an effort config option.
+        advertise_effort_config: Arc<AtomicBool>,
+        /// Config id/current/options for the advertised effort select.
+        effort_config_id: Arc<Mutex<String>>,
+        effort_config_current: Arc<Mutex<String>>,
+        effort_config_values: Arc<Mutex<Vec<String>>>,
+        /// Optional effort levels to advertise after a model config option is applied.
+        refreshed_effort_values_after_model: Arc<Mutex<Option<Vec<String>>>>,
+        /// Optional 1-based `session/set_config_option` call number to reject.
+        reject_set_config_call: Arc<Mutex<Option<usize>>>,
+        /// Error body used when rejecting `session/set_config_option`.
+        set_config_error_body: Arc<Mutex<String>>,
 
         // ── Task 4 (session-cwd): record the cwd the client sent at session/new ─
         /// The `cwd` from the most recent `session/new` request (as a lossy string).
@@ -2052,16 +2220,101 @@ mod tests {
                 set_modes: Arc::new(Mutex::new(Vec::new())),
                 set_mode_seen: Arc::new(Notify::new()),
                 reject_set_mode: Arc::new(AtomicBool::new(false)),
-                set_models: Arc::new(Mutex::new(Vec::new())),
-                set_model_seen: Arc::new(Notify::new()),
-                reject_set_model: Arc::new(AtomicBool::new(false)),
                 authenticates: Arc::new(Mutex::new(Vec::new())),
                 reject_authenticate: Arc::new(AtomicBool::new(false)),
                 auth_methods: Arc::new(Mutex::new(Vec::new())),
                 set_config_options: Arc::new(Mutex::new(Vec::new())),
                 set_config_seen: Arc::new(Notify::new()),
                 reject_set_config: Arc::new(AtomicBool::new(false)),
+                advertise_model_config: Arc::new(AtomicBool::new(true)),
+                model_config_id: Arc::new(Mutex::new("model".to_string())),
+                model_config_current: Arc::new(Mutex::new("default".to_string())),
+                model_config_values: Arc::new(Mutex::new(vec![
+                    "default".to_string(),
+                    "m".to_string(),
+                    "a".to_string(),
+                    "b".to_string(),
+                    "gpt-x".to_string(),
+                    "haiku".to_string(),
+                ])),
+                advertise_effort_config: Arc::new(AtomicBool::new(true)),
+                effort_config_id: Arc::new(Mutex::new("effort".to_string())),
+                effort_config_current: Arc::new(Mutex::new("medium".to_string())),
+                effort_config_values: Arc::new(Mutex::new(vec![
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                    "max".to_string(),
+                ])),
+                refreshed_effort_values_after_model: Arc::new(Mutex::new(None)),
+                reject_set_config_call: Arc::new(Mutex::new(None)),
+                set_config_error_body: Arc::new(Mutex::new("Invalid value for effort".to_string())),
                 new_session_cwd: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn select_options(values: Vec<String>) -> Vec<SessionConfigSelectOption> {
+            values
+                .into_iter()
+                .map(|value| SessionConfigSelectOption::new(value.clone(), value))
+                .collect()
+        }
+
+        async fn advertised_config_options(&self) -> Vec<SessionConfigOption> {
+            let mut options = Vec::new();
+
+            if self.advertise_model_config.load(Ordering::SeqCst) {
+                let id = self.model_config_id.lock().await.clone();
+                let current = self.model_config_current.lock().await.clone();
+                let values = self.model_config_values.lock().await.clone();
+                options.push(
+                    SessionConfigOption::select(
+                        id.clone(),
+                        "Model".to_string(),
+                        current,
+                        Self::select_options(values),
+                    )
+                    .category(SessionConfigOptionCategory::Model),
+                );
+            }
+
+            if self.advertise_effort_config.load(Ordering::SeqCst) {
+                let id = self.effort_config_id.lock().await.clone();
+                let current = self.effort_config_current.lock().await.clone();
+                let values = self.effort_config_values.lock().await.clone();
+                options.push(
+                    SessionConfigOption::select(
+                        id.clone(),
+                        "Effort".to_string(),
+                        current,
+                        Self::select_options(values),
+                    )
+                    .category(SessionConfigOptionCategory::ThoughtLevel),
+                );
+            }
+
+            options
+        }
+
+        async fn refresh_config_current(&self, config_id: &str, value_id: &str) {
+            let model_config_id = self.model_config_id.lock().await.clone();
+            if config_id == model_config_id {
+                *self.model_config_current.lock().await = value_id.to_string();
+                if let Some(values) = self
+                    .refreshed_effort_values_after_model
+                    .lock()
+                    .await
+                    .clone()
+                {
+                    *self.effort_config_values.lock().await = values;
+                }
+                return;
+            }
+
+            let effort_config_id = self.effort_config_id.lock().await.clone();
+            if config_id == effort_config_id {
+                *self.effort_config_current.lock().await = value_id.to_string();
             }
         }
 
@@ -2128,7 +2381,6 @@ mod tests {
             let r_auth = rec.clone();
             let r_new = rec.clone();
             let r_mode = rec.clone();
-            let r_model = rec.clone();
             let r_config = rec.clone();
             let r_prompt = rec.clone();
             let r_cancel = rec.clone();
@@ -2191,24 +2443,6 @@ mod tests {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
-                    move |req: SetSessionModelRequest,
-                          responder: agent_client_protocol::Responder<SetSessionModelResponse>,
-                          _cx| {
-                        let r = r_model.clone();
-                        async move {
-                            r.set_models.lock().await.push(req.model_id.0.to_string());
-                            r.set_model_seen.notify_one();
-                            if r.reject_set_model.load(Ordering::SeqCst) {
-                                responder.respond_with_internal_error("set_model unsupported")?;
-                            } else {
-                                responder.respond(SetSessionModelResponse::new())?;
-                            }
-                            Ok(())
-                        }
-                    },
-                    agent_client_protocol::on_receive_request!(),
-                )
-                .on_receive_request(
                     move |req: SetSessionConfigOptionRequest,
                           responder: agent_client_protocol::Responder<
                         SetSessionConfigOptionResponse,
@@ -2216,16 +2450,25 @@ mod tests {
                           _cx| {
                         let r = r_config.clone();
                         async move {
-                            r.set_config_options
-                                .lock()
-                                .await
-                                .push((req.config_id.0.to_string(), req.value.0.to_string()));
+                            let call_number = {
+                                let mut set_config_options = r.set_config_options.lock().await;
+                                set_config_options
+                                    .push((req.config_id.0.to_string(), req.value.0.to_string()));
+                                set_config_options.len()
+                            };
                             r.set_config_seen.notify_one();
-                            if r.reject_set_config.load(Ordering::SeqCst) {
-                                responder
-                                    .respond_with_internal_error("config option unsupported")?;
+                            let reject_call = *r.reject_set_config_call.lock().await;
+                            if r.reject_set_config.load(Ordering::SeqCst)
+                                || reject_call == Some(call_number)
+                            {
+                                let body = r.set_config_error_body.lock().await.clone();
+                                responder.respond_with_internal_error(body)?;
                             } else {
-                                responder.respond(SetSessionConfigOptionResponse::new(vec![]))?;
+                                r.refresh_config_current(&req.config_id.0, &req.value.0)
+                                    .await;
+                                responder.respond(SetSessionConfigOptionResponse::new(
+                                    r.advertised_config_options().await,
+                                ))?;
                             }
                             Ok(())
                         }
@@ -2250,9 +2493,10 @@ mod tests {
                                 // widening the create/cancel + concurrency window.
                                 r.new_session_gate.notified().await;
                             }
-                            responder.respond(NewSessionResponse::new(AgentSessionId::new(
-                                r.minted_id,
-                            )))?;
+                            responder.respond(
+                                NewSessionResponse::new(AgentSessionId::new(r.minted_id))
+                                    .config_options(r.advertised_config_options().await),
+                            )?;
                             Ok(())
                         }
                     },
@@ -2431,6 +2675,57 @@ mod tests {
 
     fn bkey(s: &str) -> SessionId {
         SessionId::parse(s).unwrap()
+    }
+
+    fn select_current(opts: &[SessionConfigOption], id: &str) -> Option<String> {
+        opts.iter().find_map(|opt| {
+            if &*opt.id.0 != id {
+                return None;
+            }
+            match &opt.kind {
+                SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
+                _ => None,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn recorder_advertises_and_refreshes_config_options() {
+        let rec = Recorder::new("agent-sess-CONFIGOPTS");
+        let be = connect_recording(rec).await;
+        let cx = be.cx().expect("connection handle").clone();
+
+        let new_resp: NewSessionResponse = cx
+            .send_request(AcpBackend::new_session_request("/tmp", &[]))
+            .block_task()
+            .await
+            .expect("session/new succeeds");
+        let initial_options = new_resp
+            .config_options
+            .expect("recorder advertises config options");
+        assert_eq!(
+            select_current(&initial_options, "model").as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            select_current(&initial_options, "effort").as_deref(),
+            Some("medium")
+        );
+
+        let set_resp: SetSessionConfigOptionResponse = cx
+            .send_request(SetSessionConfigOptionRequest::new(
+                new_resp.session_id,
+                SessionConfigId::new("effort"),
+                SessionConfigValueId::new("high"),
+            ))
+            .block_task()
+            .await
+            .expect("set_config_option succeeds");
+        assert_eq!(
+            select_current(&set_resp.config_options, "effort").as_deref(),
+            Some("high"),
+            "set_config_option returns refreshed config_options"
+        );
     }
 
     #[tokio::test]
@@ -3370,7 +3665,7 @@ mod tests {
         );
     }
 
-    // ── Task 6: set_mode / set_model / authenticate ────────────────────────────
+    // ── Task 6: set_mode / model config / authenticate ─────────────────────────
 
     /// `test_config` with a configured `mode`.
     fn test_config_with_mode(mode: &str) -> AcpConfig {
@@ -3457,35 +3752,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_model_error_is_non_fatal() {
-        // The agent ERRORS `session/set_model` (modeling builtin OpenAI returning
-        // models:null). This must be NON-FATAL: the session is still set up, the
-        // model failure is logged, and a subsequent prompt still completes.
+    async fn non_advertised_model_fails_mint() {
         let rec = Recorder::new("agent-sess-MODELERR");
-        rec.reject_set_model.store(true, Ordering::SeqCst);
         let cfg = AcpConfig {
-            model: Some("gpt-x".to_string()),
+            agent_id: "recorder".to_string(),
+            model: Some("missing-model".to_string()),
             ..test_config()
         };
         let be = connect_recording_with(rec.clone(), cfg).await;
         let key = bkey("bridge-MODELERR");
 
-        // Session setup succeeds despite the set_model error.
-        be.ensure_session(&key).await.expect(
-            "a set_model error must NOT fail session setup (best-effort: continue on the \
-             agent's default model)",
-        );
-        tokio::time::timeout(Duration::from_secs(2), rec.set_model_seen.notified())
-            .await
-            .expect("set_model must have reached the (erroring) agent");
-        assert_eq!(rec.set_models.lock().await.as_slice(), &["gpt-x"]);
-
-        // And a subsequent prompt still works (the connection/session survived).
-        rec.set_updates(vec![ScriptedUpdate::Text("ok")]).await;
-        let mut s = be.prompt(&key, vec![]).await.unwrap();
-        assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "ok"));
+        match be.ensure_session(&key).await {
+            Err(BridgeError::ConfigInvalid { reason }) => {
+                assert!(reason.contains("agent recorder"), "{reason}");
+                assert!(reason.contains("missing-model"), "{reason}");
+                assert!(reason.contains("valid models:"), "{reason}");
+                assert!(reason.contains("gpt-x"), "{reason}");
+            }
+            other => panic!("non-advertised model must fail mint, got {other:?}"),
+        }
         assert!(
-            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            rec.set_config_options.lock().await.is_empty(),
+            "invalid model must fail before set_config_option is sent"
         );
     }
 
@@ -3649,7 +3937,7 @@ mod tests {
         // `configure_session(S, cfg)` STASHES the per-session config; `ensure_session`
         // (driven here directly, exactly as `prompt` does) reads the stash for S at
         // mint and applies BOTH `session/set_mode(mode)` (hard) and
-        // `session/set_model(model)` (best-effort) for S's agent session — with NO
+        // `session/set_config_option(model)` for S's agent session — with NO
         // model/mode baked into `AcpConfig` (proving the stash, not the static config,
         // is what drove the configuration).
         let rec = Recorder::new("agent-sess-CFG");
@@ -3671,17 +3959,17 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), rec.set_mode_seen.notified())
             .await
             .expect("set_mode must reach the agent after session/new");
-        tokio::time::timeout(Duration::from_secs(2), rec.set_model_seen.notified())
+        tokio::time::timeout(Duration::from_secs(2), rec.set_config_seen.notified())
             .await
-            .expect("set_model must reach the agent after session/new");
+            .expect("set_config_option(model) must reach the agent after session/new");
         assert_eq!(
             rec.set_modes.lock().await.as_slice(),
             &["x"],
             "stashed mode applied at mint"
         );
         assert_eq!(
-            rec.set_models.lock().await.as_slice(),
-            &["m"],
+            rec.set_config_options.lock().await.as_slice(),
+            &[("model".to_string(), "m".to_string())],
             "stashed model applied at mint"
         );
     }
@@ -3689,8 +3977,8 @@ mod tests {
     #[tokio::test]
     async fn per_session_config_is_isolated() {
         // ONE backend, TWO bridge sessions, each configured with a DIFFERENT model.
-        // Minting each reads ITS OWN stash entry: the agent must see set_model("a")
-        // for S1 and set_model("b") for S2 — no bleed across sessions on the shared
+        // Minting each reads ITS OWN stash entry: the agent must see model="a"
+        // for S1 and model="b" for S2 — no bleed across sessions on the shared
         // connection. (The fake mints the same agent id for both, which is fine: the
         // stash is keyed by the BRIDGE SessionId, so the values stay separate.)
         let rec = Recorder::new("agent-sess-ISO");
@@ -3721,11 +4009,18 @@ mod tests {
 
         be.ensure_session(&s1).await.unwrap();
         be.ensure_session(&s2).await.unwrap();
-        // Two mints → two set_model calls. `ensure_session` only returns AFTER its
-        // mint closure (which sends + awaits the best-effort set_model reply) runs,
-        // so both calls have completed their set_model by here; assert on the
+        // Two mints → two model config calls. `ensure_session` only returns AFTER its
+        // mint closure (which sends + awaits set_config_option) runs,
+        // so both calls have completed their config update by here; assert on the
         // recorded vec rather than the (single-permit) `Notify` to avoid coalescing.
-        let mut models = rec.set_models.lock().await.clone();
+        let mut models = rec
+            .set_config_options
+            .lock()
+            .await
+            .iter()
+            .filter(|(id, _)| id == "model")
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
         models.sort();
         assert_eq!(
             models.as_slice(),
@@ -3786,8 +4081,8 @@ mod tests {
 
     #[tokio::test]
     async fn configure_session_applies_effort_at_mint() {
-        // A stashed `effort` drives a best-effort `session/set_config_option` with id
-        // `reasoning_effort` and the mapped value (`High → "high"`) at mint.
+        // A stashed `effort` drives `session/set_config_option` with the advertised
+        // effort id and resolved value (`High -> "high"`) at mint.
         let rec = Recorder::new("agent-sess-EFFORT");
         let be = connect_recording(rec.clone()).await;
         let key = bkey("bridge-EFFORT");
@@ -3808,18 +4103,18 @@ mod tests {
             .expect("set_config_option must reach the agent after session/new");
         assert_eq!(
             rec.set_config_options.lock().await.as_slice(),
-            &[("reasoning_effort".to_string(), "high".to_string())],
-            "stashed effort applied as reasoning_effort=high at mint"
+            &[("effort".to_string(), "high".to_string())],
+            "stashed effort applied as effort=high at mint"
         );
     }
 
     #[tokio::test]
     async fn effort_error_is_non_fatal() {
-        // An adapter without a structured effort knob ERRORS the config option; this
-        // must be NON-FATAL (mirrors set_model): the session is still set up and a
-        // subsequent prompt still completes.
+        // An unrelated config-option error must be NON-FATAL, and must not trigger
+        // unsupported-effort walk-down retries.
         let rec = Recorder::new("agent-sess-EFFORTERR");
         rec.reject_set_config.store(true, Ordering::SeqCst);
+        *rec.set_config_error_body.lock().await = "usage_update failed".to_string();
         let be = connect_recording(rec.clone()).await;
         let key = bkey("bridge-EFFORTERR");
 
@@ -3836,10 +4131,10 @@ mod tests {
         be.ensure_session(&key).await.expect(
             "a set_config_option error must NOT fail session setup (effort is best-effort)",
         );
-        // The (erroring) agent still recorded the attempt with the Max→xhigh mapping.
+        // The (erroring) agent still recorded the attempt with the Max -> "max" mapping.
         assert_eq!(
             rec.set_config_options.lock().await.as_slice(),
-            &[("reasoning_effort".to_string(), "xhigh".to_string())],
+            &[("effort".to_string(), "max".to_string())],
         );
         // A subsequent prompt still works (connection/session survived the error).
         rec.set_updates(vec![ScriptedUpdate::Text("ok")]).await;
@@ -3847,6 +4142,154 @@ mod tests {
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "ok"));
         assert!(
             matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_model_option_but_pinned_model_fails_mint() {
+        let rec = Recorder::new("agent-sess-NOMODELOPT");
+        rec.advertise_model_config.store(false, Ordering::SeqCst);
+        let cfg = AcpConfig {
+            agent_id: "recorder".to_string(),
+            model: Some("haiku".to_string()),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-NOMODELOPT");
+
+        match be.ensure_session(&key).await {
+            Err(BridgeError::ConfigInvalid { reason }) => {
+                assert!(
+                    reason.contains("agent recorder advertised no model option"),
+                    "{reason}"
+                );
+                assert!(reason.contains("model=haiku"), "{reason}");
+            }
+            other => {
+                panic!("pinned model without advertised model option must fail, got {other:?}")
+            }
+        }
+        assert!(rec.set_config_options.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn effort_configured_but_no_effort_option_warn_skips() {
+        let rec = Recorder::new("agent-sess-NOEFFORTOPT");
+        rec.advertise_effort_config.store(false, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-NOEFFORTOPT");
+
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: None,
+                effort: Some(Effort::High),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        be.ensure_session(&key)
+            .await
+            .expect("missing effort option is a warn+skip, not a mint failure");
+        assert!(
+            rec.set_config_options.lock().await.is_empty(),
+            "no effort option means no set_config_option attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_walkdown_converges_from_xhigh_to_high() {
+        let rec = Recorder::new("agent-sess-WALKDOWN");
+        *rec.effort_config_values.lock().await = vec!["high".to_string(), "xhigh".to_string()];
+        *rec.reject_set_config_call.lock().await = Some(1);
+        *rec.set_config_error_body.lock().await = "Invalid value for effort".to_string();
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-WALKDOWN");
+
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: None,
+                effort: Some(Effort::Max),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        be.ensure_session(&key).await.unwrap();
+
+        assert_eq!(
+            rec.set_config_options.lock().await.as_slice(),
+            &[
+                ("effort".to_string(), "xhigh".to_string()),
+                ("effort".to_string(), "high".to_string())
+            ],
+            "Max falls back to advertised xhigh, then unsupported xhigh walks down to high"
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_walkdown_stops_on_unrelated_internal_error() {
+        let rec = Recorder::new("agent-sess-WALKSTOP");
+        *rec.effort_config_values.lock().await = vec!["high".to_string(), "xhigh".to_string()];
+        *rec.reject_set_config_call.lock().await = Some(1);
+        *rec.set_config_error_body.lock().await = "usage_update failed".to_string();
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-WALKSTOP");
+
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: None,
+                effort: Some(Effort::Max),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        be.ensure_session(&key)
+            .await
+            .expect("unrelated effort error is non-fatal");
+
+        assert_eq!(
+            rec.set_config_options.lock().await.as_slice(),
+            &[("effort".to_string(), "xhigh".to_string())],
+            "unrelated -32603 must not retry lower effort levels"
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_resolves_against_refreshed_post_model_options() {
+        let rec = Recorder::new("agent-sess-REFRESHED");
+        *rec.effort_config_values.lock().await = vec!["low".to_string()];
+        *rec.refreshed_effort_values_after_model.lock().await = Some(vec![
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+        ]);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-REFRESHED");
+
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("m".to_string()),
+                effort: Some(Effort::High),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        be.ensure_session(&key).await.unwrap();
+
+        assert_eq!(
+            rec.set_config_options.lock().await.as_slice(),
+            &[
+                ("model".to_string(), "m".to_string()),
+                ("effort".to_string(), "high".to_string())
+            ],
+            "effort must resolve from model's refreshed config_options, not stale session/new options"
         );
     }
 

@@ -7,11 +7,17 @@
 #     a2a-bridge serve --config examples/a2a-bridge.multi-agent.toml
 #
 # model/effort/mode (all OPTIONAL, all applied per session):
-#   model  -> session/set_model (BEST-EFFORT). NOTE: claude's model is NOT
-#             observable through the bridge (claude-agent-acp uses the
-#             subscription default); treat `model` on claude as advisory.
-#   effort -> codex ONLY (mapped to codex-acp's `reasoning_effort`). kiro /
-#             claude / api get no bridge effort. Values: minimal|low|medium|high|max.
+#   model  -> session/set_config_option(category="model"). VALIDATED at mint:
+#             pinning a value the agent does not advertise hard-fails the session
+#             (the error lists the advertised values). Aliases resolve BEFORE
+#             validation (`fable` -> claude-fable-5[1m], `opus` -> default).
+#             claude's served model is visible in claude's own session transcript,
+#             not surfaced through the bridge.
+#   effort -> session/set_config_option(thought-level) for ANY agent that
+#             advertises one (codex `reasoning_effort`, claude `effort`). Falls
+#             back to the highest supported level <= requested; skipped with a warn
+#             if the agent advertises no effort option. Values:
+#             minimal|low|medium|high|xhigh|max.
 #   mode   -> session/set_mode, which HARD-FAILS on an unknown/invalid mode id
 #             (modes are agent-native). Omitted here on purpose; set it only to a
 #             mode your agent actually advertises.
@@ -32,21 +38,23 @@ resume_attempt_cap = 3
 [server]
 addr = "127.0.0.1:8080"
 
-# kiro: zero-auth local default (kiro-cli acp).
+# kiro: zero-auth local default (kiro-cli acp). No `model` pin: kiro advertises no
+# model config option, so any pin would hard-fail at mint (migrated 2026-06-09 —
+# was `model = "auto"`, valid only under the pre-config-option surface).
 [[agents]]
 id    = "kiro"
 cmd   = "kiro-cli"
 args  = ["acp"]
-model = "auto"
 
-# codex: gpt-5.5 with reasoning_effort (effort is codex-only).
+# codex: gpt-5.5 with reasoning_effort.
 [[agents]]
 id     = "codex"
 cmd    = "codex-acp"
 model  = "gpt-5.5"
 effort = "high"
 
-# claude: subscription. `model` is advisory (not observable through the bridge).
+# claude: subscription. `model` is validated against the advertised values and
+# applied; aliases work too (e.g. `model = "fable"` -> claude-fable-5[1m]).
 [[agents]]
 id    = "claude"
 cmd   = "claude-agent-acp"

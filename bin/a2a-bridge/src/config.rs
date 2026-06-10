@@ -176,7 +176,7 @@ pub struct AgentEntryToml {
     pub model_provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
-    /// Parsed to `Effort` in `into_snapshot`; valid values: minimal/low/medium/high/max.
+    /// Parsed to `Effort` in `into_snapshot`; valid values: minimal/low/medium/high/xhigh/max.
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
@@ -877,20 +877,9 @@ impl RegistryConfig {
 }
 
 /// Parse an effort-level string into the `Effort` enum.
-/// Valid inputs (case-sensitive): "minimal", "low", "medium", "high", "max".
+/// Valid inputs: "minimal", "low", "medium", "high", "xhigh", "max" (case-insensitive).
 fn parse_effort(s: &str) -> Result<Effort, ConfigError> {
-    Ok(match s {
-        "minimal" => Effort::Minimal,
-        "low" => Effort::Low,
-        "medium" => Effort::Medium,
-        "high" => Effort::High,
-        "max" => Effort::Max,
-        other => {
-            return Err(ConfigError::Registry(format!(
-                "invalid effort: {other:?} (expected minimal/low/medium/high/max)"
-            )));
-        }
-    })
+    s.parse::<Effort>().map_err(ConfigError::Registry)
 }
 
 /// Parse the adapter-kind string into `AgentKind`. None → Acp (back-compat).
@@ -1126,7 +1115,6 @@ mode = "read-only"
 id = "kiro"
 cmd = "kiro-cli"
 args = ["acp"]
-model = "auto"
 
 [server]
 addr = "127.0.0.1:8080"
@@ -1187,6 +1175,7 @@ cmd = "beta-cli"
             ("low", bridge_core::domain::Effort::Low),
             ("medium", bridge_core::domain::Effort::Medium),
             ("high", bridge_core::domain::Effort::High),
+            ("xhigh", bridge_core::domain::Effort::Xhigh),
             ("max", bridge_core::domain::Effort::Max),
         ] {
             assert_eq!(parse_effort(s).unwrap(), expected, "failed for {s:?}");

@@ -2,6 +2,7 @@
 
 use crate::ids::{AgentId, CallerId};
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Part {
@@ -21,7 +22,27 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    Xhigh,
     Max,
+}
+
+impl FromStr for Effort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.to_ascii_lowercase();
+        match normalized.as_str() {
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            _ => Err(format!(
+                "invalid effort: {s:?} (expected minimal/low/medium/high/xhigh/max)"
+            )),
+        }
+    }
 }
 
 /// Which adapter implementation backs an agent entry. Parsed from the TOML `kind`
@@ -296,6 +317,26 @@ mod tests {
     #[test]
     fn agent_kind_defaults_to_acp() {
         assert_eq!(AgentKind::default(), AgentKind::Acp);
+    }
+
+    #[test]
+    fn effort_from_str_parses_all_levels_case_insensitively() {
+        for (s, expected) in [
+            ("minimal", Effort::Minimal),
+            ("LOW", Effort::Low),
+            ("medium", Effort::Medium),
+            ("High", Effort::High),
+            ("xhigh", Effort::Xhigh),
+            ("max", Effort::Max),
+        ] {
+            assert_eq!(s.parse::<Effort>().unwrap(), expected, "failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn effort_from_str_rejects_invalid() {
+        let err = "bogus".parse::<Effort>().unwrap_err();
+        assert!(err.contains("minimal/low/medium/high/xhigh/max"));
     }
 
     #[test]

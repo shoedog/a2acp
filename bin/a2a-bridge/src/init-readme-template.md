@@ -34,11 +34,16 @@ no command).
 
 ### model / effort / mode
 
-- `model` → requested via `session/set_model` (**best-effort**). **Caveat:**
-  claude's model is **not observable** through the bridge — `claude-agent-acp`
-  uses the subscription's default; treat `model` on claude as advisory.
-- `effort` (minimal/low/medium/high/max) → **codex only** (mapped to codex-acp's
-  `reasoning_effort` config option). kiro / claude / api get no bridge effort.
+- `model` → `session/set_config_option(category="model")`, **VALIDATED at mint**:
+  pinning a value the agent does not advertise hard-fails the session (the error
+  lists the advertised values). Aliases resolve first (`fable`→`claude-fable-5[1m]`,
+  `opus`→`default`). claude's served model shows in claude's own transcript, not
+  the bridge's. **kiro advertises no model option — do not pin it.**
+- `effort` (minimal/low/medium/high/xhigh/max) → `session/set_config_option`
+  (thought-level) for **any** agent that advertises one (codex `reasoning_effort`,
+  claude `effort`). Falls back to the highest supported level **≤** requested;
+  skipped with a warn if the agent advertises none. (Levels are model-dependent:
+  Sonnet 4.6 / Opus 4.6 have no `xhigh`; codex tops out at `xhigh`.)
 - `mode` → `session/set_mode`, which **HARD-fails** on an invalid/unknown mode id
   (modes are agent-native). This template omits `mode` deliberately; set it only
   to a mode your agent actually advertises.

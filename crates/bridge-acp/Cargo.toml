@@ -5,16 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# `unstable_session_model` enables the SDK's `SetSessionModelRequest`/`ModelId`
-# types + the `session/set_model` JsonRpcRequest impl, which the backend uses for
-# best-effort model selection (Task 6). Those types do NOT exist without it.
 # `unstable_session_usage` models the `usage_update` SessionUpdate variant. WITHOUT it the SDK's
 # internally-tagged `SessionUpdate` enum (no `#[serde(other)]`) HARD-FAILS to deserialize an agent's
 # `session/update` of variant `usage_update` and auto-emits a spurious `-32602` back to the agent, which
 # stalls the turn → the `end_turn` result never arrives → a multi-minute hang (live-found vs claude-agent-acp,
 # which now sends `usage_update{cost}`). With the feature on, the variant deserializes and is dropped as an
 # unmodeled update by `map_session_update`. The variant already ships in the pinned 0.12.1 — feature only, no bump.
-agent-client-protocol = { workspace = true, features = ["unstable_session_model", "unstable_session_usage"] }
+agent-client-protocol = { workspace = true, features = ["unstable_session_usage"] }
 bridge-core = { path = "../bridge-core" }
 thiserror.workspace = true
 async-trait.workspace = true

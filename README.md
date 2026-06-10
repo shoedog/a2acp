@@ -49,7 +49,8 @@ A2A caller ──HTTP/JSON-RPC/SSE──▶ bridge-a2a-inbound (axum)
 - **ACP** via `agent-client-protocol` =0.12.1 (Apache-2.0,
   `github.com/agentclientprotocol/rust-sdk`) — the official SDK drives the full
   conformant lifecycle: `initialize` → `authenticate` → `session/new` →
-  `session/set_mode` → `session/set_model` → `session/prompt` (streamed
+  `session/set_mode` → `session/set_config_option` (model + effort) →
+  `session/prompt` (streamed
   `agent_message_chunk` → `PromptResponse`) → `session/cancel`. Reverse
   `request_permission` from the agent is handled bidirectionally via `PolicyEngine`.
   See ADR-0004.
@@ -83,9 +84,9 @@ cmd  = "kiro-cli"   # Agent binary (must be on PATH and in allowed_cmds if [regi
 args = ["acp"]      # Arguments passed to cmd
 # Optional per-agent ACP session settings:
 # name         = "Kiro"           # Human-readable name (fan-out source label); defaults to id
-# model        = "gpt-4o"        # Best-effort session/set_model (non-fatal if agent rejects)
+# model        = "sonnet"         # Validated via session/set_config_option(model); hard-fails at mint if the agent doesn't advertise it (aliases: fable, opus)
 # model_provider = "openai"      # LLM vendor label — descriptive only, never on the wire
-# effort       = "high"          # Effort tier: minimal / low / medium / high / max
+# effort       = "high"          # Effort tier: minimal / low / medium / high / xhigh / max (model-dependent; falls back to highest supported ≤ requested)
 # mode         = "read-only"     # Hard session/set_mode (fatal if agent rejects)
 # cwd          = "/work/dir"     # Absolute working dir for session/new (defaults to current_dir)
 # auth_method  = "oauth"         # Auth method id for authenticate (defaults to first advertised)
@@ -108,9 +109,9 @@ addr = "127.0.0.1:8080"
 | `cmd` | yes | Agent binary to spawn (must be on PATH; must be in `allowed_cmds` if `[registry]` is set) |
 | `args` | no | Arguments passed to `cmd` (e.g. `["acp"]` for kiro-cli) |
 | `name` | no | Human-readable display name; drives the fan-out source label in artifacts (defaults to `id`) |
-| `model` | no | Model id for `session/set_model` (agent-native id, passed verbatim; best-effort, non-fatal if rejected) |
+| `model` | no | Model id set via `session/set_config_option(category="model")`; **validated** against the agent's advertised values — hard-fails at mint if not advertised. Aliases resolve first (`fable`→`claude-fable-5[1m]`, `opus`→`default`). kiro advertises no model option |
 | `model_provider` | no | LLM vendor label — descriptive/routing metadata only, never sent on the wire |
-| `effort` | no | Effort tier for the agent session: `minimal` / `low` / `medium` / `high` / `max` |
+| `effort` | no | Effort tier set via `session/set_config_option` for agents that advertise one (codex `reasoning_effort`, claude `effort`): `minimal` / `low` / `medium` / `high` / `xhigh` / `max`. Falls back to the highest supported level ≤ requested |
 | `mode` | no | Mode id for `session/set_mode` (hard error if agent rejects) |
 | `cwd` | no | Working directory for `session/new`; relative values are joined onto the bridge's `current_dir()` |
 | `auth_method` | no | Auth method id for `authenticate`; defaults to first method the agent advertises |

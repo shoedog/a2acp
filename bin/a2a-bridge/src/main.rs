@@ -245,6 +245,7 @@ fn acp_spawn_inputs(
         reap_fn: bridge_core::reaper::production_reap_fn(),
     });
     let acp = bridge_acp::acp_backend::AcpConfig {
+        agent_id: entry.id.as_str().to_string(),
         cwd,
         model: entry.model.clone(),
         mode: entry.mode.clone(),
@@ -2108,13 +2109,13 @@ fn known_init_agents() -> [(&'static str, Option<&'static str>); 4] {
 fn agent_fragment(name: &str) -> &'static str {
     match name {
         "kiro" => {
-            "\n# kiro: zero-auth local default (kiro-cli acp).\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\nmodel = \"auto\"\n"
+            "\n# kiro: zero-auth local default (kiro-cli acp). No `model` pin: kiro advertises\n# no model config option, so a pin would hard-fail at mint.\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\n"
         }
         "codex" => {
-            "\n# codex: gpt-5.5 with reasoning_effort (effort is codex-only).\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
+            "\n# codex: gpt-5.5 with reasoning_effort.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
         }
         "claude" => {
-            "\n# claude: subscription. NOTE: claude's model is NOT observable through the\n# bridge (claude-agent-acp uses the subscription default; set_model is best-effort).\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n"
+            "\n# claude: subscription. `model` is validated against the advertised values and\n# applied; aliases work too (e.g. model = \"fable\" -> claude-fable-5[1m]).\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n"
         }
         "api" => {
             "\n# api: OpenAI-compatible non-process backend. `api_key_env` is the NAME of an\n# env var holding the token (never the secret itself). Effort is not applied for api.\n[[agents]]\nid          = \"api\"\nkind        = \"api\"\nbase_url    = \"https://api.openai.com/v1\"\napi_key_env = \"OPENAI_API_KEY\"\nmodel       = \"gpt-4o-mini\"\n"

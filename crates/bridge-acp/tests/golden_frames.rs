@@ -260,35 +260,39 @@ fn set_mode_request_is_wire_conformant() {
     );
 }
 
-// session/set_model wire-golden [Cl] (optional companion to set_mode). Same shape,
-// snake_case method `session/set_model`, field `modelId`. Best-effort on the wire;
-// the golden just pins the conformant serialization (feature `unstable_session_model`).
+// session/set_config_option wire-golden for model/effort pinning.
 #[test]
-fn set_model_request_is_wire_conformant() {
+fn set_config_option_request_is_wire_conformant() {
     use agent_client_protocol::schema::SessionId as AgentSessionId;
 
-    let req = AcpBackend::set_model_request(AgentSessionId::new("agent-sess-1"), "gpt-x");
-    let params: Value = serde_json::to_value(&req).expect("SetSessionModelRequest serializes");
+    let req = AcpBackend::set_config_option_request(
+        AgentSessionId::new("agent-sess-1"),
+        "model",
+        "gpt-x",
+    );
+    let params: Value =
+        serde_json::to_value(&req).expect("SetSessionConfigOptionRequest serializes");
 
     let expected_params = serde_json::json!({
         "sessionId": "agent-sess-1",
-        "modelId": "gpt-x"
+        "configId": "model",
+        "value": "gpt-x"
     });
     assert_eq!(
         params, expected_params,
-        "session/set_model params must be {{\"sessionId\":<id>,\"modelId\":<model>}}, got {params:?}"
+        "session/set_config_option params must be {{\"sessionId\":<id>,\"configId\":<id>,\"value\":<value>}}, got {params:?}"
     );
 
     let frame = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "session/set_model",
+        "method": "session/set_config_option",
         "params": params,
     });
     assert_eq!(
         frame.get("method"),
-        Some(&Value::from("session/set_model")),
-        "the request method must be the snake_case `session/set_model`: {frame:?}"
+        Some(&Value::from("session/set_config_option")),
+        "the request method must be the snake_case `session/set_config_option`: {frame:?}"
     );
 }
 
