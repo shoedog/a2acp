@@ -66,6 +66,17 @@ node adapters. See §10 risk.)
 | `set_model` honored **end-to-end** | ✅ `haiku` → served `claude-haiku-4-5-20251001` (transcript) | ✅ `gpt-5.4-mini` → served `gpt-5.4-mini` (rollout) |
 | Validates the id? | ❌ `bogus-zzz` accepted | ❌ `o3`/`gpt-5.1`/`bogus-zzz` accepted |
 
+**Advertised-list provenance (verified):** the model list the bridge sees is reported by the
+**`claude-agent-acp` adapter from the SDK bundled inside it** (`@anthropic-ai/claude-agent-sdk
+0.3.156`), filtered by any `settings.json availableModels` allowlist, with `default` always forced
+in — it is **NOT** the interactive `claude` CLI's `/model` picker and can lag it. Probed: an account
+with **Fable 5 in the interactive CLI (2.1.170)** still advertises only `default/sonnet/sonnet[1m]/
+haiku` over ACP, and pinning `fable` is **accepted by `set_model` but the turn dies**
+`model_not_found` (the bundled SDK can't serve it). The advertised list is therefore **authoritative
+for what is actually serveable** — which is exactly why strict validation (§5.2) is right: it turns a
+cryptic mid-turn `model_not_found` into a clear mint-time error. (Serving fable through the bridge
+needs an adapter/bundled-SDK bump — §12, out of scope here.)
+
 **Effort** — claude broken through the bridge:
 
 - claude effort config-id = **`effort`**; the bridge sends **`reasoning_effort`** → live:
@@ -124,6 +135,10 @@ resolve_model(want: Option<&str>, available: &[ModelInfo]) -> Result<Option<Mode
   with a message listing valid ids. **Decision:** hard-error, no silent default (catches typos;
   forces reproducible config-driven pins to use advertised canonical ids — `default`/`sonnet`/
   `haiku`, not CLI shorthand like `opus`).
+- **Motivating example (`fable`):** pinning a model the adapter can't serve (e.g. `fable` on the
+  current adapter) is silently accepted by `set_model` then dies mid-turn `model_not_found`. Strict
+  validation converts that into an immediate, actionable mint error. The error message should hint
+  that an un-advertised-but-expected model (fable) may require updating the agent's adapter/SDK.
 
 ### 5.3 Effort resolution (`resolve_effort`)
 
@@ -251,8 +266,16 @@ category: Mode|Model|ThoughtLevel|Other, kind: Select{current_value, options} }`
 Defaults applied on first run of Fable 5 / Opus 4.8 / Opus 4.7 override a previously-set level —
 which is why the bridge **always sets effort explicitly per session** and logs what it applied.
 
-## 12. Open items (resolved during implementation)
+## 12. Open items
 
-- Exact `claude-agent-acp` argv forwarding for `--fallback-model` (§5.4).
-- codex `fallback_model` equivalent, or document claude-only (§5.4).
-- Rust SDK 0.12.1 field support / bump scope (§10).
+- **`fallback_model` is a chain (verified via docs):** the Claude CLI `--fallback-model` accepts a
+  **comma-separated list** (up to 3; `"default"` expands; engages only on overloaded/unavailable/
+  non-retryable server errors — not auth/billing/rate-limit). So `fallback_model` should accept a
+  comma-separated string and **validate each element** against advertised models. codex has **no
+  fallback-model equivalent** (docs) ⇒ claude-only; reject on codex at config load.
+- Exact `claude-agent-acp` argv forwarding for `--fallback-model` (§5.4) — verify at impl.
+- Rust SDK 0.12.1 field support — **VERIFIED present** (§10), no bump.
+- **Fable (follow-up, out of scope):** serving Fable 5 (or any newer model) through the bridge
+  requires bumping `claude-agent-acp` to a version whose bundled `@anthropic-ai/claude-agent-sdk`
+  has fable access. This increment makes the *gap legible* (strict mint error) but does not add
+  fable — that is a dependency bump tracked separately.

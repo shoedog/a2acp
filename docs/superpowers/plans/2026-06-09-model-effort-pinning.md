@@ -424,7 +424,7 @@ Confirm via the Claude CLI reference that `--fallback-model <model>` is the righ
 
 - [ ] **Step 2: Append the arg when set.** In `acp_program_argv` (the function that assembles the ACP program argv per agent), when the agent `cmd` basename is `claude-agent-acp` and `fallback_model` is `Some(m)`, append `["--fallback-model", m]`. For a codex agent with `fallback_model` set, return a config error at load ("fallback_model is claude-only; codex uses …") unless Step-1 finds a codex equivalent.
 
-- [ ] **Step 3: Validate `fallback_model` against advertised models at mint** too (reuse `resolve_model`): in the mint closure, if `fallback_model` is set and `adv_models` is present, run `resolve_model(Some(fb), adv)` and **fail the mint** on `Err` (same as the primary). This catches a typo'd fallback.
+- [ ] **Step 3: Validate the `fallback_model` chain against advertised models at mint** (reuse `resolve_model`): `--fallback-model` accepts a **comma-separated chain** (verified: claude docs; up to 3, `"default"` expands). In the mint closure, if `fallback_model` is set and `adv_models` is present, split on `,`, and for each element (skip the literal `"default"`, which always resolves) run `resolve_model(Some(elem), adv)` and **fail the mint** on `Err`. This catches a typo'd fallback element. (codex: `fallback_model` is rejected at config load per Step 2 — no codex equivalent exists.)
 
 - [ ] **Step 4: Test.** Unit-test `acp_program_argv` includes `--fallback-model sonnet` for a claude agent and omits it otherwise. Run `cargo test -p a2a-bridge`.
 
