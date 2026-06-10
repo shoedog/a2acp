@@ -1,8 +1,10 @@
 # Capability-driven model & effort pinning — design (v2)
 
 **Date:** 2026-06-09
-**Status:** Draft v2 (revised after the bridge's own spec-review found 3 blockers, and after bumping
-`claude-agent-acp` → 0.44.0 / `claude-agent-sdk` 0.3.170, which restabilized the model API).
+**Status:** Draft v2.1 (v2 targeted 0.44.0's config-option surface; v2.1 folds the v2 re-review's
+amendments — codex surface probed/holds, alias map, Grouped/`Other` discovery, precise effort-error
+predicate, error-surface contract, docs/kiro migration). Re-review ran with **Fable 5 as the claude
+reviewer** (all 3 claude nodes served `claude-fable-5`).
 **Builds on:** the existing `AcpBackend` mint-time config path (`crates/bridge-acp/src/acp_backend.rs`).
 **Supersedes:** v1 (which targeted the now-removed `session/set_model` + `models` surface).
 
@@ -68,6 +70,14 @@ Installed: **claude-agent-acp 0.44.0** (bundled `@anthropic-ai/claude-agent-sdk 
 - The dedicated `session/set_model` is **not routed** by 0.44.0 (the bridge's current call is a no-op).
 - **Fable now serves** (was `model_not_found` on 0.39.0's older bundled SDK).
 
+**codex (codex-cli 0.135.0, NOT bumped) — same config-option surface, probed live.** Its initial
+`newSession.config_options` advertises `id=model category=model` (values **base ids**: `gpt-5.5`,
+`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`; current `gpt-5.5`) + `id=reasoning_effort
+category=thought_level` (`low/medium/high/xhigh`) + `id=mode category=mode`. So the unified design
+holds for **both** agents — discover-by-category works uniformly, and `model="gpt-5.5"` validates
+against the model option's base ids. (codex also still carries a redundant folded `models` matrix
+`gpt-5.5/xhigh`… which we ignore.) Options are **Ungrouped** here, but the schema permits Grouped — §5.1.
+
 **Effort** (`category == "thought_level"`, id `"effort"` for claude / `"reasoning_effort"` for codex):
 claude levels are model-dependent — Opus 4.8/4.7 = low/medium/high/xhigh/max; Sonnet 4.6/Opus 4.6 =
 low/medium/high/max (no `xhigh`). Order: **low < medium < high < xhigh < max**. The ACP
@@ -105,10 +115,14 @@ session/new ─► config_options[ {id, category: Mode|Model|ThoughtLevel|Other,
 
 From `NewSessionResponse.config_options` (and later from `SetSessionConfigOptionResponse.config_options`),
 locate options by **`category`** (`SessionConfigOptionCategory::{Model, ThoughtLevel}`), falling back to
-**`id`** (`"model"`; `"effort"`/`"reasoning_effort"`) only if `category` is absent. Each option's
-`kind` must be `Select`; extract `current_value` + the `options[].value` list. Determinism rules
-(spec-review M6): first option matching the category wins; a non-`Select` kind or missing option ⇒ treat
-as "not advertised" for that dimension; never panic.
+**`id`** (`"model"`; `"effort"`/`"reasoning_effort"`) when `category` is **absent (`None`) _or_
+`Other(_)`** (spec-review m2 — `Other` is a `Some`, so an absent-OR-unknown rule is required, not just
+absent). Each option's `kind` must be `Select`; extract `current_value` + the value list. **`Select.options`
+is an untagged `Ungrouped(Vec<Option>) | Grouped(Vec<Group>)` (schema `v1/agent.rs:2332`)** — **flatten
+groups** when extracting values (spec-review M2); handling only `Ungrouped` would read a Grouped option as
+"not advertised" and wrongly fire the hard-error. Determinism rules: first option matching the
+category/id wins; a non-`Select` kind or genuinely missing option ⇒ "not advertised" for that dimension;
+never panic. Unit fixtures must include a Grouped option and an `Other`-category option.
 
 ### 5.2 Model resolution (`resolve_model`)
 
@@ -119,9 +133,13 @@ resolve_model(want: Option<&str>, values: &[String]) -> Result<ModelDecision, Mo
 - **Decision (hard-error, spec-review-aligned):** a configured `model=` not in the advertised values
   **fails the mint** with the valid list. Reproducible; catches typos; converts the cryptic mid-turn
   `model_not_found` (e.g. an un-serveable model on an old adapter) into a clear mint error.
-- **Alias note:** aliases (`fable`, `opus`) resolve at the adapter but are *not* in the advertised
-  values, so they are **rejected** — config must use advertised ids (`claude-fable-5[1m]`, `default`).
-  The error message lists them. (Documented; a future alias-map is a YAGNI follow-up.)
+- **Alias map (spec-review MAJOR 1 — decided: ship it):** a small static map is applied **before**
+  validation so common shorthands resolve to advertised ids: `fable → claude-fable-5[1m]`,
+  `opus → default` (Max-account `default` = Opus 4.8). `sonnet`/`haiku` are already advertised ids, so
+  they pass through unmapped. The mapped value is then validated against the advertised list like any
+  other — so if a vendor rename makes the target non-advertised, it falls through to the normal
+  **hard-error** (no silent miss). The map lives in `model_effort.rs` as a `const` table with a unit
+  test; non-aliased, non-advertised ids still hard-error with the valid list.
 - **Apply via `set_config_option(model_opt.id, value)`**, not `session/set_model` (gone). Capture the
   response's `config_options` as the **refreshed** set for effort resolution.
 - **M2/M3 (loud-on-missing):** if `cfg.model.is_some()` but the agent advertised **no** Model option
@@ -140,10 +158,21 @@ resolve_effort(want: Option<&str>, opt: &AdvertisedEffort{config_id, levels}) ->
 // None => Skip ; want in levels => Apply{config_id, level} ; else highest level <= want by order => FellBack ; none => Unsupported
 ```
 Resolve against the **refreshed** effort option (post-model `set_config_option` response). Because the
-adapter *errors* on an unsupported level rather than clamping, the closure also **walks down on
-`-32603`** as a belt-and-suspenders: try the resolved level; on `-32603`, drop to the next-lower
-advertised level and retry, until one applies or none remain (warn). Both `Effort` parsers must learn
-`xhigh` (see M7).
+adapter *errors* on an unsupported level rather than clamping, the closure also **walks down** as a
+belt-and-suspenders — but with a **precise predicate** (spec-review MAJOR 4): `-32603` is the *generic*
+internal-error code (the `usage_update` hang emitted a spurious one), so walk-down triggers only on
+`is_unsupported_effort_error(e)` = code `-32603` **AND** message/`data` indicating an invalid/unsupported
+option value (substring match on the adapter's `Invalid value for config option`/`model_not_found`-style
+text). The contract: walk-down applies **only** to the effort `set_config_option` call; each fallback
+attempt drops to the next-lower advertised level by the canonical order; the fallback `warn` includes the
+**raw error body**; any *other* error (unknown-config-id, transport close, malformed response) is **not**
+swallowed — it surfaces (effort is best-effort → warn-and-stop, never silent-retry-forever); if all
+candidates fail, warn and leave the model default. **Effort ordering** lives in `model_effort.rs`
+(`EFFORT_ORDER` const + tests), not on the enum — `domain::Effort` need not derive `Ord` (avoids the
+`Minimal→"low"` shadowing of an advertised `minimal`); levels outside `EFFORT_ORDER` are ignored for
+ranking (never selected by walk-down). §1's "no hardcoded vocabularies" refers to *config-ids*; the
+five canonical level *spellings* are load-bearing constants (documented in-code). Both `Effort` parsers
+must learn `xhigh` (M7).
 
 ### 5.4 Observability (`§5.6` of v1, kept)
 
@@ -160,8 +189,9 @@ the registry layer that holds `AgentEntry.id`).
 3. **Model:** `resolve_model` → on `Err` **fail mint**; else `set_config_option(model_opt.id, value)`;
    keep the response's `config_options` as `refreshed`.
 4. **Effort:** locate the ThoughtLevel option in `refreshed` (fallback to the initial set if the
-   response omitted it); `resolve_effort`; `set_config_option(effort_opt.id, level)` with walk-down on
-   `-32603`.
+   response omitted it — **`warn` when a model was changed but the response omitted refreshed options**,
+   since the initial levels may be stale for the new model; the `-32603` walk-down then recovers it);
+   `resolve_effort`; `set_config_option(effort_opt.id, level)` with the precise walk-down (§5.3).
 5. Emit the resolved log line.
 
 ## 7. Files touched
@@ -178,7 +208,18 @@ the registry layer that holds `AgentEntry.id`).
 - **Modify** `crates/bridge-a2a-inbound/src/server.rs` — **`parse_effort_meta` (M7)**: the second,
   per-request A2A-metadata effort parser must also accept `xhigh`. Factor a single `FromStr for Effort`
   so the two parsers can't drift.
-- **Docs:** example configs (pin advertised model ids; effort guidance §11); ADR-0029.
+- **Migration (spec-review m3 — the loudness is breaking; the repo demonstrates it):**
+  - `examples/a2a-bridge.multi-agent.toml` pins **kiro `model="auto"`** — kiro advertises **no** Model
+    option, so M2/M3 would hard-fail the shipped onboarding example at mint. **Remove the kiro `model`
+    pin** (kiro has no model knob) and migration-note it.
+  - claude `effort=` pins that were silent no-ops **start applying** (cost/latency change) — call out
+    in the ADR/migration note.
+  - Stale docs to fix: `README.md:86-113,225-228`, `docs/onboarding.md:57-64` (wrong codex effort
+    values + the now-false "claude gets no bridge effort"), `bin/a2a-bridge/src/init-readme-template.md:35-42`,
+    init fragments at `main.rs:2106-2118`.
+- **agent-id threading (m1/m5):** add `AcpConfig.agent_id`; update every construction/fixture site —
+  at least `main.rs:247-261` and `crates/bridge-container/src/lib.rs:249-261`.
+- **Docs:** example configs (pin advertised model ids incl. an alias example; effort guidance §11); ADR-0029.
 - **NOT touched (descoped):** `fallback_model` config/spawn paths — follow-up.
 
 ## 8. Error handling
@@ -192,6 +233,15 @@ the registry layer that holds `AgentEntry.id`).
 | unconfigured model/effort dimension | quiet `info` skip (only when *not* configured) |
 | `set_config_option` transport/other error | model: fail mint; effort: best-effort warn |
 | `mode` rejected | unchanged (hard error) |
+
+**Error surface (spec-review MAJOR 3).** The "valid list" must reach an operator, but inbound A2A
+mapping **redacts** internal failures to a static `client_message()` (the wire-leak guard,
+`error.rs:74-86`) — so the list must NOT be the wire text. The valid list is carried on the
+**operator-facing surfaces**: `tracing::error` (always) **and** the CLI path (`run-workflow`/`implement`
+print it to stderr + non-zero exit). On the A2A wire the failure stays a static category
+(`AgentCrashed`); the diagnostic list lives in logs/CLI only. The mint-fail uses a new
+`BridgeError::config_invalid`-style variant whose `client_message()` is the static category and whose
+internal/`Display` form carries the list — mirroring the existing wire-leak split.
 
 ## 9. Testing
 
@@ -230,7 +280,7 @@ deserialization is why M3's loud-on-`None`-when-pinned guard matters.)
 
 - **`fallback_model` (descoped):** revisit via `_meta.claudeCode.options` on `session/new`; design the
   chain shape (CLI uses a comma list; SDK field is a single string).
-- **Model aliases:** advertised ids only for now; an optional alias-map (`fable`→`claude-fable-5[1m]`) is
-  a YAGNI follow-up if the ergonomics bite.
+- **Model aliases:** shipped a small static map (`fable`→`claude-fable-5[1m]`, `opus`→`default`) per
+  §5.2 — `model="fable"` works and pins the 1M Fable variant. Extend the map if more shorthands bite.
 - **Fable:** delivered by the 0.44.0 bump; this increment makes it pinnable+validated. (The global
   `claude-agent-acp` is now 0.44.0 — other bridge sessions spawn the new surface.)
