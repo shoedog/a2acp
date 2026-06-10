@@ -1115,7 +1115,6 @@ mode = "read-only"
 id = "kiro"
 cmd = "kiro-cli"
 args = ["acp"]
-model = "auto"
 
 [server]
 addr = "127.0.0.1:8080"
