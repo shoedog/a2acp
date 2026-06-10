@@ -245,6 +245,7 @@ fn acp_spawn_inputs(
         reap_fn: bridge_core::reaper::production_reap_fn(),
     });
     let acp = bridge_acp::acp_backend::AcpConfig {
+        agent_id: entry.id.as_str().to_string(),
         cwd,
         model: entry.model.clone(),
         mode: entry.mode.clone(),

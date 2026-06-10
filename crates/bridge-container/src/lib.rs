@@ -247,6 +247,7 @@ impl ContainerRwBackend {
             &labels,
         );
         let acp = AcpConfig {
+            agent_id: self.cfg.agent.clone(),
             cwd: PathBuf::from(rw_canon.as_str()),
             model: self.cfg.model.clone(),
             mode: self.cfg.mode.clone(),

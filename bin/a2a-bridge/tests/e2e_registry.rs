@@ -291,7 +291,7 @@ async fn route_and_prompt(
             .await
             .unwrap_or_else(|e| {
                 panic!(
-                    "prompt({id:?}) must return a stream (session/new+set_mode+set_model+prompt dispatched): {e:?}"
+                    "prompt({id:?}) must return a stream (session/new+set_mode+model config+prompt dispatched): {e:?}"
                 )
             });
 
