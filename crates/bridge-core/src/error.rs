@@ -71,6 +71,14 @@ impl BridgeError {
         }
     }
 
+    /// Construct a `ConfigInvalid` carrying the operator-facing reason while
+    /// keeping [`Self::client_message`] redacted to a static category.
+    pub fn config_invalid(reason: impl Into<String>) -> Self {
+        BridgeError::ConfigInvalid {
+            reason: reason.into(),
+        }
+    }
+
     /// The message safe to surface to an inbound A2A client over the wire.
     ///
     /// Internal-failure reasons (`AgentCrashed`/`ConfigInvalid`) can embed infra
@@ -202,6 +210,13 @@ mod tests {
         // The reason IS in the Display (server logs / tracing see WHY).
         let e = BridgeError::agent_crashed("spawn failed: no such file");
         assert!(e.to_string().contains("spawn failed: no such file"));
+    }
+
+    #[test]
+    fn config_invalid_carries_reason_in_display_but_redacts_client_message() {
+        let e = BridgeError::config_invalid("model bogus not in [default, sonnet]");
+        assert!(e.to_string().contains("model bogus not in"));
+        assert_eq!(e.client_message(), "invalid config");
     }
 
     #[test]

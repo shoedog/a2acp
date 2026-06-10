@@ -1882,9 +1882,11 @@ mod tests {
     use agent_client_protocol::schema::{
         AuthenticateRequest, AuthenticateResponse, ContentChunk, NewSessionResponse,
         PermissionOption, PermissionOptionId, PromptRequest, PromptResponse,
-        RequestPermissionRequest, RequestPermissionResponse, SetSessionConfigOptionResponse,
-        SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
-        SetSessionModelResponse, StopReason, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        RequestPermissionRequest, RequestPermissionResponse, SessionConfigKind,
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+        SetSessionModelRequest, SetSessionModelResponse, StopReason, ToolCallId, ToolCallUpdate,
+        ToolCallUpdateFields,
     };
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Notify;
@@ -2016,6 +2018,22 @@ mod tests {
         /// When set, the `session/set_config_option` handler REJECTS with a JSON-RPC
         /// error (modeling an adapter without a structured effort knob). NON-FATAL.
         reject_set_config: Arc<AtomicBool>,
+        /// Whether `session/new` advertises a model config option.
+        advertise_model_config: Arc<AtomicBool>,
+        /// Config id/current/options for the advertised model select.
+        model_config_id: Arc<Mutex<String>>,
+        model_config_current: Arc<Mutex<String>>,
+        model_config_values: Arc<Mutex<Vec<String>>>,
+        /// Whether `session/new` advertises an effort config option.
+        advertise_effort_config: Arc<AtomicBool>,
+        /// Config id/current/options for the advertised effort select.
+        effort_config_id: Arc<Mutex<String>>,
+        effort_config_current: Arc<Mutex<String>>,
+        effort_config_values: Arc<Mutex<Vec<String>>>,
+        /// Optional 1-based `session/set_config_option` call number to reject.
+        reject_set_config_call: Arc<Mutex<Option<usize>>>,
+        /// Error body used when rejecting `session/set_config_option`.
+        set_config_error_body: Arc<Mutex<String>>,
 
         // ── Task 4 (session-cwd): record the cwd the client sent at session/new ─
         /// The `cwd` from the most recent `session/new` request (as a lossy string).
@@ -2062,7 +2080,85 @@ mod tests {
                 set_config_options: Arc::new(Mutex::new(Vec::new())),
                 set_config_seen: Arc::new(Notify::new()),
                 reject_set_config: Arc::new(AtomicBool::new(false)),
+                advertise_model_config: Arc::new(AtomicBool::new(true)),
+                model_config_id: Arc::new(Mutex::new("model".to_string())),
+                model_config_current: Arc::new(Mutex::new("default".to_string())),
+                model_config_values: Arc::new(Mutex::new(vec![
+                    "default".to_string(),
+                    "m".to_string(),
+                    "a".to_string(),
+                    "b".to_string(),
+                    "gpt-x".to_string(),
+                    "haiku".to_string(),
+                ])),
+                advertise_effort_config: Arc::new(AtomicBool::new(true)),
+                effort_config_id: Arc::new(Mutex::new("effort".to_string())),
+                effort_config_current: Arc::new(Mutex::new("medium".to_string())),
+                effort_config_values: Arc::new(Mutex::new(vec![
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                ])),
+                reject_set_config_call: Arc::new(Mutex::new(None)),
+                set_config_error_body: Arc::new(Mutex::new("Invalid value for effort".to_string())),
                 new_session_cwd: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn select_options(values: Vec<String>) -> Vec<SessionConfigSelectOption> {
+            values
+                .into_iter()
+                .map(|value| SessionConfigSelectOption::new(value.clone(), value))
+                .collect()
+        }
+
+        async fn advertised_config_options(&self) -> Vec<SessionConfigOption> {
+            let mut options = Vec::new();
+
+            if self.advertise_model_config.load(Ordering::SeqCst) {
+                let id = self.model_config_id.lock().await.clone();
+                let current = self.model_config_current.lock().await.clone();
+                let values = self.model_config_values.lock().await.clone();
+                options.push(
+                    SessionConfigOption::select(
+                        id.clone(),
+                        "Model".to_string(),
+                        current,
+                        Self::select_options(values),
+                    )
+                    .category(SessionConfigOptionCategory::Model),
+                );
+            }
+
+            if self.advertise_effort_config.load(Ordering::SeqCst) {
+                let id = self.effort_config_id.lock().await.clone();
+                let current = self.effort_config_current.lock().await.clone();
+                let values = self.effort_config_values.lock().await.clone();
+                options.push(
+                    SessionConfigOption::select(
+                        id.clone(),
+                        "Effort".to_string(),
+                        current,
+                        Self::select_options(values),
+                    )
+                    .category(SessionConfigOptionCategory::ThoughtLevel),
+                );
+            }
+
+            options
+        }
+
+        async fn refresh_config_current(&self, config_id: &str, value_id: &str) {
+            let model_config_id = self.model_config_id.lock().await.clone();
+            if config_id == model_config_id {
+                *self.model_config_current.lock().await = value_id.to_string();
+                return;
+            }
+
+            let effort_config_id = self.effort_config_id.lock().await.clone();
+            if config_id == effort_config_id {
+                *self.effort_config_current.lock().await = value_id.to_string();
             }
         }
 
@@ -2217,16 +2313,25 @@ mod tests {
                           _cx| {
                         let r = r_config.clone();
                         async move {
-                            r.set_config_options
-                                .lock()
-                                .await
-                                .push((req.config_id.0.to_string(), req.value.0.to_string()));
+                            let call_number = {
+                                let mut set_config_options = r.set_config_options.lock().await;
+                                set_config_options
+                                    .push((req.config_id.0.to_string(), req.value.0.to_string()));
+                                set_config_options.len()
+                            };
                             r.set_config_seen.notify_one();
-                            if r.reject_set_config.load(Ordering::SeqCst) {
-                                responder
-                                    .respond_with_internal_error("config option unsupported")?;
+                            let reject_call = *r.reject_set_config_call.lock().await;
+                            if r.reject_set_config.load(Ordering::SeqCst)
+                                || reject_call == Some(call_number)
+                            {
+                                let body = r.set_config_error_body.lock().await.clone();
+                                responder.respond_with_internal_error(body)?;
                             } else {
-                                responder.respond(SetSessionConfigOptionResponse::new(vec![]))?;
+                                r.refresh_config_current(&req.config_id.0, &req.value.0)
+                                    .await;
+                                responder.respond(SetSessionConfigOptionResponse::new(
+                                    r.advertised_config_options().await,
+                                ))?;
                             }
                             Ok(())
                         }
@@ -2251,9 +2356,10 @@ mod tests {
                                 // widening the create/cancel + concurrency window.
                                 r.new_session_gate.notified().await;
                             }
-                            responder.respond(NewSessionResponse::new(AgentSessionId::new(
-                                r.minted_id,
-                            )))?;
+                            responder.respond(
+                                NewSessionResponse::new(AgentSessionId::new(r.minted_id))
+                                    .config_options(r.advertised_config_options().await),
+                            )?;
                             Ok(())
                         }
                     },
@@ -2432,6 +2538,57 @@ mod tests {
 
     fn bkey(s: &str) -> SessionId {
         SessionId::parse(s).unwrap()
+    }
+
+    fn select_current(opts: &[SessionConfigOption], id: &str) -> Option<String> {
+        opts.iter().find_map(|opt| {
+            if &*opt.id.0 != id {
+                return None;
+            }
+            match &opt.kind {
+                SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
+                _ => None,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn recorder_advertises_and_refreshes_config_options() {
+        let rec = Recorder::new("agent-sess-CONFIGOPTS");
+        let be = connect_recording(rec).await;
+        let cx = be.cx().expect("connection handle").clone();
+
+        let new_resp: NewSessionResponse = cx
+            .send_request(AcpBackend::new_session_request("/tmp", &[]))
+            .block_task()
+            .await
+            .expect("session/new succeeds");
+        let initial_options = new_resp
+            .config_options
+            .expect("recorder advertises config options");
+        assert_eq!(
+            select_current(&initial_options, "model").as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            select_current(&initial_options, "effort").as_deref(),
+            Some("medium")
+        );
+
+        let set_resp: SetSessionConfigOptionResponse = cx
+            .send_request(SetSessionConfigOptionRequest::new(
+                new_resp.session_id,
+                SessionConfigId::new("effort"),
+                SessionConfigValueId::new("high"),
+            ))
+            .block_task()
+            .await
+            .expect("set_config_option succeeds");
+        assert_eq!(
+            select_current(&set_resp.config_options, "effort").as_deref(),
+            Some("high"),
+            "set_config_option returns refreshed config_options"
+        );
     }
 
     #[tokio::test]
