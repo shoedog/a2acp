@@ -130,17 +130,45 @@ A quadlet/systemd-managed proxy is deferred to the Linux increment.
 
 ### §4 — Verify-runtime allowlist gate (slice 4 — the only Rust; owner decision 1: reject)
 
-Close the §Context gap so a disallowed verify runtime **never executes**:
-- `VerifyConfig::runtime() -> &str` (default `"docker"`), mirroring `SandboxConfig::runtime()`.
-- `RegistryConfig::effective_allowed_cmds()` — the **default** allowlist (no `[registry]`, currently agent-cmds
-  only at `config.rs:734-753`) must union agent raw commands + sandbox runtimes + the verify runtime when
-  `[verify]` exists; otherwise a `[registry]`-less podman-verify config would self-reject.
-- `VerifyToml::to_config_checked(&self, allowed_cmds)` called at **both** implement parse sites
-  (`main.rs:~1286` and the `--resume` path `~1550`) — verify is parsed separately from `into_snapshot()`,
-  so the check cannot live solely in `bridge-registry`.
-- A disallowed verify runtime **rejects into the existing `VerifyOutcome::ConfigError` path** (`main.rs:806`)
-  — no container spawns, no crash. Note the B2b-3b interaction: a `ConfigError` verify can't contribute a
-  PASS, so a misconfigured loop surfaces loudly rather than converging falsely.
+Close the §Context gap so a disallowed verify runtime **never executes**. *(Mechanism revised after a fable
+consult — `docs/superpowers/reviews/2026-06-10-podman-spec-review.md` framed the gap; a focused follow-up
+chose this simpler shape over the clean-room design's parse-time `effective_allowed_cmds()`/`to_config_checked`
+because it carries no drift risk against `into_snapshot`'s union logic.)*
+
+A **pure** gate, validated **after** the snapshot exists (so it reuses the snapshot's already-resolved
+allowlist), called once at each implement site:
+
+```
+fn gate_verify_runtime(
+    verify_cfg: Option<Result<VerifyConfig, ConfigError>>,
+    allowed_cmds: &[String],
+) -> Option<Result<VerifyConfig, ConfigError>>
+```
+
+- Only an `Ok(vc)` is gated; a pre-existing `Err` (e.g. empty `commands`) is preserved untouched; `None`
+  (no `[verify]`) passes through as `None` (stays `NotConfigured`, never becomes `ConfigError`).
+- The runtime is resolved **inside** the gate as `vc.runtime.as_deref().unwrap_or("docker")` — `VerifyConfig.runtime`
+  stays `None` through `to_config()`; the `"docker"` default otherwise only materializes later in
+  `compose_sandbox` via `SandboxConfig::runtime()`, so the gate must apply the same default (comment-pin the
+  literal to `SandboxConfig::runtime()` to keep them from disagreeing).
+- If the resolved runtime ∉ `allowed_cmds`, return `Some(Err(ConfigError::…))` with an **actionable** message:
+  `verify runtime not allowed: "<rt>" — add it to [registry].allowed_cmds or set [verify].runtime`.
+- **Wiring:** at both implement sites the existing line `let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());`
+  (`main.rs:1287` and the `--resume` path `:1550`) stays as-is; immediately **after** `into_snapshot()` succeeds
+  (`:1291`/`:1554`) wrap `verify_cfg = gate_verify_runtime(verify_cfg, &snap.allowed_cmds)`. `verify_cfg` is owned,
+  so post-snapshot gating has no borrow issue. A disallowed runtime then flows naturally into the existing
+  `VerifyOutcome::ConfigError` path (`run_verify_step`, `main.rs:806`) — no container spawns.
+- **Why no `effective_allowed_cmds()` extraction:** `snap.allowed_cmds` *is* the verbatim output of
+  `into_snapshot`'s union (which already includes each sandbox `runtime()`), so a `[registry]`-less all-podman
+  config has `"podman"` in the list and a defaulted-docker verify correctly rejects — the half-converted-config
+  bug. Reading the snapshot avoids a duplicated union that could drift. If `into_snapshot` fails first, the
+  command aborts there anyway (`:1292`/`:1555`), so the gate's result is never consumed — same user-visible
+  fatal error under either shape.
+- Note the B2b-3b interaction: a `ConfigError` verify can't contribute a PASS, so a misconfigured loop surfaces
+  loudly rather than converging falsely (the locked behavior, not a regression).
+
+*(Scope corrections from the consult: `validate_sandbox` is `registry.rs:96`; `to_config()` at `main.rs:1213`/
+`1500` is the `[implement]` LoopConfig, NOT verify — the two verify sites are `:1287`/`:1550`.)*
 
 ### §5 — Runtime preflight (warn-level, slice 4)
 
@@ -258,10 +286,14 @@ no-op; verify → failed result; a `logs --since` quirk degrades staleness detec
 
 ## §13 — Testing
 
-- **Unit:** the two example parse/parity tests (§1); the verify-gate — `effective_allowed_cmds()` unions
-  correctly, `to_config_checked` rejects a disallowed verify runtime into `ConfigError` and accepts an
-  allowlisted one, the `[registry]`-less default-allow path (§4); the preflight helper (warn on probe failure,
-  skip on empty runtime set) with an injected probe (§5). Optionally, a `"podman"` case on the argv builders
+- **Unit:** the two example parse/parity tests (§1); the verify-gate `gate_verify_runtime` pure-function set
+  (§4) — (1) defaulted runtime (`None`) + allowed=`["podman"]` → `Some(Err)` naming "docker"; (2) explicit
+  `"docker"` + allowed=`["podman"]` → `Some(Err)`; (3) explicit `"podman"` allowed → `Some(Ok)` unchanged;
+  (4) back-compat `None` + allowed contains `"docker"` → `Some(Ok)`; (5) a prior `Err` passes through
+  untouched; (6) `None` input → `None`; plus (7) one TOML-level wiring pin (a `[registry]`-less podman config
+  with a defaulted `[verify]` → `into_snapshot` → gate → `run_verify_step` returns `VerifyOutcome::ConfigError`,
+  still runtime-free); the preflight helper (warn on probe failure, skip on empty runtime set) with an injected
+  probe (§5). Optionally, a `"podman"` case on the argv builders
   asserting `argv[0]` is the configured runtime.
 - **Live gates:** §10 G1–G6 on podman-machine here (the operator stops the stockTrading dev stack to free host
   RAM for the machine VM; tear the machine down after).
