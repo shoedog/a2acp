@@ -93,9 +93,27 @@ the advertised options, with the SDK calls confined to `AcpBackend`:
   the rewrite, as the plan-review demanded.
 - **No Rust SDK bump** (types present in 0.12.1). Dropped the `unstable_session_model` cargo feature;
   kept `unstable_session_usage` (the usage_update hang fix, ADR/`cfc1ce3`).
-- **Live gate (Task 10).** Pending — to be recorded here once run against real claude 0.44.0 + codex:
-  `model=haiku`→haiku, `model=fable`→`claude-fable-5`, `model=bogus`→mint fails (valid list on
-  stderr/log, wire stays the static category), `model=sonnet effort=high`→applies (no `Unknown config
-  option`), `effort=xhigh` on sonnet→falls back to `high`, codex `gpt-5.5 effort=high`→unchanged. The
-  live-only `live_edit_changes_new_session_model` e2e test (kiro model-flip) needs re-pointing to an
-  agent that advertises a model option, since kiro no longer does.
+- **Live gate (Task 10) — PASS** (2026-06-09, real claude-agent-acp 0.44.0 + codex-cli 0.135.0 on the
+  host, via `run-workflow` single-node probes):
+  - **(a)** `model=haiku` → bridge `model_effort_resolved … model=haiku`; transcript served
+    `claude-haiku-4-5-20251001`.
+  - **(b)** `model=fable` → alias resolved to `claude-fable-5[1m]` (the advertised id); served
+    `claude-fable-5`.
+  - **(c)** `model=bogus-not-a-model` → mint **hard-failed**: `ConfigInvalid { reason: "… is not
+    advertised; valid models: default, claude-fable-5[1m], sonnet, sonnet[1m], haiku" }` surfaced on
+    the CLI/logs (the A2A-wire redaction to the static category is the separate, unit-tested
+    `client_message()` path).
+  - **(d)** `model=sonnet effort=high` → applied cleanly, **no** `Unknown config option`; served
+    `claude-sonnet-4-6`.
+  - **(e)** `model=sonnet effort=xhigh` → `effort=high (fell back from xhigh)` (Sonnet 4.6 advertises no
+    `xhigh`); served `claude-sonnet-4-6`.
+  - **(f)** codex `model=gpt-5.5 effort=high` → unchanged: rollout records `"model":"gpt-5.5"` +
+    `"reasoning_effort":"high"`, no `Unknown config option`.
+
+  Pre-gate also green: `cargo fmt --check`, `clippy --workspace --all-targets -D warnings`, full
+  `--workspace` test (via the coverage run), and the ci.yml coverage floors (workspace 87.4%≥85;
+  bridge-core 94.8%, bridge-acp 94.4% [`model_effort.rs` 96.6% line], bridge-api 95.8%,
+  bridge-workflow 92.9%, all ≥90).
+- **Known follow-up.** The live-only (`#[ignore]`) `live_edit_changes_new_session_model` e2e test
+  flips kiro's model; kiro advertises no model option under the new surface, so that test needs
+  re-pointing to an agent that does (e.g. codex). Not in CI; tracked for a fast-follow.
