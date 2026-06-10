@@ -52,11 +52,15 @@ the advertised options, with the SDK calls confined to `AcpBackend`:
    options from each `set_config_option` response). `model_values` finds the `category=="model"`
    option, flattening `Grouped`/`Ungrouped` and falling back to an `Other`-category id; `effort_opt`
    finds the thought-level option and its `config_id` (`effort` vs `reasoning_effort`) + levels.
-2. **Model — validated, fatal.** Resolve the requested model against the advertised values; a pin
-   **not** in the set **hard-fails the session** (`BridgeError::config_invalid`) *before any prompt
-   is sent*. Aliases resolve **before** validation via a small static map (`fable → claude-fable-5[1m]`,
-   `opus → default`). Agent advertises a model option + valid pin → `set_config_option(model)`;
-   advertises none + a pin → `config_invalid`; advertises none + no pin → skip.
+2. **Model — validated, fatal, two surfaces.** Resolve the requested model against the advertised
+   values; a pin **not** in the set **hard-fails the session** (`BridgeError::config_invalid`)
+   *before any prompt is sent*. Aliases resolve **before** validation via a small static map
+   (`fable → claude-fable-5[1m]`, `opus → default`). The bridge supports **both** model-selection
+   surfaces (see the 2026-06-10 amendment): (a) **`config_options` (category=model)** — claude
+   0.44.0 / codex, applied via `set_config_option`; (b) the unstable **`models` state +
+   `session/set_model`** — kiro, which returns `config_options: None` but advertises
+   `SessionModelState` (`current_model_id` + `available_models`). Advertises a surface + valid pin →
+   apply; advertises neither + a pin → `config_invalid`; advertises neither + no pin → skip.
 3. **Effort — walked-down, non-fatal.** Resolve against the **refreshed** post-model options. Fall
    back to the highest supported level **≤** requested. The ACP path **errors** (`-32603`) on an
    unsupported level rather than clamping, so the bridge **walks down itself** by `EFFORT_ORDER`,
@@ -91,8 +95,9 @@ the advertised options, with the SDK calls confined to `AcpBackend`:
   than all advertised" → corrected to "below the lowest advertised"; fixed in `a5fa607`). The
   warm-SessionSpec regression net (`per_session_config_is_isolated`, the stash/forget tests) survived
   the rewrite, as the plan-review demanded.
-- **No Rust SDK bump** (types present in 0.12.1). Dropped the `unstable_session_model` cargo feature;
-  kept `unstable_session_usage` (the usage_update hang fix, ADR/`cfc1ce3`).
+- **No Rust SDK bump** (types present in 0.12.1). Kept `unstable_session_usage` (the usage_update
+  hang fix, ADR/`cfc1ce3`). *(Originally dropped `unstable_session_model` — RESTORED 2026-06-10; see
+  the amendment below.)*
 - **Live gate (Task 10) — PASS** (2026-06-09, real claude-agent-acp 0.44.0 + codex-cli 0.135.0 on the
   host, via `run-workflow` single-node probes):
   - **(a)** `model=haiku` → bridge `model_effort_resolved … model=haiku`; transcript served
@@ -114,6 +119,21 @@ the advertised options, with the SDK calls confined to `AcpBackend`:
   `--workspace` test (via the coverage run), and the ci.yml coverage floors (workspace 87.4%≥85;
   bridge-core 94.8%, bridge-acp 94.4% [`model_effort.rs` 96.6% line], bridge-api 95.8%,
   bridge-workflow 92.9%, all ≥90).
-- **Known follow-up.** The live-only (`#[ignore]`) `live_edit_changes_new_session_model` e2e test
-  flips kiro's model; kiro advertises no model option under the new surface, so that test needs
-  re-pointing to an agent that does (e.g. codex). Not in CI; tracked for a fast-follow.
+## Amendment (2026-06-10) — kiro's model surface (`unstable_session_model` restored)
+
+The initial cut **dropped `unstable_session_model`** on the assumption that all agents had moved model
+selection into `config_options`. A live probe (prompted by the owner) disproved that for **kiro**:
+kiro returns `config_options: None` at `session/new` but **does** advertise its model via the unstable
+`models` field — `SessionModelState { current_model_id: "auto", available_models: [auto,
+claude-sonnet-4.5, claude-sonnet-4, claude-haiku-4.5, …] }` — and accepts `session/set_model`. Dropping
+the feature made `resp.models` undeserializable (the field is `#[cfg]`-gated out), so the bridge could
+not see kiro's models and `model=…` on kiro hard-failed at mint — a **regression** vs the pre-increment
+best-effort `set_model` path.
+
+**Fix:** re-enable `unstable_session_model` and make `configure_model_option` try **both** surfaces —
+`config_options` first (claude/codex), then the `models` state + `session/set_model` (kiro) — reusing
+the same `resolve_model` validation + alias map; a pin on neither surface is still `config_invalid`.
+`model_effort::model_state_values` extracts the advertised ids; `AcpBackend::set_model` applies them.
+The live-only `live_edit_changes_new_session_model` e2e (kiro `auto` → `claude-sonnet-4.5` on a new
+session, same warm backend) now **PASSES** (both turns PONG/`end_turn`). 24 `model_effort` unit tests +
+99 `bridge-acp` tests green; effort is unaffected (kiro advertises no thought-level option → skipped).

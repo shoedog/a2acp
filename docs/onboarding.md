@@ -62,7 +62,7 @@ agent advertises, then sets the requested value via `session/set_config_option`.
 
 | knob     | how it's applied                              | caveat |
 |----------|-----------------------------------------------|--------|
-| `model`  | `session/set_config_option(category="model")` | **VALIDATED at mint** — pinning a value the agent does not advertise hard-fails the session (the error lists the advertised values). Aliases resolve first (`fable`→`claude-fable-5[1m]`, `opus`→`default`). claude's served model shows in claude's own transcript, not the bridge's. **kiro advertises no model option — do not pin it.** |
+| `model`  | set on the agent's advertised surface | **VALIDATED at mint** — pinning a value the agent does not advertise hard-fails the session (the error lists the advertised values). claude 0.44.0 / codex advertise it via `session/set_config_option(category="model")`; **kiro** via the unstable `models` surface + `session/set_model` (ids `auto`/`claude-sonnet-4.5`/…). Aliases resolve first (`fable`→`claude-fable-5[1m]`, `opus`→`default`). claude's served model shows in claude's own transcript, not the bridge's. |
 | `effort` | `session/set_config_option` (thought-level)   | Applied to **any** agent that advertises one (codex `reasoning_effort`, claude `effort`). Falls back to the highest supported level **≤** requested; skipped with a warn if the agent advertises none. Values: minimal/low/medium/high/xhigh/max |
 | `mode`   | `session/set_mode`                            | **HARD-fails** on an unknown/invalid mode id — set only to a mode your agent advertises (the reference config omits it) |
 | api      | only `model` is applied                       | `effort`/`mode` are ignored for `kind="api"` |

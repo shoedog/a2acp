@@ -21,10 +21,10 @@ use agent_client_protocol::schema::{
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
-    SessionId as AgentSessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    SessionId as AgentSessionId, SessionModelState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, StopReason,
+    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
+    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo, ErrorCode};
 use async_trait::async_trait;
@@ -32,8 +32,8 @@ use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::model_effort::{
-    effort_opt, is_unsupported_effort_error, model_values, resolve_effort, resolve_model,
-    resolved_log_line, EffortDecision, ModelDecision, EFFORT_ORDER,
+    effort_opt, is_unsupported_effort_error, model_state_values, model_values, resolve_effort,
+    resolve_model, resolved_log_line, EffortDecision, ModelDecision, EFFORT_ORDER,
 };
 use bridge_core::domain::{PermissionDecision, PermissionRequest, SessionContext, SessionSpec};
 use bridge_core::error::BridgeError;
@@ -507,56 +507,115 @@ impl AcpBackend {
         }
     }
 
+    /// Resolve + apply the configured model against whichever model-selection
+    /// surface the agent advertises, and return `(refreshed_options, current_model)`:
+    ///
+    ///   1. **`config_options` (category=model)** — claude 0.44.0 / codex. Set via
+    ///      `session/set_config_option`; the response carries refreshed options that
+    ///      later drive effort discovery.
+    ///   2. **the unstable `models` state + `session/set_model`** — kiro, which
+    ///      returns `config_options: None` but DOES advertise `SessionModelState`
+    ///      (`current_model_id` + `available_models`). No options come back, so the
+    ///      original (empty) options pass through.
+    ///
+    /// A configured model the agent advertises on NEITHER surface is operator config
+    /// drift → `config_invalid` (fatal mint), listing the advertised values.
     async fn configure_model_option(
         cx: &ConnectionTo<Agent>,
         agent_session_id: &AgentSessionId,
         agent_id: &str,
         opts0: &[SessionConfigOption],
+        models0: Option<&SessionModelState>,
         model: Option<&str>,
     ) -> Result<(Vec<SessionConfigOption>, String), BridgeError> {
-        let Some((config_id, current, values)) = model_values(opts0) else {
-            if let Some(model) = model {
-                return Err(BridgeError::config_invalid(format!(
-                    "agent {agent_id} advertised no model option but model={model} configured"
-                )));
-            }
-            return Ok((opts0.to_vec(), "unadvertised".to_string()));
-        };
+        // (1) config_options surface (claude/codex).
+        if let Some((config_id, current, values)) = model_values(opts0) {
+            return match Self::resolve_model_or_invalid(agent_id, model, &values)? {
+                ModelDecision::Default => Ok((opts0.to_vec(), current)),
+                ModelDecision::Apply(value) => {
+                    let refreshed =
+                        Self::set_config_option(cx, agent_session_id, &config_id, &value)
+                            .await
+                            .map_err(|e| {
+                                BridgeError::agent_crashed(format!(
+                                    "session/set_config_option({config_id}) rejected: {e}"
+                                ))
+                            })?;
+                    let opts = if refreshed.is_empty() {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            model = %value,
+                            "model applied but agent returned no refreshed options; effort levels may be stale"
+                        );
+                        opts0.to_vec()
+                    } else {
+                        refreshed
+                    };
+                    let model_current = model_values(&opts)
+                        .map(|(_, current, _)| current)
+                        .unwrap_or(value);
+                    Ok((opts, model_current))
+                }
+            };
+        }
 
-        let decision = resolve_model(model, &values).map_err(|err| {
+        // (2) the unstable `models` state + session/set_model surface (kiro).
+        if let Some(state) = models0 {
+            let values = model_state_values(state);
+            return match Self::resolve_model_or_invalid(agent_id, model, &values)? {
+                ModelDecision::Default => {
+                    Ok((opts0.to_vec(), state.current_model_id.0.to_string()))
+                }
+                ModelDecision::Apply(value) => {
+                    Self::set_model(cx, agent_session_id, &value).await?;
+                    Ok((opts0.to_vec(), value))
+                }
+            };
+        }
+
+        // Neither surface advertised: a pinned model is config drift; otherwise skip.
+        if let Some(model) = model {
+            return Err(BridgeError::config_invalid(format!(
+                "agent {agent_id} advertised no model option but model={model} configured"
+            )));
+        }
+        Ok((opts0.to_vec(), "unadvertised".to_string()))
+    }
+
+    /// Validate a configured model against the advertised values, mapping a miss to
+    /// a fatal `config_invalid` that lists them (logged/CLI; redacted on the wire).
+    fn resolve_model_or_invalid(
+        agent_id: &str,
+        model: Option<&str>,
+        values: &[String],
+    ) -> Result<ModelDecision, BridgeError> {
+        resolve_model(model, values).map_err(|err| {
             BridgeError::config_invalid(format!(
                 "agent {agent_id} model={} is not advertised; valid models: {}",
                 err.want,
                 err.valid.join(", ")
             ))
-        })?;
+        })
+    }
 
-        match decision {
-            ModelDecision::Default => Ok((opts0.to_vec(), current)),
-            ModelDecision::Apply(value) => {
-                let refreshed = Self::set_config_option(cx, agent_session_id, &config_id, &value)
-                    .await
-                    .map_err(|e| {
-                        BridgeError::agent_crashed(format!(
-                            "session/set_config_option({config_id}) rejected: {e}"
-                        ))
-                    })?;
-                let opts = if refreshed.is_empty() {
-                    tracing::warn!(
-                        agent = %agent_id,
-                        model = %value,
-                        "model applied but agent returned no refreshed options; effort levels may be stale"
-                    );
-                    opts0.to_vec()
-                } else {
-                    refreshed
-                };
-                let model_current = model_values(&opts)
-                    .map(|(_, current, _)| current)
-                    .unwrap_or(value);
-                Ok((opts, model_current))
-            }
-        }
+    /// Apply a model on the unstable `session/set_model` surface (kiro). A rejected
+    /// model id fails the mint (the value was validated against `available_models`,
+    /// so a rejection is a real agent fault, not operator drift).
+    async fn set_model(
+        cx: &ConnectionTo<Agent>,
+        agent_session_id: &AgentSessionId,
+        model_id: &str,
+    ) -> Result<(), BridgeError> {
+        cx.send_request::<SetSessionModelRequest>(SetSessionModelRequest::new(
+            agent_session_id.clone(),
+            model_id.to_string(),
+        ))
+        .block_task()
+        .await
+        .map_err(|e| {
+            BridgeError::agent_crashed(format!("session/set_model({model_id}) rejected: {e}"))
+        })?;
+        Ok(())
     }
 
     async fn apply_effort_walkdown(
@@ -1135,6 +1194,10 @@ impl AcpBackend {
                     .map_err(|e| BridgeError::agent_crashed(format!("session/new failed: {e}")))?;
                 let id = resp.session_id;
                 let opts0 = resp.config_options.unwrap_or_default();
+                // kiro advertises its model via the unstable `models` surface
+                // (SessionModelState), NOT config_options — captured for the
+                // set_model fallback in configure_model_option.
+                let models0 = resp.models;
 
                 // (2) set_mode — HARD error, configured INSIDE the closure (before
                 // returning the id). The operator asked for a specific mode; if the
@@ -1163,6 +1226,7 @@ impl AcpBackend {
                     &id,
                     &agent_id_for_mint,
                     &opts0,
+                    models0.as_ref(),
                     model.as_deref(),
                 )
                 .await?;
@@ -2035,11 +2099,12 @@ mod tests {
     // `CancelNotification`, `NewSessionRequest`, `AgentSessionId` are already in
     // scope via `super::*`; import only the agent-side response/prompt types.
     use agent_client_protocol::schema::{
-        AuthenticateRequest, AuthenticateResponse, ContentChunk, NewSessionResponse,
+        AuthenticateRequest, AuthenticateResponse, ContentChunk, ModelInfo, NewSessionResponse,
         PermissionOption, PermissionOptionId, PromptRequest, PromptResponse,
         RequestPermissionRequest, RequestPermissionResponse, SessionConfigKind,
         SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+        SessionModelState, SetSessionConfigOptionResponse, SetSessionModeRequest,
+        SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
         ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
     };
     use bridge_core::domain::Effort;
@@ -2184,6 +2249,18 @@ mod tests {
         /// Error body used when rejecting `session/set_config_option`.
         set_config_error_body: Arc<Mutex<String>>,
 
+        // ── kiro model surface: the unstable `models` state + session/set_model ─
+        /// Whether `session/new` advertises the `models` state (SessionModelState).
+        /// kiro returns `config_options: None` but DOES advertise this.
+        advertise_models: Arc<AtomicBool>,
+        /// current_model_id + available_models for the advertised `models` state.
+        model_state_current: Arc<Mutex<String>>,
+        model_state_values: Arc<Mutex<Vec<String>>>,
+        /// Model ids observed via `session/set_model`.
+        set_models: Arc<Mutex<Vec<String>>>,
+        /// Fires every time a `session/set_model` is recorded.
+        set_model_seen: Arc<Notify>,
+
         // ── Task 4 (session-cwd): record the cwd the client sent at session/new ─
         /// The `cwd` from the most recent `session/new` request (as a lossy string).
         /// Tests assert against this to verify `ensure_session` passed the correct
@@ -2250,6 +2327,14 @@ mod tests {
                 refreshed_effort_values_after_model: Arc::new(Mutex::new(None)),
                 reject_set_config_call: Arc::new(Mutex::new(None)),
                 set_config_error_body: Arc::new(Mutex::new("Invalid value for effort".to_string())),
+                advertise_models: Arc::new(AtomicBool::new(false)),
+                model_state_current: Arc::new(Mutex::new("auto".to_string())),
+                model_state_values: Arc::new(Mutex::new(vec![
+                    "auto".to_string(),
+                    "claude-sonnet-4.5".to_string(),
+                ])),
+                set_models: Arc::new(Mutex::new(Vec::new())),
+                set_model_seen: Arc::new(Notify::new()),
                 new_session_cwd: Arc::new(Mutex::new(None)),
             }
         }
@@ -2295,6 +2380,23 @@ mod tests {
             }
 
             options
+        }
+
+        /// The unstable `models` state advertised at `session/new` (kiro surface),
+        /// or `None` when not advertising it (claude/codex use config_options).
+        async fn advertised_models(&self) -> Option<SessionModelState> {
+            if !self.advertise_models.load(Ordering::SeqCst) {
+                return None;
+            }
+            let current = self.model_state_current.lock().await.clone();
+            let available = self
+                .model_state_values
+                .lock()
+                .await
+                .iter()
+                .map(|id| ModelInfo::new(id.clone(), id.clone()))
+                .collect();
+            Some(SessionModelState::new(current, available))
         }
 
         async fn refresh_config_current(&self, config_id: &str, value_id: &str) {
@@ -2382,6 +2484,7 @@ mod tests {
             let r_new = rec.clone();
             let r_mode = rec.clone();
             let r_config = rec.clone();
+            let r_model = rec.clone();
             let r_prompt = rec.clone();
             let r_cancel = rec.clone();
             let _ = Agent
@@ -2476,6 +2579,21 @@ mod tests {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
+                    move |req: SetSessionModelRequest,
+                          responder: agent_client_protocol::Responder<SetSessionModelResponse>,
+                          _cx| {
+                        let r = r_model.clone();
+                        async move {
+                            r.set_models.lock().await.push(req.model_id.0.to_string());
+                            *r.model_state_current.lock().await = req.model_id.0.to_string();
+                            r.set_model_seen.notify_one();
+                            responder.respond(SetSessionModelResponse::new())?;
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
                     move |req: NewSessionRequest,
                           responder: agent_client_protocol::Responder<NewSessionResponse>,
                           _cx| {
@@ -2495,7 +2613,8 @@ mod tests {
                             }
                             responder.respond(
                                 NewSessionResponse::new(AgentSessionId::new(r.minted_id))
-                                    .config_options(r.advertised_config_options().await),
+                                    .config_options(r.advertised_config_options().await)
+                                    .models(r.advertised_models().await),
                             )?;
                             Ok(())
                         }
@@ -3971,6 +4090,84 @@ mod tests {
             rec.set_config_options.lock().await.as_slice(),
             &[("model".to_string(), "m".to_string())],
             "stashed model applied at mint"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_session_applies_model_via_set_model_surface() {
+        // kiro's surface: `session/new` advertises NO model config option but DOES
+        // advertise the unstable `models` state, and the model is applied via
+        // `session/set_model`. The bridge must use this fallback when config_options
+        // carries no model option.
+        let rec = Recorder::new("agent-sess-KIRO");
+        rec.advertise_model_config.store(false, Ordering::SeqCst);
+        rec.advertise_effort_config.store(false, Ordering::SeqCst);
+        rec.advertise_models.store(true, Ordering::SeqCst);
+        *rec.model_state_current.lock().await = "auto".to_string();
+        *rec.model_state_values.lock().await =
+            vec!["auto".to_string(), "claude-sonnet-4.5".to_string()];
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-KIRO");
+
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("claude-sonnet-4.5".to_string()),
+                effort: None,
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.set_model_seen.notified())
+            .await
+            .expect("set_model must reach the agent after session/new");
+        assert_eq!(
+            rec.set_models.lock().await.as_slice(),
+            &["claude-sonnet-4.5".to_string()],
+            "stashed model applied via session/set_model (kiro surface)"
+        );
+        assert!(
+            rec.set_config_options.lock().await.is_empty(),
+            "no config_options model surface → set_config_option NOT used for the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn unadvertised_model_on_set_model_surface_fails_mint() {
+        // A pinned model the `models` surface does not advertise is config drift →
+        // config_invalid (fatal mint), listing the advertised ids, and NO set_model.
+        let rec = Recorder::new("agent-sess-KIRO-BAD");
+        rec.advertise_model_config.store(false, Ordering::SeqCst);
+        rec.advertise_effort_config.store(false, Ordering::SeqCst);
+        rec.advertise_models.store(true, Ordering::SeqCst);
+        *rec.model_state_values.lock().await =
+            vec!["auto".to_string(), "claude-sonnet-4.5".to_string()];
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-KIRO-BAD");
+
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("gpt-5.5".to_string()),
+                effort: None,
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = be.ensure_session(&key).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not advertised") && msg.contains("claude-sonnet-4.5"),
+            "mint must fail listing the advertised model ids; got: {msg}"
+        );
+        assert!(
+            rec.set_models.lock().await.is_empty(),
+            "no set_model is sent for a rejected (unadvertised) pin"
         );
     }
 
