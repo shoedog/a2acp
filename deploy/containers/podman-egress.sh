@@ -3,15 +3,19 @@
 # Reproduces the SAME names so the bridge config contract is unchanged:
 #   networks: a2a-egress-internal (--internal), a2a-verify-egress (--internal), a2a-egress-external (routed)
 #   proxies:  a2a-egress-proxy (internal + external, agent filter), a2a-verify-proxy (verify + external, registries filter)
-# Both proxies BIND-MOUNT their tinyproxy filter (always fresh — edit the filter, re-run `up`, no rebuild).
+# Both proxies BIND-MOUNT their tinyproxy filter. tinyproxy reads the filter ONCE at startup, so `up`
+# RECREATES the proxies every time — that restart is what loads an edited filter (and guarantees correct
+# network wiring regardless of prior state). Editing a filter takes effect on the next `up`.
 #
 # Usage:  deploy/containers/podman-egress.sh up | status | down
-#   up:     idempotent. Re-run after every `podman machine start` (proxies do NOT survive a daemonless
-#           `podman machine stop/start`). Skips intact running proxies unless FORCE=1.
+#   up:     idempotent; RECREATES the proxies (brief egress pause). Run at setup, after a `podman machine`
+#           restart (proxies do NOT survive a daemonless `podman machine stop/start`), or to apply a filter
+#           edit — NOT mid-workflow (it briefly drops agent egress while the proxies restart).
 #   status: list the 3 networks + 2 proxies.
 #   down:   tolerate not-found; REPORT any other failure (e.g. a network still in use).
 #
-# Override the runtime with CONTAINER_RUNTIME=podman (default) — also works with nerdctl/docker.
+# podman-specific (uses `podman network exists`/`network inspect`). CONTAINER_RUNTIME overrides only for a
+# podman-compatible CLI; docker/nerdctl are NOT supported by this script.
 #
 # OLD-PODMAN / IP PINNING (aardvark-dns < netavark 1.6 / podman < 4.5 did NOT serve DNS on --internal
 # networks, so name resolution of `a2a-egress-proxy` from the internal net fails). Pin via env so EVERY
@@ -43,6 +47,13 @@ ensure_internal_network() { # $1 = name, $2 = optional subnet
       echo "       bypassed (agents get direct egress). Remove it and re-run: $RT network rm $name" >&2
       exit 1
     fi
+    # If a subnet pin is requested, the pre-existing network MUST already carry it — otherwise the later
+    # `--ip` create fails mid-up with an opaque error and a half-up state.
+    if [ -n "$subnet" ] && ! "$RT" network inspect "$name" --format '{{range .Subnets}}{{.Subnet}} {{end}}' 2>/dev/null | grep -qF "$subnet"; then
+      echo "FATAL: network '$name' exists but lacks the pinned subnet '$subnet' (the --ip create would fail" >&2
+      echo "       mid-up). Remove it and re-run so it is recreated with the pin: $RT network rm $name" >&2
+      exit 1
+    fi
   else
     if [ -n "$subnet" ]; then
       "$RT" network create --internal --subnet "$subnet" "$name"
@@ -56,11 +67,8 @@ ensure_routed_network() { # $1 = name
   "$RT" network exists "$1" 2>/dev/null || "$RT" network create "$1"
 }
 
-# A proxy is "intact" iff it is running. This script ALWAYS attaches both nets + binds the filter, so a
-# running proxy is correctly wired; a non-disruptive re-up can skip it (FORCE=1 overrides).
-proxy_running() { "$RT" ps --filter "name=^$1\$" --filter status=running --format '{{.Names}}' 2>/dev/null | grep -qx "$1"; }
-
-# create+connect+start one proxy: $1=name $2=internal-net $3=filter-file $4=optional-ip
+# create+connect+start one proxy: $1=name $2=internal-net $3=filter-file $4=optional-ip. ALWAYS rm -f first
+# so the proxy is freshly wired (both nets) and tinyproxy reloads the bind-mounted filter at this start.
 start_proxy() {
   local name="$1" net="$2" filter="$3" ip="${4:-}"
   "$RT" rm -f "$name" >/dev/null 2>&1 || true
@@ -83,11 +91,9 @@ up() {
   "$RT" image exists a2a-egress-proxy:latest 2>/dev/null \
     || "$RT" build -t a2a-egress-proxy:latest -f proxy.Containerfile .
 
-  if [ "${FORCE:-0}" != "1" ] && proxy_running a2a-egress-proxy && proxy_running a2a-verify-proxy; then
-    echo "egress already up ($RT): both proxies running (FORCE=1 to recreate)"
-    return 0
-  fi
-
+  # ALWAYS recreate (no "skip if running"): a recreate is the only thing that (a) loads an edited filter
+  # — tinyproxy reads it once at startup — and (b) guarantees correct wiring, vs trusting a possibly
+  # mis-wired pre-existing container named the same.
   start_proxy a2a-egress-proxy a2a-egress-internal tinyproxy.filter        "$PROXY_IP"
   start_proxy a2a-verify-proxy a2a-verify-egress   tinyproxy.verify.filter "$VERIFY_PROXY_IP"
 
@@ -128,5 +134,5 @@ case "${1:-}" in
   up)     up ;;
   status) status ;;
   down)   down ;;
-  *) echo "usage: $0 up | status | down   (env: CONTAINER_RUNTIME, FORCE=1, EGRESS_*_SUBNET/IP)" >&2; exit 2 ;;
+  *) echo "usage: $0 up | status | down   (env: CONTAINER_RUNTIME, EGRESS_*_SUBNET/IP)" >&2; exit 2 ;;
 esac
