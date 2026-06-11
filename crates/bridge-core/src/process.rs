@@ -80,6 +80,24 @@ impl Supervised {
     }
 }
 
+impl Drop for Supervised {
+    /// Backstop GROUP-kill on every drop path. A backend that is plain-DROPPED — normal
+    /// `run-workflow`/`implement` completion, where the graceful async [`Supervised::terminate`] is NOT
+    /// called — must not leak the agent's descendants. `kill_on_drop` reaps only the DIRECT child; the
+    /// spawned process group (`pgid == self.pid` via `process_group(0)`) can hold descendants. e.g. the
+    /// `codex-acp` node wrapper `spawnSync`s the real `codex` binary into its group; without a group kill
+    /// here that `codex` orphans (reparents to init) and accumulates across runs. SIGKILL the whole group
+    /// (best-effort: `ESRCH` after a prior `terminate()` already killed it is fine). `kill_on_drop` then
+    /// reaps the leader, so the group leader never becomes a zombie.
+    fn drop(&mut self) {
+        // SAFETY: kill(-pgid, SIGKILL) targets a process group we own — `pgid == self.pid`, the group
+        // leader, because we spawned with `process_group(0)`.
+        unsafe {
+            libc::kill(-(self.pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +147,56 @@ mod tests {
         assert!(
             buf.contains("DONE"),
             "child never finished; stdout was {buf:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_group_kills_descendants() {
+        // The leak fix: a DESCENDANT in the leader's group must die when the Supervised is plain-DROPPED
+        // (not terminate()d) — else e.g. codex-acp's spawnSync'd `codex` grandchild orphans and piles up
+        // across runs. The leader spawns `sleep 300` in its group + writes its pid; after drop it's gone.
+        let dir = std::env::temp_dir().join(format!("a2a-sup-drop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let pidfile = dir.join("gc.pid");
+        let script = format!("sleep 300 & echo $! > {pf}; wait", pf = pidfile.display());
+        let sup = Supervised::spawn("/bin/sh", &["-c", &script], None).unwrap();
+
+        // Wait for the grandchild pid to be written.
+        let mut gc: Option<u32> = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(n) = s.trim().parse::<u32>() {
+                    gc = Some(n);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let gc = gc.expect("grandchild pid written");
+        assert!(proc_state(gc).is_some(), "grandchild alive before drop");
+
+        drop(sup); // plain drop — must GROUP-kill, not just kill_on_drop the leader
+
+        // The grandchild must be killed (gone, or a zombie pending reap by init) — not left running.
+        let mut killed = false;
+        for _ in 0..150 {
+            match proc_state(gc) {
+                None => {
+                    killed = true;
+                    break;
+                }
+                Some(st) if st.starts_with('Z') => {
+                    killed = true;
+                    break;
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            killed,
+            "grandchild must be group-killed on Supervised drop (no orphan); it was still running"
         );
     }
 
