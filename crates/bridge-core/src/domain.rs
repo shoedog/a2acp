@@ -78,12 +78,17 @@ pub struct SandboxConfig {
     pub volumes: Vec<String>,
 }
 
+/// The container runtime used when none is configured. The SINGLE source of this literal — the sandbox
+/// runtime resolver, the default-`allowed_cmds` union, and the `[verify]` runtime gate all read it, so the
+/// "validate vs spawn" pair can never drift on the default.
+pub const DEFAULT_RUNTIME: &str = "docker";
+
 impl SandboxConfig {
-    /// The resolved container runtime program (default `docker`). The single source of truth: the
+    /// The resolved container runtime program (default [`DEFAULT_RUNTIME`]). The single source of truth: the
     /// snapshot-layer allowlist (S3) gates THIS value, and `compose_sandbox` spawns THIS — so validate
     /// and spawn can't drift.
     pub fn runtime(&self) -> &str {
-        self.runtime.as_deref().unwrap_or("docker")
+        self.runtime.as_deref().unwrap_or(DEFAULT_RUNTIME)
     }
 }
 

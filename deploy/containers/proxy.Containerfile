@@ -1,4 +1,4 @@
-FROM debian:stable-slim
+FROM docker.io/library/debian:stable-slim
 RUN apt-get update && apt-get install -y --no-install-recommends tinyproxy curl \
     && rm -rf /var/lib/apt/lists/*
 COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf

@@ -1,6 +1,6 @@
 # a2a-bridge reader image: portable ACP agent CLIs + read-only exploration tools. NO build toolchain
 # (readers verify via read/grep/git diff; they don't compile — that's the Slice B implement image).
-FROM node:24-slim
+FROM docker.io/library/node:24-slim
 
 # Read tools the review/design lenses use, + curl for the egress gate + the kiro installer,
 # + unzip/ca-certificates for installers, + git/ripgrep for read/grep.

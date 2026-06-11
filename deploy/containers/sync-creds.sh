@@ -45,5 +45,5 @@ fi
 # refreshes itself. Nothing to sync from the host. If it has FULLY expired, re-run the device-flow login.
 if [ "$want" = all ] || [ "$want" = kiro ]; then
   echo "note   kiro  = the a2a-kiro-data volume (in-container device-flow; not a host file)."
-  echo "             if expired, re-run: docker run -it --rm -v a2a-kiro-data:/root/.local/share a2a-agent-reader:latest kiro-cli login --use-device-flow"
+  echo "             if expired, re-run: ${CONTAINER_RUNTIME:-docker} run -it --rm -v a2a-kiro-data:/root/.local/share a2a-agent-reader:latest kiro-cli login --use-device-flow"
 fi

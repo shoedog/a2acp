@@ -434,6 +434,41 @@ impl VerifyToml {
     }
 }
 
+/// Gate the resolved `[verify]` runtime against the snapshot's allowlist. PURE — call it once after
+/// `into_snapshot()` at each `implement` site with `&snapshot.allowed_cmds`. Only an `Ok` config is
+/// checked; a prior `Err` (e.g. empty commands) and `None` pass through untouched (so `None` stays
+/// `VerifyOutcome::NotConfigured`, never becomes `ConfigError`). The `"docker"` default is applied HERE
+/// to mirror [`bridge_core::domain::SandboxConfig::runtime`] — a defaulted `[verify].runtime` otherwise
+/// only resolves to `"docker"` later in `compose_sandbox`, so the gate must apply the same default to
+/// check the value that will actually run. A disallowed runtime becomes `ConfigError`, which flows into
+/// the existing `VerifyOutcome::ConfigError` path (no container spawns).
+pub fn gate_verify_runtime(
+    verify_cfg: Option<Result<VerifyConfig, ConfigError>>,
+    allowed_cmds: &[String],
+) -> Option<Result<VerifyConfig, ConfigError>> {
+    match verify_cfg {
+        Some(Ok(mut vc)) => {
+            // Resolve the default from the SINGLE source so the gate and `compose_sandbox` can't disagree.
+            let rt = vc
+                .runtime
+                .as_deref()
+                .unwrap_or(bridge_core::domain::DEFAULT_RUNTIME)
+                .to_string();
+            if allowed_cmds.contains(&rt) {
+                // NORMALIZE: make the resolved runtime explicit so no downstream consumer re-defaults
+                // (the verify runner + the preflight read this exact value).
+                vc.runtime = Some(rt);
+                Some(Ok(vc))
+            } else {
+                Some(Err(ConfigError::Registry(format!(
+                    "verify runtime not allowed: {rt:?} — add it to [registry].allowed_cmds or set [verify].runtime"
+                ))))
+            }
+        }
+        other => other,
+    }
+}
+
 fn default_review_workflow() -> String {
     "implement-review".to_string()
 }
@@ -735,22 +770,25 @@ impl RegistryConfig {
         // entry cmds. S0 (dual-review): for a SANDBOXED entry the spawned program is the RUNTIME
         // (`sb.runtime()`), not `cmd` (the inner cli) — so default on the runtime, else the entry would
         // self-reject at the snapshot-layer S3 allowlist.
-        let allowed_cmds = match self.registry {
-            Some(r) if !r.allowed_cmds.is_empty() => r.allowed_cmds,
-            _ => {
-                let mut v: Vec<String> = self
-                    .agents
-                    .iter()
-                    .filter_map(|a| match &a.sandbox {
-                        Some(sb) => Some(sb.runtime.clone().unwrap_or_else(|| "docker".into())),
-                        None => a.cmd.clone(),
-                    })
-                    .collect();
-                v.sort();
-                v.dedup();
-                v
-            }
-        };
+        let allowed_cmds =
+            match self.registry {
+                Some(r) if !r.allowed_cmds.is_empty() => r.allowed_cmds,
+                _ => {
+                    let mut v: Vec<String> =
+                        self.agents
+                            .iter()
+                            .filter_map(|a| match &a.sandbox {
+                                Some(sb) => Some(sb.runtime.clone().unwrap_or_else(|| {
+                                    bridge_core::domain::DEFAULT_RUNTIME.into()
+                                })),
+                                None => a.cmd.clone(),
+                            })
+                            .collect();
+                    v.sort();
+                    v.dedup();
+                    v
+                }
+            };
 
         let mut entries = Vec::with_capacity(self.agents.len());
         for a in self.agents {
@@ -1059,6 +1097,69 @@ impl bridge_core::ports::ConfigSource for FileConfigSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vc(runtime: Option<&str>) -> VerifyConfig {
+        VerifyConfig {
+            runtime: runtime.map(str::to_string),
+            image: "img".into(),
+            cache: "c".into(),
+            egress: bridge_core::domain::EgressPolicy::Open,
+            commands: vec![VerifyCommand {
+                name: "t".into(),
+                cmd: "true".into(),
+                gate: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn gate_rejects_defaulted_runtime_when_only_podman_allowed() {
+        let out = gate_verify_runtime(Some(Ok(vc(None))), &["podman".to_string()]);
+        let err = out.unwrap().unwrap_err();
+        assert!(
+            format!("{err:?}").contains("docker"),
+            "rejection names the resolved default 'docker'"
+        );
+    }
+
+    #[test]
+    fn gate_rejects_explicit_disallowed_runtime() {
+        let out = gate_verify_runtime(Some(Ok(vc(Some("docker")))), &["podman".to_string()]);
+        assert!(out.unwrap().is_err());
+    }
+
+    #[test]
+    fn gate_allows_explicit_allowed_runtime() {
+        let out = gate_verify_runtime(Some(Ok(vc(Some("podman")))), &["podman".to_string()]);
+        assert_eq!(out.unwrap().unwrap().runtime.as_deref(), Some("podman"));
+    }
+
+    #[test]
+    fn gate_back_compat_defaulted_docker_allowed_and_normalized() {
+        let out = gate_verify_runtime(
+            Some(Ok(vc(None))),
+            &["docker".to_string(), "codex-acp".to_string()],
+        );
+        // Existing docker configs unaffected, AND the defaulted runtime is normalized to an explicit value
+        // so no downstream consumer re-defaults (review MAJOR 4).
+        assert_eq!(out.unwrap().unwrap().runtime.as_deref(), Some("docker"));
+    }
+
+    #[test]
+    fn gate_preserves_prior_error() {
+        let prior = Err(ConfigError::Registry(
+            "[verify] needs at least one command".into(),
+        ));
+        let out = gate_verify_runtime(Some(prior), &["podman".to_string()]);
+        assert!(
+            matches!(out, Some(Err(ConfigError::Registry(m))) if m.contains("at least one command"))
+        );
+    }
+
+    #[test]
+    fn gate_passes_through_none() {
+        assert!(gate_verify_runtime(None, &["podman".to_string()]).is_none());
+    }
 
     #[test]
     fn delegation_parsed_with_env_expansion() {

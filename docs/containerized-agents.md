@@ -176,3 +176,54 @@ root via a symlink.
 
 Set the per-request `:rw` target via **`serve` + A2A** (`message.metadata` cwd) or, for **`run-workflow`**,
 the `--session-cwd <dir>` flag — without it, agents run in the LAUNCH cwd, not the target repo.
+
+## 9. Podman (macOS `podman machine`)
+
+The runtime is config-selected (the bridge is runtime-agnostic). Docker stays the default; podman is opt-in.
+This section is validated on macOS `podman machine`; **Linux rootless is a separate follow-up** (uid/SELinux
+semantics differ). Minimum **podman ≥ 4.5** (netavark ≥ 1.6) for DNS on `--internal` networks.
+
+**1. Select podman.** Use `examples/a2a-bridge.containerized.podman.toml` — or, in your own config, the
+two-line rule: add `"podman"` to `allowed_cmds` **and** `runtime = "podman"` to every `[agents.sandbox]`
+block **and** `[verify]`.
+
+**2. Machine.** `podman` resolves via `PATH` (a launchd-launched `serve` needs `podman` on its `PATH`).
+
+```bash
+podman machine init --cpus 6 --memory 8192 --disk-size 100 && podman machine start
+podman machine inspect | grep -i mount   # confirm /Users is mounted (the identical-path -v {m}:{m} bind)
+```
+
+**3. Build the images** — podman has a **separate image store** (it cannot see docker-built images), so
+build in order:
+
+```bash
+podman build -t a2a-agent-reader:latest -f deploy/containers/reader.Containerfile deploy/containers
+podman build -t a2a-toolchain:latest    -f deploy/containers/toolchain.Containerfile deploy/containers  # uses the reader image
+podman build -t a2a-egress-proxy:latest -f deploy/containers/proxy.Containerfile  deploy/containers
+```
+
+**4. Egress.** Use the podman script (NOT `docker compose`). **Re-run it after every `podman machine start`**
+— `--restart` does not survive a daemonless machine restart.
+
+```bash
+deploy/containers/podman-egress.sh up       # idempotent; re-run after a machine restart
+deploy/containers/podman-egress.sh status   # 3 networks + 2 proxies
+deploy/containers/podman-egress.sh down
+```
+
+If name resolution of `a2a-egress-proxy` from the internal net fails (old podman), use the IP-pinning
+fallback documented in the script header (`--subnet`/`--ip` + `proxy = "http://<ip>:8888"` in the config).
+
+**5. Kiro creds.** The `a2a-kiro-data` volume does **not** carry over from docker — re-mint under podman:
+`podman run -it --rm -v a2a-kiro-data:/root/.local/share a2a-agent-reader:latest kiro-cli login --use-device-flow`
+(`sync-creds.sh` prints this hint honoring `CONTAINER_RUNTIME=podman`).
+
+**6. Run.** `a2a-bridge serve --config examples/a2a-bridge.containerized.podman.toml` (or `run-workflow` /
+`implement` with that config). A configured-but-unresponsive runtime is warned about at startup (the hard
+gate is the `allowed_cmds`/S3 allowlist + the verify-runtime gate).
+
+**Caveats.** `containers list|reap` does **not** see verify containers (no `a2a.managed=1` label — true on
+docker too). `podman rm` is **synchronous**, so expect **0** containers immediately after a run (unlike
+Docker Desktop's ~2 s async removal). A disallowed `[verify].runtime` (not in `allowed_cmds`) makes verify
+fail with `ConfigError` rather than running on the wrong engine.

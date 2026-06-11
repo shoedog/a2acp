@@ -14,6 +14,10 @@ to a running multi-agent bridge.
 > **distinct config file** (or distinct impl agent id) each; the same config pointed at two repos at once
 > will collide on the container name + boot-sweep. Give each concurrent project its own config.
 
+> **Podman (macOS):** use `examples/a2a-bridge.containerized.podman.toml` and see
+> `docs/containerized-agents.md` → §9 Podman (separate image store, `podman-egress.sh`, re-up after a
+> `podman machine` restart, kiro re-mint). Docker stays the default.
+
 ## Quick start
 
 ```sh
