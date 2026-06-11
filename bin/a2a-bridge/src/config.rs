@@ -434,6 +434,33 @@ impl VerifyToml {
     }
 }
 
+/// Gate the resolved `[verify]` runtime against the snapshot's allowlist. PURE — call it once after
+/// `into_snapshot()` at each `implement` site with `&snapshot.allowed_cmds`. Only an `Ok` config is
+/// checked; a prior `Err` (e.g. empty commands) and `None` pass through untouched (so `None` stays
+/// `VerifyOutcome::NotConfigured`, never becomes `ConfigError`). The `"docker"` default is applied HERE
+/// to mirror [`bridge_core::domain::SandboxConfig::runtime`] — a defaulted `[verify].runtime` otherwise
+/// only resolves to `"docker"` later in `compose_sandbox`, so the gate must apply the same default to
+/// check the value that will actually run. A disallowed runtime becomes `ConfigError`, which flows into
+/// the existing `VerifyOutcome::ConfigError` path (no container spawns).
+pub fn gate_verify_runtime(
+    verify_cfg: Option<Result<VerifyConfig, ConfigError>>,
+    allowed_cmds: &[String],
+) -> Option<Result<VerifyConfig, ConfigError>> {
+    match verify_cfg {
+        Some(Ok(vc)) => {
+            let rt = vc.runtime.as_deref().unwrap_or("docker"); // pin: SandboxConfig::runtime() default
+            if allowed_cmds.iter().any(|c| c == rt) {
+                Some(Ok(vc))
+            } else {
+                Some(Err(ConfigError::Registry(format!(
+                    "verify runtime not allowed: {rt:?} — add it to [registry].allowed_cmds or set [verify].runtime"
+                ))))
+            }
+        }
+        other => other,
+    }
+}
+
 fn default_review_workflow() -> String {
     "implement-review".to_string()
 }
@@ -1059,6 +1086,67 @@ impl bridge_core::ports::ConfigSource for FileConfigSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vc(runtime: Option<&str>) -> VerifyConfig {
+        VerifyConfig {
+            runtime: runtime.map(str::to_string),
+            image: "img".into(),
+            cache: "c".into(),
+            egress: bridge_core::domain::EgressPolicy::Open,
+            commands: vec![VerifyCommand {
+                name: "t".into(),
+                cmd: "true".into(),
+                gate: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn gate_rejects_defaulted_runtime_when_only_podman_allowed() {
+        let out = gate_verify_runtime(Some(Ok(vc(None))), &["podman".to_string()]);
+        let err = out.unwrap().unwrap_err();
+        assert!(
+            format!("{err:?}").contains("docker"),
+            "rejection names the resolved default 'docker'"
+        );
+    }
+
+    #[test]
+    fn gate_rejects_explicit_disallowed_runtime() {
+        let out = gate_verify_runtime(Some(Ok(vc(Some("docker")))), &["podman".to_string()]);
+        assert!(out.unwrap().is_err());
+    }
+
+    #[test]
+    fn gate_allows_explicit_allowed_runtime() {
+        let out = gate_verify_runtime(Some(Ok(vc(Some("podman")))), &["podman".to_string()]);
+        assert_eq!(out.unwrap().unwrap().runtime.as_deref(), Some("podman"));
+    }
+
+    #[test]
+    fn gate_back_compat_defaulted_docker_allowed() {
+        let out = gate_verify_runtime(
+            Some(Ok(vc(None))),
+            &["docker".to_string(), "codex-acp".to_string()],
+        );
+        assert!(out.unwrap().is_ok(), "existing docker configs unaffected");
+    }
+
+    #[test]
+    fn gate_preserves_prior_error() {
+        let prior = Err(ConfigError::Registry(
+            "[verify] needs at least one command".into(),
+        ));
+        let out = gate_verify_runtime(Some(prior), &["podman".to_string()]);
+        assert!(
+            matches!(out, Some(Err(ConfigError::Registry(m))) if m.contains("at least one command"))
+        );
+    }
+
+    #[test]
+    fn gate_passes_through_none() {
+        assert!(gate_verify_runtime(None, &["podman".to_string()]).is_none());
+    }
 
     #[test]
     fn delegation_parsed_with_env_expansion() {

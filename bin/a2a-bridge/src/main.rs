@@ -834,6 +834,48 @@ fn run_verify_step(
     }
 }
 
+/// Pure: the runtimes whose `probe` reports them unavailable. Injectable for tests.
+fn missing_runtimes(
+    runtimes: &std::collections::BTreeSet<String>,
+    probe: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    runtimes.iter().filter(|rt| !probe(rt)).cloned().collect()
+}
+
+/// Production probe: `<runtime> info` exits 0 (the runtime is installed and, for podman, its machine is up).
+fn runtime_responds(runtime: &str) -> bool {
+    std::process::Command::new(runtime)
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Warn-level preflight (NOT enforcement — the allowlist/S3 is the hard gate). Collects the distinct
+/// container runtimes a snapshot's sandboxes (+ an optional verify runtime) use, probes each, and warns on
+/// any that don't respond. A host-only config (no sandboxes, no verify runtime) probes nothing.
+fn preflight_runtimes(
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    verify_runtime: Option<&str>,
+) {
+    let mut runtimes: std::collections::BTreeSet<String> = snapshot
+        .entries
+        .iter()
+        .filter_map(|e| e.sandbox.as_ref().map(|sb| sb.runtime().to_string()))
+        .collect();
+    if let Some(rt) = verify_runtime {
+        runtimes.insert(rt.to_string());
+    }
+    for rt in missing_runtimes(&runtimes, &runtime_responds) {
+        tracing::warn!(
+            runtime = %rt,
+            "configured container runtime '{rt}' did not respond to `{rt} info` — is it installed and (for podman) is `podman machine` started?"
+        );
+    }
+}
+
 /// Run the B2b-3a review once (total). Returns `(outcome, synth_body)`. Fresh `CancellationToken` + `select!`
 /// timeout→cancel→keep-drain PER call (so the `:ro` reaper still fires on a timed-out attempt). `run_id` is
 /// qualified by `attempt`.
@@ -1290,6 +1332,17 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
+    // Gate the [verify] runtime against the resolved allowlist: a non-allowlisted runtime rejects into
+    // VerifyOutcome::ConfigError (verify never runs on the wrong engine). snapshot.allowed_cmds is the
+    // verbatim resolved list (no duplicated union to drift). verify_cfg is owned, so this shadows it.
+    let verify_cfg = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
+    preflight_runtimes(
+        &snapshot,
+        verify_cfg
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|v| v.runtime.as_deref()),
+    );
     // Canonical config path: the owner token must match between the sweeps and the spawn factory.
     let owner_config_path =
         std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
@@ -1553,6 +1606,15 @@ async fn implement_resume_cmd(
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement --resume: snapshot: {e}"))?;
+    // Same verify-runtime gate as the implement path (reject a disallowed runtime into ConfigError).
+    let verify_cfg = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
+    preflight_runtimes(
+        &snapshot,
+        verify_cfg
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|v| v.runtime.as_deref()),
+    );
 
     let owner_config_path =
         std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
@@ -1705,6 +1767,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let mut snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
+    preflight_runtimes(&snapshot, None); // warn early if a sandbox runtime isn't up (verify is implement-only)
     // MAJOR 4 (ADR-0028): stamp --session-cwd into every entry's `session_cwd` so the ONE resolution
     // chain (`resolve_static_session_cwd`) feeds BOTH the agent's ACP session cwd AND the codex native
     // MCP `-c` args' `{cwd}` from the same value — prism then indexes exactly the repo the agent works
@@ -2721,6 +2784,7 @@ async fn main() -> Result<(), BoxError> {
     //    the RegistryConfig we re-read below for the non-registry fields.
     let source = FileConfigSource::new(config_path.clone());
     let snapshot = source.load().await?; // initial desired state
+    preflight_runtimes(&snapshot, None); // warn early if a sandbox runtime isn't responding at serve boot
                                          // Increment A before-first-use crash recovery: reap only DEAD
                                          // (same host + free lease) orphans of this instance's owners
                                          // (`:rw` ∪ `:ro`); a live concurrent run holds its lease and is
@@ -3341,6 +3405,66 @@ mod cli_tests {
                 "podman example diverges from docker example outside runtime/allowlist: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn preflight_reports_unresponsive_runtimes_and_skips_empty() {
+        use std::collections::BTreeSet;
+        // Host-only config (no sandboxed runtimes) → nothing to report.
+        assert!(missing_runtimes(&BTreeSet::new(), &|_| true).is_empty());
+        let mut s = BTreeSet::new();
+        s.insert("podman".to_string());
+        // Probe fails → reported (the caller warns).
+        assert_eq!(missing_runtimes(&s, &|_| false), vec!["podman".to_string()]);
+        // Probe succeeds → not reported.
+        assert!(missing_runtimes(&s, &|_| true).is_empty());
+    }
+
+    #[test]
+    fn verify_runtime_gate_rejects_via_snapshot_allowlist() {
+        // [registry]-less all-podman config: into_snapshot's default union is {podman} (the sandbox
+        // runtime), so a defaulted-docker [verify] is rejected by the gate → VerifyOutcome::ConfigError
+        // (no container spawns). Proves the snapshot -> gate -> run_verify_step wiring, runtime-free.
+        let toml = r#"
+default = "a"
+allowed_cwd_root = "/tmp"
+[server]
+addr = "127.0.0.1:8080"
+[[agents]]
+id = "a"
+cmd = "codex-acp"
+[agents.sandbox]
+runtime = "podman"
+image = "img"
+mount = "/tmp"
+access = "ro"
+egress = "open"
+[verify]
+image = "img"
+cache = "c"
+egress = "open"
+[[verify.commands]]
+name = "t"
+cmd = "true"
+"#;
+        let cfg = config::RegistryConfig::parse(toml).expect("parses");
+        let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
+        let snapshot = cfg.into_snapshot().expect("snapshots");
+        assert!(
+            snapshot.allowed_cmds.iter().any(|c| c == "podman")
+                && !snapshot.allowed_cmds.iter().any(|c| c == "docker"),
+            "default union is podman-only"
+        );
+        let gated = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
+        let outcome = run_verify_step(
+            &gated,
+            &bridge_core::SessionCwd::parse("/tmp").unwrap(),
+            std::path::Path::new("/tmp"),
+        );
+        assert!(
+            matches!(outcome, verify::VerifyOutcome::ConfigError),
+            "defaulted-docker verify under an all-podman allowlist → ConfigError"
+        );
     }
 
     #[test]
