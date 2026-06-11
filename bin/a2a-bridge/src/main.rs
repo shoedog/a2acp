@@ -842,24 +842,63 @@ fn missing_runtimes(
     runtimes.iter().filter(|rt| !probe(rt)).cloned().collect()
 }
 
-/// Production probe: `<runtime> info` exits 0 (the runtime is installed and, for podman, its machine is up).
+/// Production probe: `<runtime> info` exits 0 within a bound. BOUNDED so a wedged probe (half-started
+/// `podman machine`) can't hang startup — on timeout it kills the child and reports "unavailable" (a warn,
+/// not enforcement). Only ever invoked on an ALLOWLISTED runtime (see `preflight_runtimes`), never on a
+/// config-named binary the allowlist would reject.
 fn runtime_responds(runtime: &str) -> bool {
-    std::process::Command::new(runtime)
+    let mut child = match std::process::Command::new(runtime)
         .arg("info")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
-/// Warn-level preflight (NOT enforcement — the allowlist/S3 is the hard gate). Collects the distinct
-/// container runtimes a snapshot's sandboxes (+ an optional verify runtime) use, probes each, and warns on
-/// any that don't respond. A host-only config (no sandboxes, no verify runtime) probes nothing.
+/// Warn-level preflight (NOT enforcement — the allowlist/S3 + the verify gate are the hard gates). Collects
+/// the distinct container runtimes a snapshot's sandboxes (+ an optional, already-gated verify runtime) use,
+/// **restricts to allowlisted runtimes**, probes each (bounded), and warns on any that don't respond. The
+/// allowlist restriction is a SECURITY requirement: probing a non-allowlisted, config-named runtime would
+/// EXECUTE that binary outside the allowlist — instead such a runtime is left for S3/the gate to reject
+/// loudly. A host-only config (no sandboxes, allowlisted verify) probes nothing.
 fn preflight_runtimes(
     snapshot: &bridge_core::domain::RegistrySnapshot,
     verify_runtime: Option<&str>,
 ) {
+    let runtimes = runtimes_to_probe(snapshot, verify_runtime);
+    for rt in missing_runtimes(&runtimes, &runtime_responds) {
+        tracing::warn!(
+            runtime = %rt,
+            "configured container runtime '{rt}' did not respond to `{rt} info` — is it installed and (for podman) is `podman machine` started?"
+        );
+    }
+}
+
+/// The runtimes preflight may probe: the distinct sandbox runtimes (+ an optional already-gated verify
+/// runtime), RESTRICTED to the allowlist. PURE — the security boundary (never probe a non-allowlisted,
+/// config-named binary) is unit-tested here.
+fn runtimes_to_probe(
+    snapshot: &bridge_core::domain::RegistrySnapshot,
+    verify_runtime: Option<&str>,
+) -> std::collections::BTreeSet<String> {
     let mut runtimes: std::collections::BTreeSet<String> = snapshot
         .entries
         .iter()
@@ -868,12 +907,8 @@ fn preflight_runtimes(
     if let Some(rt) = verify_runtime {
         runtimes.insert(rt.to_string());
     }
-    for rt in missing_runtimes(&runtimes, &runtime_responds) {
-        tracing::warn!(
-            runtime = %rt,
-            "configured container runtime '{rt}' did not respond to `{rt} info` — is it installed and (for podman) is `podman machine` started?"
-        );
-    }
+    runtimes.retain(|rt| snapshot.allowed_cmds.iter().any(|c| c == rt));
+    runtimes
 }
 
 /// Run the B2b-3a review once (total). Returns `(outcome, synth_body)`. Fresh `CancellationToken` + `select!`
@@ -3385,30 +3420,27 @@ mod cli_tests {
             }
         }
 
-        // Parity: every line that differs between the two examples must be on the runtime/allowlist
-        // axis (or a comment) — nothing structural drifts the artifact docs + the smoke point at.
-        let only_in = |a: &str, b: &str| -> Vec<String> {
-            let bset: std::collections::HashSet<_> = b.lines().map(str::trim).collect();
-            a.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !bset.contains(l))
+        // Parity (structural, ordered): strip the ONLY permitted differences — full-line comments, the
+        // `runtime = …` lines, and the `allowed_cmds = …` line — and the remainders must be byte-identical.
+        // This catches drift a line-SET diff misses: e.g. flipping a reader to `access = "rw"` changes a
+        // structural line (an exact-remainder mismatch) even though `access = "rw"` exists elsewhere.
+        let structural = |s: &str| -> Vec<String> {
+            s.lines()
+                .map(str::trim_end)
+                .filter(|l| {
+                    let t = l.trim();
+                    !t.starts_with('#')
+                        && !t.starts_with("runtime =")
+                        && !t.starts_with("allowed_cmds =")
+                })
                 .map(String::from)
                 .collect()
         };
-        let diffs: Vec<String> = only_in(podman_src, docker_src)
-            .into_iter()
-            .chain(only_in(docker_src, podman_src))
-            .collect();
-        for line in &diffs {
-            assert!(
-                line.starts_with('#')
-                    || line.contains("runtime")
-                    || line.contains("allowed_cmds")
-                    || line.contains("podman")
-                    || line.contains("docker"),
-                "podman example diverges from docker example outside runtime/allowlist: {line:?}"
-            );
-        }
+        assert_eq!(
+            structural(podman_src),
+            structural(docker_src),
+            "podman example must equal the docker example modulo comments + runtime/allowed_cmds lines"
+        );
     }
 
     #[test]
@@ -3422,6 +3454,40 @@ mod cli_tests {
         assert_eq!(missing_runtimes(&s, &|_| false), vec!["podman".to_string()]);
         // Probe succeeds → not reported.
         assert!(missing_runtimes(&s, &|_| true).is_empty());
+    }
+
+    #[test]
+    fn preflight_only_probes_allowlisted_runtimes() {
+        // SECURITY (review BLOCKER): a sandbox runtime NOT in allowed_cmds must never reach the probe —
+        // probing would execute a config-named binary outside the allowlist. into_snapshot doesn't enforce
+        // S3 (Registry::new does), so such a config can reach preflight; runtimes_to_probe must drop it.
+        let toml = r#"
+default = "a"
+allowed_cwd_root = "/tmp"
+[server]
+addr = "127.0.0.1:8080"
+[registry]
+allowed_cmds = ["podman"]
+[[agents]]
+id = "a"
+cmd = "codex-acp"
+[agents.sandbox]
+runtime = "/tmp/evil-binary"
+image = "img"
+mount = "/tmp"
+access = "ro"
+egress = "open"
+"#;
+        let snap = config::RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+        let probe = runtimes_to_probe(&snap, None);
+        assert!(
+            !probe.iter().any(|r| r.contains("evil")),
+            "un-allowlisted runtime must NOT be probed: {probe:?}"
+        );
+        assert!(probe.is_empty(), "only allowlisted runtimes are probed");
     }
 
     #[test]

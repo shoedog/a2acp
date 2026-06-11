@@ -72,8 +72,8 @@ cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip pro
 # gate = false
 
 [registry]
-# The spawned program is `docker`; validate() requires it allowlisted (also defaults to the union of
-# entry cmds, but state it explicitly as a tightening).
+# The spawned program is `podman` (the sandbox/verify runtime); validate() requires it allowlisted (also
+# defaults to the union of entry cmds, but state it explicitly as a tightening).
 allowed_cmds = ["podman"]
 
 [server]
