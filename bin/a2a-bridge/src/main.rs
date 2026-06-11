@@ -1768,11 +1768,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .into_snapshot()
         .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
     preflight_runtimes(&snapshot, None); // warn early if a sandbox runtime isn't up (verify is implement-only)
-    // MAJOR 4 (ADR-0028): stamp --session-cwd into every entry's `session_cwd` so the ONE resolution
-    // chain (`resolve_static_session_cwd`) feeds BOTH the agent's ACP session cwd AND the codex native
-    // MCP `-c` args' `{cwd}` from the same value — prism then indexes exactly the repo the agent works
-    // in (no silent wrong-repo). Acp-kind agents read this at spawn; container_rw gets the per-turn cwd
-    // via the run context instead. run-workflow targets one repo, so stamping all entries is correct.
+                                         // MAJOR 4 (ADR-0028): stamp --session-cwd into every entry's `session_cwd` so the ONE resolution
+                                         // chain (`resolve_static_session_cwd`) feeds BOTH the agent's ACP session cwd AND the codex native
+                                         // MCP `-c` args' `{cwd}` from the same value — prism then indexes exactly the repo the agent works
+                                         // in (no silent wrong-repo). Acp-kind agents read this at spawn; container_rw gets the per-turn cwd
+                                         // via the run context instead. run-workflow targets one repo, so stamping all entries is correct.
     if let Some(ref dir) = session_cwd {
         for e in &mut snapshot.entries {
             e.session_cwd = Some(dir.clone());
@@ -3377,7 +3377,11 @@ mod cli_tests {
                     "S3: sandbox runtime {:?} must be allowlisted",
                     sb.runtime()
                 );
-                assert_eq!(sb.runtime(), "podman", "every sandbox uses the podman runtime");
+                assert_eq!(
+                    sb.runtime(),
+                    "podman",
+                    "every sandbox uses the podman runtime"
+                );
             }
         }
 
