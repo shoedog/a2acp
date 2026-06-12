@@ -4182,6 +4182,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn describe_options_reads_advertised_config_options() {
+        // The default recording agent advertises a model select + an effort select at session/new.
+        // describe_options reads them into AgentCaps WITHOUT sending a prompt or configuring anything.
+        let rec = Recorder::new("agent-sess-DESCRIBE");
+        let be = connect_recording(rec.clone()).await;
+        let caps = be
+            .describe_options(std::path::Path::new("/tmp"))
+            .await
+            .expect("describe_options succeeds");
+        assert_eq!(caps.current_model.as_deref(), Some("default"));
+        assert_eq!(
+            caps.models,
+            vec!["default", "m", "a", "b", "gpt-x", "haiku"]
+        );
+        assert_eq!(
+            caps.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(caps.modes.is_empty(), "no mode select advertised");
+        // Exactly one throwaway session/new, no prompt, no model/mode configuration.
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
+        assert!(rec.prompt_log.lock().await.is_empty(), "no prompt sent");
+        assert!(
+            rec.set_config_options.lock().await.is_empty() && rec.set_modes.lock().await.is_empty(),
+            "describe_options configures nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_options_reads_models_surface_when_no_config_options() {
+        // kiro's surface: session/new advertises NO config_options but DOES advertise the unstable
+        // `models` state. describe_options falls back to it (current + available model ids).
+        let rec = Recorder::new("agent-sess-DESCRIBE-KIRO");
+        rec.advertise_model_config.store(false, Ordering::SeqCst);
+        rec.advertise_effort_config.store(false, Ordering::SeqCst);
+        rec.advertise_models.store(true, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let caps = be
+            .describe_options(std::path::Path::new("/tmp"))
+            .await
+            .expect("describe_options succeeds");
+        assert_eq!(caps.current_model.as_deref(), Some("auto"));
+        assert_eq!(caps.models, vec!["auto", "claude-sonnet-4.5"]);
+        assert!(caps.effort_levels.is_empty() && caps.modes.is_empty());
+    }
+
+    #[tokio::test]
     async fn unadvertised_model_on_set_model_surface_fails_mint() {
         // A pinned model the `models` surface does not advertise is config drift →
         // config_invalid (fatal mint), listing the advertised ids, and NO set_model.
