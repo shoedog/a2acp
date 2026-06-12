@@ -223,6 +223,11 @@ holds only the MCP entry), built from the catalog:
    (`set_config_option`) and `effort`, both verified-working. Live probe (2026-06-12) confirmed the
    advertised sets: **codex** `read-only/auto/full-access`, **claude**
    `auto/default/acceptEdits/plan/dontAsk/bypassPermissions`. So advertising `modes` cannot mislead: a
-   card value is honored, a non-card value fails loudly at mint with the advertised list. *Optional
-   follow-up:* a single live mint with a non-default mode (a token-consuming agent turn) would add a
-   belt-and-suspenders runtime proof; not required to ship given the above.
+   card value is honored, a non-card value fails loudly at mint with the advertised list.
+
+   **Live runtime proof (2026-06-12).** Drove the real per-request override path (serve →
+   `SendMessage` with `message.metadata."a2a-bridge.mode"`) against host claude:
+   - `mode="plan"` (advertised) → task **Completed**, agent replied — set_mode accepted, mode applied.
+   - `mode="bogus-not-a-mode"` (invalid) → mint **hard-failed**: `session/set_mode rejected: Invalid Mode`.
+   The negative control confirms the bridge genuinely *sends* `session/set_mode` for the override (an
+   invalid value fails), so a valid advertised value is genuinely applied — not silently ignored.
