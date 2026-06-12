@@ -551,7 +551,13 @@ async fn cancel_backend_for(
 async fn serve_card(State(srv): State<Arc<InboundServer>>) -> Response {
     let workflow_ids: Vec<&str> = srv.workflows.keys().map(|k| k.as_str()).collect();
     let mcp = srv.registry.mcp_advertisement();
-    Json(agent_card(&srv.base_url, &workflow_ids, &mcp)).into_response()
+    Json(agent_card(
+        &srv.base_url,
+        &workflow_ids,
+        &mcp,
+        &bridge_core::catalog::ModelCatalog::new(),
+    ))
+    .into_response()
 }
 
 /// `POST /` -> the JSON-RPC dispatch surface.
