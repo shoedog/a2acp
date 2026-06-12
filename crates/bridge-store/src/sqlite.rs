@@ -40,6 +40,14 @@ impl SqliteStore {
     /// safe (it can never flip a live serve's `Working` rows).
     pub fn open(path: &std::path::Path) -> Result<Self, BridgeError> {
         use fs2::FileExt;
+        // The store path may name a not-yet-created subdir (e.g. a `[store] path` of
+        // `<config-dir>/.a2a-bridge/tasks.sqlite`); neither the lock-file open nor sqlite will
+        // create it, so `mkdir -p` the parent first or `open` fails with StoreFailure.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|_| BridgeError::StoreFailure)?;
+            }
+        }
         let lock_path = {
             let mut p = path.as_os_str().to_os_string();
             p.push(".lock");
@@ -976,6 +984,20 @@ mod tests {
         drop(_first);
         assert!(SqliteStore::open(&path).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_creates_missing_parent_dir() {
+        // A `[store] path` may name a not-yet-existing subdir (e.g. `<config-dir>/.a2a-bridge/...`).
+        // `open` must `mkdir -p` the parent rather than fail with StoreFailure.
+        let base = std::env::temp_dir().join(format!("a2a-store-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let path = base.join("nested").join("tasks.sqlite");
+        assert!(!base.exists(), "parent dir must not pre-exist");
+        let store = SqliteStore::open(&path).expect("open creates the missing parent dir");
+        assert!(path.exists(), "db file created under the freshly-made dir");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
