@@ -62,9 +62,10 @@ name = "test"
 # bare container lacks (dogfood finding). CI runs the full suite post-merge; the pre-merge verify covers
 # fmt/clippy/build + the hermetic-safe tests:
 #   --exclude bridge-container: its B2a tests spawn a real Docker daemon (no docker-in-docker here).
-#   --skip process::tests::{terminate_reaps_child_no_zombie,term_ignoring_loop_forces_group_sigkill}:
-#     the supervisor's zombie-reaping + process-group-SIGKILL tests need host PID-1/signal semantics.
-cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill"
+#   --skip process::tests::{terminate_reaps_child_no_zombie,term_ignoring_loop_forces_group_sigkill,drop_group_kills_descendants}:
+#     the supervisor's zombie-reaping + process-group-SIGKILL/drop tests need host PID-1/signal semantics
+#     and a host-visible process table (container PID namespace breaks the grandchild-visibility precondition).
+cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants"
 # opt-in coverage (instrumented recompile; reported, never gates):
 # [[verify.commands]]
 # name = "coverage"
@@ -83,6 +84,7 @@ addr = "127.0.0.1:8080"
 [[agents]]
 id  = "claude"
 cmd = "claude-agent-acp"
+model = "sonnet"   # reviewer pinned to Sonnet 4.6 (dogfood)
 [agents.sandbox]
 runtime = "podman"
 image   = "a2a-agent-reader:latest"
@@ -97,6 +99,7 @@ volumes = ["/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/
 [[agents]]
 id  = "codex"
 cmd = "codex-acp"
+model = "gpt-5.5"   # reviewer pinned (dogfood)
 [agents.sandbox]
 runtime = "podman"
 image   = "a2a-agent-reader:latest"

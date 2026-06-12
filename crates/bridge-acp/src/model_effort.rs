@@ -4,6 +4,7 @@ use agent_client_protocol::schema::{
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory as Cat,
     SessionConfigSelectOptions, SessionModelState,
 };
+use bridge_core::catalog::AgentCaps;
 use bridge_core::domain::Effort;
 
 /// Static shorthand to advertised-id map, applied before validation.
@@ -108,6 +109,12 @@ pub fn model_values(opts: &[SessionConfigOption]) -> Option<(String, String, Vec
     find_select(opts, Cat::Model, &["model"])
 }
 
+/// Returns `(config_id, current_value, values)` for the advertised mode select, if any.
+/// Mirrors `model_values` against the `Mode` category (id `"mode"`).
+pub fn mode_values(opts: &[SessionConfigOption]) -> Option<(String, String, Vec<String>)> {
+    find_select(opts, Cat::Mode, &["mode"])
+}
+
 /// Advertised model ids from the unstable `models` surface (`SessionModelState`).
 /// kiro-cli returns `config_options: None` but DOES advertise this + accepts
 /// `session/set_model`; claude 0.44.0 / codex use `config_options` instead.
@@ -135,6 +142,27 @@ pub fn effort_opt(opts: &[SessionConfigOption]) -> Option<AdvertisedEffort> {
                 .collect(),
         },
     )
+}
+
+/// Map advertised ACP `configOptions` (claude/codex) -> AgentCaps. effort_opt already
+/// filters out the "default" pseudo-level (see effort_opt at model_effort.rs:128).
+pub fn caps_from_config_options(opts: &[SessionConfigOption]) -> AgentCaps {
+    let (current_model, models) = match model_values(opts) {
+        Some((_, current, values)) => (Some(current), values),
+        None => (None, Vec::new()),
+    };
+    let effort_levels = effort_opt(opts).map(|e| e.levels).unwrap_or_default();
+    let (current_mode, modes) = match mode_values(opts) {
+        Some((_, current, values)) => (Some(current), values),
+        None => (None, Vec::new()),
+    };
+    AgentCaps {
+        current_model,
+        models,
+        effort_levels,
+        modes,
+        current_mode,
+    }
 }
 
 pub const EFFORT_ORDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -460,6 +488,24 @@ mod tests {
     }
 
     #[test]
+    fn mode_values_reads_mode_select() {
+        let opts = [select_opt(
+            "mode",
+            Some(Cat::Mode),
+            "default",
+            &["default", "plan"],
+        )];
+        assert_eq!(
+            mode_values(&opts),
+            Some((
+                "mode".into(),
+                "default".into(),
+                strings(&["default", "plan"])
+            ))
+        );
+    }
+
+    #[test]
     fn effort_opt_reads_thought_level_and_filters_default() {
         let opts = [select_opt(
             "reasoning_effort",
@@ -474,6 +520,31 @@ mod tests {
                 levels: strings(&["low", "medium", "high", "xhigh"])
             })
         );
+    }
+
+    #[test]
+    fn caps_from_config_options_maps_all_three() {
+        let opts = vec![
+            select_opt(
+                "model",
+                Some(Cat::Model),
+                "sonnet",
+                &["default", "sonnet", "haiku"],
+            ),
+            select_opt(
+                "reasoning_effort",
+                Some(Cat::ThoughtLevel),
+                "high",
+                &["low", "medium", "high"],
+            ),
+            select_opt("mode", Some(Cat::Mode), "default", &["default", "plan"]),
+        ];
+        let caps = caps_from_config_options(&opts);
+        assert_eq!(caps.current_model.as_deref(), Some("sonnet"));
+        assert_eq!(caps.models, vec!["default", "sonnet", "haiku"]);
+        assert_eq!(caps.effort_levels, vec!["low", "medium", "high"]);
+        assert_eq!(caps.modes, vec!["default", "plan"]);
+        assert_eq!(caps.current_mode.as_deref(), Some("default"));
     }
 
     #[test]

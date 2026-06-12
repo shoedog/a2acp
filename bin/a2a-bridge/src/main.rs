@@ -25,6 +25,7 @@
 //   a2a-bridge task watch <id> [--from <seq>] [--url <url>]
 //                                                        — stream a task's progress (SSE)
 
+mod catalog_probe;
 mod config;
 mod containers;
 mod implement;
@@ -89,6 +90,7 @@ USAGE:
 SUBCOMMANDS:
   run-workflow <id>   Run a workflow against a repo (design | code-review | spec-review | plan-review | …).
                       --input <file> --session-cwd <repo> [--config <f>] [--out <f>]
+  models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
   implement <task>    Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
@@ -1924,6 +1926,127 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
 }
 
 // ---------------------------------------------------------------------------
+// `models` subcommand — list each agent's advertised models/effort/modes (probed live)
+// ---------------------------------------------------------------------------
+
+const MODELS_USAGE: &str = "\
+usage: a2a-bridge models [--config <path>] [--agent <id>] [--json]
+  List each configured agent's advertised models (+ effort levels + modes), probed live host-side.
+  Pass one of these to the per-request override (message.metadata a2a-bridge.{model,effort,mode}).
+  --config <path>  registry config (default: ./a2a-bridge.toml)
+  --agent <id>     show only this agent
+  --json           emit JSON (same shape as the card's agent-models extension params.agents)";
+
+struct ModelsArgs {
+    config: Option<String>,
+    agent: Option<String>,
+    json: bool,
+}
+
+fn parse_models_args(args: &[String]) -> Result<ModelsArgs, BoxError> {
+    let mut config: Option<String> = None;
+    let mut agent: Option<String> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--config" => {
+                config = Some(
+                    iter.next()
+                        .ok_or("models: --config requires a value")?
+                        .clone(),
+                );
+            }
+            "--agent" => {
+                agent = Some(
+                    iter.next()
+                        .ok_or("models: --agent requires a value")?
+                        .clone(),
+                );
+            }
+            "--json" => json = true,
+            other => {
+                return Err(format!("models: unknown flag {other:?}\n{MODELS_USAGE}").into());
+            }
+        }
+    }
+    Ok(ModelsArgs {
+        config,
+        agent,
+        json,
+    })
+}
+
+/// The catalog as the card's `params.agents` JSON object (each value via the shared `caps_to_json`).
+fn catalog_to_json(catalog: &bridge_core::catalog::ModelCatalog) -> serde_json::Value {
+    let agents: serde_json::Map<String, serde_json::Value> = catalog
+        .iter()
+        .map(|(id, caps)| (id.clone(), bridge_core::catalog::caps_to_json(caps)))
+        .collect();
+    serde_json::Value::Object(agents)
+}
+
+async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{MODELS_USAGE}");
+        return Ok(());
+    }
+    bridge_observ::init();
+    let parsed = parse_models_args(args)?;
+    let config_path = parsed
+        .config
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("models: cannot read config {:?}: {e}", config_path))?;
+    let cfg = config::RegistryConfig::parse(&raw)
+        .map_err(|e| format!("models: config parse error: {e}"))?;
+    let snapshot = cfg
+        .into_snapshot()
+        .map_err(|e| format!("models: registry snapshot error: {e}"))?;
+    // (id, entry) pairs, optionally filtered to one agent. Probing is on-demand (separate process from
+    // serve, so always live) and degrades per-agent.
+    let entries: Vec<(String, AgentEntry)> = snapshot
+        .entries
+        .iter()
+        .map(|e| (e.id.as_str().to_string(), e.clone()))
+        .filter(|(id, _)| parsed.agent.as_ref().is_none_or(|want| want == id))
+        .collect();
+    if entries.is_empty() {
+        if let Some(want) = &parsed.agent {
+            return Err(format!("models: no agent {want:?} in {config_path:?}").into());
+        }
+        return Err(format!("models: no agents configured in {config_path:?}").into());
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let catalog = catalog_probe::probe_all(&entries, &cwd).await;
+    if parsed.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&catalog_to_json(&catalog))?
+        );
+    } else {
+        for (id, _) in &entries {
+            match catalog.get(id) {
+                Some(caps) => {
+                    let current = caps.current_model.as_deref().unwrap_or("?");
+                    println!("{id}: {}  (current: {current})", caps.models.join(", "));
+                    if !caps.effort_levels.is_empty() {
+                        println!("    effort: {}", caps.effort_levels.join(", "));
+                    }
+                    if !caps.modes.is_empty() {
+                        println!("    modes:  {}", caps.modes.join(", "));
+                    }
+                }
+                None => println!("{id}: unavailable (probe failed — see logs)"),
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // A2A client helpers: submit + task get/list/cancel
 // ---------------------------------------------------------------------------
 
@@ -2654,6 +2777,7 @@ async fn main() -> Result<(), BoxError> {
     let raw_args: Vec<String> = std::env::args().collect();
     match raw_args.get(1).map(|s| s.as_str()) {
         Some("run-workflow") => return run_workflow_cmd(&raw_args[2..]).await,
+        Some("models") => return models_cmd(&raw_args[2..]).await,
         Some("implement") => return implement_cmd(&raw_args[2..]).await,
         Some("merge") => return merge::merge_cmd(&raw_args[2..]).await,
         Some("containers") => return containers_cmd(&raw_args[2..]),
@@ -2670,7 +2794,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         Some(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | implement | merge | containers | submit | task | init | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | models | implement | merge | containers | submit | task | init | help)"
             )
             .into());
         }
@@ -2836,6 +2960,13 @@ async fn main() -> Result<(), BoxError> {
         .find(|e| e.id == snapshot.default)
         .and_then(|e| e.name.clone())
         .unwrap_or_else(|| snapshot.default.as_str().to_string());
+    // advertise-models: capture (id, entry) pairs BEFORE the snapshot moves into `Registry::new`, so the
+    // startup probe + SIGHUP re-probe can build the model catalog host-side (sandbox-independent; spec §2).
+    let probe_entries: Vec<(String, AgentEntry)> = snapshot
+        .entries
+        .iter()
+        .map(|e| (e.id.as_str().to_string(), e.clone()))
+        .collect();
     // Registry::new VALIDATES the snapshot → boot fails loud on bad config (spec §7).
     let registry = Arc::new(Registry::new(snapshot, spawn)?);
 
@@ -2932,6 +3063,15 @@ async fn main() -> Result<(), BoxError> {
             None => std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
         };
 
+    // 7b. advertise-models: probe each agent's advertised model/effort/mode catalog HOST-SIDE before the
+    //     first card is served (bounded + degrade-per-agent; spec §5). Held behind an `ArcSwap` the card
+    //     reads lock-free; a `SIGHUP` handler (below) re-probes and atomically swaps it. The advertised
+    //     list is account/adapter-driven and sandbox-independent, so this never spins a container.
+    let probe_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let model_catalog = Arc::new(arc_swap::ArcSwap::from_pointee(
+        catalog_probe::probe_all(&probe_entries, &probe_cwd).await,
+    ));
+
     // 8. Construct the inbound server.
     //    InboundServer::new(registry, store, policy, route, auth, base_url, delegation, local_source_label)
     // The inbound server holds the agent registry (3b): first-message LOCAL dispatch
@@ -2950,8 +3090,33 @@ async fn main() -> Result<(), BoxError> {
         )
         .with_workflows(executor, wf_map.clone())
         .with_task_store(task_store)
-        .with_allowed_cwd_root(cfg.allowed_cwd_root.clone()),
+        .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
+        .with_model_catalog(Arc::clone(&model_catalog)),
     );
+
+    // 8a. SIGHUP → re-probe the model catalog and atomically swap it (no background timer; owner decision).
+    //     The card path reads the new catalog on its next request; in-flight requests are never dropped.
+    {
+        let sighup_catalog = Arc::clone(&model_catalog);
+        let sighup_entries = probe_entries.clone();
+        let sighup_cwd = probe_cwd.clone();
+        tokio::spawn(async move {
+            let mut hup = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    tracing::warn!(error = %e, "SIGHUP handler unavailable; model catalog will not hot-refresh");
+                    return;
+                }
+            };
+            while hup.recv().await.is_some() {
+                tracing::info!("SIGHUP: re-probing model catalog");
+                let fresh = catalog_probe::probe_all(&sighup_entries, &sighup_cwd).await;
+                sighup_catalog.store(Arc::new(fresh));
+            }
+        });
+    }
 
     // 8b. Resume in-flight detached workflows from their checkpoints BEFORE accepting
     //     new requests. Boot order: open store → build server → resume → bind listener.
@@ -3707,6 +3872,36 @@ cmd = "true"
             .collect();
         let (_id, _input, _out, _cfg, scwd) = super::parse_run_workflow_args(&args).unwrap();
         assert!(scwd.is_none());
+    }
+
+    // ---- T10: `models` subcommand arg-parsing ----
+
+    #[test]
+    fn parse_models_args_flags() {
+        let args: Vec<String> = ["--agent", "codex", "--json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = super::parse_models_args(&args).unwrap();
+        assert_eq!(parsed.agent.as_deref(), Some("codex"));
+        assert!(parsed.json && parsed.config.is_none());
+    }
+
+    #[test]
+    fn parse_models_args_config_and_defaults() {
+        let args: Vec<String> = ["--config", "x.toml"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = super::parse_models_args(&args).unwrap();
+        assert_eq!(parsed.config.as_deref(), Some("x.toml"));
+        assert!(!parsed.json && parsed.agent.is_none());
+    }
+
+    #[test]
+    fn parse_models_args_rejects_unknown_flag() {
+        let args = vec!["--bogus".to_string()];
+        assert!(super::parse_models_args(&args).is_err());
     }
 
     #[test]

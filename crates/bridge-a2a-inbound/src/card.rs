@@ -29,6 +29,7 @@ pub fn agent_card(
     base_url: &str,
     workflow_ids: &[&str],
     mcp_servers: &[(String, Vec<String>)],
+    catalog: &bridge_core::catalog::ModelCatalog,
 ) -> AgentCard {
     let code_skill = AgentSkill {
         id: "code".to_string(),
@@ -118,6 +119,34 @@ pub fn agent_card(
         }])
     };
 
+    // agent-models extension: per-agent override matrix from the live catalog. The per-agent object
+    // (empty effort/modes omitted) is built by the shared `caps_to_json` the CLI also uses (DRY).
+    let mut ext_vec = extensions.unwrap_or_default();
+    if !catalog.is_empty() {
+        let agents: serde_json::Map<String, serde_json::Value> = catalog
+            .iter()
+            .map(|(id, c)| (id.clone(), bridge_core::catalog::caps_to_json(c)))
+            .collect();
+        let mut params = std::collections::HashMap::new();
+        params.insert("agents".to_string(), serde_json::Value::Object(agents));
+        ext_vec.push(AgentExtension {
+            uri: "https://github.com/shoedog/a2acp/ext/agent-models/v1".to_string(),
+            description: Some(
+                "Per-agent model/effort/mode override matrix. To override a default, send \
+            message.metadata `a2a-bridge.model` / `a2a-bridge.effort` / `a2a-bridge.mode` targeting \
+            that agent."
+                    .to_string(),
+            ),
+            required: Some(false),
+            params: Some(params),
+        });
+    }
+    let extensions = if ext_vec.is_empty() {
+        None
+    } else {
+        Some(ext_vec)
+    };
+
     AgentCard {
         name: "a2a-bridge".to_string(),
         description: "A2A↔ACP bridge that routes agent tasks to the configured local \
@@ -163,7 +192,12 @@ mod tests {
 
     #[test]
     fn card_has_two_skills_and_pinned_version() {
-        let c = agent_card("http://localhost:8080", &[], &[]);
+        let c = agent_card(
+            "http://localhost:8080",
+            &[],
+            &[],
+            &bridge_core::catalog::ModelCatalog::new(),
+        );
         // Updated for Task 5a: three skills now (code, delegate, fan-out).
         assert!(c.skills.len() >= 2);
         assert!(c.skills.iter().any(|s| s.id == "code"));
@@ -191,7 +225,12 @@ mod tests {
 
     #[test]
     fn card_advertises_two_skills() {
-        let c = agent_card("http://localhost:8080", &[], &[]);
+        let c = agent_card(
+            "http://localhost:8080",
+            &[],
+            &[],
+            &bridge_core::catalog::ModelCatalog::new(),
+        );
         // Updated for Task 5a: three skills now.
         assert!(c.skills.len() >= 2);
         assert!(c.skills.iter().any(|s| s.id == "delegate"));
@@ -202,7 +241,12 @@ mod tests {
 
     #[test]
     fn card_has_three_skills_incl_fanout() {
-        let c = agent_card("http://x", &[], &[]);
+        let c = agent_card(
+            "http://x",
+            &[],
+            &[],
+            &bridge_core::catalog::ModelCatalog::new(),
+        );
         assert_eq!(c.skills.len(), 3);
         assert!(c.skills.iter().any(|s| s.id == "fan-out"));
     }
@@ -212,7 +256,12 @@ mod tests {
     #[test]
     fn card_appends_one_skill_per_workflow_id() {
         let ids = ["code-review", "triage"];
-        let c = agent_card("http://x", &ids, &[]);
+        let c = agent_card(
+            "http://x",
+            &ids,
+            &[],
+            &bridge_core::catalog::ModelCatalog::new(),
+        );
         // 3 fixed skills + one per workflow id.
         assert_eq!(c.skills.len(), 3 + ids.len());
         let wf = c.skills.iter().find(|s| s.id == "code-review").unwrap();
@@ -225,7 +274,12 @@ mod tests {
 
     #[test]
     fn agent_card_marks_workflow_skills_detached() {
-        let card = agent_card("http://x", &["code-review"], &[]);
+        let card = agent_card(
+            "http://x",
+            &["code-review"],
+            &[],
+            &bridge_core::catalog::ModelCatalog::new(),
+        );
         let skill = card
             .skills
             .iter()
@@ -238,7 +292,12 @@ mod tests {
 
     #[test]
     fn base_skills_are_not_marked_detached() {
-        let card = agent_card("http://x", &["code-review"], &[]);
+        let card = agent_card(
+            "http://x",
+            &["code-review"],
+            &[],
+            &bridge_core::catalog::ModelCatalog::new(),
+        );
         for id in &["code", "delegate", "fan-out"] {
             let skill = card.skills.iter().find(|s| s.id == *id).unwrap();
             let marked = skill.tags.iter().any(|x| x == "detached")
@@ -255,7 +314,12 @@ mod tests {
             ("claude".to_string(), vec!["prism".to_string()]),
             ("codex".to_string(), vec!["prism".to_string()]),
         ];
-        let c = agent_card("http://x", &[], &mcp);
+        let c = agent_card(
+            "http://x",
+            &[],
+            &mcp,
+            &bridge_core::catalog::ModelCatalog::new(),
+        );
         let exts = c
             .capabilities
             .extensions
@@ -273,7 +337,69 @@ mod tests {
 
     #[test]
     fn card_has_no_extension_without_mcp() {
-        let c = agent_card("http://x", &["code-review"], &[]);
+        let c = agent_card(
+            "http://x",
+            &["code-review"],
+            &[],
+            &bridge_core::catalog::ModelCatalog::new(),
+        );
         assert!(c.capabilities.extensions.is_none());
+    }
+
+    #[test]
+    fn card_advertises_agent_models_extension() {
+        use bridge_core::catalog::{AgentCaps, ModelCatalog};
+        let mut cat = ModelCatalog::new();
+        cat.insert(
+            "claude".into(),
+            AgentCaps {
+                current_model: Some("sonnet".into()),
+                models: vec!["default".into(), "sonnet".into(), "haiku".into()],
+                effort_levels: vec!["low".into(), "high".into()],
+                modes: vec![],
+                current_mode: None,
+            },
+        );
+        let c = agent_card("http://x", &[], &[], &cat);
+        let exts = c.capabilities.extensions.expect("extensions");
+        let ext = exts
+            .iter()
+            .find(|e| e.uri.contains("agent-models"))
+            .expect("agent-models ext");
+        let agents = ext
+            .params
+            .as_ref()
+            .and_then(|p| p.get("agents"))
+            .expect("params.agents");
+        assert_eq!(agents["claude"]["current"], serde_json::json!("sonnet"));
+        assert_eq!(
+            agents["claude"]["models"],
+            serde_json::json!(["default", "sonnet", "haiku"])
+        );
+        assert_eq!(
+            agents["claude"]["effort"],
+            serde_json::json!(["low", "high"])
+        );
+        assert!(
+            agents["claude"].get("modes").is_none(),
+            "empty modes omitted"
+        );
+    }
+
+    #[test]
+    fn card_has_no_agent_models_ext_when_catalog_empty() {
+        let c = agent_card(
+            "http://x",
+            &[],
+            &[],
+            &bridge_core::catalog::ModelCatalog::new(),
+        );
+        let has = c
+            .capabilities
+            .extensions
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e.uri.contains("agent-models"));
+        assert!(!has);
     }
 }

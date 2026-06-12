@@ -72,6 +72,19 @@ a2a-bridge init --agents codex,claude   # scaffold ./a2a-bridge.toml + prompts
 a2a-bridge serve --config ./a2a-bridge.toml
 ```
 
+`serve` advertises each agent's available models/effort/modes on the Agent Card
+(`agent-models` extension, probed at startup + refreshed on `SIGHUP`).
+
+## 4b. Discover model/effort/mode values
+
+```bash
+a2a-bridge models --config ./a2a-bridge.toml            # table: each agent's advertised models/effort/modes
+a2a-bridge models --config … --agent codex --json       # one agent, JSON (card's agent-models shape)
+```
+
+Probes live, degrades per-agent. Pass any listed value to the per-request override
+(`message.metadata` `a2a-bridge.{model,effort,mode}`) or an agent's config default.
+
 ## 5. Inspect / clean up containers
 
 ```bash

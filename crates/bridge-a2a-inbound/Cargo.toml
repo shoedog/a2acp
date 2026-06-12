@@ -17,6 +17,7 @@ tokio-util = { workspace = true }
 tokio-stream.workspace = true
 async-stream.workspace = true
 futures.workspace = true
+arc-swap.workspace = true
 axum.workspace = true
 tower.workspace = true
 a2a.workspace = true
