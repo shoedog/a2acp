@@ -186,6 +186,11 @@ pub struct InboundServer {
             std::collections::HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>,
         >,
     >,
+    /// Live per-agent model catalog (advertise-models). Probed host-side at `serve` startup and on
+    /// `SIGHUP`; [`serve_card`] reads it lock-free via `ArcSwap` so the card path never probes. Default
+    /// empty → the card omits the `agent-models` extension (same as a fully-failed probe). Wired from
+    /// `main`'s startup probe via [`InboundServer::with_model_catalog`].
+    pub model_catalog: Arc<arc_swap::ArcSwap<bridge_core::catalog::ModelCatalog>>,
 }
 
 impl InboundServer {
@@ -219,6 +224,9 @@ impl InboundServer {
             task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
             allowed_cwd_root: None,
             progress_hubs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            model_catalog: Arc::new(arc_swap::ArcSwap::from_pointee(
+                bridge_core::catalog::ModelCatalog::new(),
+            )),
         }
     }
 
@@ -257,6 +265,18 @@ impl InboundServer {
     #[must_use]
     pub fn with_allowed_cwd_root(mut self, root: Option<String>) -> Self {
         self.allowed_cwd_root = root;
+        self
+    }
+
+    /// Attach the live model catalog handle (advertise-models). Builder over [`InboundServer::new`];
+    /// `main` probes all agents at startup, wraps the result in an `ArcSwap`, and threads it here so the
+    /// card reads the current catalog and a `SIGHUP` re-probe can atomically swap it.
+    #[must_use]
+    pub fn with_model_catalog(
+        mut self,
+        catalog: Arc<arc_swap::ArcSwap<bridge_core::catalog::ModelCatalog>>,
+    ) -> Self {
+        self.model_catalog = catalog;
         self
     }
 
@@ -551,13 +571,8 @@ async fn cancel_backend_for(
 async fn serve_card(State(srv): State<Arc<InboundServer>>) -> Response {
     let workflow_ids: Vec<&str> = srv.workflows.keys().map(|k| k.as_str()).collect();
     let mcp = srv.registry.mcp_advertisement();
-    Json(agent_card(
-        &srv.base_url,
-        &workflow_ids,
-        &mcp,
-        &bridge_core::catalog::ModelCatalog::new(),
-    ))
-    .into_response()
+    let catalog = srv.model_catalog.load();
+    Json(agent_card(&srv.base_url, &workflow_ids, &mcp, &catalog)).into_response()
 }
 
 /// `POST /` -> the JSON-RPC dispatch surface.

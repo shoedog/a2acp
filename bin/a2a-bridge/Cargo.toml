@@ -30,6 +30,7 @@ tracing.workspace = true
 notify = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+arc-swap = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde_json = { workspace = true }
 a2a = { package = "a2a-lf", version = "=0.3.0" }

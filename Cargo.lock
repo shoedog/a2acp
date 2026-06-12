@@ -7,6 +7,7 @@ name = "a2a-bridge"
 version = "0.1.0"
 dependencies = [
  "a2a-lf",
+ "arc-swap",
  "async-trait",
  "axum",
  "bridge-a2a-inbound",
@@ -374,6 +375,7 @@ name = "bridge-a2a-inbound"
 version = "0.1.0"
 dependencies = [
  "a2a-lf",
+ "arc-swap",
  "async-stream",
  "async-trait",
  "axum",

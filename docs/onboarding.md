@@ -64,6 +64,14 @@ All three are OPTIONAL and applied per session. Model and effort are
 **capability-driven**: at session start the bridge reads the config options the
 agent advertises, then sets the requested value via `session/set_config_option`.
 
+**Discover the valid values without guessing.** `a2a-bridge models [--config <f>]
+[--agent <id>] [--json]` probes each configured agent live and prints its
+advertised models (+ effort levels + modes), so you know exactly what to put in a
+config or a per-request override. The same matrix rides the Agent Card as the
+`agent-models` extension (`capabilities.extensions[].params.agents`), probed at
+`serve` startup and refreshed on `SIGHUP` — a remote A2A orchestrator can read it
+to pick a valid override with no out-of-band knowledge.
+
 | knob     | how it's applied                              | caveat |
 |----------|-----------------------------------------------|--------|
 | `model`  | set on the agent's advertised surface | **VALIDATED at mint** — pinning a value the agent does not advertise hard-fails the session (the error lists the advertised values). claude 0.44.0 / codex advertise it via `session/set_config_option(category="model")`; **kiro** via the unstable `models` surface + `session/set_model` (ids `auto`/`claude-sonnet-4.5`/…). Aliases resolve first (`fable`→`claude-fable-5[1m]`, `opus`→`default`). claude's served model shows in claude's own transcript, not the bridge's. |
