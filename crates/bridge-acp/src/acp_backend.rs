@@ -32,8 +32,9 @@ use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::model_effort::{
-    effort_opt, is_unsupported_effort_error, model_state_values, model_values, resolve_effort,
-    resolve_model, resolved_log_line, EffortDecision, ModelDecision, EFFORT_ORDER,
+    caps_from_config_options, effort_opt, is_unsupported_effort_error, model_state_values,
+    model_values, resolve_effort, resolve_model, resolved_log_line, EffortDecision, ModelDecision,
+    EFFORT_ORDER,
 };
 use bridge_core::domain::{PermissionDecision, PermissionRequest, SessionContext, SessionSpec};
 use bridge_core::error::BridgeError;
@@ -1376,6 +1377,51 @@ impl AcpBackend {
         let backend = Self::connect(transport, config).await?;
         *backend.supervised.lock().expect("supervised lock") = Some(supervised);
         Ok(backend)
+    }
+
+    /// Discovery seam: mint a THROWAWAY `session/new`, read the advertised model/effort/mode
+    /// options the agent returns, map them to an [`AgentCaps`](bridge_core::catalog::AgentCaps),
+    /// and return — **no prompt is sent and nothing is configured**. This reads the SAME
+    /// `config_options`/`models` the lazy mint ([`Self::ensure_session`]) reads at its step (1),
+    /// BEFORE any model/mode/effort resolution.
+    ///
+    /// `cwd` is any readable directory: `session/new` requires one (ACP §11A) but discovery reads
+    /// nothing from it. The minted session is intentionally NOT registered in `self.sessions` (it
+    /// is throwaway), so there is no `forget_session` to call. Teardown is the CALLER's: the host
+    /// model-catalog probe ([`crate::catalog_probe`] in the bin) builds a one-shot backend per
+    /// agent and drops it, which SIGKILLs the `Supervised` child (`kill_on_drop`) and reaps any
+    /// `:ro` container (the [`Drop`] impl). The advertised list is account/adapter-driven and
+    /// sandbox-independent, so the probe builds this backend host-side (sandbox stripped).
+    pub async fn describe_options(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Result<bridge_core::catalog::AgentCaps, BridgeError> {
+        let cx = self.cx()?;
+        // session/new with NO MCP servers — discovery configures nothing.
+        let req = Self::new_session_request(cwd.to_path_buf(), &[]);
+        let resp = cx
+            .send_request(req)
+            .block_task()
+            .await
+            .inspect_err(|e| tracing::warn!(error = ?e, "session/new (describe_options) failed"))
+            .map_err(|e| {
+                BridgeError::agent_crashed(format!("session/new (describe_options) failed: {e}"))
+            })?;
+        let opts0 = resp.config_options.unwrap_or_default();
+        // claude/codex advertise via `config_options`; kiro advertises via the unstable `models`
+        // surface (SessionModelState) and returns `config_options: None`.
+        let caps = if !opts0.is_empty() {
+            caps_from_config_options(&opts0)
+        } else if let Some(state) = resp.models {
+            bridge_core::catalog::AgentCaps {
+                current_model: Some(state.current_model_id.0.to_string()),
+                models: model_state_values(&state),
+                ..Default::default()
+            }
+        } else {
+            bridge_core::catalog::AgentCaps::default()
+        };
+        Ok(caps)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
