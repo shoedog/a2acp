@@ -119,28 +119,13 @@ pub fn agent_card(
         }])
     };
 
-    // agent-models extension: per-agent override matrix from the live catalog (omit empty keys).
+    // agent-models extension: per-agent override matrix from the live catalog. The per-agent object
+    // (empty effort/modes omitted) is built by the shared `caps_to_json` the CLI also uses (DRY).
     let mut ext_vec = extensions.unwrap_or_default();
     if !catalog.is_empty() {
         let agents: serde_json::Map<String, serde_json::Value> = catalog
             .iter()
-            .map(|(id, c)| {
-                let mut o = serde_json::Map::new();
-                if let Some(m) = &c.current_model {
-                    o.insert("current".into(), serde_json::json!(m));
-                }
-                o.insert("models".into(), serde_json::json!(c.models));
-                if !c.effort_levels.is_empty() {
-                    o.insert("effort".into(), serde_json::json!(c.effort_levels));
-                }
-                if !c.modes.is_empty() {
-                    o.insert("modes".into(), serde_json::json!(c.modes));
-                }
-                if let Some(m) = &c.current_mode {
-                    o.insert("current_mode".into(), serde_json::json!(m));
-                }
-                (id.clone(), serde_json::Value::Object(o))
-            })
+            .map(|(id, c)| (id.clone(), bridge_core::catalog::caps_to_json(c)))
             .collect();
         let mut params = std::collections::HashMap::new();
         params.insert("agents".to_string(), serde_json::Value::Object(agents));

@@ -42,6 +42,27 @@ pub fn parse_kiro_list_models(stdout: &str) -> AgentCaps {
     caps
 }
 
+/// The per-agent JSON object the Agent Card extension AND the `a2a-bridge models --json` CLI both
+/// emit (DRY). `current`/`models`/`current_mode` ride through; empty `effort`/`modes` keys are OMITTED
+/// (no `"effort":[]` noise for kiro/api). Renderers wrap a map of these under `params.agents`.
+pub fn caps_to_json(caps: &AgentCaps) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    if let Some(model) = &caps.current_model {
+        object.insert("current".into(), serde_json::json!(model));
+    }
+    object.insert("models".into(), serde_json::json!(caps.models));
+    if !caps.effort_levels.is_empty() {
+        object.insert("effort".into(), serde_json::json!(caps.effort_levels));
+    }
+    if !caps.modes.is_empty() {
+        object.insert("modes".into(), serde_json::json!(caps.modes));
+    }
+    if let Some(mode) = &caps.current_mode {
+        object.insert("current_mode".into(), serde_json::json!(mode));
+    }
+    serde_json::Value::Object(object)
+}
+
 /// Parse an OpenAI-compatible `GET /v1/models` body -> model ids (in `data[].id` order).
 pub fn parse_ollama_models(body: &str) -> Result<AgentCaps, serde_json::Error> {
     #[derive(serde::Deserialize)]
@@ -95,5 +116,36 @@ mod tests {
     #[test]
     fn ollama_models_rejects_garbage() {
         assert!(parse_ollama_models("not json").is_err());
+    }
+
+    #[test]
+    fn caps_to_json_emits_present_keys_and_omits_empty() {
+        let caps = AgentCaps {
+            current_model: Some("sonnet".into()),
+            models: vec!["default".into(), "sonnet".into()],
+            effort_levels: vec!["low".into(), "high".into()],
+            modes: vec![],
+            current_mode: None,
+        };
+        let value = caps_to_json(&caps);
+        assert_eq!(value["current"], serde_json::json!("sonnet"));
+        assert_eq!(value["models"], serde_json::json!(["default", "sonnet"]));
+        assert_eq!(value["effort"], serde_json::json!(["low", "high"]));
+        assert!(value.get("modes").is_none(), "empty modes omitted");
+        assert!(value.get("current_mode").is_none(), "absent current_mode omitted");
+    }
+
+    #[test]
+    fn caps_to_json_omits_effort_for_kiro_like_caps() {
+        // kiro/api advertise models only — no effort, no modes, no current_mode keys.
+        let caps = AgentCaps {
+            current_model: Some("auto".into()),
+            models: vec!["auto".into(), "glm-5".into()],
+            ..Default::default()
+        };
+        let value = caps_to_json(&caps);
+        assert!(value.get("effort").is_none());
+        assert!(value.get("modes").is_none());
+        assert_eq!(value["models"], serde_json::json!(["auto", "glm-5"]));
     }
 }
