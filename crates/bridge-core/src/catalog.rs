@@ -132,7 +132,10 @@ mod tests {
         assert_eq!(value["models"], serde_json::json!(["default", "sonnet"]));
         assert_eq!(value["effort"], serde_json::json!(["low", "high"]));
         assert!(value.get("modes").is_none(), "empty modes omitted");
-        assert!(value.get("current_mode").is_none(), "absent current_mode omitted");
+        assert!(
+            value.get("current_mode").is_none(),
+            "absent current_mode omitted"
+        );
     }
 
     #[test]

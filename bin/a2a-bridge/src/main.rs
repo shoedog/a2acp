@@ -1951,10 +1951,18 @@ fn parse_models_args(args: &[String]) -> Result<ModelsArgs, BoxError> {
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--config" => {
-                config = Some(iter.next().ok_or("models: --config requires a value")?.clone());
+                config = Some(
+                    iter.next()
+                        .ok_or("models: --config requires a value")?
+                        .clone(),
+                );
             }
             "--agent" => {
-                agent = Some(iter.next().ok_or("models: --agent requires a value")?.clone());
+                agent = Some(
+                    iter.next()
+                        .ok_or("models: --agent requires a value")?
+                        .clone(),
+                );
             }
             "--json" => json = true,
             other => {
@@ -2014,7 +2022,10 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
     let catalog = catalog_probe::probe_all(&entries, &cwd).await;
     if parsed.json {
-        println!("{}", serde_json::to_string_pretty(&catalog_to_json(&catalog))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&catalog_to_json(&catalog))?
+        );
     } else {
         for (id, _) in &entries {
             match catalog.get(id) {
@@ -3090,14 +3101,15 @@ async fn main() -> Result<(), BoxError> {
         let sighup_entries = probe_entries.clone();
         let sighup_cwd = probe_cwd.clone();
         tokio::spawn(async move {
-            let mut hup =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "SIGHUP handler unavailable; model catalog will not hot-refresh");
-                        return;
-                    }
-                };
+            let mut hup = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    tracing::warn!(error = %e, "SIGHUP handler unavailable; model catalog will not hot-refresh");
+                    return;
+                }
+            };
             while hup.recv().await.is_some() {
                 tracing::info!("SIGHUP: re-probing model catalog");
                 let fresh = catalog_probe::probe_all(&sighup_entries, &sighup_cwd).await;

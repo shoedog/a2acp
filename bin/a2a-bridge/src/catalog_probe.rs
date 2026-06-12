@@ -78,7 +78,9 @@ async fn probe_kiro(entry: &AgentEntry) -> Result<AgentCaps, String> {
     if !out.status.success() {
         return Err(format!("{cmd} exited {:?}", out.status.code()));
     }
-    Ok(parse_kiro_list_models(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_kiro_list_models(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
 }
 
 /// api (ollama) list: OpenAI `GET {base_url}/models`. `base_url` already ends in `/v1` per the example
@@ -198,7 +200,11 @@ mod tests {
         );
         // kiro routes to the native list by cmd basename (even with a full path).
         assert_eq!(
-            probe_strategy(&entry("kiro", Some("/usr/local/bin/kiro-cli"), AgentKind::Acp)),
+            probe_strategy(&entry(
+                "kiro",
+                Some("/usr/local/bin/kiro-cli"),
+                AgentKind::Acp
+            )),
             Strategy::Kiro
         );
         // claude/codex (and any other acp cmd) → host ACP describe.
