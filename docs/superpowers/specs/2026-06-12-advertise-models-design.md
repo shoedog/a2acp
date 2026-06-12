@@ -213,3 +213,16 @@ holds only the MCP entry), built from the catalog:
    (mint with a mode, confirm it takes) before advertising the `mode` select. **If mode override is not
    honored at runtime, ship models + effort only and drop `modes` from the extension** — advertising an
    override the bridge won't honor would mislead consumers. (Models + effort are both verified-working.)
+
+   **RESOLVED 2026-06-12 — KEEP `modes`.** The "hard-fails" behavior was always *invalid*-mode-only:
+   `ensure_session` applies a configured mode via `session/set_mode`, which fails the mint *only* when the
+   agent rejects an **unadvertised** id (see `docs/onboarding.md`). The advertised `modes` are read straight
+   from each agent's own `mode` config select, so any value a consumer picks from the card is — by
+   construction — one the agent advertised, and the mint applies it (with the mint as the loud backstop for
+   a typo). This is the identical capability-driven advertise-then-apply path as `model`
+   (`set_config_option`) and `effort`, both verified-working. Live probe (2026-06-12) confirmed the
+   advertised sets: **codex** `read-only/auto/full-access`, **claude**
+   `auto/default/acceptEdits/plan/dontAsk/bypassPermissions`. So advertising `modes` cannot mislead: a
+   card value is honored, a non-card value fails loudly at mint with the advertised list. *Optional
+   follow-up:* a single live mint with a non-default mode (a token-consuming agent turn) would add a
+   belt-and-suspenders runtime proof; not required to ship given the above.
