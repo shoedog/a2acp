@@ -15,15 +15,27 @@ pub enum Verdict {
 
 /// Adaptive-depth tier. `thorough` is deferred (see the spec) — this slice has two tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tier { Light, Standard }
+pub enum Tier {
+    Light,
+    Standard,
+}
 
 /// Operator depth choice. `Auto` sizes from the diff each attempt; `Forced` pins a tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Depth { Auto, Forced(Tier) }
+pub enum Depth {
+    Auto,
+    Forced(Tier),
+}
 
 impl Depth {
     /// Resolve to a concrete tier given this attempt's diff size + the config thresholds.
-    pub fn resolve(self, files: usize, lines: usize, light_max_lines: usize, light_max_files: usize) -> Tier {
+    pub fn resolve(
+        self,
+        files: usize,
+        lines: usize,
+        light_max_lines: usize,
+        light_max_files: usize,
+    ) -> Tier {
         match self {
             Depth::Forced(t) => t,
             Depth::Auto => select_tier(files, lines, light_max_lines, light_max_files),
@@ -33,8 +45,17 @@ impl Depth {
 
 /// PURE. light iff `files <= light_max_files` AND `lines <= light_max_lines` (params in signature order);
 /// else standard.
-pub fn select_tier(files: usize, lines: usize, light_max_lines: usize, light_max_files: usize) -> Tier {
-    if lines <= light_max_lines && files <= light_max_files { Tier::Light } else { Tier::Standard }
+pub fn select_tier(
+    files: usize,
+    lines: usize,
+    light_max_lines: usize,
+    light_max_files: usize,
+) -> Tier {
+    if lines <= light_max_lines && files <= light_max_files {
+        Tier::Light
+    } else {
+        Tier::Standard
+    }
 }
 
 /// PURE. Parse `git diff --numstat` → (changed_files, added+deleted_lines). A binary row (`-\t-\t<path>`)
@@ -43,7 +64,9 @@ pub fn parse_numstat(stdout: &str) -> (usize, usize) {
     let (mut files, mut lines) = (0usize, 0usize);
     for row in stdout.lines() {
         let mut cols = row.splitn(3, '\t');
-        let (Some(a), Some(d), Some(_path)) = (cols.next(), cols.next(), cols.next()) else { continue };
+        let (Some(a), Some(d), Some(_path)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
         files += 1;
         if let (Ok(added), Ok(deleted)) = (a.parse::<usize>(), d.parse::<usize>()) {
             lines += added + deleted;
@@ -55,7 +78,9 @@ pub fn parse_numstat(stdout: &str) -> (usize, usize) {
 /// PURE. The slice reference-file path, UNDER `.git/` so it survives `git reset --hard && git clean -fdq`,
 /// never dirties the worktree, never blocks `--resume`, and is invisible to the write-capable fix turn.
 pub fn slice_ref_path(clone: &Path, runid: &str) -> PathBuf {
-    clone.join(".git/a2a-bridge/review-slices").join(format!("slice-{runid}.md"))
+    clone
+        .join(".git/a2a-bridge/review-slices")
+        .join(format!("slice-{runid}.md"))
 }
 
 /// The review step's terminal state. Every post-commit failure maps here (no `?` past the commit).
@@ -156,7 +181,12 @@ pub fn reduce(events: &[bridge_workflow::executor::WorkflowEvent]) -> (bool, Str
 /// PURE. The `{{input}}` the reviewers + synth see: the task + both host-resolved SHAs + the explicit
 /// instruction to diff + navigate. The diff is NOT inlined — reviewers run `git diff` in the clone.
 /// Pass `slice_ref` to point reviewers at a prism review-slice file under `.git/a2a-bridge/review-slices/`.
-pub fn build_review_input(task: &str, base_sha: &str, head_sha: &str, slice_ref: Option<&str>) -> String {
+pub fn build_review_input(
+    task: &str,
+    base_sha: &str,
+    head_sha: &str,
+    slice_ref: Option<&str>,
+) -> String {
     let slice = match slice_ref {
         Some(path) => format!(
             "\nA prism review-slice (defect-focused: blast radius, taint paths, missing symmetry) for this \
@@ -288,14 +318,22 @@ mod tests {
     }
     #[test]
     fn build_input_with_slice_points_at_the_ref_file() {
-        let i = build_review_input("do X", "aaa", "bbb", Some(".git/a2a-bridge/review-slices/slice-1.md"));
+        let i = build_review_input(
+            "do X",
+            "aaa",
+            "bbb",
+            Some(".git/a2a-bridge/review-slices/slice-1.md"),
+        );
         assert!(i.contains("prism review-slice") && i.contains("slice-1.md"));
     }
 
     #[test]
     fn slice_ref_path_lives_under_git_a2a_bridge() {
         let p = slice_ref_path(std::path::Path::new("/clone"), "task-7-1");
-        assert_eq!(p, std::path::PathBuf::from("/clone/.git/a2a-bridge/review-slices/slice-task-7-1.md"));
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/clone/.git/a2a-bridge/review-slices/slice-task-7-1.md")
+        );
     }
 
     #[test]
@@ -304,7 +342,9 @@ mod tests {
         assert_eq!(parse_numstat(out), (3, 14));
     }
     #[test]
-    fn parse_numstat_empty_is_zero() { assert_eq!(parse_numstat(""), (0, 0)); }
+    fn parse_numstat_empty_is_zero() {
+        assert_eq!(parse_numstat(""), (0, 0));
+    }
 
     #[test]
     fn select_tier_light_requires_both_under_thresholds() {
@@ -315,7 +355,10 @@ mod tests {
     }
     #[test]
     fn resolve_depth_forced_overrides_auto() {
-        assert_eq!(Depth::Forced(Tier::Standard).resolve(0, 0, 15, 2), Tier::Standard);
+        assert_eq!(
+            Depth::Forced(Tier::Standard).resolve(0, 0, 15, 2),
+            Tier::Standard
+        );
         assert_eq!(Depth::Auto.resolve(0, 0, 15, 2), Tier::Light);
     }
 

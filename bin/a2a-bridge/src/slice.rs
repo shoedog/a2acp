@@ -8,7 +8,14 @@ use std::time::Duration;
 #[async_trait::async_trait]
 pub trait SliceRunner: Send + Sync {
     /// Run `git diff base..head` then the prism CLI; return the slice text, or None on any failure/timeout.
-    async fn produce(&self, clone: &Path, base: &str, head: &str, prism: &Path, timeout: Duration) -> Option<String>;
+    async fn produce(
+        &self,
+        clone: &Path,
+        base: &str,
+        head: &str,
+        prism: &Path,
+        timeout: Duration,
+    ) -> Option<String>;
 }
 
 /// Write `text` (truncated head+tail to `max_bytes`) to `ref_path`, creating parent dirs. Best-effort.
@@ -18,12 +25,21 @@ pub fn write_slice(ref_path: &Path, text: &str, max_bytes: usize) -> std::io::Re
     }
     let body = if text.len() > max_bytes {
         let half = max_bytes / 2;
-        let head_end = (0..=half.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        let head_end = (0..=half.min(text.len()))
+            .rev()
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
         let tail_start = {
             let raw = text.len().saturating_sub(half);
-            (raw..=text.len()).find(|&i| text.is_char_boundary(i)).unwrap_or(text.len())
+            (raw..=text.len())
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(text.len())
         };
-        format!("{}\n…[slice truncated]…\n{}", &text[..head_end], &text[tail_start..])
+        format!(
+            "{}\n…[slice truncated]…\n{}",
+            &text[..head_end],
+            &text[tail_start..]
+        )
     } else {
         text.to_string()
     };
@@ -36,22 +52,40 @@ pub struct ProdSliceRunner;
 
 #[async_trait::async_trait]
 impl SliceRunner for ProdSliceRunner {
-    async fn produce(&self, clone: &Path, base: &str, head: &str, prism: &Path, timeout: Duration) -> Option<String> {
+    async fn produce(
+        &self,
+        clone: &Path,
+        base: &str,
+        head: &str,
+        prism: &Path,
+        timeout: Duration,
+    ) -> Option<String> {
         let diff = tokio::process::Command::new("git")
-            .current_dir(clone).args(["diff", &format!("{base}..{head}")])
-            .output().await.ok()?;
-        if !diff.status.success() { return None; }
+            .current_dir(clone)
+            .args(["diff", &format!("{base}..{head}")])
+            .output()
+            .await
+            .ok()?;
+        if !diff.status.success() {
+            return None;
+        }
         let tmp = clone.join(".git/a2a-bridge/review-slices/diff.patch");
-        if let Some(p) = tmp.parent() { std::fs::create_dir_all(p).ok()?; }
+        if let Some(p) = tmp.parent() {
+            std::fs::create_dir_all(p).ok()?;
+        }
         std::fs::write(&tmp, &diff.stdout).ok()?;
         let run = tokio::process::Command::new(prism)
             .current_dir(clone)
-            .args(["--repo"]).arg(clone)
-            .args(["--diff"]).arg(&tmp)
+            .args(["--repo"])
+            .arg(clone)
+            .args(["--diff"])
+            .arg(&tmp)
             .args(["--format", "review"])
             .output();
         let out = tokio::time::timeout(timeout, run).await.ok()?.ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
@@ -62,14 +96,28 @@ mod tests {
     struct FakeOk;
     #[async_trait::async_trait]
     impl SliceRunner for FakeOk {
-        async fn produce(&self, _c: &Path, _b: &str, _h: &str, _p: &Path, _t: Duration) -> Option<String> {
+        async fn produce(
+            &self,
+            _c: &Path,
+            _b: &str,
+            _h: &str,
+            _p: &Path,
+            _t: Duration,
+        ) -> Option<String> {
             Some("SLICE BODY".to_string())
         }
     }
     struct FakeNone;
     #[async_trait::async_trait]
     impl SliceRunner for FakeNone {
-        async fn produce(&self, _c: &Path, _b: &str, _h: &str, _p: &Path, _t: Duration) -> Option<String> {
+        async fn produce(
+            &self,
+            _c: &Path,
+            _b: &str,
+            _h: &str,
+            _p: &Path,
+            _t: Duration,
+        ) -> Option<String> {
             None
         }
     }
@@ -79,7 +127,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("a2a-slice-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let refp = dir.join(".git/a2a-bridge/review-slices/slice-1.md");
-        let body = FakeOk.produce(&dir, "a", "b", Path::new("/x/prism"), Duration::from_secs(5)).await;
+        let body = FakeOk
+            .produce(
+                &dir,
+                "a",
+                "b",
+                Path::new("/x/prism"),
+                Duration::from_secs(5),
+            )
+            .await;
         assert_eq!(body.as_deref(), Some("SLICE BODY"));
         write_slice(&refp, &body.unwrap(), 200_000).unwrap();
         assert_eq!(std::fs::read_to_string(&refp).unwrap(), "SLICE BODY");
@@ -99,7 +155,16 @@ mod tests {
 
     #[tokio::test]
     async fn none_runner_degrades() {
-        assert!(FakeNone.produce(Path::new("/c"), "a", "b", Path::new("/x"), Duration::from_secs(1)).await.is_none());
+        assert!(FakeNone
+            .produce(
+                Path::new("/c"),
+                "a",
+                "b",
+                Path::new("/x"),
+                Duration::from_secs(1)
+            )
+            .await
+            .is_none());
     }
 
     #[tokio::test]

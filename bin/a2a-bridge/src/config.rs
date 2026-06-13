@@ -2136,9 +2136,13 @@ path = "/tmp/x.db"
         // Read the ambient $HOME (don't mutate global env — that races parallel tests).
         assert_eq!(super::shellexpand_tilde("/abs/prism"), "/abs/prism"); // non-tilde passes through
         if let Ok(home) = std::env::var("HOME") {
-            let t: ReviewToml = toml::from_str("workflow=\"r\"\nslice_cmd=\"~/bin/prism\"").unwrap();
+            let t: ReviewToml =
+                toml::from_str("workflow=\"r\"\nslice_cmd=\"~/bin/prism\"").unwrap();
             let c = t.to_config().unwrap();
-            assert_eq!(c.slice_cmd, std::path::PathBuf::from(format!("{home}/bin/prism")));
+            assert_eq!(
+                c.slice_cmd,
+                std::path::PathBuf::from(format!("{home}/bin/prism"))
+            );
         }
     }
 }

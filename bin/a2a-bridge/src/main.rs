@@ -33,8 +33,8 @@ mod implement_resume;
 mod merge;
 mod resilient;
 mod review;
-mod slice;
 mod route;
+mod slice;
 mod turn;
 mod tweak;
 mod verify;
@@ -637,9 +637,9 @@ fn parse_depth_flag(v: Option<&str>) -> Result<review::Depth, BoxError> {
         None => Ok(review::Depth::Auto),
         Some("light") => Ok(review::Depth::Forced(review::Tier::Light)),
         Some("standard") => Ok(review::Depth::Forced(review::Tier::Standard)),
-        Some("thorough") => Err(
-            "--depth thorough is not yet supported (deferred); use light|standard".into(),
-        ),
+        Some("thorough") => {
+            Err("--depth thorough is not yet supported (deferred); use light|standard".into())
+        }
         Some(other) => {
             Err(format!("--depth: unknown value {other:?} (expected light|standard)").into())
         }
@@ -999,9 +999,14 @@ async fn run_review_step(
     let (files, lines) = match tokio::process::Command::new("git")
         .current_dir(clone_path)
         .args(["diff", "--numstat", &format!("{base_sha}..{head_sha}")])
-        .output().await {
+        .output()
+        .await
+    {
         Ok(o) if o.status.success() => review::parse_numstat(&String::from_utf8_lossy(&o.stdout)),
-        _ => { eprintln!("[implement] review: numstat failed; defaulting to standard tier"); (usize::MAX, usize::MAX) }
+        _ => {
+            eprintln!("[implement] review: numstat failed; defaulting to standard tier");
+            (usize::MAX, usize::MAX)
+        }
     };
     let tier = depth.resolve(files, lines, rcfg.light_max_lines, rcfg.light_max_files);
 
@@ -1009,23 +1014,44 @@ async fn run_review_step(
     let runid = format!("{task_id}-{attempt}");
     let slice_ref: Option<String> = if tier == review::Tier::Standard {
         let refp = review::slice_ref_path(clone_path, &runid);
-        match slice.produce(clone_path, base_sha, head_sha, &rcfg.slice_cmd, rcfg.slice_timeout).await {
+        match slice
+            .produce(
+                clone_path,
+                base_sha,
+                head_sha,
+                &rcfg.slice_cmd,
+                rcfg.slice_timeout,
+            )
+            .await
+        {
             Some(body) => match slice::write_slice(&refp, &body, rcfg.slice_max_bytes) {
                 Ok(()) => Some(format!(".git/a2a-bridge/review-slices/slice-{runid}.md")),
-                Err(e) => { eprintln!("[implement] review: slice write failed: {e}; continuing sliceless"); None }
+                Err(e) => {
+                    eprintln!("[implement] review: slice write failed: {e}; continuing sliceless");
+                    None
+                }
             },
-            None => { eprintln!("[implement] review: prism slice unavailable; continuing sliceless"); None }
+            None => {
+                eprintln!("[implement] review: prism slice unavailable; continuing sliceless");
+                None
+            }
         }
-    } else { None };
+    } else {
+        None
+    };
 
     // Select the workflow variant by tier: standard → rcfg.workflow; light → <workflow>-light (fallback+warn).
     let graph_id = match tier {
         review::Tier::Standard => rcfg.workflow.clone(),
         review::Tier::Light => {
-            let light = bridge_core::ids::WorkflowId::parse(format!("{}-light", rcfg.workflow.as_str()));
+            let light =
+                bridge_core::ids::WorkflowId::parse(format!("{}-light", rcfg.workflow.as_str()));
             match light.ok().filter(|id| wf_map.contains_key(id)) {
                 Some(id) => id,
-                None => { eprintln!("[implement] review: no {}-light variant; falling back to standard workflow", rcfg.workflow.as_str()); rcfg.workflow.clone() }
+                None => {
+                    eprintln!("[implement] review: no {}-light variant; falling back to standard workflow", rcfg.workflow.as_str());
+                    rcfg.workflow.clone()
+                }
             }
         }
     };
@@ -4151,28 +4177,53 @@ cmd = "true"
 
     #[test]
     fn depth_from_checkpoint_maps_all_cases() {
-        assert_eq!(super::depth_from_checkpoint(Some("light")), review::Depth::Forced(review::Tier::Light));
-        assert_eq!(super::depth_from_checkpoint(Some("standard")), review::Depth::Forced(review::Tier::Standard));
+        assert_eq!(
+            super::depth_from_checkpoint(Some("light")),
+            review::Depth::Forced(review::Tier::Light)
+        );
+        assert_eq!(
+            super::depth_from_checkpoint(Some("standard")),
+            review::Depth::Forced(review::Tier::Standard)
+        );
         assert_eq!(super::depth_from_checkpoint(None), review::Depth::Auto);
-        assert_eq!(super::depth_from_checkpoint(Some("bogus")), review::Depth::Auto);
+        assert_eq!(
+            super::depth_from_checkpoint(Some("bogus")),
+            review::Depth::Auto
+        );
     }
 
     #[test]
     fn reviewer_prompts_carry_line_by_line_and_git_archaeology() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prompts");
         let reviewers = [
-            "review-implement.md","review-correctness.md","review-architecture.md",
-            "spec-review-rigor.md","spec-review-rigor-refine.md","spec-review-soundness.md",
-            "spec-review-soundness-refine.md","plan-review-exec.md","plan-review-exec-refine.md",
-            "plan-review-coverage.md","plan-review-coverage-refine.md",
+            "review-implement.md",
+            "review-correctness.md",
+            "review-architecture.md",
+            "spec-review-rigor.md",
+            "spec-review-rigor-refine.md",
+            "spec-review-soundness.md",
+            "spec-review-soundness-refine.md",
+            "plan-review-exec.md",
+            "plan-review-exec-refine.md",
+            "plan-review-coverage.md",
+            "plan-review-coverage-refine.md",
         ];
         for f in reviewers {
             let t = std::fs::read_to_string(dir.join(f)).unwrap();
-            assert!(t.to_lowercase().contains("line-by-line"), "{f}: missing line-by-line clause");
-            assert!(t.contains("git blame") && t.contains("log -L"), "{f}: missing git archaeology");
+            assert!(
+                t.to_lowercase().contains("line-by-line"),
+                "{f}: missing line-by-line clause"
+            );
+            assert!(
+                t.contains("git blame") && t.contains("log -L"),
+                "{f}: missing git archaeology"
+            );
         }
         let ri = std::fs::read_to_string(dir.join("review-implement.md")).unwrap();
-        assert!(ri.contains("prism") && ri.contains("nav_"), "review-implement missing prism block");
+        assert!(
+            ri.contains("prism") && ri.contains("nav_"),
+            "review-implement missing prism block"
+        );
         let synth = std::fs::read_to_string(dir.join("implement-review-light-synth.md")).unwrap();
         assert!(synth.contains("{{reviewer}}") && !synth.contains("{{reviewer_claude}}"));
     }
