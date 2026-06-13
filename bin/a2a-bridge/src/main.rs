@@ -1490,9 +1490,15 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config()); // B2b-3a: parsed pre-commit (beside verify)
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
-    let snapshot = cfg
+    let mut snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
+    // Stamp the clone cwd into every entry's `session_cwd` so that codex's native MCP `{cwd}`
+    // (baked at spawn from the static entry) points at the clone, not the launch cwd.  Mirrors
+    // `run_workflow_cmd`'s ADR-0028 stamping exactly — stamping all entries is proven-safe there.
+    for e in &mut snapshot.entries {
+        e.session_cwd = Some(clone_cwd.as_str().to_string());
+    }
     // Gate the [verify] runtime against the resolved allowlist: a non-allowlisted runtime rejects into
     // VerifyOutcome::ConfigError (verify never runs on the wrong engine). snapshot.allowed_cmds is the
     // verbatim resolved list (no duplicated union to drift). verify_cfg is owned, so this shadows it.
@@ -1767,9 +1773,15 @@ async fn implement_resume_cmd(
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
-    let snapshot = cfg
+    let mut snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement --resume: snapshot: {e}"))?;
+    // Stamp the clone cwd into every entry's `session_cwd` (mirrors implement_cmd + run_workflow_cmd).
+    // Ensures codex's native MCP `{cwd}` (baked from the static entry at spawn) targets the clone,
+    // not the launch cwd — so prism indexes the right repo during the review step.
+    for e in &mut snapshot.entries {
+        e.session_cwd = Some(clone_cwd.as_str().to_string());
+    }
     // Same verify-runtime gate as the implement path (reject a disallowed runtime into ConfigError).
     let verify_cfg = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
     preflight_runtimes(

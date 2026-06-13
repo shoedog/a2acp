@@ -553,6 +553,11 @@ impl ReviewToml {
                 "[review] light_max_lines/light_max_files must be > 0".into(),
             ));
         }
+        if self.slice_timeout_secs == 0 || self.slice_max_bytes == 0 {
+            return Err(ConfigError::Registry(
+                "[review] slice_timeout_secs/slice_max_bytes must be > 0".into(),
+            ));
+        }
         let slice_cmd = std::path::PathBuf::from(shellexpand_tilde(&self.slice_cmd));
         Ok(ReviewConfig {
             workflow,
@@ -2114,6 +2119,14 @@ path = "/tmp/x.db"
     fn review_toml_rejects_zero_thresholds() {
         let t: ReviewToml = toml::from_str("workflow=\"r\"\nlight_max_lines=0").unwrap();
         assert!(t.to_config().is_err());
+    }
+
+    #[test]
+    fn review_toml_rejects_zero_slice_bounds() {
+        let t: ReviewToml = toml::from_str("workflow=\"r\"\nslice_timeout_secs=0").unwrap();
+        assert!(t.to_config().is_err());
+        let t2: ReviewToml = toml::from_str("workflow=\"r\"\nslice_max_bytes=0").unwrap();
+        assert!(t2.to_config().is_err());
     }
 
     #[test]
