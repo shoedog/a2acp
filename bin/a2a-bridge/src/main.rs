@@ -656,6 +656,16 @@ fn depth_from_checkpoint(forced_depth: Option<&str>) -> review::Depth {
     }
 }
 
+/// Serialize a `review::Depth` back to the checkpoint's `forced_depth` string.
+/// `Forced(Light)`→`Some("light")`, `Forced(Standard)`→`Some("standard")`, `Auto`→`None`.
+fn depth_to_forced_str(d: review::Depth) -> Option<String> {
+    match d {
+        review::Depth::Forced(review::Tier::Light) => Some("light".into()),
+        review::Depth::Forced(review::Tier::Standard) => Some("standard".into()),
+        review::Depth::Auto => None,
+    }
+}
+
 fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     if args.first().map(String::as_str) == Some("--resume") {
         let resume_id = args
@@ -1015,7 +1025,7 @@ async fn run_review_step(
             let light = bridge_core::ids::WorkflowId::parse(format!("{}-light", rcfg.workflow.as_str()));
             match light.ok().filter(|id| wf_map.contains_key(id)) {
                 Some(id) => id,
-                None => { eprintln!("[implement] review: no -light variant; falling back to standard workflow"); rcfg.workflow.clone() }
+                None => { eprintln!("[implement] review: no {}-light variant; falling back to standard workflow", rcfg.workflow.as_str()); rcfg.workflow.clone() }
             }
         }
     };
@@ -1350,6 +1360,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 &config_path,
                 merge_requested,
                 onto.as_deref(),
+                depth,
             )
             .await;
         }
@@ -1613,11 +1624,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
                     loop_max_attempts: loop_cfg.max_attempts,
                     attempt_next: 1,
-                    forced_depth: match depth {
-                        review::Depth::Forced(review::Tier::Light) => Some("light".into()),
-                        review::Depth::Forced(review::Tier::Standard) => Some("standard".into()),
-                        review::Depth::Auto => None,
-                    },
+                    forced_depth: depth_to_forced_str(depth),
                     phase: implement_resume::ImplementPhase::FirstCommitCreated,
                     created_at_ms: implement_resume::now_ms(),
                     updated_at_ms: implement_resume::now_ms(),
@@ -1672,6 +1679,7 @@ async fn implement_resume_cmd(
     config_path: &Path,
     merge_requested: bool,
     onto: Option<&str>,
+    depth_override: review::Depth,
 ) -> Result<(), BoxError> {
     let raw = std::fs::read_to_string(config_path)
         .map_err(|e| format!("implement --resume: read config {config_path:?}: {e}"))?;
@@ -1822,8 +1830,17 @@ async fn implement_resume_cmd(
         fix_template,
         ..
     } = warm_impl;
-    // Restore the depth from the checkpoint's forced_depth string (None → Auto).
-    let depth = depth_from_checkpoint(ck.forced_depth.as_deref());
+    // Compute effective depth: an explicit --depth override takes precedence over the checkpoint;
+    // Auto (no flag) falls back to the checkpoint's stored value. When overriding, persist the new
+    // forced_depth into the checkpoint so subsequent resumes without --depth see the same tier.
+    let depth = match depth_override {
+        review::Depth::Forced(_) => {
+            prod_ckpt.ck.forced_depth = depth_to_forced_str(depth_override);
+            let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
+            depth_from_checkpoint(prod_ckpt.ck.forced_depth.as_deref())
+        }
+        review::Depth::Auto => depth_from_checkpoint(ck.forced_depth.as_deref()),
+    };
     let outcome_phase = run_warm_loop(
         &clone,
         &ck.source_repo,
@@ -4130,5 +4147,13 @@ cmd = "true"
         );
         bridge_registry::registry::Registry::new(snap, spawn)
             .expect("containerized config (incl. the impl container_rw agent) validates");
+    }
+
+    #[test]
+    fn depth_from_checkpoint_maps_all_cases() {
+        assert_eq!(super::depth_from_checkpoint(Some("light")), review::Depth::Forced(review::Tier::Light));
+        assert_eq!(super::depth_from_checkpoint(Some("standard")), review::Depth::Forced(review::Tier::Standard));
+        assert_eq!(super::depth_from_checkpoint(None), review::Depth::Auto);
+        assert_eq!(super::depth_from_checkpoint(Some("bogus")), review::Depth::Auto);
     }
 }

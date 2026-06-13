@@ -18,7 +18,12 @@ pub fn write_slice(ref_path: &Path, text: &str, max_bytes: usize) -> std::io::Re
     }
     let body = if text.len() > max_bytes {
         let half = max_bytes / 2;
-        format!("{}\n…[slice truncated]…\n{}", &text[..half], &text[text.len() - half..])
+        let head_end = (0..=half.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        let tail_start = {
+            let raw = text.len().saturating_sub(half);
+            (raw..=text.len()).find(|&i| text.is_char_boundary(i)).unwrap_or(text.len())
+        };
+        format!("{}\n…[slice truncated]…\n{}", &text[..head_end], &text[tail_start..])
     } else {
         text.to_string()
     };
@@ -95,5 +100,18 @@ mod tests {
     #[tokio::test]
     async fn none_runner_degrades() {
         assert!(FakeNone.produce(Path::new("/c"), "a", "b", Path::new("/x"), Duration::from_secs(1)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn truncation_is_char_boundary_safe_on_multibyte() {
+        let dir = std::env::temp_dir().join(format!("a2a-slice-mb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let refp = dir.join("s.md");
+        // 1000 '…' chars (3 bytes each) — naive byte-slicing at an odd half would panic.
+        let text = "…".repeat(1000);
+        write_slice(&refp, &text, 101).unwrap(); // must not panic
+        let got = std::fs::read_to_string(&refp).unwrap();
+        assert!(got.contains("slice truncated"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
