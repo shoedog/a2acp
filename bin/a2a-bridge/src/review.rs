@@ -196,12 +196,33 @@ fn comment_markers(path: &str) -> &'static [&'static str] {
     }
 }
 
-/// PURE, path-aware. A changed line is "logical" unless blank or a leading comment for that language.
-/// Approximate LLOC (block-comment interiors and string-embedded markers are known, conservative limits).
+/// PURE. Comment-SHAPED lines that carry build/tooling SEMANTICS, not prose — counted as logical so a
+/// directive-only change is not undersized (the unsafe direction). Prefixes are language-specific but
+/// matching them across all paths is safe (a `.rs` file never begins a line with `//go:`).
+fn is_semantic_directive(t: &str) -> bool {
+    const DIRECTIVES: &[&str] = &[
+        "//go:",          // Go: //go:build, //go:generate, //go:embed
+        "// +build",      // Go legacy build constraint
+        "//nolint",       // Go linter control
+        "/// <reference", // TypeScript triple-slash directive
+        "// @ts-",        // TypeScript: @ts-nocheck / @ts-ignore / @ts-expect-error
+        "// eslint",      // JS/TS eslint control
+        "# syntax=",      // Dockerfile parser directive
+        "# escape=",      // Dockerfile parser directive
+    ];
+    DIRECTIVES.iter().any(|d| t.starts_with(d))
+}
+
+/// PURE, path-aware. A changed line is "logical" unless blank, a build/tool directive (counted), or a
+/// leading comment for that language. Approximate LLOC (block-comment interiors and string-embedded
+/// markers are known, conservative limits).
 pub fn is_logical_line(path: &str, content: &str) -> bool {
     let t = content.trim_start();
     if t.is_empty() {
         return false;
+    }
+    if is_semantic_directive(t) {
+        return true; // build tags / tool directives look like comments but carry semantics
     }
     !comment_markers(path).iter().any(|m| t.starts_with(m))
 }
@@ -606,10 +627,11 @@ mod tests {
         assert!(is_logical_line("src/a.rs", "#![allow(dead_code)]"));
         assert!(!is_logical_line("src/a.rs", "// a comment"));
         assert!(is_logical_line("src/a.rs", "    *ptr = x;")); // leading * deref counts
-                                                               // toml/yaml/sh/Dockerfile: # is a comment.
+                                                               // toml/yaml/sh/Dockerfile: # is a comment, but `# syntax=`/`# escape=` are parser directives (count).
         assert!(!is_logical_line("a.toml", "# c"));
-        assert!(!is_logical_line("Dockerfile", "# syntax=docker"));
-        assert!(!is_logical_line(
+        assert!(!is_logical_line("Dockerfile", "# a plain comment"));
+        assert!(is_logical_line("Dockerfile", "# syntax=docker"));
+        assert!(is_logical_line(
             "Containerfile",
             "# syntax=docker/dockerfile:1"
         ));
@@ -624,6 +646,24 @@ mod tests {
             "data.bin",
             "# not stripped for unknown ext"
         ));
+    }
+
+    #[test]
+    fn is_logical_line_counts_semantic_directives() {
+        // Comment-shaped lines that carry build/tooling semantics count (undercount would be the unsafe dir).
+        assert!(is_logical_line("main.go", "//go:build linux"));
+        assert!(is_logical_line("main.go", "// +build linux"));
+        assert!(is_logical_line("main.go", "//go:generate stringer -type=T"));
+        assert!(is_logical_line(
+            "Dockerfile",
+            "# syntax=docker/dockerfile:1"
+        ));
+        assert!(is_logical_line("app.ts", "/// <reference path=\"x\" />"));
+        assert!(is_logical_line("app.ts", "// @ts-nocheck"));
+        // ordinary comments stay excluded — including Rust doc comments.
+        assert!(!is_logical_line("main.go", "// just a comment"));
+        assert!(!is_logical_line("Dockerfile", "# a comment"));
+        assert!(!is_logical_line("src/a.rs", "/// a doc comment"));
     }
 
     #[test]

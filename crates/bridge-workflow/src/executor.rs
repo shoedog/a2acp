@@ -283,6 +283,15 @@ impl WorkflowExecutor {
                                         owned.push((inp.as_str().into(), t.clone()));
                                     }
                                 }
+                                // Single-upstream alias: a node with exactly one input can render its
+                                // predecessor's output as `{{draft}}` without hard-coding the predecessor's
+                                // node id — so one refine prompt serves model-diverse legs whose draft nodes
+                                // have distinct ids (e.g. reviewer_codex_draft / reviewer_claude_draft).
+                                if let [only] = n.inputs.as_slice() {
+                                    if let Some((t, _)) = outputs.get(only.as_str()) {
+                                        owned.push(("draft".into(), t.clone()));
+                                    }
+                                }
                                 let node = n.clone();
                                 let run_id = run_id.clone();
                                 let cancel = cancel.clone();
@@ -504,6 +513,48 @@ mod tests {
                 ),
             ],
         })
+    }
+
+    #[tokio::test]
+    async fn single_input_node_renders_draft_alias() {
+        // A refine node with exactly one input can reference its predecessor's output as {{draft}}
+        // (so one shared refine prompt serves legs whose draft nodes have distinct ids).
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("refine").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("draftnode").unwrap(),
+                    agent: AgentId::parse("codex").unwrap(),
+                    prompt_template: "draft {{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("refinenode").unwrap(),
+                    agent: AgentId::parse("claude").unwrap(),
+                    prompt_template: "refine against {{draft}} for {{input}}".into(),
+                    inputs: vec![NodeId::parse("draftnode").unwrap()],
+                },
+            ],
+        });
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry {
+            backends: [
+                ("codex".to_string(), mk("DRAFT_OUT")),
+                ("claude".to_string(), mk("REFINED")),
+            ]
+            .into(),
+        });
+        let refine_rec = reg.backends.get("claude").unwrap().1.clone();
+        let ex = WorkflowExecutor::new(reg);
+        let _ = ex
+            .run(graph, "DIFF".into(), "r".into(), CancellationToken::new())
+            .collect::<Vec<_>>()
+            .await;
+        let p = &refine_rec.prompts.lock().unwrap()[0];
+        assert!(
+            p.contains("DRAFT_OUT") && p.contains("DIFF"),
+            "refine node must see the draft via {{draft}} AND the original via {{input}}: {p}"
+        );
     }
 
     #[tokio::test]
