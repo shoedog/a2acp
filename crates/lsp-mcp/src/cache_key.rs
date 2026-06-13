@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 /// Per-repo cache dir under `base`, keyed by `origin_url` (git remote.origin.url) when present and
 /// non-blank, else by `repo_root`'s path. Dir name is FS-safe hex.
+/// The returned directory may not exist yet; cargo/rust-analyzer populate it on first use.
+#[must_use]
 pub fn cache_dir(base: &Path, repo_root: &Path, origin_url: Option<&str>) -> PathBuf {
     let key = match origin_url {
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
