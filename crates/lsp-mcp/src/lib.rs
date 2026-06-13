@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 pub mod cache_key;
+pub mod lsp;
 pub mod shape;
 
 #[derive(clap::Parser, Debug)]
