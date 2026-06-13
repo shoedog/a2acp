@@ -24,6 +24,10 @@ workflow = "implement-review"
 # spurious timeout (looks like an agent failure but is just the bound). 900s gives room while still capping
 # a runaway review (bridge agents are full coding agents). Raise further for very large diffs.
 timeout_secs = 900
+# Light-tier thresholds: diffs at or under BOTH limits use <workflow>-light (implement-review-light by
+# convention) instead of the full two-reviewer workflow — faster and cheaper for small changes.
+light_max_lines = 15
+light_max_files = 2
 
 # B2b-3b: the review->tweak loop. After the first commit, the bridge runs verify+review each attempt; on a
 # verify-FAIL or review-REJECT it re-prompts the `impl` agent (the `implement-fix` workflow) to fix on the
@@ -73,42 +77,35 @@ cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip pro
 # gate = false
 
 [registry]
-# The spawned program is `podman` (the sandbox/verify runtime); validate() requires it allowlisted (also
-# defaults to the union of entry cmds, but state it explicitly as a tightening).
-allowed_cmds = ["podman"]
+# podman: the container runtime for the impl/kiro/verify sandboxes.
+# codex-acp + claude-agent-acp: host-side reviewer agents (codex/claude run without a sandbox block).
+allowed_cmds = ["podman", "codex-acp", "claude-agent-acp"]
 
 [server]
 addr = "127.0.0.1:8080"
 
-# ── claude: the proven containerized agent (ADR-0013). Default + first to validate. ──
+# ── claude: host-side reviewer with prism code-nav (no container sandbox; runs the host claude-agent-acp).
+#    Moved from :ro container to host-side so it can use prism structural navigation for deeper reviews. ──
 [[agents]]
 id  = "claude"
 cmd = "claude-agent-acp"
 model = "sonnet"   # reviewer pinned to Sonnet 4.6 (dogfood)
-[agents.sandbox]
-runtime = "podman"
-image   = "a2a-agent-reader:latest"
-mount   = "/Users/wesleyjinks/code"            # == allowed_cwd_root (S2)
-access  = "ro"
-egress  = "locked"
-network = "a2a-egress-internal"
-proxy   = "http://a2a-egress-proxy:8888"
-volumes = ["/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json"]
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
 
-# ── codex: gpt-5.5 (auth + openai egress validated in-container). ──
+# ── codex: host-side reviewer with prism code-nav (no container sandbox; runs host codex-acp in read-only
+#    mode). sandbox_mode=read-only + approval_policy=never enforces hard read-only on the host-side agent. ──
 [[agents]]
 id  = "codex"
 cmd = "codex-acp"
 model = "gpt-5.5"   # reviewer pinned (dogfood)
-[agents.sandbox]
-runtime = "podman"
-image   = "a2a-agent-reader:latest"
-mount   = "/Users/wesleyjinks/code"
-access  = "ro"
-egress  = "locked"
-network = "a2a-egress-internal"
-proxy   = "http://a2a-egress-proxy:8888"
-volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
 
 # ── kiro: Linux build baked into the image. VERIFIED: Linux auth is ~/.local/share/kiro-cli/data.sqlite3
 #    (NOT ~/.aws); minted once via `kiro-cli login --use-device-flow` into the a2a-kiro-data volume. ──
@@ -209,6 +206,21 @@ id = "synth"
 agent = "claude"
 prompt_file = "../prompts/review-implement-synth.md"
 inputs = ["reviewer_codex", "reviewer_claude"]
+
+# ── implement-review-light: single reviewer + synth for small diffs (≤ light_max_lines / light_max_files).
+#    Faster + cheaper than the full two-reviewer workflow; same synth contract (VERDICT: APPROVE|REJECT). ──
+[[workflows]]
+id = "implement-review-light"
+[[workflows.nodes]]
+id = "reviewer"
+agent = "codex"
+prompt_file = "../prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/implement-review-light-synth.md"
+inputs = ["reviewer"]
 
 [[workflows]]
 # B2a acceptance gate: a single write-capable container_rw node. Run from under the mount with
