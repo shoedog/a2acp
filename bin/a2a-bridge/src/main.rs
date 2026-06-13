@@ -4271,6 +4271,7 @@ cmd = "true"
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prompts");
         let reviewers = [
             "review-implement.md",
+            "review-implement-refine.md",
             "review-correctness.md",
             "review-architecture.md",
             "spec-review-rigor.md",
@@ -4300,5 +4301,10 @@ cmd = "true"
         );
         let synth = std::fs::read_to_string(dir.join("implement-review-light-synth.md")).unwrap();
         assert!(synth.contains("{{reviewer}}") && !synth.contains("{{reviewer_claude}}"));
+        let refine = std::fs::read_to_string(dir.join("review-implement-refine.md")).unwrap();
+        assert!(
+            !refine.contains("VERDICT"),
+            "review-implement-refine must not emit a VERDICT (synth decides)"
+        );
     }
 }

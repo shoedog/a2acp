@@ -21,13 +21,20 @@ allowed_cwd_root = "/Users/wesleyjinks/code"
 [review]
 workflow = "implement-review"
 # Two thorough reviewers navigating + reviewing a REAL diff routinely exceed the 300s default and trip a
-# spurious timeout (looks like an agent failure but is just the bound). 900s gives room while still capping
-# a runaway review (bridge agents are full coding agents). Raise further for very large diffs.
-timeout_secs = 900
+# spurious timeout (looks like an agent failure but is just the bound). 1800s gives room (thorough does ~2×
+# passes) while still capping a runaway review (bridge agents are full coding agents). Raise further for very
+# large diffs.
+timeout_secs = 1800
 # Light-tier thresholds: diffs at or under BOTH limits use <workflow>-light (implement-review-light by
 # convention) instead of the full two-reviewer workflow — faster and cheaper for small changes.
 light_max_lines = 15
 light_max_files = 2
+# Thorough-tier trigger: a diff at or above EITHER limit (LLOC over code/infra files only — docs, tests,
+# lockfiles, generated files, comments, blanks excluded) runs <workflow>-thorough (draft→refine ×2).
+thorough_min_lines = 150
+thorough_min_files = 6
+# Default review depth when `--depth` is not given: auto | light | standard | thorough.
+default_depth = "auto"
 
 # B2b-3b: the review->tweak loop. After the first commit, the bridge runs verify+review each attempt; on a
 # verify-FAIL or review-REJECT it re-prompts the `impl` agent (the `implement-fix` workflow) to fix on the
@@ -220,6 +227,36 @@ id = "synth"
 agent = "claude"
 prompt_file = "../prompts/implement-review-light-synth.md"
 inputs = ["reviewer"]
+
+[[workflows]]
+# implement-review-thorough: 2 reviewers each draft→refine → synth (the large-diff tier). Reuses the
+# standard reviewer + synth prompts; the refine pass re-reads the diff line-by-line. Slice attached.
+id = "implement-review-thorough"
+[[workflows.nodes]]
+id = "reviewer_codex_draft"
+agent = "codex"
+prompt_file = "../prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "reviewer_claude_draft"
+agent = "claude"
+prompt_file = "../prompts/review-implement.md"
+inputs = []
+[[workflows.nodes]]
+id = "reviewer_codex"
+agent = "codex"
+prompt_file = "../prompts/review-implement-refine.md"
+inputs = ["reviewer_codex_draft"]
+[[workflows.nodes]]
+id = "reviewer_claude"
+agent = "claude"
+prompt_file = "../prompts/review-implement-refine.md"
+inputs = ["reviewer_claude_draft"]
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-implement-synth.md"
+inputs = ["reviewer_codex", "reviewer_claude"]
 
 [[workflows]]
 # B2a acceptance gate: a single write-capable container_rw node. Run from under the mount with
