@@ -4156,4 +4156,24 @@ cmd = "true"
         assert_eq!(super::depth_from_checkpoint(None), review::Depth::Auto);
         assert_eq!(super::depth_from_checkpoint(Some("bogus")), review::Depth::Auto);
     }
+
+    #[test]
+    fn reviewer_prompts_carry_line_by_line_and_git_archaeology() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prompts");
+        let reviewers = [
+            "review-implement.md","review-correctness.md","review-architecture.md",
+            "spec-review-rigor.md","spec-review-rigor-refine.md","spec-review-soundness.md",
+            "spec-review-soundness-refine.md","plan-review-exec.md","plan-review-exec-refine.md",
+            "plan-review-coverage.md","plan-review-coverage-refine.md",
+        ];
+        for f in reviewers {
+            let t = std::fs::read_to_string(dir.join(f)).unwrap();
+            assert!(t.to_lowercase().contains("line-by-line"), "{f}: missing line-by-line clause");
+            assert!(t.contains("git blame") && t.contains("log -L"), "{f}: missing git archaeology");
+        }
+        let ri = std::fs::read_to_string(dir.join("review-implement.md")).unwrap();
+        assert!(ri.contains("prism") && ri.contains("nav_"), "review-implement missing prism block");
+        let synth = std::fs::read_to_string(dir.join("implement-review-light-synth.md")).unwrap();
+        assert!(synth.contains("{{reviewer}}") && !synth.contains("{{reviewer_claude}}"));
+    }
 }
