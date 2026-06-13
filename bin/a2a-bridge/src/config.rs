@@ -2115,4 +2115,30 @@ path = "/tmp/x.db"
         let t: ReviewToml = toml::from_str("workflow=\"r\"\nlight_max_lines=0").unwrap();
         assert!(t.to_config().is_err());
     }
+
+    #[test]
+    fn review_toml_explicit_values_round_trip() {
+        // Guards against `to_config` hard-coding a default instead of reading `self.<field>`.
+        let t: ReviewToml = toml::from_str(
+            "workflow=\"r\"\nslice_timeout_secs=30\nslice_max_bytes=4096\nlight_max_lines=100\nlight_max_files=9",
+        )
+        .unwrap();
+        let c = t.to_config().unwrap();
+        assert_eq!(c.slice_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(c.slice_max_bytes, 4096);
+        assert_eq!(c.light_max_lines, 100);
+        assert_eq!(c.light_max_files, 9);
+    }
+
+    #[test]
+    fn review_slice_cmd_tilde_actually_expands() {
+        // `ends_with("prism")` alone would pass even if expansion were a no-op; assert the real expansion.
+        // Read the ambient $HOME (don't mutate global env — that races parallel tests).
+        assert_eq!(super::shellexpand_tilde("/abs/prism"), "/abs/prism"); // non-tilde passes through
+        if let Ok(home) = std::env::var("HOME") {
+            let t: ReviewToml = toml::from_str("workflow=\"r\"\nslice_cmd=\"~/bin/prism\"").unwrap();
+            let c = t.to_config().unwrap();
+            assert_eq!(c.slice_cmd, std::path::PathBuf::from(format!("{home}/bin/prism")));
+        }
+    }
 }
