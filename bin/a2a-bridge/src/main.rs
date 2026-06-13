@@ -942,7 +942,7 @@ async fn run_review_step(
     let Some(graph) = wf_map.get(&rcfg.workflow).cloned() else {
         return (review::ReviewOutcome::NotLoaded, String::new());
     };
-    let input = review::build_review_input(task, base_sha, head_sha);
+    let input = review::build_review_input(task, base_sha, head_sha, None);
     let ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
     };

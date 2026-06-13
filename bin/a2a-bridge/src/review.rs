@@ -154,12 +154,20 @@ pub fn reduce(events: &[bridge_workflow::executor::WorkflowEvent]) -> (bool, Str
 
 /// PURE. The `{{input}}` the reviewers + synth see: the task + both host-resolved SHAs + the explicit
 /// instruction to diff + navigate. The diff is NOT inlined — reviewers run `git diff` in the clone.
-pub fn build_review_input(task: &str, base_sha: &str, head_sha: &str) -> String {
+/// Pass `slice_ref` to point reviewers at a prism review-slice file under `.git/a2a-bridge/review-slices/`.
+pub fn build_review_input(task: &str, base_sha: &str, head_sha: &str, slice_ref: Option<&str>) -> String {
+    let slice = match slice_ref {
+        Some(path) => format!(
+            "\nA prism review-slice (defect-focused: blast radius, taint paths, missing symmetry) for this \
+             diff is at `{path}` — read it FIRST as a map of where to look, then verify against the code.\n"
+        ),
+        None => String::new(),
+    };
     format!(
         "TASK:\n{task}\n\n\
          Review the committed change in this repository: `git diff {base_sha}..{head_sha}`.\n\
          Use read-only git/grep/read to navigate the surrounding code. Assess: (1) does it DELIVER the \
-         task (incl. implied requirements); (2) correctness/regressions/edge-cases; (3) design/architecture fit."
+         task (incl. implied requirements); (2) correctness/regressions/edge-cases; (3) design/architecture fit.{slice}"
     )
 }
 
@@ -272,9 +280,15 @@ mod tests {
     }
 
     #[test]
-    fn build_input_has_task_and_both_shas_and_diff() {
-        let i = build_review_input("do X", "aaa", "bbb");
+    fn build_input_no_slice_has_task_shas_diff() {
+        let i = build_review_input("do X", "aaa", "bbb", None);
         assert!(i.contains("do X") && i.contains("git diff aaa..bbb") && i.contains("DELIVER"));
+        assert!(!i.contains("prism review-slice"));
+    }
+    #[test]
+    fn build_input_with_slice_points_at_the_ref_file() {
+        let i = build_review_input("do X", "aaa", "bbb", Some(".git/a2a-bridge/review-slices/slice-1.md"));
+        assert!(i.contains("prism review-slice") && i.contains("slice-1.md"));
     }
 
     #[test]
