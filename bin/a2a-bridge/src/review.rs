@@ -31,7 +31,8 @@ impl Depth {
     }
 }
 
-/// PURE. light iff `lines <= light_max_lines` AND `files <= light_max_files`; else standard.
+/// PURE. light iff `files <= light_max_files` AND `lines <= light_max_lines` (params in signature order);
+/// else standard.
 pub fn select_tier(files: usize, lines: usize, light_max_lines: usize, light_max_files: usize) -> Tier {
     if lines <= light_max_lines && files <= light_max_files { Tier::Light } else { Tier::Standard }
 }
