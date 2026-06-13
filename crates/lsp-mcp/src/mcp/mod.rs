@@ -122,6 +122,7 @@ fn dispatch(id: &Value, params: &Value, s: &mut LspSession) -> Value {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    log_tool_call(tool, &a);
     match dispatch_body(tool, &a, s) {
         Ok(body) => ok(id, body),
         // Tool failures are reported as content with isError, so the agent sees the reason and degrades.
@@ -136,6 +137,47 @@ fn dispatch(id: &Value, params: &Value, s: &mut LspSession) -> Value {
                 }]
             }
         }),
+    }
+}
+
+/// Format one tool-call observability line. Pure — testable.
+fn format_call_log_line(pid: u32, secs: u64, tool: &str, args: &Value) -> String {
+    format!(
+        "t={secs} pid={pid} tool={tool} args={}\n",
+        serde_json::to_string(args).unwrap_or_default()
+    )
+}
+
+/// Where to record tool calls: `$LSP_MCP_LOG`, else `~/.local/share/a2a/lsp-mcp-calls.log`.
+fn call_log_path() -> Option<std::path::PathBuf> {
+    match std::env::var("LSP_MCP_LOG") {
+        Ok(p) if !p.is_empty() => Some(p.into()),
+        _ => std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::Path::new(&h).join(".local/share/a2a/lsp-mcp-calls.log")),
+    }
+}
+
+/// Record a tool call to stderr + the call-log file. Best-effort observability — never fails the call.
+fn log_tool_call(tool: &str, args: &Value) {
+    use std::io::Write;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format_call_log_line(std::process::id(), secs, tool, args);
+    eprint!("[lsp-mcp] {line}");
+    if let Some(path) = call_log_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 }
 
@@ -209,6 +251,15 @@ pub fn serve(mut session: LspSession) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_log_line_carries_tool_and_args() {
+        let line = format_call_log_line(42, 1_700_000_000, "references", &json!({"name": "add"}));
+        assert!(line.contains("pid=42"), "{line}");
+        assert!(line.contains("tool=references"), "{line}");
+        assert!(line.contains("\"name\":\"add\""), "{line}");
+        assert!(line.ends_with('\n'));
+    }
 
     #[test]
     fn exposes_the_seven_tools() {
