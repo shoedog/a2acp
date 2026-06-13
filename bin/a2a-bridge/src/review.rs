@@ -13,11 +13,12 @@ pub enum Verdict {
     Inconclusive,
 }
 
-/// Adaptive-depth tier. `thorough` is deferred (see the spec) — this slice has two tiers.
+/// Adaptive-depth tier. `thorough` = draft→refine double pass for large code/infra diffs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Light,
     Standard,
+    Thorough,
 }
 
 /// Operator depth choice. `Auto` sizes from the diff each attempt; `Forced` pins a tier.
@@ -28,51 +29,255 @@ pub enum Depth {
 }
 
 impl Depth {
-    /// Resolve to a concrete tier given this attempt's diff size + the config thresholds.
+    /// Resolve to a concrete tier. `Forced` always wins; `Auto` sizes from `sizing` when known, else
+    /// (git/parse failure) falls back to `Standard` — NEVER `Thorough` (the unknown-size fail-safe).
+    /// `sizing` is `(files, lines)` over code/infra only.
     pub fn resolve(
         self,
-        files: usize,
-        lines: usize,
+        sizing: Option<(usize, usize)>,
         light_max_lines: usize,
         light_max_files: usize,
+        thorough_min_lines: usize,
+        thorough_min_files: usize,
     ) -> Tier {
-        match self {
-            Depth::Forced(t) => t,
-            Depth::Auto => select_tier(files, lines, light_max_lines, light_max_files),
+        match (self, sizing) {
+            (Depth::Forced(t), _) => t,
+            (Depth::Auto, Some((files, lines))) => select_tier(
+                files,
+                lines,
+                light_max_lines,
+                light_max_files,
+                thorough_min_lines,
+                thorough_min_files,
+            ),
+            (Depth::Auto, None) => Tier::Standard,
         }
     }
 }
 
-/// PURE. light iff `files <= light_max_files` AND `lines <= light_max_lines` (params in signature order);
-/// else standard.
+/// PURE. light iff `files ≤ light_max_files` AND `lines ≤ light_max_lines`; else thorough iff
+/// `lines ≥ thorough_min_lines` OR `files ≥ thorough_min_files`; else standard. Light is checked first;
+/// config validation guarantees `thorough_min_* > light_max_*` so the bands cannot overlap.
 pub fn select_tier(
     files: usize,
     lines: usize,
     light_max_lines: usize,
     light_max_files: usize,
+    thorough_min_lines: usize,
+    thorough_min_files: usize,
 ) -> Tier {
     if lines <= light_max_lines && files <= light_max_files {
         Tier::Light
+    } else if lines >= thorough_min_lines || files >= thorough_min_files {
+        Tier::Thorough
     } else {
         Tier::Standard
     }
 }
 
-/// PURE. Parse `git diff --numstat` → (changed_files, added+deleted_lines). A binary row (`-\t-\t<path>`)
-/// counts toward files only. Malformed lines are skipped (the caller treats a total parse failure as standard).
-pub fn parse_numstat(stdout: &str) -> (usize, usize) {
-    let (mut files, mut lines) = (0usize, 0usize);
-    for row in stdout.lines() {
-        let mut cols = row.splitn(3, '\t');
-        let (Some(a), Some(d), Some(_path)) = (cols.next(), cols.next(), cols.next()) else {
+/// PURE. The workflow-id suffix for a tier (`Standard` = the base workflow, no suffix).
+pub fn tier_workflow_suffix(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Light => "-light",
+        Tier::Standard => "",
+        Tier::Thorough => "-thorough",
+    }
+}
+
+/// PURE. Does this path count toward review-depth sizing? Markdown, tests, lockfiles, and generated files
+/// are excluded so depth reflects the CODE+INFRA change. Ambiguous paths COUNT (bias toward review).
+pub fn counts_toward_depth(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    if lower.ends_with(".md") || lower.ends_with(".markdown") {
+        return false;
+    }
+    const LOCKFILES: &[&str] = &[
+        "cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "gemfile.lock",
+        "poetry.lock",
+        "pipfile.lock",
+        "composer.lock",
+        "go.sum",
+    ];
+    if LOCKFILES.contains(&file) || lower.ends_with(".lock") {
+        return false;
+    }
+    if lower.ends_with(".min.js")
+        || lower.ends_with(".min.css")
+        || lower.ends_with(".pb.go")
+        || lower.ends_with(".snap")
+        || lower.ends_with(".g.dart")
+        || lower.contains("_pb2.")
+        || lower.contains(".generated.")
+        || lower.contains("_generated.")
+    {
+        return false;
+    }
+    const TEST_DIRS: &[&str] = &[
+        "tests",
+        "test",
+        "__tests__",
+        "__mocks__",
+        "testdata",
+        "fixtures",
+    ];
+    const GEN_DIRS: &[&str] = &["node_modules", "vendor", "dist", "target", ".next"];
+    if lower
+        .split('/')
+        .any(|c| TEST_DIRS.contains(&c) || GEN_DIRS.contains(&c))
+    {
+        return false;
+    }
+    if file.contains("_test.")
+        || file.contains("_tests.")
+        || file.starts_with("test_")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+        || file.contains("_spec.")
+    {
+        return false;
+    }
+    true
+}
+
+/// PURE. Comment markers for a path's language (line-comment + block-open). Empty = strip nothing.
+fn comment_markers(path: &str) -> &'static [&'static str] {
+    let lower = path.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    if file == "dockerfile" || file == "containerfile" || file.ends_with(".dockerfile") {
+        return &["#"];
+    }
+    let ext = file.rsplit('.').next().unwrap_or("");
+    match ext {
+        "rs" => &["//"], // NOT `#` — `#[derive]`/`#![…]` attributes are CODE
+        "toml" | "yaml" | "yml" | "sh" | "bash" | "py" | "rb" | "cfg" | "ini" | "conf" => &["#"],
+        "c" | "h" | "cpp" | "hpp" | "cc" | "go" | "js" | "jsx" | "ts" | "tsx" | "java" | "kt"
+        | "swift" => &["//", "/*"],
+        "sql" | "lua" | "hs" => &["--"],
+        "html" | "xml" | "vue" | "svelte" => &["<!--"],
+        _ => &[],
+    }
+}
+
+/// PURE, path-aware. A changed line is "logical" unless blank or a leading comment for that language.
+/// Approximate LLOC (block-comment interiors and string-embedded markers are known, conservative limits).
+pub fn is_logical_line(path: &str, content: &str) -> bool {
+    let t = content.trim_start();
+    if t.is_empty() {
+        return false;
+    }
+    !comment_markers(path).iter().any(|m| t.starts_with(m))
+}
+
+/// PURE. Best-effort unquote of a Git C-quoted path (`"a/x\ty"`). With `core.quotePath=false` the only
+/// remaining escapes are control chars / quotes; anything undecoded falls through (fail-open → counts).
+fn unquote_path(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let inner = &s[1..s.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('t') => out.push('\t'),
+                    Some('n') => out.push('\n'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => out.push(other),
+                    None => {}
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+/// PURE. The path from a `--- <s>` / `+++ <s>` header: unquote, drop the `a/`/`b/` prefix, `/dev/null`→None.
+fn header_path(s: &str, side: char) -> Option<String> {
+    let s = s.trim();
+    if s == "/dev/null" {
+        return None;
+    }
+    let unq = unquote_path(s);
+    let prefix = format!("{side}/");
+    Some(unq.strip_prefix(&prefix).unwrap_or(&unq).to_string())
+}
+
+/// PURE, HUNK-STATEFUL + side-aware. Parse a unified-diff patch → (code_infra_files, lloc). File paths
+/// come from the header phase; lines are classified ONLY inside hunk phase by their leading byte. A `+`
+/// line is gated by the NEW path, a `-` line by the OLD path; a file counts iff it has ≥1 logical line.
+pub fn parse_diff_for_depth(patch: &str) -> (usize, usize) {
+    let mut files = 0usize;
+    let mut lloc = 0usize;
+    let mut old_path: Option<String> = None;
+    let mut new_path: Option<String> = None;
+    let mut file_logical = 0usize;
+    let mut in_hunk = false;
+
+    for raw in patch.lines() {
+        if raw.starts_with("diff --git ") {
+            if file_logical > 0 {
+                files += 1;
+                lloc += file_logical;
+            }
+            old_path = None;
+            new_path = None;
+            file_logical = 0;
+            in_hunk = false;
             continue;
-        };
-        files += 1;
-        if let (Ok(added), Ok(deleted)) = (a.parse::<usize>(), d.parse::<usize>()) {
-            lines += added + deleted;
+        }
+        if !in_hunk {
+            if let Some(p) = raw.strip_prefix("--- ") {
+                old_path = header_path(p, 'a');
+            } else if let Some(p) = raw.strip_prefix("+++ ") {
+                new_path = header_path(p, 'b');
+            } else if let Some(p) = raw.strip_prefix("rename from ") {
+                old_path = Some(unquote_path(p));
+            } else if let Some(p) = raw.strip_prefix("rename to ") {
+                new_path = Some(unquote_path(p));
+            } else if let Some(p) = raw.strip_prefix("copy from ") {
+                old_path = Some(unquote_path(p));
+            } else if let Some(p) = raw.strip_prefix("copy to ") {
+                new_path = Some(unquote_path(p));
+            } else if raw.starts_with("@@") {
+                in_hunk = true;
+            }
+            continue;
+        }
+        match raw.as_bytes().first().copied() {
+            None => {}
+            Some(b'@') if raw.starts_with("@@") => {}
+            Some(b'\\') => {}
+            Some(b'+') => {
+                let p = new_path.as_deref().unwrap_or("");
+                if counts_toward_depth(p) && is_logical_line(p, &raw[1..]) {
+                    file_logical += 1;
+                }
+            }
+            Some(b'-') => {
+                let p = old_path.as_deref().unwrap_or("");
+                if counts_toward_depth(p) && is_logical_line(p, &raw[1..]) {
+                    file_logical += 1;
+                }
+            }
+            Some(b' ') => {}
+            Some(_) => in_hunk = false,
         }
     }
-    (files, lines)
+    if file_logical > 0 {
+        files += 1;
+        lloc += file_logical;
+    }
+    (files, lloc)
 }
 
 /// PURE. The slice reference-file path, UNDER `.git/` so it survives `git reset --hard && git clean -fdq`,
@@ -157,16 +362,18 @@ pub fn parse_verdict(synth: &str) -> (Verdict, String) {
     (footer, summary)
 }
 
-/// PURE. Reduce drained workflow events → (completed, terminal_output, reviewers_failed). Extracted from
-/// the impure drain so the riskiest reduction is unit-tested (the B2b-2 keystone pattern). A failed
-/// non-`synth` node = a failed reviewer leg (diversity collapse, surfaced in the suffix).
+/// PURE. Reduce drained workflow events → (completed, terminal_output, failed_reviewer_legs). A failed
+/// non-`synth` node is a degraded reviewer leg; draft + refine of the same leg dedup (strip `_draft`).
 pub fn reduce(events: &[bridge_workflow::executor::WorkflowEvent]) -> (bool, String, usize) {
     use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
-    let (mut completed, mut output, mut failed) = (false, String::new(), 0usize);
+    let (mut completed, mut output) = (false, String::new());
+    let mut failed_legs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for e in events {
         match e {
             WorkflowEvent::NodeFinished { node, ok, .. } if !ok && node.as_str() != "synth" => {
-                failed += 1
+                let id = node.as_str();
+                let leg = id.strip_suffix("_draft").unwrap_or(id);
+                failed_legs.insert(leg.to_string());
             }
             WorkflowEvent::Terminal { outcome, output: o } => {
                 completed = matches!(outcome, WorkflowOutcome::Completed);
@@ -175,7 +382,7 @@ pub fn reduce(events: &[bridge_workflow::executor::WorkflowEvent]) -> (bool, Str
             _ => {}
         }
     }
-    (completed, output, failed)
+    (completed, output, failed_legs.len())
 }
 
 /// PURE. The `{{input}}` the reviewers + synth see: the task + both host-resolved SHAs + the explicit
@@ -337,29 +544,181 @@ mod tests {
     }
 
     #[test]
-    fn parse_numstat_sums_added_deleted_and_counts_files() {
-        let out = "3\t1\tsrc/a.rs\n10\t0\tsrc/b.rs\n-\t-\tlogo.png\n";
-        assert_eq!(parse_numstat(out), (3, 14));
-    }
-    #[test]
-    fn parse_numstat_empty_is_zero() {
-        assert_eq!(parse_numstat(""), (0, 0));
+    fn counts_toward_depth_excludes_docs_tests_locks_generated() {
+        assert!(counts_toward_depth("src/main.rs"));
+        assert!(counts_toward_depth("deploy/Containerfile"));
+        assert!(counts_toward_depth("config/app.toml"));
+        // ambiguous dirs still count (bias toward review)
+        assert!(counts_toward_depth("src/build/mod.rs"));
+        assert!(counts_toward_depth("src/gen/codegen.rs"));
+        // excluded
+        assert!(!counts_toward_depth("docs/x.md"));
+        assert!(!counts_toward_depth("README.markdown"));
+        assert!(!counts_toward_depth("tests/it.rs"));
+        assert!(!counts_toward_depth("src/foo_test.go"));
+        assert!(!counts_toward_depth("pkg/api.test.ts"));
+        assert!(!counts_toward_depth("Cargo.lock"));
+        assert!(!counts_toward_depth("frontend/yarn.lock"));
+        assert!(!counts_toward_depth("go.sum"));
+        assert!(!counts_toward_depth("web/app.min.js"));
+        assert!(!counts_toward_depth("api/user.pb.go"));
+        assert!(!counts_toward_depth("node_modules/x/index.js"));
+        assert!(!counts_toward_depth("vendor/lib/x.go"));
     }
 
     #[test]
-    fn select_tier_light_requires_both_under_thresholds() {
-        assert_eq!(select_tier(2, 10, 15, 2), Tier::Light);
-        assert_eq!(select_tier(2, 15, 15, 2), Tier::Light);
-        assert_eq!(select_tier(3, 10, 15, 2), Tier::Standard);
-        assert_eq!(select_tier(1, 16, 15, 2), Tier::Standard);
+    fn is_logical_line_is_path_aware() {
+        // Rust: attributes are CODE (not comments); // is a comment.
+        assert!(is_logical_line("src/a.rs", "#[derive(Debug)]"));
+        assert!(is_logical_line("src/a.rs", "#![allow(dead_code)]"));
+        assert!(!is_logical_line("src/a.rs", "// a comment"));
+        assert!(is_logical_line("src/a.rs", "    *ptr = x;")); // leading * deref counts
+                                                               // toml/yaml/sh/Dockerfile: # is a comment.
+        assert!(!is_logical_line("a.toml", "# c"));
+        assert!(!is_logical_line("Dockerfile", "# syntax=docker"));
+        assert!(!is_logical_line(
+            "Containerfile",
+            "# syntax=docker/dockerfile:1"
+        ));
+        assert!(is_logical_line("a.toml", "key = 1"));
+        assert!(is_logical_line("Containerfile", "RUN echo ok"));
+        // sql: -- is a comment but counts in .rs
+        assert!(!is_logical_line("q.sql", "-- comment"));
+        assert!(is_logical_line("src/a.rs", "x -= 1;"));
+        // blanks excluded everywhere; unknown ext strips nothing.
+        assert!(!is_logical_line("src/a.rs", "   "));
+        assert!(is_logical_line(
+            "data.bin",
+            "# not stripped for unknown ext"
+        ));
     }
+
     #[test]
-    fn resolve_depth_forced_overrides_auto() {
+    fn parse_diff_for_depth_counts_code_infra_lloc_only() {
+        let patch = "\
+diff --git a/src/a.rs b/src/a.rs
+index 1..2 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,2 +1,4 @@
+ fn x() {}
++#[derive(Debug)]
++struct B;
++// just a comment
++
+diff --git a/docs/readme.md b/docs/readme.md
+--- a/docs/readme.md
++++ b/docs/readme.md
+@@ -1 +1,9 @@
++lots of docs lines that must NOT count
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1 +1,40 @@
++churn churn
+";
+        // a.rs: #[derive] + struct B count (2); comment + blank excluded. docs + lock excluded.
+        assert_eq!(parse_diff_for_depth(patch), (1, 2));
+    }
+
+    #[test]
+    fn parse_diff_for_depth_hunk_stateful_does_not_misread_content() {
+        // A removed YAML `---` renders as `----`; an added `+++` as `++++`; must count as changed lines,
+        // not be misread as file headers.
+        let patch = "\
+diff --git a/k8s/x.yaml b/k8s/x.yaml
+--- a/k8s/x.yaml
++++ b/k8s/x.yaml
+@@ -1,2 +1,2 @@
+-name: a
++++++name: b
+";
+        // one removed `-name: a` (logical) + one added `+++++name: b` (logical) = 2 lines, 1 file.
+        assert_eq!(parse_diff_for_depth(patch), (1, 2));
+    }
+
+    #[test]
+    fn parse_diff_for_depth_rename_out_of_code_counts_removals() {
+        // src/a.rs renamed to docs/a.md WITH an edit: the new path is excluded (docs), but the old path
+        // is code, so removed lines count; the added doc line does not.
+        let patch = "\
+diff --git a/src/a.rs b/docs/a.md
+similarity index 60%
+rename from src/a.rs
+rename to docs/a.md
+--- a/src/a.rs
++++ b/docs/a.md
+@@ -1,2 +1,1 @@
+-fn gone() {}
+-let removed = 1;
++now docs
+";
+        assert_eq!(parse_diff_for_depth(patch), (1, 2));
+    }
+
+    #[test]
+    fn parse_diff_for_depth_pure_rename_and_binary_are_zero() {
+        let patch = "\
+diff --git a/src/a.rs b/src/b.rs
+similarity index 100%
+rename from src/a.rs
+rename to src/b.rs
+diff --git a/logo.png b/logo.png
+index 1..2 100644
+Binary files a/logo.png and b/logo.png differ
+";
+        assert_eq!(parse_diff_for_depth(patch), (0, 0));
+    }
+
+    #[test]
+    fn parse_diff_for_depth_quoted_md_path_excluded() {
+        let patch = "\
+diff --git \"a/docs/a b.md\" \"b/docs/a b.md\"
+--- \"a/docs/a b.md\"
++++ \"b/docs/a b.md\"
+@@ -1 +1,2 @@
++a doc line
+";
+        assert_eq!(parse_diff_for_depth(patch), (0, 0));
+    }
+
+    #[test]
+    fn select_tier_three_way() {
+        // signature: (files, lines, light_max_lines, light_max_files, thorough_min_lines, thorough_min_files)
+        // light: both under
+        assert_eq!(select_tier(2, 15, 15, 2, 150, 6), Tier::Light);
+        // standard: in the band
+        assert_eq!(select_tier(3, 16, 15, 2, 150, 6), Tier::Standard);
+        assert_eq!(select_tier(5, 149, 15, 2, 150, 6), Tier::Standard);
+        // thorough by lines OR files
+        assert_eq!(select_tier(1, 150, 15, 2, 150, 6), Tier::Thorough);
+        assert_eq!(select_tier(6, 10, 15, 2, 150, 6), Tier::Thorough);
+    }
+
+    #[test]
+    fn resolve_forced_wins_and_unknown_is_standard() {
+        // Forced always wins, even with no sizing.
         assert_eq!(
-            Depth::Forced(Tier::Standard).resolve(0, 0, 15, 2),
-            Tier::Standard
+            Depth::Forced(Tier::Thorough).resolve(None, 15, 2, 150, 6),
+            Tier::Thorough
         );
-        assert_eq!(Depth::Auto.resolve(0, 0, 15, 2), Tier::Light);
+        assert_eq!(
+            Depth::Forced(Tier::Light).resolve(Some((9, 9)), 15, 2, 150, 6),
+            Tier::Light
+        );
+        // Auto + Some sizes; Auto + None (git/parse failure) → Standard fail-safe (NOT Thorough).
+        assert_eq!(
+            Depth::Auto.resolve(Some((0, 0)), 15, 2, 150, 6),
+            Tier::Light
+        );
+        assert_eq!(Depth::Auto.resolve(None, 15, 2, 150, 6), Tier::Standard);
+    }
+
+    #[test]
+    fn tier_workflow_suffix_maps_all_tiers() {
+        assert_eq!(tier_workflow_suffix(Tier::Light), "-light");
+        assert_eq!(tier_workflow_suffix(Tier::Standard), "");
+        assert_eq!(tier_workflow_suffix(Tier::Thorough), "-thorough");
     }
 
     #[test]
@@ -426,5 +785,38 @@ mod tests {
         assert!(completed);
         assert_eq!(failed, 1); // codex leg failed; a synth failure would NOT count as a reviewer
         assert!(output.contains("VERDICT: APPROVE"));
+    }
+
+    #[test]
+    fn reduce_dedups_draft_and_refine_into_one_leg() {
+        use bridge_core::ids::NodeId;
+        use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+        let fail = |id: &str| WorkflowEvent::NodeFinished {
+            node: NodeId::parse(id).unwrap(),
+            ok: false,
+            output: String::new(),
+        };
+        let term = WorkflowEvent::Terminal {
+            outcome: WorkflowOutcome::Completed,
+            output: "VERDICT: APPROVE".into(),
+        };
+        // codex leg collapses at the DRAFT only (refine then "succeeds" on garbage) → still 1 failed leg.
+        let ev = vec![fail("reviewer_codex_draft"), term.clone()];
+        assert_eq!(reduce(&ev).2, 1);
+        // both draft + refine fail → deduped to 1.
+        let ev2 = vec![
+            fail("reviewer_codex_draft"),
+            fail("reviewer_codex"),
+            term.clone(),
+        ];
+        assert_eq!(reduce(&ev2).2, 1);
+        // standard: two distinct reviewer ids → 2; a synth failure never counts.
+        let ev3 = vec![
+            fail("reviewer_codex"),
+            fail("reviewer_claude"),
+            fail("synth"),
+            term,
+        ];
+        assert_eq!(reduce(&ev3).2, 2);
     }
 }

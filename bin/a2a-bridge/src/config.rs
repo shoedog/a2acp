@@ -493,6 +493,14 @@ fn default_light_max_files() -> usize {
     2
 }
 
+fn default_thorough_min_lines() -> usize {
+    150
+}
+
+fn default_thorough_min_files() -> usize {
+    6
+}
+
 /// `[review]` (Slice B2b-3a): the review-the-diff workflow run after `implement` commits + verifies.
 /// Only NAMES a workflow id (model is an agent-level property); absent → review skipped.
 #[derive(Debug, serde::Deserialize)]
@@ -513,6 +521,10 @@ pub struct ReviewToml {
     pub light_max_lines: usize,
     #[serde(default = "default_light_max_files")]
     pub light_max_files: usize,
+    #[serde(default = "default_thorough_min_lines")]
+    pub thorough_min_lines: usize,
+    #[serde(default = "default_thorough_min_files")]
+    pub thorough_min_files: usize,
 }
 
 /// Parsed `[review]`: the workflow id is parsed (validated) HERE, pre-commit, so the post-commit lookup is
@@ -527,6 +539,8 @@ pub struct ReviewConfig {
     pub slice_max_bytes: usize,
     pub light_max_lines: usize,
     pub light_max_files: usize,
+    pub thorough_min_lines: usize,
+    pub thorough_min_files: usize,
 }
 
 fn shellexpand_tilde(p: &str) -> String {
@@ -553,6 +567,13 @@ impl ReviewToml {
                 "[review] light_max_lines/light_max_files must be > 0".into(),
             ));
         }
+        if self.thorough_min_lines <= self.light_max_lines
+            || self.thorough_min_files <= self.light_max_files
+        {
+            return Err(ConfigError::Registry(
+                "[review] thorough_min_lines/thorough_min_files must be > light_max_lines/light_max_files".into(),
+            ));
+        }
         if self.slice_timeout_secs == 0 || self.slice_max_bytes == 0 {
             return Err(ConfigError::Registry(
                 "[review] slice_timeout_secs/slice_max_bytes must be > 0".into(),
@@ -568,6 +589,8 @@ impl ReviewToml {
             slice_max_bytes: self.slice_max_bytes,
             light_max_lines: self.light_max_lines,
             light_max_files: self.light_max_files,
+            thorough_min_lines: self.thorough_min_lines,
+            thorough_min_files: self.thorough_min_files,
         })
     }
 }
@@ -2112,7 +2135,16 @@ path = "/tmp/x.db"
         let c = t.to_config().unwrap();
         assert_eq!(c.light_max_lines, 15);
         assert_eq!(c.light_max_files, 2);
+        assert_eq!(c.thorough_min_lines, 150);
+        assert_eq!(c.thorough_min_files, 6);
         assert!(c.slice_cmd.to_string_lossy().ends_with("prism"));
+    }
+
+    #[test]
+    fn review_toml_rejects_unordered_bands() {
+        let t: ReviewToml =
+            toml::from_str("workflow=\"r\"\nlight_max_lines=200\nthorough_min_lines=100").unwrap();
+        assert!(t.to_config().is_err());
     }
 
     #[test]
@@ -2133,7 +2165,7 @@ path = "/tmp/x.db"
     fn review_toml_explicit_values_round_trip() {
         // Guards against `to_config` hard-coding a default instead of reading `self.<field>`.
         let t: ReviewToml = toml::from_str(
-            "workflow=\"r\"\nslice_timeout_secs=30\nslice_max_bytes=4096\nlight_max_lines=100\nlight_max_files=9",
+            "workflow=\"r\"\nslice_timeout_secs=30\nslice_max_bytes=4096\nlight_max_lines=100\nlight_max_files=9\nthorough_min_lines=250\nthorough_min_files=12",
         )
         .unwrap();
         let c = t.to_config().unwrap();
@@ -2141,6 +2173,8 @@ path = "/tmp/x.db"
         assert_eq!(c.slice_max_bytes, 4096);
         assert_eq!(c.light_max_lines, 100);
         assert_eq!(c.light_max_files, 9);
+        assert_eq!(c.thorough_min_lines, 250);
+        assert_eq!(c.thorough_min_files, 12);
     }
 
     #[test]

@@ -662,6 +662,7 @@ fn depth_to_forced_str(d: review::Depth) -> Option<String> {
     match d {
         review::Depth::Forced(review::Tier::Light) => Some("light".into()),
         review::Depth::Forced(review::Tier::Standard) => Some("standard".into()),
+        review::Depth::Forced(review::Tier::Thorough) => Some("thorough".into()),
         review::Depth::Auto => None,
     }
 }
@@ -964,6 +965,46 @@ fn runtimes_to_probe(
     runtimes
 }
 
+/// Resolve `<base><suffix>` from the loaded workflows; warn + fall back to the base (standard) workflow
+/// when the variant is absent. Slice presence still follows the TIER, not the resolved workflow.
+fn variant_or_fallback(
+    wf_map: &std::collections::HashMap<
+        bridge_core::ids::WorkflowId,
+        std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
+    >,
+    base: &bridge_core::ids::WorkflowId,
+    suffix: &str,
+) -> bridge_core::ids::WorkflowId {
+    match bridge_core::ids::WorkflowId::parse(format!("{}{}", base.as_str(), suffix))
+        .ok()
+        .filter(|id| wf_map.contains_key(id))
+    {
+        Some(id) => id,
+        None => {
+            eprintln!(
+                "[implement] review: no {}{} variant; falling back to standard workflow",
+                base.as_str(),
+                suffix
+            );
+            base.clone()
+        }
+    }
+}
+
+/// PURE. The production git args for review-depth sizing. Force rename detection so pure renames do not
+/// degrade into full delete+add hunks when repo config disables `diff.renames`.
+fn review_sizing_diff_args(base_sha: &str, head_sha: &str) -> Vec<String> {
+    vec![
+        "-c".into(),
+        "core.quotePath=false".into(),
+        "diff".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+        "--find-renames".into(),
+        format!("{base_sha}..{head_sha}"),
+    ]
+}
+
 /// Run the B2b-3a review once (total). Returns `(outcome, synth_body)`. Fresh `CancellationToken` + `select!`
 /// timeout→cancel→keep-drain PER call (so the `:ro` reaper still fires on a timed-out attempt). `run_id` is
 /// qualified by `attempt`. `depth` selects the workflow tier (Auto=size-based; Forced overrides). `slice`
@@ -996,36 +1037,34 @@ async fn run_review_step(
 
     // Size the committed diff (auto recompute each attempt). git/parse/timeout failure → standard (safe).
     let clone_path = std::path::Path::new(clone_cwd.as_str());
-    let (files, lines) = match tokio::time::timeout(
+    let sizing: Option<(usize, usize)> = match tokio::time::timeout(
         rcfg.slice_timeout,
         tokio::process::Command::new("git")
             .current_dir(clone_path)
-            .args([
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--numstat",
-                &format!("{base_sha}..{head_sha}"),
-            ])
+            .args(review_sizing_diff_args(base_sha, head_sha))
             .output(),
     )
     .await
     {
-        Ok(Ok(o)) if o.status.success() => {
-            review::parse_numstat(&String::from_utf8_lossy(&o.stdout))
-        }
+        Ok(Ok(o)) if o.status.success() => Some(review::parse_diff_for_depth(
+            &String::from_utf8_lossy(&o.stdout),
+        )),
         _ => {
-            eprintln!(
-                "[implement] review: numstat failed or timed out; defaulting to standard tier"
-            );
-            (usize::MAX, usize::MAX)
+            eprintln!("[implement] review: diff sizing failed or timed out; sizing unknown → standard tier");
+            None
         }
     };
-    let tier = depth.resolve(files, lines, rcfg.light_max_lines, rcfg.light_max_files);
+    let tier = depth.resolve(
+        sizing,
+        rcfg.light_max_lines,
+        rcfg.light_max_files,
+        rcfg.thorough_min_lines,
+        rcfg.thorough_min_files,
+    );
 
-    // Slice prep ONLY for standard; write under .git/ (survives reset/clean). Degrade to None.
+    // Slice prep for non-light tiers; write under .git/ (survives reset/clean). Degrade to None.
     let runid = format!("{task_id}-{attempt}");
-    let slice_ref: Option<String> = if tier == review::Tier::Standard {
+    let slice_ref: Option<String> = if tier != review::Tier::Light {
         let refp = review::slice_ref_path(clone_path, &runid);
         match slice
             .produce(
@@ -1053,19 +1092,11 @@ async fn run_review_step(
         None
     };
 
-    // Select the workflow variant by tier: standard → rcfg.workflow; light → <workflow>-light (fallback+warn).
+    // Select the workflow variant by tier: standard → base; light/thorough → <base>-<suffix> (fallback+warn).
     let graph_id = match tier {
         review::Tier::Standard => rcfg.workflow.clone(),
-        review::Tier::Light => {
-            let light =
-                bridge_core::ids::WorkflowId::parse(format!("{}-light", rcfg.workflow.as_str()));
-            match light.ok().filter(|id| wf_map.contains_key(id)) {
-                Some(id) => id,
-                None => {
-                    eprintln!("[implement] review: no {}-light variant; falling back to standard workflow", rcfg.workflow.as_str());
-                    rcfg.workflow.clone()
-                }
-            }
+        review::Tier::Light | review::Tier::Thorough => {
+            variant_or_fallback(wf_map, &rcfg.workflow, review::tier_workflow_suffix(tier))
         }
     };
     let Some(graph) = wf_map.get(&graph_id).cloned() else {
@@ -4144,6 +4175,14 @@ cmd = "true"
         ])
         .is_err());
         assert!(super::parse_implement_args(&["do X".into()]).is_err());
+    }
+
+    #[test]
+    fn review_sizing_diff_args_force_rename_detection() {
+        let args = super::review_sizing_diff_args("base", "head");
+        assert!(args.iter().any(|a| a == "--find-renames"));
+        assert!(args.iter().any(|a| a == "core.quotePath=false"));
+        assert_eq!(args.last().map(String::as_str), Some("base..head"));
     }
 
     #[test]
