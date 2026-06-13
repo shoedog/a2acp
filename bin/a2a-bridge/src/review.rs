@@ -34,6 +34,21 @@ pub fn select_tier(files: usize, lines: usize, light_max_lines: usize, light_max
     if lines <= light_max_lines && files <= light_max_files { Tier::Light } else { Tier::Standard }
 }
 
+/// PURE. Parse `git diff --numstat` → (changed_files, added+deleted_lines). A binary row (`-\t-\t<path>`)
+/// counts toward files only. Malformed lines are skipped (the caller treats a total parse failure as standard).
+pub fn parse_numstat(stdout: &str) -> (usize, usize) {
+    let (mut files, mut lines) = (0usize, 0usize);
+    for row in stdout.lines() {
+        let mut cols = row.splitn(3, '\t');
+        let (Some(a), Some(d), Some(_path)) = (cols.next(), cols.next(), cols.next()) else { continue };
+        files += 1;
+        if let (Ok(added), Ok(deleted)) = (a.parse::<usize>(), d.parse::<usize>()) {
+            lines += added + deleted;
+        }
+    }
+    (files, lines)
+}
+
 /// The review step's terminal state. Every post-commit failure maps here (no `?` past the commit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewOutcome {
@@ -253,6 +268,14 @@ mod tests {
         let i = build_review_input("do X", "aaa", "bbb");
         assert!(i.contains("do X") && i.contains("git diff aaa..bbb") && i.contains("DELIVER"));
     }
+
+    #[test]
+    fn parse_numstat_sums_added_deleted_and_counts_files() {
+        let out = "3\t1\tsrc/a.rs\n10\t0\tsrc/b.rs\n-\t-\tlogo.png\n";
+        assert_eq!(parse_numstat(out), (3, 14));
+    }
+    #[test]
+    fn parse_numstat_empty_is_zero() { assert_eq!(parse_numstat(""), (0, 0)); }
 
     #[test]
     fn select_tier_light_requires_both_under_thresholds() {
