@@ -3,6 +3,8 @@
 //! verdict classification + event reduction + hand-off suffix (mirrors verify.rs); the workflow RUN is
 //! impure (live-gated).
 
+use std::path::{Path, PathBuf};
+
 /// The verdict. Inconclusive is the fail-safe — NEVER inferred Approve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -47,6 +49,12 @@ pub fn parse_numstat(stdout: &str) -> (usize, usize) {
         }
     }
     (files, lines)
+}
+
+/// PURE. The slice reference-file path, UNDER `.git/` so it survives `git reset --hard && git clean -fdq`,
+/// never dirties the worktree, never blocks `--resume`, and is invisible to the write-capable fix turn.
+pub fn slice_ref_path(clone: &Path, runid: &str) -> PathBuf {
+    clone.join(".git/a2a-bridge/review-slices").join(format!("slice-{runid}.md"))
 }
 
 /// The review step's terminal state. Every post-commit failure maps here (no `?` past the commit).
@@ -267,6 +275,12 @@ mod tests {
     fn build_input_has_task_and_both_shas_and_diff() {
         let i = build_review_input("do X", "aaa", "bbb");
         assert!(i.contains("do X") && i.contains("git diff aaa..bbb") && i.contains("DELIVER"));
+    }
+
+    #[test]
+    fn slice_ref_path_lives_under_git_a2a_bridge() {
+        let p = slice_ref_path(std::path::Path::new("/clone"), "task-7-1");
+        assert_eq!(p, std::path::PathBuf::from("/clone/.git/a2a-bridge/review-slices/slice-task-7-1.md"));
     }
 
     #[test]
