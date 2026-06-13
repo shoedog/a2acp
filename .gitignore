@@ -15,3 +15,6 @@
 /a2a-bridge.toml
 *.db
 *.db.lock
+
+# Nested crate/fixture build outputs (e.g. test fixtures) — the bare /target/ above only covers the root.
+**/target/
