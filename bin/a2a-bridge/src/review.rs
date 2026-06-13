@@ -29,6 +29,39 @@ pub enum Depth {
 }
 
 impl Depth {
+    /// Parse a `--depth` / `default_depth` value. "auto" -> Auto, else Forced(tier); unknown -> Err.
+    pub fn parse_flag(s: &str) -> Result<Depth, String> {
+        match s {
+            "auto" => Ok(Depth::Auto),
+            "light" => Ok(Depth::Forced(Tier::Light)),
+            "standard" => Ok(Depth::Forced(Tier::Standard)),
+            "thorough" => Ok(Depth::Forced(Tier::Thorough)),
+            other => Err(format!(
+                "--depth: unknown value {other:?} (expected auto|light|standard|thorough)"
+            )),
+        }
+    }
+
+    /// Reconstruct from a checkpoint `forced_depth` string; `None`/unknown -> Auto.
+    pub fn from_forced_str(s: Option<&str>) -> Depth {
+        match s {
+            Some("light") => Depth::Forced(Tier::Light),
+            Some("standard") => Depth::Forced(Tier::Standard),
+            Some("thorough") => Depth::Forced(Tier::Thorough),
+            _ => Depth::Auto,
+        }
+    }
+
+    /// Serialize to a checkpoint `forced_depth` string; Auto -> None.
+    pub fn to_forced_str(self) -> Option<String> {
+        match self {
+            Depth::Forced(Tier::Light) => Some("light".into()),
+            Depth::Forced(Tier::Standard) => Some("standard".into()),
+            Depth::Forced(Tier::Thorough) => Some("thorough".into()),
+            Depth::Auto => None,
+        }
+    }
+
     /// Resolve to a concrete tier. `Forced` always wins; `Auto` sizes from `sizing` when known, else
     /// (git/parse failure) falls back to `Standard` — NEVER `Thorough` (the unknown-size fail-safe).
     /// `sizing` is `(files, lines)` over code/infra only.
@@ -719,6 +752,34 @@ diff --git \"a/docs/a b.md\" \"b/docs/a b.md\"
         assert_eq!(tier_workflow_suffix(Tier::Light), "-light");
         assert_eq!(tier_workflow_suffix(Tier::Standard), "");
         assert_eq!(tier_workflow_suffix(Tier::Thorough), "-thorough");
+    }
+
+    #[test]
+    fn depth_parse_flag_and_forced_str_round_trip() {
+        assert_eq!(Depth::parse_flag("auto"), Ok(Depth::Auto));
+        assert_eq!(Depth::parse_flag("light"), Ok(Depth::Forced(Tier::Light)));
+        assert_eq!(
+            Depth::parse_flag("standard"),
+            Ok(Depth::Forced(Tier::Standard))
+        );
+        assert_eq!(
+            Depth::parse_flag("thorough"),
+            Ok(Depth::Forced(Tier::Thorough))
+        );
+        assert!(Depth::parse_flag("bogus").is_err());
+
+        assert_eq!(
+            Depth::from_forced_str(Some("thorough")),
+            Depth::Forced(Tier::Thorough)
+        );
+        assert_eq!(Depth::from_forced_str(None), Depth::Auto);
+        assert_eq!(Depth::from_forced_str(Some("bogus")), Depth::Auto);
+
+        assert_eq!(
+            Depth::Forced(Tier::Thorough).to_forced_str(),
+            Some("thorough".to_string())
+        );
+        assert_eq!(Depth::Auto.to_forced_str(), None);
     }
 
     #[test]

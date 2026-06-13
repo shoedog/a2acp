@@ -501,6 +501,10 @@ fn default_thorough_min_files() -> usize {
     6
 }
 
+fn default_depth_str() -> String {
+    "auto".to_string()
+}
+
 /// `[review]` (Slice B2b-3a): the review-the-diff workflow run after `implement` commits + verifies.
 /// Only NAMES a workflow id (model is an agent-level property); absent → review skipped.
 #[derive(Debug, serde::Deserialize)]
@@ -525,6 +529,8 @@ pub struct ReviewToml {
     pub thorough_min_lines: usize,
     #[serde(default = "default_thorough_min_files")]
     pub thorough_min_files: usize,
+    #[serde(default = "default_depth_str")]
+    pub default_depth: String,
 }
 
 /// Parsed `[review]`: the workflow id is parsed (validated) HERE, pre-commit, so the post-commit lookup is
@@ -541,6 +547,7 @@ pub struct ReviewConfig {
     pub light_max_files: usize,
     pub thorough_min_lines: usize,
     pub thorough_min_files: usize,
+    pub default_depth: crate::review::Depth,
 }
 
 fn shellexpand_tilde(p: &str) -> String {
@@ -574,6 +581,8 @@ impl ReviewToml {
                 "[review] thorough_min_lines/thorough_min_files must be > light_max_lines/light_max_files".into(),
             ));
         }
+        let default_depth = crate::review::Depth::parse_flag(&self.default_depth)
+            .map_err(|e| ConfigError::Registry(format!("[review] default_depth: {e}")))?;
         if self.slice_timeout_secs == 0 || self.slice_max_bytes == 0 {
             return Err(ConfigError::Registry(
                 "[review] slice_timeout_secs/slice_max_bytes must be > 0".into(),
@@ -591,6 +600,7 @@ impl ReviewToml {
             light_max_files: self.light_max_files,
             thorough_min_lines: self.thorough_min_lines,
             thorough_min_files: self.thorough_min_files,
+            default_depth,
         })
     }
 }
@@ -2137,6 +2147,7 @@ path = "/tmp/x.db"
         assert_eq!(c.light_max_files, 2);
         assert_eq!(c.thorough_min_lines, 150);
         assert_eq!(c.thorough_min_files, 6);
+        assert_eq!(c.default_depth, crate::review::Depth::Auto);
         assert!(c.slice_cmd.to_string_lossy().ends_with("prism"));
     }
 
@@ -2165,7 +2176,7 @@ path = "/tmp/x.db"
     fn review_toml_explicit_values_round_trip() {
         // Guards against `to_config` hard-coding a default instead of reading `self.<field>`.
         let t: ReviewToml = toml::from_str(
-            "workflow=\"r\"\nslice_timeout_secs=30\nslice_max_bytes=4096\nlight_max_lines=100\nlight_max_files=9\nthorough_min_lines=250\nthorough_min_files=12",
+            "workflow=\"r\"\nslice_timeout_secs=30\nslice_max_bytes=4096\nlight_max_lines=100\nlight_max_files=9\nthorough_min_lines=250\nthorough_min_files=12\ndefault_depth=\"thorough\"",
         )
         .unwrap();
         let c = t.to_config().unwrap();
@@ -2175,6 +2186,10 @@ path = "/tmp/x.db"
         assert_eq!(c.light_max_files, 9);
         assert_eq!(c.thorough_min_lines, 250);
         assert_eq!(c.thorough_min_files, 12);
+        assert_eq!(
+            c.default_depth,
+            crate::review::Depth::Forced(crate::review::Tier::Thorough)
+        );
     }
 
     #[test]

@@ -615,57 +615,22 @@ struct ImplementArgs {
     merge: bool,
     /// `--onto <branch>`: the merge target (when `--merge`); else `[merge].target_ref` / `base_ref`.
     onto: Option<String>,
-    /// `--depth light|standard`: override adaptive review depth (default: Auto).
-    depth: review::Depth,
+    /// `--depth auto|light|standard|thorough`: None means use `[review].default_depth`.
+    depth: Option<review::Depth>,
 }
 
 const IMPLEMENT_USAGE: &str = "\
-usage: a2a-bridge implement <task> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth light|standard]
+usage: a2a-bridge implement <task> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth auto|light|standard|thorough]
        a2a-bridge implement --resume <id> [--config <path>]
   <task>          what to implement (a sentence/paragraph the agent acts on)
   --repo <path>   the repo to implement in; cloned into a quarantine under allowed_cwd_root (required)
   --config <path> registry config defining the impl agent + [implement]/[verify]/[review] (default: ./a2a-bridge.toml)
   --base-ref      branch/SHA to start from (default: the repo HEAD)
   --workflow <id> the edit workflow (default: implement-edit)
-  --depth         review depth: light|standard (default: auto-select by diff size; thorough deferred)
+  --depth         review depth: auto|light|standard|thorough (default: [review].default_depth, else auto)
   --resume <id>   resume a stranded run by its <id> (the clone dir name)
 Clones --repo, runs the warm containerized impl agent (edit+fix turns share one container+session),
 verifies, reviews the diff, and hands off a branch to merge.";
-
-fn parse_depth_flag(v: Option<&str>) -> Result<review::Depth, BoxError> {
-    match v {
-        None => Ok(review::Depth::Auto),
-        Some("light") => Ok(review::Depth::Forced(review::Tier::Light)),
-        Some("standard") => Ok(review::Depth::Forced(review::Tier::Standard)),
-        Some("thorough") => {
-            Err("--depth thorough is not yet supported (deferred); use light|standard".into())
-        }
-        Some(other) => {
-            Err(format!("--depth: unknown value {other:?} (expected light|standard)").into())
-        }
-    }
-}
-
-/// Reconstruct a `review::Depth` from a checkpoint's `forced_depth` string.
-/// `Some("light")`→`Forced(Light)`, `Some("standard")`→`Forced(Standard)`, anything else/`None`→`Auto`.
-fn depth_from_checkpoint(forced_depth: Option<&str>) -> review::Depth {
-    match forced_depth {
-        Some("light") => review::Depth::Forced(review::Tier::Light),
-        Some("standard") => review::Depth::Forced(review::Tier::Standard),
-        _ => review::Depth::Auto,
-    }
-}
-
-/// Serialize a `review::Depth` back to the checkpoint's `forced_depth` string.
-/// `Forced(Light)`→`Some("light")`, `Forced(Standard)`→`Some("standard")`, `Auto`→`None`.
-fn depth_to_forced_str(d: review::Depth) -> Option<String> {
-    match d {
-        review::Depth::Forced(review::Tier::Light) => Some("light".into()),
-        review::Depth::Forced(review::Tier::Standard) => Some("standard".into()),
-        review::Depth::Forced(review::Tier::Thorough) => Some("thorough".into()),
-        review::Depth::Auto => None,
-    }
-}
 
 fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     if args.first().map(String::as_str) == Some("--resume") {
@@ -700,7 +665,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
                 }
                 "--depth" => {
                     let val = args.get(i + 1).ok_or("implement: --depth needs a value")?;
-                    depth = Some(parse_depth_flag(Some(val.as_str()))?);
+                    depth = Some(review::Depth::parse_flag(val.as_str())?);
                     i += 2;
                 }
                 other => {
@@ -716,7 +681,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
             config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
             merge,
             onto,
-            depth: depth.unwrap_or(review::Depth::Auto),
+            depth,
         });
     }
 
@@ -733,7 +698,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     let (mut repo, mut base_ref, mut config, mut workflow) = (None, None, None, None);
     let mut merge = false;
     let mut onto = None;
-    let mut depth = review::Depth::Auto;
+    let mut depth: Option<review::Depth> = None;
     while let Some(f) = iter.next() {
         match f.as_str() {
             "--merge" => merge = true,
@@ -770,7 +735,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
             }
             "--depth" => {
                 let val = iter.next().ok_or("implement: --depth needs a value")?;
-                depth = parse_depth_flag(Some(val.as_str()))?;
+                depth = Some(review::Depth::parse_flag(val.as_str())?);
             }
             other => {
                 return Err(format!("implement: unknown flag {other:?}\n{IMPLEMENT_USAGE}").into());
@@ -1003,6 +968,15 @@ fn review_sizing_diff_args(base_sha: &str, head_sha: &str) -> Vec<String> {
         "--find-renames".into(),
         format!("{base_sha}..{head_sha}"),
     ]
+}
+
+/// PURE. Resume depth precedence: no `--depth` (None) uses the checkpoint's stored depth; an explicit
+/// `--depth` overrides and becomes the new persisted depth (`Some(Auto)` clears a forced checkpoint).
+fn resolve_resume_depth(flag: Option<review::Depth>, checkpoint: Option<&str>) -> review::Depth {
+    match flag {
+        None => review::Depth::from_forced_str(checkpoint),
+        Some(d) => d,
+    }
 }
 
 /// Run the B2b-3a review once (total). Returns `(outcome, synth_body)`. Fresh `CancellationToken` + `select!`
@@ -1532,8 +1506,16 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let fix_graph = wf_map.get(&loop_cfg.fix_workflow).cloned();
     // B2b-2: parse [verify] NOW, before into_snapshot moves cfg. Owned + Clone, survives the move.
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
-    let review_cfg = cfg.review.as_ref().map(|t| t.to_config()); // B2b-3a: parsed pre-commit (beside verify)
-    let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
+    // B2b-3a: parsed pre-commit (beside verify).
+    let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
+    // ADR-0027: parsed pre-move (--merge sugar).
+    let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config());
+    // Owner default: an absent --depth falls through to [review].default_depth (else Auto).
+    let default_depth = match &review_cfg {
+        Some(Ok(rc)) => rc.default_depth,
+        _ => review::Depth::Auto,
+    };
+    let depth = depth.unwrap_or(default_depth);
     let mut snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
@@ -1700,7 +1682,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
                     loop_max_attempts: loop_cfg.max_attempts,
                     attempt_next: 1,
-                    forced_depth: depth_to_forced_str(depth),
+                    forced_depth: depth.to_forced_str(),
                     phase: implement_resume::ImplementPhase::FirstCommitCreated,
                     created_at_ms: implement_resume::now_ms(),
                     updated_at_ms: implement_resume::now_ms(),
@@ -1755,7 +1737,7 @@ async fn implement_resume_cmd(
     config_path: &Path,
     merge_requested: bool,
     onto: Option<&str>,
-    depth_override: review::Depth,
+    depth_override: Option<review::Depth>,
 ) -> Result<(), BoxError> {
     let raw = std::fs::read_to_string(config_path)
         .map_err(|e| format!("implement --resume: read config {config_path:?}: {e}"))?;
@@ -1912,17 +1894,13 @@ async fn implement_resume_cmd(
         fix_template,
         ..
     } = warm_impl;
-    // Compute effective depth: an explicit --depth override takes precedence over the checkpoint;
-    // Auto (no flag) falls back to the checkpoint's stored value. When overriding, persist the new
-    // forced_depth into the checkpoint so subsequent resumes without --depth see the same tier.
-    let depth = match depth_override {
-        review::Depth::Forced(_) => {
-            prod_ckpt.ck.forced_depth = depth_to_forced_str(depth_override);
-            let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
-            depth_from_checkpoint(prod_ckpt.ck.forced_depth.as_deref())
-        }
-        review::Depth::Auto => depth_from_checkpoint(ck.forced_depth.as_deref()),
-    };
+    // Resume precedence (replay-correct): None -> checkpoint; Some(d) -> override and persist
+    // (Some(Auto) clears a forced checkpoint). forced_depth=None re-sizes each attempt.
+    let depth = resolve_resume_depth(depth_override, ck.forced_depth.as_deref());
+    if depth_override.is_some() {
+        prod_ckpt.ck.forced_depth = depth.to_forced_str();
+        let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
+    }
     let outcome_phase = run_warm_loop(
         &clone,
         &ck.source_repo,
@@ -4129,6 +4107,7 @@ cmd = "true"
             ImplementMode::Resume { .. } => panic!("expected Fresh"),
         }
         assert_eq!(p.config, std::path::PathBuf::from("c.toml"));
+        assert_eq!(p.depth, None);
     }
 
     #[test]
@@ -4157,12 +4136,14 @@ cmd = "true"
             ImplementMode::Resume { .. } => panic!("expected Fresh"),
         }
         assert_eq!(fresh.config, std::path::PathBuf::from("/c.toml"));
+        assert_eq!(fresh.depth, None);
 
         let res = super::parse_implement_args(&["--resume".into(), "impl-1-ab".into()]).unwrap();
         match res.mode {
             ImplementMode::Resume { resume_id } => assert_eq!(resume_id, "impl-1-ab"),
             ImplementMode::Fresh { .. } => panic!("expected Resume"),
         }
+        assert_eq!(res.depth, None);
     }
 
     #[test]
@@ -4187,15 +4168,40 @@ cmd = "true"
 
     #[test]
     fn parse_implement_depth_flag() {
-        let a = super::parse_depth_flag(Some("light")).unwrap();
+        let a = review::Depth::parse_flag("light").unwrap();
         assert_eq!(a, review::Depth::Forced(review::Tier::Light));
         assert_eq!(
-            super::parse_depth_flag(Some("standard")).unwrap(),
+            review::Depth::parse_flag("standard").unwrap(),
             review::Depth::Forced(review::Tier::Standard)
         );
-        assert_eq!(super::parse_depth_flag(None).unwrap(), review::Depth::Auto);
-        assert!(super::parse_depth_flag(Some("thorough")).is_err());
-        assert!(super::parse_depth_flag(Some("bogus")).is_err());
+        assert_eq!(
+            review::Depth::parse_flag("thorough").unwrap(),
+            review::Depth::Forced(review::Tier::Thorough)
+        );
+        assert_eq!(
+            review::Depth::parse_flag("auto").unwrap(),
+            review::Depth::Auto
+        );
+        assert!(review::Depth::parse_flag("bogus").is_err());
+    }
+
+    #[test]
+    fn resume_depth_precedence() {
+        use review::{Depth, Tier};
+
+        assert_eq!(
+            super::resolve_resume_depth(None, Some("thorough")),
+            Depth::Forced(Tier::Thorough)
+        );
+        assert_eq!(super::resolve_resume_depth(None, None), Depth::Auto);
+        assert_eq!(
+            super::resolve_resume_depth(Some(Depth::Auto), Some("thorough")),
+            Depth::Auto
+        );
+        assert_eq!(
+            super::resolve_resume_depth(Some(Depth::Forced(Tier::Light)), Some("thorough")),
+            Depth::Forced(Tier::Light)
+        );
     }
 
     // R11: the example containerized config (the `impl` ContainerRw agent + the implement-edit workflow)
@@ -4240,18 +4246,22 @@ cmd = "true"
     }
 
     #[test]
-    fn depth_from_checkpoint_maps_all_cases() {
+    fn depth_from_forced_str_maps_all_cases() {
         assert_eq!(
-            super::depth_from_checkpoint(Some("light")),
+            review::Depth::from_forced_str(Some("light")),
             review::Depth::Forced(review::Tier::Light)
         );
         assert_eq!(
-            super::depth_from_checkpoint(Some("standard")),
+            review::Depth::from_forced_str(Some("standard")),
             review::Depth::Forced(review::Tier::Standard)
         );
-        assert_eq!(super::depth_from_checkpoint(None), review::Depth::Auto);
         assert_eq!(
-            super::depth_from_checkpoint(Some("bogus")),
+            review::Depth::from_forced_str(Some("thorough")),
+            review::Depth::Forced(review::Tier::Thorough)
+        );
+        assert_eq!(review::Depth::from_forced_str(None), review::Depth::Auto);
+        assert_eq!(
+            review::Depth::from_forced_str(Some("bogus")),
             review::Depth::Auto
         );
     }
