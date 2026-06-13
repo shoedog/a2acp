@@ -473,6 +473,26 @@ fn default_review_workflow() -> String {
     "implement-review".to_string()
 }
 
+fn default_slice_cmd() -> String {
+    "~/code/slicing/target/release/prism".to_string()
+}
+
+fn default_slice_timeout_secs() -> u64 {
+    60
+}
+
+fn default_slice_max_bytes() -> usize {
+    200_000
+}
+
+fn default_light_max_lines() -> usize {
+    15
+}
+
+fn default_light_max_files() -> usize {
+    2
+}
+
 /// `[review]` (Slice B2b-3a): the review-the-diff workflow run after `implement` commits + verifies.
 /// Only NAMES a workflow id (model is an agent-level property); absent → review skipped.
 #[derive(Debug, serde::Deserialize)]
@@ -483,6 +503,16 @@ pub struct ReviewToml {
     pub max_output_bytes: Option<usize>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    #[serde(default = "default_slice_cmd")]
+    pub slice_cmd: String,
+    #[serde(default = "default_slice_timeout_secs")]
+    pub slice_timeout_secs: u64,
+    #[serde(default = "default_slice_max_bytes")]
+    pub slice_max_bytes: usize,
+    #[serde(default = "default_light_max_lines")]
+    pub light_max_lines: usize,
+    #[serde(default = "default_light_max_files")]
+    pub light_max_files: usize,
 }
 
 /// Parsed `[review]`: the workflow id is parsed (validated) HERE, pre-commit, so the post-commit lookup is
@@ -492,6 +522,21 @@ pub struct ReviewConfig {
     pub workflow: bridge_core::ids::WorkflowId,
     pub max_output_bytes: usize,
     pub timeout: std::time::Duration,
+    pub slice_cmd: std::path::PathBuf,
+    pub slice_timeout: std::time::Duration,
+    pub slice_max_bytes: usize,
+    pub light_max_lines: usize,
+    pub light_max_files: usize,
+}
+
+fn shellexpand_tilde(p: &str) -> String {
+    match p.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => p.to_string(),
+        },
+        None => p.to_string(),
+    }
 }
 
 impl ReviewToml {
@@ -503,10 +548,21 @@ impl ReviewToml {
             .filter(|&n| n > 0)
             .unwrap_or(16 * 1024);
         let timeout = std::time::Duration::from_secs(self.timeout_secs.unwrap_or(300));
+        if self.light_max_lines == 0 || self.light_max_files == 0 {
+            return Err(ConfigError::Registry(
+                "[review] light_max_lines/light_max_files must be > 0".into(),
+            ));
+        }
+        let slice_cmd = std::path::PathBuf::from(shellexpand_tilde(&self.slice_cmd));
         Ok(ReviewConfig {
             workflow,
             max_output_bytes,
             timeout,
+            slice_cmd,
+            slice_timeout: std::time::Duration::from_secs(self.slice_timeout_secs),
+            slice_max_bytes: self.slice_max_bytes,
+            light_max_lines: self.light_max_lines,
+            light_max_files: self.light_max_files,
         })
     }
 }
@@ -2041,5 +2097,22 @@ path = "/tmp/x.db"
         // absent [merge] -> None
         let none = "default = \"x\"\nallowed_cwd_root = \"/x\"\n[server]\n";
         assert!(super::RegistryConfig::parse(none).unwrap().merge.is_none());
+    }
+
+    // ---- [review] slice + threshold fields (Task 5) ----
+
+    #[test]
+    fn review_toml_parses_slice_and_thresholds_with_defaults() {
+        let t: ReviewToml = toml::from_str("workflow = \"implement-review\"").unwrap();
+        let c = t.to_config().unwrap();
+        assert_eq!(c.light_max_lines, 15);
+        assert_eq!(c.light_max_files, 2);
+        assert!(c.slice_cmd.to_string_lossy().ends_with("prism"));
+    }
+
+    #[test]
+    fn review_toml_rejects_zero_thresholds() {
+        let t: ReviewToml = toml::from_str("workflow=\"r\"\nlight_max_lines=0").unwrap();
+        assert!(t.to_config().is_err());
     }
 }
