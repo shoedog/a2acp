@@ -35,6 +35,11 @@ pub struct ImplementCheckpoint {
     pub loop_max_attempts: u32, // FROZEN from the original [implement] config
     pub attempt_next: u32,      // the attempt to (re)start at
 
+    /// Operator-forced review depth ("light"|"standard"), if any. `#[serde(default)]` so pre-existing
+    /// (schema-version-1) checkpoints read as None = auto-size each attempt.
+    #[serde(default)]
+    pub forced_depth: Option<String>,
+
     pub phase: ImplementPhase,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -209,6 +214,7 @@ mod tests {
             fix_workflow: "implement-fix".into(),
             loop_max_attempts: 3,
             attempt_next: 2,
+            forced_depth: None,
             phase: ImplementPhase::InLoop,
             created_at_ms: 1,
             updated_at_ms: 2,
@@ -297,6 +303,23 @@ mod tests {
                 .success(),
             "git {args:?}"
         );
+    }
+
+    #[test]
+    fn checkpoint_round_trips_forced_depth_and_defaults_old() {
+        // An older checkpoint JSON without the field deserializes with forced_depth = None.
+        let old = r#"{"schema_version":1,"resume_id":"x","task_id":"x","task_brief":"b","source_repo":"/s","clone_path":"/c","config_path":"/cfg","branch":"br","base_ref":null,"base_commit":"abc","current_commit":null,"original_message":null,"edit_workflow":"e","fix_workflow":"f","loop_max_attempts":3,"attempt_next":1,"phase":"InLoop","created_at_ms":0,"updated_at_ms":0}"#;
+        let cp: ImplementCheckpoint = serde_json::from_str(old).unwrap();
+        assert_eq!(cp.forced_depth, None);
+
+        // A new checkpoint round-trips forced_depth when set.
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join(".git")).unwrap();
+        let mut ck = sample(td.path());
+        ck.forced_depth = Some("light".into());
+        save_checkpoint(td.path(), &ck).unwrap();
+        let back = load_checkpoint(td.path()).unwrap();
+        assert_eq!(back.forced_depth.as_deref(), Some("light"));
     }
 
     #[test]

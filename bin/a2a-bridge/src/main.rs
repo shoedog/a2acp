@@ -1527,6 +1527,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
                     loop_max_attempts: loop_cfg.max_attempts,
                     attempt_next: 1,
+                    forced_depth: None,
                     phase: implement_resume::ImplementPhase::FirstCommitCreated,
                     created_at_ms: implement_resume::now_ms(),
                     updated_at_ms: implement_resume::now_ms(),

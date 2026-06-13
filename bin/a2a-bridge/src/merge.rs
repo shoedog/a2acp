@@ -917,6 +917,7 @@ mod git_tests {
             fix_workflow: "f".into(),
             loop_max_attempts: 1,
             attempt_next: 1,
+            forced_depth: None,
             phase,
             created_at_ms: 0,
             updated_at_ms: 0,
