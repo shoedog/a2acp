@@ -1,0 +1,11 @@
+[package]
+name = "sample"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "lib.rs"
+
+# Standalone: the empty [workspace] excludes this fixture from the parent a2a-bridge workspace
+# (it is test DATA for rust-analyzer, not a workspace member). Without this, `cargo` errors.
+[workspace]
