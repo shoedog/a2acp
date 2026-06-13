@@ -102,6 +102,12 @@ model = "sonnet"   # reviewer pinned to Sonnet 4.6 (dogfood)
 name = "prism"
 command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
 args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+# lsp (L3): type-resolved semantic nav via rust-analyzer — the complement to prism's structural graph.
+# --target-cache keys a per-repo CARGO_TARGET_DIR by origin → ~0.7s warm index across clones. See lsp-nav skill.
+[[agents.mcp]]
+name = "lsp"
+command = "/Users/wesleyjinks/code/a2a-bridge/target/release/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "rust", "--target-cache", "/Users/wesleyjinks/.local/share/a2a/lsp-target-cache"]
 
 # ── codex: host-side reviewer with prism code-nav (no container sandbox; runs host codex-acp in read-only
 #    mode). sandbox_mode=read-only + approval_policy=never enforces hard read-only on the host-side agent. ──
@@ -114,6 +120,12 @@ args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
 name = "prism"
 command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
 args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+# lsp (L3): type-resolved semantic nav via rust-analyzer — the complement to prism's structural graph.
+# --target-cache keys a per-repo CARGO_TARGET_DIR by origin → ~0.7s warm index across clones. See lsp-nav skill.
+[[agents.mcp]]
+name = "lsp"
+command = "/Users/wesleyjinks/code/a2a-bridge/target/release/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "rust", "--target-cache", "/Users/wesleyjinks/.local/share/a2a/lsp-target-cache"]
 
 # ── kiro: Linux build baked into the image. VERIFIED: Linux auth is ~/.local/share/kiro-cli/data.sqlite3
 #    (NOT ~/.aws); minted once via `kiro-cli login --use-device-flow` into the a2a-kiro-data volume. ──
