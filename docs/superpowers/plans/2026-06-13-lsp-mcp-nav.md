@@ -430,6 +430,8 @@ git commit -m "feat(lsp-mcp): Content-Length frame codec (shared MCP+LSP wire)"
 - Modify: `crates/lsp-mcp/src/lsp/mod.rs`
 - Test: `crates/lsp-mcp/tests/integration.rs` (+ fixture crate)
 
+**⚠️ lsp-types 0.97 (locked) — URI API (dogfood finding from Batch A):** `lsp-types 0.97` replaced `url::Url` with `lsp_types::Uri` (fluent_uri) — there is **no `Url`, `from_file_path`, or `to_file_path`**. So everywhere the snippets below say `lsp_types::Url::from_file_path(p)`, instead build the request URI as a plain string: `fn file_uri(p: &Path) -> String { format!("file://{}", p.display()) }` and put that String straight into the `json!`. For *responses*, deserialize `lsp_types::Location` (its `.uri` is a `Uri`) and build hits via `shape::NavHit::from_location` (already decodes the path via `shape::file_path_from_uri`); make `shape::file_path_from_uri` `pub(crate)` and reuse it where a `CallHierarchyItem`'s path is needed. Do not call `to_file_path()` anywhere.
+
 **Note on readiness:** rust-analyzer answers `workspace/symbol` with *empty* results until indexing finishes, so the session must gate the first query. Primary signal: advertise `experimental.serverStatusNotification` and wait for a `serverStatus`/`$/progress`-end with quiescence. Robust fallback (always implemented, so this is not a placeholder): track `$/progress` begin/end tokens and consider ready once at least one progress has begun-and-ended, OR after a `ready_timeout` (default 30s) — then answer best-effort.
 
 - [ ] **Step 1: Create the fixture crate**

@@ -24,7 +24,8 @@ impl NavHit {
     }
 }
 
-fn file_path_from_uri(uri: &lsp_types::Uri) -> Option<String> {
+/// Decode a `file://` URI to a filesystem path. Reused by call-hierarchy result shaping (Batch B).
+pub(crate) fn file_path_from_uri(uri: &lsp_types::Uri) -> Option<String> {
     let raw = uri.as_str();
     let path = raw.strip_prefix("file://")?;
     Some(percent_decode_path(path))
