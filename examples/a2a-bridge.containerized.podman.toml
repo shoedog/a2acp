@@ -1,6 +1,7 @@
 # PODMAN variant of a2a-bridge.containerized.toml (macOS `podman machine`).
-# Two-line rule vs the docker config: (1) allowed_cmds lists "podman"; (2) every [agents.sandbox]
-# block AND [verify] set runtime = "podman". Everything else is byte-identical.
+# Two-line rule vs the docker config: (1) allowed_cmds lists "podman"; (2) the remaining [agents.sandbox]
+# blocks (kiro :ro, impl :rw) AND [verify] set runtime = "podman". Everything else is byte-identical.
+# (claude+codex reviewers are host-side — no sandbox block — so the rule covers only kiro/impl/verify.)
 # Run:  a2a-bridge serve --config examples/a2a-bridge.containerized.podman.toml   (from the repo root)
 # Prereqs (see docs/containerized-agents.md → Podman):
 #   - deploy/containers/podman-egress.sh up   (re-run after every `podman machine start`)

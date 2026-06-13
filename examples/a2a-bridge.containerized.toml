@@ -1,13 +1,15 @@
-# Containerized :ro readers (claude + codex + kiro) behind the egress lock, + the non-process ollama.
+# kiro = :ro containerized reader behind the egress lock; claude+codex reviewers run HOST-SIDE with prism
+# (codex hard read-only via sandbox_mode); impl = container_rw; + the non-process ollama.
 # Run:  a2a-bridge serve --config examples/a2a-bridge.containerized.toml   (from the repo root)
 # Prereqs (see docs/containerized-agents.md):
 #   - docker compose -f deploy/containers/compose.egress.yaml up -d --build
-#   - the reader image built (deploy/containers/reader.Containerfile)
+#   - the reader image built (deploy/containers/reader.Containerfile) — for the kiro :ro reader
 #   - per-agent creds: WRITABLE single-file copies in ~/.config/a2a-creds/{claude,codex}, and a
 #     one-time `kiro-cli login --use-device-flow` into the `a2a-kiro-data` volume.
 #
-# MUST-FIX (dual-review): allowed_cwd_root is OPT-IN and MUST equal the mount root, or readers ship
-# with NO cwd gate. Identical-path :ro mount makes the session/new cwd resolve inside the container.
+# MUST-FIX (dual-review): for the still-containerized agents (kiro :ro, impl :rw), allowed_cwd_root is
+# OPT-IN and MUST equal the mount root, or they ship with NO cwd gate; identical-path mount makes the
+# session/new cwd resolve inside the container. (claude+codex reviewers are host-side — not gated by this.)
 
 default = "claude"
 
@@ -82,7 +84,9 @@ allowed_cmds = ["docker", "codex-acp", "claude-agent-acp"]
 addr = "127.0.0.1:8080"
 
 # ── claude: host-side reviewer with prism code-nav (no container sandbox; runs the host claude-agent-acp).
-#    Moved from :ro container to host-side so it can use prism structural navigation for deeper reviews. ──
+#    Moved from :ro container to host-side so it can use prism structural navigation for deeper reviews.
+#    Read-only is PROMPT-CONTRACT only here (claude-agent-acp has no read-only flag) — softer than codex's
+#    hard sandbox_mode=read-only below; acceptable for an advisory reviewer, but note the asymmetry. ──
 [[agents]]
 id  = "claude"
 cmd = "claude-agent-acp"
