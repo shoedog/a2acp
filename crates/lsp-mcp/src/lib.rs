@@ -40,8 +40,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         let origin = git_origin(&repo);
         cache_key::cache_dir(base, &repo, origin.as_deref())
     });
-    let mut session = lsp::LspSession::start(&repo, target.as_deref())?;
-    session.wait_ready(std::time::Duration::from_secs(30))?;
+    let session = lsp::LspSession::start(&repo, target.as_deref())?;
     mcp::serve(session)
 }
 

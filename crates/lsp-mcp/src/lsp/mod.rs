@@ -21,6 +21,7 @@ pub struct LspSession {
     next_id: i64,
     pending: Arc<Mutex<HashMap<i64, Sender<Value>>>>,
     ready: Arc<Mutex<ReadyState>>,
+    readied: bool,
 }
 
 #[derive(Default)]
@@ -84,6 +85,7 @@ impl LspSession {
             next_id: 0,
             pending,
             ready,
+            readied: false,
         };
         let root = file_uri(repo);
         s.request(
@@ -146,6 +148,15 @@ impl LspSession {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Lazily ensure the index is ready — waits only on the first call (idempotent after).
+    pub fn ensure_ready(&mut self, timeout: std::time::Duration) -> anyhow::Result<()> {
+        if !self.readied {
+            self.wait_ready(timeout)?;
+            self.readied = true;
+        }
+        Ok(())
     }
 
     fn locations_to_hits(v: &Value) -> Vec<NavHit> {
