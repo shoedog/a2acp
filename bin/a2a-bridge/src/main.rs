@@ -994,17 +994,30 @@ async fn run_review_step(
         Some(Ok(c)) => c,
     };
 
-    // Size the committed diff (auto recompute each attempt). git/parse failure → standard (safe).
+    // Size the committed diff (auto recompute each attempt). git/parse/timeout failure → standard (safe).
     let clone_path = std::path::Path::new(clone_cwd.as_str());
-    let (files, lines) = match tokio::process::Command::new("git")
-        .current_dir(clone_path)
-        .args(["diff", "--numstat", &format!("{base_sha}..{head_sha}")])
-        .output()
-        .await
+    let (files, lines) = match tokio::time::timeout(
+        rcfg.slice_timeout,
+        tokio::process::Command::new("git")
+            .current_dir(clone_path)
+            .args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                &format!("{base_sha}..{head_sha}"),
+            ])
+            .output(),
+    )
+    .await
     {
-        Ok(o) if o.status.success() => review::parse_numstat(&String::from_utf8_lossy(&o.stdout)),
+        Ok(Ok(o)) if o.status.success() => {
+            review::parse_numstat(&String::from_utf8_lossy(&o.stdout))
+        }
         _ => {
-            eprintln!("[implement] review: numstat failed; defaulting to standard tier");
+            eprintln!(
+                "[implement] review: numstat failed or timed out; defaulting to standard tier"
+            );
             (usize::MAX, usize::MAX)
         }
     };

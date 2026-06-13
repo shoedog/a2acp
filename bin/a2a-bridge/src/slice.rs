@@ -23,8 +23,9 @@ pub fn write_slice(ref_path: &Path, text: &str, max_bytes: usize) -> std::io::Re
     if let Some(parent) = ref_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    const MARKER: &str = "\n…[slice truncated]…\n";
     let body = if text.len() > max_bytes {
-        let half = max_bytes / 2;
+        let half = max_bytes.saturating_sub(MARKER.len()) / 2;
         let head_end = (0..=half.min(text.len()))
             .rev()
             .find(|&i| text.is_char_boundary(i))
@@ -35,11 +36,7 @@ pub fn write_slice(ref_path: &Path, text: &str, max_bytes: usize) -> std::io::Re
                 .find(|&i| text.is_char_boundary(i))
                 .unwrap_or(text.len())
         };
-        format!(
-            "{}\n…[slice truncated]…\n{}",
-            &text[..head_end],
-            &text[tail_start..]
-        )
+        format!("{}{MARKER}{}", &text[..head_end], &text[tail_start..])
     } else {
         text.to_string()
     };
@@ -60,32 +57,44 @@ impl SliceRunner for ProdSliceRunner {
         prism: &Path,
         timeout: Duration,
     ) -> Option<String> {
-        let diff = tokio::process::Command::new("git")
-            .current_dir(clone)
-            .args(["diff", &format!("{base}..{head}")])
-            .output()
-            .await
-            .ok()?;
-        if !diff.status.success() {
-            return None;
-        }
-        let tmp = clone.join(".git/a2a-bridge/review-slices/diff.patch");
-        if let Some(p) = tmp.parent() {
-            std::fs::create_dir_all(p).ok()?;
-        }
-        std::fs::write(&tmp, &diff.stdout).ok()?;
-        let run = tokio::process::Command::new(prism)
-            .current_dir(clone)
-            .args(["--repo"])
-            .arg(clone)
-            .args(["--diff"])
-            .arg(&tmp)
-            .args(["--format", "review"])
-            .output();
-        let out = tokio::time::timeout(timeout, run).await.ok()?.ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        tokio::time::timeout(timeout, async {
+            // --no-ext-diff/--no-textconv: never invoke an external diff/textconv driver (could hang/be hostile).
+            let diff = tokio::process::Command::new("git")
+                .current_dir(clone)
+                .args([
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    &format!("{base}..{head}"),
+                ])
+                .output()
+                .await
+                .ok()?;
+            if !diff.status.success() {
+                return None;
+            }
+            let tmp = clone.join(".git/a2a-bridge/review-slices/diff.patch");
+            if let Some(p) = tmp.parent() {
+                std::fs::create_dir_all(p).ok()?;
+            }
+            std::fs::write(&tmp, &diff.stdout).ok()?;
+            let out = tokio::process::Command::new(prism)
+                .current_dir(clone)
+                .args(["--repo"])
+                .arg(clone)
+                .args(["--diff"])
+                .arg(&tmp)
+                .args(["--format", "review"])
+                .output()
+                .await
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 
@@ -149,7 +158,13 @@ mod tests {
         let refp = dir.join("s.md");
         write_slice(&refp, &"x".repeat(1000), 100).unwrap();
         let got = std::fs::read_to_string(&refp).unwrap();
+        // marker is "\n…[slice truncated]…\n" = 24 bytes; output must fit in max_bytes + marker.
         assert!(got.contains("slice truncated") && got.len() < 1000);
+        assert!(
+            got.len() <= 100 + 30,
+            "truncated output exceeded honest cap: {} bytes",
+            got.len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
