@@ -41,12 +41,17 @@ A workflow is just `[[workflows]]` + `[[workflows.nodes]]` in the config — cop
 ```bash
 a2a-bridge implement "Add a --json flag to the export command" \
   --repo   /path/to/target-repo \
-  --config examples/a2a-bridge.containerized.toml
+  --config examples/a2a-bridge.containerized.toml \
+  [--depth light|standard]                          # override the auto review depth (optional)
 ```
 
 Clones the repo into a quarantine under `allowed_cwd_root`, runs the **warm** containerized `impl` agent
 (edit + fix turns share ONE container + session), build/test-verifies, reviews the diff, and hands off a
 branch for you to merge. The default `impl` agent is **codex (gpt-5.5, effort=high)**.
+
+The **review-the-diff** scales to the diff: small diffs get a fast 1-reviewer **light** pass, larger ones the
+2-reviewer **standard** pass + a prism diff-slice. Auto-sized from `git diff --numstat`; `--depth` forces a
+tier (persisted across `--resume`). Reviewers run host-side with prism code-nav (read-only).
 
 **Land it (`merge`, ADR-0027).** Integrate an **Approved** run's commit into its source repo, re-authored to
 **you** (the operator), without touching your working checkout:

@@ -108,6 +108,32 @@ a2a-bridge submit code-review --input diff.txt --url http://127.0.0.1:8080
 a2a-bridge task watch <task-id> --url http://127.0.0.1:8080   # reattachable (ADR-0015)
 ```
 
+### Code-nav tooling (all reviewers)
+
+Reviewers run **read-only** and get a consistent code-nav toolset to verify claims
+against the real code, not just the artifact: **prism** structural navigation
+(`mcp__prism__nav_*` — wire `[[agents.mcp]]` prism per agent, host-side), and
+**git archaeology** (`git blame`, `git log -L`, `git log -S/-G` pickaxe). Every
+reviewer is instructed to do a thorough, human-style **line-by-line** read
+regardless of size — depth never licenses a shallower read.
+
+### Adaptive depth (the `implement` review-the-diff)
+
+`implement`'s review-the-diff scales the *number* of passes (not per-reviewer
+rigor) to the committed diff size:
+
+- **light** (diff ≤ `[review].light_max_lines` AND ≤ `light_max_files`): one
+  reviewer + a verdict synth — fast on the tweak loop's small fixes.
+- **standard** (default): two diverse reviewers + a synth, plus a **prism
+  diff-slice** (defect-focused: blast radius, taint paths, missing symmetry)
+  written to `<clone>/.git/a2a-bridge/review-slices/…` and handed to the reviewers
+  as a reference file.
+
+Auto-selected from `git diff --numstat` each attempt; override with
+`a2a-bridge implement … --depth light|standard`. A forced depth is stored in the
+resume checkpoint (and `--depth` on `--resume` overrides it). (`thorough` —
+a refine pass — is deferred; see the design spec.)
+
 ## Path + reload rules
 
 - Workflow `prompt_file` paths and a **relative** `[store] path` resolve relative
