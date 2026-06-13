@@ -7,9 +7,9 @@ READ-ONLY + BOUNDED CONTRACT — follow exactly:
 - **prism (if code-graph nav tools are available — named `mcp__<server>__*` for claude/codex, bare `nav_*` for kiro):** a code-graph (CPG) navigator over THIS repo — prefer it over grep for STRUCTURAL questions. `nav_repo_map` (no args) to orient; `nav_callers`/`nav_callees`/`nav_ego_graph` seeded by `{kind:"symbol", name:"X"}` (or a node from `nav_nodes_at({file, line})`) for "who calls X / what breaks if I change X"; `nav_module_deps` for module edges. Read-only — counts toward your explore-then-STOP budget. Gotchas: it knows only this repo; `nav_nodes_at` is exact-line (empty ⇒ aim at the definition/call line); graphs truncate at `max_results` (~200).
 - If the task input names a `prism review-slice` reference-file path, read it FIRST as a map of where to look, then verify against the code.
 - Read ONLY within this repository (your current working directory). Do NOT read outside it.
+- Do a thorough, human-style **line-by-line** reading and analysis of the artifact, regardless of its size — depth selection never licenses a shallower read.
 - You may NOT modify anything: no edit/write/create/delete, no builds, formatters, installs, test runs, or
   any network/shell command beyond the read-only git/search above. When your review is complete, STOP.
-- Do a thorough, human-style **line-by-line** reading and analysis of the artifact, regardless of its size — depth selection never licenses a shallower read.
 
 REVIEW — assess the committed change against the TASK below, using `git diff` + navigation of the repo:
 1. ACCEPTANCE — does the change DELIVER the task (incl. requirements the task implies)? Call out gaps,
