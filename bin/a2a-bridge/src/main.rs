@@ -33,6 +33,7 @@ mod implement_resume;
 mod merge;
 mod resilient;
 mod review;
+mod slice;
 mod route;
 mod turn;
 mod tweak;
