@@ -11,6 +11,29 @@ pub enum Verdict {
     Inconclusive,
 }
 
+/// Adaptive-depth tier. `thorough` is deferred (see the spec) — this slice has two tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier { Light, Standard }
+
+/// Operator depth choice. `Auto` sizes from the diff each attempt; `Forced` pins a tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth { Auto, Forced(Tier) }
+
+impl Depth {
+    /// Resolve to a concrete tier given this attempt's diff size + the config thresholds.
+    pub fn resolve(self, files: usize, lines: usize, light_max_lines: usize, light_max_files: usize) -> Tier {
+        match self {
+            Depth::Forced(t) => t,
+            Depth::Auto => select_tier(files, lines, light_max_lines, light_max_files),
+        }
+    }
+}
+
+/// PURE. light iff `lines <= light_max_lines` AND `files <= light_max_files`; else standard.
+pub fn select_tier(files: usize, lines: usize, light_max_lines: usize, light_max_files: usize) -> Tier {
+    if lines <= light_max_lines && files <= light_max_files { Tier::Light } else { Tier::Standard }
+}
+
 /// The review step's terminal state. Every post-commit failure maps here (no `?` past the commit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewOutcome {
@@ -229,6 +252,19 @@ mod tests {
     fn build_input_has_task_and_both_shas_and_diff() {
         let i = build_review_input("do X", "aaa", "bbb");
         assert!(i.contains("do X") && i.contains("git diff aaa..bbb") && i.contains("DELIVER"));
+    }
+
+    #[test]
+    fn select_tier_light_requires_both_under_thresholds() {
+        assert_eq!(select_tier(2, 10, 15, 2), Tier::Light);
+        assert_eq!(select_tier(2, 15, 15, 2), Tier::Light);
+        assert_eq!(select_tier(3, 10, 15, 2), Tier::Standard);
+        assert_eq!(select_tier(1, 16, 15, 2), Tier::Standard);
+    }
+    #[test]
+    fn resolve_depth_forced_overrides_auto() {
+        assert_eq!(Depth::Forced(Tier::Standard).resolve(0, 0, 15, 2), Tier::Standard);
+        assert_eq!(Depth::Auto.resolve(0, 0, 15, 2), Tier::Light);
     }
 
     #[test]
