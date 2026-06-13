@@ -1,7 +1,7 @@
 # Richer Review — Code-Nav Tooling + Adaptive Depth — Design
 
 **Date:** 2026-06-13
-**Status:** Draft (revised after a codex gpt-5.5/xhigh spec-review)
+**Status:** Draft (revised after two codex gpt-5.5/xhigh spec-reviews)
 **Goal:** Make the bridge's self-hosted reviews (code / spec / plan / implement-review) *find more, faster* by
 (1) giving every reviewer a consistent, read-only **code-navigation toolset** — prism whole-repo nav, prism
 diff-slicing into reference files, and git archaeology — and (2) scaling **how many** review passes run to the
@@ -9,7 +9,7 @@ size of the artifact (**adaptive depth**), without ever diluting per-reviewer ri
 
 **Owner principle (load-bearing):** every reviewer ALWAYS does a thorough, human-style line-by-line reading and
 analysis of the artifact, *regardless of size*. Adaptive depth scales the **number** of independent
-readings / passes / pre-steps — never how carefully any single reviewer reads.
+readings / pre-steps — never how carefully any single reviewer reads.
 
 ---
 
@@ -20,27 +20,29 @@ The bridge self-hosts four reviews, each a workflow on the static workflow-DAG e
 | Review | Where it runs | Today's structure | Artifact |
 |---|---|---|---|
 | **code-review** | `run-workflow` / serve | correctness (codex) + architecture (claude) → synth | a diff |
-| **spec-review** | `run-workflow` | rigordraft + soundnessdraft → rigor + soundness (refine) → synth | a spec doc |
-| **plan-review** | `run-workflow` | execdraft + coveragedraft → exec + coverage (refine) → synth | a plan doc |
-| **implement-review** | the `implement` loop, orchestrated by **`main.rs::run_review_step`** (`main.rs:920`), which runs the configured `[review].workflow` (default `implement-review`); `review.rs` holds only the PURE glue | 2 diverse reviewers (codex+claude) → synth `VERDICT:` (ADR-0022) | the committed diff in the clone |
+| **spec-review** | `run-workflow` | rigordraft + soundnessdraft → rigor + soundness (refine) → synth | a spec |
+| **plan-review** | `run-workflow` | execdraft + coveragedraft → exec + coverage (refine) → synth | a plan |
+| **implement-review** | the `implement` loop, via **`main.rs::run_review_step`** (`main.rs:920`), which runs the configured `[review].workflow` (default `implement-review`) on the executor and reads the **terminal node's** output | 2 diverse reviewers (codex+claude) → synth `VERDICT:` (ADR-0022) | the committed diff in the clone |
 
-**Module split (ground truth — corrected from the first draft):** `review.rs` is PURE
-(`build_review_input(task, base_sha, head_sha)`, `parse_verdict(synth)`, `reduce(events)`, `outcome_suffix`).
-The IMPURE workflow run is `main.rs::run_review_step`; it loads exactly the configured `[review].workflow`,
-builds one input string, runs the workflow on the executor, and reads the **terminal node's** output. The
-executor requires **exactly one terminal node and returns that terminal's output**; `parse_verdict` reads it.
-Reviewer prompts (`prompts/review-implement.md:18`) explicitly say the reviewer must **NOT** emit `VERDICT` —
-only the **synth** node does. These three facts constrain the depth design (below).
+**Ground-truth constraints (verified):**
+- `review.rs` is PURE (`build_review_input`, `parse_verdict`, `reduce`, `outcome_suffix`); the IMPURE run is
+  `main.rs::run_review_step`, which loads exactly the configured `[review].workflow`.
+- The executor requires **exactly one terminal node and returns its output**; `parse_verdict` reads it.
+- Reviewer prompts (`review-implement.md:18`) say the reviewer must **NOT** emit `VERDICT`; only **synth** does.
+- The workflow template renderer (`template.rs:19`) leaves **unknown placeholders verbatim** — so a synth
+  prompt with `{{reviewer_claude}}` fed only one reviewer would emit that token literally.
+- The implement loop runs **`git reset --hard && git clean -fdq`** before each verify/review attempt
+  (`tweak.rs:190`); `implement --resume` refuses a **dirty** clone (`implement_resume.rs:156`,
+  `implement.rs:183`). ⇒ **untracked files in the worktree are destroyed and/or block resume.**
+- Registry `validate` rejects an ACP agent whose `cmd` is not in `allowed_cmds` (`registry.rs:160`).
 
 **Reviewers have shifted host-side** (read-only ⇒ low risk): `spec-review`/`plan-review` configs run agents
-host-side **with prism wired** (`[[agents.mcp]] prism` → `prism-mcp --repo {cwd}`), trading egress-lockdown for
-prism + full nav + no container overhead. **prism is the owner's own `~/code/slicing` project**: `prism-mcp`
-(nav server) + `prism` (slicing CLI: `prism --repo <root> --diff <unified-diff> --format review`), sharing
-`libprism` + a CPG cache keyed by repo path.
+host-side **with prism wired** (`[[agents.mcp]] prism` → `prism-mcp --repo {cwd}`). **prism is the owner's own
+`~/code/slicing` project**: `prism-mcp` (nav server) + `prism` (slicing CLI: `prism --repo <root> --diff
+<unified-diff> --format review`), sharing a CPG cache keyed by repo path.
 
-**Gaps today:** (1) `implement-review` has **no prism guidance** (prompt + the input built in `run_review_step`
-say only git/grep/read), and the prism **slicing CLI is unused in every review**; (2) **no adaptive depth** —
-every review pays its full node count regardless of a 1-line vs 1,000-line change.
+**Gaps:** (1) `implement-review` has **no prism guidance** and the slicing CLI is **unused in every review**;
+(2) **no adaptive depth** — every review pays its full node count regardless of diff size.
 
 ---
 
@@ -48,167 +50,176 @@ every review pays its full node count regardless of a 1-line vs 1,000-line chang
 
 ### 1. The uniform reviewer contract (prompt-only)
 
-Every **reviewer** prompt (NOT synth prompts) carries two clauses, made uniform:
+Every **reviewer** prompt (NOT synth prompts) carries two clauses:
 - **Line-by-line (non-negotiable):** *"Do a thorough, human-style line-by-line reading and analysis of the
   artifact, regardless of its size. Depth selection never licenses a shallower read."*
-- **Read-only code-nav contract** (superset of today's): read/list/grep + `git diff`/`log`/`show` + the §2
-  additions. No writes/builds/installs/test-runs/network beyond read-only git/search; if a tool is denied,
-  continue.
+- **Read-only code-nav contract:** read/list/grep + `git diff`/`log`/`show` + the §2 additions; no
+  writes/builds/installs/test-runs/network beyond read-only git/search; if a tool is denied, continue.
 
-**Exact prompt files covered** (the prompt-contract test asserts both clauses in each):
-`review-implement.md`, `review-correctness.md`, `review-architecture.md`, `spec-review-rigor.md`,
-`spec-review-rigor-refine.md`, `spec-review-soundness.md`, `spec-review-soundness-refine.md`,
-`plan-review-exec.md`, `plan-review-exec-refine.md`, `plan-review-coverage.md`,
-`plan-review-coverage-refine.md`. **Excluded** (synthesizers, not reviewers): `review-synth.md`,
-`review-implement-synth.md`, `spec-review-synth.md`, `plan-review-synth.md`.
+**Exact prompt files covered** (a prompt-contract test asserts both clauses in each, and asserts the prism
+block in `review-implement.md`): `review-implement.md`, `review-correctness.md`, `review-architecture.md`,
+`spec-review-rigor.md`, `spec-review-rigor-refine.md`, `spec-review-soundness.md`,
+`spec-review-soundness-refine.md`, `plan-review-exec.md`, `plan-review-exec-refine.md`,
+`plan-review-coverage.md`, `plan-review-coverage-refine.md`. **Excluded** (synthesizers): `review-synth.md`,
+`review-implement-synth.md`, `implement-review-light-synth.md` (new, §3), `spec-review-synth.md`,
+`plan-review-synth.md`.
 
 ### 2. Code-nav toolset
 
-**(a) prism whole-repo nav (MCP) — consistent + actually available for implement-review.** Add the prism block
-the other three prompts already have to **`review-implement.md`** (the gap). Per owner decision, the
-**implement-review reviewers run HOST-SIDE with prism wired** (no sandbox; matches the reviewer host-side
-shift): the implement config gains host-side review agents with `[[agents.mcp]] prism` pointed at the **clone**
-(`--session-cwd`/`{cwd}` = the clone path). Read-only is preserved per agent: **codex reviewers use codex's own
-`sandbox_mode="read-only"`** (a hard guarantee even without a container); **claude reviewers are read-only by
-prompt** (no tool flags). *Cost note:* prism's CPG cache is keyed by repo path, so a fresh clone is a cold CPG
-build per implement; prism is light (CPG, not type inference) and degrades gracefully, but this is a known
-per-clone cost (an optimization — pointing nav at the stable origin — is out of scope).
+**(a) prism whole-repo nav (MCP) — consistent + available for implement-review.** Add the prism block the
+other three prompts have to **`review-implement.md`**. Per owner decision, the **implement-review reviewers run
+HOST-SIDE with prism** (matching the reviewer host-side shift). Concretely, in the implement config
+(`containerized.toml` + its podman twin): the existing **`codex` / `claude` reviewer agents drop their
+`[agents.sandbox]`** (host-side) and gain **`[[agents.mcp]] prism`** (`prism-mcp --repo {cwd}`, `{cwd}` = the
+clone). Read-only is preserved per agent: **codex** reviewers add `-c sandbox_mode="read-only"` (a hard
+guarantee even without a container); **claude** reviewers are read-only by prompt. **`allowed_cmds` gains
+`codex-acp` and `claude-agent-acp`** (registry rejects un-allowlisted ACP cmds); `docker` stays for the still-
+containerized `impl` agent. *Cost note:* prism's CPG cache is keyed by repo path → a fresh clone is a cold CPG
+build per implement; prism is light (CPG, not type inference) and degrades gracefully (a stable-origin
+optimization is out of scope).
 
-**(b) prism diff-slice → reference file — implement-review ONLY (this slice).** A host-side **slice-prep step**
-(see §4) runs `prism --repo <clone> --diff <diff> --format review` and writes the slice to a **reference file**
-`<clone>/.a2a-review/slice-<runid>.md`; the reviewer prompt is given the PATH + read instructions — **never
-inlined** (slices can be large). **code-review slicing is DEFERRED** (it runs via `run-workflow`, needing a
-separate prep seam; bundled with the deferred standalone work) — code-review still gets prism nav + git this
-slice. spec/plan reviews are doc-based → no slice.
+**(b) prism diff-slice → reference file — implement-review ONLY.** A host-side **slice-prep step** (§4) runs
+`prism --repo <clone> --diff <diff> --format review` and writes the slice to
+**`<clone>/.git/a2a-bridge/review-slices/slice-<runid>.md`** — inside `.git/` (the same `.git/a2a-bridge` area
+the resume checkpoint uses, ADR-0026), so it **survives `reset --hard`/`clean -fdq`, never makes the worktree
+dirty, never blocks resume, and is never visible to the write-capable fix turn**. The reviewer prompt is given
+the PATH + read instructions — **never inlined**. **code-review slicing is DEFERRED** (it runs via
+`run-workflow`, needing a separate prep seam) — code-review still gets prism nav + git this slice. spec/plan
+reviews are doc-based → no slice.
 
-**(c) git archaeology.** Expand the read-only contract in the reviewer prompts (the §1 list) to explicitly
-permit `git blame`, `git log -L <range>:<file>`, and `git log -S/-G` (pickaxe) — "why is this here / when
-introduced."
+**(c) git archaeology.** Expand the reviewer prompts' read-only contract to permit `git blame`,
+`git log -L <range>:<file>`, and `git log -S/-G` (pickaxe).
 
 **Out of scope: LSP** (rust-analyzer measured ~106 s cold / ~2.9 GB — see Deferred).
 
-### 3. Adaptive depth — implement-review only (Approach 3)
+### 3. Adaptive depth — implement-review only, TWO tiers (Approach 3)
 
-Three tiers; each scales the **number of passes**, never per-reviewer rigor. **The synth node is ALWAYS the
-single terminal and is the ONLY node that emits `VERDICT`** (preserving the existing contract); reviewer nodes
-never emit a verdict at any tier.
+`thorough` is **deferred** (it needs a *refine* pass — new prompts + a draft→refine→synth DAG that does not
+exist for implement-review; see Deferred). This slice ships **light** and **standard**. The **synth node is
+always the single terminal and the only node that emits `VERDICT`**; reviewer nodes never emit one.
 
-| Tier | Reviewer lenses | Refine | Slice prep | Terminal |
-|---|---|---|---|---|
-| **light** | **1** thorough lens | no | no | synth (1 reviewer input) |
-| **standard** (default) | 2 diverse lenses | no | yes | synth (2 inputs) |
-| **thorough** | 2 diverse lenses | yes | yes | synth (2 inputs) |
+| Tier | Reviewer lenses | Slice prep | Terminal |
+|---|---|---|---|
+| **light** | **1** thorough lens | no | a dedicated `implement-review-light-synth` (single `{{reviewer}}` input) |
+| **standard** (default) | 2 diverse lenses | yes | the existing 2-input synth |
 
-*Light is "1 reviewer + synth," not a terminal reviewer* — because reviewer prompts forbid `VERDICT` and the
-executor returns the terminal's output. Precedent: `examples/a2a-bridge.slicing-implement-fast.toml:177` (a
-1-reviewer+synth fast config). The light variant's synth accepts a single reviewer input.
+*Light is "1 reviewer + synth," not a terminal reviewer* (reviewer prompts forbid `VERDICT`; the executor
+returns the terminal's output). It uses a **dedicated `implement-review-light-synth.md`** prompt taking a
+single `{{reviewer}}` input — NOT the 2-input `review-implement-synth.md` (whose `{{reviewer_claude}}` would
+render verbatim). Precedent for 1-reviewer+synth: `slicing-implement-fast.toml:176`.
 
-**Selection (`select_tier`, pure — the coverage keystone).** `main.rs::run_review_step` computes
-`git diff --numstat base..head` on the committed diff → `(files_changed, lines_changed)` where
-`lines_changed = Σ(added + deleted)` over non-binary files (binary/rename rows contribute to `files_changed`
-only; exact parse edge-cases are plan-level). Then:
-`select_tier`: **light** iff `lines_changed ≤ light_max_lines` **AND** `files_changed ≤ light_max_files`;
-**thorough** iff `lines_changed ≥ thorough_min_lines` **OR** `files_changed ≥ thorough_min_files`; else
-**standard**. A `--depth light|standard|thorough` flag on `implement` **overrides** the auto choice.
+**Selection (`select_tier`, pure — the coverage keystone).** `run_review_step` computes
+`git diff --numstat base..head` → `(files_changed, lines_changed = Σ(added+deleted)` over non-binary rows;
+binary/rename rows count toward `files_changed` only). **`select_tier`: light iff
+`lines_changed ≤ light_max_lines` AND `files_changed ≤ light_max_files`; else standard.** A `--depth
+light|standard` flag on `implement` **overrides** auto (`--depth thorough` → a clear "not yet supported"
+usage error while thorough is deferred). **If `git diff --numstat` or its parse fails → warn + standard tier**
+(safe fallback; post-commit loop code never hard-fails here).
 
-**Variant resolution.** `[review].workflow` (default `implement-review`) is the **standard** id; light/thorough
-resolve to `<workflow>-light` / `<workflow>-thorough` by convention. **A missing variant falls back to the
-standard workflow + warns** (never fails the loop). The **slice decision follows the TIER, independent of which
-workflow actually runs** — i.e., a tier that says "no slice" skips prep even if its variant fell back to
-standard, and vice-versa.
+**Variant resolution.** `[review].workflow` (default `implement-review`) is the **standard** id; light resolves
+to `<workflow>-light`. **A missing `-light` variant falls back to the standard workflow + warns** (never fails
+the loop). The **slice decision follows the TIER**, independent of which workflow runs (light ⇒ no slice even
+on fallback).
 
-**Depth × the tweak loop / resume (`tweak.rs:197`, `implement_resume.rs:33`).** The loop reviews **every**
-attempt; the committed diff changes as tweaks amend, so **auto depth is RECOMPUTED each attempt**. A **forced**
-`--depth` applies to **all** attempts and is **stored in the resume checkpoint** alongside the existing
-edit/fix workflow ids + attempt counter, so `--resume` preserves it (auto stays auto on resume = recompute).
+**Depth × tweak loop / resume.** The loop reviews **every** attempt and the committed diff changes as tweaks
+amend, so **auto depth is RECOMPUTED each attempt**. A **forced** `--depth` applies to **all** attempts and is
+**stored in the resume checkpoint** (a new optional field; `#[serde(default)]` ⇒ pre-existing checkpoints read
+as `auto`). `implement --resume <id>` uses the stored depth; an explicit `--depth` on the resume command
+**overrides and rewrites** the checkpoint.
 
 ### 4. The slice-prep seam (host-side, impure — owned by `main.rs`)
 
-Invoked by `run_review_step` **after tier selection, before the workflow runs** (so light skips it entirely):
-1. Materialize the unified diff for `base_sha..head_sha` in the clone to a temp file.
-2. Run `prism --repo <clone> --diff <diff-file> --format review` (binary path from `[review].slice_cmd`,
-   default `~/code/slicing/target/release/prism`, with `~` expanded), **bounded by `[review].slice_timeout_secs`**.
-3. Write stdout (truncated at a max size, keeping head+tail) to `<clone>/.a2a-review/slice-<runid>.md`; pass
-   the path into `build_review_input` so the prompt references it.
-4. **Degrade gracefully:** prism absent / nonzero exit / timeout → warn + run the review WITHOUT the slice
-   (reviewers still have prism nav + git). The slice is an accelerant, never a hard dependency. The
-   `.a2a-review/` artifact lives in the throwaway clone (no cleanup needed; clone is reaped).
+Invoked by `run_review_step` **after tier selection, only when the tier wants a slice** (standard), **before**
+the workflow runs:
+1. Materialize the unified diff for `base_sha..head_sha` to a temp file.
+2. Run `prism --repo <clone> --diff <diff-file> --format review` (`[review].slice_cmd`, default
+   `~/code/slicing/target/release/prism`, `~` expanded), bounded by `[review].slice_timeout_secs`.
+3. Write stdout (truncated at `[review].slice_max_bytes`, keeping head+tail) to
+   `<clone>/.git/a2a-bridge/review-slices/slice-<runid>.md`; pass the path into `build_review_input`.
+4. **Degrade:** prism absent / nonzero / timeout → warn + review WITHOUT the slice (reviewers still have prism
+   nav + git). The slice is an accelerant, never a hard dependency. Under `.git/` ⇒ no worktree/cleanup
+   interaction; reaped with the clone.
 
-**Placement:** the subprocess runner is an injectable seam (a small new module or a `run_review_step` helper)
-so tests drive a fake runner with no prism. The PURE pieces — `select_tier`, the `numstat` parse,
-`slice_ref_path(runid)` — live in `review.rs` (mirroring verify.rs's pure/impure split).
+**Placement:** the subprocess runner is an injectable seam (small new module / `run_review_step` helper) so
+tests drive a fake runner with no prism. PURE pieces — `select_tier`, the `numstat` parse, `slice_ref_path` —
+live in `review.rs` (mirroring verify.rs's pure/impure split).
 
-### 5. Config additions (`[review]`, all optional, defaulted)
+### 5. Config additions (`[review]`, optional, defaulted)
 
-- `slice_cmd` — prism slicing binary path (default `~/code/slicing/target/release/prism`).
-- `slice_timeout_secs` (default e.g. 60), `slice_max_bytes` (truncation cap).
-- `light_max_lines` / `light_max_files` / `thorough_min_lines` / `thorough_min_files` — `select_tier`
-  thresholds (sensible defaults, e.g. light ≤ 15 lines & ≤ 2 files; thorough ≥ 400 lines or ≥ 10 files).
-- Variant ids are conventional (`<workflow>{,-light,-thorough}`); no new id fields — derived from
-  `[review].workflow`.
+- `slice_cmd` (default `~/code/slicing/target/release/prism`), `slice_timeout_secs` (e.g. 60),
+  `slice_max_bytes` (truncation cap).
+- `light_max_lines`, `light_max_files` — the single `select_tier` boundary (defaults e.g. ≤ 15 lines & ≤ 2
+  files). Validated `> 0` at config load. (No thorough thresholds — thorough is deferred.)
+- Variant id is conventional (`<workflow>-light`) — derived from `[review].workflow`; no new id fields.
 
 ### 6. Components & files
 
-- **Prompts:** the 11 reviewer prompts in §1 gain the line-by-line + git-archaeology clauses;
-  `review-implement.md` additionally gains the prism block + the slice-ref read instruction. Synth prompts
-  untouched (except the light variant's synth handling a single input — a new `review-implement-synth` variant
-  or a tolerant existing one).
-- **`bin/a2a-bridge/src/review.rs` (pure):** `select_tier`, `parse_numstat`, `slice_ref_path`; extend
-  `build_review_input` to optionally reference the slice file.
-- **`bin/a2a-bridge/src/main.rs` (`run_review_step`, impure):** compute diff-stat → tier (or `--depth`
-  override) → run slice-prep (if tier wants it) → resolve+run the variant workflow → existing `reduce` /
-  `parse_verdict`.
+- **Prompts:** the 11 reviewer prompts (§1) gain the line-by-line + git-archaeology clauses;
+  `review-implement.md` also gains the prism block + slice-ref read instruction. New
+  **`implement-review-light-synth.md`** (single-input verdict synth).
+- **`review.rs` (pure):** `select_tier`, `parse_numstat`, `slice_ref_path`; `build_review_input` optionally
+  references the slice file.
+- **`main.rs::run_review_step` (impure):** diff-stat → tier (or `--depth`) → slice-prep (if standard) →
+  resolve+run the variant → existing `reduce`/`parse_verdict`.
 - **New seam:** the slice subprocess runner (injectable).
-- **`config.rs`:** `[review]` fields above; `implement` arg parse gains `--depth`.
-- **`implement_resume.rs`:** checkpoint stores the forced-depth (if any).
-- **Example configs:** `examples/a2a-bridge.containerized.toml` (+ its podman twin) gain host-side
-  implement-review reviewers with prism + the `implement-review-{light,thorough}` variants + `[review]`
-  thresholds.
+- **`config.rs`:** `[review]` fields; `implement` arg parse gains `--depth` (light|standard).
+- **`implement_resume.rs`:** checkpoint stores forced-depth (`#[serde(default)]`).
+- **Example configs:** `containerized.toml` (+ podman twin) — host-side `codex`/`claude` reviewers + prism +
+  `allowed_cmds` + the `implement-review-light` workflow + `[review]` thresholds.
 
 ### 7. Error handling
 
-- prism slice missing/failing/timeout → warn + proceed sliceless (reported-not-gating, mirrors verify).
-- Unknown `--depth` value → usage error before any agent runs.
-- Missing variant workflow id → fall back to standard + warn (tier's slice decision still honored).
-- The line-by-line + git-archaeology clauses (and the implement-review prism block) are asserted by a
-  prompt-contract test so an edit can't silently drop them.
+- prism slice missing/failing/timeout → warn + sliceless (reported-not-gating).
+- `git diff --numstat` failure → warn + standard tier.
+- Unknown/`thorough` `--depth` → usage error before any agent runs.
+- Missing `-light` variant → fall back to standard + warn (tier's slice decision still honored).
+- `light_max_*` ≤ 0 → `ConfigInvalid` at load.
+- A prompt-contract test asserts the line-by-line + git-archaeology clauses (and the implement-review prism
+  block) so an edit can't silently drop them.
 
 ## Testing
 
-- **Pure / unit:** `select_tier` across the light/standard/thorough boundaries + `--depth` override +
-  AND/OR threshold semantics; `parse_numstat` (added+deleted sum; binary/rename rows → files only);
-  `slice_ref_path`; the slice-prep seam with an injected fake runner (writes ref file; degrades to none on
-  error/timeout); prompt-contract assertions over the exact 11 reviewer files (and synth-exclusion);
-  variant-id resolution + fallback; checkpoint round-trips the forced depth.
-- **Live (DoD):** a tiny-diff `implement` selects **light** (1 lens, no slice, synth verdict) and a large-diff
-  one selects **thorough** (2 lenses + refine + slice ref present and referenced); the host-side implement
-  reviewers demonstrably call `mcp__prism__nav_*` (real prism use, not just degradation) and read the slice
-  ref file; degrade path (prism absent → review still completes + verdicts). Dogfood this design through the
-  bridge's own spec/plan reviews.
+- **Pure / unit:** `select_tier` across the light/standard boundary + `--depth` override + the
+  numstat-failure→standard fallback; `parse_numstat` (added+deleted sum; binary/rename → files only);
+  `slice_ref_path` (under `.git/a2a-bridge/review-slices/`); the slice-prep seam with an injected fake runner
+  (writes ref file; degrades on error/timeout); prompt-contract assertions over the exact 11 reviewer files +
+  synth exclusion; variant-id resolution + fallback; checkpoint round-trips forced depth (+ `serde(default)`
+  for old checkpoints); `light_max_* ≤ 0` rejected.
+- **Live (DoD):** a tiny-diff `implement` selects **light** (1 lens, no slice, light-synth verdict); a normal
+  diff selects **standard** (2 lenses + slice ref present under `.git/` and referenced). **Observability:** the
+  reviewers' prism use + slice read are verified in the agent **session transcript / `docker logs` /
+  `agent_stderr`** (the bridge's drained child stderr) showing `mcp__prism__nav_*` calls — named artifacts, not
+  hand-waving. Degrade path (prism absent → review still completes + verdicts). `implement --resume` after a
+  crash mid-review does not refuse the clone (slice is under `.git/`). Dogfood this design through the bridge's
+  own spec/plan reviews.
 - **Floors:** keep ci.yml coverage floors; new pure code is high-coverage by construction.
 
 ## Deferred (captured, own specs)
 
-1. **code-review diff-slice** via the `run-workflow` path — needs a standalone slice-prep seam (input plumbing
-   + reference-file injection outside the implement loop). Bundled with #2.
-2. **Executor "depth-gate" primitive (Approach 1)** — first-class auto/forced adaptive depth for the
-   **standalone** `run-workflow` reviews (nodes carry a `tier`; a sizing-driven gate runs only nodes at-or-below
-   the depth). Avoids variant proliferation but needs conditional execution in the streaming DAG. Deferred:
-   standalone auto-sizing has low payoff and the executor change carries real risk.
-3. **L3 — warm multi-language LSP capability** (rust-analyzer/gopls/pyright/tsserver via an LSP-over-MCP shim),
-   serving both review (thorough tier) and **implement** across the owner's stable repos. Gated on per-language
-   cold-index costs (only rust-analyzer measured: ~106 s / ~2.9 GB) and **whether a clone can reuse a warm
-   index** (the crux of whether L3 helps the clone-based implementor). **Leaning L3**; its own spec.
+1. **`thorough` tier (implement-review refine pass)** — a draft→refine→synth shape for implement-review (new
+   refine prompts + node wiring) for large diffs; deferred because it's a new review pattern and large
+   implement diffs are uncommon.
+2. **code-review diff-slice** via `run-workflow` — needs a standalone slice-prep seam (input plumbing +
+   reference-file injection outside the implement loop).
+3. **Executor "depth-gate" primitive (Approach 1)** — first-class auto/forced depth for the **standalone**
+   `run-workflow` reviews (tiered nodes + a sizing gate), avoiding variant proliferation; needs conditional
+   execution in the streaming DAG.
+4. **L3 — warm multi-language LSP capability** (rust-analyzer/gopls/pyright/tsserver via an LSP-over-MCP shim)
+   for both review (a future thorough tier) and **implement** across the owner's stable repos. Gated on
+   per-language cold-index costs (rust-analyzer: ~106 s / ~2.9 GB) and **whether a clone reuses a warm index**.
+   **Leaning L3**; its own spec.
 
 ## Scope guard (non-goals)
 
-- **No** LSP; **no** executor changes (adaptive depth = bridge-driven variant selection for implement-review
-  ONLY); **no** standalone-review depth variation; **no** code-review slice this slice; **no** semgrep/CodeQL
-  augmentation; **no** change to the verdict/tweak-loop contract (synth stays the sole verdict terminal).
+- **No** LSP; **no** executor changes (adaptive depth = bridge-driven variant selection, implement-review
+  ONLY, two tiers); **no** `thorough` tier; **no** standalone-review depth; **no** code-review slice; **no**
+  semgrep/CodeQL augmentation; **no** change to the verdict/tweak-loop contract (synth stays the sole verdict
+  terminal).
 
-## Open questions (for review)
+## Resolved decisions (were open)
 
-1. **Slice format:** `--format review` (defect-targeted) vs `text`/`json` as the reference-file content — pick
-   the default; make it `[review].slice_format` only if it needs to vary.
-2. **Light's synth:** a dedicated `implement-review-light-synth` prompt (single input) vs making the existing
-   synth tolerant of 1 input — pick during planning (precedent: `slicing-implement-fast.toml`).
+- Slice format: **`--format review`** (defect-targeted).
+- Light's synth: a **dedicated `implement-review-light-synth.md`** (single input) — not a tolerant rewrite of
+  the 2-input synth (the renderer leaves `{{reviewer_claude}}` verbatim).
+- Slice location: **`<clone>/.git/a2a-bridge/review-slices/`** (survives reset/clean; no worktree/resume
+  interaction).
