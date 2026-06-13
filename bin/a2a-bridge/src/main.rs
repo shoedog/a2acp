@@ -646,6 +646,16 @@ fn parse_depth_flag(v: Option<&str>) -> Result<review::Depth, BoxError> {
     }
 }
 
+/// Reconstruct a `review::Depth` from a checkpoint's `forced_depth` string.
+/// `Some("light")`→`Forced(Light)`, `Some("standard")`→`Forced(Standard)`, anything else/`None`→`Auto`.
+fn depth_from_checkpoint(forced_depth: Option<&str>) -> review::Depth {
+    match forced_depth {
+        Some("light") => review::Depth::Forced(review::Tier::Light),
+        Some("standard") => review::Depth::Forced(review::Tier::Standard),
+        _ => review::Depth::Auto,
+    }
+}
+
 fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     if args.first().map(String::as_str) == Some("--resume") {
         let resume_id = args
@@ -946,7 +956,8 @@ fn runtimes_to_probe(
 
 /// Run the B2b-3a review once (total). Returns `(outcome, synth_body)`. Fresh `CancellationToken` + `select!`
 /// timeout→cancel→keep-drain PER call (so the `:ro` reaper still fires on a timed-out attempt). `run_id` is
-/// qualified by `attempt`.
+/// qualified by `attempt`. `depth` selects the workflow tier (Auto=size-based; Forced overrides). `slice`
+/// provides optional prism code-nav context for standard-tier reviews (degrades to None on failure).
 #[allow(clippy::too_many_arguments)]
 async fn run_review_step(
     review_cfg: &Option<Result<config::ReviewConfig, config::ConfigError>>,
@@ -961,6 +972,8 @@ async fn run_review_step(
     clone_cwd: &bridge_core::SessionCwd,
     task_id: &str,
     attempt: u32,
+    depth: review::Depth,
+    slice: &dyn slice::SliceRunner,
 ) -> (review::ReviewOutcome, String) {
     let rcfg = match review_cfg {
         None => return (review::ReviewOutcome::NotConfigured, String::new()),
@@ -970,10 +983,46 @@ async fn run_review_step(
         }
         Some(Ok(c)) => c,
     };
-    let Some(graph) = wf_map.get(&rcfg.workflow).cloned() else {
+
+    // Size the committed diff (auto recompute each attempt). git/parse failure → standard (safe).
+    let clone_path = std::path::Path::new(clone_cwd.as_str());
+    let (files, lines) = match tokio::process::Command::new("git")
+        .current_dir(clone_path)
+        .args(["diff", "--numstat", &format!("{base_sha}..{head_sha}")])
+        .output().await {
+        Ok(o) if o.status.success() => review::parse_numstat(&String::from_utf8_lossy(&o.stdout)),
+        _ => { eprintln!("[implement] review: numstat failed; defaulting to standard tier"); (usize::MAX, usize::MAX) }
+    };
+    let tier = depth.resolve(files, lines, rcfg.light_max_lines, rcfg.light_max_files);
+
+    // Slice prep ONLY for standard; write under .git/ (survives reset/clean). Degrade to None.
+    let runid = format!("{task_id}-{attempt}");
+    let slice_ref: Option<String> = if tier == review::Tier::Standard {
+        let refp = review::slice_ref_path(clone_path, &runid);
+        match slice.produce(clone_path, base_sha, head_sha, &rcfg.slice_cmd, rcfg.slice_timeout).await {
+            Some(body) => match slice::write_slice(&refp, &body, rcfg.slice_max_bytes) {
+                Ok(()) => Some(format!(".git/a2a-bridge/review-slices/slice-{runid}.md")),
+                Err(e) => { eprintln!("[implement] review: slice write failed: {e}; continuing sliceless"); None }
+            },
+            None => { eprintln!("[implement] review: prism slice unavailable; continuing sliceless"); None }
+        }
+    } else { None };
+
+    // Select the workflow variant by tier: standard → rcfg.workflow; light → <workflow>-light (fallback+warn).
+    let graph_id = match tier {
+        review::Tier::Standard => rcfg.workflow.clone(),
+        review::Tier::Light => {
+            let light = bridge_core::ids::WorkflowId::parse(format!("{}-light", rcfg.workflow.as_str()));
+            match light.ok().filter(|id| wf_map.contains_key(id)) {
+                Some(id) => id,
+                None => { eprintln!("[implement] review: no -light variant; falling back to standard workflow"); rcfg.workflow.clone() }
+            }
+        }
+    };
+    let Some(graph) = wf_map.get(&graph_id).cloned() else {
         return (review::ReviewOutcome::NotLoaded, String::new());
     };
-    let input = review::build_review_input(task, base_sha, head_sha, None);
+    let input = review::build_review_input(task, base_sha, head_sha, slice_ref.as_deref());
     let ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
     };
@@ -1035,6 +1084,8 @@ struct ProdEffects<'a> {
     task: &'a str,
     base_sha: &'a str,
     task_id: &'a str,
+    /// Adaptive review depth: Auto = size-based; Forced overrides the auto-selection.
+    depth: review::Depth,
 }
 
 #[async_trait::async_trait]
@@ -1053,6 +1104,8 @@ impl tweak::TweakEffects for ProdEffects<'_> {
             self.clone_cwd,
             self.task_id,
             attempt,
+            self.depth,
+            &slice::ProdSliceRunner,
         )
         .await
     }
@@ -1181,6 +1234,7 @@ async fn run_warm_loop(
     executor: &bridge_workflow::executor::WorkflowExecutor,
     fix_template: Option<String>,
     prod_ckpt: &mut implement_resume::ProdCheckpoint,
+    depth: review::Depth,
 ) -> implement_resume::ImplementPhase {
     let final_ = {
         let mut effects = ProdEffects {
@@ -1196,6 +1250,7 @@ async fn run_warm_loop(
             task,
             base_sha,
             task_id,
+            depth,
         };
         tweak::run_tweak_loop(
             clone,
@@ -1281,6 +1336,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let config_path = a.config.clone();
     let merge_requested = a.merge;
     let onto = a.onto.clone();
+    let depth = a.depth;
     let (task, repo, base_ref, workflow) = match a.mode {
         ImplementMode::Fresh {
             task,
@@ -1557,7 +1613,11 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
                     loop_max_attempts: loop_cfg.max_attempts,
                     attempt_next: 1,
-                    forced_depth: None,
+                    forced_depth: match depth {
+                        review::Depth::Forced(review::Tier::Light) => Some("light".into()),
+                        review::Depth::Forced(review::Tier::Standard) => Some("standard".into()),
+                        review::Depth::Auto => None,
+                    },
                     phase: implement_resume::ImplementPhase::FirstCommitCreated,
                     created_at_ms: implement_resume::now_ms(),
                     updated_at_ms: implement_resume::now_ms(),
@@ -1592,6 +1652,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 &executor,
                 fix_template,
                 &mut prod_ckpt,
+                depth,
             )
             .await;
             merge_after_loop(
@@ -1761,6 +1822,8 @@ async fn implement_resume_cmd(
         fix_template,
         ..
     } = warm_impl;
+    // Restore the depth from the checkpoint's forced_depth string (None → Auto).
+    let depth = depth_from_checkpoint(ck.forced_depth.as_deref());
     let outcome_phase = run_warm_loop(
         &clone,
         &ck.source_repo,
@@ -1783,6 +1846,7 @@ async fn implement_resume_cmd(
         &executor,
         fix_template,
         &mut prod_ckpt,
+        depth,
     )
     .await;
     merge_after_loop(
