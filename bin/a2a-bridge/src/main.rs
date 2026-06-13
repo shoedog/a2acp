@@ -4018,6 +4018,10 @@ cmd = "true"
     fn parse_implement_depth_flag() {
         let a = super::parse_depth_flag(Some("light")).unwrap();
         assert_eq!(a, review::Depth::Forced(review::Tier::Light));
+        assert_eq!(
+            super::parse_depth_flag(Some("standard")).unwrap(),
+            review::Depth::Forced(review::Tier::Standard)
+        );
         assert_eq!(super::parse_depth_flag(None).unwrap(), review::Depth::Auto);
         assert!(super::parse_depth_flag(Some("thorough")).is_err());
         assert!(super::parse_depth_flag(Some("bogus")).is_err());
