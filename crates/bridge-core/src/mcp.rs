@@ -174,6 +174,13 @@ pub fn render_kiro_agent_config(mcp: &[McpServerSpec], cwd: &str, agent_name: &s
         "tools": tools,
         "allowedTools": allowed,
         "includeMcpJson": false,
+        // Custom kiro agents (unlike default agents) must opt into skill discovery via `resources`
+        // with `skill://` URIs — workspace + global. Lets the bridge's kiro agents load the
+        // cross-agent skills library (lsp-nav, prism-nav, …). See kiro.dev/docs/cli/skills.
+        "resources": [
+            "skill://.kiro/skills/*/SKILL.md",
+            "skill://~/.kiro/skills/*/SKILL.md",
+        ],
     });
     serde_json::to_string_pretty(&config).unwrap_or_default()
 }
@@ -318,5 +325,26 @@ mod tests {
             .iter()
             .any(|t| t == "@prism"));
         assert!(!cfg.contains("{cwd}"));
+    }
+
+    #[test]
+    fn kiro_agent_config_advertises_skill_resources() {
+        // Custom agents must opt into skill discovery via `resources` with skill:// URIs.
+        let cfg = render_kiro_agent_config(&[], "/repo", "a2a-mcp-kiro");
+        let v: serde_json::Value = serde_json::from_str(&cfg).expect("valid JSON");
+        let res = v["resources"].as_array().expect("resources array");
+        let joined = res
+            .iter()
+            .filter_map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("skill://"),
+            "must advertise skill:// resources, got {joined}"
+        );
+        assert!(
+            joined.contains("~/.kiro/skills/"),
+            "must include the global skills glob"
+        );
     }
 }
