@@ -4186,6 +4186,23 @@ cmd = "true"
     }
 
     #[test]
+    fn parse_implement_args_threads_depth_thorough() {
+        // Integration: --depth thorough flows through the arg parser to Some(Forced(Thorough)).
+        let a: Vec<String> = ["do X", "--repo", "/r", "--depth", "thorough"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let p = super::parse_implement_args(&a).unwrap();
+        assert_eq!(p.depth, Some(review::Depth::Forced(review::Tier::Thorough)));
+        // an unknown --depth value is rejected.
+        let bad: Vec<String> = ["do X", "--repo", "/r", "--depth", "bogus"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(super::parse_implement_args(&bad).is_err());
+    }
+
+    #[test]
     fn resume_depth_precedence() {
         use review::{Depth, Tier};
 

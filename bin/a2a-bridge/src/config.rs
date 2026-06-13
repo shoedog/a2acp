@@ -2159,6 +2159,12 @@ path = "/tmp/x.db"
     }
 
     #[test]
+    fn review_toml_rejects_bogus_default_depth() {
+        let t: ReviewToml = toml::from_str("workflow=\"r\"\ndefault_depth=\"bogus\"").unwrap();
+        assert!(t.to_config().is_err());
+    }
+
+    #[test]
     fn review_toml_rejects_zero_thresholds() {
         let t: ReviewToml = toml::from_str("workflow=\"r\"\nlight_max_lines=0").unwrap();
         assert!(t.to_config().is_err());
