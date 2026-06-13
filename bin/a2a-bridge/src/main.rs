@@ -615,19 +615,36 @@ struct ImplementArgs {
     merge: bool,
     /// `--onto <branch>`: the merge target (when `--merge`); else `[merge].target_ref` / `base_ref`.
     onto: Option<String>,
+    /// `--depth light|standard`: override adaptive review depth (default: Auto).
+    depth: review::Depth,
 }
 
 const IMPLEMENT_USAGE: &str = "\
-usage: a2a-bridge implement <task> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>]
+usage: a2a-bridge implement <task> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth light|standard]
        a2a-bridge implement --resume <id> [--config <path>]
   <task>          what to implement (a sentence/paragraph the agent acts on)
   --repo <path>   the repo to implement in; cloned into a quarantine under allowed_cwd_root (required)
   --config <path> registry config defining the impl agent + [implement]/[verify]/[review] (default: ./a2a-bridge.toml)
   --base-ref      branch/SHA to start from (default: the repo HEAD)
   --workflow <id> the edit workflow (default: implement-edit)
+  --depth         review depth: light|standard (default: auto-select by diff size; thorough deferred)
   --resume <id>   resume a stranded run by its <id> (the clone dir name)
 Clones --repo, runs the warm containerized impl agent (edit+fix turns share one container+session),
 verifies, reviews the diff, and hands off a branch to merge.";
+
+fn parse_depth_flag(v: Option<&str>) -> Result<review::Depth, BoxError> {
+    match v {
+        None => Ok(review::Depth::Auto),
+        Some("light") => Ok(review::Depth::Forced(review::Tier::Light)),
+        Some("standard") => Ok(review::Depth::Forced(review::Tier::Standard)),
+        Some("thorough") => Err(
+            "--depth thorough is not yet supported (deferred); use light|standard".into(),
+        ),
+        Some(other) => {
+            Err(format!("--depth: unknown value {other:?} (expected light|standard)").into())
+        }
+    }
+}
 
 fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     if args.first().map(String::as_str) == Some("--resume") {
@@ -638,6 +655,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
         let mut config = None;
         let mut merge = false;
         let mut onto = None;
+        let mut depth = None;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
@@ -659,6 +677,11 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
                     );
                     i += 2;
                 }
+                "--depth" => {
+                    let val = args.get(i + 1).ok_or("implement: --depth needs a value")?;
+                    depth = Some(parse_depth_flag(Some(val.as_str()))?);
+                    i += 2;
+                }
                 other => {
                     return Err(format!(
                         "implement --resume: unexpected arg {other:?}\n{IMPLEMENT_USAGE}"
@@ -672,6 +695,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
             config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
             merge,
             onto,
+            depth: depth.unwrap_or(review::Depth::Auto),
         });
     }
 
@@ -688,6 +712,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     let (mut repo, mut base_ref, mut config, mut workflow) = (None, None, None, None);
     let mut merge = false;
     let mut onto = None;
+    let mut depth = review::Depth::Auto;
     while let Some(f) = iter.next() {
         match f.as_str() {
             "--merge" => merge = true,
@@ -722,6 +747,10 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
                         .clone(),
                 )
             }
+            "--depth" => {
+                let val = iter.next().ok_or("implement: --depth needs a value")?;
+                depth = parse_depth_flag(Some(val.as_str()))?;
+            }
             other => {
                 return Err(format!("implement: unknown flag {other:?}\n{IMPLEMENT_USAGE}").into());
             }
@@ -739,6 +768,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
         config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
         merge,
         onto,
+        depth,
     })
 }
 
@@ -3982,6 +4012,15 @@ cmd = "true"
         ])
         .is_err());
         assert!(super::parse_implement_args(&["do X".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_implement_depth_flag() {
+        let a = super::parse_depth_flag(Some("light")).unwrap();
+        assert_eq!(a, review::Depth::Forced(review::Tier::Light));
+        assert_eq!(super::parse_depth_flag(None).unwrap(), review::Depth::Auto);
+        assert!(super::parse_depth_flag(Some("thorough")).is_err());
+        assert!(super::parse_depth_flag(Some("bogus")).is_err());
     }
 
     // R11: the example containerized config (the `impl` ContainerRw agent + the implement-edit workflow)
