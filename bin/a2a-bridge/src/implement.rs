@@ -62,6 +62,39 @@ pub fn commit_argv(clone: &str, msg: &str) -> Vec<String> {
     v
 }
 
+pub struct WarmEgress {
+    pub network: String,
+    pub proxy: String,
+}
+
+/// PURE. The `(program, argv)` to fetch deps into the impl-lsp cache via the registries egress, NO creds.
+pub fn compose_warm_fetch(clone: &str, cache_vol: &str, e: &WarmEgress) -> (String, Vec<String>) {
+    let argv = vec![
+        "run".into(),
+        "--rm".into(),
+        "--network".into(),
+        e.network.clone(),
+        "-e".into(),
+        format!("HTTPS_PROXY={}", e.proxy),
+        "-e".into(),
+        format!("HTTP_PROXY={}", e.proxy),
+        "-e".into(),
+        "CARGO_HOME=/cargo".into(),
+        "-v".into(),
+        format!("{clone}:/work"),
+        "-v".into(),
+        format!("{cache_vol}:/cargo"),
+        "--workdir".into(),
+        "/work".into(),
+        "--entrypoint".into(),
+        "bash".into(),
+        "a2a-toolchain:latest".into(),
+        "-c".into(),
+        "cargo fetch --locked".into(),
+    ];
+    ("docker".into(), argv)
+}
+
 // ─── Commit message ──────────────────────────────────────────────────────────
 
 /// Resolve the commit message: the agent-written `.git/A2A_COMMIT_MSG` content if non-blank, else a
@@ -456,6 +489,44 @@ mod tests {
             "all -c before commit"
         );
         assert_eq!(&a[ci..], &["commit", "--no-verify", "-m", "subject"]);
+    }
+
+    #[test]
+    fn impl_lsp_cache_name_is_per_repo_and_distinct_from_verify() {
+        let a = crate::verify::cache_volume_name("a2a-impl-lsp-cache", "/clones/x");
+        let b = crate::verify::cache_volume_name("a2a-impl-lsp-cache", "/clones/y");
+        assert_ne!(a, b, "different repos must get different cache volumes");
+        // distinct base from verify so the two caches never collide
+        let v = crate::verify::cache_volume_name("a2a-verify-cache", "/clones/x");
+        assert_ne!(a, v, "impl-lsp cache must not share verify's volume");
+        assert!(a.starts_with("a2a-impl-lsp-cache-"));
+    }
+
+    #[test]
+    fn warm_lsp_fetch_argv_uses_egress_offline_false_and_cache_mount() {
+        // compose_warm_fetch(clone, cache_vol, egress_cfg) -> (program, argv) for
+        // `docker run ... cargo fetch --locked`
+        let (program, argv) = compose_warm_fetch(
+            "/clones/x",
+            "a2a-impl-lsp-cache-deadbeef",
+            &WarmEgress {
+                network: "a2a-verify-egress".into(),
+                proxy: "http://a2a-verify-proxy:8888".into(),
+            },
+        );
+        assert_eq!(program, "docker");
+        let joined = argv.join(" ");
+        assert!(joined.contains("--network a2a-verify-egress"), "{joined}");
+        assert!(
+            joined.contains("a2a-impl-lsp-cache-deadbeef:/cargo"),
+            "{joined}"
+        );
+        assert!(joined.contains("CARGO_HOME=/cargo"), "{joined}");
+        assert!(joined.contains("cargo fetch --locked"), "{joined}");
+        assert!(
+            !joined.contains("auth.json"),
+            "warm fetch must mount NO creds"
+        );
     }
 
     #[test]

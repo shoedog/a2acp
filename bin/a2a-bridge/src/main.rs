@@ -853,6 +853,62 @@ fn run_verify_step(
     }
 }
 
+/// Warm the impl-lsp dep cache through verify's registries-only egress. Best-effort: failures degrade
+/// in-container nav but never block the implement flow. Returns the cache name on success for later mounts.
+fn warm_lsp_deps_step(
+    verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    clone: &std::path::Path,
+) -> Option<String> {
+    let warn = |reason: String| {
+        eprintln!(
+            "[implement] lsp warm-deps skipped/failed: {reason} — in-container nav will be workspace-only"
+        );
+    };
+    let vcfg = match verify_cfg {
+        None => {
+            warn("no [verify] block".into());
+            return None;
+        }
+        Some(Err(e)) => {
+            warn(format!("verify config error: {e:?}"));
+            return None;
+        }
+        Some(Ok(vcfg)) => vcfg,
+    };
+    let (network, proxy) = match &vcfg.egress {
+        bridge_core::domain::EgressPolicy::Locked { network, proxy, .. } => {
+            (network.clone(), proxy.clone())
+        }
+        bridge_core::domain::EgressPolicy::Open => {
+            warn("verify egress is open; locked network+proxy required".into());
+            return None;
+        }
+    };
+    let clone_canon = std::fs::canonicalize(clone).unwrap_or_else(|_| clone.to_path_buf());
+    let clone_canon = clone_canon.to_string_lossy();
+    let cache_vol = verify::cache_volume_name("a2a-impl-lsp-cache", &clone_canon);
+    let egress = implement::WarmEgress { network, proxy };
+    let (program, argv) = implement::compose_warm_fetch(&clone_canon, &cache_vol, &egress);
+    eprintln!("[implement] lsp warm-deps: fetching deps into {cache_vol}");
+    match verify::docker_runner(&program, &argv) {
+        Ok((0, _)) => {
+            eprintln!("[implement] lsp warm-deps: ok ({cache_vol})");
+            Some(cache_vol)
+        }
+        Ok((exit, output)) => {
+            warn(format!(
+                "fetch exited {exit}: {}",
+                verify::truncate_output(&output, 4096).trim()
+            ));
+            None
+        }
+        Err(e) => {
+            warn(format!("runner error: {e}"));
+            None
+        }
+    }
+}
+
 /// Pure: the runtimes whose `probe` reports them unavailable. Injectable for tests.
 fn missing_runtimes(
     runtimes: &std::collections::BTreeSet<String>,
@@ -1562,6 +1618,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         instance_id: instance_id.clone(),
     };
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
+    let _impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &clone);
 
     // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
     // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
@@ -1837,6 +1894,7 @@ async fn implement_resume_cmd(
     };
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
+    let _impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &clone);
     let suffix = format!("r{}", implement::nonce(6));
     let warm_impl = build_warm_impl(
         &graph,
