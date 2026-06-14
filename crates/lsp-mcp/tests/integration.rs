@@ -62,3 +62,21 @@ fn implementations_finds_the_impl() {
     assert!(!impls.is_empty(), "Greet must have an implementor (En)");
     s.shutdown();
 }
+
+#[test]
+fn evict_then_query_reindexes() {
+    if !ra_available() {
+        eprintln!("skip");
+        return;
+    }
+    let mut s = lsp_mcp::lsp::LspSession::start(&sample_repo(), None).unwrap();
+    s.ensure_ready(Duration::from_secs(120)).unwrap();
+    assert!(!s.workspace_symbol("add").unwrap().is_empty());
+    s.evict();
+    s.ensure_ready(Duration::from_secs(120)).unwrap();
+    assert!(
+        !s.workspace_symbol("add").unwrap().is_empty(),
+        "RA respawned + re-indexed after evict"
+    );
+    s.shutdown();
+}

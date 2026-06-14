@@ -123,8 +123,11 @@ fn dispatch(id: &Value, params: &Value, s: &mut LspSession) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
     log_tool_call(tool, &a);
-    let _ = s.ensure_ready(std::time::Duration::from_secs(30));
-    match dispatch_body(tool, &a, s) {
+    s.touch();
+    let result = s
+        .ensure_ready(std::time::Duration::from_secs(30))
+        .and_then(|()| dispatch_body(tool, &a, s));
+    match result {
         Ok(body) => ok(id, body),
         // Tool failures are reported as content with isError, so the agent sees the reason and degrades.
         Err(e) => json!({
