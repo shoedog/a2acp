@@ -1273,12 +1273,30 @@ async fn build_warm_impl(
     clone_cwd: &bridge_core::SessionCwd,
     task_id: &str,
     session_suffix: Option<&str>,
+    impl_lsp_cache_vol: Option<&str>,
 ) -> Result<WarmImpl, BoxError> {
     let impl_entry =
         resolve_impl_identity(graph, fix_graph, snapshot).map_err(|e| format!("implement: {e}"))?;
     let edit_template = graph.nodes[0].prompt_template.clone();
     let fix_template = fix_graph.map(|g| g.nodes[0].prompt_template.clone());
-    let ccfg = container_rw_cfg_from_entry(&impl_entry, run)?;
+    let mut ccfg = container_rw_cfg_from_entry(&impl_entry, run)?;
+    // Slice B: runtime-derived LSP nav mounts for the in-container implementor's rust-analyzer (ADR-0028).
+    // These are NAMED volumes mounting at absolute container paths OUTSIDE the `:rw` repo mount, so they
+    // never nest under it (the S6 concern is host paths under `mount`; the parse/validate S6 ran on the
+    // static config). Appended here (post-snapshot) because the names are per-clone (NOT static, codex #1):
+    //   - the warmed dep cache at /cargo, READ-ONLY (Task 1 offline proof: read-only is sufficient) — only
+    //     when the warm fetch succeeded (else in-container nav degrades to workspace-only, as warned).
+    //   - a writable target dir at /lsp-target so RA's own CARGO_TARGET_DIR persists per-repo across turns.
+    let target_canon = std::fs::canonicalize(clone_cwd.as_str())
+        .unwrap_or_else(|_| std::path::PathBuf::from(clone_cwd.as_str()));
+    let impl_lsp_target_vol =
+        verify::cache_volume_name("a2a-impl-lsp-target", &target_canon.to_string_lossy());
+    if let Some(cache) = impl_lsp_cache_vol {
+        ccfg.sandbox.volumes.push(format!("{cache}:/cargo:ro"));
+    }
+    ccfg.sandbox
+        .volumes
+        .push(format!("{impl_lsp_target_vol}:/lsp-target"));
     let warm_owner = container_owner(
         owner_config_path,
         ccfg.sandbox.mount.as_str(),
@@ -1618,7 +1636,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         instance_id: instance_id.clone(),
     };
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let _impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &clone);
+    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &clone);
 
     // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
     // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
@@ -1634,6 +1652,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         &clone_cwd,
         &task_id,
         None,
+        impl_lsp_cache_vol.as_deref(),
     )
     .await?;
     let warm_runner = Arc::new(resilient::ResilientWarm::new(
@@ -1894,7 +1913,7 @@ async fn implement_resume_cmd(
     };
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let _impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &clone);
+    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &clone);
     let suffix = format!("r{}", implement::nonce(6));
     let warm_impl = build_warm_impl(
         &graph,
@@ -1906,6 +1925,7 @@ async fn implement_resume_cmd(
         &clone_cwd,
         &ck.task_id,
         Some(&suffix),
+        impl_lsp_cache_vol.as_deref(),
     )
     .await?;
     let warm_runner = Arc::new(resilient::ResilientWarm::new(

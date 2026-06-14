@@ -165,6 +165,24 @@ egress  = "locked"
 network = "a2a-egress-internal"
 proxy   = "http://a2a-egress-proxy:8888"
 volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
+# lsp (L3 Slice B): in-container type-resolved nav for the implementor's edits. The Linux lsp-mcp + RA are
+# baked into a2a-toolchain (Tasks 2-3); CARGO_HOME=/cargo is the READ-ONLY warmed dep cache (Task 1), offline
+# so RA never fetches; --target-cache /lsp-target is the writable per-repo CARGO_TARGET_DIR; the call log lands
+# under the clone's .git/ (survives --rm, fetched at hand-off). Both /cargo + /lsp-target are runtime-derived
+# named volumes appended in main.rs (per-clone names, NOT static).
+[[agents.mcp]]
+name = "lsp"
+command = "/usr/local/bin/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "rust", "--target-cache", "/lsp-target"]
+[[agents.mcp.env]]
+name = "CARGO_HOME"
+value = "/cargo"
+[[agents.mcp.env]]
+name = "CARGO_NET_OFFLINE"
+value = "true"
+[[agents.mcp.env]]
+name = "LSP_MCP_LOG"
+value = "{cwd}/.git/a2a-bridge/lsp-mcp-calls.log"
 
 # ── ollama: non-process api agent (kind="api"). Uncontainerized by design — no mount/proxy/creds.
 #    NOT tool-free — it advertises a deterministic side-effect-free stub tool (no fs/shell).
