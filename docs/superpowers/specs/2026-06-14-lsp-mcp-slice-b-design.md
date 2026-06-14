@@ -1,7 +1,7 @@
 # LSP-over-MCP semantic nav — Slice B (in-container implementor) — design
 
 **Date:** 2026-06-14
-**Status:** Approved (brainstorming) — ready for plan
+**Status:** Approved (brainstorming) — revised per codex gpt-5.5 xhigh spec review — ready for plan
 **Predecessor:** `2026-06-13-lsp-mcp-nav-design.md` (Slice A — host-side reviewers — shipped `main` `112648e`)
 
 ## Goal
@@ -21,73 +21,100 @@ Both load-bearing unknowns were validated before committing:
 | **rust-analyzer runs in `a2a-toolchain`** | ✅ `rustup component add rust-analyzer` works (component `rust-analyzer-aarch64-unknown-linux-gnu` is available; base = Debian 12). On a mounted a2a-bridge clone: **Database loaded 6.64s** (≈ host's ~9s cold), peak RSS **3039 MB**. |
 | **RA sees the agent's in-container edits** | ✅ inotify **fires** for writes made *inside* the container to the virtiofs bind-mount (`EVENT IN_CREATE`). RA's `notify`-based server-side watcher uses inotify → it will reflect the agent's edits. **Live nav works.** |
 
-Two constraints the spikes pinned down: **(1)** the in-container index *needed egress* to resolve deps into the cold `~/.cargo` — the production impl container is egress-locked, so **dep sources must be provided offline** (see Architecture §2). **(2)** ~3 GB RA per impl container.
+The in-container index *needed egress* to resolve deps into the cold `~/.cargo` — the production impl container is egress-locked, so **dep sources must be provided offline** (§2). And **~3 GB RA per impl container** (Memory, below).
+
+The codex review additionally **confirmed in-code**: CodexNative `{cwd}` for `container_rw` resolves to the canonical clone (`bridge-container/src/lib.rs:232`) — so the impl agent's `lsp --repo` is *correct* (unlike the deferred host-reviewer asymmetry); and the shim's `initialize` omits client `didChangeWatchedFiles` registration (`lsp/mod.rs:91`) — so the server-side-watcher premise holds.
 
 ## Architecture
 
 ### 1. Image — bake RA + the Linux `lsp-mcp` into `a2a-toolchain`
 
-The toolchain Dockerfile (`deploy/containers/`) gains:
-- `rustup component add rust-analyzer` (the working RA — note the prior image shipped only a non-functional rustup *proxy*).
-- The **Linux `lsp-mcp` binary**, built in a Docker build stage from the workspace (`cargo build --release -p lsp-mcp`) and `COPY`'d into the final image at a fixed path (e.g. `/usr/local/bin/lsp-mcp`).
+- `rustup component add rust-analyzer` (the working RA — the prior image shipped only a non-functional rustup *proxy*).
+- The **Linux `lsp-mcp` binary** at a fixed path (`/usr/local/bin/lsp-mcp`).
 
-The impl agent and verify share this image, so it's one Dockerfile change. (Slice A's host shim is a separate macOS binary; this is the Linux build of the same crate — no source changes to `lsp-mcp` are expected.)
+**Build context (codex #5).** The toolchain image is currently built from the `deploy/containers` context, from which a build stage *cannot* `cargo build -p lsp-mcp` (no workspace). Fix: build the toolchain image from the **repo-root context** with a `.dockerignore` (so a multi-stage build can compile `lsp-mcp` from the workspace and `COPY` the binary into the final stage), and update the Docker/Podman runbook (`docs/containerized-agents.md`). Alternative if repo-root context is undesirable: a separate `cargo build --release -p lsp-mcp` step that emits the Linux binary, `COPY`'d in — the plan picks one; repo-root multi-stage is the default.
 
-### 2. Dep-access — bridge-managed cache volume, warmed via `[verify]` (Option B)
+### 2. Dep-access — a **separate**, runtime-wired, **read-only** dep-source cache (Option B, corrected)
 
-The egress-locked impl container's RA gets dependency **sources** from a **bridge-managed cargo-registry cache volume** mounted into the container; RA/cargo run **offline** (`CARGO_NET_OFFLINE=true`). This keeps the impl box sealed (no host-fs mount) and portable, consistent with how verify already gives a container cargo access.
+The egress-locked impl container's RA gets dependency **sources** from a **dedicated, bridge-managed cargo cache** — **not** verify's cache. This corrects two codex BLOCKERs:
+- **#1:** verify's cache volume name is computed at **runtime** (`<base>-<hash(canonical source)>`, `verify.rs:124`) and can't be expressed as a static `[agents.sandbox].volumes` mount. So the impl-lsp cache is wired at **runtime in the `implement` flow** (its own `cache_volume_name`-style per-repo derivation, a *distinct* volume e.g. `a2a-impl-lsp-cache-<hash>`), not static config.
+- **#2:** sharing verify's **mutable** cache into the **creds-bearing** impl container is wrong — the agent could poison verify's trusted inputs, and RA's proc-macro/build-script execution would mix with creds. A **separate** cache removes the poisoning vector entirely (verify's cache is untouched).
 
-**Warming reuses the `[verify]` infrastructure.** Before the impl agent's RA needs deps, a `cargo fetch --locked` runs on the clone through the **existing registries-only egress** (`a2a-verify-egress` / `a2a-verify-proxy`) into the **existing `a2a-verify-cache`** volume. So:
-- The cache volume the impl RA reads **is** `a2a-verify-cache` (already per-repo keyed, already populated by verify runs).
-- The warm step is a `cargo fetch` using the `[verify]` block's `egress`/`network`/`proxy`/`cache`, run as a **pre-edit step** in the `implement` flow (idempotent — fast when warm, ~minutes only on a truly cold cache). This eliminates the cold-cache chicken/egg (the impl RA runs *before* this attempt's verify, so it can't rely on this attempt's verify to warm the cache).
+**Warming — a new `warm_lsp_deps` phase (codex #3).** There is no pre-edit phase today (fresh `implement` gates `[verify]` then builds the warm impl backend at `main.rs:1507/1570`; verify is post-commit). So Slice B **adds an explicit `warm_lsp_deps` phase** to both the fresh and resume paths (`main.rs` ~1507 / ~1799), **before** `build_warm_impl`. It runs `cargo fetch --locked` (+ whatever the §Open spike proves is needed to fully extract sources) on the clone in a **no-creds, registries-only egress** container — reusing `compose_verify`/egress *mechanics* (`a2a-verify-egress`/proxy) but as its own phase, populating the dedicated impl-lsp cache. This eliminates the cold-cache chicken/egg (the impl RA runs before this attempt's verify).
 
-**Dependency:** a config **without a `[verify]` block** gets **no warm step**, so the impl RA resolves only workspace crates (no external-dep type resolution) — **degraded, not broken** nav. The dogfood configs have `[verify]`. The wiring must surface this clearly (a warning when `lsp` is on the impl agent but `[verify]` is absent).
+**Offline + env (codex #4).** `SandboxToml` has no `env` field, and `compose_sandbox` only injects proxy env — so `CARGO_HOME`/`CARGO_NET_OFFLINE` go through **`[[agents.mcp.env]]`** on the `lsp` server (which CodexNative already renders into the codex-acp argv): `CARGO_HOME=<cache mount>`, `CARGO_NET_OFFLINE=true`. `lsp-mcp` already sets `CARGO_TARGET_DIR` for its RA child (`lsp/mod.rs:42`); the cargo-home/offline come from the MCP env.
+
+**Read-only vs writable** is decided by the first plan spike (§Open / codex #7): prefer the cache mounted **read-only** (the `warm_lsp_deps` phase pre-extracts everything RA needs); fall back to a **writable own cache** only if RA provably needs to write cargo-home (src unpacking, locks, git checkouts) — and even then the poisoning risk is contained because it's the impl run's *own* per-repo cache, never verify's.
+
+**Dependency:** a config **without a `[verify]` block** (so no egress/proxy to reuse) gets **no warm step** → RA indexes workspace-only (degraded, not broken). Emit a warning at config build when `lsp` is on the impl agent without `[verify]`.
 
 ### 3. Target cache — per-repo Linux volume (cross-container only)
 
-The impl RA's `CARGO_TARGET_DIR` points at a **Linux docker volume** (e.g. `a2a-impl-lsp-target`), per-repo keyed (same origin-hash scheme as Slice A's `cache_dir`). This **cannot** be shared with the host shim's `~/.local/share/a2a/lsp-target-cache` — the container is Linux/aarch64, the host is macOS/aarch64, so the rustc fingerprints differ and the build artifacts are incompatible. It **can** be shared cross-impl-container (all Linux), for warm reuse across runs.
+RA's `CARGO_TARGET_DIR` → a **Linux docker volume** (`a2a-impl-lsp-target`), per-repo keyed (Slice A's origin-hash scheme). It **cannot** share the host shim's `~/.local/share/a2a/lsp-target-cache` (container Linux/aarch64 vs host macOS/aarch64 → incompatible rustc fingerprints). It **can** share cross-impl-container for warm reuse.
 
 ### 4. Wiring — `lsp` on the impl agent (CodexNative)
 
 Add `[[agents.mcp]] lsp` to the **impl** agent in `examples/a2a-bridge.containerized.toml` (+ `.podman.toml`):
-- `command` = the baked in-container path (`/usr/local/bin/lsp-mcp`).
-- `args` = `["--repo", "{cwd}", "--lang", "rust", "--target-cache", "<container target-volume path>"]`. `{cwd}` resolves to the clone inside the container (the impl agent's session cwd; already correct for the impl agent, unlike the deferred host-reviewer asymmetry).
-- Delivery is `CodexNative` (`-c mcp_servers.lsp.*`, baked into the codex-acp argv) — the impl agent is codex; the args resolve inside the container.
-- The mounts (cache volume, target volume, `CARGO_NET_OFFLINE`) are added to the impl agent's `[agents.sandbox]` (or carried by the lsp config). **Zero `lsp-mcp` source changes**; this is image + config.
+- `command` = `/usr/local/bin/lsp-mcp` (baked, in-container).
+- `args` = `["--repo", "{cwd}", "--lang", "rust", "--target-cache", "<container target mount>"]`. `{cwd}` → the clone (confirmed correct for `container_rw`).
+- `[[agents.mcp.env]]` = `CARGO_HOME`, `CARGO_NET_OFFLINE=true`, and **`LSP_MCP_LOG`** (codex #8 — see Observability).
+- The dedicated cache + target volume mounts are added at **runtime** in the `implement` flow (not static config, per #1).
 
-The host reviewers' Slice A wiring is unchanged. Only the impl agent gains in-container `lsp`.
+The host reviewers' Slice A wiring is unchanged. Only the impl agent gains in-container `lsp`. **Zero `lsp-mcp` source change** for the wiring; the only `lsp-mcp` change is idle-evict (§6).
 
 ### 5. Edit-sync — RA's server-side fs-watcher (no shim change)
 
-The shim's `initialize` does **not** advertise client `didChangeWatchedFiles` dynamic registration, so RA falls back to its **own** `notify`/inotify server-side watcher (spike-validated to fire for in-container edits). When the agent writes a file via its tools, RA picks it up and incrementally re-analyzes (~50 ms, Slice A spike Q4). **No `lsp-mcp` change** — the shim already triggers server-side watching.
+The shim omits client `didChangeWatchedFiles` (confirmed), so RA uses its own `notify`/inotify watcher (spike-validated for in-container edits). The agent's edits surface in nav (~50 ms incremental, Slice A Q4). No `lsp-mcp` change.
 
-### 6. Warmth — free within a run
+**Dep-change restart (codex #6).** `lsp-mcp` starts one RA before serving and the loop reuses it across fix attempts; a running RA is **not** guaranteed to pick up a cargo-home/`Cargo.lock` change. So: when `Cargo.toml`/`Cargo.lock` changed during an edit (and a `warm_lsp_deps` re-fetch ran), **restart the RA child** before the next turn. This rides the **same idle-evict/respawn machinery** as §6 (kill + lazy re-spawn), so it's one mechanism.
 
-`lsp-mcp` is session-scoped; the impl agent's container + ACP session are warm across the edit→fix turns (ADR-0024). So RA indexes **once** per run (~7 s, absorbed by Slice A's lazy handshake) and stays warm for every subsequent turn/nav call. No warm pool.
+### 6. Lifecycle — warmth + **idle-evict** (the memory lever)
+
+- **Warm within a run (free):** `lsp-mcp` is session-scoped; the impl container + ACP session are warm across edit→fix turns (ADR-0024). RA indexes **once** (~7 s, absorbed by Slice A's lazy handshake) and stays warm.
+- **Idle-evict (new `lsp-mcp` feature):** `lsp-mcp` tracks last-tool-call time; after an idle timeout it **kills the RA child** (frees ~3 GB) and resets `readied=false`. The next tool call **lazily respawns** RA (~0.7 s warm off the shared target — reusing the FU2 `ensure_ready` path). Because the impl agent is **idle during the review phase**, its RA is evicted there automatically (Memory ladder, below). `lsp-mcp` *owns* its RA, so this lives in `lsp-mcp` — the bridge can't cleanly kill codex's MCP subprocess. The dep-change restart (#6) is the same kill+respawn.
+
+## Memory
+
+The dominant cost is **one RA ≈ 3 GB heap** (per process; not reducible by sharing a *disk* cache — the heap is rebuilt in each process). The codex revisions are correctness/isolation, **~zero RAM delta** (the separate cache is disk + reclaimable page cache; `warm_lsp_deps` is a transient pre-RA fetch container).
+
+Review-phase peak ladder:
+
+| | Review-phase resident RA |
+|---|---|
+| Slice B as first specced | impl RA (3 GB, held idle) + 2 host reviewer RAs (6 GB) = **~9 GB** |
+| **+ idle-evict (this spec)** | impl RA **evicted while idle** + 2 host RAs = **~6 GB** (= the Slice A baseline) |
+| + shared host-reviewer RA (deferred, see Non-goals) | one shared host RA = **~3 GB** |
+
+Idle-evict drops the impl RA's contribution during review; the two host reviewer RAs are *actively querying* then, so only the shared-daemon change shrinks those.
 
 ## Non-goals
 
 - **Slice C** — other languages (gopls/pyright/tsserver).
-- **Cross-run warm pool** — pre-warmed RA standing by for the *next* `implement`. High LOE (pool manager + lifecycle + eviction) for ~7 s saved once per run while holding ~3 GB idle. Within-run warmth is already free (§6).
-- The deferred Slice A follow-ups (codex host-reviewer `{cwd}` asymmetry; the `experimental/serverStatus` readiness signal).
-- Giving `lsp` to the `:ro` reader agents (kiro) — only the `:rw` impl agent.
+- **Shared host-reviewer `lsp` daemon** — one RA serving both host reviewers of the same clone (6 GB → 3 GB during review). Feasible host-side (no OrbStack boundary) but a real Slice A architecture change (MCP-over-socket daemon + lifecycle, the deferred "gateway" model). Its own follow-up.
+- **Cross-run warm pool** — pre-warmed RA for the *next* `implement`. High LOE for ~7 s saved once/run while holding 3 GB idle; within-run warmth is free.
+- The deferred Slice A follow-ups (codex host-reviewer `{cwd}` asymmetry; `experimental/serverStatus` readiness signal).
+- `lsp` for the `:ro` reader agents (kiro) — only the `:rw` impl agent.
 
 ## Error handling & edge cases
 
-- **No `[verify]` block** → no warm step → RA indexes workspace-only (degraded nav). Emit a warning at config build when `lsp` is on the impl agent without `[verify]`.
-- **Cold cache** (first run, never verified) → the warm `cargo fetch` populates it (~minutes once); subsequent runs are warm. If `cargo fetch` fails (e.g. egress misconfig), RA degrades to workspace-only; the edit still proceeds (the agent has shell/file tools).
+- **No `[verify]` block** → no `warm_lsp_deps` → RA indexes workspace-only (degraded nav). Warn at config build.
+- **`warm_lsp_deps` fetch fails** (egress misconfig) → RA degrades to workspace-only; the edit still proceeds (the agent has shell/file tools).
 - **RA fails to spawn / crashes in-container** → the shim returns a structured tool error; the impl agent degrades to its normal tools. Never blocks the edit.
-- **Memory** → ~3 GB RA per impl container, on top of codex. Concurrent impl runs each add ~3 GB; document it. The binding constraint is concurrent RA processes, not dep-access.
-- **`CARGO_NET_OFFLINE` + a dep-bump mid-clone** → if the clone's Cargo.lock references a crate not in the warmed cache, RA can't resolve it offline → that crate's types degrade. The pre-edit `cargo fetch --locked` covers the lock's deps, so this only bites if the lock changes *during* the edit (rare; re-warm on the next attempt).
+- **Dep-bump mid-edit** → §5 restart re-fetches + restarts RA before the next turn; a lock change with no re-fetch degrades that crate's types until the next attempt.
+- **Observability under `--rm` (codex #8)** → the default `lsp-mcp-calls.log` (`/root/.local/share/...`) vanishes when the container is reaped. Set `LSP_MCP_LOG` (via `[[agents.mcp.env]]`) to a path **under the clone** (which the bridge fetches at hand-off) so the live gate can read it.
+- **Memory** → ~3 GB RA per impl container; idle-evict bounds the review-phase peak (Memory). The binding constraint is concurrent RA processes.
+- **Isolation note** → RA runs build-scripts/proc-macros (dependency code) in the creds-bearing impl container. This crosses **no new boundary**: the impl container is already `danger-full-access` with creds where the agent can run arbitrary code (incl. `cargo`); network egress is locked; the separate read-only cache removes the cache-poisoning vector; and the bridge commits only the agent-staged index (a proc-macro can't stage an exfil file). So the residual ("trusted-dep proc-macros execute with creds present") matches the existing impl posture — **no sidecar, no disabling proc-macros** (which would gut nav on this proc-macro-heavy repo).
 
 ## Testing & DoD
 
-- **Image build** verifies `rust-analyzer --version` succeeds and `/usr/local/bin/lsp-mcp` runs in the built image.
-- **Live dogfood gate** (the bridge validating itself, as every slice has): run a real `a2a-bridge implement` on a repo, and confirm — via the **`lsp-mcp-calls.log`** observability added in Slice A (now written *inside* the impl container; mount or `docker logs` it out) — that the impl agent **issued at least one `lsp` tool call** during the edit, and that RA **reflected an edit** made mid-session (a nav query before vs after the agent changes a `pub` item). The per-repo target volume + `a2a-verify-cache` are confirmed populated.
-- The hermetic-safe `lsp-mcp` unit/integration tests are unchanged (Slice B is image + config + a warm step; no `lsp-mcp` source change).
+- **First plan task = the offline-completeness proof (codex #7).** Run `warm_lsp_deps`, then a **fresh no-egress, no-host-cache** RA container with *only* the intended mounts/env (the dedicated cache + target volume + `CARGO_HOME`/`CARGO_NET_OFFLINE`), and confirm registry crates **and git deps** resolve and index. This decides read-only vs writable cache (§2) before any wiring is built.
+- **Image build** verifies `rust-analyzer --version` works and `/usr/local/bin/lsp-mcp` runs in the built image.
+- **`lsp-mcp` idle-evict** gets unit coverage where pure (the idle/respawn decision) + an integration check that a query after eviction re-indexes and returns correct results.
+- **Live dogfood gate:** a real `a2a-bridge implement`, confirming via the `LSP_MCP_LOG` written **under the clone** that the impl agent **issued an `lsp` tool call** during the edit, that RA **reflected a mid-session edit**, and (memory) that the impl RA was **evicted during the review phase** (no 3 GB impl RA resident then).
 
-## Open questions / risks
+## Open questions / risks (for the plan)
 
-- **`cargo fetch` completeness** — does `cargo fetch --locked` populate everything RA needs offline (registry index + `src` extraction + git deps)? Validate in the plan's first task; if `git` deps need `~/.cargo/git`, ensure the warm step + cache volume cover it.
-- **Where the warm step lives** — a pre-edit phase in `implement` reusing the `[verify]` config. Confirm it composes with the existing `implement` flow without a `[verify]`-required hard error (degrade gracefully).
-- **Container target-volume path** — pick a fixed in-container mount (e.g. `/lsp-target`) and key the per-repo subdir the same way Slice A's `cache_dir` does.
+- **Offline completeness (#7)** — the keystone spike above; does `cargo fetch --locked` + the chosen mounts give RA *everything* offline (registry index, `src` extraction, git deps, any writable cargo-home need)?
+- **`warm_lsp_deps` placement** — the exact insertion point in the fresh + resume `implement` paths, and graceful degrade without `[verify]`.
+- **Idle-evict timeout** — pick a default (e.g. 60 s) that evicts during review without thrashing within an active edit; make it configurable.
+- **Container mount paths** — fixed in-container paths for the cache + target volumes, keyed per-repo like Slice A's `cache_dir`.
