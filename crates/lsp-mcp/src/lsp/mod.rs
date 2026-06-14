@@ -40,6 +40,25 @@ pub struct LspSession {
 struct ReadyState {
     began: bool,
     active: u32,
+    /// Latest `experimental/serverStatus { quiescent }` from rust-analyzer — true once it has finished
+    /// loading/indexing and has no background work in flight. A reliable readiness signal even when the
+    /// `$/progress` begin/end pair never fires (warm/fast index), which otherwise stalled the first tool
+    /// call for the full `ensure_ready` timeout (~30s). RA sends it because we advertise
+    /// `serverStatusNotification` in `initialize`.
+    quiescent: bool,
+}
+
+/// PURE. Ready when RA reports it's settled (`quiescent`) OR a `$/progress` cycle has begun-and-ended.
+/// Two independent signals so a missing `$/progress` (warm index) no longer forces a full-timeout wait.
+fn is_ready(s: &ReadyState) -> bool {
+    s.quiescent || (s.began && s.active == 0)
+}
+
+/// PURE. The `quiescent` flag from an `experimental/serverStatus` notification's `params` (top-level,
+/// unlike `$/progress`'s nested `value.kind`). `None` when absent/wrong-typed → the caller keeps the
+/// prior value rather than guessing.
+fn parse_quiescent(params: &Value) -> Option<bool> {
+    params.get("quiescent").and_then(|q| q.as_bool())
 }
 
 impl LspSession {
@@ -87,6 +106,15 @@ impl LspSession {
                             Some("end") => g.active = g.active.saturating_sub(1),
                             _ => {}
                         }
+                    } else if msg.get("method").and_then(|m| m.as_str())
+                        == Some("experimental/serverStatus")
+                    {
+                        // RA's readiness signal (it sends this because initialize advertises
+                        // serverStatusNotification). `quiescent:true` => loaded + idle. Track the latest
+                        // value (it flips false during re-index after edits, true once settled again).
+                        if let Some(q) = parse_quiescent(&msg["params"]) {
+                            ready.lock().unwrap().quiescent = q;
+                        }
                     }
                 }
             });
@@ -113,7 +141,8 @@ impl LspSession {
     }
 
     /// Spawn rust-analyzer rooted at `repo` (CARGO_TARGET_DIR=`target_cache` when given) and run the
-    /// LSP initialize handshake. A background thread routes responses by id and tracks `$/progress`.
+    /// LSP initialize handshake. A background thread routes responses by id and tracks readiness via both
+    /// `$/progress` and RA's `experimental/serverStatus` (`quiescent`).
     pub fn start(repo: &Path, target_cache: Option<&Path>) -> anyhow::Result<Self> {
         let (child, stdin, pending, ready) = Self::spawn_ra(repo, target_cache)?;
         let mut s = LspSession {
@@ -232,7 +261,7 @@ impl LspSession {
             self.touch();
             {
                 let g = self.ready.lock().unwrap();
-                if g.began && g.active == 0 {
+                if is_ready(&g) {
                     return Ok(());
                 }
             }
@@ -435,12 +464,53 @@ impl Drop for LspSession {
 
 #[cfg(test)]
 mod tests {
-    use super::should_evict;
+    use super::{is_ready, parse_quiescent, should_evict, ReadyState};
+    use serde_json::json;
+
+    #[test]
+    fn parse_quiescent_reads_serverstatus_shape() {
+        // RA's experimental/serverStatus params: { health, quiescent, message }.
+        assert_eq!(
+            parse_quiescent(&json!({"health":"ok","quiescent":true})),
+            Some(true)
+        );
+        assert_eq!(
+            parse_quiescent(&json!({"health":"warning","quiescent":false})),
+            Some(false)
+        );
+        // absent / wrong-typed → None (caller keeps the prior value, doesn't guess).
+        assert_eq!(parse_quiescent(&json!({"health":"ok"})), None);
+        assert_eq!(parse_quiescent(&json!({"quiescent":"yes"})), None);
+    }
 
     #[test]
     fn should_evict_after_idle_timeout() {
         assert!(should_evict(120, 60));
         assert!(!should_evict(30, 60));
         assert!(!should_evict(120, 0), "timeout 0 disables eviction");
+    }
+
+    #[test]
+    fn is_ready_via_quiescent_or_progress() {
+        // serverStatus path: quiescent alone is enough (no $/progress needed — the warm-index case).
+        assert!(is_ready(&ReadyState {
+            quiescent: true,
+            began: false,
+            active: 0,
+        }));
+        // $/progress path: a begun-and-ended cycle, no serverStatus.
+        assert!(is_ready(&ReadyState {
+            quiescent: false,
+            began: true,
+            active: 0,
+        }));
+        // mid-index: progress begun but still active, not yet quiescent → not ready.
+        assert!(!is_ready(&ReadyState {
+            quiescent: false,
+            began: true,
+            active: 1,
+        }));
+        // nothing heard yet → not ready.
+        assert!(!is_ready(&ReadyState::default()));
     }
 }
