@@ -68,7 +68,15 @@ pub struct WarmEgress {
 }
 
 /// PURE. The `(program, argv)` to fetch deps into the impl-lsp cache via the registries egress, NO creds.
-pub fn compose_warm_fetch(clone: &str, cache_vol: &str, e: &WarmEgress) -> (String, Vec<String>) {
+/// `runtime` (docker|podman) + `image` come from `[verify]` so the warm fetch tracks the same runtime the
+/// rest of the pipeline uses — hardcoding `docker`/`a2a-toolchain:latest` silently broke the podman config.
+pub fn compose_warm_fetch(
+    runtime: &str,
+    image: &str,
+    clone: &str,
+    cache_vol: &str,
+    e: &WarmEgress,
+) -> (String, Vec<String>) {
     let argv = vec![
         "run".into(),
         "--rm".into(),
@@ -88,11 +96,11 @@ pub fn compose_warm_fetch(clone: &str, cache_vol: &str, e: &WarmEgress) -> (Stri
         "/work".into(),
         "--entrypoint".into(),
         "bash".into(),
-        "a2a-toolchain:latest".into(),
+        image.into(),
         "-c".into(),
         "cargo fetch --locked".into(),
     ];
-    ("docker".into(), argv)
+    (runtime.to_string(), argv)
 }
 
 // ─── Commit message ──────────────────────────────────────────────────────────
@@ -504,9 +512,11 @@ mod tests {
 
     #[test]
     fn warm_lsp_fetch_argv_uses_egress_offline_false_and_cache_mount() {
-        // compose_warm_fetch(clone, cache_vol, egress_cfg) -> (program, argv) for
-        // `docker run ... cargo fetch --locked`
+        // compose_warm_fetch(runtime, image, clone, cache_vol, egress) -> (program, argv) for
+        // `<runtime> run ... <image> cargo fetch --locked`. Runtime+image come from [verify] (podman parity).
         let (program, argv) = compose_warm_fetch(
+            "podman",
+            "a2a-toolchain:latest",
             "/clones/x",
             "a2a-impl-lsp-cache-deadbeef",
             &WarmEgress {
@@ -514,9 +524,13 @@ mod tests {
                 proxy: "http://a2a-verify-proxy:8888".into(),
             },
         );
-        assert_eq!(program, "docker");
+        assert_eq!(
+            program, "podman",
+            "the runtime is honored (not hardcoded docker)"
+        );
         let joined = argv.join(" ");
         assert!(joined.contains("--network a2a-verify-egress"), "{joined}");
+        assert!(joined.contains("a2a-toolchain:latest"), "{joined}");
         assert!(
             joined.contains("a2a-impl-lsp-cache-deadbeef:/cargo"),
             "{joined}"

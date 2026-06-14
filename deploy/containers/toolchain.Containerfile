@@ -17,7 +17,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --no-modify-path --default-toolchain 1.94.0 --profile minimal
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p lsp-mcp && cp target/release/lsp-mcp /lsp-mcp
+RUN cargo build --release --locked -p lsp-mcp && cp target/release/lsp-mcp /lsp-mcp
 
 # ── Final toolchain image ──
 FROM a2a-agent-reader:latest

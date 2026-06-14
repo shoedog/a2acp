@@ -205,6 +205,12 @@ podman build -t a2a-toolchain:latest    -f deploy/containers/toolchain.Container
 podman build -t a2a-egress-proxy:latest -f deploy/containers/proxy.Containerfile  deploy/containers
 ```
 
+> **Per-repo cache volumes (verify + L3 Slice B impl-lsp).** `implement`/`verify` create per-source-repo
+> named volumes — `a2a-verify-cache-<hash>`, `a2a-impl-lsp-cache-<hash>` (warmed RA deps, mounted `:ro`),
+> `a2a-impl-lsp-target-<hash>` (RA's `CARGO_TARGET_DIR`). They are keyed on the **source repo** so they're
+> reused across runs (bounded to one set per repo), but nothing reaps them automatically and the target
+> cache grows over time. To reclaim disk: `docker volume rm $(docker volume ls -q | grep -E 'a2a-(verify-cache|impl-lsp)')`.
+
 **4. Egress.** Use the podman script (NOT `docker compose`). **Re-run it after every `podman machine start`**
 — `--restart` does not survive a daemonless machine restart.
 

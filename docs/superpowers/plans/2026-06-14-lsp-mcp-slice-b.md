@@ -401,7 +401,7 @@ REQUIRED SUB-SKILL: Use superpowers:finishing-a-development-branch.
 
 ## Self-review notes
 
-- **Spec coverage:** image bake (Tasks 2–3), dep-access B / separate runtime-wired cache (Tasks 4–6), `warm_lsp_deps` (Task 5), env via `[[agents.mcp.env]]` (Task 6), repo-root build context (Task 3), edit-sync (no task — validated, unchanged), idle-evict + dep-change restart (Task 7, one mechanism), offline proof first (Task 1), live gate + memory (Task 8). All codex findings #1–#8 map to a task.
+- **Spec coverage:** image bake (Tasks 2–3), dep-access B / separate runtime-wired cache (Tasks 4–6), `warm_lsp_deps` (Task 5), env via `[[agents.mcp.env]]` (Task 6), repo-root build context (Task 3), edit-sync (no task — validated, unchanged), idle-evict (Task 7); dep-change restart DEFERRED (needs a writable/re-fetch path — read-only offline cache; see spec §5), offline proof first (Task 1), live gate + memory (Task 8). All codex findings #1–#8 map to a task.
 - **Read-only vs writable** is gated by Task 1's verdict; Task 6 Step 2 references `[:ro per Task 1]`.
 - **No `lsp-mcp` source change except idle-evict** — wiring is image + config; idle-evict is the one crate change (Task 7).
 - **The warm fetch is no-creds** — asserted in Task 5's test (`!joined.contains("auth.json")`), preserving the isolation argument.

@@ -857,6 +857,7 @@ fn run_verify_step(
 /// in-container nav but never block the implement flow. Returns the cache name on success for later mounts.
 fn warm_lsp_deps_step(
     verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    repo: &std::path::Path,
     clone: &std::path::Path,
 ) -> Option<String> {
     let warn = |reason: String| {
@@ -884,11 +885,20 @@ fn warm_lsp_deps_step(
             return None;
         }
     };
+    // Key the cache on the SOURCE repo (mirrors verify::run_verify_step) so it is REUSED across runs and
+    // bounded to one volume per repo. Keying on the per-run quarantine `clone` (a fresh nonce each run)
+    // would never reuse the "warmed" deps AND orphan a GB-scale named volume every run (review BLOCKER).
+    let repo_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let cache_vol = verify::cache_volume_name("a2a-impl-lsp-cache", &repo_canon.to_string_lossy());
+    // The fetch still runs IN the clone (its Cargo.lock == the source repo's at base_ref).
     let clone_canon = std::fs::canonicalize(clone).unwrap_or_else(|_| clone.to_path_buf());
     let clone_canon = clone_canon.to_string_lossy();
-    let cache_vol = verify::cache_volume_name("a2a-impl-lsp-cache", &clone_canon);
     let egress = implement::WarmEgress { network, proxy };
-    let (program, argv) = implement::compose_warm_fetch(&clone_canon, &cache_vol, &egress);
+    // Honor the [verify] runtime+image so the warm fetch tracks the same runtime as the rest of the
+    // pipeline (the shipped podman config sets runtime="podman"; hardcoding docker silently degraded it).
+    let runtime = vcfg.runtime.as_deref().unwrap_or("docker");
+    let (program, argv) =
+        implement::compose_warm_fetch(runtime, &vcfg.image, &clone_canon, &cache_vol, &egress);
     eprintln!("[implement] lsp warm-deps: fetching deps into {cache_vol}");
     match verify::docker_runner(&program, &argv) {
         Ok((0, _)) => {
@@ -1274,21 +1284,24 @@ async fn build_warm_impl(
     task_id: &str,
     session_suffix: Option<&str>,
     impl_lsp_cache_vol: Option<&str>,
+    repo: &std::path::Path,
 ) -> Result<WarmImpl, BoxError> {
     let impl_entry =
         resolve_impl_identity(graph, fix_graph, snapshot).map_err(|e| format!("implement: {e}"))?;
     let edit_template = graph.nodes[0].prompt_template.clone();
     let fix_template = fix_graph.map(|g| g.nodes[0].prompt_template.clone());
     let mut ccfg = container_rw_cfg_from_entry(&impl_entry, run)?;
-    // Slice B: runtime-derived LSP nav mounts for the in-container implementor's rust-analyzer (ADR-0028).
+    // Slice B: runtime-derived LSP nav mounts for the in-container implementor's rust-analyzer (these
+    // back the lsp MCP server delivered into this container via the ADR-0028 CodexNative path).
     // These are NAMED volumes mounting at absolute container paths OUTSIDE the `:rw` repo mount, so they
     // never nest under it (the S6 concern is host paths under `mount`; the parse/validate S6 ran on the
     // static config). Appended here (post-snapshot) because the names are per-clone (NOT static, codex #1):
     //   - the warmed dep cache at /cargo, READ-ONLY (Task 1 offline proof: read-only is sufficient) — only
     //     when the warm fetch succeeded (else in-container nav degrades to workspace-only, as warned).
-    //   - a writable target dir at /lsp-target so RA's own CARGO_TARGET_DIR persists per-repo across turns.
-    let target_canon = std::fs::canonicalize(clone_cwd.as_str())
-        .unwrap_or_else(|_| std::path::PathBuf::from(clone_cwd.as_str()));
+    //   - a writable target dir at /lsp-target so RA's own CARGO_TARGET_DIR persists per-repo across runs.
+    // Keyed on the SOURCE repo (like the dep cache + verify), NOT the per-run clone — so it is REUSED and
+    // bounded to one volume per repo (review BLOCKER: clone-keying never reuses + leaks a volume per run).
+    let target_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let impl_lsp_target_vol =
         verify::cache_volume_name("a2a-impl-lsp-target", &target_canon.to_string_lossy());
     if let Some(cache) = impl_lsp_cache_vol {
@@ -1636,7 +1649,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         instance_id: instance_id.clone(),
     };
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &clone);
+    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &repo, &clone);
 
     // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
     // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
@@ -1653,6 +1666,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         &task_id,
         None,
         impl_lsp_cache_vol.as_deref(),
+        &repo,
     )
     .await?;
     let warm_runner = Arc::new(resilient::ResilientWarm::new(
@@ -1913,7 +1927,7 @@ async fn implement_resume_cmd(
     };
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &clone);
+    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &ck.source_repo, &clone);
     let suffix = format!("r{}", implement::nonce(6));
     let warm_impl = build_warm_impl(
         &graph,
@@ -1926,6 +1940,7 @@ async fn implement_resume_cmd(
         &ck.task_id,
         Some(&suffix),
         impl_lsp_cache_vol.as_deref(),
+        &ck.source_repo,
     )
     .await?;
     let warm_runner = Arc::new(resilient::ResilientWarm::new(
