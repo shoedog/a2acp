@@ -199,7 +199,9 @@ build in order:
 
 ```bash
 podman build -t a2a-agent-reader:latest -f deploy/containers/reader.Containerfile deploy/containers
-podman build -t a2a-toolchain:latest    -f deploy/containers/toolchain.Containerfile deploy/containers  # uses the reader image
+# toolchain uses the REPO-ROOT context (L3 Slice B): its lspbuild stage compiles crates/lsp-mcp from the
+# workspace. The repo-root .dockerignore keeps the context small (excludes target/, ~99G).
+podman build -t a2a-toolchain:latest    -f deploy/containers/toolchain.Containerfile .  # reader image + RA + lsp-mcp
 podman build -t a2a-egress-proxy:latest -f deploy/containers/proxy.Containerfile  deploy/containers
 ```
 

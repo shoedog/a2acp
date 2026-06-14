@@ -1,0 +1,9 @@
+# Repo-root build context for deploy/containers/toolchain.Containerfile's lspbuild stage.
+# Exclude the giant + irrelevant trees so the context upload is small (target/ alone is ~99G).
+target/
+**/target/
+.git/
+.a2a-implement/
+**/node_modules/
+docs/
+*.log
