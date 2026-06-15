@@ -1,6 +1,24 @@
 //! Compact, agent-friendly result shaping. Never hand an agent a raw LSP Location blob.
 use serde_json::{json, Value};
 
+/// Build a `file://` request URI from an absolute path with proper percent-encoding (lsp-types 0.97 has
+/// no `Url::from_file_path`). The decoder partner is `file_path_from_uri`; the two MUST round-trip.
+pub(crate) fn file_uri(p: &std::path::Path) -> String {
+    let mut out = String::from("file://");
+    for b in p.to_string_lossy().as_bytes() {
+        let b = *b;
+        // Keep path-safe ASCII unescaped: unreserved + `/`. Everything else is %XX (UTF-8 byte-wise).
+        let safe = b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~');
+        if safe {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NavHit {
     /// Filesystem path (from the file:// URI).
@@ -87,6 +105,32 @@ mod tests {
         assert_eq!(hit.file, "/repo/src/foo.rs");
         assert_eq!(hit.line, 42, "0-based 41 -> 1-based 42");
         assert_eq!(hit.signature.as_deref(), Some("fn build_cfg"));
+    }
+
+    #[test]
+    fn file_uri_round_trips_through_decode() {
+        use std::path::Path;
+        for raw in [
+            "/repo/src/foo.rs",
+            "/repo/my code/a b.rs", // spaces
+            "/repo/100%done/x.rs",  // percent
+            "/repo/issue#42/x.rs",  // hash
+            "/repo/café/déjà.rs",   // non-ASCII
+        ] {
+            let uri = file_uri(Path::new(raw));
+            assert!(uri.starts_with("file://"), "uri must be file://: {uri}");
+            // The encoded form must NOT contain raw spaces/# (they'd break URI parsing).
+            assert!(!uri.contains(' '), "spaces must be encoded: {uri}");
+            let decoded = decode_for_test(&uri);
+            assert_eq!(decoded, raw, "round-trip failed for {raw} via {uri}");
+        }
+    }
+
+    // file_path_from_uri takes an lsp_types::Uri; build one from the encoded string to exercise the real decoder.
+    fn decode_for_test(uri: &str) -> String {
+        use std::str::FromStr;
+        let u = lsp_types::Uri::from_str(uri).expect("valid uri");
+        file_path_from_uri(&u).expect("decodes")
     }
 
     #[test]

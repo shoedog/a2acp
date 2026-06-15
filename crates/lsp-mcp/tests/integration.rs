@@ -23,7 +23,7 @@ fn session_reaches_ready_and_resolves_a_symbol() {
         eprintln!("skip: rust-analyzer not on PATH");
         return;
     }
-    let mut s = lsp_mcp::lsp::LspSession::start(&sample_repo(), None).expect("start");
+    let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).expect("start");
     s.wait_ready(Duration::from_secs(60)).expect("ready");
     let hits = s.workspace_symbol("add").expect("query");
     assert!(
@@ -40,7 +40,7 @@ fn references_finds_the_caller() {
         eprintln!("skip");
         return;
     }
-    let mut s = lsp_mcp::lsp::LspSession::start(&sample_repo(), None).unwrap();
+    let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
     s.wait_ready(Duration::from_secs(60)).unwrap();
     let refs = s.references("add", true).unwrap();
     assert!(
@@ -56,7 +56,7 @@ fn implementations_finds_the_impl() {
         eprintln!("skip");
         return;
     }
-    let mut s = lsp_mcp::lsp::LspSession::start(&sample_repo(), None).unwrap();
+    let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
     s.wait_ready(Duration::from_secs(60)).unwrap();
     let impls = s.implementations("Greet").unwrap();
     assert!(!impls.is_empty(), "Greet must have an implementor (En)");
@@ -69,7 +69,7 @@ fn evict_then_query_reindexes() {
         eprintln!("skip");
         return;
     }
-    let mut s = lsp_mcp::lsp::LspSession::start(&sample_repo(), None).unwrap();
+    let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
     s.ensure_ready(Duration::from_secs(120)).unwrap();
     assert!(!s.workspace_symbol("add").unwrap().is_empty());
     s.evict();
@@ -77,6 +77,28 @@ fn evict_then_query_reindexes() {
     assert!(
         !s.workspace_symbol("add").unwrap().is_empty(),
         "RA respawned + re-indexed after evict"
+    );
+    s.shutdown();
+}
+
+#[test]
+fn rust_document_symbols_includes_nested_trait_method() {
+    if !ra_available() {
+        eprintln!("skip: rust-analyzer not on PATH");
+        return;
+    }
+    let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
+    s.ensure_ready(std::time::Duration::from_secs(120)).unwrap();
+    let syms = s.document_symbols(&sample_repo().join("lib.rs")).unwrap();
+    let names: Vec<&str> = syms.iter().filter_map(|h| h.signature.as_deref()).collect();
+    // Top-level items still present (additive, not a replacement).
+    assert!(names.contains(&"add"), "top-level fn add, got {names:?}");
+    assert!(names.contains(&"Greet"), "trait Greet, got {names:?}");
+    // NEW: the trait method `hi` is now extracted via children recursion (it was DROPPED by the old flat
+    // parse). This LOCKS the additive recursive output for Rust — the change is intended, not byte-for-byte.
+    assert!(
+        names.contains(&"hi"),
+        "nested trait method `hi` (recursion), got {names:?}"
     );
     s.shutdown();
 }

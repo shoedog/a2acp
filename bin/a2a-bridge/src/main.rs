@@ -3751,6 +3751,84 @@ mod cli_tests {
         assert_eq!(resolve_static_session_cwd(None, None), "."); // default
     }
 
+    /// FU1 codex `{cwd}` CONTRACT TEST (Slice C1 D2 deterministic fork). The per-request `--session-cwd`
+    /// is stamped into `entry.session_cwd` (run-workflow ~L2081 / serve per-request) BEFORE the SpawnFn
+    /// runs. This LOCKS that the spawn-site resolution chain threads that stamped value through to codex's
+    /// native `-c mcp_servers.*` `{cwd}` substitution — NOT the bridge launch dir. Replays the EXACT chain
+    /// the spawn site runs: resolve_static_session_cwd → absolutize/passthrough → canonicalize-or-raw
+    /// (`acp_spawn_inputs`' `mcp_cwd`) → `acp_program_argv`. NOTE: deterministic source-level contract;
+    /// the live `{cwd}` gate (Phase B) is the final arbiter — the historical live break may be unreadable
+    /// from source, so a green here does NOT prove live behavior.
+    #[test]
+    fn codex_mcp_cwd_uses_stamped_session_cwd() {
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+        // A real per-request Python repo dir so the spawn-site canonicalize() succeeds (mirrors prod).
+        let repo = std::env::temp_dir().join(format!("a2a-fu1-pyrepo-{}", implement::nonce(8)));
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        // canonicalize the expected value the same way `acp_spawn_inputs` computes `mcp_cwd` (on macOS
+        // /tmp → /private/tmp), so the assertion matches what codex actually receives.
+        let expected = std::fs::canonicalize(&repo)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| repo_str.clone());
+
+        // A codex CodexNative agent whose mcp server args carry the `{cwd}` placeholder.
+        let mut codex = acp_entry("codex");
+        codex.cmd = Some("codex-acp".into());
+        codex.mcp_delivery = McpDelivery::CodexNative;
+        codex.mcp = vec![McpServerSpec {
+            name: "lsp".into(),
+            command: "/opt/lsp-mcp".into(),
+            args: vec![
+                "--repo".into(),
+                "{cwd}".into(),
+                "--lang".into(),
+                "auto".into(),
+            ],
+            env: vec![],
+        }];
+        // The per-request stamp the run-workflow/serve path applies BEFORE the SpawnFn runs.
+        codex.session_cwd = Some(repo_str.clone());
+
+        // Replay the EXACT spawn-site resolution chain (main.rs ~L470-471 → acp_spawn_inputs ~L201).
+        let resolved =
+            resolve_static_session_cwd(codex.session_cwd.as_deref(), codex.cwd.as_deref());
+        let abs = {
+            let p = PathBuf::from(&resolved);
+            if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir().unwrap().join(p)
+            }
+        };
+        let mcp_cwd = std::fs::canonicalize(&abs)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| abs.to_string_lossy().into_owned());
+
+        let (_p, argv) = acp_program_argv(&codex, None, &[], &mcp_cwd).unwrap();
+
+        // The codex argv must carry the {cwd}-substituted STAMPED session_cwd (the python repo),
+        // not the launch dir, and no literal {cwd} must survive.
+        assert!(
+            argv.iter().any(|a| a.contains(&expected)),
+            "codex argv must contain stamped session_cwd {expected:?}: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("{cwd}")),
+            "no literal {{cwd}} may survive: {argv:?}"
+        );
+        let launch = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            !argv.iter().any(|a| a.contains(&launch)),
+            "codex argv must NOT contain the launch dir {launch:?}: {argv:?}"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
     #[test]
     fn serve_config_flag_parses_and_rejects_unknown() {
         assert_eq!(serve_config_flag(&[]).unwrap(), None);

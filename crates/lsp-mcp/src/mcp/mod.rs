@@ -1,7 +1,7 @@
 pub mod error;
 pub mod transport;
 
-use crate::lsp::LspSession;
+use crate::lsp::LspClient;
 use crate::mcp::error::*;
 use crate::mcp::transport::Lifecycle;
 use crate::shape::render_hits;
@@ -59,7 +59,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "references",
-            "description": "All references to a symbol (blast radius); resolves generics/traits.",
+            "description": "All references to a symbol (blast radius); type-resolved across the language's generics/polymorphism.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -80,7 +80,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "implementations",
-            "description": "Trait impls / who implements a trait or type.",
+            "description": "Implementations of a symbol (Rust trait impls; Python subclasses / overrides).",
             "inputSchema": name_only
         }),
         json!({
@@ -116,7 +116,7 @@ fn ok(id: &Value, body: Value) -> Value {
     })
 }
 
-fn dispatch(id: &Value, params: &Value, s: &mut LspSession) -> Value {
+fn dispatch(id: &Value, params: &Value, s: &mut LspClient) -> Value {
     let tool = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let a = params
         .get("arguments")
@@ -185,7 +185,7 @@ fn log_tool_call(tool: &str, args: &Value) {
     }
 }
 
-fn dispatch_body(tool: &str, a: &Value, s: &mut LspSession) -> anyhow::Result<Value> {
+fn dispatch_body(tool: &str, a: &Value, s: &mut LspClient) -> anyhow::Result<Value> {
     Ok(match tool {
         "workspace_symbol" => {
             let q = a["query"]
@@ -222,8 +222,8 @@ fn dispatch_body(tool: &str, a: &Value, s: &mut LspSession) -> anyhow::Result<Va
     })
 }
 
-/// Block on stdin, driving the MCP loop against a warm `LspSession`.
-pub fn serve(mut session: LspSession) -> anyhow::Result<()> {
+/// Block on stdin, driving the MCP loop against a warm `LspClient`.
+pub fn serve(mut session: LspClient) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut r = BufReader::new(stdin.lock());
     let mut out = std::io::stdout();
