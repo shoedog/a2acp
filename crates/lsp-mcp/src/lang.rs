@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 pub enum Lang {
     Rust,
     Python,
+    Go,
 }
 
 impl Lang {
@@ -16,26 +17,38 @@ impl Lang {
         match self {
             Lang::Rust => "rust",
             Lang::Python => "python",
+            Lang::Go => "go",
         }
     }
 }
 
 /// Detect the language from `repo`'s root markers, single-unambiguous-root ONLY (spec §1).
-/// Errors on BOTH-markers (ambiguous) or NEITHER (cannot detect → require explicit --lang).
+/// `go.mod` → go; the existing rust (`Cargo.toml`) / python (markers) predicates are unchanged.
+/// ANY two-or-more markers present → ambiguous→refuse; NONE → cannot-detect → require explicit --lang.
 pub fn detect_lang(repo: &Path) -> anyhow::Result<Lang> {
     let is_rust = repo.join("Cargo.toml").is_file();
     let is_python = python_markers(repo) || has_real_pyproject(repo) || shallow_py_scan(repo);
-    match (is_rust, is_python) {
-        (true, true) => anyhow::bail!(
-            "ambiguous repo root (both Rust and Python markers) at {repo:?}; pass an explicit --lang"
-        ),
-        (true, false) => Ok(Lang::Rust),
-        (false, true) => Ok(Lang::Python),
-        (false, false) => anyhow::bail!(
-            "could not detect language at {repo:?} (no Cargo.toml / setup.py / setup.cfg / requirements*.txt / \
-             pyproject project section / .py files); pass an explicit --lang"
-        ),
+    let is_go = repo.join("go.mod").is_file();
+    let n = [is_rust, is_python, is_go].iter().filter(|b| **b).count();
+    if n >= 2 {
+        anyhow::bail!(
+            "ambiguous repo root (multiple language markers: rust={is_rust} python={is_python} go={is_go}) \
+             at {repo:?}; pass an explicit --lang"
+        );
     }
+    if is_rust {
+        return Ok(Lang::Rust);
+    }
+    if is_python {
+        return Ok(Lang::Python);
+    }
+    if is_go {
+        return Ok(Lang::Go);
+    }
+    anyhow::bail!(
+        "could not detect language at {repo:?} (no Cargo.toml / setup.py / setup.cfg / requirements*.txt / \
+         pyproject project section / .py files / go.mod); pass an explicit --lang"
+    )
 }
 
 fn python_markers(repo: &Path) -> bool {

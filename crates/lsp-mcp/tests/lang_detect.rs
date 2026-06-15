@@ -225,3 +225,28 @@ fn relative_explicit_python_path_resolves_against_repo() {
         PyResolve::Fallback => panic!("relative explicit path must not fall back to python3"),
     }
 }
+
+#[test]
+fn go_mod_is_go() {
+    let d = td();
+    fs::write(d.path().join("go.mod"), "module example.com/x\n\ngo 1.26\n").unwrap();
+    assert_eq!(detect_lang(d.path()).unwrap(), Lang::Go);
+}
+
+#[test]
+fn go_and_rust_markers_are_ambiguous() {
+    let d = td();
+    fs::write(d.path().join("go.mod"), "module example.com/x\n").unwrap();
+    fs::write(d.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+    let err = detect_lang(d.path()).unwrap_err().to_string();
+    assert!(err.contains("ambiguous"), "go+rust → ambiguous refusal, got {err}");
+}
+
+#[test]
+fn go_and_python_markers_are_ambiguous() {
+    let d = td();
+    fs::write(d.path().join("go.mod"), "module example.com/x\n").unwrap();
+    fs::write(d.path().join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
+    let err = detect_lang(d.path()).unwrap_err().to_string();
+    assert!(err.contains("ambiguous"), "go+python → ambiguous refusal, got {err}");
+}

@@ -14,7 +14,7 @@ pub struct Cli {
     /// Repo root the language server is rooted at (the session cwd).
     #[arg(long)]
     pub repo: PathBuf,
-    /// Language server to drive: "auto" (detect from repo markers), "rust", or "python".
+    /// Language server to drive: "auto" (detect from repo markers), "rust", "python", or "go".
     #[arg(long, default_value = "auto")]
     pub lang: String,
     /// Base dir for the per-repo shared build cache (CARGO_TARGET_DIR). Optional.
@@ -38,7 +38,8 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         "auto" => crate::lang::detect_lang(&repo)?,
         "rust" => crate::lang::Lang::Rust,
         "python" => crate::lang::Lang::Python,
-        other => anyhow::bail!("--lang must be auto|rust|python (got {other:?})"),
+        "go" => crate::lang::Lang::Go,
+        other => anyhow::bail!("--lang must be auto|rust|python|go (got {other:?})"),
     };
     // Observability (spec §1): a misrouted {cwd} landing on the wrong language is now LOUD in the log.
     eprintln!("[lsp-mcp] root={} lang={}", repo.display(), lang.as_str());
@@ -53,6 +54,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         crate::lang::Lang::Python => {
             crate::lang::pyright_config(&repo, cli.python_path.as_deref())?
         }
+        crate::lang::Lang::Go => anyhow::bail!("go not yet implemented"), // TODO Task 4
     };
     // USE `is_project_root`: validate an EXPLICIT --lang against the repo (auto already validated above).
     if explicit && !(cfg.is_project_root)(&repo) {
