@@ -11,11 +11,6 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Build a `file://` request URI from an absolute path (lsp-types 0.97 has no `Url::from_file_path`).
-fn file_uri(p: &Path) -> String {
-    format!("file://{}", p.display())
-}
-
 type PendingRequests = Arc<Mutex<HashMap<i64, Sender<Value>>>>;
 type SharedReady = Arc<Mutex<crate::lang::Readiness>>;
 
@@ -106,7 +101,7 @@ impl LspClient {
     }
 
     fn handshake(&mut self) -> anyhow::Result<()> {
-        let root = file_uri(&self.repo);
+        let root = shape::file_uri(&self.repo);
         let params = (self.cfg.initialize_params)(&root);
         self.request("initialize", params, Duration::from_secs(30))?;
         self.notify("initialized", json!({}));
@@ -398,7 +393,7 @@ impl LspClient {
     }
 
     pub fn document_symbols(&mut self, file: &Path) -> anyhow::Result<Vec<NavHit>> {
-        let uri = file_uri(file);
+        let uri = shape::file_uri(file);
         let v = self.request(
             "textDocument/documentSymbol",
             json!({ "textDocument": { "uri": uri } }),
