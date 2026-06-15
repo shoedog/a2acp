@@ -245,7 +245,7 @@ pub fn serve(mut session: LspClient) -> anyhow::Result<()> {
             None
         };
         if let Some(reply) = reply {
-            crate::lsp::codec::write_frame(&mut out, serde_json::to_vec(&reply)?.as_slice())?;
+            transport::write_line_frame(&mut out, serde_json::to_vec(&reply)?.as_slice())?;
         }
     }
     session.shutdown();

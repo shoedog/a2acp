@@ -71,8 +71,39 @@ impl Lifecycle {
     }
 }
 
+/// MCP-over-stdio framing: **newline-delimited JSON-RPC** (one compact JSON message per line). This is the
+/// MCP stdio transport standard — DISTINCT from the LSP `Content-Length` framing (`crate::lsp::codec`) used
+/// to talk to the language server. The agents' MCP clients (claude-agent-acp, codex) speak newline framing;
+/// answering them with `Content-Length` left them waiting for headers that never came, so the lsp tools
+/// never registered (every host-reviewer `mcp__lsp__*` call returned "unavailable"). prism-mcp uses newline.
+pub fn read_line_frame<R: std::io::BufRead>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    loop {
+        let mut buf = Vec::new();
+        let n = r.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            return Ok(None); // EOF — peer closed stdin
+        }
+        // Trim the line terminator (\n or \r\n) and skip blank lines between messages.
+        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        if buf.is_empty() {
+            continue;
+        }
+        return Ok(Some(buf));
+    }
+}
+
+/// Write one MCP reply to the agent: compact JSON + a single `\n`, then flush.
+pub fn write_line_frame<W: std::io::Write>(w: &mut W, body: &[u8]) -> std::io::Result<()> {
+    w.write_all(body)?;
+    w.write_all(b"\n")?;
+    w.flush()
+}
+
+/// Read one MCP request from the agent (stdin). MCP stdio = newline-delimited JSON.
 pub fn read_frame_stdin<R: std::io::BufRead>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
-    crate::lsp::codec::read_frame(r)
+    read_line_frame(r)
 }
 
 #[cfg(test)]
@@ -126,5 +157,32 @@ mod tests {
     fn initialize_falls_back_when_client_omits_version() {
         let out = drive(&[r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#]);
         assert_eq!(out[0]["result"]["protocolVersion"], "2025-06-18");
+    }
+
+    #[test]
+    fn read_line_frame_reads_newline_delimited_json() {
+        // MCP stdio = newline-delimited JSON (NOT Content-Length). The agents send this.
+        let wire = b"{\"jsonrpc\":\"2.0\",\"id\":1}\n{\"jsonrpc\":\"2.0\",\"id\":2}\n";
+        let mut r = std::io::BufReader::new(&wire[..]);
+        let a = read_line_frame(&mut r).unwrap().unwrap();
+        assert_eq!(a, br#"{"jsonrpc":"2.0","id":1}"#);
+        let b = read_line_frame(&mut r).unwrap().unwrap();
+        assert_eq!(b, br#"{"jsonrpc":"2.0","id":2}"#);
+        assert!(read_line_frame(&mut r).unwrap().is_none()); // EOF
+    }
+
+    #[test]
+    fn read_line_frame_skips_blank_lines_and_trims_crlf() {
+        let wire = b"\r\n{\"id\":1}\r\n\n";
+        let mut r = std::io::BufReader::new(&wire[..]);
+        assert_eq!(read_line_frame(&mut r).unwrap().unwrap(), br#"{"id":1}"#);
+        assert!(read_line_frame(&mut r).unwrap().is_none());
+    }
+
+    #[test]
+    fn write_line_frame_appends_single_newline() {
+        let mut buf = Vec::new();
+        write_line_frame(&mut buf, br#"{"id":1}"#).unwrap();
+        assert_eq!(buf, b"{\"id\":1}\n");
     }
 }

@@ -1,5 +1,6 @@
-//! LSP/MCP wire framing: `Content-Length: N\r\n\r\n<body>`. Shared by both the MCP (agent) side and
-//! the LSP (rust-analyzer) side.
+//! LSP wire framing: `Content-Length: N\r\n\r\n<body>`. Used ONLY to talk to the language server
+//! (rust-analyzer / basedpyright). The MCP (agent-facing) side uses newline-delimited JSON instead
+//! (`crate::mcp::transport::{read_line_frame,write_line_frame}`) — that's the MCP stdio standard.
 use std::io::{self, BufRead, Read, Write};
 
 pub fn write_frame<W: Write>(w: &mut W, body: &[u8]) -> io::Result<()> {
