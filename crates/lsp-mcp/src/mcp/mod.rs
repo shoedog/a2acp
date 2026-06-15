@@ -59,7 +59,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "references",
-            "description": "All references to a symbol (blast radius); resolves generics/traits.",
+            "description": "All references to a symbol (blast radius); type-resolved across the language's generics/polymorphism.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -80,7 +80,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "implementations",
-            "description": "Trait impls / who implements a trait or type.",
+            "description": "Implementations of a symbol (Rust trait impls; Python subclasses / overrides).",
             "inputSchema": name_only
         }),
         json!({

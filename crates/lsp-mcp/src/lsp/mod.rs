@@ -398,10 +398,27 @@ impl LspClient {
 
     pub fn hover(&mut self, name: &str) -> anyhow::Result<Option<String>> {
         let v = self.positional("textDocument/hover", name)?;
-        Ok(v["contents"]["value"]
+        // MarkupContent { value } | a bare MarkedString string | MarkedString[] (array of strings/objects).
+        let s = v["contents"]["value"]
             .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| v["contents"].as_str().map(|s| s.to_string())))
+            .map(str::to_string)
+            .or_else(|| v["contents"].as_str().map(str::to_string))
+            .or_else(|| {
+                v["contents"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| {
+                                e.as_str()
+                                    .map(str::to_string)
+                                    .or_else(|| e["value"].as_str().map(str::to_string))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|s| !s.is_empty())
+            });
+        Ok(s)
     }
 
     pub fn document_symbols(&mut self, file: &Path) -> anyhow::Result<Vec<NavHit>> {
@@ -414,18 +431,38 @@ impl LspClient {
         let mut out = Vec::new();
         if let Some(arr) = v.as_array() {
             for it in arr {
-                if let Some(name) = it["name"].as_str() {
-                    let line = it["range"]["start"]["line"].as_u64().unwrap_or(0) as u32 + 1;
-                    out.push(NavHit {
-                        file: file.to_string_lossy().into_owned(),
-                        line,
-                        signature: Some(name.to_string()),
-                        context: it["detail"].as_str().map(|s| s.to_string()),
-                    });
-                }
+                Self::collect_doc_symbols(it, file, &mut out);
             }
         }
         Ok(out)
+    }
+
+    /// Recursively flatten a DocumentSymbol tree (`children`) into NavHits. Also handles the flat
+    /// SymbolInformation form (no `children`). Required so Python class methods aren't dropped (spec §1):
+    /// with `hierarchicalDocumentSymbolSupport` advertised, both basedpyright and rust-analyzer return the
+    /// nested `DocumentSymbol{children}` form, so a flat top-level parse drops nested methods (e.g. `greet`
+    /// under `Greeter`, `hi` under the `Greet` trait). The walk surfaces them additively.
+    fn collect_doc_symbols(it: &Value, file: &Path, out: &mut Vec<NavHit>) {
+        if let Some(name) = it["name"].as_str() {
+            // DocumentSymbol uses `range`; SymbolInformation uses `location.range`.
+            let start = if it.get("range").is_some() {
+                &it["range"]["start"]
+            } else {
+                &it["location"]["range"]["start"]
+            };
+            let line = start["line"].as_u64().unwrap_or(0) as u32 + 1;
+            out.push(NavHit {
+                file: file.to_string_lossy().into_owned(),
+                line,
+                signature: Some(name.to_string()),
+                context: it["detail"].as_str().map(|s| s.to_string()),
+            });
+        }
+        if let Some(children) = it["children"].as_array() {
+            for c in children {
+                Self::collect_doc_symbols(c, file, out);
+            }
+        }
     }
 
     pub fn call_hierarchy(&mut self, name: &str, incoming: bool) -> anyhow::Result<Vec<NavHit>> {

@@ -254,6 +254,7 @@ pub fn rust_ra_config(target_cache: Option<&Path>) -> LangServerConfig {
                 "processId": std::process::id(),
                 "rootUri": root_uri,
                 "capabilities": { "workspace": { "symbol": {} },
+                    "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } },
                     "experimental": { "serverStatusNotification": true } },
                 "workspaceFolders": [{ "uri": root_uri, "name": "root" }],
             })
@@ -379,7 +380,8 @@ pub fn pyright_config(
             json!({
                 "processId": std::process::id(),
                 "rootUri": root_uri,
-                "capabilities": { "workspace": { "symbol": {}, "configuration": false } },
+                "capabilities": { "workspace": { "symbol": {}, "configuration": false },
+                    "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } } },
                 "workspaceFolders": [{ "uri": root_uri, "name": "root" }],
             })
         }),
@@ -522,9 +524,34 @@ mod tests {
             json!(true)
         );
         assert_eq!(p["capabilities"]["workspace"]["symbol"], json!({}));
+        // LOAD-BEARING: hierarchical documentSymbol support MUST be advertised. With it, rust-analyzer (and
+        // basedpyright) return the nested `DocumentSymbol{children}` form so `collect_doc_symbols` recursion
+        // surfaces nested methods (e.g. the `hi` trait method); WITHOUT it, servers fall back to the flat
+        // `SymbolInformation` form and the recursion is dead code (nested methods never reach the children walk).
+        assert_eq!(
+            p["capabilities"]["textDocument"]["documentSymbol"]
+                ["hierarchicalDocumentSymbolSupport"],
+            json!(true)
+        );
         assert!(
             cfg.post_init_config.is_none(),
             "Rust sends NO post-init config"
+        );
+    }
+
+    #[test]
+    fn pyright_advertises_hierarchical_document_symbols() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = pyright_config(d.path(), None).unwrap();
+        let p = (cfg.initialize_params)("file:///repo");
+        // LOAD-BEARING (Python side): without `hierarchicalDocumentSymbolSupport`, basedpyright returns the
+        // flat `SymbolInformation` form and class methods (e.g. `Greeter.greet`) are dropped from the children
+        // walk — the live `document_symbols_extracts_class_and_method_recursively` test only fails-then-passes
+        // because this capability is advertised. Locks it so the recursion stays genuinely exercised.
+        assert_eq!(
+            p["capabilities"]["textDocument"]["documentSymbol"]
+                ["hierarchicalDocumentSymbolSupport"],
+            json!(true)
         );
     }
 }

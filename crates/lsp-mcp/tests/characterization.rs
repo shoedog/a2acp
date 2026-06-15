@@ -5,13 +5,21 @@ use lsp_mcp::lang::{LangServerConfig, Readiness, RustReady};
 use serde_json::json;
 use std::time::Duration;
 
-/// The exact `initialize` params the Rust path sends today (lib `handshake()`), captured here so the
-/// `Readiness::RustRa` config in Task 3 reproduces them value-for-value.
+/// The exact `initialize` params the Rust path sends today (via `rust_ra_config().initialize_params`),
+/// captured here so the `Readiness::RustRa` config reproduces them value-for-value.
+///
+/// NOTE (Task 8 intentional change): Rust's initialize now INTENTIONALLY advertises
+/// `hierarchicalDocumentSymbolSupport: true` (per LSP documentSymbol capability) to enable
+/// rust-analyzer to return nested `DocumentSymbol{children}` (e.g. the `hi` trait method)
+/// instead of the flat `SymbolInformation` form. This enables `collect_doc_symbols` recursion to
+/// surface nested methods. The change is intended — NOT a regression — and is locked by
+/// `rust_document_symbols_includes_nested_trait_method` in integration.rs.
 fn rust_initialize_params(root_uri: &str, pid: u32) -> serde_json::Value {
     json!({
         "processId": pid,
         "rootUri": root_uri,
         "capabilities": { "workspace": { "symbol": {} },
+            "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } },
             "experimental": { "serverStatusNotification": true } },
         "workspaceFolders": [{ "uri": root_uri, "name": "root" }],
     })
@@ -29,6 +37,16 @@ fn rust_initialize_params_are_pinned() {
     assert_eq!(p["processId"], json!(7));
     assert_eq!(p["rootUri"], json!("file:///repo"));
     assert_eq!(p["workspaceFolders"][0]["name"], json!("root"));
+    // LOAD-BEARING (Task 8 intentional change): hierarchicalDocumentSymbolSupport MUST be advertised
+    // so rust-analyzer returns nested DocumentSymbol{children} (enabling recursive document_symbols).
+    // Without it, RA falls back to flat SymbolInformation and nested methods (e.g. trait method `hi`)
+    // are dropped. This pin catches any future accidental removal. Locked by
+    // `rust_document_symbols_includes_nested_trait_method` in integration.rs.
+    assert_eq!(
+        p["capabilities"]["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"],
+        json!(true),
+        "Rust initialize MUST advertise hierarchicalDocumentSymbolSupport to enable recursive document_symbols"
+    );
 }
 
 #[test]
