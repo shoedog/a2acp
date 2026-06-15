@@ -14,8 +14,8 @@ pub struct Cli {
     /// Repo root the language server is rooted at (the session cwd).
     #[arg(long)]
     pub repo: PathBuf,
-    /// Language server to drive. Slice A supports only "rust".
-    #[arg(long, default_value = "rust")]
+    /// Language server to drive: "auto" (detect from repo markers), "rust", or "python".
+    #[arg(long, default_value = "auto")]
     pub lang: String,
     /// Base dir for the per-repo shared build cache (CARGO_TARGET_DIR). Optional.
     #[arg(long)]
@@ -23,25 +23,47 @@ pub struct Cli {
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        cli.lang == "rust",
-        "Slice A supports only --lang rust (got {:?})",
-        cli.lang
-    );
     let repo = cli
         .repo
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("repo {:?}: {e}", cli.repo))?;
-    anyhow::ensure!(
-        repo.join("Cargo.toml").exists(),
-        "not a cargo repo (no Cargo.toml): {:?}",
-        repo
-    );
-    let target = cli.target_cache.as_deref().map(|base| {
-        let origin = git_origin(&repo);
-        cache_key::cache_dir(base, &repo, origin.as_deref())
-    });
-    let session = lsp::LspClient::start_with(&repo, lang::rust_ra_config(target.as_deref()))?;
+    // Track whether the language was chosen EXPLICITLY (vs auto-detected): an explicit `--lang rust|python`
+    // is validated against the repo via `is_project_root` BEFORE starting (today explicit `--lang python`
+    // on a non-Python dir is unguarded). `auto` is already validated by `detect_lang`.
+    let explicit = cli.lang.as_str() != "auto";
+    let lang = match cli.lang.as_str() {
+        "auto" => crate::lang::detect_lang(&repo)?,
+        "rust" => crate::lang::Lang::Rust,
+        "python" => crate::lang::Lang::Python,
+        other => anyhow::bail!("--lang must be auto|rust|python (got {other:?})"),
+    };
+    // Observability (spec §1): a misrouted {cwd} landing on the wrong language is now LOUD in the log.
+    eprintln!("[lsp-mcp] root={} lang={}", repo.display(), lang.as_str());
+    let cfg = match lang {
+        crate::lang::Lang::Rust => {
+            let target = cli.target_cache.as_deref().map(|base| {
+                let origin = git_origin(&repo);
+                cache_key::cache_dir(base, &repo, origin.as_deref())
+            });
+            crate::lang::rust_ra_config(target.as_deref())
+        }
+        // TODO Task 6: replace with `crate::lang::pyright_config(&repo, cli.python_path.as_deref())?`
+        // (the basedpyright LangServerConfig + the `--python-path` Cli field both land in Task 6).
+        crate::lang::Lang::Python => anyhow::bail!("python not yet implemented"),
+    };
+    // USE `is_project_root`: validate an EXPLICIT --lang against the repo (auto already validated above).
+    if explicit && !(cfg.is_project_root)(&repo) {
+        anyhow::bail!(
+            "explicit --lang {} but {:?} is not a {} project root (missing the {} root markers); \
+             pass the right --lang or point --repo at a {} root",
+            lang.as_str(),
+            repo,
+            lang.as_str(),
+            lang.as_str(),
+            lang.as_str()
+        );
+    }
+    let session = lsp::LspClient::start_with(&repo, cfg)?;
     mcp::serve(session)
 }
 
