@@ -54,7 +54,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         crate::lang::Lang::Python => {
             crate::lang::pyright_config(&repo, cli.python_path.as_deref())?
         }
-        crate::lang::Lang::Go => anyhow::bail!("go not yet implemented"), // TODO Task 4
+        crate::lang::Lang::Go => crate::lang::go_config(&repo)?,
     };
     // USE `is_project_root`: validate an EXPLICIT --lang against the repo (auto already validated above).
     if explicit && !(cfg.is_project_root)(&repo) {

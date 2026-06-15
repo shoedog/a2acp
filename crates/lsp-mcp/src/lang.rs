@@ -141,6 +141,7 @@ fn shallow_py_scan(repo: &Path) -> bool {
 pub enum Readiness {
     RustRa(RustReady),
     Pyright(PyrightReady),
+    Gopls(GoplsReady),
 }
 
 /// Rust path readiness state — the old `ReadyState`, unchanged fields/semantics.
@@ -171,6 +172,30 @@ pub struct PyrightReady {
 impl PyrightReady {
     /// PURE no-progress settle gate: settings applied, no progress begun, and the settle window has
     /// elapsed since `settled_at`. Timed from `settled_at` (settings-applied), not from any wait entry.
+    pub fn settled_no_progress(&self, settle: Duration) -> bool {
+        !self.began
+            && self
+                .settled_at
+                .map(|t| t.elapsed() >= settle)
+                .unwrap_or(false)
+    }
+}
+
+/// gopls readiness: like basedpyright, gopls emits no `$/progress` for a typical workspace load (Task-1
+/// spike Gate 3), so readiness is reached by SETTLING — `settled_at` (stamped after `initialized`, since
+/// gopls has no post-init config) + this window elapsed with no progress seen. `$/progress` begin/end
+/// parsing is harmless belt-and-suspenders for a gopls that DOES emit it.
+#[derive(Debug, Default)]
+pub struct GoplsReady {
+    pub began: bool,
+    pub active: u32,
+    /// Set (`Some(Instant::now())`) at the end of `handshake` (after `initialized`) — gopls has no
+    /// `post_init_config`, so the settle clock starts at `initialized`, not at settings-applied.
+    pub settled_at: Option<Instant>,
+}
+
+impl GoplsReady {
+    /// PURE no-progress settle gate: no progress begun and the settle window has elapsed since `settled_at`.
     pub fn settled_no_progress(&self, settle: Duration) -> bool {
         !self.began
             && self
@@ -212,13 +237,27 @@ impl Readiness {
                 }
                 _ => {}
             },
+            Readiness::Gopls(s) => {
+                if method == "$/progress" {
+                    match params["value"]["kind"].as_str() {
+                        Some("begin") => {
+                            s.began = true;
+                            s.active += 1;
+                        }
+                        Some("end") => {
+                            s.active = s.active.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
-    /// PURE ready predicate. RustRa: quiescent OR begun-and-ended. Pyright: begun-and-ended, OR
+    /// PURE ready predicate. RustRa: quiescent OR begun-and-ended. Pyright/Gopls: begun-and-ended, OR
     /// settings applied with no progress seen (the no-progress settle is timed by LspClient::wait_ready
-    /// via `PyrightReady::settled_no_progress`). The settle branch is the LOAD-BEARING path because
-    /// basedpyright emits NO `pyright/*Progress` for a typical analysis (Task-1 spike): it is an
+    /// via `settled_no_progress`). The settle branch is the LOAD-BEARING path because basedpyright/gopls
+    /// emit NO progress for a typical analysis/load (Task-1 spikes): it is an
     /// INDEPENDENT OR-branch, NOT gated behind having seen `begin`. begin/end parsing is harmless
     /// belt-and-suspenders for servers that DO emit progress.
     pub fn is_ready(&self) -> bool {
@@ -227,6 +266,7 @@ impl Readiness {
             // The pure predicate covers the begun-and-ended branch; the no-progress settle branch is
             // OR'd in by LspClient::wait_ready, which owns the settle window (a Duration, not in scope here).
             Readiness::Pyright(s) => s.began && s.active == 0,
+            Readiness::Gopls(s) => s.began && s.active == 0,
         }
     }
 }
@@ -500,6 +540,36 @@ pub fn pyright_config(
     })
 }
 
+/// Go / gopls config. gopls auto-configures from `go.mod` — NO interpreter discovery, NO
+/// didChangeConfiguration (`post_init_config = None`), `spawn_env = []` (gopls inherits GOPATH/GOROOT from
+/// the env; Task-1 spike Gate 2). `program_argv = [resolve_lsp_server("gopls"), "serve"]` (the spike's
+/// proven stdio invocation; Gate 1). Readiness is the no-progress settle (Gate 3).
+pub fn go_config(repo: &Path) -> anyhow::Result<LangServerConfig> {
+    let _ = repo; // gopls needs no per-repo discovery; `repo` kept for signature symmetry / future use.
+    let server_bin = resolve_lsp_server("gopls");
+    eprintln!("[lsp-mcp] gopls server: {server_bin}");
+    Ok(LangServerConfig {
+        name: "gopls",
+        program_argv: vec![server_bin, "serve".to_string()],
+        spawn_env: vec![],
+        is_project_root: Box::new(|root: &Path| root.join("go.mod").exists()),
+        initialize_params: Box::new(|root_uri: &str| {
+            json!({
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                // Advertise hierarchical documentSymbol so methods on a struct/interface surface via the
+                // recursive `collect_doc_symbols` walk. NO window/workDoneProgress → readiness is the
+                // no-progress settle (gopls emits no progress for a typical load; spike Gate 3).
+                "capabilities": { "workspace": { "symbol": {} },
+                    "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } } },
+                "workspaceFolders": [{ "uri": root_uri, "name": "root" }],
+            })
+        }),
+        post_init_config: None,
+        new_readiness: Box::new(|| Readiness::Gopls(GoplsReady::default())),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +788,104 @@ mod tests {
             !p.settled_no_progress(settle),
             "begin seen ⇒ no no-progress settle (needs a matching end)"
         );
+    }
+
+    #[test]
+    fn go_config_has_no_post_init_and_uses_serve() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = go_config(d.path()).unwrap();
+        assert_eq!(cfg.name, "gopls");
+        assert!(
+            cfg.post_init_config.is_none(),
+            "gopls auto-configures from go.mod — NO post-init config"
+        );
+        assert!(
+            cfg.spawn_env.is_empty(),
+            "gopls inherits the env — no spawn_env injection"
+        );
+        assert_eq!(
+            cfg.program_argv.last().map(String::as_str),
+            Some("serve"),
+            "gopls is spawned with the proven stdio invocation"
+        );
+
+        let d2 = tempfile::tempdir().unwrap();
+        std::fs::write(d2.path().join("go.mod"), "module example.com/x\n").unwrap();
+        assert!(
+            (cfg.is_project_root)(d2.path()),
+            "a go.mod dir is a Go project root"
+        );
+        assert!(
+            !(cfg.is_project_root)(d.path()),
+            "a dir without go.mod is NOT a Go project root"
+        );
+    }
+
+    #[test]
+    fn go_config_advertises_hierarchical_document_symbols() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = go_config(d.path()).unwrap();
+        let p = (cfg.initialize_params)("file:///repo");
+        assert_eq!(
+            p["capabilities"]["textDocument"]["documentSymbol"]
+                ["hierarchicalDocumentSymbolSupport"],
+            json!(true),
+            "hierarchical documentSymbol must be advertised so methods surface via children recursion"
+        );
+    }
+
+    #[test]
+    fn gopls_no_progress_is_ready_after_settle() {
+        let settle = Duration::from_millis(50);
+        let p = GoplsReady {
+            began: false,
+            active: 0,
+            settled_at: Some(Instant::now()),
+        };
+        assert!(
+            !p.settled_no_progress(settle),
+            "not ready before the settle window elapses"
+        );
+
+        let p = GoplsReady {
+            began: false,
+            active: 0,
+            settled_at: Some(Instant::now() - Duration::from_millis(60)),
+        };
+        assert!(
+            p.settled_no_progress(settle),
+            "settle elapsed with no progress → ready"
+        );
+
+        let p = GoplsReady {
+            began: false,
+            active: 0,
+            settled_at: None,
+        };
+        assert!(
+            !p.settled_no_progress(settle),
+            "no settled_at → not settle-ready"
+        );
+
+        let p = GoplsReady {
+            began: true,
+            active: 1,
+            settled_at: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(
+            !p.settled_no_progress(settle),
+            "begin seen ⇒ no no-progress settle"
+        );
+    }
+
+    #[test]
+    fn gopls_ready_via_progress() {
+        let mut r = Readiness::Gopls(GoplsReady::default());
+        assert!(!r.is_ready());
+        r.on_notification("$/progress", &json!({"value":{"kind":"begin"}}));
+        assert!(!r.is_ready(), "begun, still active");
+        r.on_notification("$/progress", &json!({"value":{"kind":"end"}}));
+        assert!(r.is_ready(), "begun-and-ended is ready");
     }
 
     #[test]

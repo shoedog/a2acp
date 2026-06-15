@@ -120,18 +120,18 @@ pub fn should_evict(idle_secs: u64, timeout_secs: u64) -> bool {
     timeout_secs > 0 && idle_secs >= timeout_secs
 }
 
-/// The no-progress settle window for the Pyright path: basedpyright emits NO `pyright/*Progress` for a
-/// typical analysis (Task-1 spike), so readiness is reached by SETTLING — settings applied + this window
-/// elapsed with no progress seen. Independent OR-branch of `Readiness::is_ready`; only the Pyright variant
-/// is affected (RustRa's `settled_no_progress` equivalent never fires). Lands fully wired in Task 6.
+/// The no-progress settle window for settle-based language servers: basedpyright/gopls emit NO progress for
+/// a typical analysis/load, so readiness is reached by SETTLING — settings/init applied + this window
+/// elapsed with no progress seen. Independent OR-branch of `Readiness::is_ready`; RustRa is unaffected.
 const PYRIGHT_SETTLE: Duration = Duration::from_millis(1500);
 
-/// LOAD-BEARING Pyright readiness branch, evaluated by `wait_ready` (it owns the runtime settle Duration
-/// that the pure `Readiness::is_ready` predicate can't carry). Returns true only for a `Pyright` machine
-/// that has settled with no progress; always false for `RustRa`.
-fn pyright_settled(r: &crate::lang::Readiness) -> bool {
+/// LOAD-BEARING settle branch for the no-progress languages (basedpyright + gopls), evaluated by
+/// `wait_ready` (it owns the runtime settle Duration the pure `Readiness::is_ready` can't carry). True
+/// only for a settle-based machine that has settled with no progress; false for RustRa.
+fn settled_no_progress(r: &crate::lang::Readiness) -> bool {
     match r {
         crate::lang::Readiness::Pyright(p) => p.settled_no_progress(PYRIGHT_SETTLE),
+        crate::lang::Readiness::Gopls(g) => g.settled_no_progress(PYRIGHT_SETTLE),
         crate::lang::Readiness::RustRa(_) => false,
     }
 }
@@ -250,6 +250,10 @@ impl LspClient {
             if let crate::lang::Readiness::Pyright(s) = &mut *self.ready.lock().unwrap() {
                 s.settled_at = Some(Instant::now());
             }
+        }
+        // Gopls has no post_init_config → stamp its settle clock right after `initialized`.
+        if let crate::lang::Readiness::Gopls(s) = &mut *self.ready.lock().unwrap() {
+            s.settled_at = Some(Instant::now());
         }
         Ok(())
     }
@@ -426,8 +430,9 @@ impl LspClient {
     }
 
     /// Block until the server reports ready (per its `Readiness` machine), or `timeout` (best-effort past
-    /// the bound). The Pyright no-progress settle is OR'd in here because the settle window is a runtime
-    /// Duration the pure `Readiness::is_ready` predicate doesn't carry.
+    /// the bound). The no-progress settle for the settle-based servers (Pyright/Gopls) is OR'd in here via
+    /// `settled_no_progress` because the settle window is a runtime Duration the pure `Readiness::is_ready`
+    /// predicate doesn't carry.
     pub fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let t0 = Instant::now();
         loop {
@@ -436,7 +441,7 @@ impl LspClient {
             self.touch();
             {
                 let g = self.ready.lock().unwrap();
-                if g.is_ready() || pyright_settled(&g) {
+                if g.is_ready() || settled_no_progress(&g) {
                     return Ok(());
                 }
             }
