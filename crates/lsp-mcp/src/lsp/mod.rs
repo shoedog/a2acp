@@ -37,27 +37,27 @@ pub struct LspSession {
 }
 
 #[derive(Default)]
-struct ReadyState {
-    began: bool,
-    active: u32,
+pub struct ReadyState {
+    pub began: bool,
+    pub active: u32,
     /// Latest `experimental/serverStatus { quiescent }` from rust-analyzer — true once it has finished
     /// loading/indexing and has no background work in flight. A reliable readiness signal even when the
     /// `$/progress` begin/end pair never fires (warm/fast index), which otherwise stalled the first tool
     /// call for the full `ensure_ready` timeout (~30s). RA sends it because we advertise
     /// `serverStatusNotification` in `initialize`.
-    quiescent: bool,
+    pub quiescent: bool,
 }
 
 /// PURE. Ready when RA reports it's settled (`quiescent`) OR a `$/progress` cycle has begun-and-ended.
 /// Two independent signals so a missing `$/progress` (warm index) no longer forces a full-timeout wait.
-fn is_ready(s: &ReadyState) -> bool {
+pub fn is_ready(s: &ReadyState) -> bool {
     s.quiescent || (s.began && s.active == 0)
 }
 
 /// PURE. The `quiescent` flag from an `experimental/serverStatus` notification's `params` (top-level,
 /// unlike `$/progress`'s nested `value.kind`). `None` when absent/wrong-typed → the caller keeps the
 /// prior value rather than guessing.
-fn parse_quiescent(params: &Value) -> Option<bool> {
+pub fn parse_quiescent(params: &Value) -> Option<bool> {
     params.get("quiescent").and_then(|q| q.as_bool())
 }
 

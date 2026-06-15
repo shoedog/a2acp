@@ -60,3 +60,11 @@ fn git_origin(repo: &std::path::Path) -> Option<String> {
         Some(s)
     }
 }
+
+#[doc(hidden)] // out of the documented API, but resolvable from the external characterization harness.
+pub mod testkit {
+    //! Internal helpers exposed ONLY for the characterization harness (tests/characterization.rs).
+    //! Doc-hidden so they don't appear in the public docs; the items themselves are `pub` because an
+    //! external `tests/` crate cannot reach `pub(crate)` items (and `pub use` of `pub(crate)` won't compile).
+    pub use crate::lsp::{is_ready, parse_quiescent, ReadyState};
+}
