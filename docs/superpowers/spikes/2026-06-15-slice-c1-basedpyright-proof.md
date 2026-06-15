@@ -42,6 +42,8 @@ Server log confirms it adopted the venv interpreter: `Assuming Python version 3.
 
 **Task 6 implication:** the wrapped `{ "settings": { "python": { "pythonPath": … } } }` push envelope alone resolves third-party defs/hover into the venv's site-packages. **Task 6's `post_init_config` ships exactly this wrapped form** (NOT a bare `{ "python": { "pythonPath": … } }`).
 
+**Known limitation — third-party symbols are NOT reachable by name via the name-addressed API:** basedpyright's `workspace/symbol` indexes ONLY workspace (in-repo) symbols, so the bridge's name-addressed API (which resolves a name→position via `workspace/symbol` first) CANNOT reach a third-party symbol BY NAME (e.g. `definition("BaseModel")` errors with "symbol not found"). Third-party symbols are reachable POSITIONALLY — at a usage site in the workspace — as this gate proved for `click.echo` (located via `textDocument/definition` at a known position). In-workspace name resolution (e.g. `Greeter`, `module_greet`) works fine. **A reviewer of Task 9's DoD should expect third-party-by-name to not resolve; a null/error on a THIRD-PARTY name is a known structural gap (not a bug).** This is distinct from the no-venv fallback (Gate 1c): even WITH a correctly configured venv, `workspace/symbol` simply does not index site-packages.
+
 ---
 
 ## Gate 1b — repo override behavior — repo config WINS (shim must not fight it)

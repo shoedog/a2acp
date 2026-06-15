@@ -1523,7 +1523,7 @@ First runs the relocated LIVE `{cwd}` codex gate (it needs the Task-4 binary's `
 | §1 split `LspClient` from `LangServerConfig` | Task 3 |
 | §1/§2 `is_project_root` field added AND wired (explicit `--lang` validated before start) | Task 3 (field on `LangServerConfig` + rust predicate) + Task 4 (`run()` calls `(cfg.is_project_root)(repo)` for explicit `--lang`) + Task 6 (pyright predicate) |
 | §1 `Readiness` absorbs ONLY notification parsing; `id`-routing STAYS in `LspClient` | Task 3 (`Readiness::on_notification`; reader thread keeps the `if let Some(id)` route inline) |
-| §1 `Readiness::RustRa` wraps current logic unchanged | Task 3 (`RustReady` + `rust_ra_config`) + Task 2 characterization proving byte-for-byte |
+| §1 `Readiness::RustRa` wraps current logic unchanged | Task 3 (`RustReady` + `rust_ra_config`) + Task 2 characterization proving byte-for-byte (readiness + resolution paths; EXCEPT the intentional `document_symbols` recursion change AND the one added `hierarchicalDocumentSymbolSupport` initialize capability that enables it — both intended + locked by tests; see Task 8) |
 | §1 fake-LSP characterization HARNESS FIRST (transition table + happy respawn) | Task 2 (green on current code, then re-asserted post-refactor); + Task 3 adds the GENUINE respawn-FAILURE + request-touch tests |
 | §1 `resolve_pos` duplicate-name fixture + documented degradation | Task 8 (`resolve_pos_handles_duplicate_name`, `models.py` duplicate `greet`) |
 | §1 recursive `document_symbols.children` REQUIRED (class→method) | Task 8 (`collect_doc_symbols` recursion + test) |
