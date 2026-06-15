@@ -146,6 +146,174 @@ fn respawn_failure_leaves_evicted_true() {
         s.is_evicted_for_test(),
         "FAILED respawn must leave evicted=true (crown-jewel invariant)"
     );
+    // Finding 2: a spawn-failed respawn also leaves no child handle (the bogus binary never spawned a
+    // child, so nothing is leaked — the spawn-succeeds/handshake-fails leak is covered separately by
+    // `respawn_failure_reaps_new_child_no_leak`).
+    assert!(
+        !s.child_present_for_test(),
+        "FAILED respawn (spawn error) leaves no leaked child handle"
+    );
+}
+
+/// A fake LSP (shell script) that reproduces the Finding-1 collision: it emits a server-initiated
+/// `workspace/configuration` request whose id (1) COLLIDES with the client's `initialize` (also id 1),
+/// then BLOCKS reading one reply frame from its stdin, and ONLY THEN emits the real `initialize`
+/// response. Consequences for the reader thread under test:
+///
+/// - CORRECT (fixed): server-req is answered (reply written to $A2A_REPLY_FILE) → the fake unblocks →
+///   emits the real init response → handshake (initialize) gets ITS correct response → start Ok.
+/// - OLD BUG, DROP: server-req dropped → no reply → fake blocks forever → initialize times out → Err.
+/// - OLD BUG, MIS-ROUTE: server-req delivered to pending id 1 → no reply written → fake blocks → the
+///   reply file stays empty.
+///
+/// So `start Ok` proves (a) the client request got its own response; a non-empty reply file with a
+/// `result` array proves (b) the server request was answered.
+const FAKE_COLLISION_LSP: &str = r#"
+emit() {
+  body="$1"
+  len=$(printf '%s' "$body" | wc -c | tr -d ' ')
+  printf 'Content-Length: %s\r\n\r\n%s' "$len" "$body"
+}
+# Read exactly one framed message from stdin into stdout; returns its body via the `frame` variable is not
+# possible in pure sh easily, so we read into a file and cat it.
+read_one_frame() {  # writes the body to $1
+  clen=0
+  while IFS= read -r line; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    [ -z "$line" ] && break
+    case "$line" in
+      Content-Length:*) clen=$(printf '%s' "${line#Content-Length:}" | tr -d ' ') ;;
+    esac
+  done
+  dd bs=1 count="$clen" of="$1" 2>/dev/null
+}
+# 1) colliding server-initiated request (id 1, same as the client's initialize).
+emit '{"jsonrpc":"2.0","id":1,"method":"workspace/configuration","params":{"items":[{"section":"python"}]}}'
+# 2) the client writes BOTH its `initialize` request AND our reply to our stdin (same pipe, racy order).
+#    Read frames until we see OUR reply — a frame carrying `result` (the workspace/configuration answer),
+#    NOT a `method` (the client's initialize request). Skip non-reply frames so the capture is robust.
+tmp="$A2A_REPLY_FILE.frame"
+while :; do
+  read_one_frame "$tmp"
+  if grep -q '"result"' "$tmp" 2>/dev/null && ! grep -q '"method"' "$tmp" 2>/dev/null; then
+    cp "$tmp" "$A2A_REPLY_FILE"
+    break
+  fi
+done
+# 3) now emit the real initialize response (id 1).
+emit '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"the_real":"init_result"}}}'
+sleep 5
+"#;
+
+#[test]
+fn server_request_with_colliding_id_does_not_corrupt_pending() {
+    // Finding 1 (HIGH): a server-initiated request (id+method) whose id collides with an in-flight client
+    // request must be ANSWERED, never routed to `pending` as that client's response. Drive a real
+    // LspClient against a fake LSP that forces exactly this collision (see FAKE_COLLISION_LSP).
+    let reply_file = std::env::temp_dir().join(format!(
+        "a2a-collision-reply-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&reply_file);
+    let cfg = LangServerConfig {
+        name: "fake-collision-lsp",
+        program_argv: vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            FAKE_COLLISION_LSP.to_string(),
+        ],
+        spawn_env: vec![(
+            "A2A_REPLY_FILE".to_string(),
+            reply_file.to_string_lossy().into_owned(),
+        )],
+        is_project_root: Box::new(|_| true),
+        initialize_params: Box::new(|root| json!({ "rootUri": root })),
+        post_init_config: None,
+        new_readiness: Box::new(|| Readiness::RustRa(RustReady::default())),
+    };
+    // (a) start_with runs the handshake `initialize` (id 1). It returns Ok ONLY if initialize received
+    //     its OWN response — proving the colliding server request did not corrupt pending id 1 (a drop
+    //     would time out → Err; a mis-route would also block the fake → no real response → Err/empty).
+    let mut s = lsp_mcp::lsp::LspClient::start_with(&sample_repo(), cfg)
+        .expect("initialize must receive its own response despite the colliding server request");
+    // (b) the server request was answered: the fake captured our reply (a workspace/configuration result).
+    let reply = std::fs::read_to_string(&reply_file).unwrap_or_default();
+    assert!(
+        !reply.is_empty(),
+        "the server-initiated workspace/configuration request must be answered (reply captured), got empty"
+    );
+    let reply_json: serde_json::Value =
+        serde_json::from_str(&reply).expect("captured reply must be valid JSON-RPC");
+    assert_eq!(
+        reply_json["id"],
+        json!(1),
+        "reply echoes the server request id"
+    );
+    assert!(
+        reply_json["result"].is_array(),
+        "workspace/configuration reply result must be an array (one entry per item), got {reply_json}"
+    );
+    s.shutdown();
+    let _ = std::fs::remove_file(&reply_file);
+}
+
+#[test]
+fn respawn_failure_reaps_new_child_no_leak() {
+    // Finding 2 (MEDIUM): respawn installs the NEW child BEFORE handshake; if handshake fails the
+    // new child must be killed+waited (not leaked for the next respawn to overwrite). This exercises
+    // the spawn-SUCCEEDS / handshake-FAILS path (the bogus-binary crown-jewel test fails at spawn() and
+    // never creates a child, so it can't catch this leak). A tiny fake LSP replies to the `initialize`
+    // request (id 1 — the first request the handshake sends) with a JSON-RPC ERROR, so `handshake()`
+    // returns Err deterministically and fast; the fake stays alive (sleep) so we can assert it's reaped.
+    if !ra_available() {
+        eprintln!("skip: rust-analyzer not on PATH");
+        return;
+    }
+    // A frame replying to id 1 (the initialize request) with an error → handshake bails immediately.
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"fake handshake failure"}}"#;
+    let script = format!(
+        "printf 'Content-Length: {}\\r\\n\\r\\n{}'; sleep 5",
+        body.len(),
+        body
+    );
+    let fake = LangServerConfig {
+        name: "fake-handshake-fail-lsp",
+        program_argv: vec!["/bin/sh".to_string(), "-c".to_string(), script],
+        spawn_env: vec![],
+        is_project_root: Box::new(|_| true),
+        initialize_params: Box::new(|root| json!({ "rootUri": root })),
+        post_init_config: None,
+        new_readiness: Box::new(|| Readiness::RustRa(RustReady::default())),
+    };
+    // Start a healthy client, evict it (old child reaped → self.child == None), then point respawn at the
+    // fake cfg whose spawn() SUCCEEDS but whose handshake FAILS.
+    let mut s =
+        lsp_mcp::lsp::LspClient::start_with(&sample_repo(), lsp_mcp::lang::rust_ra_config(None))
+            .unwrap();
+    s.ensure_ready(Duration::from_secs(120)).unwrap();
+    s.evict();
+    assert!(s.is_evicted_for_test(), "evict() set evicted=true");
+    s.set_cfg_for_test(fake);
+    let err = s.respawn_for_test();
+    assert!(
+        err.is_err(),
+        "respawn must fail when the fake server errors on initialize"
+    );
+    // Crown-jewel invariant preserved: a failed respawn leaves evicted=true.
+    assert!(
+        s.is_evicted_for_test(),
+        "FAILED respawn must leave evicted=true"
+    );
+    // Finding 2: the newly-spawned (but handshake-failed) child must be reaped, NOT leaked.
+    assert!(
+        !s.child_present_for_test(),
+        "FAILED respawn must reap the new child (no leaked handle for the next respawn to overwrite)"
+    );
 }
 
 #[test]

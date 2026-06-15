@@ -22,9 +22,55 @@ fn pysample() -> PathBuf {
 fn pysample_venv_python() -> PathBuf {
     pysample().join(".venv/bin/python")
 }
-/// Skip unless basedpyright AND the fixture venv (with the third-party dep) both exist.
+
+/// What the Python liveness guard should do, given the require-flag and the presence of basedpyright +
+/// the fixture venv. Pure so the require-but-absent case is testable WITHOUT uninstalling basedpyright.
+#[derive(Debug, PartialEq, Eq)]
+enum PyGate {
+    Run,
+    Skip,
+    /// `LSP_MCP_REQUIRE_PYTHON=1` is set but a prerequisite is missing → the guard MUST fail (CI enforces
+    /// real Python coverage instead of silently green-ing). Carries the human-readable reason.
+    Require(String),
+}
+
+/// Decide the gate. With `require` set, a missing prerequisite is a HARD failure (not a silent skip) so a
+/// CI job can enforce real Python coverage. With `require` unset (the dev default), a missing prerequisite
+/// is a silent skip so machines without basedpyright/venv aren't broken.
+fn python_gate(require: bool, pyright: bool, venv: bool) -> PyGate {
+    match (pyright, venv) {
+        (true, true) => PyGate::Run,
+        _ if require => {
+            let mut missing = Vec::new();
+            if !pyright {
+                missing.push("basedpyright not on PATH");
+            }
+            if !venv {
+                missing.push("fixture venv (tests/fixtures/pysample/.venv/bin/python) missing");
+            }
+            PyGate::Require(missing.join("; "))
+        }
+        _ => PyGate::Skip,
+    }
+}
+
+/// Skip unless basedpyright AND the fixture venv (with the third-party dep) both exist — UNLESS
+/// `LSP_MCP_REQUIRE_PYTHON=1` is set, in which case a missing prerequisite PANICS so a CI job enforces
+/// real Python coverage rather than silently green-ing (Finding 3). Returns true ⇒ run the live test.
 fn ready() -> bool {
-    pyright_available() && pysample_venv_python().is_file()
+    let require = std::env::var("LSP_MCP_REQUIRE_PYTHON").as_deref() == Ok("1");
+    match python_gate(
+        require,
+        pyright_available(),
+        pysample_venv_python().is_file(),
+    ) {
+        PyGate::Run => true,
+        PyGate::Skip => false,
+        PyGate::Require(why) => panic!(
+            "LSP_MCP_REQUIRE_PYTHON=1 but Python coverage cannot run: {why}. \
+             Install basedpyright + create the fixture venv, or unset LSP_MCP_REQUIRE_PYTHON."
+        ),
+    }
 }
 
 fn start() -> LspClient {
@@ -181,4 +227,44 @@ fn references_and_callhierarchy_and_definition() {
     let _calls = s.call_hierarchy("module_greet", true).unwrap(); // incoming callers, must not error
     let _impls = s.implementations("Greeter").unwrap(); // basedpyright may return [] — must not error
     s.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Finding 3: the require-Python gate decision (pure, hermetic — no real basedpyright needed)
+// ---------------------------------------------------------------------------
+
+/// Both prerequisites present → Run, regardless of the require flag.
+#[test]
+fn python_gate_runs_when_both_present() {
+    assert_eq!(python_gate(false, true, true), PyGate::Run);
+    assert_eq!(python_gate(true, true, true), PyGate::Run);
+}
+
+/// require UNSET (dev default) + a missing prerequisite → silent Skip (dev machines aren't broken).
+#[test]
+fn python_gate_skips_when_not_required_and_absent() {
+    assert_eq!(python_gate(false, false, false), PyGate::Skip);
+    assert_eq!(python_gate(false, false, true), PyGate::Skip);
+    assert_eq!(python_gate(false, true, false), PyGate::Skip);
+}
+
+/// require SET + a missing prerequisite → Require (the guard must FAIL, not skip). This is the
+/// behavior `ready()` turns into a panic so CI enforces real Python coverage (Finding 3).
+#[test]
+fn python_gate_requires_when_required_and_absent() {
+    assert!(matches!(
+        python_gate(true, false, false),
+        PyGate::Require(_)
+    ));
+    assert!(matches!(python_gate(true, false, true), PyGate::Require(_)));
+    assert!(matches!(python_gate(true, true, false), PyGate::Require(_)));
+    // The reason names the missing piece(s).
+    match python_gate(true, false, true) {
+        PyGate::Require(why) => assert!(why.contains("basedpyright"), "got: {why}"),
+        other => panic!("expected Require, got {other:?}"),
+    }
+    match python_gate(true, true, false) {
+        PyGate::Require(why) => assert!(why.contains("venv"), "got: {why}"),
+        other => panic!("expected Require, got {other:?}"),
+    }
 }
