@@ -15,20 +15,32 @@ impl Lifecycle {
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         match method {
-            "initialize" => Some(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": "lsp-mcp",
-                        "version": env!("CARGO_PKG_VERSION")
+            "initialize" => {
+                // Echo the client's requested `protocolVersion` for compatibility: a strict MCP client
+                // (codex-acp / claude-agent-acp) rejects the handshake — and never registers our tools —
+                // if the server answers with a version it doesn't recognize. lsp-mcp's surface is just the
+                // stable tools/{list,call} protocol, so echoing the client's version is safe. Fall back to a
+                // known-stable version only when the client omits one.
+                let proto = msg
+                    .get("params")
+                    .and_then(|p| p.get("protocolVersion"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("2025-06-18");
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": proto,
+                        "capabilities": {
+                            "tools": {}
+                        },
+                        "serverInfo": {
+                            "name": "lsp-mcp",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
                     }
-                }
-            })),
+                }))
+            }
             "notifications/initialized" => {
                 self.initialized = true;
                 None
@@ -98,5 +110,21 @@ mod tests {
         assert!(out
             .iter()
             .any(|m| m["id"] == 2 && m["result"]["tools"].is_array()));
+    }
+
+    #[test]
+    fn initialize_echoes_client_protocol_version() {
+        // A strict MCP client (codex-acp/claude-agent-acp) rejects the handshake — and never registers
+        // our tools — unless the server answers with a protocolVersion it recognizes. Echo the client's.
+        let out = drive(&[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#,
+        ]);
+        assert_eq!(out[0]["result"]["protocolVersion"], "2024-11-05");
+    }
+
+    #[test]
+    fn initialize_falls_back_when_client_omits_version() {
+        let out = drive(&[r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#]);
+        assert_eq!(out[0]["result"]["protocolVersion"], "2025-06-18");
     }
 }
