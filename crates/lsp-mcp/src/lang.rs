@@ -324,6 +324,67 @@ pub fn resolve_python_path(
     PyResolve::Fallback // no venv found → python3 fallback (warned), only because there was no explicit override
 }
 
+/// Resolve a bare server program name to an absolute path suitable for `Command::program`.
+///
+/// Search order:
+/// 1. If `name` contains a path separator, return it unchanged — it is already a path.
+/// 2. Each `:` -separated directory in `path_var` (the value of `$PATH`): `<dir>/<name>`.
+/// 3. `home_dir/.local/bin/<name>` — the standard `uv tool install` shim location.
+/// 4. `home_dir/.cargo/bin/<name>` — the standard `cargo install` location.
+///
+/// The first candidate that `is_usable_interpreter` accepts (exists + executable) is returned as an
+/// absolute path string. If none match, `name` is returned unchanged so the caller degrades to the
+/// existing "not found" OS error rather than panicking.
+///
+/// Factored to accept explicit `path_var` and `home_dir` so tests can be hermetic.
+fn resolve_lsp_server_with_env(
+    name: &str,
+    path_var: Option<&str>,
+    home_dir: Option<&str>,
+) -> String {
+    use std::path::MAIN_SEPARATOR;
+    // If the name already contains a separator it is already a concrete path — return as-is.
+    if name.contains(MAIN_SEPARATOR) {
+        return name.to_string();
+    }
+    // Search PATH directories.
+    if let Some(path) = path_var {
+        for dir in path.split(':').filter(|d| !d.is_empty()) {
+            let candidate = std::path::Path::new(dir).join(name);
+            if is_usable_interpreter(&candidate) {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    // Fallback: HOME/.local/bin (uv shims) then HOME/.cargo/bin.
+    if let Some(home) = home_dir {
+        let home = std::path::Path::new(home);
+        for subdir in &[".local/bin", ".cargo/bin"] {
+            let candidate = home.join(subdir).join(name);
+            if is_usable_interpreter(&candidate) {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    // Nothing found — return bare name so the caller gets the normal OS "not found" error.
+    name.to_string()
+}
+
+/// Thin wrapper around `resolve_lsp_server_with_env` that reads the real `$PATH` and `$HOME`.
+fn resolve_lsp_server(name: &str) -> String {
+    let path = std::env::var("PATH").ok();
+    let home = std::env::var("HOME").ok();
+    let resolved = resolve_lsp_server_with_env(name, path.as_deref(), home.as_deref());
+    // Log a hint when resolution falls back to the bare name (binary not found in any search location).
+    if resolved == name && !name.contains(std::path::MAIN_SEPARATOR) {
+        eprintln!(
+            "[lsp-mcp] WARNING: {name} not found on PATH/~/.local/bin/~/.cargo/bin; \
+             install via 'uv tool install basedpyright'"
+        );
+    }
+    resolved
+}
+
 /// Python / basedpyright config. Resolves the interpreter, advertises NO `window/workDoneProgress` (so the
 /// no-progress settle — not a progress cycle — is the readiness signal; Task-1 spike Gate 2), and sends the
 /// WRAPPED `didChangeConfiguration { settings: { python: { pythonPath } } }` envelope (spike Gate 1a).
@@ -364,9 +425,11 @@ pub fn pyright_config(
         "workspace/didChangeConfiguration".to_string(),
         json!({ "settings": { "python": { "pythonPath": python_path } } }),
     );
+    let server_bin = resolve_lsp_server("basedpyright-langserver");
+    eprintln!("[lsp-mcp] basedpyright server: {server_bin}");
     Ok(LangServerConfig {
         name: "basedpyright",
-        program_argv: vec!["basedpyright-langserver".to_string(), "--stdio".to_string()],
+        program_argv: vec![server_bin, "--stdio".to_string()],
         spawn_env: vec![],
         // The Python root predicates (reuse the Task-4 detection helpers) — a setup.py/setup.cfg/
         // requirements*.txt marker, a REAL pyproject section, or a shallow `.py` scan. `run()` validates an
@@ -393,6 +456,93 @@ pub fn pyright_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------
+    // resolve_lsp_server hermetic unit tests (TDD RED → GREEN)
+    // ---------------------------------------------------------------------------
+
+    /// Helper: make a temp dir with an executable `name` binary (mode 0o755) and return its path.
+    #[cfg(unix)]
+    fn make_fake_executable(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// A bare name found on PATH → returns its absolute path.
+    #[test]
+    fn resolve_lsp_server_finds_name_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        make_fake_executable(dir.path(), "basedpyright-langserver");
+        let resolved = resolve_lsp_server_with_env(
+            "basedpyright-langserver",
+            Some(dir.path().to_str().unwrap()),
+            None,
+        );
+        assert_eq!(
+            resolved,
+            dir.path()
+                .join("basedpyright-langserver")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            "should find the executable on the provided PATH"
+        );
+    }
+
+    /// PATH lacks the binary but HOME/.local/bin has it → returns that absolute path.
+    #[test]
+    fn resolve_lsp_server_falls_back_to_home_local_bin() {
+        let home = tempfile::tempdir().unwrap();
+        let local_bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        make_fake_executable(&local_bin, "basedpyright-langserver");
+
+        let resolved = resolve_lsp_server_with_env(
+            "basedpyright-langserver",
+            Some("/nonexistent_dir_that_does_not_exist"),
+            Some(home.path().to_str().unwrap()),
+        );
+        assert_eq!(
+            resolved,
+            local_bin
+                .join("basedpyright-langserver")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            "should find the executable in HOME/.local/bin when not on PATH"
+        );
+    }
+
+    /// Nothing matches → returns the bare name unchanged (degrades gracefully, no panic).
+    #[test]
+    fn resolve_lsp_server_returns_bare_name_when_nothing_matches() {
+        let resolved = resolve_lsp_server_with_env(
+            "basedpyright-langserver",
+            Some("/nonexistent_dir_that_does_not_exist"),
+            Some("/another_nonexistent_home"),
+        );
+        assert_eq!(
+            resolved, "basedpyright-langserver",
+            "should return bare name when no match found"
+        );
+    }
+
+    /// A name that already contains a path separator → returned unchanged, no resolution attempted.
+    #[test]
+    fn resolve_lsp_server_passes_through_names_with_path_separator() {
+        let resolved = resolve_lsp_server_with_env(
+            "/usr/local/bin/basedpyright-langserver",
+            Some("/some/path"),
+            Some("/some/home"),
+        );
+        assert_eq!(
+            resolved, "/usr/local/bin/basedpyright-langserver",
+            "names with a path separator should be returned unchanged"
+        );
+    }
 
     #[test]
     fn rust_ready_via_quiescent_or_progress() {
