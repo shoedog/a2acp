@@ -239,7 +239,10 @@ fn go_and_rust_markers_are_ambiguous() {
     fs::write(d.path().join("go.mod"), "module example.com/x\n").unwrap();
     fs::write(d.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
     let err = detect_lang(d.path()).unwrap_err().to_string();
-    assert!(err.contains("ambiguous"), "go+rust → ambiguous refusal, got {err}");
+    assert!(
+        err.contains("ambiguous"),
+        "go+rust → ambiguous refusal, got {err}"
+    );
 }
 
 #[test]
@@ -248,5 +251,8 @@ fn go_and_python_markers_are_ambiguous() {
     fs::write(d.path().join("go.mod"), "module example.com/x\n").unwrap();
     fs::write(d.path().join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
     let err = detect_lang(d.path()).unwrap_err().to_string();
-    assert!(err.contains("ambiguous"), "go+python → ambiguous refusal, got {err}");
+    assert!(
+        err.contains("ambiguous"),
+        "go+python → ambiguous refusal, got {err}"
+    );
 }

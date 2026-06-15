@@ -344,16 +344,18 @@ pub fn resolve_python_path(
 /// 2. Each `:` -separated directory in `path_var` (the value of `$PATH`): `<dir>/<name>`.
 /// 3. `home_dir/.local/bin/<name>` — the standard `uv tool install` shim location.
 /// 4. `home_dir/.cargo/bin/<name>` — the standard `cargo install` location.
+/// 5. Each dir in `go_candidates` (e.g. `$GOPATH/bin`, `$(go env GOROOT)/bin`) — for off-PATH gopls.
 ///
 /// The first candidate that `is_usable_interpreter` accepts (exists + executable) is returned as an
 /// absolute path string. If none match, `name` is returned unchanged so the caller degrades to the
 /// existing "not found" OS error rather than panicking.
 ///
-/// Factored to accept explicit `path_var` and `home_dir` so tests can be hermetic.
+/// Factored to accept explicit `path_var`, `home_dir`, and `go_candidates` so tests can be hermetic.
 fn resolve_lsp_server_with_env(
     name: &str,
     path_var: Option<&str>,
     home_dir: Option<&str>,
+    go_candidates: &[PathBuf],
 ) -> String {
     use std::path::MAIN_SEPARATOR;
     // If the name already contains a separator it is already a concrete path — return as-is.
@@ -379,20 +381,52 @@ fn resolve_lsp_server_with_env(
             }
         }
     }
+    // Go toolchain locations (for a bare `gopls` not on PATH, e.g. in a container).
+    for dir in go_candidates {
+        let candidate = dir.join(name);
+        if is_usable_interpreter(&candidate) {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
     // Nothing found — return bare name so the caller gets the normal OS "not found" error.
     name.to_string()
+}
+
+/// Best-effort Go toolchain bin dirs from `go env` (`$GOPATH/bin`, `$(go env GOROOT)/bin`). Skipped
+/// (empty) if `go` is absent — never panics. Used only to find a bare `gopls` that isn't on PATH.
+fn go_bin_candidates() -> Vec<PathBuf> {
+    ["GOPATH", "GOROOT"]
+        .into_iter()
+        .filter_map(go_env_bin)
+        .collect()
+}
+
+fn go_env_bin(var: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("go")
+        .args(["env", var])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path).join("bin"))
 }
 
 /// Thin wrapper around `resolve_lsp_server_with_env` that reads the real `$PATH` and `$HOME`.
 fn resolve_lsp_server(name: &str) -> String {
     let path = std::env::var("PATH").ok();
     let home = std::env::var("HOME").ok();
-    let resolved = resolve_lsp_server_with_env(name, path.as_deref(), home.as_deref());
+    let go = go_bin_candidates();
+    let resolved = resolve_lsp_server_with_env(name, path.as_deref(), home.as_deref(), &go);
     // Log a hint when resolution falls back to the bare name (binary not found in any search location).
     if resolved == name && !name.contains(std::path::MAIN_SEPARATOR) {
         eprintln!(
-            "[lsp-mcp] WARNING: {name} not found on PATH/~/.local/bin/~/.cargo/bin; \
-             install via 'uv tool install basedpyright'"
+            "[lsp-mcp] WARNING: {name} not found on PATH / ~/.local/bin / ~/.cargo/bin / Go toolchain bin; \
+             install it (basedpyright: 'uv tool install basedpyright'; gopls: 'go install golang.org/x/tools/gopls@latest')"
         );
     }
     resolved
@@ -493,6 +527,7 @@ mod tests {
             "basedpyright-langserver",
             Some(dir.path().to_str().unwrap()),
             None,
+            &[],
         );
         assert_eq!(
             resolved,
@@ -517,6 +552,7 @@ mod tests {
             "basedpyright-langserver",
             Some("/nonexistent_dir_that_does_not_exist"),
             Some(home.path().to_str().unwrap()),
+            &[],
         );
         assert_eq!(
             resolved,
@@ -529,6 +565,26 @@ mod tests {
         );
     }
 
+    /// gopls is not on PATH / ~/.local/bin / ~/.cargo/bin but IS in $GOPATH/bin -> resolved via go_env.
+    #[test]
+    fn resolve_lsp_server_finds_gopls_in_gopath_bin() {
+        let gopath = tempfile::tempdir().unwrap();
+        let gobin = gopath.path().join("bin");
+        std::fs::create_dir_all(&gobin).unwrap();
+        make_fake_executable(&gobin, "gopls");
+        let resolved = resolve_lsp_server_with_env(
+            "gopls",
+            Some("/nonexistent_dir_that_does_not_exist"),
+            Some("/another_nonexistent_home"),
+            &[gopath.path().join("bin"), gopath.path().join("goroot/bin")],
+        );
+        assert_eq!(
+            resolved,
+            gobin.join("gopls").to_str().unwrap().to_string(),
+            "gopls should resolve from a $GOPATH/bin candidate"
+        );
+    }
+
     /// Nothing matches → returns the bare name unchanged (degrades gracefully, no panic).
     #[test]
     fn resolve_lsp_server_returns_bare_name_when_nothing_matches() {
@@ -536,6 +592,7 @@ mod tests {
             "basedpyright-langserver",
             Some("/nonexistent_dir_that_does_not_exist"),
             Some("/another_nonexistent_home"),
+            &[],
         );
         assert_eq!(
             resolved, "basedpyright-langserver",
@@ -550,6 +607,7 @@ mod tests {
             "/usr/local/bin/basedpyright-langserver",
             Some("/some/path"),
             Some("/some/home"),
+            &[],
         );
         assert_eq!(
             resolved, "/usr/local/bin/basedpyright-langserver",
