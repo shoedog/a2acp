@@ -23,7 +23,7 @@ fn session_reaches_ready_and_resolves_a_symbol() {
         eprintln!("skip: rust-analyzer not on PATH");
         return;
     }
-    let mut s = lsp_mcp::lsp::LspSession::start(&sample_repo(), None).expect("start");
+    let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).expect("start");
     s.wait_ready(Duration::from_secs(60)).expect("ready");
     let hits = s.workspace_symbol("add").expect("query");
     assert!(
@@ -40,7 +40,7 @@ fn references_finds_the_caller() {
         eprintln!("skip");
         return;
     }
-    let mut s = lsp_mcp::lsp::LspSession::start(&sample_repo(), None).unwrap();
+    let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
     s.wait_ready(Duration::from_secs(60)).unwrap();
     let refs = s.references("add", true).unwrap();
     assert!(
@@ -56,7 +56,7 @@ fn implementations_finds_the_impl() {
         eprintln!("skip");
         return;
     }
-    let mut s = lsp_mcp::lsp::LspSession::start(&sample_repo(), None).unwrap();
+    let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
     s.wait_ready(Duration::from_secs(60)).unwrap();
     let impls = s.implementations("Greet").unwrap();
     assert!(!impls.is_empty(), "Greet must have an implementor (En)");
@@ -69,7 +69,7 @@ fn evict_then_query_reindexes() {
         eprintln!("skip");
         return;
     }
-    let mut s = lsp_mcp::lsp::LspSession::start(&sample_repo(), None).unwrap();
+    let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
     s.ensure_ready(Duration::from_secs(120)).unwrap();
     assert!(!s.workspace_symbol("add").unwrap().is_empty());
     s.evict();

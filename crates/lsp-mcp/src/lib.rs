@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 pub mod cache_key;
+pub mod lang;
 pub mod lsp;
 pub mod mcp;
 pub mod shape;
@@ -40,7 +41,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         let origin = git_origin(&repo);
         cache_key::cache_dir(base, &repo, origin.as_deref())
     });
-    let session = lsp::LspSession::start(&repo, target.as_deref())?;
+    let session = lsp::LspClient::start_with(&repo, lang::rust_ra_config(target.as_deref()))?;
     mcp::serve(session)
 }
 
@@ -66,5 +67,5 @@ pub mod testkit {
     //! Internal helpers exposed ONLY for the characterization harness (tests/characterization.rs).
     //! Doc-hidden so they don't appear in the public docs; the items themselves are `pub` because an
     //! external `tests/` crate cannot reach `pub(crate)` items (and `pub use` of `pub(crate)` won't compile).
-    pub use crate::lsp::{is_ready, parse_quiescent, ReadyState};
+    pub use crate::lang::{PyrightReady, Readiness, RustReady};
 }

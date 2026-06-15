@@ -17,16 +17,32 @@ fn file_uri(p: &Path) -> String {
 }
 
 type PendingRequests = Arc<Mutex<HashMap<i64, Sender<Value>>>>;
-type SharedReady = Arc<Mutex<ReadyState>>;
+type SharedReady = Arc<Mutex<crate::lang::Readiness>>;
 
 pub fn should_evict(idle_secs: u64, timeout_secs: u64) -> bool {
     timeout_secs > 0 && idle_secs >= timeout_secs
 }
 
-pub struct LspSession {
+/// The no-progress settle window for the Pyright path: basedpyright emits NO `pyright/*Progress` for a
+/// typical analysis (Task-1 spike), so readiness is reached by SETTLING — settings applied + this window
+/// elapsed with no progress seen. Independent OR-branch of `Readiness::is_ready`; only the Pyright variant
+/// is affected (RustRa's `settled_no_progress` equivalent never fires). Lands fully wired in Task 6.
+const PYRIGHT_SETTLE: Duration = Duration::from_millis(800);
+
+/// LOAD-BEARING Pyright readiness branch, evaluated by `wait_ready` (it owns the runtime settle Duration
+/// that the pure `Readiness::is_ready` predicate can't carry). Returns true only for a `Pyright` machine
+/// that has settled with no progress; always false for `RustRa`.
+fn pyright_settled(r: &crate::lang::Readiness) -> bool {
+    match r {
+        crate::lang::Readiness::Pyright(p) => p.settled_no_progress(PYRIGHT_SETTLE),
+        crate::lang::Readiness::RustRa(_) => false,
+    }
+}
+
+pub struct LspClient {
     child: Arc<Mutex<Option<Child>>>,
     repo: PathBuf,
-    target_cache: Option<PathBuf>,
+    cfg: Arc<crate::lang::LangServerConfig>,
     last_activity: Arc<Mutex<Instant>>,
     evicted: Arc<AtomicBool>,
     stdin: ChildStdin,
@@ -36,52 +52,31 @@ pub struct LspSession {
     readied: bool,
 }
 
-#[derive(Default)]
-pub struct ReadyState {
-    pub began: bool,
-    pub active: u32,
-    /// Latest `experimental/serverStatus { quiescent }` from rust-analyzer — true once it has finished
-    /// loading/indexing and has no background work in flight. A reliable readiness signal even when the
-    /// `$/progress` begin/end pair never fires (warm/fast index), which otherwise stalled the first tool
-    /// call for the full `ensure_ready` timeout (~30s). RA sends it because we advertise
-    /// `serverStatusNotification` in `initialize`.
-    pub quiescent: bool,
-}
-
-/// PURE. Ready when RA reports it's settled (`quiescent`) OR a `$/progress` cycle has begun-and-ended.
-/// Two independent signals so a missing `$/progress` (warm index) no longer forces a full-timeout wait.
-pub fn is_ready(s: &ReadyState) -> bool {
-    s.quiescent || (s.began && s.active == 0)
-}
-
-/// PURE. The `quiescent` flag from an `experimental/serverStatus` notification's `params` (top-level,
-/// unlike `$/progress`'s nested `value.kind`). `None` when absent/wrong-typed → the caller keeps the
-/// prior value rather than guessing.
-pub fn parse_quiescent(params: &Value) -> Option<bool> {
-    params.get("quiescent").and_then(|q| q.as_bool())
-}
-
-impl LspSession {
-    fn spawn_ra(
+impl LspClient {
+    /// Spawn the configured language server rooted at `repo` (with `cfg.spawn_env`). A background thread
+    /// routes responses by id (language-AGNOSTIC, stays here) and delegates NOTIFICATION parsing to the
+    /// per-language `Readiness::on_notification` machine.
+    fn spawn(
         repo: &Path,
-        target_cache: Option<&Path>,
+        cfg: &crate::lang::LangServerConfig,
     ) -> anyhow::Result<(Child, ChildStdin, PendingRequests, SharedReady)> {
-        let mut cmd = Command::new("rust-analyzer");
-        cmd.current_dir(repo)
+        let mut cmd = Command::new(&cfg.program_argv[0]);
+        cmd.args(&cfg.program_argv[1..])
+            .current_dir(repo)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        if let Some(tc) = target_cache {
-            cmd.env("CARGO_TARGET_DIR", tc);
+        for (k, v) in &cfg.spawn_env {
+            cmd.env(k, v);
         }
         let mut child = cmd
             .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to spawn rust-analyzer: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", cfg.name))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
-        let ready = Arc::new(Mutex::new(ReadyState::default()));
+        let ready = Arc::new(Mutex::new((cfg.new_readiness)()));
         {
             let pending = pending.clone();
             let ready = ready.clone();
@@ -92,29 +87,16 @@ impl LspSession {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    // id-routing is language-AGNOSTIC and STAYS here (review: don't drag it into Readiness).
                     if let Some(id) = msg.get("id").and_then(|i| i.as_i64()) {
                         if let Some(tx) = pending.lock().unwrap().remove(&id) {
                             let _ = tx.send(msg);
                         }
-                    } else if msg.get("method").and_then(|m| m.as_str()) == Some("$/progress") {
-                        let mut g = ready.lock().unwrap();
-                        match msg["params"]["value"]["kind"].as_str() {
-                            Some("begin") => {
-                                g.began = true;
-                                g.active += 1;
-                            }
-                            Some("end") => g.active = g.active.saturating_sub(1),
-                            _ => {}
-                        }
-                    } else if msg.get("method").and_then(|m| m.as_str())
-                        == Some("experimental/serverStatus")
-                    {
-                        // RA's readiness signal (it sends this because initialize advertises
-                        // serverStatusNotification). `quiescent:true` => loaded + idle. Track the latest
-                        // value (it flips false during re-index after edits, true once settled again).
-                        if let Some(q) = parse_quiescent(&msg["params"]) {
-                            ready.lock().unwrap().quiescent = q;
-                        }
+                    } else if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                        ready
+                            .lock()
+                            .unwrap()
+                            .on_notification(method, &msg["params"]);
                     }
                 }
             });
@@ -125,30 +107,31 @@ impl LspSession {
 
     fn handshake(&mut self) -> anyhow::Result<()> {
         let root = file_uri(&self.repo);
-        self.request(
-            "initialize",
-            json!({
-                "processId": std::process::id(),
-                "rootUri": root,
-                "capabilities": { "workspace": { "symbol": {} },
-                    "experimental": { "serverStatusNotification": true } },
-                "workspaceFolders": [{ "uri": root, "name": "root" }],
-            }),
-            Duration::from_secs(30),
-        )?;
+        let params = (self.cfg.initialize_params)(&root);
+        self.request("initialize", params, Duration::from_secs(30))?;
         self.notify("initialized", json!({}));
+        if let Some((method, params)) = self.cfg.post_init_config.clone() {
+            self.notify(&method, params);
+        }
         Ok(())
     }
 
-    /// Spawn rust-analyzer rooted at `repo` (CARGO_TARGET_DIR=`target_cache` when given) and run the
-    /// LSP initialize handshake. A background thread routes responses by id and tracks readiness via both
-    /// `$/progress` and RA's `experimental/serverStatus` (`quiescent`).
+    /// Slice-A/test-compat: start with the Rust config (optional CARGO_TARGET_DIR), matching the old
+    /// signature. Existing integration/characterization call sites use `start(&repo, None)`.
     pub fn start(repo: &Path, target_cache: Option<&Path>) -> anyhow::Result<Self> {
-        let (child, stdin, pending, ready) = Self::spawn_ra(repo, target_cache)?;
-        let mut s = LspSession {
+        Self::start_with(repo, crate::lang::rust_ra_config(target_cache))
+    }
+
+    /// Start any language server from its config. Spawns the server rooted at `repo`, runs the LSP
+    /// initialize handshake (+ optional post-init config notification), and arms the idle watcher. A
+    /// background thread routes responses by id and tracks readiness via the config's `Readiness` machine.
+    pub fn start_with(repo: &Path, cfg: crate::lang::LangServerConfig) -> anyhow::Result<Self> {
+        let cfg = Arc::new(cfg);
+        let (child, stdin, pending, ready) = Self::spawn(repo, &cfg)?;
+        let mut s = LspClient {
             child: Arc::new(Mutex::new(Some(child))),
             repo: repo.to_path_buf(),
-            target_cache: target_cache.map(Path::to_path_buf),
+            cfg,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             evicted: Arc::new(AtomicBool::new(false)),
             stdin,
@@ -160,6 +143,29 @@ impl LspSession {
         s.handshake()?;
         s.start_idle_watcher();
         Ok(s)
+    }
+
+    /// Doc-hidden test accessors: drive `respawn` / read `evicted` / read the idle clock / swap the config
+    /// from the external `tests/` crate WITHOUT widening the real API (the fields stay private). Used by the
+    /// crown-jewel `respawn_failure_leaves_evicted_true` + request-touch idle-race tests in characterization.
+    #[doc(hidden)]
+    pub fn respawn_for_test(&mut self) -> anyhow::Result<()> {
+        self.respawn()
+    }
+
+    #[doc(hidden)]
+    pub fn is_evicted_for_test(&self) -> bool {
+        self.evicted.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn last_activity_for_test(&self) -> std::time::Instant {
+        *self.last_activity.lock().unwrap()
+    }
+
+    #[doc(hidden)]
+    pub fn set_cfg_for_test(&mut self, cfg: crate::lang::LangServerConfig) {
+        self.cfg = std::sync::Arc::new(cfg);
     }
 
     fn do_evict(child: &Arc<Mutex<Option<Child>>>, evicted: &Arc<AtomicBool>) {
@@ -201,8 +207,7 @@ impl LspSession {
     }
 
     fn respawn(&mut self) -> anyhow::Result<()> {
-        let (child, stdin, pending, ready) =
-            Self::spawn_ra(&self.repo, self.target_cache.as_deref())?;
+        let (child, stdin, pending, ready) = Self::spawn(&self.repo, &self.cfg)?;
         *self.child.lock().unwrap() = Some(child);
         self.stdin = stdin;
         self.pending = pending;
@@ -210,8 +215,10 @@ impl LspSession {
         self.next_id = 0;
         self.readied = false;
         // Re-init BEFORE clearing `evicted`: if the handshake fails the session stays marked evicted so the
-        // NEXT call retries respawn rather than driving a half-dead RA (review MAJOR: respawn-failure path).
-        // handshake()'s initialize request touch()es → the idle clock is fresh before we re-arm the watcher.
+        // NEXT call retries respawn rather than driving a half-dead server (review MAJOR: respawn-failure
+        // path). `handshake()` now re-sends initialize + initialized + post_init_config (a Python venv/
+        // settings survive a respawn). Its initialize request touch()es → the idle clock is fresh before we
+        // re-arm the watcher.
         self.handshake()?;
         self.evicted.store(false, Ordering::SeqCst);
         Ok(())
@@ -252,16 +259,18 @@ impl LspSession {
         Ok(msg.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// Block until indexing has begun-and-ended, or `timeout` (best-effort past the bound).
+    /// Block until the server reports ready (per its `Readiness` machine), or `timeout` (best-effort past
+    /// the bound). The Pyright no-progress settle is OR'd in here because the settle window is a runtime
+    /// Duration the pure `Readiness::is_ready` predicate doesn't carry.
     pub fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let t0 = Instant::now();
         loop {
-            // An in-progress index wait is active use — touch so the watcher can't evict RA mid-index
-            // (a slow in-container cold/re-index can exceed the idle timeout otherwise).
+            // An in-progress index wait is active use — touch so the watcher can't evict the server
+            // mid-index (a slow in-container cold/re-index can exceed the idle timeout otherwise).
             self.touch();
             {
                 let g = self.ready.lock().unwrap();
-                if is_ready(&g) {
+                if g.is_ready() || pyright_settled(&g) {
                     return Ok(());
                 }
             }
@@ -456,7 +465,7 @@ impl LspSession {
     }
 }
 
-impl Drop for LspSession {
+impl Drop for LspClient {
     fn drop(&mut self) {
         Self::do_evict(&self.child, &self.evicted);
     }
@@ -464,53 +473,12 @@ impl Drop for LspSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ready, parse_quiescent, should_evict, ReadyState};
-    use serde_json::json;
-
-    #[test]
-    fn parse_quiescent_reads_serverstatus_shape() {
-        // RA's experimental/serverStatus params: { health, quiescent, message }.
-        assert_eq!(
-            parse_quiescent(&json!({"health":"ok","quiescent":true})),
-            Some(true)
-        );
-        assert_eq!(
-            parse_quiescent(&json!({"health":"warning","quiescent":false})),
-            Some(false)
-        );
-        // absent / wrong-typed → None (caller keeps the prior value, doesn't guess).
-        assert_eq!(parse_quiescent(&json!({"health":"ok"})), None);
-        assert_eq!(parse_quiescent(&json!({"quiescent":"yes"})), None);
-    }
+    use super::should_evict;
 
     #[test]
     fn should_evict_after_idle_timeout() {
         assert!(should_evict(120, 60));
         assert!(!should_evict(30, 60));
         assert!(!should_evict(120, 0), "timeout 0 disables eviction");
-    }
-
-    #[test]
-    fn is_ready_via_quiescent_or_progress() {
-        // serverStatus path: quiescent alone is enough (no $/progress needed — the warm-index case).
-        assert!(is_ready(&ReadyState {
-            quiescent: true,
-            began: false,
-            active: 0,
-        }));
-        // $/progress path: a begun-and-ended cycle, no serverStatus.
-        assert!(is_ready(&ReadyState {
-            quiescent: false,
-            began: true,
-            active: 0,
-        }));
-        // mid-index: progress begun but still active, not yet quiescent → not ready.
-        assert!(!is_ready(&ReadyState {
-            quiescent: false,
-            began: true,
-            active: 1,
-        }));
-        // nothing heard yet → not ready.
-        assert!(!is_ready(&ReadyState::default()));
     }
 }
