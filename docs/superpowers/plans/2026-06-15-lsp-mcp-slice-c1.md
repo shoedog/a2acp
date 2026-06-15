@@ -1,10 +1,12 @@
 # LSP-MCP Slice C1 Implementation Plan
 
+> **Status:** Revised after a THIRD plan-review round (opus + codex/gpt-5.5 staff review — "not ready to execute as-is"). All must-fixes folded: Task 1 keeps only host-probing gates and the live `{cwd}` gate moved to Task 9 (it needs the Task-4 binary); the `didChangeConfiguration` wrapped `settings` envelope is reconciled across Task 1↔Task 6; the `testkit` compile bug fixed (genuinely-`pub` + `#[doc(hidden)] pub mod testkit`); a GENUINE respawn-FAILURE-leaves-`evicted=true` test + a request-touch test added; `LangServerConfig.is_project_root` added AND wired in `run()` (not a dead field); `has_real_pyproject` `dynamic` predicate anchored; interpreter exec-validation + explicit-invalid-path HARD error + settle-clock-origin fix (`PyrightReady.settled_at`) + an automated pure no-progress test; the dup-name fixture false-green fixed + a guarded Rust `document_symbols` nested-children lock added; Task 9 makes the live `{cwd}` gate first, the Python 7-tool coverage a REQUIRED DoD gate, and — per **user decision D2 — FU1 MANDATORY in C1 if the gate finds codex `{cwd}` broken (no claude-only fallback)**. Harness = **TARGETED fixes** (user decision D1 — NOT a full fake-rust-analyzer binary).
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Generalize `lsp-mcp` from a rust-analyzer-only shim into a `--lang`→language-server registry (rust + Python/basedpyright) so the bridge's host-side reviewers get the same 7-tool type-resolved nav surface on Python repos, keeping the working Rust/FU3 path byte-for-byte.
 
-**Architecture:** A language-agnostic `LspClient` (process spawn, reader-thread `id`-routing, request/response correlation, the 7 tools, idle-evict/respawn) is parameterized by a `LangServerConfig` (`program_argv`, `is_project_root`, `initialize_params`, `post_init_config`, `spawn_env`, `readiness`). A `Readiness` enum absorbs ONLY the reader-thread notification parsing (`Readiness::RustRa` = the current `$/progress`+`serverStatus` machine unchanged; `Readiness::Pyright` = `pyright/{begin,end}Progress` + no-progress settle). `--lang auto` detects the language from root markers. The host reviewers' single `--lang auto` MCP entry serves any unambiguous rust-or-python repo.
+**Architecture:** A language-agnostic `LspClient` (process spawn, reader-thread `id`-routing, request/response correlation, the 7 tools, idle-evict/respawn) is parameterized by a `LangServerConfig` (`program_argv`, `spawn_env`, `is_project_root`, `initialize_params`, `post_init_config`, `new_readiness`). **`is_project_root` is a USED field** — `run()` calls `(cfg.is_project_root)(repo)` to validate an EXPLICIT `--lang rust|python` against the repo before starting (rust: `Cargo.toml` exists; python: the §2 root markers); `--lang auto` is already validated by `detect_lang`. A `Readiness` enum absorbs ONLY the reader-thread notification parsing (`Readiness::RustRa` = the current `$/progress`+`serverStatus` machine unchanged; `Readiness::Pyright` = `pyright/{begin,end}Progress` + a no-progress settle timed from `PyrightReady.settled_at` = settings-applied, NOT from `wait_ready` entry). `--lang auto` detects the language from root markers. The host reviewers' single `--lang auto` MCP entry serves any unambiguous rust-or-python repo.
 
 **Tech Stack:** Rust (crates/lsp-mcp), rust-analyzer, basedpyright, MCP-over-stdio
 
@@ -14,26 +16,28 @@
 
 | File | Create/Modify | Responsibility |
 | --- | --- | --- |
-| `docs/superpowers/spikes/2026-06-15-slice-c1-basedpyright-proof.md` | Create | Spike verdict: config-channel resolution (w/ + w/o repo override + no-venv fallback), readiness, `--lang auto` cases, the LIVE `{cwd}` codex gate go/no-go. |
+| `docs/superpowers/spikes/2026-06-15-slice-c1-basedpyright-proof.md` | Create | Spike verdict (Task 1, host-probing only): config-channel resolution (w/ + w/o repo override + no-venv fallback, driving the WRAPPED `{ "settings": { "python": { "pythonPath": … } } }` envelope), readiness + no-progress settle, `--lang auto` predicate cases. (The LIVE `{cwd}` codex gate moved to Task 9 — it needs the Task-4 binary.) |
 | `crates/lsp-mcp/Cargo.toml` | Modify | Add `[dev-dependencies] tempfile = "3"` (matching the sibling crates' direct pin — `tempfile` is NOT a workspace dep) for the characterization harness + detection tests (no runtime deps added — percent-encoding is hand-rolled like the existing decoder). |
-| `crates/lsp-mcp/src/lib.rs` | Modify | `Cli` gains `--python-path`; `--lang auto` default; `run()` dispatches `detect_lang` → builds the `LangServerConfig` → starts `LspClient`; startup root+language log. |
-| `crates/lsp-mcp/src/lang.rs` | Create | `LangServerConfig` struct, `Readiness` enum (+ its reader-thread notification parsing), `rust_ra_config()`, `pyright_config()`, interpreter discovery (`resolve_python_path`), `detect_lang` predicates. |
-| `crates/lsp-mcp/src/lsp/mod.rs` | Modify | Rename/refactor `LspSession`→`LspClient` parameterized by `LangServerConfig`; `spawn`/`respawn` send `post_init_config`; reader thread keeps `id`-routing, delegates notification parsing to `Readiness`; `file_uri` percent-encodes; `resolve_pos`/`document_symbols`/`hover` per-server handling. |
+| `crates/lsp-mcp/src/lib.rs` | Modify | `Cli` gains `--python-path`; `--lang auto` default; `run()` dispatches `detect_lang` → builds the `LangServerConfig` → validates an EXPLICIT `--lang` via `(cfg.is_project_root)(repo)` → starts `LspClient`; startup root+language log. Adds `#[doc(hidden)] pub mod testkit` (genuinely-`pub` re-exports for the EXTERNAL characterization harness — `pub(crate)` is unreachable from a `tests/` crate). |
+| `crates/lsp-mcp/src/lang.rs` | Create | `LangServerConfig` struct (incl. the USED `is_project_root` field), `Readiness` enum (+ its reader-thread notification parsing), `RustReady`/`PyrightReady` (with `settled_at` for the no-progress settle), `rust_ra_config()`, `pyright_config()`, interpreter discovery (`resolve_python_path` → `PyResolve` {Resolved/Fallback/Hard}), `detect_lang` predicates. Pure tests: readiness transitions + the no-progress settle. |
+| `crates/lsp-mcp/src/lsp/mod.rs` | Modify | Rename/refactor `LspSession`→`LspClient` parameterized by `LangServerConfig`; `spawn`/`respawn` send `post_init_config`; reader thread keeps `id`-routing, delegates notification parsing to `Readiness`; `wait_ready` settle timed from `settled_at`; `file_uri` percent-encodes; `resolve_pos`/`document_symbols` (recursive children)/`hover` (array form) per-server handling. Genuinely-`pub` `is_ready`/`parse_quiescent`/`ReadyState`→`Readiness`; doc-hidden test wrappers (`respawn_for_test`/`is_evicted_for_test`/`set_cfg_for_test`/`last_activity_for_test`). |
 | `crates/lsp-mcp/src/mcp/mod.rs` | Modify | Genericize the `references`/`implementations` tool descriptions; the dispatch path is unchanged (it calls `LspClient` methods by the same names). |
 | `crates/lsp-mcp/src/shape.rs` | Modify | (No logic change; `file_path_from_uri` is the round-trip partner asserted by the new URI tests.) |
-| `crates/lsp-mcp/tests/characterization.rs` | Create | Fake-LSP harness: pins Rust `initialize` bytes + the readiness transition table + request-touch + respawn ordering (failure→`evicted=true`) + Rust sends no post-init config. Green on CURRENT code first. |
+| `crates/lsp-mcp/tests/characterization.rs` | Create | Fake-LSP harness: pins Rust `initialize` bytes + the readiness transition table + the happy respawn ordering (`respawn_success_clears_evicted`). Green on CURRENT code first. Post-refactor (Task 3): the `Readiness`-based transition rewrite + the GENUINE `respawn_failure_leaves_evicted_true` (bogus `program_argv`) + the request-touch idle-race test. |
+| `crates/lsp-mcp/tests/integration.rs` | Modify | Re-point `LspSession`→`LspClient` (Task 3); ADD a guarded Rust `document_symbols` test locking the additive nested-children output against the `sample` fixture (Task 8). |
 | `crates/lsp-mcp/tests/lang_detect.rs` | Create | `detect_lang` unit/fixture tests (rust/python/tooling-only-pyproject/`.py`-guard with excluded dirs/ambiguous-refusal). |
 | `crates/lsp-mcp/tests/python_nav.rs` | Create | Python fixture tests for all 7 tools (guarded on `basedpyright-langserver --version`), interpreter-discovery, post-eviction resolution. |
 | `crates/lsp-mcp/tests/fixtures/pysample/` | Create | Small Python fixture: a package with a class→method (hierarchical symbols), a duplicate-name symbol, a third-party import, a `.venv` with that dependency installed (created by the test harness, gitignored). |
-| `crates/lsp-mcp/tests/integration.rs` | Modify | Existing Rust integration tests reference `LspSession` — re-point to `LspClient` (the registry refactor renames the type). |
 | `examples/a2a-bridge.containerized.toml` | Modify | Host reviewers' (claude + codex) `lsp` MCP entry: `--lang rust` → `--lang auto`. |
+| `examples/a2a-bridge.containerized.podman.toml` | Modify | Same two HOST reviewer `lsp` entries → `--lang auto` (in-container `impl` stays `rust`). |
+| `bin/a2a-bridge/src/main.rs` | Modify (MANDATORY-if-broken, D2) | FU1: thread per-request `session_cwd` into codex's `render_codex_mcp_args` `{cwd}` — ONLY if the Task-9 live `{cwd}` gate finds codex broken (no claude-only fallback). |
 | `crates/lsp-mcp/src/cache_key.rs` | (No change) | Rust-only `CARGO_TARGET_DIR` keying; Python has no target cache in C1. Left as-is. |
 
 ---
 
-### Task 1: Spike (host path) — GATES
+### Task 1: Spike (host path) — host-probing GATES (no bridge binary needed)
 
-A throwaway/measurement task. No production code lands; the deliverable is the verdict file. **This task GATES the host-wiring task (Task 9): if the `{cwd}` codex gate is broken, Task 9 forks per the §4.4 decision.** Run on the host with a real `basedpyright-langserver` + an existing Python repo + a real `rust-analyzer`.
+A throwaway/measurement task. No production code lands; the deliverable is the verdict file. Task 1 keeps ONLY the host-probing gates that need no bridge binary (config-channel resolution, repo-override behavior, readiness + no-progress settle, the `--lang auto` predicate LOGIC). **The LIVE `{cwd}` codex gate was RELOCATED to the first step of Task 9** — it cannot run here because the current `lsp-mcp` has no `--lang auto` and no startup root/lang log; those land in Task 4, so the gate runs after the Task-4 binary exists (it remains the gate that forks Task 9). Run Task 1 on the host with a real `basedpyright-langserver` + an existing Python repo + a real `rust-analyzer`.
 
 **Files:**
 - Create: `docs/superpowers/spikes/2026-06-15-slice-c1-basedpyright-proof.md`
@@ -41,27 +45,23 @@ A throwaway/measurement task. No production code lands; the deliverable is the v
 **Steps:**
 
 - [ ] Confirm the host has basedpyright: `basedpyright-langserver --version` (if absent, `pip install basedpyright`). Record the version in the verdict file.
-- [ ] **Gate 1a — config-channel resolution from an EXISTING venv.** Pick a Python repo with a venv that imports a third-party package (e.g. `~/code/agent-eval` if it has `.venv` with `requests`/`pydantic`). By hand, drive basedpyright over stdio: send `initialize` advertising NO `window/workDoneProgress`, then `initialized`, then `workspace/didChangeConfiguration` with `{ "python": { "pythonPath": "<repo>/.venv/bin/python" } }`, then `textDocument/definition` / `textDocument/hover` on a third-party symbol. Confirm it resolves into the venv's site-packages (NOT "unknown"). A throwaway script is fine; capture the request/response transcript into the verdict file.
-- [ ] **Gate 1b — repo override behavior.** Repeat 1a against a repo that ALSO has a `pyrightconfig.json` or `pyproject [tool.basedpyright]`. Record whether the repo override wins over the `didChangeConfiguration` `pythonPath` (informs the §2 documented behavior — the shim does not fight a repo override).
+- [ ] **Gate 1a — config-channel resolution from an EXISTING venv, driving the WRAPPED envelope Task 6 ships.** Pick a Python repo with a venv that imports a third-party package (e.g. `~/code/agent-eval` if it has `.venv` with `requests`/`pydantic`). By hand, drive basedpyright over stdio: send `initialize` advertising NO `window/workDoneProgress`, then `initialized`, then `workspace/didChangeConfiguration` with the **LSP-standard wrapped form** `{ "settings": { "python": { "pythonPath": "<repo>/.venv/bin/python" } } }` (NOT a bare `{ "python": { "pythonPath": … } }`) — this is the EXACT envelope Task 6's `post_init_config` ships, so the spike proves the form that ships. Then `textDocument/definition` / `textDocument/hover` on a third-party symbol. Confirm it resolves into the venv's site-packages (NOT "unknown"). A throwaway script is fine; capture the request/response transcript into the verdict file. **Note: the proven form is the wrapped `settings` envelope; Task 6 ships exactly this.**
+- [ ] **Gate 1b — repo override behavior.** Repeat 1a against a repo that ALSO has a `pyrightconfig.json` or `pyproject [tool.basedpyright]`. Record whether the repo override wins over the wrapped `didChangeConfiguration` `pythonPath` (informs the §2 documented behavior — the shim does not fight a repo override).
 - [ ] **Gate 1c — no-venv fallback.** Run against a Python repo/dir with NO venv and no `--python-path`. Confirm the `python3`-on-PATH fallback degrades to incomplete third-party resolution (stdlib still resolves) and that this is the case the shim must LOG a warning for (not a silent empty result). Record the observed degradation.
-- [ ] **Gate 2 — readiness.** From the 1a transcript, confirm `pyright/beginProgress` + `pyright/endProgress` notifications fire after `initialized`+settings. Then test the no-progress case: confirm that a `workspace/symbol` issued shortly after `initialized` (before any progress) still returns — i.e. the shim must treat a short post-settings settle as ready, not wait a full 30s bound. Record both observations.
-- [ ] **Gate 3 — `--lang auto` detection.** On paper/by inspection against real repos, record the verdict for each predicate case: rust (`Cargo.toml`), python (`setup.py`/`setup.cfg`/`requirements*.txt`/`pyproject` with a real section), tooling-only `pyproject` (`[tool.black]` only → NOT python by that marker, falls to `.py`-scan), `.py`-scan excluding `.venv`/`venv`/`.git`/`target`/`node_modules`/hidden/build/vendor, and BOTH rust+python markers → ambiguous→refuse. This validates the predicates Task 4 will implement.
-- [ ] **Gate 4 — LIVE `{cwd}` codex gate (the go/no-go).** Run the bridge's host **codex** reviewer against a Python repo via the per-request session-cwd (e.g. `a2a-bridge run-workflow code-review --session-cwd ~/code/agent-eval --config <a host config whose codex `lsp` entry uses `--lang auto`>`). Inspect the lsp-mcp startup log (the `eprint!`/call-log line) and confirm codex's lsp-mcp resolved its `--repo {cwd}` to **that Python repo** (startup log shows the target root + `lang=python`), NOT the bridge launch dir (which would `auto`→rust silently). Record the observed root + detected language.
-- [ ] **Record the go/no-go verdict.** Write the §4.4 decision into the verdict file:
-  - If `{cwd}` resolves correctly for codex → Task 9 wires `--lang auto` for BOTH claude + codex and the live DoD covers both.
-  - If `{cwd}` is broken for codex → Task 9 forks: EITHER (A) fix FU1 (thread per-request `session_cwd` into codex's `render_codex_mcp_args` `{cwd}` at the SpawnFn boundary — note `bin/a2a-bridge/src/main.rs` already passes `mcp_cwd` into `acp_program_argv` (~line 125) which is fed `resolve_static_session_cwd(entry.session_cwd, entry.cwd)` at the spawn site (~line 471); the fork checks whether the per-request `--session-cwd` stamp into `entry.session_cwd` (~line 2081) actually reaches that path for codex) OR (B) ship the Python live-gate claude-only and fast-follow FU1. State which.
-- [ ] `git add docs/superpowers/spikes/2026-06-15-slice-c1-basedpyright-proof.md && git commit -m "spike(lsp-mcp): C1 basedpyright host-path proof + live {cwd} codex gate verdict"`
+- [ ] **Gate 2 — readiness + no-progress settle.** From the 1a transcript, confirm `pyright/beginProgress` + `pyright/endProgress` notifications fire after `initialized`+settings. Then test the no-progress case: confirm that a `workspace/symbol` issued shortly after `initialized`+settings (before any progress) still returns — i.e. the shim must treat a short post-settings settle as ready, not wait a full 30s bound, AND must NOT pay the full timeout when a `beginProgress` arrives without a matching `endProgress` (the begin-without-end stall §2 forbids). Record both observations.
+- [ ] **Gate 3 — `--lang auto` detection LOGIC (predicate cases, no binary).** Reason about the predicates against real repos (no bridge binary needed — these are pure host-dir checks): rust (`Cargo.toml`), python (`setup.py`/`setup.cfg`/`requirements*.txt`/`pyproject` with a real section), tooling-only `pyproject` (`[tool.black]` only → NOT python by that marker, falls to `.py`-scan), `.py`-scan excluding `.venv`/`venv`/`.git`/`target`/`node_modules`/hidden/build/vendor, and BOTH rust+python markers → ambiguous→refuse. This validates the predicates Task 4 will implement. (The LIVE `{cwd}` codex gate that USED to be Gate 4 here is now the first step of Task 9.)
+- [ ] `git add docs/superpowers/spikes/2026-06-15-slice-c1-basedpyright-proof.md && git commit -m "spike(lsp-mcp): C1 basedpyright host-path proof (config-channel + readiness + detection logic)"`
 
 ---
 
 ### Task 2: Fake-LSP characterization harness (BEFORE the refactor)
 
-Pin the CURRENT Rust behavior so the registry refactor (Task 3) is provably byte-for-byte. This harness must be **green on the current code** before Task 3 touches anything. It drives a synthetic notification stream through the readiness machine and asserts the transition table, plus the `initialize` bytes, request-touch, respawn ordering, and "Rust sends no post-init config".
+Pin the CURRENT Rust behavior so the registry refactor (Task 3) is provably byte-for-byte. This harness must be **green on the current code** before Task 3 touches anything. Task 2 drives a synthetic notification stream through the readiness machine and asserts the transition table, plus the `initialize` bytes and the happy respawn ordering (`respawn_success_clears_evicted`). (The GENUINE respawn-FAILURE-leaves-`evicted=true` test, the request-touch idle-race test, and the "Rust sends no post-init config" assertion all need the Task-3 `LangServerConfig`/`start_with` seam — they land in Task 3.)
 
 **Files:**
 - Create: `crates/lsp-mcp/tests/characterization.rs`
 - Modify: `crates/lsp-mcp/Cargo.toml` (add `tempfile` dev-dep)
-- Modify: `crates/lsp-mcp/src/lsp/mod.rs` (expose the pure readiness helpers + `ReadyState` as `pub(crate)` so the harness can drive them; today `is_ready`/`parse_quiescent`/`ReadyState` are private)
+- Modify: `crates/lsp-mcp/src/lsp/mod.rs` (expose the pure readiness helpers + `ReadyState` so the harness can drive them; today `is_ready`/`parse_quiescent`/`ReadyState` are private)
 
 **Steps:**
 
@@ -71,11 +71,13 @@ Pin the CURRENT Rust behavior so the registry refactor (Task 3) is provably byte
   tempfile = "3"
   ```
 - [ ] Run `cargo build -p lsp-mcp` and see it compile (no harness yet).
-- [ ] Make the readiness internals reachable from a `tests/` integration test. In `crates/lsp-mcp/src/lsp/mod.rs`, change the three private items to crate-visible: `pub(crate) fn is_ready`, `pub(crate) fn parse_quiescent`, `pub(crate) struct ReadyState` with `pub(crate)` fields `began`/`active`/`quiescent`. Re-export them for tests via a test-only surface — add at the bottom of `src/lib.rs`:
+- [ ] Make the readiness internals reachable from an EXTERNAL `tests/` integration test. **A `tests/` crate is a SEPARATE crate — it cannot see `pub(crate)` items, and you cannot `pub use` a `pub(crate)` item.** So make the three items GENUINELY `pub` (not `pub(crate)`), then re-export them under a `#[doc(hidden)]` module so they stay out of the documented public API while resolving from `tests/`. In `crates/lsp-mcp/src/lsp/mod.rs`, change the three private items to genuinely public: `pub fn is_ready`, `pub fn parse_quiescent`, `pub struct ReadyState` with `pub` fields `began`/`active`/`quiescent` (the fields the harness reads must be `pub` too). Then add at the bottom of `src/lib.rs`:
   ```rust
-  #[doc(hidden)]
+  #[doc(hidden)] // out of the documented API, but resolvable from the external characterization harness.
   pub mod testkit {
-      //! Crate-internal helpers exposed ONLY for the characterization harness (tests/characterization.rs).
+      //! Internal helpers exposed ONLY for the characterization harness (tests/characterization.rs).
+      //! Doc-hidden so they don't appear in the public docs; the items themselves are `pub` because an
+      //! external `tests/` crate cannot reach `pub(crate)` items (and `pub use` of `pub(crate)` won't compile).
       pub use crate::lsp::{is_ready, parse_quiescent, ReadyState};
   }
   ```
@@ -150,7 +152,7 @@ Pin the CURRENT Rust behavior so the registry refactor (Task 3) is provably byte
   }
   ```
 - [ ] Run `cargo test -p lsp-mcp --test characterization rust_readiness_transition_table` and see it PASS.
-- [ ] Add the request-touch + respawn-ordering + no-post-init characterizations using a real (guarded) RA session, mirroring `tests/integration.rs`'s `ra_available()` guard. Append:
+- [ ] Add the HAPPY respawn-ordering characterization using a real (guarded) RA session, mirroring `tests/integration.rs`'s `ra_available()` guard. (The GENUINE respawn-FAILURE test, the request-touch test, and the "Rust sends no post-init config" assertion all need the Task-3 `LangServerConfig`/`start_with` seam, so they land in Task 3.) Append:
   ```rust
   use std::time::Duration;
 
@@ -163,10 +165,12 @@ Pin the CURRENT Rust behavior so the registry refactor (Task 3) is provably byte
   }
 
   #[test]
-  fn respawn_failure_leaves_evicted_true() {
-      // A respawn whose handshake CANNOT succeed must leave the session marked evicted so the NEXT call
-      // retries respawn (mod.rs:respawn re-inits BEFORE clearing `evicted`). We force failure by pointing
-      // a fresh client at a non-cargo dir AFTER eviction. Guarded: needs a real RA to start the first time.
+  fn respawn_success_clears_evicted() {
+      // HAPPY PATH: a respawn whose handshake SUCCEEDS clears `evicted` and the session resolves again.
+      // (The GENUINE failure-leaves-evicted=true test — the crown-jewel invariant — lands in Task 3, where
+      // the LangServerConfig seam lets us inject a bogus program_argv to FORCE a respawn failure.)
+      // We evict a healthy session and assert the next ensure_ready re-spawns against the SAME (valid) repo
+      // and resolves. Guarded: needs a real RA to start the first time.
       if !ra_available() { eprintln!("skip: rust-analyzer not on PATH"); return; }
       let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
       s.ensure_ready(Duration::from_secs(120)).unwrap();
@@ -178,7 +182,7 @@ Pin the CURRENT Rust behavior so the registry refactor (Task 3) is provably byte
       s.shutdown();
   }
   ```
-  (Note: this test references `LspClient` — the post-Task-3 name. BEFORE Task 3, write it against `LspSession` and rename in Task 3 when the type is renamed. Add a comment marking the rename.)
+  (Note: this test references `LspClient` — the post-Task-3 name. BEFORE Task 3, write it against `LspSession` and rename in Task 3 when the type is renamed. Add a comment marking the rename. The OLD name `respawn_failure_leaves_evicted_true` was a MISLABEL — it asserts the success path — so we name it `respawn_success_clears_evicted` from the start; the real failure invariant is Task 3's `respawn_failure_leaves_evicted_true` below.)
 - [ ] Run `cargo test -p lsp-mcp --test characterization` and see the whole harness PASS on the current code (the guarded test skips if RA is absent; the two pure tests must pass everywhere).
 - [ ] `git add crates/lsp-mcp/Cargo.toml crates/lsp-mcp/src/lib.rs crates/lsp-mcp/src/lsp/mod.rs crates/lsp-mcp/tests/characterization.rs && git commit -m "test(lsp-mcp): fake-LSP characterization harness pins Rust readiness + initialize bytes (pre-refactor)"`
 
@@ -203,6 +207,7 @@ Split the language-agnostic client from the per-language config. `Readiness` abs
   //! `Readiness` absorbs ONLY the reader-thread NOTIFICATION parsing (id-routing stays in LspClient).
   use serde_json::{json, Value};
   use std::path::{Path, PathBuf};
+  use std::time::{Duration, Instant};
 
   /// Per-language readiness: the notification-parsing half of the reader thread + the ready predicate.
   /// `RustRa` reproduces the current `$/progress` + `experimental/serverStatus` machine byte-for-byte.
@@ -225,8 +230,19 @@ Split the language-agnostic client from the per-language config. `Readiness` abs
   pub struct PyrightReady {
       pub began: bool,
       pub active: u32,
-      /// Set once `initialized`+settings have been sent; starts the no-progress settle clock in LspClient.
-      pub settings_applied: bool,
+      /// Set (`Some(Instant::now())`) the moment `initialized`+settings are applied in `handshake`. This is
+      /// the CORRECT settle-clock origin: the no-progress settle is timed from when settings were applied,
+      /// NOT from `wait_ready` entry (Opus H2). Timing from `wait_ready` entry made a begin-without-end
+      /// server pay the FULL timeout — the exact FU3 stall §2 forbids. None until settings are applied.
+      pub settled_at: Option<Instant>,
+  }
+
+  impl PyrightReady {
+      /// PURE no-progress settle gate: settings applied, no progress begun, and the settle window has
+      /// elapsed since `settled_at`. Timed from `settled_at` (settings-applied), not from any wait entry.
+      pub fn settled_no_progress(&self, settle: Duration) -> bool {
+          !self.began && self.settled_at.map(|t| t.elapsed() >= settle).unwrap_or(false)
+      }
   }
 
   impl Readiness {
@@ -272,6 +288,11 @@ Split the language-agnostic client from the per-language config. `Readiness` abs
       pub program_argv: Vec<String>,
       /// Extra spawn env (rust: CARGO_TARGET_DIR when a target cache is given).
       pub spawn_env: Vec<(String, String)>,
+      /// Predicate: is `root` a valid project root for THIS language? Used by `run()` to validate an
+      /// EXPLICIT `--lang rust|python` against the repo before starting (spec §1/§2 root markers). For
+      /// `--lang auto` the language is already chosen by `detect_lang`, so this is a redundant-but-cheap
+      /// re-check; for explicit `--lang` it is the ONLY guard against pointing the wrong server at a repo.
+      pub is_project_root: Box<dyn Fn(&Path) -> bool + Send + Sync>,
       /// The `initialize` params for this language (rooted at `root_uri`).
       pub initialize_params: Box<dyn Fn(&str) -> Value + Send + Sync>,
       /// Notification sent immediately after `initialized` (Python: didChangeConfiguration). None for Rust.
@@ -289,6 +310,7 @@ Split the language-agnostic client from the per-language config. `Readiness` abs
           name: "rust-analyzer",
           program_argv: vec!["rust-analyzer".to_string()],
           spawn_env,
+          is_project_root: Box::new(|root: &Path| root.join("Cargo.toml").exists()),
           initialize_params: Box::new(|root_uri: &str| {
               json!({
                   "processId": std::process::id(),
@@ -482,13 +504,98 @@ Split the language-agnostic client from the per-language config. `Readiness` abs
       }
   }
   ```
-- [ ] Update the `testkit` re-export in `lib.rs` to point at the new `Readiness`-based API (the harness's `is_ready`/`parse_quiescent`/`ReadyState` imports change — rewrite `characterization.rs`'s `apply`/transition test to use `Readiness::RustRa(RustReady::default())` + `on_notification`/`is_ready` instead). Re-export:
+- [ ] Update the `#[doc(hidden)] pub mod testkit` re-export in `lib.rs` to point at the new `Readiness`-based API (the harness's `is_ready`/`parse_quiescent`/`ReadyState` imports change to the `Readiness`-based ones). The items re-exported MUST be genuinely `pub` in `lang.rs` (`Readiness`, `RustReady`, `PyrightReady`, with `pub` fields the harness reads) — same genuinely-pub doc-hidden scheme as Task 2 (an external `tests/` crate cannot reach `pub(crate)`). Re-export:
   ```rust
-  #[doc(hidden)]
+  #[doc(hidden)] // out of the documented API; resolvable from tests/characterization.rs.
   pub mod testkit {
       pub use crate::lang::{Readiness, RustReady, PyrightReady};
   }
   ```
+- [ ] **Opus H1 — rewrite `characterization.rs`'s `apply`/transition test against the new `Readiness` API with LITERAL code** (the old version imported the removed `is_ready`/`parse_quiescent`/`ReadyState`). Replace the `apply` helper and `rust_readiness_transition_table` test in `crates/lsp-mcp/tests/characterization.rs` with:
+  ```rust
+  use lsp_mcp::testkit::{Readiness, RustReady};
+
+  #[test]
+  fn rust_readiness_transition_table() {
+      let begin = json!({"value":{"kind":"begin"}});
+      let end = json!({"value":{"kind":"end"}});
+      let quiescent = json!({"quiescent": true});
+
+      // ordered begin→end → ready
+      let mut r = Readiness::RustRa(RustReady::default());
+      assert!(!r.is_ready(), "nothing heard yet");
+      r.on_notification("$/progress", &begin);
+      assert!(!r.is_ready(), "begun, still active");
+      r.on_notification("$/progress", &end);
+      assert!(r.is_ready(), "begun-and-ended → ready");
+
+      // experimental/serverStatus quiescent alone (warm-no-progress) → ready, no $/progress needed
+      let mut r = Readiness::RustRa(RustReady::default());
+      r.on_notification("experimental/serverStatus", &quiescent);
+      assert!(r.is_ready(), "quiescent alone is enough");
+
+      // out-of-order: a stray `end` before any `begin` must NOT mark ready (active saturates at 0, began stays false)
+      let mut r = Readiness::RustRa(RustReady::default());
+      r.on_notification("$/progress", &end);
+      assert!(!r.is_ready(), "lone end is not ready");
+  }
+  ```
+  (Note: `on_notification` takes the `params` value directly — `&msg["params"]` at the reader-thread call site — so the test passes the `params`-shaped values above, matching `mod.rs`'s `ready.lock().unwrap().on_notification(method, &msg["params"])`.)
+- [ ] Run `cargo test -p lsp-mcp --test characterization rust_readiness_transition_table` and see it PASS against the new `Readiness` machine.
+- [ ] **FIX (crown-jewel invariant) — add the GENUINE respawn-FAILURE test (failure leaves `evicted=true`).** This is the real invariant the old mislabeled test never checked. It needs the `LangServerConfig` seam (to inject a bogus `program_argv`) plus `respawn` + the `evicted` flag reachable from the harness. Expose them: in `src/lsp/mod.rs` add `#[doc(hidden)] pub fn respawn_for_test(&mut self) -> anyhow::Result<()> { self.respawn() }` and `#[doc(hidden)] pub fn is_evicted_for_test(&self) -> bool { self.evicted.load(std::sync::atomic::Ordering::SeqCst) }` (thin doc-hidden wrappers so `respawn`/`evicted` stay private but the harness can drive them). (`start_with` is already `pub` from this task's rename step.) Append to `crates/lsp-mcp/tests/characterization.rs`:
+  ```rust
+  use lsp_mcp::lang::{LangServerConfig, Readiness, RustReady};
+
+  #[test]
+  fn respawn_failure_leaves_evicted_true() {
+      // CROWN-JEWEL INVARIANT: a respawn whose handshake CANNOT succeed leaves `evicted=true` so the NEXT
+      // call retries respawn (mod.rs:respawn re-inits BEFORE clearing `evicted`). Force failure by building
+      // an LspClient over a LangServerConfig whose program_argv[0] is a non-existent binary — spawn() fails.
+      let bogus = LangServerConfig {
+          name: "bogus-lsp",
+          program_argv: vec!["definitely-not-a-real-lsp-xyz".to_string()],
+          spawn_env: vec![],
+          is_project_root: Box::new(|_| true),
+          initialize_params: Box::new(|root| serde_json::json!({ "rootUri": root })),
+          post_init_config: None,
+          new_readiness: Box::new(|| Readiness::RustRa(RustReady::default())),
+      };
+      // start_with FAILS to spawn the bogus binary, so build via a real RA first then swap is awkward;
+      // instead assert start_with itself errors AND, when we DO have a started client, a forced respawn
+      // against a bogus cfg leaves evicted=true. We use the real-RA path to get a started client, evict it,
+      // then point respawn at the bogus cfg.
+      if !ra_available() { eprintln!("skip: rust-analyzer not on PATH"); return; }
+      let mut s = lsp_mcp::lsp::LspClient::start_with(&sample_repo(), lsp_mcp::lang::rust_ra_config(None)).unwrap();
+      s.ensure_ready(Duration::from_secs(120)).unwrap();
+      s.evict();
+      assert!(s.is_evicted_for_test(), "evict() set evicted=true");
+      // Swap the cfg to the bogus one and force a respawn — spawn() of the missing binary must Err...
+      s.set_cfg_for_test(bogus);
+      let err = s.respawn_for_test();
+      assert!(err.is_err(), "respawn of a non-existent binary must fail");
+      // ...and the invariant: evicted is STILL true after the failed respawn (next call retries respawn).
+      assert!(s.is_evicted_for_test(), "FAILED respawn must leave evicted=true (crown-jewel invariant)");
+  }
+  ```
+  To make this compile, also add a doc-hidden cfg-swap helper in `src/lsp/mod.rs`: `#[doc(hidden)] pub fn set_cfg_for_test(&mut self, cfg: crate::lang::LangServerConfig) { self.cfg = std::sync::Arc::new(cfg); }`. (`respawn` re-spawns from `self.cfg`, so swapping it then calling `respawn_for_test` forces the bogus spawn while keeping the eviction-ordering code under test.)
+- [ ] Run `cargo test -p lsp-mcp --test characterization respawn_failure_leaves_evicted_true` (RA-guarded) and see it PASS: the failed respawn leaves `evicted=true`.
+- [ ] **FIX (request-touch) — add a request-touch test so the Task-3 refactor cannot silently drop the idle-race touch.** The idle-race fix is that `request()`/`wait_ready()` call `touch()` (advancing `last_activity`), and `respawn` clears `evicted` only AFTER the handshake. The `stdin: ChildStdin` field can't be constructed without a live process, so this is an RA-guarded behavioral test (matching the existing harness guard) that proves the REQUEST PATH advances `last_activity` — a pure `touch()`-only unit test would prove `touch` works but NOT that `wait_ready`/`request` call it. Expose the clock for the test: `#[doc(hidden)] pub fn last_activity_for_test(&self) -> std::time::Instant { *self.last_activity.lock().unwrap() }` in `src/lsp/mod.rs`. Append to `crates/lsp-mcp/tests/characterization.rs` (it already has the `ra_available()` + `sample_repo()` helpers):
+  ```rust
+  #[test]
+  fn request_path_advances_last_activity_idle_race_guard() {
+      // The idle-race fix: wait_ready()/request() touch() on the active path so the watcher can't evict
+      // mid-use. Assert last_activity ADVANCES across a wait_ready() call. If the refactor drops the
+      // request-path touch(), last_activity does not advance and this fails. RA-guarded (needs a started client).
+      if !ra_available() { eprintln!("skip: rust-analyzer not on PATH"); return; }
+      let mut s = lsp_mcp::lsp::LspClient::start_with(&sample_repo(), lsp_mcp::lang::rust_ra_config(None)).unwrap();
+      let before = s.last_activity_for_test();
+      std::thread::sleep(Duration::from_millis(20));
+      s.wait_ready(Duration::from_millis(50)).unwrap(); // touches on every loop iteration
+      assert!(s.last_activity_for_test() > before, "request/wait path must touch() (idle-race fix)");
+      s.shutdown();
+  }
+  ```
+  (D1 = targeted: this reuses the existing RA guard + `start_with` + the doc-hidden clock accessor — no fake-rust-analyzer binary. The pure `should_evict_after_idle_timeout` test already locks the `should_evict` arithmetic; THIS test locks that the request path actually calls `touch()`.)
 - [ ] Rename `LspSession`→`LspClient` everywhere it's referenced: `tests/integration.rs` (`lsp_mcp::lsp::LspSession` → `LspClient`, 4 sites), `tests/characterization.rs` (the `respawn_failure_leaves_evicted_true` test), `src/mcp/mod.rs` (`use crate::lsp::LspSession` → `LspClient`; the `dispatch`/`serve`/`dispatch_body` param types `s: &mut LspSession` → `&mut LspClient`), and `src/lib.rs` `run()`. Use `cargo build -p lsp-mcp` to find every site.
 - [ ] Run `cargo test -p lsp-mcp` and see ALL tests pass: the moved unit tests, the characterization harness (now via `Readiness`), and the guarded integration tests (Rust path byte-for-byte). Run `cargo clippy -p lsp-mcp -- -D warnings` and fix any lints from the refactor.
 - [ ] `git add crates/lsp-mcp/src/lang.rs crates/lsp-mcp/src/lib.rs crates/lsp-mcp/src/lsp/mod.rs crates/lsp-mcp/src/mcp/mod.rs crates/lsp-mcp/tests/integration.rs crates/lsp-mcp/tests/characterization.rs && git commit -m "refactor(lsp-mcp): split LspClient from LangServerConfig + Readiness (Rust byte-for-byte)"`
@@ -633,7 +740,10 @@ Concrete, testable predicates. `rust` iff `Cargo.toml`; `python` iff `setup.py`/
       const REAL: [&str; 5] = ["[project]", "[tool.poetry]", "[tool.pdm]", "[build-system]", "[project.dependencies]"];
       text.lines().any(|l| {
           let l = l.trim();
-          REAL.iter().any(|m| l.starts_with(m)) || l == "dynamic"
+          // `starts_with("dynamic")` matches a `dynamic = [...]` key (PEP 621) but NOT an arbitrary bare
+          // `dynamic` token mid-line; the old `l == "dynamic"` matched nothing useful and a bare-`dynamic`
+          // arm would over-match — anchor to the line start.
+          REAL.iter().any(|m| l.starts_with(m)) || l.starts_with("dynamic")
       })
   }
 
@@ -677,6 +787,10 @@ Concrete, testable predicates. `rust` iff `Cargo.toml`; `python` iff `setup.py`/
           .repo
           .canonicalize()
           .map_err(|e| anyhow::anyhow!("repo {:?}: {e}", cli.repo))?;
+      // Track whether the language was chosen EXPLICITLY (vs auto-detected): an explicit `--lang rust|python`
+      // is validated against the repo via `is_project_root` BEFORE starting (today explicit `--lang python`
+      // on a non-Python dir is unguarded). `auto` is already validated by `detect_lang`.
+      let explicit = cli.lang.as_str() != "auto";
       let lang = match cli.lang.as_str() {
           "auto" => crate::lang::detect_lang(&repo)?,
           "rust" => crate::lang::Lang::Rust,
@@ -687,10 +801,6 @@ Concrete, testable predicates. `rust` iff `Cargo.toml`; `python` iff `setup.py`/
       eprintln!("[lsp-mcp] root={} lang={}", repo.display(), lang.as_str());
       let cfg = match lang {
           crate::lang::Lang::Rust => {
-              anyhow::ensure!(
-                  repo.join("Cargo.toml").exists(),
-                  "not a cargo repo (no Cargo.toml): {:?}", repo
-              );
               let target = cli.target_cache.as_deref().map(|base| {
                   let origin = git_origin(&repo);
                   cache_key::cache_dir(base, &repo, origin.as_deref())
@@ -699,11 +809,19 @@ Concrete, testable predicates. `rust` iff `Cargo.toml`; `python` iff `setup.py`/
           }
           crate::lang::Lang::Python => crate::lang::pyright_config(&repo, cli.python_path.as_deref())?,
       };
+      // USE `is_project_root`: validate an EXPLICIT --lang against the repo (auto already validated above).
+      if explicit && !(cfg.is_project_root)(&repo) {
+          anyhow::bail!(
+              "explicit --lang {} but {:?} is not a {} project root (missing the {} root markers); \
+               pass the right --lang or point --repo at a {} root",
+              lang.as_str(), repo, lang.as_str(), lang.as_str(), lang.as_str()
+          );
+      }
       let session = lsp::LspClient::start_with(&repo, cfg)?;
       mcp::serve(session)
   }
   ```
-  (Note: `pyright_config` + `--python-path` land in Task 6; until then, leave a `crate::lang::Lang::Python => anyhow::bail!("python not yet implemented")` arm and a `// TODO Task 6` so `run()` compiles. Replace it in Task 6. The `--python-path` Cli field is added in Task 6.)
+  (Note: `pyright_config` + `--python-path` land in Task 6; until then, leave a `crate::lang::Lang::Python => anyhow::bail!("python not yet implemented")` arm and a `// TODO Task 6` so `run()` compiles. Replace it in Task 6. The `--python-path` Cli field is added in Task 6. The `is_project_root` validation block above compiles from Task 4 on, since `rust_ra_config` already populates the field; it becomes meaningful for Python once Task 6 lands `pyright_config`'s predicate.)
 - [ ] Run `cargo test -p lsp-mcp` (whole crate) and `cargo clippy -p lsp-mcp -- -D warnings`; confirm green.
 - [ ] `git add crates/lsp-mcp/src/lang.rs crates/lsp-mcp/src/lib.rs crates/lsp-mcp/tests/lang_detect.rs && git commit -m "feat(lsp-mcp): --lang auto detection (rust/python predicates + ambiguous refusal + startup log)"`
 
@@ -776,13 +894,13 @@ The builder is a naive `format!("file://{}", display)` (no percent-encoding) whi
 
 ### Task 6: Python `LangServerConfig` (basedpyright) + interpreter discovery
 
-`basedpyright-langserver --stdio`; python root markers; `initialize_params` advertising NO `window/workDoneProgress`; `post_init_config` = `workspace/didChangeConfiguration { python.pythonPath }`; `Readiness::Pyright` with the no-progress settle; the ordered interpreter-discovery contract; add `--python-path` to `Cli`.
+`basedpyright-langserver --stdio`; python root markers (also the `is_project_root` predicate); `initialize_params` advertising NO `window/workDoneProgress`; `post_init_config` = `workspace/didChangeConfiguration` with the **WRAPPED `{ settings:{ python:{ pythonPath } } }` envelope** (the form Task 1 proves); `Readiness::Pyright` no-progress settle timed from `settled_at`; the ordered interpreter-discovery contract (`PyResolve`, exists+executable, explicit-invalid = HARD error); add `--python-path` to `Cli`.
 
 **Files:**
 - Modify: `crates/lsp-mcp/src/lib.rs` (`Cli.python_path`; replace the Task-4 `python not yet implemented` arm)
-- Modify: `crates/lsp-mcp/src/lang.rs` (`pyright_config`, `resolve_python_path`)
-- Modify: `crates/lsp-mcp/src/lsp/mod.rs` (the no-progress settle in `wait_ready` for `Readiness::Pyright`)
-- Test: `crates/lsp-mcp/tests/lang_detect.rs` (interpreter-discovery unit tests — pure, fixture-driven)
+- Modify: `crates/lsp-mcp/src/lang.rs` (`pyright_config` incl. `is_project_root`, `resolve_python_path`→`PyResolve`, `is_usable_interpreter` exec-check; pure tests: discovery cases + `pyright_no_progress_is_ready_after_settle_not_full_bound`)
+- Modify: `crates/lsp-mcp/src/lsp/mod.rs` (the no-progress settle in `wait_ready` for `Readiness::Pyright`, timed from `settled_at` set in `handshake`)
+- Test: `crates/lsp-mcp/tests/lang_detect.rs` (interpreter-discovery unit tests — pure, fixture-driven, incl. hard-error + non-executable cases)
 
 **Steps:**
 
@@ -794,7 +912,7 @@ The builder is a naive `format!("file://{}", display)` (no percent-encoding) whi
   ```
 - [ ] Write the FAILING interpreter-discovery unit tests. Append to `crates/lsp-mcp/tests/lang_detect.rs`:
   ```rust
-  use lsp_mcp::lang::resolve_python_path;
+  use lsp_mcp::lang::{resolve_python_path, PyResolve};
   use std::os::unix::fs::PermissionsExt;
 
   fn make_exe(p: &std::path::Path) {
@@ -805,14 +923,47 @@ The builder is a naive `format!("file://{}", display)` (no percent-encoding) whi
       std::fs::set_permissions(p, perm).unwrap();
   }
 
+  /// A regular file with NO execute bits — exists but is not a usable interpreter.
+  fn make_nonexec(p: &std::path::Path) {
+      std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+      std::fs::write(p, "not executable\n").unwrap();
+      let mut perm = std::fs::metadata(p).unwrap().permissions();
+      perm.set_mode(0o644);
+      std::fs::set_permissions(p, perm).unwrap();
+  }
+
   #[test]
   fn explicit_flag_wins() {
       let d = td();
       let py = d.path().join("custom/python");
       make_exe(&py);
-      let (resolved, warned) = resolve_python_path(d.path(), Some(&py), None);
-      assert_eq!(resolved, Some(py));
-      assert!(!warned, "explicit valid path → no warning");
+      match resolve_python_path(d.path(), Some(&py), None) {
+          PyResolve::Resolved(p) => assert_eq!(p, py),
+          _ => panic!("explicit valid path must Resolve"),
+      }
+  }
+
+  #[test]
+  fn explicit_invalid_path_is_hard_error() {
+      let d = td();
+      // (a) missing explicit path → Hard (caller bails; NO silent python3 fallback).
+      let missing = d.path().join("nope/python");
+      assert!(matches!(resolve_python_path(d.path(), Some(&missing), None), PyResolve::Hard(_)),
+          "missing explicit path → Hard error, not Fallback");
+      // (b) present-but-non-executable explicit path → Hard.
+      let noexec = d.path().join("bin/python");
+      make_nonexec(&noexec);
+      assert!(matches!(resolve_python_path(d.path(), Some(&noexec), None), PyResolve::Hard(_)),
+          "non-executable explicit path → Hard error, not Fallback");
+  }
+
+  #[test]
+  fn nonexecutable_venv_python_is_not_usable() {
+      let d = td();
+      // A `.venv/bin/python` that exists but isn't executable must NOT be accepted as a venv interpreter.
+      make_nonexec(&d.path().join(".venv/bin/python"));
+      assert!(matches!(resolve_python_path(d.path(), None, None), PyResolve::Fallback),
+          "non-executable venv python is skipped → Fallback");
   }
 
   #[test]
@@ -821,57 +972,69 @@ The builder is a naive `format!("file://{}", display)` (no percent-encoding) whi
       let ve = d.path().join("ve");
       make_exe(&ve.join("bin/python"));
       make_exe(&d.path().join(".venv/bin/python"));
-      let (resolved, _) = resolve_python_path(d.path(), None, Some(ve.as_path()));
-      assert_eq!(resolved, Some(ve.join("bin/python")), "$VIRTUAL_ENV precedes <repo>/.venv");
+      match resolve_python_path(d.path(), None, Some(ve.as_path())) {
+          PyResolve::Resolved(p) => assert_eq!(p, ve.join("bin/python"), "$VIRTUAL_ENV precedes <repo>/.venv"),
+          _ => panic!("must Resolve to the $VIRTUAL_ENV interpreter"),
+      }
   }
 
   #[test]
   fn dot_venv_then_venv() {
       let d = td();
       make_exe(&d.path().join("venv/bin/python")); // only `venv`, no `.venv`
-      let (resolved, _) = resolve_python_path(d.path(), None, None);
-      assert_eq!(resolved, Some(d.path().join("venv/bin/python")));
+      match resolve_python_path(d.path(), None, None) {
+          PyResolve::Resolved(p) => assert_eq!(p, d.path().join("venv/bin/python")),
+          _ => panic!("must Resolve to <repo>/venv/bin/python"),
+      }
   }
 
   #[test]
   fn no_venv_falls_back_to_python3_with_warning() {
-      let d = td(); // empty repo, no venv, no $VIRTUAL_ENV
-      let (resolved, warned) = resolve_python_path(d.path(), None, None);
-      assert_eq!(resolved, None, "no venv → None (caller uses python3 on PATH)");
-      assert!(warned, "fallback MUST warn (not a silent empty result)");
-  }
-
-  #[test]
-  fn nonexistent_explicit_path_is_rejected() {
-      let d = td();
-      let missing = d.path().join("nope/python");
-      let (resolved, warned) = resolve_python_path(d.path(), Some(&missing), None);
-      assert_eq!(resolved, None, "missing explicit path is not used");
-      assert!(warned);
+      let d = td(); // empty repo, no venv, no $VIRTUAL_ENV, no explicit override
+      assert!(matches!(resolve_python_path(d.path(), None, None), PyResolve::Fallback),
+          "no venv + no explicit override → Fallback (caller uses python3 + LOGGED WARNING, not silent)");
   }
   ```
 - [ ] Run `cargo test -p lsp-mcp --test lang_detect resolve_python_path` and see it FAIL (no `resolve_python_path`).
 - [ ] Implement `resolve_python_path` + `pyright_config` in `crates/lsp-mcp/src/lang.rs`:
   ```rust
-  /// Validate a candidate interpreter exists + is executable (best-effort: regular file, not a dir).
+  /// Validate a candidate interpreter exists AND is executable. A regular file alone is NOT enough — a
+  /// non-executable path would make basedpyright fail to launch the interpreter at use-time (spec §2 says
+  /// the chosen path is validated exists+executable before use). Unix: check the file mode's execute bits.
   fn is_usable_interpreter(p: &Path) -> bool {
-      std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
+      use std::os::unix::fs::PermissionsExt;
+      match std::fs::metadata(p) {
+          Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
+          Err(_) => false,
+      }
   }
 
-  /// Ordered interpreter discovery (spec §2). Returns `(resolved, warned)`:
-  /// (1) explicit flag / LSP_MCP_PYTHON_PATH, (2) $VIRTUAL_ENV/bin/python, (3) <repo>/.venv/bin/python,
-  /// (4) <repo>/venv/bin/python, (5) None → caller falls back to `python3` on PATH with a logged warning.
-  /// `warned == true` means third-party resolution may be incomplete (no venv) OR an explicit path was bad.
+  /// Outcome of interpreter discovery. `Hard` = an EXPLICIT override (flag/env) that is missing or
+  /// non-executable → the caller MUST `anyhow::bail!` (never silently fall back to `python3` — that would
+  /// mask a typo and silently degrade third-party resolution). `Resolved(p)` = a usable venv interpreter.
+  /// `Fallback` = no explicit override AND no venv found → caller uses `python3` on PATH + a LOGGED WARNING.
+  pub enum PyResolve {
+      Resolved(PathBuf),
+      Fallback,
+      Hard(PathBuf),
+  }
+
+  /// Ordered interpreter discovery (spec §2). Precedence:
+  /// (1) explicit flag / LSP_MCP_PYTHON_PATH — if INVALID (missing/non-executable) → `Hard` (caller bails);
+  /// (2) $VIRTUAL_ENV/bin/python, (3) <repo>/.venv/bin/python, (4) <repo>/venv/bin/python — first usable wins;
+  /// (5) none → `Fallback` (caller uses `python3` on PATH with a logged warning).
+  /// NOTE: a bad EXPLICIT override is a HARD ERROR, NOT a silent `python3` fallback. The silent+warned
+  /// `python3` fallback is ONLY the no-explicit-override / no-venv case.
   pub fn resolve_python_path(
       repo: &Path,
       explicit: Option<&Path>,
       virtual_env: Option<&Path>,
-  ) -> (Option<PathBuf>, bool) {
+  ) -> PyResolve {
       if let Some(p) = explicit {
           return if is_usable_interpreter(p) {
-              (Some(p.to_path_buf()), false)
+              PyResolve::Resolved(p.to_path_buf())
           } else {
-              (None, true) // bad explicit path → fall back + warn
+              PyResolve::Hard(p.to_path_buf()) // bad explicit override → HARD ERROR (no silent fallback)
           };
       }
       let candidates = [
@@ -881,10 +1044,10 @@ The builder is a naive `format!("file://{}", display)` (no percent-encoding) whi
       ];
       for c in candidates.into_iter().flatten() {
           if is_usable_interpreter(&c) {
-              return (Some(c), false);
+              return PyResolve::Resolved(c);
           }
       }
-      (None, true) // no venv found → python3 fallback, warn
+      PyResolve::Fallback // no venv found → python3 fallback (warned), only because there was no explicit override
   }
 
   /// Python / basedpyright config. Resolves the interpreter, advertises NO `window/workDoneProgress` (so
@@ -894,19 +1057,28 @@ The builder is a naive `format!("file://{}", display)` (no percent-encoding) whi
       let explicit = explicit_python
           .map(Path::to_path_buf)
           .or_else(|| std::env::var_os("LSP_MCP_PYTHON_PATH").map(PathBuf::from));
-      let (resolved, warned) = resolve_python_path(repo, explicit.as_deref(), virtual_env.as_deref());
-      // Fall back to `python3` on PATH when no venv was found (degraded, but stdlib still resolves).
-      let python_path = resolved
-          .map(|p| p.display().to_string())
-          .unwrap_or_else(|| "python3".to_string());
-      if warned {
-          eprintln!(
-              "[lsp-mcp] WARNING: no venv interpreter found for {repo:?}; using `{python_path}` — \
-               third-party (site-packages) resolution may be incomplete. Pass --python-path to fix."
-          );
-      } else {
-          eprintln!("[lsp-mcp] python interpreter: {python_path}");
-      }
+      let python_path = match resolve_python_path(repo, explicit.as_deref(), virtual_env.as_deref()) {
+          PyResolve::Resolved(p) => {
+              let s = p.display().to_string();
+              eprintln!("[lsp-mcp] python interpreter: {s}");
+              s
+          }
+          // An EXPLICIT --python-path / LSP_MCP_PYTHON_PATH that is missing or non-executable is a HARD ERROR:
+          // never silently fall back to `python3` (that would mask a typo and silently degrade resolution).
+          PyResolve::Hard(p) => anyhow::bail!(
+              "explicit python interpreter {:?} is missing or not executable — fix --python-path / \
+               LSP_MCP_PYTHON_PATH (no silent fallback to python3 for an explicit override)", p
+          ),
+          // No explicit override AND no venv → degrade to `python3` on PATH with a LOGGED WARNING (stdlib
+          // still resolves; third-party may be incomplete). This is the ONLY warned-fallback case.
+          PyResolve::Fallback => {
+              eprintln!(
+                  "[lsp-mcp] WARNING: no venv interpreter found for {repo:?}; using `python3` on PATH — \
+                   third-party (site-packages) resolution may be incomplete. Pass --python-path to fix."
+              );
+              "python3".to_string()
+          }
+      };
       let post = (
           "workspace/didChangeConfiguration".to_string(),
           json!({ "settings": { "python": { "pythonPath": python_path } } }),
@@ -915,6 +1087,12 @@ The builder is a naive `format!("file://{}", display)` (no percent-encoding) whi
           name: "basedpyright",
           program_argv: vec!["basedpyright-langserver".to_string(), "--stdio".to_string()],
           spawn_env: vec![],
+          // USE `is_project_root`: the Python root predicates (reuses the Task-4 detection helpers) — a real
+          // pyproject section / setup.py / setup.cfg / requirements*.txt / a `.py` shallow-scan. `run()`
+          // validates an explicit `--lang python` against this before starting basedpyright.
+          is_project_root: Box::new(|root: &Path| {
+              python_markers(root) || has_real_pyproject(root) || shallow_py_scan(root)
+          }),
           initialize_params: Box::new(|root_uri: &str| {
               // Advertise NO window/workDoneProgress → basedpyright emits pyright/{begin,end}Progress instead.
               json!({
@@ -929,20 +1107,50 @@ The builder is a naive `format!("file://{}", display)` (no percent-encoding) whi
       })
   }
   ```
-  (Note on the `didChangeConfiguration` payload: confirm against the Task-1 spike transcript whether basedpyright reads `{ "settings": { "python": {...} } }` (LSP-standard `DidChangeConfigurationParams`) vs a bare `{ "python": {...} }`; the spec §2 wrote the bare form — use whichever the spike PROVED resolves a third-party def, and adjust this literal to match. Do NOT ship the form the spike didn't verify.)
-- [ ] Run `cargo test -p lsp-mcp --test lang_detect resolve_python_path` and see ALL discovery tests PASS.
-- [ ] Replace the Task-4 placeholder arm in `run()`: change `crate::lang::Lang::Python => anyhow::bail!("python not yet implemented")` to `crate::lang::Lang::Python => crate::lang::pyright_config(&repo, cli.python_path.as_deref())?`. Run `cargo build -p lsp-mcp`.
-- [ ] Implement the no-progress settle for `Readiness::Pyright` in `wait_ready` (so the first Python call doesn't pay the full bound). The `PyrightReady.settings_applied` flag is set after `handshake` (which sends `post_init_config`). In `src/lsp/mod.rs`, mark it set at the end of `handshake` for the Pyright variant, and **REPLACE the Task-3 `wait_ready` body** (do NOT add a second function) so it treats "settings applied + no progress within a short settle" as ready:
+  (Note on the `didChangeConfiguration` payload: this ships the **LSP-standard WRAPPED `settings` envelope** `{ "settings": { "python": { "pythonPath": … } } }` — which is exactly the form Task 1 Gate 1a drives and PROVES resolves a third-party def. The spec §2 wrote a bare `{ "python": {...} }`; the WRAPPED form is the proven one and is what this `post_init_config` ships. Do NOT regress to the bare form.)
+- [ ] Run `cargo test -p lsp-mcp --test lang_detect resolve_python_path explicit_invalid_path_is_hard_error nonexecutable_venv_python_is_not_usable` and see ALL discovery tests PASS (incl. the hard-error + non-executable cases).
+- [ ] **Add the AUTOMATED no-progress readiness test (D1 = targeted: a PURE unit test on the readiness state machine, NOT a live basedpyright).** It proves the FU3 guard per-language: settings applied, no progress notification arrives, and readiness becomes ready after the settle window WITHOUT progress — i.e. the first call does NOT wait the full bound. Add to `crates/lsp-mcp/src/lang.rs`'s `#[cfg(test)] mod tests`:
   ```rust
-  // in handshake(), AFTER sending post_init_config:
+  #[test]
+  fn pyright_no_progress_is_ready_after_settle_not_full_bound() {
+      let settle = Duration::from_millis(50);
+      // Simulate "settings applied, no progress notification arrives": settled_at = now, began = false.
+      let mut p = PyrightReady { began: false, active: 0, settled_at: Some(Instant::now()) };
+      // Immediately after settings applied (within the settle window): NOT yet ready, but also NOT a full
+      // timeout — the settle is timed from settled_at, not from any wait entry.
+      assert!(!p.settled_no_progress(settle), "not ready before the settle window elapses");
+      assert!(!Readiness::Pyright(std::mem::take(&mut p)).is_ready(), "no progress + no settle ⇒ is_ready() false");
+      // After the settle window with NO progress → ready (the first call returns fast, not at the full bound).
+      let p = PyrightReady { began: false, active: 0, settled_at: Some(Instant::now() - Duration::from_millis(60)) };
+      assert!(p.settled_no_progress(settle), "settle elapsed with no progress → ready (no full-bound wait)");
+      // settled_at = None (settings not yet applied) is never settle-ready.
+      let p = PyrightReady { began: false, active: 0, settled_at: None };
+      assert!(!p.settled_no_progress(settle), "no settled_at (settings not applied) → not settle-ready");
+      // A begin-without-end does NOT settle (began == true) — documented begin-without-end ceiling.
+      let p = PyrightReady { began: true, active: 1, settled_at: Some(Instant::now() - Duration::from_secs(1)) };
+      assert!(!p.settled_no_progress(settle), "begin seen ⇒ no no-progress settle (needs a matching end)");
+  }
+  ```
+  (`PyrightReady` derives `Default`; the explicit-field construction needs the fields `pub` — they are, per Task 3. `std::mem::take` needs `Default`, satisfied.)
+- [ ] Run `cargo test -p lsp-mcp pyright_no_progress_is_ready_after_settle_not_full_bound` and see it PASS.
+- [ ] Replace the Task-4 placeholder arm in `run()`: change `crate::lang::Lang::Python => anyhow::bail!("python not yet implemented")` to `crate::lang::Lang::Python => crate::lang::pyright_config(&repo, cli.python_path.as_deref())?`. Run `cargo build -p lsp-mcp`.
+- [ ] Implement the no-progress settle for `Readiness::Pyright` in `wait_ready` (so the first Python call doesn't pay the full bound), with the **CORRECT clock origin (Opus H2)**: the settle is timed from when settings were APPLIED (`PyrightReady.settled_at`), NOT from `wait_ready` entry. Timing from `wait_ready` entry made a begin-without-end server pay the FULL timeout. Set `settled_at = Some(Instant::now())` at the end of `handshake` for the Pyright variant, and **REPLACE the Task-3 `wait_ready` body** (do NOT add a second function) so it treats "settings applied + no progress within a short settle SINCE settings-applied" as ready via the pure `PyrightReady::settled_no_progress`:
+  ```rust
+  // in handshake(), AFTER sending post_init_config — stamp the settle-clock origin (settings applied now):
   if self.cfg.post_init_config.is_some() {
       if let crate::lang::Readiness::Pyright(s) = &mut *self.ready.lock().unwrap() {
-          s.settings_applied = true;
+          s.settled_at = Some(Instant::now());
       }
   }
   ```
   ```rust
-  // in wait_ready(): a Pyright no-progress settle of ~1.5s after settings_applied counts as ready.
+  // in wait_ready(): a Pyright no-progress settle of ~1.5s AFTER settings-applied (settled_at) counts as
+  // ready. The settle is timed from settled_at (via settled_no_progress), so a begin-without-end server is
+  // ready ~settle after settings — it does NOT pay the full `timeout` (Opus H2 / the FU3 stall §2 forbids).
+  // BEGIN-WITHOUT-END BEHAVIOR (documented): once any `beginProgress` is seen, `is_ready()` requires a
+  // matching `endProgress` (begun-and-ended). If `end` never arrives, the no-progress settle does NOT
+  // re-apply (s.began is true), so wait_ready returns at `timeout` (best-effort) — this is the begin-without-
+  // end ceiling; the common path (no progress, or paired begin/end) is fast.
   pub fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
       let t0 = Instant::now();
       let settle = Duration::from_millis(1500);
@@ -954,8 +1162,8 @@ The builder is a naive `format!("file://{}", display)` (no percent-encoding) whi
                   return Ok(());
               }
               if let crate::lang::Readiness::Pyright(s) = &*g {
-                  // No progress seen yet, settings applied, and the short settle has elapsed → ready.
-                  if s.settings_applied && !s.began && t0.elapsed() >= settle {
+                  // No progress yet, settings applied, settle elapsed SINCE settled_at → ready.
+                  if s.settled_no_progress(settle) {
                       return Ok(());
                   }
               }
@@ -1056,6 +1264,7 @@ Recursive `document_symbols.children` (REQUIRED — class→method); `resolve_po
 - Modify: `crates/lsp-mcp/src/lsp/mod.rs` (`document_symbols` recursion; `hover` array form)
 - Modify: `crates/lsp-mcp/src/mcp/mod.rs` (genericize 2 tool descriptions)
 - Test: `crates/lsp-mcp/tests/python_nav.rs` (extend — 7-tool coverage + duplicate-name + recursive symbols + non-empty hover)
+- Test: `crates/lsp-mcp/tests/integration.rs` (ADD a guarded Rust `document_symbols` test locking the additive nested-children output against the `sample` fixture)
 
 **Steps:**
 
@@ -1068,21 +1277,25 @@ Recursive `document_symbols.children` (REQUIRED — class→method); `resolve_po
     dependencies = ["pydantic>=2"]
     ```
   - `pysample/__init__.py`: empty
-  - `pysample/models.py` — a class with a method (hierarchical symbols), a third-party import, and a DUPLICATE name across two scopes:
+  - `pysample/models.py` — a class with a method (hierarchical symbols), a third-party import, and a DUPLICATE name across two scopes. **The recursive-`document_symbols` test must FAIL if `children` recursion is dropped, so the NESTED method name must NOT also exist at module scope** (else `contains("greet")` false-greens from the module function). The class method is `greet`; the module-level function is renamed `module_greet` and the duplicate-name pair for `resolve_pos` is `module_greet` (module) vs a method `module_greet`-free design — we keep a distinct duplicate via a method named `greet` + a module function `greet_text` (NOT `greet`), and assert `document_symbols` sees `greet` ONLY as a child of `Greeter`:
     ```python
     from pydantic import BaseModel
 
     GREETING = "hi"
 
-    class Greeter(BaseModel):       # third-party base class (third-party def target)
+    class Greeter(BaseModel):           # third-party base class (third-party def target)
         name: str
 
-        def greet(self) -> str:     # class->method (recursive document_symbols target)
+        def greet(self) -> str:         # class->method `greet` — exists ONLY as a CHILD of Greeter
             return f"{GREETING} {self.name}"
 
-    def greet() -> str:             # DUPLICATE name `greet` at module scope (resolve_pos first-hit)
+        def module_greet(self) -> str:  # DUPLICATE name `module_greet` (method side; resolve_pos first-hit)
+            return GREETING
+
+    def module_greet() -> str:          # DUPLICATE name `module_greet` at module scope (resolve_pos first-hit)
         return GREETING
     ```
+    (`greet` is now nested-ONLY: it appears in `document_symbols` output solely via `Greeter.children` extraction — so the recursive test fails if recursion is dropped. `module_greet` is the duplicate-name pair for `resolve_pos`, present at BOTH module and method scope.)
   - A `.gitignore` in the fixture dir ignoring `.venv/`.
 - [ ] Add a fixture-venv setup note + helper. Create `crates/lsp-mcp/tests/fixtures/pysample/README.md` (one line) documenting the setup command the test host runs once:
   ```
@@ -1101,8 +1314,12 @@ Recursive `document_symbols.children` (REQUIRED — class→method); `resolve_po
       s.ensure_ready(Duration::from_secs(60)).unwrap();
       let syms = s.document_symbols(&models_py()).unwrap();
       let names: Vec<&str> = syms.iter().filter_map(|h| h.signature.as_deref()).collect();
-      assert!(names.iter().any(|n| n.contains("Greeter")), "class Greeter, got {names:?}");
-      assert!(names.iter().any(|n| n.contains("greet")), "method greet (nested child), got {names:?}");
+      assert!(names.iter().any(|n| *n == "Greeter"), "class Greeter, got {names:?}");
+      // `greet` exists ONLY as a child of `Greeter` (no module-level `greet`). Asserting EXACT `greet`
+      // proves child extraction — this test FAILS if `children` recursion is dropped (the flat top-level
+      // parse never sees `greet`). Use exact equality, not `contains`, so `module_greet` can't false-green.
+      assert!(names.iter().any(|n| *n == "greet"),
+          "method `greet` must appear via Greeter.children recursion, got {names:?}");
       s.shutdown();
   }
   ```
@@ -1150,7 +1367,25 @@ Recursive `document_symbols.children` (REQUIRED — class→method); `resolve_po
       }
   }
   ```
-- [ ] Run `cargo test -p lsp-mcp --test python_nav document_symbols_extracts` and see it PASS. Then run `tests/integration.rs` (Rust `document_symbols` not exercised there directly — but run the full crate test to confirm no regression). Also re-run the `characterization` + `integration` Rust tests to confirm the recursive walk is byte-compatible for the flat Rust shape.
+- [ ] Run `cargo test -p lsp-mcp --test python_nav document_symbols_extracts` and see it PASS. **The recursion ADDITIVELY includes nested children in the Rust `document_symbols` output too — it is NOT "byte-compatible" with the old flat parse (there was no Rust `document_symbols` test, so "re-run to confirm byte-compatible" would verify nothing). Instead, ADD a guarded Rust `document_symbols` characterization test that LOCKS the new recursive output against the `sample` fixture** (which has a trait `Greet` with a nested method `hi`). In `crates/lsp-mcp/tests/integration.rs` (it already has `sample_repo()` + `ra_available()`), add:
+  ```rust
+  #[test]
+  fn rust_document_symbols_includes_nested_trait_method() {
+      if !ra_available() { eprintln!("skip: rust-analyzer not on PATH"); return; }
+      let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
+      s.ensure_ready(std::time::Duration::from_secs(120)).unwrap();
+      let syms = s.document_symbols(&sample_repo().join("lib.rs")).unwrap();
+      let names: Vec<&str> = syms.iter().filter_map(|h| h.signature.as_deref()).collect();
+      // Top-level items still present (additive, not a replacement).
+      assert!(names.iter().any(|n| *n == "add"), "top-level fn add, got {names:?}");
+      assert!(names.iter().any(|n| *n == "Greet"), "trait Greet, got {names:?}");
+      // NEW: the trait method `hi` is now extracted via children recursion (it was DROPPED by the old flat
+      // parse). This LOCKS the additive recursive output for Rust — the change is intended, not byte-for-byte.
+      assert!(names.iter().any(|n| *n == "hi"), "nested trait method `hi` (recursion), got {names:?}");
+      s.shutdown();
+  }
+  ```
+  (`hi` appears as a child of the `Greet` trait and the `impl Greet for En` block — the recursive walk surfaces it; the old flat top-level parse never did. This guarded test is the lock; the plan's wording is corrected: **Rust `document_symbols` now additively includes nested children — intended, locked by this test — NOT byte-compatible.**) Then run the full crate test (`cargo test -p lsp-mcp`) to confirm the other Rust paths (`definition`/`references`/`call_hierarchy`/`workspace_symbol`) are unchanged.
 - [ ] Write the duplicate-name `resolve_pos` + non-empty `hover` + remaining-tools tests. Append to `python_nav.rs`:
   ```rust
   #[test]
@@ -1158,10 +1393,11 @@ Recursive `document_symbols.children` (REQUIRED — class→method); `resolve_po
       if !ready() { eprintln!("skip"); return; }
       let mut s = start();
       s.ensure_ready(Duration::from_secs(60)).unwrap();
-      // `greet` exists as both a method (Greeter.greet) and a module function. First-hit must resolve to
-      // a real location (degradation documented: we keep the name-only API; basedpyright ranks the hits).
-      let def = s.definition("greet").unwrap();
-      assert!(!def.is_empty(), "duplicate `greet` must resolve to some def, got {def:?}");
+      // `module_greet` exists as BOTH a method (Greeter.module_greet) and a module function. First-hit must
+      // resolve to a real location (degradation documented: we keep the name-only API; basedpyright ranks
+      // the hits). (`greet` is the nested-only name used by the recursion test — distinct from this pair.)
+      let def = s.definition("module_greet").unwrap();
+      assert!(!def.is_empty(), "duplicate `module_greet` must resolve to some def, got {def:?}");
       s.shutdown();
   }
 
@@ -1221,31 +1457,57 @@ Recursive `document_symbols.children` (REQUIRED — class→method); `resolve_po
   - `implementations`: `"Trait impls / who implements a trait or type."` → `"Implementations of a symbol (Rust trait impls; Python subclasses / overrides)."`
 - [ ] Update the `mcp/mod.rs` unit test if it asserts on description text (it asserts only on tool names + count — confirm `exposes_the_seven_tools` still passes). Run `cargo test -p lsp-mcp --lib`.
 - [ ] Run `cargo test -p lsp-mcp --test python_nav` on the fixture host and see all 7-tool tests PASS. Run the FULL crate test (`cargo test -p lsp-mcp`) + `cargo clippy -p lsp-mcp -- -D warnings`; confirm the Rust path is still green.
-- [ ] `git add crates/lsp-mcp/tests/fixtures/pysample crates/lsp-mcp/src/lsp/mod.rs crates/lsp-mcp/src/mcp/mod.rs crates/lsp-mcp/tests/python_nav.rs && git commit -m "feat(lsp-mcp): Python 7-tool fixture coverage — recursive document_symbols, hover arrays, generic tool descs"`
+- [ ] `git add crates/lsp-mcp/tests/fixtures/pysample crates/lsp-mcp/src/lsp/mod.rs crates/lsp-mcp/src/mcp/mod.rs crates/lsp-mcp/tests/python_nav.rs crates/lsp-mcp/tests/integration.rs && git commit -m "feat(lsp-mcp): Python 7-tool fixture coverage — recursive document_symbols (+ Rust nested-children lock), hover arrays, generic tool descs"`
 
 ---
 
-### Task 9: Host wiring + DoD
+### Task 9: Live `{cwd}` gate (relocated) + host wiring + DoD
 
-Set the host reviewers' lsp MCP entry to `--lang auto`; a host basedpyright presence/version check in the DoD; the live DoD = host review of one of the user's Python repos with semantic nav working (claude + codex per the §1 spike `{cwd}` outcome); full-branch review vs main before merge.
+First runs the relocated LIVE `{cwd}` codex gate (it needs the Task-4 binary's `--lang auto` + startup root/lang log, so it could not live in Task 1). Per **decision D2: if the gate finds codex `{cwd}` BROKEN, FU1 is MANDATORY C1 work — there is NO claude-only fallback.** Then wires the host reviewers' lsp entry to `--lang auto`; a host basedpyright presence/version check in the DoD; the live DoD = host review of one of the user's Python repos with semantic nav working, covering BOTH claude + codex; full-branch review vs main before merge.
 
 **Files:**
 - Modify: `examples/a2a-bridge.containerized.toml` (the two host reviewers' `lsp` entries — claude ~line 110, codex ~line 128)
-- Possibly Modify (FORK from Task 1): `bin/a2a-bridge/src/main.rs` (FU1 fix, ONLY if the spike found `{cwd}` broken for codex)
+- Modify (MANDATORY if the gate finds `{cwd}` broken for codex — D2): `bin/a2a-bridge/src/main.rs` (FU1 fix — thread per-request `session_cwd` into codex's `{cwd}`)
 
 **Steps:**
 
-- [ ] Apply the spike fork decision (from Task 1's verdict file). Read `docs/superpowers/spikes/2026-06-15-slice-c1-basedpyright-proof.md` Gate 4 verdict:
-  - If `{cwd}` resolved correctly for codex → wire BOTH reviewers + the live DoD covers both. Proceed to the next step.
-  - If `{cwd}` was broken (option A — fix FU1) → thread the per-request session_cwd to codex's `render_codex_mcp_args` `{cwd}`. The seam is already present: `acp_program_argv` (`bin/a2a-bridge/src/main.rs` ~line 121-162) takes `mcp_cwd` and passes it to `render_codex_mcp_args` (~line 140); the spawn site computes `resolve_static_session_cwd(entry.session_cwd, entry.cwd)` (~line 471) and the per-request stamp writes `entry.session_cwd` (~line 2081 for run-workflow, ~1613/~1899 for implement). Verify the run-workflow/serve path that drives the host reviewer actually stamps `session_cwd` BEFORE the spawn computes `mcp_cwd`; if a path doesn't, add the stamp there. Add/extend a unit test next to the existing `resolve_static_session_cwd` tests asserting the codex `{cwd}` resolves to the stamped session_cwd.
-  - If `{cwd}` was broken (option B — claude-only) → wire `--lang auto` for both entries (it's harmless for codex on Rust repos), but scope the live DoD to claude only and add a "FU1 fast-follow" note in this plan's Self-review + the commit message.
+- [ ] **RELOCATED LIVE `{cwd}` codex gate (the go/no-go; moved from Task 1, now runnable).** It runs HERE because `--lang auto` + the startup root/lang log only exist after Task 4. Build the release binary first (`cargo build --release -p lsp-mcp`; confirm `target/release/lsp-mcp --help` shows `--lang` default `auto` and `--python-path`). Then run the bridge's host **codex** reviewer against a Python repo via the per-request session-cwd:
+  ```
+  a2a-bridge run-workflow code-review --session-cwd ~/code/agent-eval \
+    --config <a host config whose codex `lsp` entry uses --lang auto>
+  ```
+  Inspect the lsp-mcp startup log (the `[lsp-mcp] root=… lang=…` line + the call-log) and confirm codex's lsp-mcp resolved its `--repo {cwd}` to **that Python repo** (startup log shows the target root + `lang=python`), NOT the bridge launch dir (which would `auto`→rust silently). Record the observed root + detected language into the spike verdict file's Gate-4 section. **This is the fork point for the rest of Task 9.**
+- [ ] **Apply the D2 fork from the gate result:**
+  - If `{cwd}` resolved correctly for codex → no FU1 needed; the live DoD below covers BOTH claude + codex. Skip to the wiring step.
+  - **If `{cwd}` was BROKEN for codex → FU1 is MANDATORY (D2 — NO claude-only fallback).** Fix it with a TDD step (failing test → fix → pass), threading the per-request `session_cwd` into codex's `render_codex_mcp_args` `{cwd}` at the SpawnFn boundary in `bin/a2a-bridge/src/main.rs`. The seam (verified against ground truth):
+    - the spawn site computes `resolve_static_session_cwd(entry.session_cwd.as_deref(), entry.cwd.as_deref())` (~line 470-471) → `cwd`;
+    - `acp_spawn_inputs` canonicalizes that `cwd` into `mcp_cwd` (~line 201) and feeds it to `acp_program_argv(entry, …, &mcp_cwd)` (~line 240, helper at ~line 121-162);
+    - `acp_program_argv` passes `mcp_cwd` to `render_codex_mcp_args(&entry.mcp, mcp_cwd)` (~line 140) — so codex's native `-c mcp_servers.*` `{cwd}` is substituted from `mcp_cwd`;
+    - the per-request `--session-cwd` is stamped into `entry.session_cwd` for run-workflow at ~line 2079-2083 (`for e in &mut snapshot.entries { e.session_cwd = Some(dir.clone()); }`) BEFORE the SpawnFn runs.
+    So for `run-workflow` the chain already threads the stamped `session_cwd` → `mcp_cwd` → codex `{cwd}`. **FU1's job is to (a) prove the live break's actual cause (the gate showed it broken at runtime even though the source chain looks correct — the memory records this disconnect is "unreadable from source"), and (b) ensure EVERY host-reviewer-driving path stamps `session_cwd` BEFORE `mcp_cwd` is computed.** Concretely:
+    1. **Failing test first:** next to the existing `resolve_static_session_cwd_chain`/`acp_program_argv_appends_codex_native_mcp_args` tests (~line 3704-3751), add `fn codex_mcp_cwd_uses_stamped_session_cwd()` that builds a codex `AgentEntry` with `mcp` set and `session_cwd = Some("/python/repo")`, runs the SAME resolution the spawn site does (`resolve_static_session_cwd(entry.session_cwd.as_deref(), entry.cwd.as_deref())` → canonicalize-or-passthrough → `acp_program_argv(&entry, None, &[], &mcp_cwd)`), and asserts the codex argv contains the `{cwd}`-substituted value `/python/repo` (NOT the launch dir). If the current code already passes this, the test still LOCKS the contract against regression; if the live break is in a path the test doesn't cover (e.g. the `serve`/`message/send` per-request stamp at the points where the host reviewer is actually driven), extend the test/fix to THAT path — add the missing `e.session_cwd = Some(dir)` stamp before the spawn computes `mcp_cwd` there.
+    2. **Fix:** add the missing per-request stamp (or correct the substitution) so the failing test passes.
+    3. **Re-run the live gate** from the previous step and confirm codex now logs `lang=python` + the correct root.
+  - There is NO option-B (claude-only) path. Remove any expectation of shipping the Python gate claude-only — D2 makes FU1 in-scope C1 work when the gate breaks.
 - [ ] Change the host reviewers' lsp entries to `--lang auto`. In `examples/a2a-bridge.containerized.toml`, for BOTH the `claude` agent's lsp entry (~line 110) and the `codex` agent's lsp entry (~line 128), change `"--lang", "rust"` → `"--lang", "auto"`. Leave the `impl` agent's in-container lsp entry (~line 176) as `"--lang", "rust"` (the container always passes explicit `--lang`; Python-in-container is Slice C2). Update the adjacent comment from "type-resolved semantic nav via rust-analyzer" to "type-resolved semantic nav via rust-analyzer (rust) or basedpyright (python), auto-detected per repo".
 - [ ] Mirror the change into `examples/a2a-bridge.containerized.podman.toml` (it has the same three `name = "lsp"` entries at ~108/126/176 — change the two HOST reviewer entries to `--lang auto`, leave the in-container `impl` one as `rust`).
-- [ ] Build the release binary the host config points at: `cargo build --release -p lsp-mcp` and confirm `target/release/lsp-mcp --help` shows the `--lang` default is `auto` and `--python-path` exists.
-- [ ] DoD presence check: run `basedpyright-langserver --version` on the host and record it (mirrors the Rust path's `rust-analyzer --version` precedent). If absent, `pip install basedpyright`.
-- [ ] LIVE DoD — host review of a Python repo with semantic nav. Pick one of `~/code/code-review-backtest`, `~/code/agent-eval`, `~/code/a2a-local-bridge` (whichever is a clean unambiguous Python repo). Run a host code-review through the bridge against it (e.g. `a2a-bridge run-workflow code-review --session-cwd <python-repo> --config examples/a2a-bridge.containerized.toml`) and confirm in the lsp-mcp call log that: (a) the startup line shows `lang=python` + the correct root, (b) at least one lsp tool call (e.g. `definition`/`hover`/`references`) returned semantic results. Scope to claude (and codex iff the Task-1 spike said `{cwd}` works for codex). Capture the evidence into the DoD notes (paste the relevant call-log lines into the commit message or a scratch note).
-- [ ] Run the full workspace test + lint floors to confirm no cross-crate regression: `cargo test -p lsp-mcp && cargo clippy -p lsp-mcp -- -D warnings && cargo fmt --check`. (lsp-mcp is the only crate touched; the workspace floors live in `ci.yml`.)
-- [ ] `git add examples/a2a-bridge.containerized.toml examples/a2a-bridge.containerized.podman.toml` (+ `bin/a2a-bridge/src/main.rs` if FU1 was fixed) `&& git commit -m "feat(lsp-mcp): host reviewers --lang auto + Python live DoD (Slice C1)"`
+- [ ] DoD basedpyright presence check: run `basedpyright-langserver --version` on the host and record it (mirrors the Rust path's `rust-analyzer --version` precedent). If absent, `pip install basedpyright`. Keep this presence/version check in the DoD.
+- [ ] **REQUIRED DoD gate (Codex#8): the Python 7-tool suite must actually RUN, not silently skip.** The `python_nav.rs` tests guard on basedpyright + the fixture venv via `ready()` (Task 7) — if either is absent, ALL Python tests skip and the suite false-greens. So the DoD MUST set up the fixture venv and RUN the suite, failing/flagging if absent. Explicit DoD commands:
+  ```
+  # 1. fixture venv (one-time; gitignored) — the explicit setup command:
+  python3 -m venv crates/lsp-mcp/tests/fixtures/pysample/.venv \
+    && crates/lsp-mcp/tests/fixtures/pysample/.venv/bin/pip install 'pydantic>=2'
+  # 2. presence gate (FAIL the DoD if missing — do NOT let the suite report green by skipping):
+  basedpyright-langserver --version || { echo "DoD FAIL: basedpyright absent"; exit 1; }
+  test -x crates/lsp-mcp/tests/fixtures/pysample/.venv/bin/python \
+    || { echo "DoD FAIL: fixture venv absent — python_nav would silently skip"; exit 1; }
+  # 3. run the Python suite (must execute the 7-tool + post-eviction tests, not skip):
+  cargo test -p lsp-mcp --test python_nav
+  ```
+  Confirm the run shows the Python tests EXECUTING (e.g. `document_symbols_extracts_class_and_method_recursively ... ok`, `post_eviction_still_resolves_third_party_def ... ok`) — not `0 passed; 0 failed` from blanket skips. Record the test output in the DoD notes.
+- [ ] LIVE DoD — host review of a Python repo with semantic nav, covering BOTH claude + codex. Pick one of `~/code/code-review-backtest`, `~/code/agent-eval`, `~/code/a2a-local-bridge` (whichever is a clean unambiguous Python repo). Run a host code-review through the bridge against it (`a2a-bridge run-workflow code-review --session-cwd <python-repo> --config examples/a2a-bridge.containerized.toml`) and confirm in the lsp-mcp call log that: (a) the startup line shows `lang=python` + the correct root, (b) at least one lsp tool call (e.g. `definition`/`hover`/`references`) returned semantic results. **The live DoD covers BOTH claude AND codex** (codex's `{cwd}` is correct either because the gate passed or because FU1 fixed it). Capture the evidence into the DoD notes (paste the relevant call-log lines into the commit message or a scratch note).
+- [ ] Run the full workspace test + lint floors to confirm no cross-crate regression: `cargo test -p lsp-mcp && cargo clippy -p lsp-mcp -- -D warnings && cargo fmt --check`. (lsp-mcp + possibly `bin/a2a-bridge` (FU1) are the only crates touched; the workspace floors live in `ci.yml`.)
+- [ ] `git add examples/a2a-bridge.containerized.toml examples/a2a-bridge.containerized.podman.toml` (+ `bin/a2a-bridge/src/main.rs` if FU1 was taken) `&& git commit -m "feat(lsp-mcp): host reviewers --lang auto + Python live DoD (claude+codex) (Slice C1)"`
 - [ ] Full-branch review vs main before merge: run the bridge's own review on the whole `feat/lsp-mcp-slice-c` diff (`git diff main...HEAD`) — host code-review + a clean-room design cross-check — and address any blockers. Then use superpowers:finishing-a-development-branch to decide merge/PR.
 
 ---
@@ -1256,12 +1518,13 @@ Set the host reviewers' lsp MCP entry to `--lang auto`; a host basedpyright pres
 
 | Spec § | Covered by |
 | --- | --- |
-| §1 `--lang auto` predicates (rust/python/tooling-only/`.py`-scan/ambiguous) | Task 4 (`detect_lang` + `tests/lang_detect.rs`) |
+| §1 `--lang auto` predicates (rust/python/tooling-only/`.py`-scan/ambiguous) | Task 4 (`detect_lang` + `tests/lang_detect.rs`); `has_real_pyproject` `dynamic` arm anchored to `starts_with("dynamic")` |
 | §1 startup LOGS resolved root + language | Task 4 (`eprintln!("[lsp-mcp] root=… lang=…")` in `run()`) |
 | §1 split `LspClient` from `LangServerConfig` | Task 3 |
+| §1/§2 `is_project_root` field added AND wired (explicit `--lang` validated before start) | Task 3 (field on `LangServerConfig` + rust predicate) + Task 4 (`run()` calls `(cfg.is_project_root)(repo)` for explicit `--lang`) + Task 6 (pyright predicate) |
 | §1 `Readiness` absorbs ONLY notification parsing; `id`-routing STAYS in `LspClient` | Task 3 (`Readiness::on_notification`; reader thread keeps the `if let Some(id)` route inline) |
 | §1 `Readiness::RustRa` wraps current logic unchanged | Task 3 (`RustReady` + `rust_ra_config`) + Task 2 characterization proving byte-for-byte |
-| §1 fake-LSP characterization HARNESS FIRST | Task 2 (green on current code, then re-asserted post-refactor) |
+| §1 fake-LSP characterization HARNESS FIRST (transition table + happy respawn) | Task 2 (green on current code, then re-asserted post-refactor); + Task 3 adds the GENUINE respawn-FAILURE + request-touch tests |
 | §1 `resolve_pos` duplicate-name fixture + documented degradation | Task 8 (`resolve_pos_handles_duplicate_name`, `models.py` duplicate `greet`) |
 | §1 recursive `document_symbols.children` REQUIRED (class→method) | Task 8 (`collect_doc_symbols` recursion + test) |
 | §1 `file://` URI round-trip fix | Task 5 |
@@ -1269,24 +1532,28 @@ Set the host reviewers' lsp MCP entry to `--lang auto`; a host basedpyright pres
 | §1 `hover` handles `MarkupContent` AND `MarkedString[]` non-empty | Task 8 (`hover` array arm + `hover_is_non_empty`) |
 | §2 server `basedpyright-langserver --stdio` | Task 6 (`pyright_config.program_argv`) |
 | §2 root markers | Task 4 (`python_markers`/`has_real_pyproject`) |
-| §2 interpreter discovery contract (5-step precedence + validate + warn) | Task 6 (`resolve_python_path` + tests) |
+| §2 interpreter discovery contract (5-step precedence + validate exists+executable + warn) | Task 6 (`resolve_python_path`→`PyResolve`; `is_usable_interpreter` checks mode&0o111; tests incl. `explicit_invalid_path_is_hard_error`, `nonexecutable_venv_python_is_not_usable`) |
+| §2 explicit invalid `--python-path`/env → HARD error (not silent `python3`) | Task 6 (`PyResolve::Hard` → `anyhow::bail!`; `python3`+warning is no-explicit-override only) |
 | §2 `--python-path`/`LSP_MCP_PYTHON_PATH` | Task 6 (`Cli.python_path` + env lookup) |
-| §2 `didChangeConfiguration { python.pythonPath }` delivery, no `workspace.configuration` | Task 6 (`post_init_config` + `configuration: false`) |
+| §2 `didChangeConfiguration` WRAPPED `{ settings:{ python:{ pythonPath } } }` delivery, no `workspace.configuration` | Task 6 (`post_init_config` wrapped envelope + `configuration: false`) — proven by Task 1 Gate 1a |
 | §2 respawn re-sends config + post-eviction resolution test | Task 7 (structural via Task 3's `handshake`-in-`respawn`; live guard test) |
-| §2 `Readiness::Pyright` `pyright/{begin,end}Progress` + no-progress settle (first call doesn't wait full bound) | Task 6 (`PyrightReady` + the `settle` branch in `wait_ready`) |
+| §2 `Readiness::Pyright` `pyright/{begin,end}Progress` + no-progress settle (first call doesn't wait full bound; settle timed from `settled_at`, not wait entry) | Task 6 (`PyrightReady.settled_at` + `settled_no_progress` in `wait_ready`) + automated pure test `pyright_no_progress_is_ready_after_settle_not_full_bound` |
 | §3 host reviewers' `--lang auto` entry | Task 9 |
 | §3 host basedpyright presence/version check in DoD | Task 9 |
-| §3 `{cwd}` asymmetry as a LIVE SPIKE GATE (not soft) | Task 1 Gate 4 + Task 9 fork |
-| §4.1 config-channel resolution (w/ + w/o repo override + no-venv fallback) | Task 1 Gates 1a/1b/1c |
-| §4.2 readiness spike | Task 1 Gate 2 |
-| §4.3 `--lang auto` detection spike | Task 1 Gate 3 |
-| §4.4 live `{cwd}` codex gate + go/no-go fork | Task 1 Gate 4 → Task 9 |
+| §3 Python 7-tool coverage as a REQUIRED DoD gate (fail if basedpyright/fixture-venv absent — no silent skip) | Task 9 (explicit fixture-venv setup + presence gate + `cargo test -p lsp-mcp --test python_nav`) |
+| §3 `{cwd}` asymmetry as a LIVE GATE (not soft); FU1 MANDATORY-if-broken (D2) | Task 9 first step (relocated live gate) + D2 fork (FU1 in-scope, no claude-only) |
+| §4.1 config-channel resolution (w/ + w/o repo override + no-venv fallback, WRAPPED envelope) | Task 1 Gates 1a/1b/1c |
+| §4.2 readiness + no-progress + begin-without-end spike | Task 1 Gate 2 |
+| §4.3 `--lang auto` detection LOGIC spike | Task 1 Gate 3 |
+| §4.4 live `{cwd}` codex gate + go/no-go fork | RELOCATED to Task 9 first step (needs the Task-4 binary) |
 | §4 spike verdict file | Task 1 |
 | Tests/regression: all 7 tools Python fixture | Task 8 |
 | Tests/regression: interpreter discovery | Task 6 |
 | Tests/regression: post-eviction Python resolution | Task 7 |
 | Tests/regression: URI round-trip | Task 5 |
 | Tests/regression: existing Rust tests stay green (FU3 behind `Readiness::RustRa`) | Task 2 + Task 3 (full-crate test gate each task) |
+| Tests/regression: Rust `document_symbols` additive nested-children LOCK | Task 8 (`rust_document_symbols_includes_nested_trait_method` guarded against the `sample` fixture) |
+| Tests/regression: automated no-progress settle (pure, not live) | Task 6 (`pyright_no_progress_is_ready_after_settle_not_full_bound`) |
 | Execution order (spike → characterization → refactor → Python config → wiring → full-branch review) | Tasks 1→9 in order |
 
 **Review must-fix coverage:**
@@ -1295,16 +1562,24 @@ Set the host reviewers' lsp MCP entry to `--lang auto`; a host basedpyright pres
 | --- | --- |
 | Respawn-config-resend pulled INTO C1 (was wrongly C2-deferred) | Task 7 (+ Task 3 making `respawn`→`handshake`→`post_init_config`) |
 | Explicit interpreter/venv discovery contract (not "auto-detected" prose) | Task 6 |
-| Broadened fake-LSP characterization harness (transition table + respawn ordering + no-post-init) | Task 2 |
-| Concrete `--lang auto` predicates (not prose) | Task 4 |
-| Required hierarchical `document_symbols` (not optional) | Task 8 |
+| Broadened fake-LSP characterization harness (transition table + request-touch + respawn ordering + no-post-init) | Task 2 (happy path) + Task 3 (GENUINE respawn-FAILURE→`evicted=true` via bogus `program_argv`; request-touch test) |
+| `testkit` compile bug (external `tests/` can't see `pub(crate)`; `pub use` of `pub(crate)` won't compile; no `testkit` module) | Task 2 + Task 3 (genuinely-`pub` items + `#[doc(hidden)] pub mod testkit`) |
+| `respawn_failure_leaves_evicted_true` was MISLABELED (asserted success) | Renamed to `respawn_success_clears_evicted` (Task 2); genuine failure test added (Task 3) |
+| Concrete `--lang auto` predicates (not prose); `dynamic` over-match | Task 4 (`detect_lang`; `dynamic` → `starts_with`) |
+| `is_project_root` add-AND-use (not a dead field) | Task 3 (add) + Task 4/Task 6 (wire in `run()`) |
+| Required hierarchical `document_symbols` (not optional); dup-name fixture false-green; Rust output NOT byte-compatible | Task 8 (recursion; fixture `greet` nested-ONLY + `module_greet` dup pair; guarded Rust nested-children lock + corrected wording) |
 | `Readiness` must NOT drag `id`-routing along | Task 3 (id-route stays inline in reader thread; only notifications delegate) |
-| Live `{cwd}` spike gate decides FU1 (unreadable from source) | Task 1 Gate 4 + Task 9 fork |
+| Live `{cwd}` gate decides FU1; FU1 MANDATORY-if-broken (D2) | Task 9 first step (relocated gate) + D2 fork (FU1 in-scope, TDD; no claude-only) |
 | URI builder asymmetry (encode vs decode) | Task 5 |
 | `references`/`implementations` descriptions are Rust-flavored, advertised to the agent | Task 8 |
 | `hover` must not silently return None on `MarkedString[]` | Task 8 |
-| No-venv → `python3` + LOGGED WARNING (not silent empty) | Task 6 (`warned` flag → `eprintln!` WARNING) |
+| Interpreter exec-validation (exists AND executable) + explicit-invalid HARD error | Task 6 (`is_usable_interpreter` mode&0o111; `PyResolve::Hard`→bail) |
+| Settle clock origin (was timed from `wait_ready` entry → begin-without-end paid full timeout) | Task 6 (`PyrightReady.settled_at` set at settings-applied; `settled_no_progress`) + pure test |
+| No-venv (no explicit override) → `python3` + LOGGED WARNING (not silent empty) | Task 6 (`PyResolve::Fallback` → `eprintln!` WARNING) |
+| Python 7-tool coverage must RUN in the DoD (no silent skip) | Task 9 (fixture-venv setup + presence gate + run `--test python_nav`) |
 
-**Open follow-ups (not C1):** FU1 (codex `{cwd}`) is fixed in Task 9 ONLY if the Task-1 spike found it broken AND chose option A; option B ships claude-only with FU1 as a fast-follow. All of Slice C2 (in-container Python implementor, per-language verify, uv warm) is explicitly deferred per the spec's C2 section.
+**Open follow-ups (not C1):** Per **decision D2**, FU1 (codex `{cwd}`) is **MANDATORY C1 work IF the Task-9 live gate finds codex `{cwd}` broken** — there is NO claude-only fallback. If the gate finds `{cwd}` already correct, no FU1 is needed and the live DoD covers both reviewers as-is. All of Slice C2 (in-container Python implementor, per-language verify, uv warm) is explicitly deferred per the spec's C2 section.
 
-**Placeholder scan:** No "TBD"/"similar to above"/"add error handling" placeholders. Three intentional, explicitly-flagged forward references: (1) Task 4's `Lang::Python` arm is a temporary `bail!` replaced in Task 6 (flagged inline); (2) Task 6's `didChangeConfiguration` payload shape is conditioned on the Task-1 spike transcript (flagged — ship only the proven form); (3) Task 7's `third_party_symbol` placeholder is replaced by `BaseModel` in Task 8 (flagged). Each is a real, named action — not a vague gap.
+**Harness scope (decision D1):** the readiness/respawn coverage uses **TARGETED fixes** — pure unit tests on the `Readiness` state machine + the no-progress settle, doc-hidden test wrappers to drive `respawn`/`evicted`, and a bogus-`program_argv` `LangServerConfig` to force a respawn failure — **NOT a full fake-rust-analyzer binary**.
+
+**Placeholder scan:** No "TBD"/"similar to above"/"add error handling" placeholders. Three intentional, explicitly-flagged forward references: (1) Task 4's `Lang::Python` arm is a temporary `bail!` replaced in Task 6 (flagged inline); (2) Task 7's `third_party_symbol` placeholder is replaced by `BaseModel` in Task 8 (flagged); (3) Task 9's FU1 fix is conditional on the live-gate result (D2 — mandatory if broken; the seam + TDD step are fully specified). The `didChangeConfiguration` payload is NO LONGER conditional — Task 1 proves and Task 6 ships the SAME wrapped `settings` envelope. Each forward reference is a real, named action — not a vague gap.
