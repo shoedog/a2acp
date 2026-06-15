@@ -498,6 +498,22 @@ mod tests {
     }
 
     #[test]
+    fn pyright_config_carries_resendable_post_init() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = pyright_config(d.path(), None).unwrap();
+        let (method, params) = cfg
+            .post_init_config
+            .expect("python MUST send post-init config");
+        assert_eq!(method, "workspace/didChangeConfiguration");
+        // The pythonPath key must be present (the venv that respawn re-applies).
+        let s = serde_json::to_string(&params).unwrap();
+        assert!(
+            s.contains("pythonPath"),
+            "post-init config must set pythonPath, got {s}"
+        );
+    }
+
+    #[test]
     fn rust_initialize_params_match_pinned_handshake() {
         let cfg = rust_ra_config(None);
         let p = (cfg.initialize_params)("file:///repo");
