@@ -1,7 +1,7 @@
 //! The per-language server registry: `LangServerConfig` parameterizes the language-agnostic `LspClient`.
 //! `Readiness` absorbs ONLY the reader-thread NOTIFICATION parsing (id-routing stays in LspClient).
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The language the shim drives. Chosen by `--lang` (explicit) or `detect_lang` (`--lang auto`).
@@ -263,6 +263,131 @@ pub fn rust_ra_config(target_cache: Option<&Path>) -> LangServerConfig {
     }
 }
 
+/// Validate a candidate interpreter exists AND is executable. A regular file alone is NOT enough — a
+/// non-executable path would make basedpyright fail to launch the interpreter at use-time (spec §2 says
+/// the chosen path is validated exists+executable before use). Unix: check the file mode's execute bits.
+fn is_usable_interpreter(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(p) {
+        Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
+/// Outcome of interpreter discovery. `Hard` = an EXPLICIT override (flag/env) that is missing or
+/// non-executable → the caller MUST `anyhow::bail!` (never silently fall back to `python3` — that would
+/// mask a typo and silently degrade third-party resolution). `Resolved(p)` = a usable venv interpreter.
+/// `Fallback` = no explicit override AND no venv found → caller uses `python3` on PATH + a LOGGED WARNING.
+pub enum PyResolve {
+    Resolved(PathBuf),
+    Fallback,
+    Hard(PathBuf),
+}
+
+/// Ordered interpreter discovery (spec §2). Precedence:
+/// (1) explicit flag / LSP_MCP_PYTHON_PATH — if INVALID (missing/non-executable) → `Hard` (caller bails);
+/// (2) $VIRTUAL_ENV/bin/python, (3) <repo>/.venv/bin/python, (4) <repo>/venv/bin/python — first usable wins;
+/// (5) none → `Fallback` (caller uses `python3` on PATH with a logged warning).
+/// NOTE: a bad EXPLICIT override is a HARD ERROR, NOT a silent `python3` fallback. The silent+warned
+/// `python3` fallback is ONLY the no-explicit-override / no-venv case.
+pub fn resolve_python_path(
+    repo: &Path,
+    explicit: Option<&Path>,
+    virtual_env: Option<&Path>,
+) -> PyResolve {
+    if let Some(p) = explicit {
+        // A RELATIVE explicit path must be resolved against `repo` (basedpyright is spawned with
+        // `current_dir(repo)` so it consumes `pythonPath` relative to the repo, not the process cwd).
+        // Join onto `repo` so validation and consumption agree; absolute paths pass through unchanged.
+        let resolved = if p.is_relative() {
+            repo.join(p)
+        } else {
+            p.to_path_buf()
+        };
+        return if is_usable_interpreter(&resolved) {
+            PyResolve::Resolved(resolved)
+        } else {
+            PyResolve::Hard(resolved) // bad explicit override → HARD ERROR (no silent fallback)
+        };
+    }
+    let candidates = [
+        virtual_env.map(|v| v.join("bin/python")),
+        Some(repo.join(".venv/bin/python")),
+        Some(repo.join("venv/bin/python")),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if is_usable_interpreter(&c) {
+            return PyResolve::Resolved(c);
+        }
+    }
+    PyResolve::Fallback // no venv found → python3 fallback (warned), only because there was no explicit override
+}
+
+/// Python / basedpyright config. Resolves the interpreter, advertises NO `window/workDoneProgress` (so the
+/// no-progress settle — not a progress cycle — is the readiness signal; Task-1 spike Gate 2), and sends the
+/// WRAPPED `didChangeConfiguration { settings: { python: { pythonPath } } }` envelope (spike Gate 1a).
+pub fn pyright_config(
+    repo: &Path,
+    explicit_python: Option<&Path>,
+) -> anyhow::Result<LangServerConfig> {
+    let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
+    let explicit = explicit_python
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("LSP_MCP_PYTHON_PATH").map(PathBuf::from));
+    let python_path = match resolve_python_path(repo, explicit.as_deref(), virtual_env.as_deref()) {
+        PyResolve::Resolved(p) => {
+            let s = p.display().to_string();
+            eprintln!("[lsp-mcp] python interpreter: {s}");
+            s
+        }
+        // An EXPLICIT --python-path / LSP_MCP_PYTHON_PATH that is missing or non-executable is a HARD ERROR:
+        // never silently fall back to `python3` (that would mask a typo and silently degrade resolution).
+        PyResolve::Hard(p) => anyhow::bail!(
+            "explicit python interpreter {:?} is missing or not executable — fix --python-path / \
+             LSP_MCP_PYTHON_PATH (no silent fallback to python3 for an explicit override)",
+            p
+        ),
+        // No explicit override AND no venv → degrade to `python3` on PATH with a LOGGED WARNING (stdlib
+        // still resolves; third-party may be incomplete; spike Gate 1c). This is the ONLY warned-fallback case.
+        PyResolve::Fallback => {
+            eprintln!(
+                "[lsp-mcp] WARNING: no venv interpreter found for {repo:?}; using `python3` on PATH — \
+                 third-party (site-packages) resolution may be incomplete. Pass --python-path to fix."
+            );
+            "python3".to_string()
+        }
+    };
+    // The LSP-standard WRAPPED `settings` envelope (spike Gate 1a) — the proven form that resolves
+    // third-party defs into the venv's site-packages. Do NOT regress to a bare `{ "python": {…} }` form.
+    let post = (
+        "workspace/didChangeConfiguration".to_string(),
+        json!({ "settings": { "python": { "pythonPath": python_path } } }),
+    );
+    Ok(LangServerConfig {
+        name: "basedpyright",
+        program_argv: vec!["basedpyright-langserver".to_string(), "--stdio".to_string()],
+        spawn_env: vec![],
+        // The Python root predicates (reuse the Task-4 detection helpers) — a setup.py/setup.cfg/
+        // requirements*.txt marker, a REAL pyproject section, or a shallow `.py` scan. `run()` validates an
+        // explicit `--lang python` against this before starting basedpyright.
+        is_project_root: Box::new(|root: &Path| {
+            python_markers(root) || has_real_pyproject(root) || shallow_py_scan(root)
+        }),
+        initialize_params: Box::new(|root_uri: &str| {
+            // Advertise NO window/workDoneProgress → readiness is reached via the no-progress settle, not a
+            // progress cycle (basedpyright emits no `pyright/*Progress` for typical analyses; spike Gate 2).
+            json!({
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "capabilities": { "workspace": { "symbol": {}, "configuration": false } },
+                "workspaceFolders": [{ "uri": root_uri, "name": "root" }],
+            })
+        }),
+        post_init_config: Some(post),
+        new_readiness: Box::new(|| Readiness::Pyright(PyrightReady::default())),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +443,57 @@ mod tests {
         assert!(
             !r.settled_no_progress(Duration::from_secs(1)),
             "begin seen suppresses the no-progress settle"
+        );
+    }
+
+    #[test]
+    fn pyright_no_progress_is_ready_after_settle_not_full_bound() {
+        let settle = Duration::from_millis(50);
+        // Simulate "settings applied, no progress notification arrives": settled_at = now, began = false.
+        let mut p = PyrightReady {
+            began: false,
+            active: 0,
+            settled_at: Some(Instant::now()),
+        };
+        // Immediately after settings applied (within the settle window): NOT yet ready, but also NOT a full
+        // timeout — the settle is timed from settled_at, not from any wait entry.
+        assert!(
+            !p.settled_no_progress(settle),
+            "not ready before the settle window elapses"
+        );
+        assert!(
+            !Readiness::Pyright(std::mem::take(&mut p)).is_ready(),
+            "no progress + no settle ⇒ is_ready() false"
+        );
+        // After the settle window with NO progress → ready (the first call returns fast, not at the full bound).
+        let p = PyrightReady {
+            began: false,
+            active: 0,
+            settled_at: Some(Instant::now() - Duration::from_millis(60)),
+        };
+        assert!(
+            p.settled_no_progress(settle),
+            "settle elapsed with no progress → ready (no full-bound wait)"
+        );
+        // settled_at = None (settings not yet applied) is never settle-ready.
+        let p = PyrightReady {
+            began: false,
+            active: 0,
+            settled_at: None,
+        };
+        assert!(
+            !p.settled_no_progress(settle),
+            "no settled_at (settings not applied) → not settle-ready"
+        );
+        // A begin-without-end does NOT settle (began == true) — documented begin-without-end ceiling.
+        let p = PyrightReady {
+            began: true,
+            active: 1,
+            settled_at: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(
+            !p.settled_no_progress(settle),
+            "begin seen ⇒ no no-progress settle (needs a matching end)"
         );
     }
 

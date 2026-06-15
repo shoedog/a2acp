@@ -20,6 +20,9 @@ pub struct Cli {
     /// Base dir for the per-repo shared build cache (CARGO_TARGET_DIR). Optional.
     #[arg(long)]
     pub target_cache: Option<PathBuf>,
+    /// Python interpreter for basedpyright's `pythonPath` (highest-precedence override). Also LSP_MCP_PYTHON_PATH.
+    #[arg(long)]
+    pub python_path: Option<PathBuf>,
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -47,9 +50,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             });
             crate::lang::rust_ra_config(target.as_deref())
         }
-        // TODO Task 6: replace with `crate::lang::pyright_config(&repo, cli.python_path.as_deref())?`
-        // (the basedpyright LangServerConfig + the `--python-path` Cli field both land in Task 6).
-        crate::lang::Lang::Python => anyhow::bail!("python not yet implemented"),
+        crate::lang::Lang::Python => {
+            crate::lang::pyright_config(&repo, cli.python_path.as_deref())?
+        }
     };
     // USE `is_project_root`: validate an EXPLICIT --lang against the repo (auto already validated above).
     if explicit && !(cfg.is_project_root)(&repo) {

@@ -22,7 +22,7 @@ pub fn should_evict(idle_secs: u64, timeout_secs: u64) -> bool {
 /// typical analysis (Task-1 spike), so readiness is reached by SETTLING — settings applied + this window
 /// elapsed with no progress seen. Independent OR-branch of `Readiness::is_ready`; only the Pyright variant
 /// is affected (RustRa's `settled_no_progress` equivalent never fires). Lands fully wired in Task 6.
-const PYRIGHT_SETTLE: Duration = Duration::from_millis(800);
+const PYRIGHT_SETTLE: Duration = Duration::from_millis(1500);
 
 /// LOAD-BEARING Pyright readiness branch, evaluated by `wait_ready` (it owns the runtime settle Duration
 /// that the pure `Readiness::is_ready` predicate can't carry). Returns true only for a `Pyright` machine
@@ -87,6 +87,10 @@ impl LspClient {
                         if let Some(tx) = pending.lock().unwrap().remove(&id) {
                             let _ = tx.send(msg);
                         }
+                        // A server-INITIATED request (has both `id` AND `method`, e.g. `workspace/configuration`)
+                        // that doesn't match a pending client id is intentionally DROPPED here. C1 declares
+                        // `configuration:false` in `initialize` so the server must not send it; revisit if a
+                        // future task must answer a server-initiated request.
                     } else if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
                         ready
                             .lock()
@@ -107,6 +111,14 @@ impl LspClient {
         self.notify("initialized", json!({}));
         if let Some((method, params)) = self.cfg.post_init_config.clone() {
             self.notify(&method, params);
+            // Stamp the settle-clock origin: settings are applied NOW. The Pyright no-progress settle is
+            // timed from `settled_at` (settings-applied), NOT from `wait_ready` entry (Opus H2) — so a
+            // begin-without-end server is ready ~settle after settings, never paying the full timeout. This
+            // is the LOAD-BEARING readiness path: basedpyright emits no `pyright/*Progress` for typical
+            // analyses (Task-1 spike Gate 2), so the settle — not a begin/end cycle — is what makes it ready.
+            if let crate::lang::Readiness::Pyright(s) = &mut *self.ready.lock().unwrap() {
+                s.settled_at = Some(Instant::now());
+            }
         }
         Ok(())
     }
