@@ -105,33 +105,48 @@ pub fn compose_container_rw(
 
 /// PURE+TOTAL. The `(program, argv)` for ONE verify command (Slice B2b-2). Reuses [`compose_sandbox`]
 /// (clone `mount=clone, access=Ro`, the cache volume appended) so egress / runtime / suffix derivation
-/// stay ONE source of truth. The command runs under `sh -c` with CARGO_HOME/CARGO_TARGET_DIR exported
-/// into the cache mount — so its exit code (read by the caller from the container) IS the command's
-/// verdict. NO creds: the only volumes are the `:ro` clone + the cache.
+/// stay ONE source of truth. The command runs under `sh -c` with the binding's env exported — so its
+/// exit code (read by the caller from the container) IS the command's verdict. NO creds: the only
+/// volumes are the `:ro` clone + the cache.
 pub fn compose_verify(
     runtime: Option<&str>,
     image: &str,
     egress: &EgressPolicy,
     clone: &crate::session_cwd::SessionCwd,
-    cache_vol: &str,
+    cache: &crate::profile::CacheBinding,
     command: &str,
 ) -> (String, Vec<String>) {
-    // `cd` the clone FIRST: compose_sandbox emits no --workdir (ACP cwd arrives via session/new), the
-    // reader base image sets WORKDIR /work, and verify is a bare `sh -c`. The clone is mounted identical-
-    // path, so `cd '<clone>'` lands in the repo. `&&` chains so a failed cd surfaces as a verify failure
-    // and the trailing `{command}`'s exit code is the script's exit (read by the caller from the container).
-    let script = format!(
-        "cd '{clone}' && export CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target && \
-         mkdir -p \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\" && {command}",
-        clone = clone.as_str(),
-    );
+    // Export the binding's env (each `K=V`), make the dirs it points at, then run the command. `cd` first
+    // (compose_sandbox emits no --workdir; the reader base sets WORKDIR /work). `&&` chains so a failed cd
+    // or export surfaces as a verify failure and the command's exit is the script's exit.
+    let exports = cache
+        .env
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mkdirs = cache
+        .env
+        .iter()
+        .map(|(k, _)| format!("\"${k}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Only emit the `export …/mkdir -p …` prefix when the binding HAS env — an empty binding would
+    // otherwise produce malformed `export  && mkdir -p  &&` (a future no-verify-env profile). For the
+    // rust binding (2 vars) this is byte-for-byte the old script.
+    let prefix = if cache.env.is_empty() {
+        String::new()
+    } else {
+        format!("export {exports} && mkdir -p {mkdirs} && ")
+    };
+    let script = format!("cd '{clone}' && {prefix}{command}", clone = clone.as_str(),);
     let sb = SandboxConfig {
         runtime: runtime.map(str::to_string),
         image: image.to_string(),
         mount: clone.as_str().to_string(),
         access: MountAccess::Ro,
         egress: egress.clone(),
-        volumes: vec![format!("{cache_vol}:/cache")],
+        volumes: cache.mounts.clone(),
     };
     compose_sandbox(&sb, "sh", &["-c".to_string(), script], &[])
 }
@@ -404,6 +419,7 @@ mod tests {
 
     #[test]
     fn compose_verify_ro_clone_plus_cache_reuses_compose_sandbox() {
+        use crate::profile::{rust_profile, CacheCtx};
         use crate::session_cwd::SessionCwd;
         let egress = EgressPolicy::Locked {
             network: "a2a-verify-egress".into(),
@@ -411,12 +427,14 @@ mod tests {
             no_proxy: None,
         };
         let clone = SessionCwd::parse("/Users/w/code/.a2a-implement/impl-1-ab").unwrap();
+        let binding =
+            rust_profile().cache_binding(CacheCtx::Verify, "", "a2a-verify-cache-deadbeef");
         let (prog, argv) = compose_verify(
             None,
             "a2a-toolchain:latest",
             &egress,
             &clone,
-            "a2a-verify-cache-deadbeef",
+            &binding,
             "cargo build --locked",
         );
         assert_eq!(prog, "docker");
@@ -452,17 +470,53 @@ mod tests {
 
     #[test]
     fn compose_verify_open_egress_has_no_network() {
+        use crate::profile::{rust_profile, CacheCtx};
         use crate::session_cwd::SessionCwd;
         let clone = SessionCwd::parse("/repo/clone").unwrap();
+        let binding = rust_profile().cache_binding(CacheCtx::Verify, "", "c");
         let (_p, argv) = compose_verify(
             Some("podman"),
             "img",
             &EgressPolicy::Open,
             &clone,
-            "c",
+            &binding,
             "cargo test --locked",
         );
         assert!(!argv.iter().any(|a| a == "--network"));
+    }
+
+    #[test]
+    fn compose_verify_via_binding_is_byte_for_byte() {
+        use crate::profile::{rust_profile, CacheCtx};
+        use crate::session_cwd::SessionCwd;
+        let clone = SessionCwd::parse("/Users/x/code/.a2a-implement/impl-1-abc").unwrap();
+        let egress = EgressPolicy::Locked {
+            network: "net".into(),
+            proxy: "http://p:8888".into(),
+            no_proxy: Some("localhost".into()),
+        };
+        let binding =
+            rust_profile().cache_binding(CacheCtx::Verify, "warmvol", "a2a-verify-cache-x");
+        let (prog, argv) = compose_verify(
+            None,
+            "img:latest",
+            &egress,
+            &clone,
+            &binding,
+            "cargo build --locked",
+        );
+        // EXACT byte-for-byte: pin the WHOLE script (a partial contains/starts/ends check would let a
+        // malformed `mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"` segment slip through).
+        assert_eq!(
+            argv.last().unwrap(),
+            "cd '/Users/x/code/.a2a-implement/impl-1-abc' && export CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target && mkdir -p \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\" && cargo build --locked"
+        );
+        // The cache mount comes from the binding.
+        assert!(
+            argv.iter().any(|a| a == "a2a-verify-cache-x:/cache"),
+            "{argv:?}"
+        );
+        let _ = prog;
     }
 
     #[test]

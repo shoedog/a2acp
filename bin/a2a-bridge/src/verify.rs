@@ -143,13 +143,18 @@ pub fn run_verify(
     max_bytes: usize,
 ) -> VerifyVerdict {
     let mut results = Vec::new();
+    let binding = bridge_core::profile::rust_profile().cache_binding(
+        bridge_core::profile::CacheCtx::Verify,
+        "",
+        cache_vol,
+    );
     for c in &cfg.commands {
         let (prog, argv) = bridge_core::sandbox::compose_verify(
             cfg.runtime.as_deref(),
             &cfg.image,
             &cfg.egress,
             clone,
-            cache_vol,
+            &binding,
             &c.cmd,
         );
         let (exit, out) = match runner(&prog, &argv) {
