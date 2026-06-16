@@ -23,6 +23,14 @@ pub struct CacheBinding {
     pub mounts: Vec<String>,
 }
 
+/// One verify command (the profile-owned analogue of the old `[[verify.commands]]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyCommand {
+    pub name: String,
+    pub cmd: String,
+    pub gate: bool,
+}
+
 /// A per-language profile (an ATOM — selected as a set; never per-combo; C2 §1). Step 1 carries only the
 /// fields the seam + warm-fetch consume; Step 2 extends it (verify commands, image override, config parse).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +50,10 @@ pub struct LanguageProfile {
     lsp_env: Vec<(String, String)>,
     /// Env exported in the Verify container.
     verify_env: Vec<(String, String)>,
+    /// Optional per-profile container image override (default: `[verify].image`).
+    pub image: Option<String>,
+    /// Per-profile verify commands (replaces the old top-level `[verify].commands`).
+    pub verify_commands: Vec<VerifyCommand>,
 }
 
 impl LanguageProfile {
@@ -64,6 +76,35 @@ impl LanguageProfile {
             },
         }
     }
+
+    /// Construct from config-parsed parts. The private cache/env fields make this the only way the
+    /// bin layer can build a profile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        id: String,
+        fetch_cmd: String,
+        warm_cache_base: String,
+        dep_cache_path: String,
+        verify_cache_path: String,
+        fetch_env: Vec<(String, String)>,
+        lsp_env: Vec<(String, String)>,
+        verify_env: Vec<(String, String)>,
+        image: Option<String>,
+        verify_commands: Vec<VerifyCommand>,
+    ) -> Self {
+        Self {
+            id,
+            fetch_cmd,
+            warm_cache_base,
+            dep_cache_path,
+            verify_cache_path,
+            fetch_env,
+            lsp_env,
+            verify_env,
+            image,
+            verify_commands,
+        }
+    }
 }
 
 /// The hardcoded Rust profile — reproduces today's three cargo sites exactly (Step 1).
@@ -79,6 +120,29 @@ pub fn rust_profile() -> LanguageProfile {
         verify_env: vec![
             ("CARGO_HOME".to_string(), "/cache/cargo".to_string()),
             ("CARGO_TARGET_DIR".to_string(), "/cache/target".to_string()),
+        ],
+        image: None,
+        verify_commands: vec![
+            VerifyCommand {
+                name: "fmt".into(),
+                cmd: "cargo fmt --all -- --check".into(),
+                gate: true,
+            },
+            VerifyCommand {
+                name: "clippy".into(),
+                cmd: "cargo clippy --all-targets --all-features --locked -- -D warnings".into(),
+                gate: true,
+            },
+            VerifyCommand {
+                name: "build".into(),
+                cmd: "cargo build --locked".into(),
+                gate: true,
+            },
+            VerifyCommand {
+                name: "test".into(),
+                cmd: "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants".into(),
+                gate: true,
+            },
         ],
     }
 }
@@ -125,5 +189,25 @@ mod tests {
     fn rust_fetch_cmd_is_cargo_fetch_locked() {
         assert_eq!(rust_profile().fetch_cmd, "cargo fetch --locked");
         assert_eq!(rust_profile().warm_cache_base, "a2a-impl-lsp-cache");
+    }
+
+    #[test]
+    fn rust_profile_carries_verify_commands_and_no_image_override() {
+        let p = rust_profile();
+        assert_eq!(
+            p.image, None,
+            "rust uses [verify].image (no per-profile override)"
+        );
+        let names: Vec<&str> = p.verify_commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["fmt", "clippy", "build", "test"]);
+        assert_eq!(p.verify_commands[0].cmd, "cargo fmt --all -- --check");
+        assert!(
+            p.verify_commands.iter().all(|c| c.gate),
+            "all default-gate true"
+        );
+        assert_eq!(
+            p.verify_commands[3].cmd,
+            "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants"
+        );
     }
 }
