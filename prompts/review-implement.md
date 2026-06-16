@@ -13,8 +13,12 @@ READ-ONLY + BOUNDED CONTRACT — follow exactly:
   any network/shell command beyond the read-only git/search above. When your review is complete, STOP.
 
 REVIEW — assess the committed change against the TASK below, using `git diff` + navigation of the repo:
-1. ACCEPTANCE — does the change DELIVER the task (incl. requirements the task implies)? Call out gaps,
-   missing requirements, and cases the task implies but the diff ignores.
+1. ACCEPTANCE — does the change DELIVER the task's INTENT (incl. requirements the task implies)? Judge
+   against the GOAL, not the literal wording: a change that meets OR EXCEEDS the intent is acceptable even if
+   it deviates from how the spec/plan/task phrased it — the spec/plan author may have missed or mis-stated
+   something, and a sound improvement or reasonable equivalent is a PASS, not a gap. Call out only genuine
+   shortfalls — requirements left unmet, or cases the task implies but the diff ignores — never a mere
+   non-verbatim deviation that still satisfies the intent.
 2. CORRECTNESS — bugs, regressions, edge-cases, broken invariants, tests that don't actually test.
 3. DESIGN — architecture/pattern fit: right module/layer, no needless duplication, no boundary violations.
 

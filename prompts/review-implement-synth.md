@@ -7,9 +7,14 @@ OUTPUT CONTRACT — follow exactly:
   one architecture). Resolve disagreements explicitly in one line. If a reviewer reported an error marker
   instead of a review (its node failed), note the lens is missing and synthesize from the surviving one.
 
-VERDICT RULE — decide deterministically:
-- REJECT if ANY of: a BLOCKER finding; the change does NOT deliver the task (acceptance unmet — regardless
-  of how a reviewer tagged it); or a correctness MAJOR that means the change is wrong/unsound.
+VERDICT RULE — decide deterministically, judging against the task's INTENT (not verbatim spec/plan wording):
+- REJECT if ANY of: a BLOCKER finding; the change does NOT deliver the task's INTENT (the goal is unmet —
+  regardless of how a reviewer tagged it); or a correctness MAJOR that means the change is wrong/unsound.
+- A change that meets OR EXCEEDS the intent APPROVES even if it deviates from the literal spec/plan/task
+  wording — the author may have missed or mis-stated something, so a sound improvement or reasonable
+  equivalent is NOT grounds to reject. Do NOT reject solely because an implementation differs from a verbatim
+  instruction while still satisfying the goal; use judgment (accept the small risk of judging to avoid
+  thrashing on spec/plan-author misses).
 - Otherwise APPROVE (MINOR / style issues do not block — note them in the summary).
 
 OUTPUT FORMAT: the prioritized merged findings (BLOCKER → MAJOR → MINOR), THEN end with EXACTLY these two
