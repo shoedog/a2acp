@@ -1747,18 +1747,33 @@ addr="127.0.0.1:8080"
 
     #[test]
     fn tracked_example_language_verify_commands_round_trip() {
-        let cases = [
+        // Pin the FULL (name, cmd, gate) per config — not just names — so a changed test flag, a dropped
+        // `--exclude`/`--skip`, or clippy re-added to slicing is caught (gpt-5.5 review MINOR).
+        let fmt = ("fmt", "cargo fmt --all -- --check", true);
+        let clippy = (
+            "clippy",
+            "cargo clippy --all-targets --all-features --locked -- -D warnings",
+            true,
+        );
+        let build = ("build", "cargo build --locked", true);
+        let bridge_test = (
+            "test",
+            "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants",
+            true,
+        );
+        let slicing_test = ("test", "cargo test --locked", true);
+        let cases: [(&str, Vec<(&str, &str, bool)>); 3] = [
             (
                 include_str!("../../../examples/a2a-bridge.containerized.toml"),
-                &["fmt", "clippy", "build", "test"][..],
+                vec![fmt, clippy, build, bridge_test],
             ),
             (
                 include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
-                &["fmt", "clippy", "build", "test"][..],
+                vec![fmt, clippy, build, bridge_test],
             ),
             (
                 include_str!("../../../examples/a2a-bridge.slicing-implement.toml"),
-                &["fmt", "build", "test"][..],
+                vec![fmt, build, slicing_test],
             ),
         ];
         for (raw, expected) in cases {
@@ -1767,12 +1782,12 @@ addr="127.0.0.1:8080"
                 .language_profiles()
                 .unwrap();
             let rust = profiles.iter().find(|p| p.id == "rust").unwrap();
-            let names: Vec<&str> = rust
+            let got: Vec<(&str, &str, bool)> = rust
                 .verify_commands
                 .iter()
-                .map(|c| c.name.as_str())
+                .map(|c| (c.name.as_str(), c.cmd.as_str(), c.gate))
                 .collect();
-            assert_eq!(names, expected);
+            assert_eq!(got, expected);
         }
     }
 
