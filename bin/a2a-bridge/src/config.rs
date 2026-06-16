@@ -1762,7 +1762,7 @@ addr="127.0.0.1:8080"
             true,
         );
         let slicing_test = ("test", "cargo test --locked", true);
-        let cases: [(&str, Vec<(&str, &str, bool)>); 3] = [
+        let cases = [
             (
                 include_str!("../../../examples/a2a-bridge.containerized.toml"),
                 vec![fmt, clippy, build, bridge_test],
