@@ -198,16 +198,20 @@ mod tests {
             p.image, None,
             "rust uses [verify].image (no per-profile override)"
         );
-        let names: Vec<&str> = p.verify_commands.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["fmt", "clippy", "build", "test"]);
-        assert_eq!(p.verify_commands[0].cmd, "cargo fmt --all -- --check");
-        assert!(
-            p.verify_commands.iter().all(|c| c.gate),
-            "all default-gate true"
-        );
+        // Pin the WHOLE list by value + order (name, cmd, gate) so a changed clippy/build/test/fmt
+        // command — not just the endpoints — is caught.
         assert_eq!(
-            p.verify_commands[3].cmd,
-            "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants"
+            p.verify_commands,
+            vec![
+                VerifyCommand { name: "fmt".into(), cmd: "cargo fmt --all -- --check".into(), gate: true },
+                VerifyCommand { name: "clippy".into(), cmd: "cargo clippy --all-targets --all-features --locked -- -D warnings".into(), gate: true },
+                VerifyCommand { name: "build".into(), cmd: "cargo build --locked".into(), gate: true },
+                VerifyCommand {
+                    name: "test".into(),
+                    cmd: "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants".into(),
+                    gate: true,
+                },
+            ]
         );
     }
 }
