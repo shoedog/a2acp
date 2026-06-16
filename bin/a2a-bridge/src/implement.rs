@@ -74,10 +74,11 @@ pub fn compose_warm_fetch(
     runtime: &str,
     image: &str,
     clone: &str,
-    cache_vol: &str,
+    cache: &bridge_core::profile::CacheBinding,
+    fetch_cmd: &str,
     e: &WarmEgress,
 ) -> (String, Vec<String>) {
-    let argv = vec![
+    let mut argv = vec![
         "run".into(),
         "--rm".into(),
         "--network".into(),
@@ -86,20 +87,24 @@ pub fn compose_warm_fetch(
         format!("HTTPS_PROXY={}", e.proxy),
         "-e".into(),
         format!("HTTP_PROXY={}", e.proxy),
-        "-e".into(),
-        "CARGO_HOME=/cargo".into(),
-        "-v".into(),
-        format!("{clone}:/work"),
-        "-v".into(),
-        format!("{cache_vol}:/cargo"),
-        "--workdir".into(),
-        "/work".into(),
-        "--entrypoint".into(),
-        "bash".into(),
-        image.into(),
-        "-c".into(),
-        "cargo fetch --locked".into(),
     ];
+    for (k, v) in &cache.env {
+        argv.push("-e".into());
+        argv.push(format!("{k}={v}"));
+    }
+    argv.push("-v".into());
+    argv.push(format!("{clone}:/work"));
+    for m in &cache.mounts {
+        argv.push("-v".into());
+        argv.push(m.clone());
+    }
+    argv.push("--workdir".into());
+    argv.push("/work".into());
+    argv.push("--entrypoint".into());
+    argv.push("bash".into());
+    argv.push(image.into());
+    argv.push("-c".into());
+    argv.push(fetch_cmd.to_string());
     (runtime.to_string(), argv)
 }
 
@@ -512,13 +517,20 @@ mod tests {
 
     #[test]
     fn warm_lsp_fetch_argv_uses_egress_offline_false_and_cache_mount() {
-        // compose_warm_fetch(runtime, image, clone, cache_vol, egress) -> (program, argv) for
+        // compose_warm_fetch(runtime, image, clone, cache, fetch_cmd, egress) -> (program, argv) for
         // `<runtime> run ... <image> cargo fetch --locked`. Runtime+image come from [verify] (podman parity).
+        let p = bridge_core::profile::rust_profile();
+        let binding = p.cache_binding(
+            bridge_core::profile::CacheCtx::Fetch,
+            "a2a-impl-lsp-cache-deadbeef",
+            "",
+        );
         let (program, argv) = compose_warm_fetch(
             "podman",
             "a2a-toolchain:latest",
             "/clones/x",
-            "a2a-impl-lsp-cache-deadbeef",
+            &binding,
+            &p.fetch_cmd,
             &WarmEgress {
                 network: "a2a-verify-egress".into(),
                 proxy: "http://a2a-verify-proxy:8888".into(),
@@ -541,6 +553,49 @@ mod tests {
             !joined.contains("auth.json"),
             "warm fetch must mount NO creds"
         );
+    }
+
+    #[test]
+    fn compose_warm_fetch_via_binding_is_byte_for_byte() {
+        use bridge_core::profile::{rust_profile, CacheCtx};
+        let p = rust_profile();
+        let binding = p.cache_binding(CacheCtx::Fetch, "warmvol", "");
+        let e = WarmEgress {
+            network: "net".into(),
+            proxy: "http://p:8888".into(),
+        };
+        let (prog, argv) =
+            compose_warm_fetch("docker", "img:latest", "/clone", &binding, &p.fetch_cmd, &e);
+        assert_eq!(prog, "docker");
+        // EXACT byte-for-byte: pin the WHOLE argv (order + content) so a positional drift can't slip
+        // through (the env -e's land AFTER the proxy -e's and BEFORE the clone -v, then the cache -v).
+        let expected: Vec<String> = [
+            "run",
+            "--rm",
+            "--network",
+            "net",
+            "-e",
+            "HTTPS_PROXY=http://p:8888",
+            "-e",
+            "HTTP_PROXY=http://p:8888",
+            "-e",
+            "CARGO_HOME=/cargo",
+            "-v",
+            "/clone:/work",
+            "-v",
+            "warmvol:/cargo",
+            "--workdir",
+            "/work",
+            "--entrypoint",
+            "bash",
+            "img:latest",
+            "-c",
+            "cargo fetch --locked",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(argv, expected);
     }
 
     #[test]

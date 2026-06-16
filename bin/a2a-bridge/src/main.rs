@@ -889,16 +889,24 @@ fn warm_lsp_deps_step(
     // bounded to one volume per repo. Keying on the per-run quarantine `clone` (a fresh nonce each run)
     // would never reuse the "warmed" deps AND orphan a GB-scale named volume every run (review BLOCKER).
     let repo_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-    let cache_vol = verify::cache_volume_name("a2a-impl-lsp-cache", &repo_canon.to_string_lossy());
+    let p = bridge_core::profile::rust_profile();
+    let cache_vol = verify::cache_volume_name(&p.warm_cache_base, &repo_canon.to_string_lossy());
     // The fetch still runs IN the clone (its Cargo.lock == the source repo's at base_ref).
     let clone_canon = std::fs::canonicalize(clone).unwrap_or_else(|_| clone.to_path_buf());
     let clone_canon = clone_canon.to_string_lossy();
     let egress = implement::WarmEgress { network, proxy };
+    let binding = p.cache_binding(bridge_core::profile::CacheCtx::Fetch, &cache_vol, "");
     // Honor the [verify] runtime+image so the warm fetch tracks the same runtime as the rest of the
     // pipeline (the shipped podman config sets runtime="podman"; hardcoding docker silently degraded it).
     let runtime = vcfg.runtime.as_deref().unwrap_or("docker");
-    let (program, argv) =
-        implement::compose_warm_fetch(runtime, &vcfg.image, &clone_canon, &cache_vol, &egress);
+    let (program, argv) = implement::compose_warm_fetch(
+        runtime,
+        &vcfg.image,
+        &clone_canon,
+        &binding,
+        &p.fetch_cmd,
+        &egress,
+    );
     eprintln!("[implement] lsp warm-deps: fetching deps into {cache_vol}");
     match verify::docker_runner(&program, &argv) {
         Ok((0, _)) => {
