@@ -1,0 +1,34 @@
+# LSP-MCP Go plan — per-task dogfood review. codex gpt-5.5 xhigh, host-RO, prism + lsp MCP nav.
+# The reviewer reads the diff range named in the prompt (git diff, host read-only) and navigates the
+# repo structurally (prism) + type-resolved (lsp). Rewrite prompts/lsp-go-review.md with the task's diff
+# range + spec before each run. Run (per task):
+#   ./target/release/a2a-bridge run-workflow lsp-go-review --input /dev/null \
+#     --session-cwd /Users/wesleyjinks/code/a2a-bridge \
+#     --config examples/a2a-bridge.lsp-go-review.toml --out /tmp/lsp-go-review.md
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+[[agents.mcp]]
+name = "lsp"
+command = "/Users/wesleyjinks/code/a2a-bridge/target/release/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/Users/wesleyjinks/.local/share/a2a/lsp-target-cache"]
+
+[[workflows]]
+id = "lsp-go-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/lsp-go-review.md"
+inputs = []
+
+[server]
+addr = "127.0.0.1:8080"

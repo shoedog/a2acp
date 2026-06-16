@@ -1,0 +1,34 @@
+# Task-6 LIVE DoD: prove the HOST reviewer lsp path serves a Go repo (--lang auto → gopls) with working
+# semantic nav. Mirrors the containerized.toml codex host reviewer EXACTLY (codex gpt-5.5, host read-only,
+# prism + lsp --lang auto) + adds LSP_MCP_LOG so the call log gives definitive evidence (lang=go + tool
+# results). Run: a2a-bridge run-workflow go-dod --input /dev/null --session-cwd /tmp/dod-go-uuid \
+#   --config examples/a2a-bridge.lsp-go-dod.toml --out /tmp/lsp-go-dod.md
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[agents.mcp]]
+name = "prism"
+command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
+args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
+[[agents.mcp]]
+name = "lsp"
+command = "/Users/wesleyjinks/code/a2a-bridge/target/release/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/Users/wesleyjinks/.local/share/a2a/lsp-target-cache"]
+[[agents.mcp.env]]
+name = "LSP_MCP_LOG"
+value = "/tmp/lsp-go-dod-calls.log"
+
+[[workflows]]
+id = "go-dod"
+[[workflows.nodes]]
+id = "nav"
+agent = "codex"
+prompt_file = "../prompts/lsp-go-dod.md"
+inputs = []
+
+[server]
+addr = "127.0.0.1:8080"
