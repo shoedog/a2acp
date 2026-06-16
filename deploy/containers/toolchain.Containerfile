@@ -46,3 +46,19 @@ RUN rustup component add rust-analyzer rust-src
 # L3 Slice B: the in-container lsp-mcp shim (built in the lspbuild stage), delivered to the impl agent
 # via CodexNative (`-c mcp_servers.lsp.command=/usr/local/bin/lsp-mcp`).
 COPY --from=lspbuild /lsp-mcp /usr/local/bin/lsp-mcp
+
+# C2a Step 2b: Go toolchain + gopls so the impl agent can edit/build/test Go, the bridge can run a
+# deterministic Go verify, and gopls runs in-container for live nav. Pinned for reproducibility; its own
+# layer so the slow Rust layers above stay cached. GOTOOLCHAIN=local prevents per-repo toolchain drift.
+ENV GO_VERSION=1.23.4
+RUN curl --proto '=https' --tlsv1.2 -sSfL "https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" \
+      -o /tmp/go.tgz \
+ && tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:/root/go/bin:$PATH GOTOOLCHAIN=local
+RUN go install golang.org/x/tools/gopls@v0.17.1
+# Symlink into /usr/local/bin (on EVERY shell's PATH, login + non-login) so the impl agent's go calls
+# and gopls resolve even under a login shell that resets PATH via /etc/profile (the ENV PATH above only
+# covers non-login execs like the bridge verify).
+RUN ln -sf /usr/local/go/bin/go /usr/local/bin/go \
+ && ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
+ && ln -sf /root/go/bin/gopls /usr/local/bin/gopls

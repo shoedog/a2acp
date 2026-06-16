@@ -1,5 +1,10 @@
-# Verify-only egress: the cargo registries + GitHub for git deps. Anchored ERE, default-deny.
+# Verify-only egress: the cargo registries + GitHub for git deps, plus Go module hosts. Anchored ERE,
+# default-deny.
 # `(^|\.)crates\.io$` already covers index.crates.io (sparse index) + static.crates.io (downloads);
-# `(^|\.)github\.com$` already covers codeload.github.com (git-dep tarballs). Two lines, no redundancy.
+# `(^|\.)github\.com$` already covers codeload.github.com (git-dep tarballs).
+# C2a Step 2b — Go: `(^|\.)golang\.org$` covers proxy.golang.org (GOPROXY) + sum.golang.org (checksum db);
+# `(^|\.)storage\.googleapis\.com$` covers the default GOPROXY's module blob redirects.
 (^|\.)crates\.io$
 (^|\.)github\.com$
+(^|\.)golang\.org$
+(^|\.)storage\.googleapis\.com$
