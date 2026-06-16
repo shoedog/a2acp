@@ -1,0 +1,2 @@
+# Go build cache / vendored deps not committed; deps are fetched via `go mod download`.
+/vendor/
