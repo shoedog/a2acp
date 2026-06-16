@@ -102,7 +102,7 @@ model = "sonnet"   # reviewer pinned to Sonnet 4.6 (dogfood)
 name = "prism"
 command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
 args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
-# lsp (L3): type-resolved semantic nav via rust-analyzer (rust) or basedpyright (python), auto-detected per repo — the complement to prism's structural graph.
+# lsp (L3): type-resolved semantic nav via rust-analyzer (rust), basedpyright (python), or gopls (go), auto-detected per repo — the complement to prism's structural graph.
 # --target-cache keys a per-repo CARGO_TARGET_DIR by origin → ~0.7s warm index across clones. See lsp-nav skill.
 [[agents.mcp]]
 name = "lsp"
@@ -120,7 +120,7 @@ args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
 name = "prism"
 command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
 args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/prism-cache-host"]
-# lsp (L3): type-resolved semantic nav via rust-analyzer (rust) or basedpyright (python), auto-detected per repo — the complement to prism's structural graph.
+# lsp (L3): type-resolved semantic nav via rust-analyzer (rust), basedpyright (python), or gopls (go), auto-detected per repo — the complement to prism's structural graph.
 # --target-cache keys a per-repo CARGO_TARGET_DIR by origin → ~0.7s warm index across clones. See lsp-nav skill.
 [[agents.mcp]]
 name = "lsp"
