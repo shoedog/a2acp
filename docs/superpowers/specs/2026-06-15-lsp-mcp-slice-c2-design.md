@@ -24,7 +24,9 @@ A **combined Rust+Go toolchain image** + **config-driven per-language profiles**
 2. **Select** the `[[languages]]` profile whose `id` equals the detected `Lang::as_str()`.
 3. **Run** that profile's fetch/verify commands + per-context env + cache mounts (below), in the profile's image (default `[verify].image`), and spawn the impl agent's in-container lsp as `--lang auto`.
 
-Language knowledge lives in **config**, not Rust branches — the next language is a profile + an image. The Rust changes are: the `lsp-mcp` dep + typed detection, profile parsing/selection, and threading the selected profile through **three** cache/env sites (§3).
+**Profiles are per-language ATOMS, selected as a SET — never per-combo.** `[[languages]]` defines one profile per language (`rust`, `go`, …); the selection for a repo is the *set* of detected languages (`detect_repo_langs -> Vec<LangRoot>`). A "Rust+Go" repo is the set `{rust, go}` → apply the **union** of the `rust` and `go` bindings; there is NEVER a `rust+go` profile (that path is 2^N — combinatorial and untenable). "None/n/a" is the **empty set** (no profile applied; `--lang none` forces it) — not a profile. **C2a/C2b gate the selection to ≤1** (single-language-per-cwd; `>1` → refuse, narrow `--repo`); **C2c lifts the gate and iterates the set** (union of per-profile bindings + per-service verify + multi-root LSP). The gate is a restriction, not a model limit — so C2c is purely additive. Because the `cache_binding` seam (§2.2) is per-profile, "apply a set" = "apply each member"; C2a applies the one.
+
+Language knowledge lives in **config**, not Rust branches — the next language is a profile + an image. The Rust changes are: the `lsp-mcp` dep + typed detection, profile parsing/selection, and routing all cache/env through the **single seam** (§2.2) the profile drives.
 
 ## §2. Config surface — `[verify]` (infra) + `[[languages]]` (per-language)
 
@@ -125,7 +127,7 @@ The per-turn `ContainerRw` path runs the `impl` agent per turn; the `--lang auto
 
 ## §5. C2c — multi-language-within-one-cwd (DEFERRED, designed-for)
 
-Out of scope; the seam extends: `detect_repo_langs` returns the FULL set → C2c consumes all. **Per-service verify:** map the diff's changed files to their nearest language-root, run each touched root's profile verify in its subdir. **Multi-root LSP nav:** the hard part — `lsp-mcp --lang auto` is single-root and refuses multi-marker roots; subdir-rooted/multi-root nav (`--project-root`, concurrent language servers) is the lsp-mcp deferral folded in here. **Warm:** warm each language's cache. C2a/C2b only ensure `detect_repo_langs` returns a set and selection is keyed by `id`.
+Out of scope; **additive on the locked-in model** — C2c just **lifts the ≤1 gate** and applies the **union of per-profile bindings** over the full `detect_repo_langs` set (no new profile model, no per-combo profiles). **Warm:** warm each selected language's cache (iterate the set through the same `cache_binding`/`Fetch` seam). **Per-service verify:** map the diff's changed files to their nearest language-root, run each touched root's profile verify in its subdir. **Multi-root LSP nav:** the only genuinely-hard part — `lsp-mcp --lang auto` is single-root and refuses multi-marker roots; subdir-rooted/multi-root nav (`--project-root`, concurrent language servers) is the lsp-mcp deferral folded in here. C2a/C2b only ensure `detect_repo_langs` returns a set, selection is keyed by `id`, and the seam is per-profile.
 
 ## §6. Image strategy
 
