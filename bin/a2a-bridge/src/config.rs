@@ -112,6 +112,8 @@ pub struct RegistryConfig {
     pub store: Option<StoreConfig>,
     #[serde(default)]
     pub workflows: Vec<WorkflowToml>,
+    #[serde(default)]
+    pub languages: Vec<LanguageToml>,
     /// Global root path that gates which per-request cwds are allowed (later tasks).
     /// Absent → no global root restriction.
     #[serde(default)]
@@ -363,13 +365,27 @@ fn default_gate() -> bool {
     true
 }
 
-/// One verify command: `gate=false` is reported but never fails the verdict (e.g. coverage).
 #[derive(Debug, serde::Deserialize)]
-pub struct VerifyCommandToml {
+pub struct LanguageVerifyToml {
     pub name: String,
     pub cmd: String,
     #[serde(default = "default_gate")]
     pub gate: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LanguageToml {
+    pub id: String,
+    pub fetch: String,
+    pub fetch_env: Option<std::collections::BTreeMap<String, String>>,
+    pub warm_cache: String,
+    pub dep_cache_path: String,
+    pub verify_cache_path: String,
+    pub lsp_env: Option<std::collections::BTreeMap<String, String>>,
+    pub verify_env: Option<std::collections::BTreeMap<String, String>>,
+    pub image: Option<String>,
+    #[serde(default)]
+    pub verify: Vec<LanguageVerifyToml>,
 }
 
 /// `[verify]` (Slice B2b-2): the build+test verify the `implement` subcommand runs after the commit.
@@ -387,49 +403,28 @@ pub struct VerifyToml {
     pub proxy: Option<String>,
     #[serde(default)]
     pub no_proxy: Option<String>,
-    #[serde(default)]
-    pub commands: Vec<VerifyCommandToml>,
+    /// REMOVED — moved to `[[languages.verify]]`. Kept ONLY to reject legacy configs loudly
+    /// (no deny_unknown_fields). `Option<toml::Value>` detects PRESENCE without reading any fields.
+    pub commands: Option<toml::Value>,
 }
 
-/// Parsed `[verify]`: structured commands + a validated egress policy.
+/// Parsed `[verify]`: verify infrastructure + a validated egress policy.
 #[derive(Debug, Clone)]
 pub struct VerifyConfig {
     pub runtime: Option<String>,
     pub image: String,
     pub cache: String,
     pub egress: bridge_core::domain::EgressPolicy,
-    pub commands: Vec<VerifyCommand>,
-}
-
-#[derive(Debug, Clone)]
-pub struct VerifyCommand {
-    pub name: String,
-    pub cmd: String,
-    pub gate: bool,
 }
 
 impl VerifyToml {
     pub fn to_config(&self) -> Result<VerifyConfig, ConfigError> {
-        if self.commands.is_empty() {
-            return Err(ConfigError::Registry(
-                "[verify] needs at least one command".into(),
-            ));
-        }
         let egress = parse_egress_fields(&self.egress, &self.network, &self.proxy, &self.no_proxy)?;
         Ok(VerifyConfig {
             runtime: self.runtime.clone(),
             image: self.image.clone(),
             cache: self.cache.clone(),
             egress,
-            commands: self
-                .commands
-                .iter()
-                .map(|c| VerifyCommand {
-                    name: c.name.clone(),
-                    cmd: c.cmd.clone(),
-                    gate: c.gate,
-                })
-                .collect(),
         })
     }
 }
@@ -789,7 +784,23 @@ impl RegistryConfig {
             d.peer_url = expand_env(&d.peer_url)?;
             d.auth = expand_env(&d.auth)?;
         }
+        if let Some(v) = &cfg.verify {
+            if v.commands.is_some() {
+                return Err(ConfigError::Registry(
+                    "[verify].commands / [[verify.commands]] is removed — move them to [[languages.verify]]".into(),
+                ));
+            }
+        }
         Ok(cfg)
+    }
+
+    pub fn language_profiles(
+        &self,
+    ) -> Result<Vec<bridge_core::profile::LanguageProfile>, ConfigError> {
+        self.languages
+            .iter()
+            .map(LanguageToml::to_profile)
+            .collect()
     }
 
     /// Parse each `[[workflows]]` entry: load prompt files from `base`, cross-check
@@ -1008,6 +1019,42 @@ impl RegistryConfig {
     }
 }
 
+impl LanguageToml {
+    pub fn to_profile(&self) -> Result<bridge_core::profile::LanguageProfile, ConfigError> {
+        if self.verify.is_empty() {
+            return Err(ConfigError::Registry(format!(
+                "[[languages]] id={:?} needs at least one [[languages.verify]] command",
+                self.id
+            )));
+        }
+        Ok(bridge_core::profile::LanguageProfile::from_parts(
+            self.id.clone(),
+            self.fetch.clone(),
+            self.warm_cache.clone(),
+            self.dep_cache_path.clone(),
+            self.verify_cache_path.clone(),
+            map_pairs(&self.fetch_env),
+            map_pairs(&self.lsp_env),
+            map_pairs(&self.verify_env),
+            self.image.clone(),
+            self.verify
+                .iter()
+                .map(|v| bridge_core::profile::VerifyCommand {
+                    name: v.name.clone(),
+                    cmd: v.cmd.clone(),
+                    gate: v.gate,
+                })
+                .collect(),
+        ))
+    }
+}
+
+fn map_pairs(m: &Option<std::collections::BTreeMap<String, String>>) -> Vec<(String, String)> {
+    m.as_ref()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
+}
+
 /// Parse an effort-level string into the `Effort` enum.
 /// Valid inputs: "minimal", "low", "medium", "high", "xhigh", "max" (case-insensitive).
 fn parse_effort(s: &str) -> Result<Effort, ConfigError> {
@@ -1198,11 +1245,6 @@ mod tests {
             image: "img".into(),
             cache: "c".into(),
             egress: bridge_core::domain::EgressPolicy::Open,
-            commands: vec![VerifyCommand {
-                name: "t".into(),
-                cmd: "true".into(),
-                gate: true,
-            }],
         }
     }
 
@@ -1241,12 +1283,10 @@ mod tests {
 
     #[test]
     fn gate_preserves_prior_error() {
-        let prior = Err(ConfigError::Registry(
-            "[verify] needs at least one command".into(),
-        ));
+        let prior = Err(ConfigError::Registry("prior config error".into()));
         let out = gate_verify_runtime(Some(prior), &["podman".to_string()]);
         assert!(
-            matches!(out, Some(Err(ConfigError::Registry(m))) if m.contains("at least one command"))
+            matches!(out, Some(Err(ConfigError::Registry(m))) if m.contains("prior config error"))
         );
     }
 
@@ -1603,10 +1643,16 @@ addr="127.0.0.1:8080"
             egress = "locked"
             network = "a2a-verify-egress"
             proxy = "http://a2a-verify-proxy:8888"
-            [[verify.commands]]
+            [[languages]]
+            id = "rust"
+            fetch = "cargo fetch --locked"
+            warm_cache = "a2a-impl-lsp-cache"
+            dep_cache_path = "/cargo"
+            verify_cache_path = "/cache"
+            [[languages.verify]]
             name = "fmt"
             cmd = "cargo fmt --all -- --check"
-            [[verify.commands]]
+            [[languages.verify]]
             name = "test"
             cmd = "cargo test --locked"
             gate = false
@@ -1620,10 +1666,13 @@ addr="127.0.0.1:8080"
             v.egress,
             bridge_core::domain::EgressPolicy::Locked { .. }
         ));
-        assert_eq!(v.commands.len(), 2);
-        assert_eq!(v.commands[0].name, "fmt");
-        assert!(v.commands[0].gate); // gate defaults to true
-        assert!(!v.commands[1].gate); // explicit gate=false
+        let profiles = c.language_profiles().unwrap();
+        assert_eq!(profiles.len(), 1);
+        let commands = &profiles[0].verify_commands;
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].name, "fmt");
+        assert!(commands[0].gate); // gate defaults to true
+        assert!(!commands[1].gate); // explicit gate=false
     }
 
     #[test]
@@ -1641,9 +1690,6 @@ addr="127.0.0.1:8080"
             cache = "c"
             egress = "locked"
             proxy = "http://p:8888"
-            [[verify.commands]]
-            name = "t"
-            cmd = "cargo test"
             "#,
         )
         .unwrap();
@@ -1652,8 +1698,8 @@ addr="127.0.0.1:8080"
     }
 
     #[test]
-    fn verify_config_rejects_empty_commands() {
-        let c = RegistryConfig::parse(
+    fn legacy_verify_commands_is_rejected() {
+        let e = RegistryConfig::parse(
             r#"
             default = "x"
             [server]
@@ -1665,11 +1711,69 @@ addr="127.0.0.1:8080"
             image = "i"
             cache = "c"
             egress = "open"
+            [[verify.commands]]
+            name = "t"
+            cmd = "cargo test"
+            "#,
+        )
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("verify.commands"));
+        assert!(msg.contains("languages"));
+    }
+
+    #[test]
+    fn profile_needs_at_least_one_verify_command() {
+        let c = RegistryConfig::parse(
+            r#"
+            default = "x"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "x"
+            cmd = "echo"
+            [[languages]]
+            id = "rust"
+            fetch = "cargo fetch --locked"
+            warm_cache = "a2a-impl-lsp-cache"
+            dep_cache_path = "/cargo"
+            verify_cache_path = "/cache"
             "#,
         )
         .unwrap();
-        let e = c.verify.as_ref().unwrap().to_config().unwrap_err();
-        assert!(format!("{e:?}").contains("at least one command"));
+        let e = c.language_profiles().unwrap_err();
+        assert!(e.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn tracked_example_language_verify_commands_round_trip() {
+        let cases = [
+            (
+                include_str!("../../../examples/a2a-bridge.containerized.toml"),
+                &["fmt", "clippy", "build", "test"][..],
+            ),
+            (
+                include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
+                &["fmt", "clippy", "build", "test"][..],
+            ),
+            (
+                include_str!("../../../examples/a2a-bridge.slicing-implement.toml"),
+                &["fmt", "build", "test"][..],
+            ),
+        ];
+        for (raw, expected) in cases {
+            let profiles = RegistryConfig::parse(raw)
+                .unwrap()
+                .language_profiles()
+                .unwrap();
+            let rust = profiles.iter().find(|p| p.id == "rust").unwrap();
+            let names: Vec<&str> = rust
+                .verify_commands
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            assert_eq!(names, expected);
+        }
     }
 
     #[test]

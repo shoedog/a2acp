@@ -137,21 +137,19 @@ pub type Runner<'a> = dyn Fn(&str, &[String]) -> std::io::Result<(i32, String)> 
 /// container's exit code. Stops at the FIRST gate failure. Pure given an injected `runner`.
 pub fn run_verify(
     cfg: &VerifyConfig,
+    profile: &bridge_core::profile::LanguageProfile,
     clone: &bridge_core::SessionCwd,
     cache_vol: &str,
     runner: &Runner,
     max_bytes: usize,
 ) -> VerifyVerdict {
     let mut results = Vec::new();
-    let binding = bridge_core::profile::rust_profile().cache_binding(
-        bridge_core::profile::CacheCtx::Verify,
-        "",
-        cache_vol,
-    );
-    for c in &cfg.commands {
+    let binding = profile.cache_binding(bridge_core::profile::CacheCtx::Verify, "", cache_vol);
+    let image = profile.image.as_deref().unwrap_or(&cfg.image);
+    for c in &profile.verify_commands {
         let (prog, argv) = bridge_core::sandbox::compose_verify(
             cfg.runtime.as_deref(),
-            &cfg.image,
+            image,
             &cfg.egress,
             clone,
             &binding,
@@ -323,23 +321,40 @@ mod tests {
         assert!(failure_digest(&v, 4096).contains("(no output)"));
     }
 
-    use crate::config::VerifyCommand;
-
-    fn cfg(cmds: &[(&str, bool)]) -> VerifyConfig {
+    fn cfg() -> VerifyConfig {
         VerifyConfig {
             runtime: None,
             image: "img".into(),
             cache: "cache".into(),
             egress: bridge_core::domain::EgressPolicy::Open,
-            commands: cmds
-                .iter()
-                .map(|(c, gate)| VerifyCommand {
+        }
+    }
+
+    fn profile(
+        cmds: &[(&str, bool)],
+        image: Option<&str>,
+    ) -> bridge_core::profile::LanguageProfile {
+        bridge_core::profile::LanguageProfile::from_parts(
+            "rust".into(),
+            "cargo fetch --locked".into(),
+            "a2a-impl-lsp-cache".into(),
+            "/cargo".into(),
+            "/cache".into(),
+            vec![("CARGO_HOME".into(), "/cargo".into())],
+            Vec::new(),
+            vec![
+                ("CARGO_HOME".into(), "/cache/cargo".into()),
+                ("CARGO_TARGET_DIR".into(), "/cache/target".into()),
+            ],
+            image.map(str::to_string),
+            cmds.iter()
+                .map(|(c, gate)| bridge_core::profile::VerifyCommand {
                     name: (*c).into(),
                     cmd: format!("cargo {c}"),
                     gate: *gate,
                 })
                 .collect(),
-        }
+        )
     }
 
     #[test]
@@ -355,12 +370,16 @@ mod tests {
             }
         };
         let v = run_verify(
-            &cfg(&[
-                ("fmt", true),
-                ("clippy", true),
-                ("build", true),
-                ("test", true),
-            ]),
+            &cfg(),
+            &profile(
+                &[
+                    ("fmt", true),
+                    ("clippy", true),
+                    ("build", true),
+                    ("test", true),
+                ],
+                None,
+            ),
             &clone,
             "cache-x",
             &runner,
@@ -386,7 +405,8 @@ mod tests {
             }
         };
         let v = run_verify(
-            &cfg(&[("coverage", false), ("test", true)]),
+            &cfg(),
+            &profile(&[("coverage", false), ("test", true)], None),
             &clone,
             "cache-x",
             &runner,
@@ -404,8 +424,46 @@ mod tests {
         let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
             Err(std::io::Error::other("docker missing"))
         };
-        let v = run_verify(&cfg(&[("build", true)]), &clone, "cache-x", &runner, 4096);
+        let v = run_verify(
+            &cfg(),
+            &profile(&[("build", true)], None),
+            &clone,
+            "cache-x",
+            &runner,
+            4096,
+        );
         assert!(!v.passed);
         assert!(v.results[0].output.contains("docker missing"));
+    }
+
+    #[test]
+    fn run_verify_uses_profile_image_override_or_falls_back_to_verify_image() {
+        let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let runner = |_p: &str, argv: &[String]| -> std::io::Result<(i32, String)> {
+            seen.borrow_mut().push(argv.to_vec());
+            Ok((0, "ok".into()))
+        };
+
+        let _ = run_verify(
+            &cfg(),
+            &profile(&[("test", true)], Some("override:img")),
+            &clone,
+            "cache-x",
+            &runner,
+            4096,
+        );
+        let _ = run_verify(
+            &cfg(),
+            &profile(&[("test", true)], None),
+            &clone,
+            "cache-x",
+            &runner,
+            4096,
+        );
+
+        let seen = seen.borrow();
+        assert!(seen[0].iter().any(|a| a == "override:img"));
+        assert!(seen[1].iter().any(|a| a == "img"));
     }
 }

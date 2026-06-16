@@ -59,16 +59,25 @@ proxy    = "http://a2a-verify-proxy:8888"
 # NO_PROXY=localhost so `cargo test`'s local HTTP servers (wiremock etc.) aren't hijacked by the cargo-
 # fetch proxy. Without it, any test that binds 127.0.0.1 spuriously fails verify (live-gate finding).
 no_proxy = "localhost,127.0.0.1"
-[[verify.commands]]
+
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "a2a-impl-lsp-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/cache"
+fetch_env = { CARGO_HOME = "/cargo" }
+verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target" }
+[[languages.verify]]
 name = "fmt"
 cmd  = "cargo fmt --all -- --check"
-[[verify.commands]]
+[[languages.verify]]
 name = "clippy"
 cmd  = "cargo clippy --all-targets --all-features --locked -- -D warnings"
-[[verify.commands]]
+[[languages.verify]]
 name = "build"
 cmd  = "cargo build --locked"
-[[verify.commands]]
+[[languages.verify]]
 name = "test"
 # A HERMETIC verify can't run this repo's SYSTEM-INTEGRATION tests — they need host capabilities the
 # bare container lacks (dogfood finding). CI runs the full suite post-merge; the pre-merge verify covers
@@ -79,7 +88,7 @@ name = "test"
 #     and a host-visible process table (container PID namespace breaks the grandchild-visibility precondition).
 cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants"
 # opt-in coverage (instrumented recompile; reported, never gates):
-# [[verify.commands]]
+# [[languages.verify]]
 # name = "coverage"
 # cmd  = "cargo llvm-cov --workspace --locked --summary-only"
 # gate = false

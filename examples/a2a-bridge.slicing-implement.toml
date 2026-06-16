@@ -43,17 +43,26 @@ proxy    = "http://a2a-verify-proxy:8888"
 no_proxy = "localhost,127.0.0.1"
 # SLICING repo verify gates. No clippy gate: this repo is not clippy-`-D warnings` clean, and gating on
 # it would send the fix loop chasing pre-existing warnings. fmt + build + full test suite is the contract.
-[[verify.commands]]
+
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "a2a-impl-lsp-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/cache"
+fetch_env = { CARGO_HOME = "/cargo" }
+verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target" }
+[[languages.verify]]
 name = "fmt"
 cmd  = "cargo fmt --all -- --check"
-[[verify.commands]]
+[[languages.verify]]
 name = "build"
 cmd  = "cargo build --locked"
-[[verify.commands]]
+[[languages.verify]]
 name = "test"
 cmd  = "cargo test --locked"
 # opt-in coverage (instrumented recompile; reported, never gates):
-# [[verify.commands]]
+# [[languages.verify]]
 # name = "coverage"
 # cmd  = "cargo llvm-cov --workspace --locked --summary-only"
 # gate = false

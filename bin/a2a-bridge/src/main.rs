@@ -815,10 +815,20 @@ fn resolve_impl_identity(
     Ok(entry)
 }
 
+fn pick_rust_profile(
+    cfg: &config::RegistryConfig,
+) -> Result<bridge_core::profile::LanguageProfile, config::ConfigError> {
+    cfg.language_profiles()?
+        .into_iter()
+        .find(|p| p.id == "rust")
+        .ok_or_else(|| config::ConfigError::Registry("no [[languages]] id=\"rust\" profile".into()))
+}
+
 /// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
 /// fails (a runner error becomes a failed result); a config error reduces to `ConfigError`.
 fn run_verify_step(
     verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    profile: &bridge_core::profile::LanguageProfile,
     clone_cwd: &bridge_core::SessionCwd,
     repo: &std::path::Path,
 ) -> verify::VerifyOutcome {
@@ -831,13 +841,15 @@ fn run_verify_step(
         Some(Ok(vcfg)) => {
             let repo_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
             let cache_vol = verify::cache_volume_name(&vcfg.cache, &repo_canon.to_string_lossy());
+            let image = profile.image.as_deref().unwrap_or(&vcfg.image);
             eprintln!(
                 "[implement] verify: running {} command(s) in {}",
-                vcfg.commands.len(),
-                vcfg.image
+                profile.verify_commands.len(),
+                image
             );
             let verdict = verify::run_verify(
                 vcfg,
+                profile,
                 clone_cwd,
                 &cache_vol,
                 &verify::docker_runner,
@@ -857,6 +869,7 @@ fn run_verify_step(
 /// in-container nav but never block the implement flow. Returns the cache name on success for later mounts.
 fn warm_lsp_deps_step(
     verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    profile: &bridge_core::profile::LanguageProfile,
     repo: &std::path::Path,
     clone: &std::path::Path,
 ) -> Option<String> {
@@ -889,22 +902,23 @@ fn warm_lsp_deps_step(
     // bounded to one volume per repo. Keying on the per-run quarantine `clone` (a fresh nonce each run)
     // would never reuse the "warmed" deps AND orphan a GB-scale named volume every run (review BLOCKER).
     let repo_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-    let p = bridge_core::profile::rust_profile();
-    let cache_vol = verify::cache_volume_name(&p.warm_cache_base, &repo_canon.to_string_lossy());
+    let cache_vol =
+        verify::cache_volume_name(&profile.warm_cache_base, &repo_canon.to_string_lossy());
     // The fetch still runs IN the clone (its Cargo.lock == the source repo's at base_ref).
     let clone_canon = std::fs::canonicalize(clone).unwrap_or_else(|_| clone.to_path_buf());
     let clone_canon = clone_canon.to_string_lossy();
     let egress = implement::WarmEgress { network, proxy };
-    let binding = p.cache_binding(bridge_core::profile::CacheCtx::Fetch, &cache_vol, "");
+    let binding = profile.cache_binding(bridge_core::profile::CacheCtx::Fetch, &cache_vol, "");
     // Honor the [verify] runtime+image so the warm fetch tracks the same runtime as the rest of the
     // pipeline (the shipped podman config sets runtime="podman"; hardcoding docker silently degraded it).
     let runtime = vcfg.runtime.as_deref().unwrap_or("docker");
+    let image = profile.image.as_deref().unwrap_or(&vcfg.image);
     let (program, argv) = implement::compose_warm_fetch(
         runtime,
-        &vcfg.image,
+        image,
         &clone_canon,
         &binding,
-        &p.fetch_cmd,
+        &profile.fetch_cmd,
         &egress,
     );
     eprintln!("[implement] lsp warm-deps: fetching deps into {cache_vol}");
@@ -1196,6 +1210,7 @@ async fn run_review_step(
 /// lifetime; `fix` is only called when `fix_graph` is `Some` (the loop guards with `fix_available`).
 struct ProdEffects<'a> {
     verify_cfg: &'a Option<Result<config::VerifyConfig, config::ConfigError>>,
+    profile: &'a bridge_core::profile::LanguageProfile,
     review_cfg: &'a Option<Result<config::ReviewConfig, config::ConfigError>>,
     wf_map: &'a std::collections::HashMap<
         bridge_core::ids::WorkflowId,
@@ -1219,7 +1234,7 @@ struct ProdEffects<'a> {
 #[async_trait::async_trait]
 impl tweak::TweakEffects for ProdEffects<'_> {
     async fn verify(&mut self, _attempt: u32) -> verify::VerifyOutcome {
-        run_verify_step(self.verify_cfg, self.clone_cwd, self.repo)
+        run_verify_step(self.verify_cfg, self.profile, self.clone_cwd, self.repo)
     }
     async fn review(&mut self, attempt: u32, head_sha: &str) -> (review::ReviewOutcome, String) {
         run_review_step(
@@ -1292,6 +1307,7 @@ async fn build_warm_impl(
     task_id: &str,
     session_suffix: Option<&str>,
     impl_lsp_cache_vol: Option<&str>,
+    profile: &bridge_core::profile::LanguageProfile,
     repo: &std::path::Path,
 ) -> Result<WarmImpl, BoxError> {
     let impl_entry =
@@ -1313,11 +1329,7 @@ async fn build_warm_impl(
     let impl_lsp_target_vol =
         verify::cache_volume_name("a2a-impl-lsp-target", &target_canon.to_string_lossy());
     if let Some(cache) = impl_lsp_cache_vol {
-        let lsp = bridge_core::profile::rust_profile().cache_binding(
-            bridge_core::profile::CacheCtx::Lsp,
-            cache,
-            "",
-        );
+        let lsp = profile.cache_binding(bridge_core::profile::CacheCtx::Lsp, cache, "");
         ccfg.sandbox.volumes.extend(lsp.mounts);
     }
     ccfg.sandbox
@@ -1380,6 +1392,7 @@ async fn run_warm_loop(
     impl_session: &bridge_core::ids::SessionId,
     clone_cwd: &bridge_core::SessionCwd,
     verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    profile: &bridge_core::profile::LanguageProfile,
     review_cfg: &Option<Result<config::ReviewConfig, config::ConfigError>>,
     wf_map: &std::collections::HashMap<
         bridge_core::ids::WorkflowId,
@@ -1393,6 +1406,7 @@ async fn run_warm_loop(
     let final_ = {
         let mut effects = ProdEffects {
             verify_cfg,
+            profile,
             review_cfg,
             wf_map,
             executor,
@@ -1606,6 +1620,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let fix_graph = wf_map.get(&loop_cfg.fix_workflow).cloned();
     // B2b-2: parse [verify] NOW, before into_snapshot moves cfg. Owned + Clone, survives the move.
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
+    let profile =
+        pick_rust_profile(&cfg).map_err(|e| format!("implement: language profile: {e}"))?;
     // B2b-3a: parsed pre-commit (beside verify).
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
     // ADR-0027: parsed pre-move (--merge sugar).
@@ -1662,7 +1678,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         instance_id: instance_id.clone(),
     };
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &repo, &clone);
+    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &profile, &repo, &clone);
 
     // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
     // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
@@ -1679,6 +1695,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         &task_id,
         None,
         impl_lsp_cache_vol.as_deref(),
+        &profile,
         &repo,
     )
     .await?;
@@ -1815,6 +1832,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 &impl_session,
                 &clone_cwd,
                 &verify_cfg,
+                &profile,
                 &review_cfg,
                 &wf_map,
                 &executor,
@@ -1900,6 +1918,8 @@ async fn implement_resume_cmd(
     })?;
     let fix_graph = wf_map.get(&fix_wf_id).cloned();
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
+    let profile = pick_rust_profile(&cfg)
+        .map_err(|e| format!("implement --resume: language profile: {e}"))?;
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
     let mut snapshot = cfg
@@ -1940,7 +1960,7 @@ async fn implement_resume_cmd(
     };
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &ck.source_repo, &clone);
+    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &profile, &ck.source_repo, &clone);
     let suffix = format!("r{}", implement::nonce(6));
     let warm_impl = build_warm_impl(
         &graph,
@@ -1953,6 +1973,7 @@ async fn implement_resume_cmd(
         &ck.task_id,
         Some(&suffix),
         impl_lsp_cache_vol.as_deref(),
+        &profile,
         &ck.source_repo,
     )
     .await?;
@@ -2024,6 +2045,7 @@ async fn implement_resume_cmd(
         &impl_session,
         &clone_cwd,
         &verify_cfg,
+        &profile,
         &review_cfg,
         &wf_map,
         &executor,
@@ -4035,12 +4057,19 @@ egress = "open"
 image = "img"
 cache = "c"
 egress = "open"
-[[verify.commands]]
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "a2a-impl-lsp-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/cache"
+[[languages.verify]]
 name = "t"
 cmd = "true"
 "#;
         let cfg = config::RegistryConfig::parse(toml).expect("parses");
         let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
+        let profile = pick_rust_profile(&cfg).expect("rust profile");
         let snapshot = cfg.into_snapshot().expect("snapshots");
         assert!(
             snapshot.allowed_cmds.iter().any(|c| c == "podman")
@@ -4050,6 +4079,7 @@ cmd = "true"
         let gated = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
         let outcome = run_verify_step(
             &gated,
+            &profile,
             &bridge_core::SessionCwd::parse("/tmp").unwrap(),
             std::path::Path::new("/tmp"),
         );
