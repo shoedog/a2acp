@@ -25,3 +25,9 @@ func (e En) Greet() string { // method side of the duplicate `Greet`
 func NewID() string {
 	return uuid.New().String()
 }
+
+// Double calls Add — gives call_hierarchy(Add, incoming) a real caller to find (else the test could
+// always-empty-pass). Appended at the END so the line numbers the other tests assert stay stable.
+func Double(x int) int {
+	return Add(x, x)
+}

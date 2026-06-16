@@ -233,13 +233,21 @@ fn implementations_of_interface() {
 }
 
 #[test]
-fn call_hierarchy_does_not_error() {
+fn call_hierarchy_finds_incoming_caller() {
     if !ready() {
         eprintln!("skip");
         return;
     }
     let mut s = start();
     s.ensure_ready(Duration::from_secs(60)).unwrap();
-    let _calls = s.call_hierarchy("Add", true).unwrap(); // incoming callers, must not error
+    // `Double` calls `Add` (fixture) — incoming call hierarchy must surface that caller, not merely
+    // "no error" (Add with no callers would always-empty-pass and prove nothing about result parsing).
+    let calls = s.call_hierarchy("Add", true).unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|h| h.signature.as_deref() == Some("Double")),
+        "call_hierarchy(Add, incoming) must find caller Double, got {calls:?}"
+    );
     s.shutdown();
 }

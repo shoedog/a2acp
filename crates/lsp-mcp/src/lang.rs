@@ -460,7 +460,13 @@ fn go_env_bin(var: &str) -> Option<PathBuf> {
 fn resolve_lsp_server(name: &str) -> String {
     let path = std::env::var("PATH").ok();
     let home = std::env::var("HOME").ok();
-    let go = go_bin_candidates();
+    // The Go toolchain dirs are only relevant for gopls. Building them shells `go env GOPATH`/`GOROOT`, so
+    // gate on the name — resolving rust-analyzer / basedpyright must NOT spawn those Go subprocesses.
+    let go = if name == "gopls" {
+        go_bin_candidates()
+    } else {
+        Vec::new()
+    };
     let resolved = resolve_lsp_server_with_env(name, path.as_deref(), home.as_deref(), &go);
     // Log a hint when resolution falls back to the bare name (binary not found in any search location).
     if resolved == name && !name.contains(std::path::MAIN_SEPARATOR) {
