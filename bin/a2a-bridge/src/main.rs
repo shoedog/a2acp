@@ -1313,7 +1313,12 @@ async fn build_warm_impl(
     let impl_lsp_target_vol =
         verify::cache_volume_name("a2a-impl-lsp-target", &target_canon.to_string_lossy());
     if let Some(cache) = impl_lsp_cache_vol {
-        ccfg.sandbox.volumes.push(format!("{cache}:/cargo:ro"));
+        let lsp = bridge_core::profile::rust_profile().cache_binding(
+            bridge_core::profile::CacheCtx::Lsp,
+            cache,
+            "",
+        );
+        ccfg.sandbox.volumes.extend(lsp.mounts);
     }
     ccfg.sandbox
         .volumes
