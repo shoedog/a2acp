@@ -2261,6 +2261,22 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .cloned()
         .ok_or_else(|| format!("run-workflow: unknown workflow {workflow_id:?}"))?;
 
+    // #1d: warm the in-container LSP dep cache up front for container_rw agents. run-workflow targets ONE
+    // repo (the stamped --session-cwd), so the profile + warm are resolved once and applied to every
+    // container_rw entry. Best-effort: any failure degrades to no in-container nav (Part A reports it).
+    let verify_cfg_raw = cfg.verify.as_ref().map(|t| t.to_config());
+    let warm_repo: Option<std::path::PathBuf> = session_cwd.as_ref().map(std::path::PathBuf::from);
+    let warm_profile = match warm_repo.as_ref() {
+        Some(repo) => match select_profile(&cfg, &LangArg::Auto, repo) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[run-workflow] lsp warm: language detect skipped: {e:?}");
+                None
+            }
+        },
+        None => None,
+    };
+
     // Build the registry + executor using the same SpawnFn the server uses.
     let mut snapshot = cfg
         .into_snapshot()
@@ -2274,6 +2290,30 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     if let Some(ref dir) = session_cwd {
         for e in &mut snapshot.entries {
             e.session_cwd = Some(dir.clone());
+        }
+    }
+    let has_container_rw = snapshot
+        .entries
+        .iter()
+        .any(|e| e.kind == bridge_core::domain::AgentKind::ContainerRw);
+    if has_container_rw {
+        if let (Some(repo), Some(p)) = (warm_repo.as_ref(), warm_profile.as_ref()) {
+            let verify_cfg = config::gate_verify_runtime(verify_cfg_raw, &snapshot.allowed_cmds);
+            // read_only=true: the per-turn "clone" is the user's REAL repo — never mutate it.
+            let warm_vol = warm_lsp_deps_step(&verify_cfg, Some(p), repo, repo, true);
+            for e in &mut snapshot.entries {
+                if e.kind == bridge_core::domain::AgentKind::ContainerRw {
+                    if let Some(sb) = e.sandbox.as_mut() {
+                        apply_warm_lsp(
+                            &mut e.mcp,
+                            &mut sb.volumes,
+                            Some(p),
+                            warm_vol.as_deref(),
+                            repo,
+                        );
+                    }
+                }
+            }
         }
     }
     // Canonical config path: the owner token must match between the sweeps and the spawn factory.
