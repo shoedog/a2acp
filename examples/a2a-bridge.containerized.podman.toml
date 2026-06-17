@@ -209,12 +209,6 @@ name = "lsp"
 command = "/usr/local/bin/lsp-mcp"
 args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/lsp-target"]
 [[agents.mcp.env]]
-name = "CARGO_HOME"
-value = "/cargo"
-[[agents.mcp.env]]
-name = "CARGO_NET_OFFLINE"
-value = "true"
-[[agents.mcp.env]]
 name = "LSP_MCP_LOG"
 value = "{cwd}/.git/a2a-bridge/lsp-mcp-calls.log"
 

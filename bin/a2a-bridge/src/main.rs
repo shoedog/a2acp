@@ -1365,6 +1365,27 @@ impl resilient::WarmRebuild for ContainerWarmRebuild {
     }
 }
 
+/// Merge `env` (the selected profile's Lsp env) onto the impl agent's `lsp` MCP server spec.
+/// Profile values WIN over any same-key config value.
+/// Other specs (e.g. prism) are untouched. No-op if there is no `lsp` spec.
+fn apply_lsp_env(specs: &mut [bridge_core::mcp::McpServerSpec], env: &[(String, String)]) {
+    if let Some(lsp) = specs.iter_mut().find(|s| s.name == "lsp") {
+        for (k, v) in env {
+            if let Some(entry) = lsp.env.iter_mut().find(|(ek, _)| ek == k) {
+                entry.1 = v.clone();
+            } else {
+                lsp.env.push((k.clone(), v.clone()));
+            }
+        }
+    }
+}
+
+/// Remove the `lsp` MCP server spec entirely (for `--lang none`: bare run, no in-container nav).
+/// Other specs are untouched.
+fn drop_lsp(specs: &mut Vec<bridge_core::mcp::McpServerSpec>) {
+    specs.retain(|s| s.name != "lsp");
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_warm_impl(
     graph: &bridge_workflow::graph::WorkflowGraph,
@@ -1398,10 +1419,23 @@ async fn build_warm_impl(
     let target_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let impl_lsp_target_vol =
         verify::cache_volume_name("a2a-impl-lsp-target", &target_canon.to_string_lossy());
-    if let Some(cache) = impl_lsp_cache_vol {
-        if let Some(p) = profile {
-            let lsp = p.cache_binding(bridge_core::profile::CacheCtx::Lsp, cache, "");
-            ccfg.sandbox.volumes.extend(lsp.mounts);
+    match profile {
+        None => {
+            // --lang none: bare run, no in-container language server
+            drop_lsp(&mut ccfg.mcp);
+        }
+        Some(p) => {
+            // ENV: always inject the profile's Lsp env (independent of the warm dep cache)
+            let lsp = p.cache_binding(
+                bridge_core::profile::CacheCtx::Lsp,
+                impl_lsp_cache_vol.unwrap_or(""),
+                "",
+            );
+            apply_lsp_env(&mut ccfg.mcp, &lsp.env);
+            // MOUNT: only when the warm dep cache exists (byte-for-byte with today's mount behavior)
+            if impl_lsp_cache_vol.is_some() {
+                ccfg.sandbox.volumes.extend(lsp.mounts);
+            }
         }
     }
     ccfg.sandbox
@@ -4794,5 +4828,74 @@ cmd = "cargo build --locked"
             super::resume_lang_arg(&Some("rust".into())),
             LangArg::Explicit("rust".into())
         );
+    }
+
+    fn lsp_spec(env: Vec<(String, String)>) -> bridge_core::mcp::McpServerSpec {
+        bridge_core::mcp::McpServerSpec {
+            name: "lsp".into(),
+            command: "/usr/local/bin/lsp-mcp".into(),
+            args: vec![],
+            env,
+        }
+    }
+
+    fn prism_spec() -> bridge_core::mcp::McpServerSpec {
+        bridge_core::mcp::McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec![],
+            env: vec![("RUST_LOG".into(), "warn".into())],
+        }
+    }
+
+    #[test]
+    fn apply_lsp_env_sets_env_and_overrides_same_key() {
+        let mut specs = vec![
+            lsp_spec(vec![
+                ("LSP_MCP_LOG".into(), "/log".into()),
+                ("CARGO_HOME".into(), "/old-cargo".into()),
+            ]),
+            prism_spec(),
+        ];
+        let profile_env = vec![
+            ("CARGO_HOME".into(), "/cargo".into()),
+            ("CARGO_NET_OFFLINE".into(), "true".into()),
+        ];
+        super::apply_lsp_env(&mut specs, &profile_env);
+        let lsp = specs.iter().find(|s| s.name == "lsp").unwrap();
+        assert!(lsp
+            .env
+            .iter()
+            .any(|(k, v)| k == "LSP_MCP_LOG" && v == "/log"));
+        assert!(
+            lsp.env
+                .iter()
+                .any(|(k, v)| k == "CARGO_HOME" && v == "/cargo"),
+            "profile must override existing CARGO_HOME"
+        );
+        assert!(
+            lsp.env
+                .iter()
+                .any(|(k, v)| k == "CARGO_NET_OFFLINE" && v == "true"),
+            "profile must add CARGO_NET_OFFLINE"
+        );
+        // prism untouched
+        let prism = specs.iter().find(|s| s.name == "prism").unwrap();
+        assert_eq!(prism.env, vec![("RUST_LOG".into(), "warn".into())]);
+    }
+
+    #[test]
+    fn apply_lsp_env_no_op_when_no_lsp_spec() {
+        let mut specs = vec![prism_spec()];
+        super::apply_lsp_env(&mut specs, &[("CARGO_HOME".into(), "/cargo".into())]);
+        assert_eq!(specs[0].env, vec![("RUST_LOG".into(), "warn".into())]);
+    }
+
+    #[test]
+    fn drop_lsp_removes_only_lsp_spec() {
+        let mut specs = vec![lsp_spec(vec![]), prism_spec()];
+        super::drop_lsp(&mut specs);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "prism");
     }
 }

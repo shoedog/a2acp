@@ -1846,15 +1846,20 @@ addr="127.0.0.1:8080"
                 .position(|a| a == "--lang")
                 .expect("--lang arg present");
             assert_eq!(lsp.args[lang_pos + 1], "auto", "--lang value must be auto");
-            // CARGO_HOME + CARGO_NET_OFFLINE must remain in the impl lsp env until M2 wiring
-            // (profile.lsp_env → ccfg.mcp) lands; removing them here would strand rust-analyzer.
+            // M2 wiring landed: CARGO_HOME + CARGO_NET_OFFLINE come from the rust profile's
+            // lsp_env (injected at runtime by apply_lsp_env) — they must NOT be in the static config.
             assert!(
-                lsp.env.iter().any(|e| e.name == "CARGO_HOME"),
-                "CARGO_HOME must still be in impl lsp env (M2 wiring not yet landed)"
+                !lsp.env.iter().any(|e| e.name == "CARGO_HOME"),
+                "CARGO_HOME must not be in impl lsp config env (now injected from profile)"
             );
             assert!(
-                lsp.env.iter().any(|e| e.name == "CARGO_NET_OFFLINE"),
-                "CARGO_NET_OFFLINE must still be in impl lsp env (M2 wiring not yet landed)"
+                !lsp.env.iter().any(|e| e.name == "CARGO_NET_OFFLINE"),
+                "CARGO_NET_OFFLINE must not be in impl lsp config env (now injected from profile)"
+            );
+            // LSP_MCP_LOG must remain in the static config (not profile-owned).
+            assert!(
+                lsp.env.iter().any(|e| e.name == "LSP_MCP_LOG"),
+                "LSP_MCP_LOG must still be in impl lsp config env"
             );
         }
     }
