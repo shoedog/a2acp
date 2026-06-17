@@ -145,3 +145,15 @@ Invoked by sending `/name args` as a text part in `session/prompt`.
 **stdio** (primary): client launches the agent subprocess; **newline-delimited** UTF-8 JSON-RPC; messages
 **MUST NOT contain embedded newlines**; stdout = ACP frames only, stderr = optional logging. Streamable
 HTTP is a draft. (This is exactly the framing the bridge's lsp-mcp newline fix relies on.)
+
+## Extensibility
+
+- **`_meta { [key]: unknown }`** on **all** protocol types — the sanctioned place for custom data.
+  **MUST NOT** add custom fields at the root of a spec type (all top-level fields are reserved). Vendor-scope
+  it: `_meta: { "a2a-bridge": { … } }` (cf. `zed.dev`). The bridge SHOULD ride `_meta` for orchestration
+  correlation (handle/contextId/operationId) rather than inventing root fields.
+- **Reserved root `_meta` keys** (W3C trace context): `traceparent`, `tracestate`, `baggage` — a standard
+  distributed-tracing seam (useful for C5 transcript / E9 watchdog correlation).
+- **`_`-prefixed methods/notifications** are reserved for extensions: custom **requests** (have `id`; reply
+  `-32601` Method-not-found if unknown) and custom **notifications** (no `id`; SHOULD ignore if unknown).
+  Tolerant-reader rule the bridge already follows for unmodeled `session/update` variants.

@@ -409,6 +409,15 @@ invoked as `/name` text parts) — S4's MCP/CLI surface MAY forward these as fir
 (deferred). fs/terminal client methods (capability-gated, agent→client) are the controlled-environment seam
 for E1/E2 containerization — note, not in the core slices.
 
+## P-7 — Extensibility: ride `_meta`, not custom root fields (refines S2/S4)
+ACP forbids custom root fields on spec types; the sanctioned seam is **`_meta`** (vendor-scoped, e.g.
+`_meta:{"a2a-bridge":{handle,contextId,operationId}}`), plus `_`-prefixed custom methods/notifications
+(tolerant-reader: ignore unknown — the bridge already does this for unmodeled `session/update`s). Reserved
+root `_meta` keys `traceparent`/`tracestate`/`baggage` give a **standard W3C trace-context seam** for C5
+transcript + E9 watchdog correlation. **So:** orchestration correlation (handle/op/context ids) that must
+cross the ACP boundary rides `_meta`, NOT new wire fields; and the journal's `OrchEvent` can adopt
+trace-context ids for cross-surface correlation. Cheap, additive, foundation-correct.
+
 ## Net effect on the slices
 - **Slice 0** additionally: add `Plan`/`ToolCall`/`ToolCallUpdate`/config/mode/commands `OrchEventKind`
   variants + stop-reason→`TerminalStatus` mapping; record `agent_capabilities` into the (forthcoming)

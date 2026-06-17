@@ -1,0 +1,17 @@
+# Codex gpt-5.5 XHIGH architecture-analysis PASS 3 — final deep review + protocol-fold validation + targeted divergences/invariants.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "arch-review-pass3"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/orchestration-architecture-review-pass3.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8092"
