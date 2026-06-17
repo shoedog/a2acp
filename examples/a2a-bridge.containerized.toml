@@ -325,6 +325,19 @@ prompt_file = "../prompts/impl-smoke.md"
 inputs = []
 
 [[workflows]]
+# C2b: a single container_rw `impl` turn that uses the in-container lsp (--lang auto) to type-resolve a
+# symbol. Run per-session-cwd to prove ONE serve/run-workflow handles polyglot sessions (go vs rust). The
+# codex impl gets the lsp via CodexNative (-c mcp_servers.*); see ADR-00xx (claude/kiro container_rw MCP
+# delivery is a separate gap). Run:
+#   a2a-bridge run-workflow c2b-nav --input <fn-name-file> --session-cwd <a-go-or-rust-repo> --config <this>
+id = "c2b-nav"
+[[workflows.nodes]]
+id = "nav"
+agent = "impl"
+prompt_file = "../prompts/c2b-nav.md"
+inputs = []
+
+[[workflows]]
 # B2b-1: the write-capable edit node driven by `a2a-bridge implement`. The agent edits + stages + writes
 # .git/A2A_COMMIT_MSG; the bridge host-commits the staged index.
 id = "implement-edit"
