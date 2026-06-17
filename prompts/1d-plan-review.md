@@ -1,0 +1,21 @@
+You are reviewing an IMPLEMENTATION PLAN for correctness and completeness, grounded against the ACTUAL bridge code in this repo (session-cwd = the a2a-bridge repo). READ-ONLY: read files, grep, `git`; do NOT edit/build/test.
+
+The plan is below (passed as input):
+
+{{input}}
+
+JUDGE AGAINST INTENT, NOT VERBATIM. Reserve BLOCKER/MAJOR for genuine plan defects: a step that won't compile as written, a wrong function signature/field name, an ordering bug, a missed spec requirement, a real regression risk, or an unsound design. A non-verbatim-but-correct step is fine.
+
+CONTEXT — the plan implements "#1d": rust-analyzer readiness under the per-turn `run-workflow` path. Root cause: the per-turn path (`container_rw_cfg_from_entry`, `bin/a2a-bridge/src/main.rs`) never warms the dep cache / injects the offline lsp-env that the warm `implement` path (`build_warm_impl`) does, and the agent egress is locked → cold RA can't fetch crates.io → never quiescent → empty nav reported as "no lsp tool". Two parts: (A) lsp-mcp degrade (configurable `LSP_MCP_READY_SECS` + honest not-ready tool reply); (B) `run-workflow` warms each `container_rw` entry up front (it stamps `--session-cwd` before registry build), reusing `build_warm_impl`'s machinery via a shared `apply_warm_lsp` helper. `serve` per-request warm is DEFERRED (out of scope) — confirm that's a defensible cut, not a hidden breakage.
+
+Spec: `docs/superpowers/specs/2026-06-17-lsp-mcp-1d-ra-readiness-per-turn.md`.
+
+HUNT (ground each finding in file:line in the REAL code):
+1. **Signatures/fields are real.** Verify against the code: `select_profile` (returns `Result<Option<LanguageProfile>, ConfigError>`; `Auto` ERRORS on undetected/ambiguous — the plan must treat that as best-effort skip, NOT propagate); `warm_lsp_deps_step`, `compose_warm_fetch`, `apply_lsp_env`, `drop_lsp`, `verify::cache_volume_name`, `config::gate_verify_runtime`, `bridge_core::mcp::McpServerSpec` fields, `bridge_core::profile::{LanguageProfile, CacheCtx, cache_binding, rust_profile}`. Flag any signature/field the plan gets wrong.
+2. **Ordering around `into_snapshot()`.** `cfg` is consumed by `into_snapshot()`. The plan captures `verify_cfg_raw` + selects the profile from `&cfg` BEFORE the snapshot, then gates verify + mutates `snapshot.entries` AFTER. Confirm nothing the plan references after the snapshot still borrows `cfg`, and that mutating `snapshot.entries` before `Registry::new(snapshot, spawn)` actually reaches the spawn (does `container_rw_cfg_from_entry` read `entry.mcp` + `entry.sandbox.volumes`? — it should, so the mutation flows through).
+3. **`apply_warm_lsp` byte-for-byte.** The extraction from `build_warm_impl` (~main.rs:1434–1458) must preserve behavior exactly (the `None=>drop_lsp`, the `Some` env + conditional `/cargo` mount, the UNCONDITIONAL `/lsp-target` push). Confirm the `impl_lsp_target_vol` naming + keying (source repo, not per-run clone) is preserved.
+4. **`read_only` mount.** For the per-turn path the "clone" is the user's REAL repo → `:ro` is required (no mutation). Confirm `cargo fetch`/`go mod download` work against `:ro` /work writing only to the cache vol (needs a committed lock; if absent, warm degrades — acceptable?). Confirm implement callers pass `false` (no behavior change to the quarantine-clone path).
+5. **Degrade semantics.** `wait_ready`/`ensure_ready` returning `bool` (true=ready, false=timed-out) and latching `readied` ONLY on true — confirm the only caller is `dispatch` (no other callers break), and that a timed-out first call correctly re-waits on the agent's retry (doesn't permanently short-circuit). Confirm `tools/list` is static (so "no lsp tool" really is a failed CALL, validating the whole framing).
+6. **Coverage/risk.** Does the live gate (Task 6) actually prove the fix (rust nav returns type-resolved, repo unmutated, cache reused, honest degrade, no host-side regression)? Any missing test, any unsound step, any spec requirement with no task?
+
+OUTPUT: severity-tag each finding (BLOCKER / MAJOR / MINOR) with file:line + a concrete fix. If a severity bucket is empty, say so. End with one line: `VERDICT: ship | fix-then-ship | redesign`. Be decisive; ground in real code; don't pad.

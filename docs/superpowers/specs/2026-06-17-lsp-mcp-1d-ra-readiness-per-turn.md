@@ -50,6 +50,11 @@ that is exercised for nav today (`run-workflow`, the C2b/dogfood gate).
   `"rust-analyzer is still indexing (or could not index offline); retry shortly"` — instead
   of an empty hit list the agent misreads as "no tool". Genuine empty results (RA ready, no
   match) stay as today.
+- **Scope of the degrade.** This covers the **detected-but-not-ready** case (a language WAS
+  detected; RA is slow/offline). A *truly undetected* repo is NOT covered: `lsp-mcp --lang auto`
+  calls `detect_lang(&repo)?` and **exits before serving** (`crates/lsp-mcp/src/lib.rs:37`), so
+  there is no MCP server to return a message — that is pre-existing, acceptable behavior (no
+  language → no nav server). The degrade is for *detected* repos whose RA can't index in time.
 - No change to the RustRa/Pyright/Gopls readiness machines.
 
 ### Part B — Warm-on-spawn for run-workflow (entry pre-mutation, NO cross-crate change)
@@ -100,9 +105,9 @@ honest "still indexing / not available offline" message instead of misleading em
 repo> --lang auto` → in-container RA reaches quiescent and a nav tool (`hover`/`definition`)
 returns a **type-resolved** result (not empty, not "no lsp tool"); the warm fetch goes
 through the **registries-egress** (agent stays locked) and does **not** mutate the user's
-repo (`:ro`); the cache is keyed on the source repo (one volume, reused, no per-run leak);
-`--lang none` / undetected returns the honest degrade message; the `implement` warm path and
-codex in-container nav are unchanged.
+repo (`:ro`); the cache is keyed on the source repo (one volume, reused, no per-run leak); a
+**detected-but-not-ready** RA (warm cold + `LSP_MCP_READY_SECS=2`) returns the honest degrade
+message instead of empty hits; the `implement` warm path and codex in-container nav are unchanged.
 
 ## Constraints carried from the session
 

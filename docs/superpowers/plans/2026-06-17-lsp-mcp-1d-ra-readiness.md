@@ -198,10 +198,20 @@ Then rewrite the body of `dispatch` (replace the `let result = ...; match result
 
 (Remove the old hardcoded `from_secs(30)` call — `ready_timeout()` replaces it.)
 
+- [ ] **Step 3c: Update existing test callers of `wait_ready`/`ensure_ready`**
+
+The integration/characterization tests under `crates/lsp-mcp/tests/` (e.g. `go_nav.rs`, `python_nav.rs`,
+`characterization.rs`, `integration.rs`) call `wait_ready`/`ensure_ready`. The `Result<()>`→`Result<bool>`
+change still *compiles* (the `bool` from `.unwrap()` is discarded), but a test that means "the server MUST be
+ready here" should now assert it. Grep the callers and, where the intent is readiness, change
+`s.wait_ready(t).unwrap();` → `assert!(s.wait_ready(t).unwrap(), "server not ready");` (same for
+`ensure_ready`). Leave callers that don't assert readiness as-is.
+
 - [ ] **Step 4: Run tests + build**
 
-Run: `cargo test -p lsp-mcp not_ready_response && cargo build -p lsp-mcp`
-Expected: PASS + clean build (the `bool` return is consumed only inside `dispatch`; no other callers — verified).
+Run: `cargo test -p lsp-mcp not_ready_response && cargo build -p lsp-mcp && cargo test -p lsp-mcp`
+Expected: PASS + clean build (`dispatch` is the only PRODUCTION caller; the test callers compile and now
+assert readiness where intended).
 
 - [ ] **Step 5: Commit**
 
@@ -237,7 +247,16 @@ fn compose_warm_fetch_read_only_mounts_work_ro() {
 }
 ```
 
-Update the existing `compose_warm_fetch_via_binding_is_byte_for_byte` (and any other caller in tests) to pass `false` as the new last arg; its expected output is unchanged.
+Update **both** existing test callers to pass `false` as the new last arg (their expected output is
+unchanged): `compose_warm_fetch_via_binding_is_byte_for_byte` (`implement.rs:~622`) **and**
+`warm_lsp_fetch_argv_uses_egress_offline_false_and_cache_mount` (`implement.rs:~582`). Grep
+`compose_warm_fetch(` to catch any others.
+
+**Go `:ro` caveat (document, not code):** `cargo fetch --locked` writes only to `CARGO_HOME` (the cache vol),
+so `:ro` /work is safe for rust with a committed `Cargo.lock`. For Go, `go mod download` with
+`GOFLAGS=-mod=mod` (the go profile's lsp_env) may want to write `go.sum` → would fail on `:ro`. The per-turn
+warm degrades cleanly on that failure (best-effort → no in-container nav), but the live gate and any go
+fixture must use a repo with a **committed, up-to-date `go.sum`** (mirrors the `Cargo.lock` requirement).
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -286,7 +305,25 @@ In `main.rs` tests:
 ```rust
 #[test]
 fn apply_warm_lsp_injects_env_mounts_and_target_vol() {
-    let p = bridge_core::profile::rust_profile();
+    // NOTE: the hardcoded `rust_profile()` has EMPTY lsp_env (profile.rs:119) — the real lsp_env lives on
+    // the CONFIG profile (containerized.toml). So build a profile WITH lsp_env populated via `from_parts`.
+    // `McpServerSpec.env` and `LanguageProfile.lsp_env` are BOTH `Vec<(String, String)>` (mcp.rs:18,
+    // profile.rs:50). `lsp_env` is private → must use the constructor.
+    let p = bridge_core::profile::LanguageProfile::from_parts(
+        "rust".into(),
+        "cargo fetch --locked".into(),
+        "a2a-impl-lsp-cache".into(),
+        "/cargo".into(),                 // dep_cache_path → the Lsp-ctx mount target
+        "/cache/cargo".into(),           // verify_cache_path (unused here)
+        vec![],                          // fetch_env
+        vec![                            // lsp_env (the thing under test)
+            ("CARGO_HOME".into(), "/cargo".into()),
+            ("CARGO_NET_OFFLINE".into(), "true".into()),
+        ],
+        vec![],                          // verify_env
+        None,                            // image
+        vec![],                          // verify_commands
+    );
     let mut mcp = vec![bridge_core::mcp::McpServerSpec {
         name: "lsp".into(),
         command: "/usr/local/bin/lsp-mcp".into(),
@@ -295,15 +332,15 @@ fn apply_warm_lsp_injects_env_mounts_and_target_vol() {
     }];
     let mut vols: Vec<String> = vec![];
     apply_warm_lsp(&mut mcp, &mut vols, Some(&p), Some("warmvol"), std::path::Path::new("/tmp/repo"));
-    // env injected onto the lsp spec
-    assert!(mcp[0].env.iter().any(|e| e.name == "CARGO_HOME"), "lsp env missing CARGO_HOME: {:?}", mcp[0].env);
+    // env injected onto the lsp spec (tuple access — env is Vec<(String,String)>)
+    assert!(mcp[0].env.iter().any(|(k, _)| k == "CARGO_HOME"), "lsp env missing CARGO_HOME: {:?}", mcp[0].env);
     // warm dep cache mounted (because warm vol is Some) + the per-repo target vol mounted
     assert!(vols.iter().any(|v| v.contains("warmvol")), "missing /cargo mount: {vols:?}");
     assert!(vols.iter().any(|v| v.ends_with(":/lsp-target")), "missing /lsp-target mount: {vols:?}");
 }
 ```
 
-(Confirm the exact `McpServerSpec` field names by reading `crates/bridge-core/src/mcp.rs`; adjust the literal if `env` uses a different shape — `apply_lsp_env`'s existing usage is the source of truth.)
+(`from_parts` is the 10-arg constructor at `profile.rs:83`; signature confirmed. Verify the arg order at implement time.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -464,9 +501,19 @@ cargo build --release --bin a2a-bridge --bin lsp-mcp
 
 - [ ] **Gate 3 — cache reuse, no leak.** `docker volume ls | grep a2a-impl-lsp` shows ONE dep-cache vol + ONE target vol for the fixture; a second run reuses them (no per-run proliferation).
 
-- [ ] **Gate 4 — honest degrade.** Point the same workflow at a no-language dir (or a repo whose language has no `[[languages]]` profile): the nav tool returns the "still indexing / could not index offline; retry" message (Part A), not empty hits. (`LSP_MCP_READY_SECS=5` makes the timeout fast to observe.)
+- [ ] **Gate 4 — honest degrade (DETECTED-but-not-ready ONLY).** Part A applies only when a language IS
+  detected but RA can't become ready — a truly no-language repo makes `lsp-mcp --lang auto` exit at startup
+  (`detect_lang(&repo)?`, `crates/lsp-mcp/src/lib.rs:37`) *before* it serves, so it can't return the message
+  (pre-existing behavior; no language = no nav server, which is correct). To exercise the degrade, use a
+  **detectable rust repo whose RA cannot index in time**: run Gate 1's fixture with `LSP_MCP_READY_SECS=2`
+  set on the lsp server **and** the warm cache cold/disabled (so RA stays not-quiescent) → the nav tool
+  returns the "still indexing / could not index offline; retry" message, not empty hits.
 
-- [ ] **Gate 5 — no regression.** A host-side workflow with no container_rw agents (e.g. `code-review`) pays no warm cost (no `lsp warm-deps` log); the `implement` warm path still works (`apply_warm_lsp` extraction is byte-for-byte).
+- [ ] **Gate 5 — no regression.** (a) A host-side workflow with no container_rw agents (e.g. `code-review`)
+  pays no warm cost (no `lsp warm-deps` log — proves the `has_container_rw` guard). (b) A MIXED workflow
+  (host reviewer node + a container_rw node, if available) warms only the container_rw entry and leaves host
+  entries untouched (proves the per-entry `if e.kind == ContainerRw` guard). (c) The `implement` warm path
+  still works end-to-end (`apply_warm_lsp` extraction is byte-for-byte).
 
 ---
 

@@ -1,0 +1,27 @@
+# Codex (gpt-5.5 high) independent review of the #1d PLAN, grounded against the a2a-bridge code.
+# The plan is passed via --input → {{input}}; session-cwd = the bridge repo so codex reads source directly.
+# Run:
+#   ./target/release/a2a-bridge run-workflow 1d-plan-review \
+#     --input docs/superpowers/plans/2026-06-17-lsp-mcp-1d-ra-readiness.md \
+#     --session-cwd /Users/wesleyjinks/code/a2a-bridge \
+#     --config examples/a2a-bridge.1d-plan-review-codex.toml --out /tmp/1d-plan-review-codex.md
+
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "high"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+
+[[workflows]]
+id = "1d-plan-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/1d-plan-review.md"
+inputs = []
+
+[server]
+addr = "127.0.0.1:8082"
