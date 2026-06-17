@@ -12,3 +12,5 @@
 (^|\.)storage\.googleapis\.com$
 (^|\.)pypi\.org$
 (^|\.)pythonhosted\.org$
+# JS/TS slice — npm: `(^|\.)npmjs\.org$` covers registry.npmjs.org (package metadata) + cdn downloads.
+(^|\.)npmjs\.org$

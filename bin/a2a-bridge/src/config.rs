@@ -1881,6 +1881,63 @@ addr="127.0.0.1:8080"
     }
 
     #[test]
+    fn example_containerized_typescript_language_profile() {
+        // Check both configs symmetrically — the typescript profile must be identical in each (guards Docker/
+        // Podman drift + the load-bearing npm/tsc command strings; validated by the Task 3 live gate).
+        for raw in [
+            include_str!("../../../examples/a2a-bridge.containerized.toml"),
+            include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
+        ] {
+            let cfg = RegistryConfig::parse(raw).unwrap();
+            let profiles = cfg.language_profiles().unwrap();
+            let ts = profiles
+                .iter()
+                .find(|p| p.id == "typescript")
+                .expect("typescript profile present in containerized config");
+            // Fetch: copy manifests to / then `cd /` + `npm ci` (installs into /node_modules root-walk
+            // target, spiked). The fetch command copies the manifests into / so `npm ci` runs at / and
+            // populates the mounted /node_modules volume.
+            assert!(
+                ts.fetch_cmd
+                    .contains("cp /work/package.json /work/package-lock.json /")
+                    && ts.fetch_cmd.contains("npm ci --ignore-scripts"),
+                "typescript fetch must copy manifests to / then npm ci --ignore-scripts: {}",
+                ts.fetch_cmd
+            );
+            // lsp_env is empty for TS (swappable via LSP_MCP_TS_SERVER in lsp_env; default unset → tsls).
+            let lsp_env = ts
+                .cache_binding(bridge_core::profile::CacheCtx::Lsp, "", "")
+                .env;
+            assert!(
+                lsp_env.is_empty(),
+                "typescript lsp_env must be empty (swap via lsp_env override, not a default): {lsp_env:?}"
+            );
+            // Pin full (name, cmd, gate) verify tuples.
+            let got: Vec<(&str, &str, bool)> = ts
+                .verify_commands
+                .iter()
+                .map(|c| (c.name.as_str(), c.cmd.as_str(), c.gate))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    (
+                        "typecheck",
+                        "cp /work/package.json /work/package-lock.json / 2>/dev/null && (cd / && npm ci --ignore-scripts || npm install --ignore-scripts) && cd /work && tsc --noEmit",
+                        true
+                    ),
+                    (
+                        "lint",
+                        "if ls .eslintrc* eslint.config.* >/dev/null 2>&1; then PATH=/node_modules/.bin:$PATH eslint .; else echo 'no eslint config; skip'; fi",
+                        true
+                    ),
+                    ("test", "npm test --if-present", true),
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn example_containerized_impl_lsp_lang_is_auto() {
         // Check both configs symmetrically.
         for raw in [

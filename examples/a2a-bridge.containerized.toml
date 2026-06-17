@@ -143,6 +143,38 @@ cmd  = "ruff check ."
 name = "test"
 cmd  = "uv venv /cache/venv && { UV_PROJECT_ENVIRONMENT=/cache/venv uv sync --frozen || VIRTUAL_ENV=/cache/venv uv pip install -r requirements.txt; } && /cache/venv/bin/python -m pytest -q"
 
+[[languages]]
+id = "typescript"
+# SPIKED fetch (spike 2): `npm ci --prefix /` FAILS (EUSAGE — it looks for the lock at the prefix). The
+# working shape copies the manifests to / then `npm ci` at / → populates the mounted /node_modules vol.
+# --ignore-scripts: a warm fetch must NOT run arbitrary dep postinstall scripts (codex hardening). Best-
+# effort (|| true) so a no-lock/no-deps repo still gets a usable bare server (degrades, never crashes).
+fetch = "cp /work/package.json /work/package-lock.json / 2>/dev/null && cd / && { npm ci --ignore-scripts || npm install --ignore-scripts || true; }"
+warm_cache = "a2a-impl-lsp-cache-ts"
+dep_cache_path = "/node_modules"     # the root-walk target (spiked); mounted :ro for nav, rw for fetch
+verify_cache_path = "/node_modules"  # B1 FIX: verify gets its OWN /node_modules vol (the verify container
+                                     # does NOT mount the warm dep cache + the clone is :ro), so the verify
+                                     # cmds install deps into it, then tsc resolves via the root-walk.
+fetch_env = { npm_config_cache = "/npmcache" }
+verify_env = { npm_config_cache = "/cache/npm" }
+# Swappable seam (M1): ts_config reads LSP_MCP_TS_SERVER (else "typescript-language-server"). To swap the
+# CONTAINERIZED server with NO rebuild, set it HERE (lsp_env reaches the in-container lsp-mcp via the
+# stripped-env path; a host/image env would NOT — see containerized-mcp-env-trap). Default: unset → tsls.
+# (tsserver's typescript-lib path, if needed, goes in initialize_params, NOT lsp_env — see Layer 1.)
+lsp_env = {}   # e.g. { LSP_MCP_TS_SERVER = "/usr/local/bin/vtsls" } to swap
+[[languages.verify]]
+# B1: verify installs deps into the /node_modules verify vol (copy manifests + npm ci), THEN tsc resolves
+# via the root-walk. Mirrors python's verify-venv-into-/cache.
+name = "typecheck"
+cmd  = "cp /work/package.json /work/package-lock.json / 2>/dev/null && (cd / && npm ci --ignore-scripts || npm install --ignore-scripts) && cd /work && tsc --noEmit"
+[[languages.verify]]
+name = "lint"
+# eslint is project-local (in /node_modules/.bin) + config-driven; guard on a config + put the bin on PATH.
+cmd  = "if ls .eslintrc* eslint.config.* >/dev/null 2>&1; then PATH=/node_modules/.bin:$PATH eslint .; else echo 'no eslint config; skip'; fi"
+[[languages.verify]]
+name = "test"
+cmd  = "npm test --if-present"   # honors the project's test script; no-op if absent
+
 [registry]
 # docker: the container runtime for the impl/kiro/verify sandboxes.
 # codex-acp + claude-agent-acp: host-side reviewer agents (codex/claude run without a sandbox block).
