@@ -1,0 +1,18 @@
+# Codex gpt-5.5 HIGH host-side implementor for Slice 0 tasks (write-enabled, full access).
+# Driven by run-workflow --input <task-prompt> --session-cwd <repo>.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "high"
+args = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "slice0-impl"
+[[workflows.nodes]]
+id = "impl"
+agent = "codex"
+prompt_file = "../prompts/slice0-impl-node.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8096"
