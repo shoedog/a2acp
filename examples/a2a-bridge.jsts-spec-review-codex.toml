@@ -1,0 +1,29 @@
+# Codex (gpt-5.5 xhigh) independent review of the Python polyglot SPEC, grounded against the bridge code.
+# Run:
+#   ./target/release/a2a-bridge run-workflow jsts-spec-review \
+#     --input docs/superpowers/specs/2026-06-17-lsp-mcp-python-polyglot.md \
+#     --session-cwd /Users/wesleyjinks/code/a2a-bridge \
+#     --config examples/a2a-bridge.jsts-spec-review-codex.toml --out /tmp/jsts-spec-review-codex.md
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[agents.mcp]]
+name = "lsp"
+command = "/Users/wesleyjinks/code/a2a-bridge/target/release/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/Users/wesleyjinks/.local/share/a2a/lsp-target-cache"]
+
+[[workflows]]
+id = "jsts-spec-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/jsts-spec-review.md"
+inputs = []
+
+[server]
+addr = "127.0.0.1:8087"
