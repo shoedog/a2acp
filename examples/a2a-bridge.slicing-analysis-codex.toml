@@ -1,0 +1,17 @@
+# Codex gpt-5.5 XHIGH dedicated slicing & sequencing analysis of the converged orchestration architecture.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "slicing-analysis"
+[[workflows.nodes]]
+id = "analyze"
+agent = "codex"
+prompt_file = "../prompts/orchestration-slicing-analysis.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8093"
