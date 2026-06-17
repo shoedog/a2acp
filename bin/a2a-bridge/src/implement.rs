@@ -145,6 +145,60 @@ pub fn read_commit_msg_file(clone: &Path) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
+// ─── claude OAuth cred preflight ──────────────────────────────────────────────
+
+/// Parse the `expiresAt` (epoch millis) from a claude `.credentials.json` body. Tolerates the
+/// `{"claudeAiOauth":{"expiresAt":..}}` wrapper or a flat object; `expiresAt` or `expires_at`.
+pub fn parse_claude_expiry_ms(json: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let o = v.get("claudeAiOauth").unwrap_or(&v);
+    o.get("expiresAt")
+        .or_else(|| o.get("expires_at"))
+        .and_then(|e| e.as_i64())
+}
+
+/// Preflight for a claude-agent-acp agent: if it mounts a `.credentials.json` whose OAuth token is already
+/// EXPIRED, fail fast with a clear message instead of letting the in-container agent crash with the opaque
+/// `AgentCrashed{session/prompt failed: transport error or kill-switch escalation}`. `now_ms` is injected so
+/// the comparison is testable. `volumes` are the sandbox `host:container[:opts]` mount specs. No-op for
+/// non-claude agents, no mounted cred, or an unreadable/unparseable cred (don't block on uncertainty).
+pub fn claude_cred_preflight(
+    cmd: Option<&str>,
+    volumes: &[String],
+    now_ms: i64,
+) -> Result<(), String> {
+    if cmd != Some("claude-agent-acp") {
+        return Ok(());
+    }
+    for vol in volumes {
+        let host = vol.split(':').next().unwrap_or("");
+        if !host.ends_with(".credentials.json") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(host) else {
+            continue;
+        };
+        if let Some(exp) = parse_claude_expiry_ms(&body) {
+            if exp < now_ms {
+                return Err(format!(
+                    "claude OAuth creds at {host} are EXPIRED (expiresAt={exp} < now={now_ms}). Re-login \
+                     (`claude`) and refresh the a2a-creds copy, then retry. This is the usual cause of the \
+                     opaque agent crash 'session/prompt failed: transport error or kill-switch escalation'."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `now_ms` for the preflight (epoch millis; 0 if the clock is before the epoch, which never happens).
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 // ─── Task id / branch ────────────────────────────────────────────────────────
 
 /// `impl-<pid>-<nonce>` — filesystem- and branch-name-safe.
@@ -972,5 +1026,52 @@ mod tests {
         run_git(Some(&clone), &["add", "X.md"]).unwrap();
         host_commit(&clone, "c").unwrap();
         assert_eq!(head_sha(&repo).unwrap(), before, "source repo untouched");
+    }
+
+    #[test]
+    fn parse_claude_expiry_wrapper_flat_and_missing() {
+        assert_eq!(
+            parse_claude_expiry_ms(r#"{"claudeAiOauth":{"expiresAt":123}}"#),
+            Some(123)
+        );
+        assert_eq!(parse_claude_expiry_ms(r#"{"expires_at":456}"#), Some(456));
+        assert_eq!(parse_claude_expiry_ms(r#"{"other":1}"#), None);
+        assert_eq!(parse_claude_expiry_ms("not json"), None);
+    }
+
+    #[test]
+    fn claude_cred_preflight_errors_only_when_expired() {
+        // non-claude agent: never blocks
+        assert!(claude_cred_preflight(
+            Some("codex-acp"),
+            &["/x/.credentials.json:/c".into()],
+            1000
+        )
+        .is_ok());
+        // claude but no .credentials.json mount: ok
+        assert!(
+            claude_cred_preflight(Some("claude-agent-acp"), &["/x/foo:/c".into()], 1000).is_ok()
+        );
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let exp = dir.join(format!("a2a-cred-exp-{pid}.credentials.json"));
+        std::fs::write(&exp, r#"{"claudeAiOauth":{"expiresAt":500}}"#).unwrap();
+        let r = claude_cred_preflight(
+            Some("claude-agent-acp"),
+            &[format!("{}:/root/.claude/.credentials.json", exp.display())],
+            1000,
+        );
+        assert!(r.is_err(), "expired (500 < 1000) must error");
+        assert!(r.unwrap_err().contains("EXPIRED"));
+        let ok = dir.join(format!("a2a-cred-ok-{pid}.credentials.json"));
+        std::fs::write(&ok, r#"{"claudeAiOauth":{"expiresAt":9999}}"#).unwrap();
+        assert!(claude_cred_preflight(
+            Some("claude-agent-acp"),
+            &[format!("{}:/root/.claude/.credentials.json", ok.display())],
+            1000
+        )
+        .is_ok());
+        let _ = std::fs::remove_file(&exp);
+        let _ = std::fs::remove_file(&ok);
     }
 }

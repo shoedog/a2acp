@@ -12,5 +12,5 @@ CONTRACT — follow exactly:
   your staged change on the current branch for you.
 - When done, STOP. Your reply text is NOT used as the commit message — only `.git/A2A_COMMIT_MSG` is.
 
-TASK:
-{{input}}
+TASK: your task is written in the file `.git/A2A_TASK.md` in this repository (your current working
+directory). Read that file IN FULL first (it is the complete, authoritative task), then implement it.

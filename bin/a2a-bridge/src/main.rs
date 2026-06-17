@@ -1411,6 +1411,15 @@ async fn build_warm_impl(
         resolve_impl_identity(graph, fix_graph, snapshot).map_err(|e| format!("implement: {e}"))?;
     let edit_template = graph.nodes[0].prompt_template.clone();
     let fix_template = fix_graph.map(|g| g.nodes[0].prompt_template.clone());
+    // Fail fast with a clear message if the claude impl agent's mounted OAuth creds are already expired,
+    // instead of spawning a container that crashes opaquely on session/prompt (the recurring footgun).
+    if let Some(sb) = impl_entry.sandbox.as_ref() {
+        implement::claude_cred_preflight(
+            impl_entry.cmd.as_deref(),
+            &sb.volumes,
+            implement::now_ms(),
+        )?;
+    }
     let mut ccfg = container_rw_cfg_from_entry(&impl_entry, run)?;
     // Slice B: runtime-derived LSP nav mounts for the in-container implementor's rust-analyzer (these
     // back the lsp MCP server delivered into this container via the ADR-0028 CodexNative path).
@@ -1833,9 +1842,16 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
 
-    // First edit turn — on the WARM session (off the executor). Render the single-node `{{input}}` template.
-    let edit_vars: std::collections::HashMap<&str, &str> =
-        std::collections::HashMap::from([("input", task.as_str())]);
+    // Deliver the task to the agent via a FILE in the clone, NOT the ACP session/prompt payload: a large
+    // task that contains non-ASCII chars crashes the in-container claude session/prompt (the large x
+    // non-ASCII interaction; ASCII or small is fine). Writing it to `.git/A2A_TASK.md` keeps the prompt
+    // small + ASCII while the agent reads the full (arbitrarily large / unicode) task from the file
+    // (file-read of unicode is safe — validated). implement-edit.md reads this file instead of {{input}}.
+    std::fs::write(clone.join(".git").join("A2A_TASK.md"), task.as_bytes())
+        .map_err(|e| format!("implement: write task file: {e}"))?;
+    // First edit turn — on the WARM session (off the executor). The edit template now points the agent at
+    // `.git/A2A_TASK.md` (no task interpolation), so the prompt itself is small + ASCII regardless of task.
+    let edit_vars: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     let edit_input = bridge_workflow::template::render(&warm_impl.edit_template, &edit_vars);
     let completed = turn::TurnRunner::run_turn(
         warm_runner.as_ref(),
