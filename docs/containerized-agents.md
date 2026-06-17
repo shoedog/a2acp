@@ -8,6 +8,12 @@ egress is locked to the model providers only.
 **Validated:** macOS + Docker Desktop (the container runtime is a Linux VM). Production target is
 rootless **podman on Linux** (CLI-compatible; bind-mount I/O is ~native vs slower on macOS).
 
+> ⚠️ **Adding an in-container LSP/MCP server (a new language, a new tool)?** Read
+> [`containerized-mcp-env-trap.md`](containerized-mcp-env-trap.md) FIRST. A containerized agent hands its
+> spawned MCP subprocesses a **stripped env** (not the image `ENV`), so anything the server needs must be
+> in the profile `lsp_env`, tools must be **real binaries on PATH (no mise/rustup shims)**, and the
+> failure mode is an opaque **"no lsp tool"**. That doc has the diagnostic + the rule.
+
 ---
 
 ## 1. Build the reader image
