@@ -149,7 +149,7 @@ id = "typescript"
 # working shape copies the manifests to / then `npm ci` at / → populates the mounted /node_modules vol.
 # --ignore-scripts: a warm fetch must NOT run arbitrary dep postinstall scripts (codex hardening). Best-
 # effort (|| true) so a no-lock/no-deps repo still gets a usable bare server (degrades, never crashes).
-fetch = "cp /work/package.json /work/package-lock.json / 2>/dev/null && cd / && { npm ci --ignore-scripts || npm install --ignore-scripts || true; }"
+fetch = "cp /work/package.json / 2>/dev/null; cp /work/package-lock.json / 2>/dev/null; cd / && { npm ci --ignore-scripts || npm install --ignore-scripts || true; }"
 warm_cache = "a2a-impl-lsp-cache-ts"
 dep_cache_path = "/node_modules"     # the root-walk target (spiked); mounted :ro for nav, rw for fetch
 verify_cache_path = "/node_modules"  # B1 FIX: verify gets its OWN /node_modules vol (the verify container
@@ -166,7 +166,7 @@ lsp_env = {}   # e.g. { LSP_MCP_TS_SERVER = "/usr/local/bin/vtsls" } to swap
 # B1: verify installs deps into the /node_modules verify vol (copy manifests + npm ci), THEN tsc resolves
 # via the root-walk. Mirrors python's verify-venv-into-/cache.
 name = "typecheck"
-cmd  = "cp /work/package.json /work/package-lock.json / 2>/dev/null && (cd / && npm ci --ignore-scripts || npm install --ignore-scripts) && cd /work && tsc --noEmit"
+cmd  = "cp package.json / 2>/dev/null; cp package-lock.json / 2>/dev/null; (cd / && { npm ci --ignore-scripts || npm install --ignore-scripts || true; }); tsc --noEmit"
 [[languages.verify]]
 name = "lint"
 # eslint is project-local (in /node_modules/.bin) + config-driven; guard on a config + put the bin on PATH.

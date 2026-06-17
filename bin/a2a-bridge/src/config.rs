@@ -1898,10 +1898,10 @@ addr="127.0.0.1:8080"
             // target, spiked). The fetch command copies the manifests into / so `npm ci` runs at / and
             // populates the mounted /node_modules volume.
             assert!(
-                ts.fetch_cmd
-                    .contains("cp /work/package.json /work/package-lock.json /")
+                ts.fetch_cmd.contains("cp /work/package.json /")
+                    && ts.fetch_cmd.contains("cp /work/package-lock.json /")
                     && ts.fetch_cmd.contains("npm ci --ignore-scripts"),
-                "typescript fetch must copy manifests to / then npm ci --ignore-scripts: {}",
+                "typescript fetch must copy manifests (separately/tolerant) to / then npm ci --ignore-scripts: {}",
                 ts.fetch_cmd
             );
             // lsp_env is empty for TS (swappable via LSP_MCP_TS_SERVER in lsp_env; default unset → tsls).
@@ -1923,7 +1923,7 @@ addr="127.0.0.1:8080"
                 vec![
                     (
                         "typecheck",
-                        "cp /work/package.json /work/package-lock.json / 2>/dev/null && (cd / && npm ci --ignore-scripts || npm install --ignore-scripts) && cd /work && tsc --noEmit",
+                        "cp package.json / 2>/dev/null; cp package-lock.json / 2>/dev/null; (cd / && { npm ci --ignore-scripts || npm install --ignore-scripts || true; }); tsc --noEmit",
                         true
                     ),
                     (

@@ -608,13 +608,20 @@ impl LspClient {
     /// identifiers — the common case). `None` if the file/line/name can't be read/found → caller keeps
     /// `from_char`. Best-effort: reads the file from disk (the repo is mounted), bounded by the line.
     fn identifier_column(&self, uri: &str, line: u64, from_char: u64, name: &str) -> Option<u64> {
-        let path = uri.strip_prefix("file://").unwrap_or(uri);
-        let text = std::fs::read_to_string(path).ok()?;
+        // Percent-decode the URI (a repo path with a space/unicode arrives `%20`-encoded; a raw strip would
+        // make the read fail → silent no-op back to start_char).
+        let path = shape::file_path_from_uri_str(uri).unwrap_or_else(|| uri.to_string());
+        let text = std::fs::read_to_string(&path).ok()?;
         let l = text.lines().nth(line as usize)?;
-        let from = from_char as usize;
-        let hay = l.get(from..)?;
-        let rel = hay.find(name)?;
-        Some((from + rel) as u64)
+        // `from_char` is a UTF-16 column; map to a byte index to slice (ASCII-exact; best-effort otherwise).
+        let from_byte = l
+            .char_indices()
+            .nth(from_char as usize)
+            .map(|(b, _)| b)
+            .unwrap_or(0);
+        let rel = l.get(from_byte..)?.find(name)?;
+        // byte offset → UTF-16 column (LSP positions are UTF-16 code units).
+        Some(l[..from_byte + rel].encode_utf16().count() as u64)
     }
 
     fn positional(&mut self, method: &str, name: &str) -> anyhow::Result<Value> {
