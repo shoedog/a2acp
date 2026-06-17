@@ -1370,13 +1370,19 @@ impl resilient::WarmRebuild for ContainerWarmRebuild {
 /// Other specs (e.g. prism) are untouched. No-op if there is no `lsp` spec.
 fn apply_lsp_env(specs: &mut [bridge_core::mcp::McpServerSpec], env: &[(String, String)]) {
     if let Some(lsp) = specs.iter_mut().find(|s| s.name == "lsp") {
-        for (k, v) in env {
-            if let Some(entry) = lsp.env.iter_mut().find(|(ek, _)| ek == k) {
-                entry.1 = v.clone();
-            } else {
-                lsp.env.push((k.clone(), v.clone()));
-            }
-        }
+        // Profile env FIRST, then the config's non-overridden entries. Putting the selected-language
+        // env ahead of the residual config env reproduces the pre-move render order byte-for-byte (the
+        // old static config listed CARGO_* before LSP_MCP_LOG). Profile values WIN on key conflicts.
+        let profile_keys: std::collections::HashSet<&str> =
+            env.iter().map(|(k, _)| k.as_str()).collect();
+        let mut merged: Vec<(String, String)> = env.to_vec();
+        merged.extend(
+            lsp.env
+                .iter()
+                .filter(|(k, _)| !profile_keys.contains(k.as_str()))
+                .cloned(),
+        );
+        lsp.env = merged;
     }
 }
 
@@ -4878,6 +4884,17 @@ cmd = "cargo build --locked"
                 .iter()
                 .any(|(k, v)| k == "CARGO_NET_OFFLINE" && v == "true"),
             "profile must add CARGO_NET_OFFLINE"
+        );
+        // EXACT order: profile env first (CARGO_*), then the config's non-overridden entry (LSP_MCP_LOG),
+        // and the overridden CARGO_HOME appears ONCE with the profile value -- byte-for-byte with the
+        // pre-move render order (CARGO_* before LSP_MCP_LOG).
+        assert_eq!(
+            lsp.env,
+            vec![
+                ("CARGO_HOME".into(), "/cargo".into()),
+                ("CARGO_NET_OFFLINE".into(), "true".into()),
+                ("LSP_MCP_LOG".into(), "/log".into()),
+            ]
         );
         // prism untouched
         let prism = specs.iter().find(|s| s.name == "prism").unwrap();
