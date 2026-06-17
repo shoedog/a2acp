@@ -589,8 +589,32 @@ impl LspClient {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("symbol `{name}` location has no uri"))?
             .to_string();
-        let pos = first["location"]["range"]["start"].clone();
-        Ok((uri, pos))
+        let start = &first["location"]["range"]["start"];
+        let line = start["line"].as_u64().unwrap_or(0);
+        let start_char = start["character"].as_u64().unwrap_or(0);
+        // Snap the position to the IDENTIFIER on the symbol's start line. workspace/symbol's
+        // `range.start` is the DECLARATION start, which for some servers (tsserver) is the line/keyword
+        // start (char 0), NOT the name — hovering/defining there resolves nothing. Find `name` at/after
+        // `start_char` on that line so the positional request lands on the identifier. Idempotent for
+        // servers whose range.start already IS the identifier (rust-analyzer/gopls/basedpyright): the name
+        // is right there, so the column is unchanged. Falls back to `start_char` if not found.
+        let character = self
+            .identifier_column(&uri, line, start_char, name)
+            .unwrap_or(start_char);
+        Ok((uri, json!({ "line": line, "character": character })))
+    }
+
+    /// Column of `name` at/after `from_char` on `line` of the file at `uri` (UTF-16 ≈ byte for ASCII
+    /// identifiers — the common case). `None` if the file/line/name can't be read/found → caller keeps
+    /// `from_char`. Best-effort: reads the file from disk (the repo is mounted), bounded by the line.
+    fn identifier_column(&self, uri: &str, line: u64, from_char: u64, name: &str) -> Option<u64> {
+        let path = uri.strip_prefix("file://").unwrap_or(uri);
+        let text = std::fs::read_to_string(path).ok()?;
+        let l = text.lines().nth(line as usize)?;
+        let from = from_char as usize;
+        let hay = l.get(from..)?;
+        let rel = hay.find(name)?;
+        Some((from + rel) as u64)
     }
 
     fn positional(&mut self, method: &str, name: &str) -> anyhow::Result<Value> {
