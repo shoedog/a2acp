@@ -22,33 +22,49 @@ impl Lang {
     }
 }
 
+/// Typed outcome of root-marker detection (spec §1): branch on the variant, never parse error strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Detection {
+    Detected(Lang),
+    None,
+    Ambiguous,
+}
+
+/// Typed root-marker detection (spec §1): single unambiguous marker → Detected; zero → None;
+/// two-or-more → Ambiguous. No bail / no error strings — callers branch on the variant.
+pub fn detect(repo: &Path) -> Detection {
+    let is_rust = repo.join("Cargo.toml").is_file();
+    let is_python = python_markers(repo) || has_real_pyproject(repo) || shallow_py_scan(repo);
+    let is_go = repo.join("go.mod").is_file();
+    match [is_rust, is_python, is_go].iter().filter(|b| **b).count() {
+        0 => Detection::None,
+        1 if is_rust => Detection::Detected(Lang::Rust),
+        1 if is_python => Detection::Detected(Lang::Python),
+        1 => Detection::Detected(Lang::Go),
+        _ => Detection::Ambiguous,
+    }
+}
+
 /// Detect the language from `repo`'s root markers, single-unambiguous-root ONLY (spec §1).
 /// `go.mod` → go; the existing rust (`Cargo.toml`) / python (markers) predicates are unchanged.
 /// ANY two-or-more markers present → ambiguous→refuse; NONE → cannot-detect → require explicit --lang.
 pub fn detect_lang(repo: &Path) -> anyhow::Result<Lang> {
-    let is_rust = repo.join("Cargo.toml").is_file();
-    let is_python = python_markers(repo) || has_real_pyproject(repo) || shallow_py_scan(repo);
-    let is_go = repo.join("go.mod").is_file();
-    let n = [is_rust, is_python, is_go].iter().filter(|b| **b).count();
-    if n >= 2 {
-        anyhow::bail!(
-            "ambiguous repo root (multiple language markers: rust={is_rust} python={is_python} go={is_go}) \
-             at {repo:?}; pass an explicit --lang"
-        );
+    match detect(repo) {
+        Detection::Detected(l) => Ok(l),
+        Detection::Ambiguous => {
+            let is_rust = repo.join("Cargo.toml").is_file();
+            let is_python = python_markers(repo) || has_real_pyproject(repo) || shallow_py_scan(repo);
+            let is_go = repo.join("go.mod").is_file();
+            anyhow::bail!(
+                "ambiguous repo root (multiple language markers: rust={is_rust} python={is_python} go={is_go}) \
+                 at {repo:?}; pass an explicit --lang"
+            )
+        }
+        Detection::None => anyhow::bail!(
+            "could not detect language at {repo:?} (no Cargo.toml / setup.py / setup.cfg / requirements*.txt / \
+             pyproject project section / .py files / go.mod); pass an explicit --lang"
+        ),
     }
-    if is_rust {
-        return Ok(Lang::Rust);
-    }
-    if is_python {
-        return Ok(Lang::Python);
-    }
-    if is_go {
-        return Ok(Lang::Go);
-    }
-    anyhow::bail!(
-        "could not detect language at {repo:?} (no Cargo.toml / setup.py / setup.cfg / requirements*.txt / \
-         pyproject project section / .py files / go.mod); pass an explicit --lang"
-    )
 }
 
 fn python_markers(repo: &Path) -> bool {
@@ -579,6 +595,18 @@ pub fn go_config(repo: &Path) -> anyhow::Result<LangServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_typed_classifies_none_rust_go_ambiguous() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(detect(d.path()), Detection::None);
+        std::fs::write(d.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert_eq!(detect(d.path()), Detection::Detected(Lang::Rust));
+        std::fs::write(d.path().join("go.mod"), "module x\n").unwrap();
+        assert_eq!(detect(d.path()), Detection::Ambiguous);
+        std::fs::remove_file(d.path().join("Cargo.toml")).unwrap();
+        assert_eq!(detect(d.path()), Detection::Detected(Lang::Go));
+    }
 
     // ---------------------------------------------------------------------------
     // resolve_lsp_server hermetic unit tests (TDD RED → GREEN)
