@@ -178,6 +178,29 @@ weighted B2 panel UX (fix fan-out identity/cancel/typed-results first); E7/E8. *
 result object (use a tagged envelope); session-handles-in-TaskStore; task-id-as-handle; relying on
 `forget_session` for context reset.
 
+## Spike findings (run 2026-06-17, ground truth for PASS 2)
+
+Two load-bearing unknowns were spiked LIVE before this pass; both resolved in the design's favor.
+
+- **SPIKE A — clear-via-`session/new` on a warm connection (CORRECTION-1's primitive).** Ran a 2-node
+  single-agent `run-workflow` (`remember` → `recall`, recall `inputs=[remember]`) against host
+  `codex-acp` (gpt-5.5). A `pgrep -f codex-acp` watcher held **steady at 2 processes for the entire run
+  (t2–t30), never 4**, INCLUDING across the node transition. `codex-acp` is a node wrapper + a darwin
+  binary → 2 procs IS one logical agent; a per-node cold start would have transiently shown 4. **One warm
+  `codex-acp` served both nodes** (registry `OnceCell` reuse within the process). The `recall` node
+  returned **`NONE`** (the code word from `remember` was NOT visible) → the executor's per-node fresh
+  `SessionId` yields **fresh context on the SAME warm connection**. **Verdict:** "reset context, keep the
+  warm process" is feasible *today* via a fresh `session/new` on the live connection — CORRECTION-1's
+  `clear` primitive is real, not hypothetical. The remaining design work is making it an explicit backend
+  method (vs. the executor accidentally getting it via fresh-mint) + the generation key.
+- **SPIKE B — telemetry (CORRECTION-2 / RISK-1 / Q4).** CONFIRMED via the real-capture corpus
+  `crates/bridge-acp/tests/corpus/codex-acp.jsonl`: codex-acp 0.15.0 emits
+  `{"sessionUpdate":"usage_update","used":14584,"size":258400}` — **token count + window size**, not
+  cost-only. The bridge receives it on the same parse path as the corpus replay but **drops it** in
+  `map_session_update` (`acp_backend.rs:1480`, returns `None` for non-`AgentMessageChunk`). **Verdict:** A4
+  threshold is **precise** for codex (used/size → exact window fraction); claude emits cost; degrade to
+  estimated per-backend. Pure plumbing — no protocol fix.
+
 ## Open for PASS 2 (the next codex-xhigh pass on this revised doc)
 - The exact **`OrchEvent`/`OrchResult` schema** (variants + the tagged-payload envelope) + how the 3→1
   event-path unification is staged without breaking W3b/reattach.
