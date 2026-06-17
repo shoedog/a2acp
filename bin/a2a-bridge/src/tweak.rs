@@ -90,16 +90,18 @@ pub fn classify(attempt: u32, max_attempts: u32, v: &VerifyOutcome, r: &ReviewOu
 }
 
 pub fn build_fix_input(
-    task: &str,
     verify_digest: &str,
     review_findings: Option<&str>,
     max_bytes: usize,
 ) -> String {
-    let header = format!(
-        "{task}\n\nThe previous attempt did not pass. FIX the issues below; re-stage your fixes with \
-         `git add` (the bridge folds ONLY staged changes); do NOT run `git commit` and do NOT write a commit \
-         message.\n"
-    );
+    // The task is delivered out-of-band via `.git/A2A_TASK.md` (NOT inlined here): a large, non-ASCII task
+    // inlined into the fix-turn prompt would re-trigger the in-container session/prompt crash (large x
+    // non-ASCII) that the edit-turn file delivery fixed. The agent already read it on the edit turn and can
+    // re-read it. Only the bridge-generated (ASCII) verify/review feedback is inline below.
+    let header = "Your task is in `.git/A2A_TASK.md` in this repo (re-read it if needed). The previous \
+         attempt did not pass. FIX the issues below; re-stage your fixes with `git add` (the bridge folds \
+         ONLY staged changes); do NOT run `git commit` and do NOT write a commit message.\n"
+        .to_string();
     let remaining = max_bytes.saturating_sub(header.len());
     let v = verify_digest.trim();
     let rfind = review_findings.map(str::trim).filter(|s| !s.is_empty());
@@ -173,7 +175,10 @@ impl CheckpointSink for NoopCheckpointSink {
 pub async fn run_tweak_loop(
     clone: &std::path::Path,
     branch: &str,
-    task: &str,
+    // Retained for call-site/checkpoint stability; the task is delivered to the fix turn via
+    // `.git/A2A_TASK.md` (build_fix_input no longer inlines it -- avoids re-triggering the large x non-ASCII
+    // session/prompt crash on a fix turn).
+    _task: &str,
     mut sha: String,
     original_message: &str,
     start_attempt: u32,
@@ -232,7 +237,7 @@ pub async fn run_tweak_loop(
                     } => Some(synth.as_str()),
                     _ => None,
                 };
-                let input = build_fix_input(task, &digest, findings, 12 * 1024);
+                let input = build_fix_input(&digest, findings, 12 * 1024);
                 let completed = eff.fix(attempt, &input).await;
                 if !completed {
                     break LoopReport {
@@ -429,19 +434,26 @@ mod tests {
     }
 
     #[test]
-    fn build_fix_input_keeps_task_and_sections() {
-        let i = build_fix_input("do X", "### clippy\nerr", Some("BLOCKER: bug"), 4096);
-        assert!(i.contains("do X") && i.contains("## Verify failures") && i.contains("### clippy"));
+    fn build_fix_input_references_task_file_and_keeps_sections() {
+        let i = build_fix_input("### clippy\nerr", Some("BLOCKER: bug"), 4096);
+        // Task is referenced via the file (NOT inlined) so a large/non-ASCII task can't re-enter the prompt.
+        assert!(
+            i.contains(".git/A2A_TASK.md")
+                && i.contains("## Verify failures")
+                && i.contains("### clippy")
+        );
         assert!(i.contains("## Review findings (REJECTED)") && i.contains("BLOCKER: bug"));
-        // Warm-session framing: self-sufficient (task + git-add mandate), no "prior commit" assumption.
         assert!(i.contains("git add"));
         assert!(!i.contains("prior commit"));
-        let v = build_fix_input("do X", "### test\nfail", None, 4096);
+        // The header is ASCII (the whole point: the fix-turn prompt stays small + ASCII).
+        assert!(i.is_ascii(), "fix header must be ASCII");
+        let v = build_fix_input("### test\nfail", None, 4096);
         assert!(v.contains("## Verify failures") && !v.contains("Review findings"));
-        let r = build_fix_input("do X", "", Some("MAJOR: y"), 4096);
+        let r = build_fix_input("", Some("MAJOR: y"), 4096);
         assert!(!r.contains("## Verify failures") && r.contains("Review findings"));
-        let t = build_fix_input("do X", &"E".repeat(9000), Some(&"R".repeat(9000)), 256);
-        assert!(t.contains("do X"));
+        // Even with huge feedback, the header (task-file reference) is always present.
+        let t = build_fix_input(&"E".repeat(9000), Some(&"R".repeat(9000)), 256);
+        assert!(t.contains(".git/A2A_TASK.md"));
     }
 
     #[test]
