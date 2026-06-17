@@ -494,6 +494,18 @@ fn resolve_lsp_server(name: &str) -> String {
     resolved
 }
 
+/// True if the repo pins its OWN basedpyright/pyright config, which OVERRIDES the pushed `pythonPath`
+/// (so a warmed venv may be ignored). Checks `pyrightconfig.json` or a `[tool.pyright]`/`[tool.basedpyright]`
+/// section in `pyproject.toml`. Cheap, best-effort (a read failure → false).
+pub fn repo_has_pyright_config(repo: &Path) -> bool {
+    if repo.join("pyrightconfig.json").is_file() {
+        return true;
+    }
+    std::fs::read_to_string(repo.join("pyproject.toml"))
+        .map(|s| s.contains("[tool.pyright]") || s.contains("[tool.basedpyright]"))
+        .unwrap_or(false)
+}
+
 /// Python / basedpyright config. Resolves the interpreter, advertises NO `window/workDoneProgress` (so the
 /// no-progress settle — not a progress cycle — is the readiness signal; Task-1 spike Gate 2), and sends the
 /// WRAPPED `didChangeConfiguration { settings: { python: { pythonPath } } }` envelope (spike Gate 1a).
@@ -528,6 +540,13 @@ pub fn pyright_config(
             "python3".to_string()
         }
     };
+    if repo_has_pyright_config(repo) {
+        eprintln!(
+            "[lsp-mcp] WARNING: {repo:?} has a pyrightconfig.json / [tool.(based)pyright] section — \
+             basedpyright may honor it OVER the pushed pythonPath {python_path:?}, so a warmed venv \
+             could be ignored (third-party resolution may differ). See docs/containerized-mcp-env-trap.md."
+        );
+    }
     // The LSP-standard WRAPPED `settings` envelope (spike Gate 1a) — the proven form that resolves
     // third-party defs into the venv's site-packages. Do NOT regress to a bare `{ "python": {…} }` form.
     let post = (
@@ -976,5 +995,18 @@ mod tests {
                 ["hierarchicalDocumentSymbolSupport"],
             json!(true)
         );
+    }
+
+    #[test]
+    fn detects_repo_pyright_config() {
+        let d = std::env::temp_dir().join(format!("lspmcp-pyrcfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        assert!(!repo_has_pyright_config(&d)); // none
+        std::fs::write(d.join("pyrightconfig.json"), "{}").unwrap();
+        assert!(repo_has_pyright_config(&d)); // explicit file
+        let _ = std::fs::remove_file(d.join("pyrightconfig.json"));
+        std::fs::write(d.join("pyproject.toml"), "[tool.basedpyright]\n").unwrap();
+        assert!(repo_has_pyright_config(&d)); // pyproject section
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
