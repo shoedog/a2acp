@@ -6,10 +6,22 @@ prioritized)
 
 ## Goal
 
-Make a bridge-driven agent as light to drive as an in-session subagent by **keeping `codex-acp` (and any
-ACP) sessions warm across calls** (A1) and **resuming the same warm session — context intact — for the
-fix/continuation loop** (A2). Turns implement→review→fix from **3 cold runs** (≈27s cold start + repo
-re-read each) into **warm reuse** (≈sub-second amortized) without losing cross-vendor model diversity.
+Make a bridge-driven agent as light to drive as an in-session subagent by **keeping the agent PROCESS warm
+across tasks** (A1) and giving the orchestrator **per-task control over the agent's CONTEXT** (A2 + the
+A3 manual levers + A4): continue / compact / clear, with **context-usage visibility** and a **pre-task
+threshold** that *suggests* (never auto-runs) compaction. Two problems this solves (user framing):
+1. **Cold startup per task** — pay the `codex-acp` spawn + ACP handshake (≈27s) ONCE, then amortize.
+2. **LLM implementor/reviewer re-orienting per task** — let the agent KEEP context across tasks (no
+   repo/spec re-read) when that's wanted, and reset/summarize it deliberately when it isn't.
+
+**Requirements pulled in (2026-06-17 user):**
+- **Per-task context mode — continue | compact | clear — chosen by the orchestrator, with the warm PROCESS
+  kept alive REGARDLESS** (clearing/compacting context must NOT cold-restart the agent).
+- **Context-usage visibility:** tokens used / window-remaining, exposed at **task start AND end**, ideally
+  **queryable mid-task**.
+- **Threshold warning (no mid-task auto-compaction):** a **configurable default** threshold; when a
+  session's usage crosses it, the bridge **warns/suggests compact-or-clear BEFORE the next task** — it
+  never auto-compacts *during* a task (avoids a surprise mid-task summarize).
 
 ## Findings (grounded in the code)
 
@@ -62,6 +74,47 @@ Keep `run-workflow` as the driver but make it a **client of a running serve** fo
   already speak to serve — this is the workflow analogue + the contextId thread.)
 - No `--serve` → today's in-process one-shot (unchanged).
 
+## Context management — warm PROCESS vs per-task CONTEXT (the key model)
+
+Decouple the two: the **process** (codex-acp, the expensive cold-start) stays warm across ALL tasks; the
+**ACP session/context** is what the per-task mode acts on, on that same warm process:
+- **continue** — same ACP session, context intact (A2). The agent remembers prior tasks; no re-orient.
+- **clear** — `session/new` on the SAME warm process → fresh context, zero cold-start (the process,
+  MCP servers, and toolchain stay live). "reset, keep the handle."
+- **compact** — summarize the current context, then seed a fresh session on the warm process with that
+  summary (≈ the harness's compaction). Keeps continuity without the full transcript.
+
+So **warmth (process) and context (session) are orthogonal** — exactly the user's "keep warm sessions even
+if clearing/compacting." `session/new` on a live codex-acp connection is cheap; the cold tax is the
+process+handshake, which we never re-pay.
+
+### Telemetry + threshold
+
+- **Usage source (THE feasibility crux — spike first):** the bridge already enables the ACP
+  `unstable_session_usage` feature → it receives a **`usage_update`** SessionUpdate. **Unknown +
+  load-bearing:** does that event carry **token counts / context-window fraction** (what the user needs),
+  or only **cost** (what claude emits per memory)? And **does codex-acp emit it at all**? Spike a real
+  codex-acp + claude session, capture `usage_update`, inspect fields. If it lacks tokens/window →
+  telemetry degrades to **cost-only or estimated** (count chars/tokens we send + the model's window), and
+  the threshold becomes approximate — the spec's precision hinges on this.
+- **Exposure:** usage at **task start + end** (in the structured/streamed result) + a **queryable
+  `session-status`** op (mid-task). Ties to the roadmap's C1 (typed result) / C4 (telemetry).
+- **Threshold:** a configurable default (e.g. % of window); checked **before** dispatching the next task →
+  emit a warn/suggest (compact|clear); the orchestrator decides. **Never** mid-task.
+
+### Open ergonomics questions (for the brainstorm — reviewers or dispatched sessions)
+
+1. **Mode interface:** `--context-mode continue|compact|clear` on the run call? a separate
+   `session compact|clear|status` op? both? How does the orchestrator name/track a warm session
+   (contextId? a returned session handle)?
+2. **Telemetry exposure:** result field vs a poll op vs a stream event — and the start/end/during cadence.
+3. **Threshold UX:** where configured (config default + per-call override), and the warn shape (a field on
+   the result? a distinct event? blocking vs advisory?).
+4. **compact semantics:** who summarizes (the agent via a compact prompt, or the bridge) + what's preserved.
+5. **Fit with the larger roadmap:** this is A2+A3(levers)+A4 — reviewers should situate it against
+   `docs/orchestration-improvements-2026-06-17.md` (D2 MCP tool as the umbrella, C1/C2 result/stream,
+   A3 auto-heuristic, B1 interactivity) so we don't bake a shape that fights those.
+
 ## Definition of Done
 
 1. **Continuation works:** two `run-workflow … --serve … --context C` calls against one `serve` → the 2nd
@@ -72,16 +125,26 @@ Keep `run-workflow` as the driver but make it a **client of a running serve** fo
 3. **Isolation:** distinct `contextId`s get distinct warm sessions; no cross-talk.
 4. **Back-compat:** no `--serve`/no contextId → unchanged one-shot + per-task behavior; the existing
    per-node-fresh executor behavior is preserved for non-continuation runs (the keep-warm is opt-in).
+7. **Per-task mode:** `clear` and `compact` reset/summarize context while the **same warm process** serves
+   (proven: same process id / no cold handshake across a clear); `continue` keeps context (DoD-1).
+8. **Telemetry:** usage (tokens/window or the spike's best-available proxy) surfaced at task start + end +
+   via a `session-status` query; a configurable threshold emits a pre-task warn/suggest (never mid-task).
 5. **No leak:** warm sessions evict on TTL/idle + a manual `release`; the reaper/lease invariants hold.
 6. **Live-gated** against a real `serve` + codex: implement→review→fix as three continuation calls on one
    warm session; cold-vs-warm latency measured.
 
-## Out of scope (follow-ups, per the roadmap doc)
+## In / out of scope (revised per the user requirements)
 
-- **A3** (task-list-driven lifecycle heuristic) + **A4** (context-budget telemetry + `compact`/`clear`) —
-  this slice does minimal TTL/idle eviction only.
-- **B/C/D/E** items (bidirectional clarify, fan-out panel, structured result, MCP tool, watchdog, etc.).
-- A warm pool for *one-shot* `run-workflow` without a serve (out — one-shot can't persist).
+**IN (pulled in 2026-06-17):** A2 continuation; the **A3 *manual* levers** (per-task continue/compact/clear,
+keep-warm, release/TTL); **A4** context-usage telemetry + `compact`/`clear` + the configurable pre-task
+threshold-warn. (These are the user's explicit asks.)
+
+**OUT (follow-ups):**
+- **A3 *auto*-heuristic** (the bridge deciding keep-vs-tear-down from the task list) — this slice gives the
+  orchestrator the manual levers + the telemetry to decide; the auto-heuristic is later.
+- **B/C/D/E** beyond what telemetry needs (the full MCP tool D2, fan-out B2, bidirectional B1, watchdog E9)
+  — though the reviewers situate this design so D2/C1 can wrap it cleanly later.
+- A warm pool for *one-shot* `run-workflow` without a serve (one-shot can't persist).
 
 ## Risks
 
