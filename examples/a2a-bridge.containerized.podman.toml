@@ -68,7 +68,9 @@ dep_cache_path = "/cargo"
 verify_cache_path = "/cache"
 fetch_env = { CARGO_HOME = "/cargo" }
 verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target" }
-lsp_env = { CARGO_HOME = "/cargo", CARGO_NET_OFFLINE = "true" }
+# RUSTUP_HOME required: rust-analyzer is a rustup proxy and the agent (codex) hands its MCP subprocess a
+# minimal env that drops the image's RUSTUP_HOME — without it RA can't resolve a toolchain (#1d). Mirrors docker.
+lsp_env = { CARGO_HOME = "/cargo", CARGO_NET_OFFLINE = "true", RUSTUP_HOME = "/usr/local/rustup" }
 [[languages.verify]]
 name = "fmt"
 cmd  = "cargo fmt --all -- --check"

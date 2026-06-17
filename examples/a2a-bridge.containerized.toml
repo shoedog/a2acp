@@ -66,7 +66,11 @@ dep_cache_path = "/cargo"
 verify_cache_path = "/cache"
 fetch_env = { CARGO_HOME = "/cargo" }
 verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target" }
-lsp_env = { CARGO_HOME = "/cargo", CARGO_NET_OFFLINE = "true" }
+# RUSTUP_HOME is REQUIRED: rust-analyzer is a rustup PROXY (/usr/local/cargo/bin/rust-analyzer); codex-acp
+# hands its MCP subprocesses a MINIMAL env that drops the image's RUSTUP_HOME, so without it the proxy can't
+# resolve a toolchain ("rustup could not choose a version"), RA never answers LSP initialize, lsp-mcp times
+# out + exits, and codex reports "no lsp tool" for rust. gopls is a direct binary so it was unaffected (#1d).
+lsp_env = { CARGO_HOME = "/cargo", CARGO_NET_OFFLINE = "true", RUSTUP_HOME = "/usr/local/rustup" }
 [[languages.verify]]
 name = "fmt"
 cmd  = "cargo fmt --all -- --check"
