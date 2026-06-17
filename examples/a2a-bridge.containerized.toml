@@ -129,7 +129,7 @@ warm_cache = "a2a-impl-lsp-cache-py"
 dep_cache_path = "/pyvenv"
 verify_cache_path = "/cache"
 fetch_env = { UV_CACHE_DIR = "/uvcache" }
-verify_env = { UV_CACHE_DIR = "/cache/uv" }
+verify_env = { UV_CACHE_DIR = "/cache/uv", RUFF_CACHE_DIR = "/cache/ruff" }
 # basedpyright reads site-packages via this interpreter. PATH not needed (binaries symlinked to /usr/local/bin,
 # already on codex's stripped PATH). PYTHONDONTWRITEBYTECODE guards a __pycache__ write under the :ro venv.
 lsp_env = { LSP_MCP_PYTHON_PATH = "/pyvenv/bin/python", PYTHONDONTWRITEBYTECODE = "1" }
@@ -141,7 +141,7 @@ name = "lint"
 cmd  = "ruff check ."
 [[languages.verify]]
 name = "test"
-cmd  = "UV_PROJECT_ENVIRONMENT=/cache/venv uv sync --frozen && /cache/venv/bin/pytest -q"
+cmd  = "uv venv /cache/venv && { UV_PROJECT_ENVIRONMENT=/cache/venv uv sync --frozen || VIRTUAL_ENV=/cache/venv uv pip install -r requirements.txt; } && /cache/venv/bin/python -m pytest -q"
 
 [registry]
 # docker: the container runtime for the impl/kiro/verify sandboxes.
