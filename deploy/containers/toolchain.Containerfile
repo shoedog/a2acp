@@ -62,3 +62,18 @@ RUN go install golang.org/x/tools/gopls@v0.17.1
 RUN ln -sf /usr/local/go/bin/go /usr/local/bin/go \
  && ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
  && ln -sf /root/go/bin/gopls /usr/local/bin/gopls
+
+# Python (LSP-MCP polyglot slice): mise-provisioned python + uv + ruff + basedpyright. The REAL binaries are
+# SYMLINKED into /usr/local/bin (already on every PATH incl. codex's stripped MCP-subprocess PATH) — NEVER
+# mise shims/activation: a shim resolves the tool version from mise's env, which the stripped env drops →
+# the exact #1d trap (see docs/containerized-mcp-env-trap.md). mise installs to
+# ~/.local/share/mise/installs/.../bin (real, absolute-path executables); node (image base) backs the
+# node-based basedpyright-langserver.
+RUN curl -fsSL https://mise.run | sh
+ENV PATH=/root/.local/bin:$PATH
+RUN /root/.local/bin/mise use -g -y python@3.12.13 uv@0.11.21 ruff@0.15.17 "npm:basedpyright@1.39.8"
+# Symlink the RESOLVED real binaries (NOT the shims dir). basedpyright ships both `basedpyright` (answers
+# --version) and `basedpyright-langserver` (stdio); python install exposes `python`+`python3`.
+RUN set -eux; for t in python python3 uv ruff basedpyright basedpyright-langserver; do \
+      ln -sf "$(/root/.local/bin/mise which "$t")" "/usr/local/bin/$t"; \
+    done
