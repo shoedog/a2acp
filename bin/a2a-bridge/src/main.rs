@@ -2292,17 +2292,25 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             e.session_cwd = Some(dir.clone());
         }
     }
-    let has_container_rw = snapshot
-        .entries
-        .iter()
-        .any(|e| e.kind == bridge_core::domain::AgentKind::ContainerRw);
-    if has_container_rw {
+    // Warm ONLY container_rw agents the SELECTED workflow actually resolves (its graph nodes), not every
+    // container_rw entry in the config: the shipped containerized.toml defines the `impl` container_rw agent
+    // AND host-only workflows (code-review/spec-review/design) — warming config-wide would make those pay a
+    // docker warm-fetch + registries-egress attempt for an agent they never spawn (dual-review MAJOR).
+    let wf_agent_ids: std::collections::HashSet<&str> =
+        graph.nodes.iter().map(|n| n.agent.as_str()).collect();
+    let warms_container_rw = snapshot.entries.iter().any(|e| {
+        e.kind == bridge_core::domain::AgentKind::ContainerRw
+            && wf_agent_ids.contains(e.id.as_str())
+    });
+    if warms_container_rw {
         if let (Some(repo), Some(p)) = (warm_repo.as_ref(), warm_profile.as_ref()) {
             let verify_cfg = config::gate_verify_runtime(verify_cfg_raw, &snapshot.allowed_cmds);
             // read_only=true: the per-turn "clone" is the user's REAL repo — never mutate it.
             let warm_vol = warm_lsp_deps_step(&verify_cfg, Some(p), repo, repo, true);
             for e in &mut snapshot.entries {
-                if e.kind == bridge_core::domain::AgentKind::ContainerRw {
+                if e.kind == bridge_core::domain::AgentKind::ContainerRw
+                    && wf_agent_ids.contains(e.id.as_str())
+                {
                     if let Some(sb) = e.sandbox.as_mut() {
                         apply_warm_lsp(
                             &mut e.mcp,
