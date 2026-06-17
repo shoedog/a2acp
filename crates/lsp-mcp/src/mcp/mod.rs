@@ -129,20 +129,26 @@ fn ok(id: &Value, body: Value) -> Value {
     })
 }
 
-/// The honest "RA not ready" tool reply: an `isError` content the agent can read and retry on, instead of
-/// an empty hit list it misreads as "no lsp tool".
-fn not_ready_response(id: &Value) -> Value {
+/// An `isError` tool result the agent can read (and, for not-ready, retry on). Shared shape so the three
+/// error paths (spawn/respawn failure, not-ready, tool-body failure) can't drift.
+fn iserror(id: &Value, text: impl Into<String>) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
             "isError": true,
-            "content": [{
-                "type": "text",
-                "text": "rust-analyzer is still indexing (or could not index offline); retry shortly"
-            }]
+            "content": [{ "type": "text", "text": text.into() }]
         }
     })
+}
+
+/// The honest "language server not ready" reply: the agent reads it and retries, instead of an empty hit
+/// list it misreads as "no lsp tool". Language-neutral — lsp-mcp is polyglot (RA / gopls / basedpyright).
+fn not_ready_response(id: &Value) -> Value {
+    iserror(
+        id,
+        "the language server is still indexing (or could not index offline); retry shortly",
+    )
 }
 
 fn dispatch(id: &Value, params: &Value, s: &mut LspClient) -> Value {
@@ -154,21 +160,11 @@ fn dispatch(id: &Value, params: &Value, s: &mut LspClient) -> Value {
     log_tool_call(tool, &a);
     s.touch();
     match s.ensure_ready(ready_timeout()) {
-        Err(e) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": { "isError": true,
-                "content": [{ "type": "text", "text": format!("lsp-mcp error: {e}") }] }
-        }),
+        Err(e) => iserror(id, format!("lsp-mcp error: {e}")),
         Ok(false) => not_ready_response(id),
         Ok(true) => match dispatch_body(tool, &a, s) {
             Ok(body) => ok(id, body),
-            Err(e) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "isError": true,
-                    "content": [{ "type": "text", "text": format!("lsp-mcp error: {e}") }] }
-            }),
+            Err(e) => iserror(id, format!("lsp-mcp error: {e}")),
         },
     }
 }
