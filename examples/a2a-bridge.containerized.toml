@@ -66,6 +66,7 @@ dep_cache_path = "/cargo"
 verify_cache_path = "/cache"
 fetch_env = { CARGO_HOME = "/cargo" }
 verify_env = { CARGO_HOME = "/cache/cargo", CARGO_TARGET_DIR = "/cache/target" }
+lsp_env = { CARGO_HOME = "/cargo", CARGO_NET_OFFLINE = "true" }
 [[languages.verify]]
 name = "fmt"
 cmd  = "cargo fmt --all -- --check"
@@ -90,6 +91,28 @@ cmd  = "cargo test --workspace --locked --exclude bridge-container -- --skip pro
 # name = "coverage"
 # cmd  = "cargo llvm-cov --workspace --locked --summary-only"
 # gate = false
+
+[[languages]]
+id = "go"
+fetch = "go mod download"
+warm_cache = "a2a-impl-lsp-cache-go"
+dep_cache_path = "/go/pkg/mod"
+verify_cache_path = "/cache"
+fetch_env = { GOMODCACHE = "/go/pkg/mod", GOFLAGS = "-mod=mod" }
+verify_env = { GOMODCACHE = "/cache/gomodcache", GOCACHE = "/cache/go-build", GOFLAGS = "-mod=readonly" }
+lsp_env = { GOMODCACHE = "/go/pkg/mod", GOFLAGS = "-mod=mod" }
+[[languages.verify]]
+name = "gofmt"
+cmd  = "test -z \"$(gofmt -l .)\""
+[[languages.verify]]
+name = "vet"
+cmd  = "go vet ./..."
+[[languages.verify]]
+name = "build"
+cmd  = "go build ./..."
+[[languages.verify]]
+name = "test"
+cmd  = "go test ./..."
 
 [registry]
 # docker: the container runtime for the impl/kiro/verify sandboxes.
@@ -182,7 +205,7 @@ volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/au
 [[agents.mcp]]
 name = "lsp"
 command = "/usr/local/bin/lsp-mcp"
-args = ["--repo", "{cwd}", "--lang", "rust", "--target-cache", "/lsp-target"]
+args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/lsp-target"]
 [[agents.mcp.env]]
 name = "CARGO_HOME"
 value = "/cargo"

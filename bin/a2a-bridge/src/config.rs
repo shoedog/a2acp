@@ -1792,6 +1792,74 @@ addr="127.0.0.1:8080"
     }
 
     #[test]
+    fn example_containerized_go_language_profile() {
+        // Check both configs symmetrically — the go profile must be identical in each.
+        for raw in [
+            include_str!("../../../examples/a2a-bridge.containerized.toml"),
+            include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
+        ] {
+            let cfg = RegistryConfig::parse(raw).unwrap();
+            let profiles = cfg.language_profiles().unwrap();
+            let go = profiles
+                .iter()
+                .find(|p| p.id == "go")
+                .expect("go profile present in containerized config");
+            // Pin full (name, cmd, gate) tuples — same standard as tracked_example_language_verify_commands_round_trip.
+            let got: Vec<(&str, &str, bool)> = go
+                .verify_commands
+                .iter()
+                .map(|c| (c.name.as_str(), c.cmd.as_str(), c.gate))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    ("gofmt", "test -z \"$(gofmt -l .)\"", true),
+                    ("vet", "go vet ./...", true),
+                    ("build", "go build ./...", true),
+                    ("test", "go test ./...", true),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn example_containerized_impl_lsp_lang_is_auto() {
+        // Check both configs symmetrically.
+        for raw in [
+            include_str!("../../../examples/a2a-bridge.containerized.toml"),
+            include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
+        ] {
+            let cfg = RegistryConfig::parse(raw).unwrap();
+            let impl_agent = cfg
+                .agents
+                .iter()
+                .find(|a| a.id == "impl")
+                .expect("impl agent present");
+            let lsp = impl_agent
+                .mcp
+                .iter()
+                .find(|m| m.name == "lsp")
+                .expect("lsp mcp server present");
+            let lang_pos = lsp
+                .args
+                .iter()
+                .position(|a| a == "--lang")
+                .expect("--lang arg present");
+            assert_eq!(lsp.args[lang_pos + 1], "auto", "--lang value must be auto");
+            // CARGO_HOME + CARGO_NET_OFFLINE must remain in the impl lsp env until M2 wiring
+            // (profile.lsp_env → ccfg.mcp) lands; removing them here would strand rust-analyzer.
+            assert!(
+                lsp.env.iter().any(|e| e.name == "CARGO_HOME"),
+                "CARGO_HOME must still be in impl lsp env (M2 wiring not yet landed)"
+            );
+            assert!(
+                lsp.env.iter().any(|e| e.name == "CARGO_NET_OFFLINE"),
+                "CARGO_NET_OFFLINE must still be in impl lsp env (M2 wiring not yet landed)"
+            );
+        }
+    }
+
+    #[test]
     fn review_config_parses_workflow_and_defaults() {
         let c = RegistryConfig::parse(
             "default=\"x\"\n[server]\naddr=\"127.0.0.1:8080\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n[review]\nworkflow=\"implement-review\"\n",
