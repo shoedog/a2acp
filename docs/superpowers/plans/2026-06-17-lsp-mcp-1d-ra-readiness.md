@@ -523,3 +523,35 @@ cargo build --release --bin a2a-bridge --bin lsp-mcp
 - **Type consistency:** `apply_warm_lsp` signature is identical at both call sites (`build_warm_impl`, `run_workflow_cmd`); `ensure_ready`/`wait_ready` now return `bool` (only caller is `dispatch`); `warm_lsp_deps_step`/`compose_warm_fetch` gain a trailing `read_only: bool` (implement callers pass `false`, run-workflow passes `true`).
 - **Risk:** Task 5 is the integration (config capture ordering around `into_snapshot`, entry mutation reaching the spawn). Codex reviews Task 5 + the final branch; Opus reviews Tasks 1–4 per-task.
 - **Open confirmations for the implementer:** (1) `McpServerSpec` field names in the Task-4 test (read `bridge-core/src/mcp.rs`); (2) `gate_verify_runtime` ownership/signature; (3) `bridge_core::profile::rust_profile()` is `pub` for the tests. Adjust literals to match real signatures — do not invent.
+
+---
+
+## Outcome (live gate, 2026-06-17) — corrected root cause + KEYSTONE
+
+The live gate **overturned the spec's root cause**. Tasks 1–5 (Part A degrade + Part B
+warm-on-spawn) implemented + reviewed cleanly (codex Task-5 review: `ship`; Opus Part A: `ship`),
+but the rust gate still failed with "no lsp tool" — even with warm succeeding and lsp-mcp serving
+`tools/list` in 0.25s standalone. Instrumenting codex's MCP-subprocess env (a `/bin/sh` wrapper
+dumping `env` to a file) revealed the truth:
+
+- **rust-analyzer is a rustup PROXY** (`/usr/local/cargo/bin/rust-analyzer`).
+- **codex-acp gives MCP subprocesses a minimal env that DROPS the image's `RUSTUP_HOME`** (it
+  propagated `CARGO_HOME`/`CARGO_NET_OFFLINE` from `lsp_env`, but not the image ENV).
+- → the proxy can't resolve a toolchain → RA never answers LSP `initialize` → lsp-mcp's 30s
+  `initialize` timeout (`lsp/mod.rs:241`) fires → lsp-mcp **exits** → codex sees the server die →
+  "no lsp tool". gopls is a direct binary, hence unaffected.
+
+**KEYSTONE FIX (Task 0, config-only):** `RUSTUP_HOME=/usr/local/rustup` in the rust profile's
+`lsp_env` (`examples/a2a-bridge.containerized.toml` + `.podman.toml`). No image rebuild, no code
+change. A wrong first guess (symlinking RA into `/usr/local/bin`) was reverted — RA was always on
+codex's PATH via `/usr/local/cargo/bin`; the gap was `RUSTUP_HOME`, not PATH.
+
+**Validated gates:** Gate 1 ✓ type-resolved `pub fn build_greeting(name: &str, formal: bool) ->
+Greeting @ src/lib.rs:11` (codex called `workspace_symbol`+`hover` per the call log — proving RA
+initialized AND indexed offline via the warm `/cargo`, i.e. Part B works). Gate 2 ✓ fixture
+unmutated (`:ro`). Gate 3 ✓ one cache + one target vol per fixture, reused. Gate 5 ✓ go
+non-regression. Gate 4 (detected-but-not-ready degrade) covered by Part A unit tests + Opus review
+(forcing it live is a Catch-22 once warm makes RA ready).
+
+**Net:** #1d = (0) RUSTUP_HOME keystone + (A) degrade [Tasks 1–2] + (B) warm-on-spawn [Tasks 3–5].
+All three needed; the keystone was the actual "no lsp tool" fix, A+B make RA usable + fail honest.

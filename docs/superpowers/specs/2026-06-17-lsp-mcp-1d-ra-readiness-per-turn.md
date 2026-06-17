@@ -7,8 +7,24 @@
 ## Problem
 
 Under the per-turn `container_rw` path (`run-workflow` / `serve`), in-container rust nav
-fails: the codex/sonnet agent reports "no lsp tool". gopls "worked" in the C2b gate only
-because that fixture had zero external deps.
+fails: the codex/sonnet agent reports "no lsp tool".
+
+> **ROOT CAUSE CORRECTED (live gate, 2026-06-17).** The analysis below (cold RA can't index
+> offline / readiness window) was **plausible but WRONG** as the cause of "no lsp tool". The
+> actual blocker, found by instrumenting codex's MCP-subprocess env: **rust-analyzer is a rustup
+> PROXY** (`/usr/local/cargo/bin/rust-analyzer`), and **codex-acp hands its MCP subprocesses a
+> minimal env that DROPS the image's `RUSTUP_HOME`**. Without it the proxy can't resolve a
+> toolchain (`"rustup could not choose a version"`) → RA never answers LSP `initialize` →
+> lsp-mcp times out at 30s and **exits** → codex sees the server die → "no lsp tool". gopls
+> works because it's a direct binary (no `RUSTUP_HOME`). **The keystone fix is one env var:
+> `RUSTUP_HOME=/usr/local/rustup` in the rust profile's `lsp_env`** (config-only; it propagates
+> to the subprocess like `CARGO_HOME`/`CARGO_NET_OFFLINE` already did). Parts A+B below are still
+> valid and needed — **Part B (warm) is what lets RA INDEX offline once it initializes** (proven:
+> the gate returned a type-resolved signature, not empty hits); **Part A (degrade)** is the
+> safety net. So #1d shipped as: **(0) RUSTUP_HOME keystone + (A) degrade + (B) warm-on-spawn.**
+
+gopls "worked" in the C2b gate only because that fixture had zero external deps AND gopls is a
+direct binary unaffected by the `RUSTUP_HOME` gap.
 
 ### Root cause (code-grounded, deterministic — not "just slow")
 
