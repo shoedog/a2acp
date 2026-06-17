@@ -39,7 +39,10 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         "rust" => crate::lang::Lang::Rust,
         "python" => crate::lang::Lang::Python,
         "go" => crate::lang::Lang::Go,
-        other => anyhow::bail!("--lang must be auto|rust|python|go (got {other:?})"),
+        "typescript" | "ts" | "javascript" | "js" => crate::lang::Lang::TypeScript,
+        other => anyhow::bail!(
+            "--lang must be auto|rust|python|go|typescript|ts|javascript|js (got {other:?})"
+        ),
     };
     // Observability (spec §1): a misrouted {cwd} landing on the wrong language is now LOUD in the log.
     eprintln!("[lsp-mcp] root={} lang={}", repo.display(), lang.as_str());
@@ -55,6 +58,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             crate::lang::pyright_config(&repo, cli.python_path.as_deref())?
         }
         crate::lang::Lang::Go => crate::lang::go_config(&repo)?,
+        crate::lang::Lang::TypeScript => crate::lang::ts_config(&repo)?,
     };
     // USE `is_project_root`: validate an EXPLICIT --lang against the repo (auto already validated above).
     if explicit && !(cfg.is_project_root)(&repo) {
@@ -94,5 +98,7 @@ pub mod testkit {
     //! Internal helpers exposed ONLY for the characterization harness (tests/characterization.rs).
     //! Doc-hidden so they don't appear in the public docs; the items themselves are `pub` because an
     //! external `tests/` crate cannot reach `pub(crate)` items (and `pub use` of `pub(crate)` won't compile).
-    pub use crate::lang::{PyrightReady, Readiness, RustReady};
+    // `PyrightReady` is now a type alias for `SettleReady` — export both so the harness keeps compiling
+    // unchanged, and export `SettleReady` directly for new tests and future aliases.
+    pub use crate::lang::{PyrightReady, Readiness, RustReady, SettleReady};
 }

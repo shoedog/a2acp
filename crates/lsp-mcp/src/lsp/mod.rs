@@ -125,13 +125,14 @@ pub fn should_evict(idle_secs: u64, timeout_secs: u64) -> bool {
 /// elapsed with no progress seen. Independent OR-branch of `Readiness::is_ready`; RustRa is unaffected.
 const PYRIGHT_SETTLE: Duration = Duration::from_millis(1500);
 
-/// LOAD-BEARING settle branch for the no-progress languages (basedpyright + gopls), evaluated by
-/// `wait_ready` (it owns the runtime settle Duration the pure `Readiness::is_ready` can't carry). True
-/// only for a settle-based machine that has settled with no progress; false for RustRa.
+/// LOAD-BEARING settle branch for the no-progress languages (basedpyright + gopls + typescript-language-server),
+/// evaluated by `wait_ready` (it owns the runtime settle Duration the pure `Readiness::is_ready` can't carry).
+/// True only for a settle-based machine that has settled with no progress; false for RustRa.
 fn settled_no_progress(r: &crate::lang::Readiness) -> bool {
     match r {
-        crate::lang::Readiness::Pyright(p) => p.settled_no_progress(PYRIGHT_SETTLE),
-        crate::lang::Readiness::Gopls(g) => g.settled_no_progress(PYRIGHT_SETTLE),
+        crate::lang::Readiness::Pyright(s)
+        | crate::lang::Readiness::Gopls(s)
+        | crate::lang::Readiness::Ts(s) => s.settled_no_progress(PYRIGHT_SETTLE),
         crate::lang::Readiness::RustRa(_) => false,
     }
 }
@@ -251,9 +252,13 @@ impl LspClient {
                 s.settled_at = Some(Instant::now());
             }
         }
-        // Gopls has no post_init_config → stamp its settle clock right after `initialized`.
-        if let crate::lang::Readiness::Gopls(s) = &mut *self.ready.lock().unwrap() {
-            s.settled_at = Some(Instant::now());
+        // Gopls and Ts have no post_init_config → stamp their settle clocks right after `initialized`.
+        // (Ts settle is identical to gopls: no post-init config, settle from initialized.)
+        match &mut *self.ready.lock().unwrap() {
+            crate::lang::Readiness::Gopls(s) | crate::lang::Readiness::Ts(s) => {
+                s.settled_at = Some(Instant::now());
+            }
+            _ => {}
         }
         Ok(())
     }

@@ -10,6 +10,7 @@ pub enum Lang {
     Rust,
     Python,
     Go,
+    TypeScript,
 }
 
 impl Lang {
@@ -18,6 +19,7 @@ impl Lang {
             Lang::Rust => "rust",
             Lang::Python => "python",
             Lang::Go => "go",
+            Lang::TypeScript => "typescript",
         }
     }
 }
@@ -36,11 +38,20 @@ pub fn detect(repo: &Path) -> Detection {
     let is_rust = repo.join("Cargo.toml").is_file();
     let is_python = python_markers(repo) || has_real_pyproject(repo) || shallow_py_scan(repo);
     let is_go = repo.join("go.mod").is_file();
-    match [is_rust, is_python, is_go].iter().filter(|b| **b).count() {
+    // Detection marker for TS is tsconfig.json ONLY — NOT package.json (a tooling package.json is
+    // present in a huge fraction of rust/python repos and would flip them to Ambiguous; tsconfig.json
+    // is a strong, low-noise TS signal; tsconfig-less pure-JS needs explicit `--lang typescript`).
+    let is_ts = repo.join("tsconfig.json").is_file();
+    match [is_rust, is_python, is_go, is_ts]
+        .iter()
+        .filter(|b| **b)
+        .count()
+    {
         0 => Detection::None,
         1 if is_rust => Detection::Detected(Lang::Rust),
         1 if is_python => Detection::Detected(Lang::Python),
-        1 => Detection::Detected(Lang::Go),
+        1 if is_go => Detection::Detected(Lang::Go),
+        1 => Detection::Detected(Lang::TypeScript),
         _ => Detection::Ambiguous,
     }
 }
@@ -55,14 +66,15 @@ pub fn detect_lang(repo: &Path) -> anyhow::Result<Lang> {
             let is_rust = repo.join("Cargo.toml").is_file();
             let is_python = python_markers(repo) || has_real_pyproject(repo) || shallow_py_scan(repo);
             let is_go = repo.join("go.mod").is_file();
+            let is_ts = repo.join("tsconfig.json").is_file();
             anyhow::bail!(
-                "ambiguous repo root (multiple language markers: rust={is_rust} python={is_python} go={is_go}) \
+                "ambiguous repo root (multiple language markers: rust={is_rust} python={is_python} go={is_go} typescript={is_ts}) \
                  at {repo:?}; pass an explicit --lang"
             )
         }
         Detection::None => anyhow::bail!(
             "could not detect language at {repo:?} (no Cargo.toml / setup.py / setup.cfg / requirements*.txt / \
-             pyproject project section / .py files / go.mod); pass an explicit --lang"
+             pyproject project section / .py files / go.mod / tsconfig.json); pass an explicit --lang"
         ),
     }
 }
@@ -156,8 +168,9 @@ fn shallow_py_scan(repo: &Path) -> bool {
 #[derive(Debug)]
 pub enum Readiness {
     RustRa(RustReady),
-    Pyright(PyrightReady),
-    Gopls(GoplsReady),
+    Pyright(SettleReady),
+    Gopls(SettleReady),
+    Ts(SettleReady),
 }
 
 /// Rust path readiness state — the old `ReadyState`, unchanged fields/semantics.
@@ -173,45 +186,25 @@ pub struct RustReady {
     pub quiescent: bool,
 }
 
-/// Python (basedpyright) readiness: `pyright/{begin,end}Progress` + a short no-progress settle.
+/// Shared settle-based readiness state for Pyright, Gopls, and TypeScript. All three use the same
+/// `{began, active, settled_at}` fields and the same `settled_no_progress` predicate — extracted here to
+/// avoid byte-identical duplication (was `PyrightReady` + `GoplsReady`; TS would have been a 3rd copy).
+///
+/// Pyright uses `pyright/{begin,end}Progress`; Gopls and Ts use `$/progress` begin/end. The notification
+/// dispatch lives in `Readiness::on_notification`; this struct is PURE state + the settle predicate.
 #[derive(Debug, Default)]
-pub struct PyrightReady {
+pub struct SettleReady {
     pub began: bool,
     pub active: u32,
-    /// Set (`Some(Instant::now())`) the moment `initialized`+settings are applied in `handshake`. This is
-    /// the CORRECT settle-clock origin: the no-progress settle is timed from when settings were applied,
-    /// NOT from `wait_ready` entry (Opus H2). Timing from `wait_ready` entry made a begin-without-end
-    /// server pay the FULL timeout — the exact FU3 stall §2 forbids. None until settings are applied.
+    /// Set (`Some(Instant::now())`) when the server is considered "settings applied" in `handshake`:
+    /// for Pyright, after `post_init_config`; for Gopls and Ts, right after `initialized` (no post-init).
+    /// None until that point. The no-progress settle is timed from here, NOT from `wait_ready` entry (Opus H2).
     pub settled_at: Option<Instant>,
 }
 
-impl PyrightReady {
-    /// PURE no-progress settle gate: settings applied, no progress begun, and the settle window has
-    /// elapsed since `settled_at`. Timed from `settled_at` (settings-applied), not from any wait entry.
-    pub fn settled_no_progress(&self, settle: Duration) -> bool {
-        !self.began
-            && self
-                .settled_at
-                .map(|t| t.elapsed() >= settle)
-                .unwrap_or(false)
-    }
-}
-
-/// gopls readiness: like basedpyright, gopls emits no `$/progress` for a typical workspace load (Task-1
-/// spike Gate 3), so readiness is reached by SETTLING — `settled_at` (stamped after `initialized`, since
-/// gopls has no post-init config) + this window elapsed with no progress seen. `$/progress` begin/end
-/// parsing is harmless belt-and-suspenders for a gopls that DOES emit it.
-#[derive(Debug, Default)]
-pub struct GoplsReady {
-    pub began: bool,
-    pub active: u32,
-    /// Set (`Some(Instant::now())`) at the end of `handshake` (after `initialized`) — gopls has no
-    /// `post_init_config`, so the settle clock starts at `initialized`, not at settings-applied.
-    pub settled_at: Option<Instant>,
-}
-
-impl GoplsReady {
+impl SettleReady {
     /// PURE no-progress settle gate: no progress begun and the settle window has elapsed since `settled_at`.
+    /// Timed from `settled_at` (settings-applied / initialized), not from any wait entry.
     pub fn settled_no_progress(&self, settle: Duration) -> bool {
         !self.began
             && self
@@ -220,6 +213,12 @@ impl GoplsReady {
                 .unwrap_or(false)
     }
 }
+
+/// Type alias kept for backward compatibility with the external characterization harness
+/// (`crate::testkit` re-exports it as `PyrightReady`).
+pub type PyrightReady = SettleReady;
+/// Type alias kept for backward compatibility (was a separate struct, now unified as `SettleReady`).
+pub type GoplsReady = SettleReady;
 
 impl Readiness {
     /// Parse one inbound NOTIFICATION (never a response — id-routing is the caller's job). Mutates state.
@@ -253,7 +252,7 @@ impl Readiness {
                 }
                 _ => {}
             },
-            Readiness::Gopls(s) => {
+            Readiness::Gopls(s) | Readiness::Ts(s) => {
                 if method == "$/progress" {
                     match params["value"]["kind"].as_str() {
                         Some("begin") => {
@@ -270,9 +269,9 @@ impl Readiness {
         }
     }
 
-    /// PURE ready predicate. RustRa: quiescent OR begun-and-ended. Pyright/Gopls: begun-and-ended, OR
+    /// PURE ready predicate. RustRa: quiescent OR begun-and-ended. Pyright/Gopls/Ts: begun-and-ended, OR
     /// settings applied with no progress seen (the no-progress settle is timed by LspClient::wait_ready
-    /// via `settled_no_progress`). The settle branch is the LOAD-BEARING path because basedpyright/gopls
+    /// via `settled_no_progress`). The settle branch is the LOAD-BEARING path because basedpyright/gopls/tsls
     /// emit NO progress for a typical analysis/load (Task-1 spikes): it is an
     /// INDEPENDENT OR-branch, NOT gated behind having seen `begin`. begin/end parsing is harmless
     /// belt-and-suspenders for servers that DO emit progress.
@@ -281,8 +280,9 @@ impl Readiness {
             Readiness::RustRa(s) => s.quiescent || (s.began && s.active == 0),
             // The pure predicate covers the begun-and-ended branch; the no-progress settle branch is
             // OR'd in by LspClient::wait_ready, which owns the settle window (a Duration, not in scope here).
-            Readiness::Pyright(s) => s.began && s.active == 0,
-            Readiness::Gopls(s) => s.began && s.active == 0,
+            Readiness::Pyright(s) | Readiness::Gopls(s) | Readiness::Ts(s) => {
+                s.began && s.active == 0
+            }
         }
     }
 }
@@ -577,7 +577,7 @@ pub fn pyright_config(
             })
         }),
         post_init_config: Some(post),
-        new_readiness: Box::new(|| Readiness::Pyright(PyrightReady::default())),
+        new_readiness: Box::new(|| Readiness::Pyright(SettleReady::default())),
     })
 }
 
@@ -607,7 +607,43 @@ pub fn go_config(repo: &Path) -> anyhow::Result<LangServerConfig> {
             })
         }),
         post_init_config: None,
-        new_readiness: Box::new(|| Readiness::Gopls(GoplsReady::default())),
+        new_readiness: Box::new(|| Readiness::Gopls(SettleReady::default())),
+    })
+}
+
+/// TypeScript / typescript-language-server config. The server is swappable via `LSP_MCP_TS_SERVER` (env)
+/// so the container profile can override it without a rebuild — set `lsp_env = { LSP_MCP_TS_SERVER = "vtsls" }`
+/// in the TS `[[languages]]` profile. Detection marker = `tsconfig.json` (NOT bare `package.json` — too noisy).
+/// `is_project_root` is MORE lenient (package.json suffices for explicit `--lang typescript`). Readiness =
+/// no-progress settle (typescript-language-server's `$/progress` is unreliable; same signal as gopls).
+pub fn ts_config(repo: &Path) -> anyhow::Result<LangServerConfig> {
+    let _ = repo;
+    let server =
+        std::env::var("LSP_MCP_TS_SERVER").unwrap_or_else(|_| "typescript-language-server".into());
+    let server_bin = resolve_lsp_server(&server);
+    eprintln!("[lsp-mcp] typescript server: {server_bin}");
+    Ok(LangServerConfig {
+        name: "typescript-language-server",
+        program_argv: vec![server_bin, "--stdio".to_string()],
+        spawn_env: vec![],
+        // Explicit `--lang typescript` at a package.json-only repo (no tsconfig.json) is valid — the user
+        // is choosing the language explicitly. Auto-detect requires tsconfig.json; explicit is more lenient.
+        is_project_root: Box::new(|root: &Path| {
+            root.join("tsconfig.json").exists() || root.join("package.json").exists()
+        }),
+        initialize_params: Box::new(|root_uri: &str| {
+            json!({
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "capabilities": { "workspace": { "symbol": {} },
+                    "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } } },
+                "workspaceFolders": [{ "uri": root_uri, "name": "root" }],
+                // If impl finds tsserver isn't auto-discovered under the stripped env, add:
+                // "initializationOptions": { "tsserver": { "path": "<global typescript lib tsserver.js>" } }
+            })
+        }),
+        post_init_config: None,
+        new_readiness: Box::new(|| Readiness::Ts(SettleReady::default())),
     })
 }
 
@@ -1008,5 +1044,44 @@ mod tests {
         std::fs::write(d.join("pyproject.toml"), "[tool.basedpyright]\n").unwrap();
         assert!(repo_has_pyright_config(&d)); // pyproject section
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detect_typescript_via_tsconfig_only() {
+        let d = tempfile::tempdir().unwrap();
+        // a tooling-only package.json must NOT trigger TS (no rust/python regression — Opus m2)
+        std::fs::write(d.path().join("package.json"), "{}").unwrap();
+        assert_eq!(detect(d.path()), Detection::None);
+        std::fs::write(d.path().join("tsconfig.json"), "{}").unwrap();
+        assert_eq!(detect(d.path()), Detection::Detected(Lang::TypeScript));
+    }
+
+    #[test]
+    fn ts_config_returns_typescript_language_server_config() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = ts_config(d.path()).unwrap();
+        assert_eq!(cfg.name, "typescript-language-server");
+        assert!(cfg.program_argv.iter().any(|a| a == "--stdio"));
+        assert!(cfg.post_init_config.is_none(), "TS has no post-init config");
+        assert!(cfg.spawn_env.is_empty());
+        // is_project_root: tsconfig.json or package.json
+        let d2 = tempfile::tempdir().unwrap();
+        assert!(
+            !(cfg.is_project_root)(d2.path()),
+            "empty dir is not TS root"
+        );
+        std::fs::write(d2.path().join("package.json"), "{}").unwrap();
+        assert!(
+            (cfg.is_project_root)(d2.path()),
+            "package.json is enough for explicit --lang ts"
+        );
+        std::fs::write(d2.path().join("tsconfig.json"), "{}").unwrap();
+        assert!((cfg.is_project_root)(d2.path()), "tsconfig.json is TS root");
+        // readiness is settle-based
+        let ready = (cfg.new_readiness)();
+        assert!(
+            matches!(ready, Readiness::Ts(_)),
+            "TS uses Ts(SettleReady) readiness"
+        );
     }
 }
