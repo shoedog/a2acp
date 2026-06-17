@@ -433,7 +433,7 @@ impl LspClient {
     /// the bound). The no-progress settle for the settle-based servers (Pyright/Gopls) is OR'd in here via
     /// `settled_no_progress` because the settle window is a runtime Duration the pure `Readiness::is_ready`
     /// predicate doesn't carry.
-    pub fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
+    pub fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<bool> {
         let t0 = Instant::now();
         loop {
             // An in-progress index wait is active use — touch so the watcher can't evict the server
@@ -442,26 +442,31 @@ impl LspClient {
             {
                 let g = self.ready.lock().unwrap();
                 if g.is_ready() || settled_no_progress(&g) {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
             if t0.elapsed() >= timeout {
-                return Ok(());
+                return Ok(false);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
-    /// Lazily ensure the index is ready — waits only on the first call (idempotent after).
-    pub fn ensure_ready(&mut self, timeout: std::time::Duration) -> anyhow::Result<()> {
+    /// Lazily ensure the index is ready — waits only until ready (idempotent once ready). Returns whether
+    /// the server is ready. A timed-out wait does NOT latch `readied`, so the agent's retry waits again
+    /// (giving a slow cold index more time) instead of permanently short-circuiting.
+    pub fn ensure_ready(&mut self, timeout: std::time::Duration) -> anyhow::Result<bool> {
         if self.evicted.load(Ordering::SeqCst) {
             self.respawn()?;
         }
-        if !self.readied {
-            self.wait_ready(timeout)?;
+        if self.readied {
+            return Ok(true);
+        }
+        let ready = self.wait_ready(timeout)?;
+        if ready {
             self.readied = true;
         }
-        Ok(())
+        Ok(ready)
     }
 
     fn locations_to_hits(v: &Value) -> Vec<NavHit> {

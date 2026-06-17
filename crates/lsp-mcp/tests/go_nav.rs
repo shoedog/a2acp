@@ -141,7 +141,10 @@ fn workspace_symbol_finds_func() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     assert!(!s.workspace_symbol("Add").unwrap().is_empty());
     s.shutdown();
 }
@@ -153,7 +156,10 @@ fn document_symbols_extracts_type_and_method_recursively() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     let syms = s.document_symbols(&go_src()).unwrap();
     assert!(
         syms.iter()
@@ -179,7 +185,10 @@ fn definition_and_references_and_hover() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     // Workspace-local nav: `Add` resolves + hovers.
     assert!(
         !s.definition("Add").unwrap().is_empty(),
@@ -221,7 +230,10 @@ fn implementations_of_interface() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     // `Greeter` is an interface; `En` implements it. Assert gopls actually finds the implementer in the
     // fixture (not just "no error" — that would pass on an empty result and prove nothing).
     let impls = s.implementations("Greeter").unwrap();
@@ -239,7 +251,10 @@ fn call_hierarchy_finds_incoming_caller() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     // `Double` calls `Add` (fixture) — incoming call hierarchy must surface that caller, not merely
     // "no error" (Add with no callers would always-empty-pass and prove nothing about result parsing).
     let calls = s.call_hierarchy("Add", true).unwrap();

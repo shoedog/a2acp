@@ -24,7 +24,10 @@ fn session_reaches_ready_and_resolves_a_symbol() {
         return;
     }
     let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).expect("start");
-    s.wait_ready(Duration::from_secs(60)).expect("ready");
+    assert!(
+        s.wait_ready(Duration::from_secs(60)).expect("ready"),
+        "server not ready"
+    );
     let hits = s.workspace_symbol("add").expect("query");
     assert!(
         hits.iter()
@@ -41,7 +44,10 @@ fn references_finds_the_caller() {
         return;
     }
     let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
-    s.wait_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.wait_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     let refs = s.references("add", true).unwrap();
     assert!(
         refs.iter().any(|h| h.line == 5),
@@ -57,7 +63,10 @@ fn implementations_finds_the_impl() {
         return;
     }
     let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
-    s.wait_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.wait_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     let impls = s.implementations("Greet").unwrap();
     assert!(!impls.is_empty(), "Greet must have an implementor (En)");
     s.shutdown();
@@ -70,10 +79,16 @@ fn evict_then_query_reindexes() {
         return;
     }
     let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
-    s.ensure_ready(Duration::from_secs(120)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(120)).unwrap(),
+        "server not ready"
+    );
     assert!(!s.workspace_symbol("add").unwrap().is_empty());
     s.evict();
-    s.ensure_ready(Duration::from_secs(120)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(120)).unwrap(),
+        "server not ready after respawn"
+    );
     assert!(
         !s.workspace_symbol("add").unwrap().is_empty(),
         "RA respawned + re-indexed after evict"
@@ -88,7 +103,10 @@ fn rust_document_symbols_includes_nested_trait_method() {
         return;
     }
     let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
-    s.ensure_ready(std::time::Duration::from_secs(120)).unwrap();
+    assert!(
+        s.ensure_ready(std::time::Duration::from_secs(120)).unwrap(),
+        "server not ready"
+    );
     let syms = s.document_symbols(&sample_repo().join("lib.rs")).unwrap();
     let names: Vec<&str> = syms.iter().filter_map(|h| h.signature.as_deref()).collect();
     // Top-level items still present (additive, not a replacement).

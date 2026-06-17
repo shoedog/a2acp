@@ -127,7 +127,10 @@ fn post_eviction_still_resolves_third_party_def() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     // First resolution of a third-party symbol works (the venv is applied via didChangeConfiguration):
     // positional go-to-def at the `BaseModel` usage jumps into the venv's pydantic site-packages.
     let before = basemodel_def_targets(&mut s);
@@ -137,7 +140,10 @@ fn post_eviction_still_resolves_third_party_def() {
     );
     // Evict, then the NEXT call must respawn AND re-send didChangeConfiguration so the venv survives.
     s.evict();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     let after = basemodel_def_targets(&mut s);
     assert!(
         after.iter().any(|u| u.contains("site-packages/pydantic")),
@@ -153,7 +159,10 @@ fn document_symbols_extracts_class_and_method_recursively() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     let syms = s.document_symbols(&models_py()).unwrap();
     let names: Vec<&str> = syms.iter().filter_map(|h| h.signature.as_deref()).collect();
     assert!(names.contains(&"Greeter"), "class Greeter, got {names:?}");
@@ -174,7 +183,10 @@ fn resolve_pos_handles_duplicate_name() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     // `module_greet` exists as BOTH a method (Greeter.module_greet) and a module function. First-hit must
     // resolve to a real location (degradation documented: we keep the name-only API; basedpyright ranks
     // the hits). (`greet` is the nested-only name used by the recursion test — distinct from this pair.)
@@ -193,7 +205,10 @@ fn hover_is_non_empty() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     let h = s.hover("Greeter").unwrap();
     assert!(
         h.as_deref().map(|x| !x.is_empty()).unwrap_or(false),
@@ -209,7 +224,10 @@ fn workspace_symbol_finds_class() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     assert!(!s.workspace_symbol("Greeter").unwrap().is_empty());
     s.shutdown();
 }
@@ -221,7 +239,10 @@ fn references_and_callhierarchy_and_definition() {
         return;
     }
     let mut s = start();
-    s.ensure_ready(Duration::from_secs(60)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(60)).unwrap(),
+        "server not ready"
+    );
     assert!(!s.definition("Greeter").unwrap().is_empty(), "definition");
     let _refs = s.references("greet", true).unwrap(); // must not error
     let _calls = s.call_hierarchy("module_greet", true).unwrap(); // incoming callers, must not error

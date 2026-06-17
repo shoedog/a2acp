@@ -129,6 +129,22 @@ fn ok(id: &Value, body: Value) -> Value {
     })
 }
 
+/// The honest "RA not ready" tool reply: an `isError` content the agent can read and retry on, instead of
+/// an empty hit list it misreads as "no lsp tool".
+fn not_ready_response(id: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "isError": true,
+            "content": [{
+                "type": "text",
+                "text": "rust-analyzer is still indexing (or could not index offline); retry shortly"
+            }]
+        }
+    })
+}
+
 fn dispatch(id: &Value, params: &Value, s: &mut LspClient) -> Value {
     let tool = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let a = params
@@ -137,23 +153,23 @@ fn dispatch(id: &Value, params: &Value, s: &mut LspClient) -> Value {
         .unwrap_or_else(|| json!({}));
     log_tool_call(tool, &a);
     s.touch();
-    let result = s
-        .ensure_ready(std::time::Duration::from_secs(30))
-        .and_then(|()| dispatch_body(tool, &a, s));
-    match result {
-        Ok(body) => ok(id, body),
-        // Tool failures are reported as content with isError, so the agent sees the reason and degrades.
+    match s.ensure_ready(ready_timeout()) {
         Err(e) => json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": {
-                "isError": true,
-                "content": [{
-                    "type": "text",
-                    "text": format!("lsp-mcp error: {e}")
-                }]
-            }
+            "result": { "isError": true,
+                "content": [{ "type": "text", "text": format!("lsp-mcp error: {e}") }] }
         }),
+        Ok(false) => not_ready_response(id),
+        Ok(true) => match dispatch_body(tool, &a, s) {
+            Ok(body) => ok(id, body),
+            Err(e) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "isError": true,
+                    "content": [{ "type": "text", "text": format!("lsp-mcp error: {e}") }] }
+            }),
+        },
     }
 }
 
@@ -285,6 +301,16 @@ mod tests {
         assert_eq!(parse_ready_secs(Some("notanum".into())), 90);
         assert_eq!(parse_ready_secs(Some("0".into())), 90); // 0 is meaningless → default
         assert_eq!(parse_ready_secs(Some("120".into())), 120);
+    }
+
+    #[test]
+    fn not_ready_response_is_iserror_with_retry_hint() {
+        let r = not_ready_response(&json!(7));
+        assert_eq!(r["id"], json!(7));
+        assert_eq!(r["result"]["isError"], json!(true));
+        let txt = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(txt.contains("indexing"), "{txt}");
+        assert!(txt.contains("retry"), "{txt}");
     }
 
     #[test]

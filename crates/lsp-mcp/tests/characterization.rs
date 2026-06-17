@@ -99,11 +99,17 @@ fn respawn_success_clears_evicted() {
         return;
     }
     let mut s = lsp_mcp::lsp::LspClient::start(&sample_repo(), None).unwrap();
-    s.ensure_ready(Duration::from_secs(120)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(120)).unwrap(),
+        "server not ready"
+    );
     s.evict();
     // After evict, the next ensure_ready respawns against the SAME (valid) repo and succeeds — assert the
     // evicted flag clears on success and the session resolves again (the happy respawn ordering).
-    s.ensure_ready(Duration::from_secs(120)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(120)).unwrap(),
+        "server not ready after respawn"
+    );
     assert!(
         !s.workspace_symbol("add").unwrap().is_empty(),
         "respawn re-indexed after evict"
@@ -134,7 +140,10 @@ fn respawn_failure_leaves_evicted_true() {
     let mut s =
         lsp_mcp::lsp::LspClient::start_with(&sample_repo(), lsp_mcp::lang::rust_ra_config(None))
             .unwrap();
-    s.ensure_ready(Duration::from_secs(120)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(120)).unwrap(),
+        "server not ready"
+    );
     s.evict();
     assert!(s.is_evicted_for_test(), "evict() set evicted=true");
     // Swap the cfg to the bogus one and force a respawn — spawn() of the missing binary must Err...
@@ -295,7 +304,10 @@ fn respawn_failure_reaps_new_child_no_leak() {
     let mut s =
         lsp_mcp::lsp::LspClient::start_with(&sample_repo(), lsp_mcp::lang::rust_ra_config(None))
             .unwrap();
-    s.ensure_ready(Duration::from_secs(120)).unwrap();
+    assert!(
+        s.ensure_ready(Duration::from_secs(120)).unwrap(),
+        "server not ready"
+    );
     s.evict();
     assert!(s.is_evicted_for_test(), "evict() set evicted=true");
     s.set_cfg_for_test(fake);
