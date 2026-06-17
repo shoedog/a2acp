@@ -4512,6 +4512,8 @@ cmd = "true"
     fn select_profile_explicit_go_finds_profile() {
         let toml = r#"
 default = "a"
+[server]
+addr = "127.0.0.1:8080"
 [[agents]]
 id = "a"
 cmd = "codex-acp"
@@ -4540,6 +4542,8 @@ cmd = "go build ./..."
     fn select_profile_explicit_bogus_errors() {
         let toml = r#"
 default = "a"
+[server]
+addr = "127.0.0.1:8080"
 [[agents]]
 id = "a"
 cmd = "codex-acp"
@@ -4566,6 +4570,8 @@ cmd = "cargo build --locked"
     fn select_profile_none_returns_option_none() {
         let toml = r#"
 default = "a"
+[server]
+addr = "127.0.0.1:8080"
 [[agents]]
 id = "a"
 cmd = "codex-acp"
@@ -4591,6 +4597,8 @@ cmd = "cargo build --locked"
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         let toml = r#"
 default = "a"
+[server]
+addr = "127.0.0.1:8080"
 [[agents]]
 id = "a"
 cmd = "codex-acp"
@@ -4615,6 +4623,8 @@ cmd = "cargo build --locked"
         let dir = tempfile::tempdir().unwrap();
         let toml = r#"
 default = "a"
+[server]
+addr = "127.0.0.1:8080"
 [[agents]]
 id = "a"
 cmd = "codex-acp"
