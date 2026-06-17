@@ -77,3 +77,11 @@ RUN /root/.local/bin/mise use -g -y python@3.12.13 uv@0.11.21 ruff@0.15.17 "npm:
 RUN set -eux; for t in python python3 uv ruff basedpyright basedpyright-langserver; do \
       ln -sf "$(/root/.local/bin/mise which "$t")" "/usr/local/bin/$t"; \
     done
+
+# JS/TS (LSP-MCP polyglot slice): typescript-language-server + typescript via `npm install -g` — NOT mise.
+# mise installs each npm package in an ISOLATED dir, so typescript-language-server cannot find `typescript`
+# as a sibling (tsserver discovery fails). `npm install -g` co-locates them in /usr/local/lib/node_modules
+# (siblings → tsls auto-discovers tsserver) AND puts REAL binaries on /usr/local/bin (env-trap compliant,
+# no shims — validated: tsls --stdio responds to `initialize` under a fully stripped env with no
+# tsserver.path needed). Pinned for reproducibility. node/npm are the image base.
+RUN npm install -g typescript-language-server@5.3.0 typescript@6.0.3

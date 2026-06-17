@@ -60,17 +60,18 @@ like python, NOT a bridge-machinery change.
   `--lang` match and `Lang::TypeScript => ts_config(&repo)?` to the config match; extend the
   `--lang must be …` error string.
 
-### Layer 2 — Toolchain image (mise, real-binary symlinks — same as python)
+### Layer 2 — Toolchain image (`npm install -g` for TS — a reasoned deviation from python's mise)
 
-`toolchain.Containerfile`: `mise use -g -y npm:typescript-language-server@<pin> npm:typescript@<pin>`
-(node is already the image base — but **verify `node`+`npm` are real binaries on the stripped PATH**, not
-just present for the base; the DoD shim guard covers them). Symlink the REAL binaries into `/usr/local/bin`:
-`typescript-language-server`, `tsc`, `tsserver` (NEVER mise shims — [[containerized-mcp-env-trap]]).
-typescript-language-server needs the `typescript` package (tsserver): `npm:typescript` global provides it.
-Impl-spike whether the server **auto-discovers** the global tsserver under the stripped env; if not, pass
-`initializationOptions.tsserver.path` (→ the real `tsserver.js`/`lib`) in `ts_config`'s `initialize_params`
-(it must be a literal in the mint params — `lsp_env` won't carry a path the agent strips). Also capture the
-resolved global `typescript` lib path at build time (it's version-pinned).
+`toolchain.Containerfile`: **`npm install -g typescript-language-server@5.3.0 typescript@6.0.3`** — NOT
+mise. **Why deviate (VALIDATED):** mise installs each npm package in an ISOLATED dir, so
+typescript-language-server can't find `typescript` as a sibling → tsserver discovery fails. `npm install
+-g` co-locates them in `/usr/local/lib/node_modules` (siblings → tsls auto-discovers tsserver, **no
+`tsserver.path` needed**) AND puts REAL binaries on `/usr/local/bin` (env-trap compliant, no shims — node
+is the image base). **Spiked:** under a fully stripped env (`PATH=/usr/local/bin:/usr/bin:/bin HOME=/root`),
+`typescript-language-server --stdio` responds to `initialize` with capabilities + no error, and
+`tsls/tsc/node/npm --version` all resolve. So `ts_config` needs no `initializationOptions.tsserver.path`
+and `lsp_env={}` is honest. (This satisfies the user's env-trap requirement — real binaries on PATH — which
+was the actual goal; mise's value was uniformity for python's *mixed* ecosystem, not pure-npm tooling.)
 
 ### Layer 3 — The `typescript` `[[languages]]` profile (both configs, mirrored)
 
