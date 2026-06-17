@@ -8,6 +8,19 @@ use crate::shape::render_hits;
 use serde_json::{json, Value};
 use std::io::BufReader;
 
+/// Readiness budget for `ensure_ready`, in seconds. `LSP_MCP_READY_SECS` overrides the default; a
+/// cold (even warm-cached) rust-analyzer cold index can exceed the old 30s. Pure for testing.
+fn parse_ready_secs(var: Option<String>) -> u64 {
+    var.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(90)
+}
+
+/// The configured readiness budget as a Duration.
+fn ready_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(parse_ready_secs(std::env::var("LSP_MCP_READY_SECS").ok()))
+}
+
 fn name_arg(a: &Value) -> Result<&str, Value> {
     a.get("name")
         .and_then(|v| v.as_str())
@@ -263,6 +276,15 @@ mod tests {
         assert!(line.contains("tool=references"), "{line}");
         assert!(line.contains("\"name\":\"add\""), "{line}");
         assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn parse_ready_secs_defaults_and_overrides() {
+        assert_eq!(parse_ready_secs(None), 90);
+        assert_eq!(parse_ready_secs(Some(String::new())), 90);
+        assert_eq!(parse_ready_secs(Some("notanum".into())), 90);
+        assert_eq!(parse_ready_secs(Some("0".into())), 90); // 0 is meaningless → default
+        assert_eq!(parse_ready_secs(Some("120".into())), 120);
     }
 
     #[test]
