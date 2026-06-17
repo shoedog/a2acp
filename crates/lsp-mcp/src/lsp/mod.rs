@@ -260,7 +260,64 @@ impl LspClient {
             }
             _ => {}
         }
+        // A LAZY server (tsserver) loads NO project until a file is opened → bootstrap-open one so
+        // `workspace/symbol` stops returning "No Project". No-op for RA/gopls/basedpyright (`bootstrap_exts`
+        // is empty — they index on init).
+        if !self.cfg.bootstrap_exts.is_empty() {
+            self.bootstrap_open();
+        }
         Ok(())
+    }
+
+    /// Open one project source file so a lazy server (tsserver) loads its project, then poll (bounded) until
+    /// `workspace/symbol` stops erroring with "No Project" — so the first nav sees a loaded project. The
+    /// settle clock is re-stamped from the `didOpen` (the project load starts now). No-op if no source file.
+    fn bootstrap_open(&mut self) {
+        let Some(path) = crate::lang::find_source_file(&self.repo, self.cfg.bootstrap_exts) else {
+            eprintln!(
+                "[lsp-mcp] bootstrap-open: no source file under {:?}; a lazy server may report No Project",
+                self.repo
+            );
+            return;
+        };
+        let text = match std::fs::read(&path) {
+            // bound the open: a multi-MB minified file would bloat the didOpen for no nav benefit.
+            Ok(b) if b.len() <= 4 * 1024 * 1024 => String::from_utf8_lossy(&b).into_owned(),
+            _ => return,
+        };
+        let uri = shape::file_uri(&path);
+        let lang_id = crate::lang::language_id_for(&path);
+        eprintln!(
+            "[lsp-mcp] bootstrap-open {} (languageId={lang_id}) to load the project",
+            path.display()
+        );
+        self.notify(
+            "textDocument/didOpen",
+            json!({ "textDocument": { "uri": uri, "languageId": lang_id, "version": 1, "text": text } }),
+        );
+        // Re-stamp the Ts settle clock from the didOpen (the lazy project load begins now).
+        if let crate::lang::Readiness::Ts(s) = &mut *self.ready.lock().unwrap() {
+            s.settled_at = Some(Instant::now());
+        }
+        // Poll until the project is loaded (workspace/symbol stops erroring) or a bound elapses.
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(20) {
+            match self.request(
+                "workspace/symbol",
+                json!({ "query": "" }),
+                Duration::from_secs(5),
+            ) {
+                Ok(_) => {
+                    eprintln!(
+                        "[lsp-mcp] bootstrap-open: project loaded in {:?}",
+                        t0.elapsed()
+                    );
+                    return;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(300)),
+            }
+        }
+        eprintln!("[lsp-mcp] bootstrap-open: project not confirmed loaded within 20s (continuing)");
     }
 
     /// Slice-A/test-compat: start with the Rust config (optional CARGO_TARGET_DIR), matching the old
@@ -821,6 +878,7 @@ mod tests {
             initialize_params: Box::new(|root| json!({ "rootUri": root })),
             post_init_config: None,
             new_readiness: Box::new(|| Readiness::RustRa(RustReady::default())),
+            bootstrap_exts: &[],
         };
         let dir = std::env::temp_dir();
         let res = LspClient::spawn(&dir, &cfg);

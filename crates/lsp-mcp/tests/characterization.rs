@@ -130,6 +130,7 @@ fn respawn_failure_leaves_evicted_true() {
         initialize_params: Box::new(|root| json!({ "rootUri": root })),
         post_init_config: None,
         new_readiness: Box::new(|| Readiness::RustRa(RustReady::default())),
+        bootstrap_exts: &[],
     };
     // Use the real-RA path to get a STARTED client, evict it, then point respawn at the bogus cfg so the
     // missing-binary spawn() errors while keeping the eviction-ordering code under test.
@@ -243,6 +244,7 @@ fn server_request_with_colliding_id_does_not_corrupt_pending() {
         initialize_params: Box::new(|root| json!({ "rootUri": root })),
         post_init_config: None,
         new_readiness: Box::new(|| Readiness::RustRa(RustReady::default())),
+        bootstrap_exts: &[],
     };
     // (a) start_with runs the handshake `initialize` (id 1). It returns Ok ONLY if initialize received
     //     its OWN response — proving the colliding server request did not corrupt pending id 1 (a drop
@@ -298,6 +300,7 @@ fn respawn_failure_reaps_new_child_no_leak() {
         initialize_params: Box::new(|root| json!({ "rootUri": root })),
         post_init_config: None,
         new_readiness: Box::new(|| Readiness::RustRa(RustReady::default())),
+        bootstrap_exts: &[],
     };
     // Start a healthy client, evict it (old child reaped → self.child == None), then point respawn at the
     // fake cfg whose spawn() SUCCEEDS but whose handshake FAILS.

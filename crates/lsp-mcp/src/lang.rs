@@ -306,6 +306,49 @@ pub struct LangServerConfig {
     pub post_init_config: Option<(String, Value)>,
     /// A fresh readiness machine for this language (one per spawn).
     pub new_readiness: Box<dyn Fn() -> Readiness + Send + Sync>,
+    /// Source-file extensions to bootstrap-OPEN after `initialized` (empty = no bootstrap). A LAZY server
+    /// (tsserver) loads NO project until a file is opened, so `workspace/symbol` returns "No Project" until
+    /// lsp-mcp `didOpen`s a project file. RustRa/gopls/basedpyright index on init → `&[]`.
+    pub bootstrap_exts: &'static [&'static str],
+}
+
+/// First source file under `repo` (bounded depth 3, skipping build/vendor/hidden dirs via
+/// [`EXCLUDED_SCAN_DIRS`]) whose extension is in `exts` — the file lsp-mcp bootstrap-opens to make a lazy
+/// server (tsserver) load its project. `None` if no match.
+pub fn find_source_file(repo: &Path, exts: &[&str]) -> Option<PathBuf> {
+    fn walk(dir: &Path, exts: &[&str], depth: u8) -> Option<PathBuf> {
+        if depth == 0 {
+            return None;
+        }
+        let rd = std::fs::read_dir(dir).ok()?;
+        let mut subdirs = Vec::new();
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if e.file_type().as_ref().map(|t| t.is_dir()).unwrap_or(false) {
+                if name.starts_with('.') || EXCLUDED_SCAN_DIRS.contains(&name.as_ref()) {
+                    continue;
+                }
+                subdirs.push(e.path());
+            } else if let Some(ext) = e.path().extension().and_then(|x| x.to_str()) {
+                if exts.contains(&ext) {
+                    return Some(e.path());
+                }
+            }
+        }
+        subdirs.iter().find_map(|d| walk(d, exts, depth - 1))
+    }
+    walk(repo, exts, 3)
+}
+
+/// LSP `languageId` for a source-file path (tsserver `didOpen`).
+pub fn language_id_for(path: &Path) -> &'static str {
+    match path.extension().and_then(|x| x.to_str()) {
+        Some("tsx") => "typescriptreact",
+        Some("jsx") => "javascriptreact",
+        Some("js") | Some("mjs") | Some("cjs") => "javascript",
+        _ => "typescript",
+    }
 }
 
 /// Rust / rust-analyzer config — reproduces the pre-refactor `spawn_ra`+`handshake` exactly.
@@ -330,6 +373,7 @@ pub fn rust_ra_config(target_cache: Option<&Path>) -> LangServerConfig {
         }),
         post_init_config: None,
         new_readiness: Box::new(|| Readiness::RustRa(RustReady::default())),
+        bootstrap_exts: &[],
     }
 }
 
@@ -578,6 +622,7 @@ pub fn pyright_config(
         }),
         post_init_config: Some(post),
         new_readiness: Box::new(|| Readiness::Pyright(SettleReady::default())),
+        bootstrap_exts: &[],
     })
 }
 
@@ -608,6 +653,7 @@ pub fn go_config(repo: &Path) -> anyhow::Result<LangServerConfig> {
         }),
         post_init_config: None,
         new_readiness: Box::new(|| Readiness::Gopls(SettleReady::default())),
+        bootstrap_exts: &[],
     })
 }
 
@@ -644,6 +690,8 @@ pub fn ts_config(repo: &Path) -> anyhow::Result<LangServerConfig> {
         }),
         post_init_config: None,
         new_readiness: Box::new(|| Readiness::Ts(SettleReady::default())),
+        // tsserver is LAZY: it loads no project until a file is opened → bootstrap-open one of these.
+        bootstrap_exts: &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
     })
 }
 
@@ -1083,5 +1131,22 @@ mod tests {
             matches!(ready, Readiness::Ts(_)),
             "TS uses Ts(SettleReady) readiness"
         );
+    }
+
+    #[test]
+    fn find_source_file_skips_node_modules_and_finds_ts() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(d.path().join("node_modules/pkg/index.ts"), "x").unwrap(); // excluded
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/svc.ts"), "x").unwrap();
+        let exts = ["ts", "tsx"];
+        let found = find_source_file(d.path(), &exts).unwrap();
+        assert!(found.ends_with("src/svc.ts"), "found {found:?}");
+        assert_eq!(
+            language_id_for(std::path::Path::new("a.tsx")),
+            "typescriptreact"
+        );
+        assert_eq!(language_id_for(std::path::Path::new("a.js")), "javascript");
     }
 }
