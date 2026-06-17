@@ -256,9 +256,17 @@ impl ContainerRwBackend {
             cancel_grace: self.cfg.cancel_grace,
             // :rw has its own reaper (this crate); the inner AcpBackend's :ro reaper stays off.
             container: None,
-            // Codex implementor MCP rides the container's codex-acp argv (`-c` args), NOT the ACP
-            // `mcpServers` param — so the inner backend's ACP-param MCP list stays empty (ADR-0028).
-            mcp: Vec::new(),
+            // MCP delivery to the inner CONTAINER agent (#1b):
+            //  - CodexNative: rides the codex-acp argv `-c mcp_servers.*` (rendered into `inner_args` above)
+            //    -> the inner backend's ACP-param list stays EMPTY (ADR-0028).
+            //  - Acp (claude): the inner AcpBackend mints `NewSessionRequest.mcpServers` from this list,
+            //    `{cwd}`-substituted at mint with this turn's clone -> in-container lsp/prism nav for claude.
+            //  - KiroNative: kiro honors neither channel for stdio MCP (settings file) -> not wired here.
+            mcp: if matches!(self.cfg.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
+                self.cfg.mcp.clone()
+            } else {
+                Vec::new()
+            },
         };
         let inner = match self.spawn.spawn(&program, &argv, acp).await {
             Ok(i) => i,
@@ -729,6 +737,7 @@ mod tests {
         fail: bool,
         fail_prompt: bool,
         last_argv: Mutex<Vec<String>>,
+        last_acp_mcp: Mutex<Vec<bridge_core::mcp::McpServerSpec>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
     }
     impl CountingSpawn {
@@ -738,6 +747,7 @@ mod tests {
                 fail,
                 fail_prompt: false,
                 last_argv: Mutex::new(vec![]),
+                last_acp_mcp: Mutex::new(vec![]),
                 last_inner: Mutex::new(None),
             })
         }
@@ -748,10 +758,11 @@ mod tests {
             &self,
             _program: &str,
             argv: &[String],
-            _cfg: AcpConfig,
+            cfg: AcpConfig,
         ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
             self.count.fetch_add(1, Ordering::SeqCst);
             *self.last_argv.lock().await = argv.to_vec();
+            *self.last_acp_mcp.lock().await = cfg.mcp.clone();
             if self.fail {
                 return Err(BridgeError::agent_crashed("boom"));
             }
@@ -934,6 +945,49 @@ mod tests {
             "args {{cwd}}->{canon}: {argv:?}"
         );
         assert!(!argv.iter().any(|a| a.contains("{cwd}")));
+        while stream.next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn acp_delivery_passes_mcp_to_inner_session_not_codex_args() {
+        // #1b: a claude (Acp-delivery) container_rw agent must deliver MCP via the inner AcpConfig.mcp
+        // (-> NewSessionRequest.mcpServers at mint), NOT via codex `-c` args. So the inner backend's
+        // ACP-param MCP list is populated AND no `-c mcp_servers.*` arg is appended.
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let mut cfg = cfg_with_mount(root);
+        cfg.cmd = "claude-agent-acp".into();
+        cfg.mcp_delivery = McpDelivery::Acp;
+        cfg.mcp = vec![McpServerSpec {
+            name: "lsp".into(),
+            command: "/usr/local/bin/lsp-mcp".into(),
+            args: vec![
+                "--repo".into(),
+                "{cwd}".into(),
+                "--lang".into(),
+                "auto".into(),
+            ],
+            env: vec![],
+        }];
+        let spawn = CountingSpawn::new(false);
+        let (reap, _) = counting_reap();
+        let be = ContainerRwBackend::new_with_hooks(cfg, spawn.clone(), "inst".into(), reap)
+            .await
+            .unwrap();
+        let s = SessionId::parse("s1").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let mut stream = be.prompt(&s, vec![]).await.unwrap();
+        let inner_mcp = spawn.last_acp_mcp.lock().await.clone();
+        assert_eq!(inner_mcp.len(), 1, "inner ACP session must get the lsp MCP");
+        assert_eq!(inner_mcp[0].name, "lsp");
+        assert_eq!(inner_mcp[0].command, "/usr/local/bin/lsp-mcp");
+        // NOT delivered via codex `-c` args.
+        let argv = spawn.last_argv.lock().await.clone();
+        assert!(
+            !argv.iter().any(|a| a.starts_with("mcp_servers.")),
+            "claude path must not append codex -c mcp args: {argv:?}"
+        );
         while stream.next().await.is_some() {}
     }
 
