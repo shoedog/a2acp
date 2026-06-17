@@ -71,7 +71,7 @@ forwards exactly like `CARGO_HOME` already did). No image rebuild, no code chang
 | gopls (Go) | yes | `GOMODCACHE`, `GOFLAGS` | symlinked `/usr/local/bin/gopls` |
 | rust-analyzer (Rust) | **no** (rustup proxy) | `CARGO_HOME`, `CARGO_NET_OFFLINE`, **`RUSTUP_HOME`** | rustup proxy on PATH (`/usr/local/cargo/bin`) |
 | basedpyright (Python) | node CLI | **`LSP_MCP_PYTHON_PATH`** (→ the warmed venv interpreter), `PYTHONDONTWRITEBYTECODE` | symlink `basedpyright`/`-langserver`; node already at `/usr/local/bin` |
-| typescript-language-server (JS/TS, future) | node CLI | (TBD — `tsserver`/`typescript.tsdk` pointer, node) | symlink the launcher; node on PATH |
+| typescript-language-server (JS/TS) | node CLI | **none** (`lsp_env={}`) — deps resolve positionally via `/node_modules`; swap the server via `LSP_MCP_TS_SERVER` in `lsp_env` | **`npm install -g`** (NOT mise): mise isolates each pkg so tsls can't find `typescript` as a sibling; npm-global co-locates them in `/usr/local/lib/node_modules` + puts real `typescript-language-server`/`tsc`/`tsserver` on `/usr/local/bin`. Also LAZY → lsp-mcp bootstrap-`didOpen`s a file. |
 
 **When adding a language, ask:** (1) Is the server a proxy/shim or a direct binary? A proxy/shim needs its
 resolver env in `lsp_env`. (2) What does the server read at startup that lives in the image `ENV`? Put it
