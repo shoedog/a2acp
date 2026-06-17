@@ -40,6 +40,13 @@ pub struct ImplementCheckpoint {
     #[serde(default)]
     pub forced_depth: Option<String>,
 
+    /// The language selection resolved at start, so resume re-selects the SAME profile instead of
+    /// re-detecting. `None` = a pre-4b checkpoint (re-detect on resume, backward-compat); `Some("none")`
+    /// = a bare `--lang none` run (stay bare); `Some(id)` = the chosen profile id ("rust"/"go").
+    /// `#[serde(default)]` so schema-version-1 checkpoints read as None.
+    #[serde(default)]
+    pub resolved_lang: Option<String>,
+
     pub phase: ImplementPhase,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -215,6 +222,7 @@ mod tests {
             loop_max_attempts: 3,
             attempt_next: 2,
             forced_depth: None,
+            resolved_lang: None,
             phase: ImplementPhase::InLoop,
             created_at_ms: 1,
             updated_at_ms: 2,
@@ -320,6 +328,26 @@ mod tests {
         save_checkpoint(td.path(), &ck).unwrap();
         let back = load_checkpoint(td.path()).unwrap();
         assert_eq!(back.forced_depth.as_deref(), Some("light"));
+    }
+
+    #[test]
+    fn checkpoint_round_trips_resolved_lang() {
+        // A checkpoint with resolved_lang: Some("go") serializes and deserializes back to Some("go").
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join(".git")).unwrap();
+        let mut ck = sample(td.path());
+        ck.resolved_lang = Some("go".into());
+        save_checkpoint(td.path(), &ck).unwrap();
+        let back = load_checkpoint(td.path()).unwrap();
+        assert_eq!(back.resolved_lang.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn checkpoint_resolved_lang_defaults_none_for_old_json() {
+        // An older checkpoint JSON without the resolved_lang key decodes with resolved_lang == None.
+        let old = r#"{"schema_version":1,"resume_id":"x","task_id":"x","task_brief":"b","source_repo":"/s","clone_path":"/c","config_path":"/cfg","branch":"br","base_ref":null,"base_commit":"abc","current_commit":null,"original_message":null,"edit_workflow":"e","fix_workflow":"f","loop_max_attempts":3,"attempt_next":1,"phase":"InLoop","created_at_ms":0,"updated_at_ms":0}"#;
+        let cp: ImplementCheckpoint = serde_json::from_str(old).unwrap();
+        assert_eq!(cp.resolved_lang, None);
     }
 
     #[test]

@@ -918,6 +918,7 @@ mod git_tests {
             loop_max_attempts: 1,
             attempt_next: 1,
             forced_depth: None,
+            resolved_lang: None,
             phase,
             created_at_ms: 0,
             updated_at_ms: 0,

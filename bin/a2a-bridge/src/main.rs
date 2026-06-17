@@ -871,6 +871,16 @@ fn select_profile(
     }
 }
 
+/// Convert the persisted `resolved_lang` from a checkpoint back to a `LangArg` for `select_profile`.
+/// `None` (pre-4b checkpoint) -> re-detect for backward compat; `Some("none")` -> bare run; `Some(id)` -> explicit.
+fn resume_lang_arg(resolved_lang: &Option<String>) -> LangArg {
+    match resolved_lang.as_deref() {
+        None => LangArg::Auto,
+        Some("none") => LangArg::None,
+        Some(id) => LangArg::Explicit(id.to_string()),
+    }
+}
+
 /// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
 /// fails (a runner error becomes a failed result); a config error reduces to `ConfigError`.
 /// Returns `Skipped` immediately when `profile` is `None` (`--lang none`).
@@ -1866,6 +1876,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     loop_max_attempts: loop_cfg.max_attempts,
                     attempt_next: 1,
                     forced_depth: depth.to_forced_str(),
+                    resolved_lang: Some(
+                        profile
+                            .as_ref()
+                            .map(|p| p.id.clone())
+                            .unwrap_or_else(|| "none".to_string()),
+                    ),
                     phase: implement_resume::ImplementPhase::FirstCommitCreated,
                     created_at_ms: implement_resume::now_ms(),
                     updated_at_ms: implement_resume::now_ms(),
@@ -1981,8 +1997,9 @@ async fn implement_resume_cmd(
     })?;
     let fix_graph = wf_map.get(&fix_wf_id).cloned();
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
-    let profile = select_profile(&cfg, &LangArg::Auto, &ck.source_repo)
-        .map_err(|e| format!("implement --resume: language profile: {e}"))?;
+    let resume_lang = resume_lang_arg(&ck.resolved_lang);
+    let profile = select_profile(&cfg, &resume_lang, &ck.source_repo)
+        .map_err(|e| format!("implement: language profile (resume): {e}"))?;
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
     let mut snapshot = cfg
@@ -4766,6 +4783,16 @@ cmd = "cargo build --locked"
         assert!(
             !refine.contains("VERDICT"),
             "review-implement-refine must not emit a VERDICT (synth decides)"
+        );
+    }
+
+    #[test]
+    fn resume_lang_arg_maps_all_cases() {
+        assert_eq!(super::resume_lang_arg(&None), LangArg::Auto);
+        assert_eq!(super::resume_lang_arg(&Some("none".into())), LangArg::None);
+        assert_eq!(
+            super::resume_lang_arg(&Some("rust".into())),
+            LangArg::Explicit("rust".into())
         );
     }
 }
