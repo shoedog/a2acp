@@ -331,10 +331,97 @@ mapping is stable, so we need an explicit primitive:
 - **UPDATE-MINIMAL (Opus #1):** `Update` only grows variants a single ACP turn can emit (Text/Permission/
   Usage/Done); everything else is journal-level, adapted inside `AcpBackend`.
 
-## Convergence status
+## Convergence status (pre-protocol-grounding)
 **Architecture CONVERGED** across 2 codex-xhigh passes + 2 Opus lenses (pass-0 decomposition → pass-1 4-seam
 correction → pass-2 detailed design, all `sound-with-changes`, no open contradictions). Remaining work is
-**per-slice spec→plan→implement**, starting with **Slice 0** (the substrate: core `OrchEvent`/`OrchResult`/
-`SessionHandleId`/`UsageSnapshot` types + the additive event-path adapters + un-alias contextId from task
-id + executor forwards permission/usage additively). No further architecture pass is required unless slicing
-surfaces a redesign-forcing issue.
+**per-slice spec→plan→implement**, starting with **Slice 0**. The ACP-protocol grounding below (PASS 2.5)
+adds refinements that must be folded before slicing, then re-reviewed (PASS 3).
+
+---
+
+# PASS 2.5 — ACP v1 protocol grounding (folded 2026-06-17)
+
+Grounded the design against the actual ACP v1 spec (full quick-reference: `docs/references/acp-protocol-v1.md`).
+Several facts **refine** the pass-2 design — chosen for the long-term foundation even where they add work now.
+The bridge is the **Client**; everything optional is **capability-gated** (the agent advertises it at
+`initialize`, and the bridge ALREADY captures `agent_capabilities` `acp_backend.rs:234/970/1060`).
+
+## P-1 — Reseed is `set_config_option`/`set_mode`, NOT (only) reset (refines CORRECTION-3 / OPEN-4)
+ACP supports **mid-session** config change — `session/set_config_option {sessionId,configId,value}`
+(categories `mode`/`model`/`thought_level`) **and** `session/set_mode` (deprecated→config-options),
+changeable **idle OR generating, no new session**. And the bridge **already implements both**
+(`set_config_option_request`/`set_mode_request`, golden-frame-tested; codex emits `config_option_update` with
+all three categories — corpus `codex-acp.jsonl`). **So a mismatched-model/effort `continue` should FIRST
+attempt `set_config_option`/`set_mode` on the warm session** (capability/option-gated), and only fall back to
+`clear`/`compact`-reset if the agent doesn't advertise that option or rejects it (memory: kiro uses `models`+
+`session/set_model`; mode set can hard-fail). CORRECTION-3's "reject mismatched continue" becomes
+"**reconcile via config-option if advertised, else typed-error → clear/compact**." The `config_option_update`
+notification (agent-initiated, full-state-each-time, dependent cascades) becomes an `OrchEventKind` so the
+orchestrator sees model/effort/mode drift.
+
+## P-2 — Durability has a capability-gated upgrade path (refines OPEN-2)
+ACP defines a full capability-gated session-management surface: `session/load` (gated `loadSession`;
+**replays full history** as `session/update` chunks → the agent persists context server-side),
+`session/resume` (gated `sessionCapabilities.resume`; reconnect **without** replay), `session/close` (gated
+`.close`; clean teardown of a **live** session), `session/delete {sessionId}` (gated `.delete`; purge
+persisted **history** — orthogonal to close), and `session/list {cwd?,cursor?}` → `{sessions[],nextCursor?}`
+(gated `.list`; enumerate persisted sessions `{sessionId,cwd,title?,updatedAt?,…}` — a discovery surface).
+**None are implemented in the bridge today** (capability captured, unused). So: the **default stays** "warm
+table in-memory → post-restart `continue` returns typed `SessionExpired`" (OPEN-2) — BUT the `SessionManager`
+must **record `loadSession`/`resume`/`close`/`delete`/`list` capabilities** and the design must leave the
+documented hooks: post-restart, if `loadSession` is advertised, `continue` MAY rehydrate via `session/list`
+(discover) + `session/load` (replay) instead of failing; `release` SHOULD prefer `session/close` (live
+teardown) when advertised + optionally `session/delete` (purge history), else a bare process reap. Implement
+capability *recording* now (foundation); the load/resume/close/delete/list *actions* are deferred slices
+(and map cleanly onto S4 tool operations).
+
+## P-3 — Richer `session/update` variants the bridge drops today (refines OPEN-1)
+The bridge maps only `agent_message_chunk`→Text and drops the rest (`acp_backend.rs:1480/1490`). ACP streams
+**`plan`** (entries `{content, priority:high|medium|low, status:pending|in_progress|completed}`,
+**complete-replacement** semantics), **`tool_call`** / **`tool_call_update`** (`{toolCallId, title,
+kind:read|edit|delete|move|search|execute|think|fetch|other, status:pending|in_progress|completed|failed,
+content:{content|diff{path,oldText,newText}|terminal{terminalId}}, locations:[{path,line?}], rawInput,
+rawOutput}`), `usage_update`, `current_mode_update`, `config_option_update`, `available_commands_update`. Add
+these as first-class `OrchEventKind` variants (`Plan`, `ToolCall`, `ToolCallUpdate`, plus the config/mode/
+commands updates) — they are the substance of C3/C5 observability and B2 cost/diff visibility. `Plan`'s
+complete-replacement rule is a semantic the journal must preserve (replace, not append).
+
+## P-4 — Stop reasons → `OrchResult` status (refines OPEN-1 result)
+The `session/prompt` response `StopReason` ∈ `end_turn | max_tokens | max_turn_requests | refusal |
+cancelled`. `OrchResultPayload::Turn { stop_reason }` carries it verbatim; map to `TerminalStatus`
+(`end_turn`→Completed; `cancelled`→Canceled; `refusal`/`max_*`→Failed-with-reason). **`max_tokens` is the
+A4 threshold's failure mode** (window exhausted mid-turn) — the pre-task threshold-warn exists precisely to
+avoid hitting it; surface it distinctly, not as a generic failure.
+
+## P-5 — Permission outcome mapping confirmed (confirms OPEN-3)
+`session/request_permission {sessionId, toolCall, options[]}` → outcome `cancelled | selected{optionId}`;
+option kinds `allow_once|allow_always|reject_once|reject_always`. This **confirms** OPEN-3: `Modify` =
+select a specific offered `optionId` (no arbitrary arg-mutation — there is no protocol affordance for it);
+`Approve`→an allow option, `Deny`→a reject option, timeout/`Escalate`-default→`cancelled` or `reject_once`.
+A `session/cancel` mid-permission MUST resolve the pending decision with `cancelled` (ties OPEN-3's oneshot to
+the cancel path). Inject parts use ACP **content blocks** (text/image/audio/resource/resource_link), not raw
+strings — `InjectRequest` should carry `Vec<ContentBlock>`, gated by `promptCapabilities`.
+
+## P-6 — Surfaces & transport (confirms S4)
+Transport = stdio, **newline-delimited** JSON-RPC, no embedded newlines (exactly the bridge's lsp-mcp framing
+fix). The agent also exposes `available_commands_update` (slash commands `{name,description,input.hint}`,
+invoked as `/name` text parts) — S4's MCP/CLI surface MAY forward these as first-class operations later
+(deferred). fs/terminal client methods (capability-gated, agent→client) are the controlled-environment seam
+for E1/E2 containerization — note, not in the core slices.
+
+## Net effect on the slices
+- **Slice 0** additionally: add `Plan`/`ToolCall`/`ToolCallUpdate`/config/mode/commands `OrchEventKind`
+  variants + stop-reason→`TerminalStatus` mapping; record `agent_capabilities` into the (forthcoming)
+  `SessionManager` shape. (Still no consumers.)
+- **Slice 1** additionally: `SessionManager` records `loadSession`/`resume`/`close`/`delete` + config-option
+  capabilities; `continue` reconciles model/effort/mode via `set_config_option`/`set_mode` (P-1) before any
+  typed-error.
+- **Slice 2** additionally: `release` prefers `session/close` when advertised; document (don't yet build) the
+  `session/load` rehydration path for post-restart `continue`.
+- **Deferred (new):** `session/load`/`resume` rehydration; slash-command forwarding; fs/terminal surface.
+
+## Convergence status
+Architecture converged through pass-2; **PASS 2.5 protocol grounding folded** → re-review in **PASS 3**
+(full deep codex-xhigh + Opus) + a **targeted narrow pass** on the adjudicated divergences (OnceCell vs
+new-SessionId reset; `OrchEvent` Ser/De vs a separate `OrchCommand`) and the 3 cross-cutting invariants
+(SEQ-AUTHORITY, WATCHDOG-VS-PERMISSION, UPDATE-MINIMAL). Slice 0 begins after PASS 3 converges.
