@@ -624,8 +624,15 @@ mod tests {
             network: "net".into(),
             proxy: "http://p:8888".into(),
         };
-        let (prog, argv) =
-            compose_warm_fetch("docker", "img:latest", "/clone", &binding, &p.fetch_cmd, &e, false);
+        let (prog, argv) = compose_warm_fetch(
+            "docker",
+            "img:latest",
+            "/clone",
+            &binding,
+            &p.fetch_cmd,
+            &e,
+            false,
+        );
         assert_eq!(prog, "docker");
         // EXACT byte-for-byte: pin the WHOLE argv (order + content) so a positional drift can't slip
         // through (the env -e's land AFTER the proxy -e's and BEFORE the clone -v, then the cache -v).
@@ -661,11 +668,28 @@ mod tests {
     #[test]
     fn compose_warm_fetch_read_only_mounts_work_ro() {
         let p = bridge_core::profile::rust_profile();
-        let e = WarmEgress { network: "n".into(), proxy: "http://p:8888".into() };
+        let e = WarmEgress {
+            network: "n".into(),
+            proxy: "http://p:8888".into(),
+        };
         let binding = p.cache_binding(bridge_core::profile::CacheCtx::Fetch, "vol", "");
-        let (_prog, argv) = compose_warm_fetch("docker", "img:latest", "/clone", &binding, &p.fetch_cmd, &e, true);
-        assert!(argv.iter().any(|a| a == "/clone:/work:ro"), "expected :ro work mount, got {argv:?}");
-        assert!(!argv.iter().any(|a| a == "/clone:/work"), "must not also mount rw");
+        let (_prog, argv) = compose_warm_fetch(
+            "docker",
+            "img:latest",
+            "/clone",
+            &binding,
+            &p.fetch_cmd,
+            &e,
+            true,
+        );
+        assert!(
+            argv.iter().any(|a| a == "/clone:/work:ro"),
+            "expected :ro work mount, got {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "/clone:/work"),
+            "must not also mount rw"
+        );
     }
 
     #[test]
