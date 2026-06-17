@@ -608,6 +608,13 @@ enum ImplementMode {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum LangArg {
+    Auto,
+    Explicit(String),
+    None,
+}
+
 struct ImplementArgs {
     mode: ImplementMode,
     config: PathBuf,
@@ -617,6 +624,8 @@ struct ImplementArgs {
     onto: Option<String>,
     /// `--depth auto|light|standard|thorough`: None means use `[review].default_depth`.
     depth: Option<review::Depth>,
+    /// `--lang auto|none|<id>`: language profile selection for warm+verify.
+    lang: LangArg,
 }
 
 const IMPLEMENT_USAGE: &str = "\
@@ -628,6 +637,7 @@ usage: a2a-bridge implement <task> --repo <path> [--config <path>] [--base-ref <
   --base-ref      branch/SHA to start from (default: the repo HEAD)
   --workflow <id> the edit workflow (default: implement-edit)
   --depth         review depth: auto|light|standard|thorough (default: [review].default_depth, else auto)
+  --lang          language profile: auto|none|<id> (default: auto; auto detects from repo markers)
   --resume <id>   resume a stranded run by its <id> (the clone dir name)
 Clones --repo, runs the warm containerized impl agent (edit+fix turns share one container+session),
 verifies, reviews the diff, and hands off a branch to merge.";
@@ -682,6 +692,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
             merge,
             onto,
             depth,
+            lang: LangArg::Auto,
         });
     }
 
@@ -699,6 +710,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     let mut merge = false;
     let mut onto = None;
     let mut depth: Option<review::Depth> = None;
+    let mut lang = LangArg::Auto;
     while let Some(f) = iter.next() {
         match f.as_str() {
             "--merge" => merge = true,
@@ -737,6 +749,14 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
                 let val = iter.next().ok_or("implement: --depth needs a value")?;
                 depth = Some(review::Depth::parse_flag(val.as_str())?);
             }
+            "--lang" => {
+                let val = iter.next().ok_or("implement: --lang needs a value")?;
+                lang = match val.as_str() {
+                    "auto" => LangArg::Auto,
+                    "none" => LangArg::None,
+                    s => LangArg::Explicit(s.to_string()),
+                };
+            }
             other => {
                 return Err(format!("implement: unknown flag {other:?}\n{IMPLEMENT_USAGE}").into());
             }
@@ -755,6 +775,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
         merge,
         onto,
         depth,
+        lang,
     })
 }
 
@@ -815,23 +836,58 @@ fn resolve_impl_identity(
     Ok(entry)
 }
 
-fn pick_rust_profile(
+fn select_profile(
     cfg: &config::RegistryConfig,
-) -> Result<bridge_core::profile::LanguageProfile, config::ConfigError> {
-    cfg.language_profiles()?
-        .into_iter()
-        .find(|p| p.id == "rust")
-        .ok_or_else(|| config::ConfigError::Registry("no [[languages]] id=\"rust\" profile".into()))
+    lang: &LangArg,
+    repo: &std::path::Path,
+) -> Result<Option<bridge_core::profile::LanguageProfile>, config::ConfigError> {
+    let profiles = cfg.language_profiles()?;
+    let by_id = |id: &str| profiles.iter().find(|p| p.id == id).cloned();
+    match lang {
+        LangArg::None => Ok(None),
+        LangArg::Explicit(id) => by_id(id).map(Some).ok_or_else(|| {
+            let ids: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+            config::ConfigError::Registry(format!(
+                "--lang {id:?}: no [[languages]] profile with that id; configured: {ids:?}"
+            ))
+        }),
+        LangArg::Auto => match lsp_mcp::lang::detect(repo) {
+            lsp_mcp::lang::Detection::Detected(l) => by_id(l.as_str()).map(Some).ok_or_else(|| {
+                config::ConfigError::Registry(format!(
+                    "detected {} but no [[languages]] id={:?} profile; add one or pass --lang none",
+                    l.as_str(),
+                    l.as_str()
+                ))
+            }),
+            lsp_mcp::lang::Detection::None => Err(config::ConfigError::Registry(format!(
+                "could not detect a language at {repo:?}; pass --lang <id|none> (configured: {:?})",
+                profiles.iter().map(|p| p.id.as_str()).collect::<Vec<_>>()
+            ))),
+            lsp_mcp::lang::Detection::Ambiguous => Err(config::ConfigError::Registry(format!(
+                "ambiguous repo root at {repo:?} (multiple language markers); pass --lang <id|none> (configured: {:?})",
+                profiles.iter().map(|p| p.id.as_str()).collect::<Vec<_>>()
+            ))),
+        },
+    }
 }
 
 /// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
 /// fails (a runner error becomes a failed result); a config error reduces to `ConfigError`.
+/// Returns `Skipped` immediately when `profile` is `None` (`--lang none`).
 fn run_verify_step(
     verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
-    profile: &bridge_core::profile::LanguageProfile,
+    profile: Option<&bridge_core::profile::LanguageProfile>,
     clone_cwd: &bridge_core::SessionCwd,
     repo: &std::path::Path,
 ) -> verify::VerifyOutcome {
+    let profile = match profile {
+        None => {
+            return verify::VerifyOutcome::Skipped {
+                reason: "--lang none".into(),
+            }
+        }
+        Some(p) => p,
+    };
     match verify_cfg {
         None => verify::VerifyOutcome::NotConfigured,
         Some(Err(e)) => {
@@ -847,32 +903,36 @@ fn run_verify_step(
                 profile.verify_commands.len(),
                 image
             );
-            let verdict = verify::run_verify(
+            let outcome = verify::run_verify(
                 vcfg,
-                profile,
+                Some(profile),
                 clone_cwd,
                 &cache_vol,
                 &verify::docker_runner,
                 16 * 1024,
             );
-            for r in &verdict.results {
-                if !r.ok {
-                    eprintln!("[implement] verify: {} failed:\n{}", r.name, r.output);
+            if let verify::VerifyOutcome::Ran(ref verdict) = outcome {
+                for r in &verdict.results {
+                    if !r.ok {
+                        eprintln!("[implement] verify: {} failed:\n{}", r.name, r.output);
+                    }
                 }
             }
-            verify::VerifyOutcome::Ran(verdict)
+            outcome
         }
     }
 }
 
 /// Warm the impl-lsp dep cache through verify's registries-only egress. Best-effort: failures degrade
 /// in-container nav but never block the implement flow. Returns the cache name on success for later mounts.
+/// Returns `None` immediately when `profile` is `None` (`--lang none`).
 fn warm_lsp_deps_step(
     verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
-    profile: &bridge_core::profile::LanguageProfile,
+    profile: Option<&bridge_core::profile::LanguageProfile>,
     repo: &std::path::Path,
     clone: &std::path::Path,
 ) -> Option<String> {
+    let profile = profile?;
     let warn = |reason: String| {
         eprintln!(
             "[implement] lsp warm-deps skipped/failed: {reason} — in-container nav will be workspace-only"
@@ -1210,7 +1270,7 @@ async fn run_review_step(
 /// lifetime; `fix` is only called when `fix_graph` is `Some` (the loop guards with `fix_available`).
 struct ProdEffects<'a> {
     verify_cfg: &'a Option<Result<config::VerifyConfig, config::ConfigError>>,
-    profile: &'a bridge_core::profile::LanguageProfile,
+    profile: Option<&'a bridge_core::profile::LanguageProfile>,
     review_cfg: &'a Option<Result<config::ReviewConfig, config::ConfigError>>,
     wf_map: &'a std::collections::HashMap<
         bridge_core::ids::WorkflowId,
@@ -1307,7 +1367,7 @@ async fn build_warm_impl(
     task_id: &str,
     session_suffix: Option<&str>,
     impl_lsp_cache_vol: Option<&str>,
-    profile: &bridge_core::profile::LanguageProfile,
+    profile: Option<&bridge_core::profile::LanguageProfile>,
     repo: &std::path::Path,
 ) -> Result<WarmImpl, BoxError> {
     let impl_entry =
@@ -1329,8 +1389,10 @@ async fn build_warm_impl(
     let impl_lsp_target_vol =
         verify::cache_volume_name("a2a-impl-lsp-target", &target_canon.to_string_lossy());
     if let Some(cache) = impl_lsp_cache_vol {
-        let lsp = profile.cache_binding(bridge_core::profile::CacheCtx::Lsp, cache, "");
-        ccfg.sandbox.volumes.extend(lsp.mounts);
+        if let Some(p) = profile {
+            let lsp = p.cache_binding(bridge_core::profile::CacheCtx::Lsp, cache, "");
+            ccfg.sandbox.volumes.extend(lsp.mounts);
+        }
     }
     ccfg.sandbox
         .volumes
@@ -1392,7 +1454,7 @@ async fn run_warm_loop(
     impl_session: &bridge_core::ids::SessionId,
     clone_cwd: &bridge_core::SessionCwd,
     verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
-    profile: &bridge_core::profile::LanguageProfile,
+    profile: Option<&bridge_core::profile::LanguageProfile>,
     review_cfg: &Option<Result<config::ReviewConfig, config::ConfigError>>,
     wf_map: &std::collections::HashMap<
         bridge_core::ids::WorkflowId,
@@ -1505,6 +1567,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let merge_requested = a.merge;
     let onto = a.onto.clone();
     let depth = a.depth;
+    let lang = a.lang;
     let (task, repo, base_ref, workflow) = match a.mode {
         ImplementMode::Fresh {
             task,
@@ -1620,8 +1683,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let fix_graph = wf_map.get(&loop_cfg.fix_workflow).cloned();
     // B2b-2: parse [verify] NOW, before into_snapshot moves cfg. Owned + Clone, survives the move.
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
-    let profile =
-        pick_rust_profile(&cfg).map_err(|e| format!("implement: language profile: {e}"))?;
+    let profile = select_profile(&cfg, &lang, &repo)
+        .map_err(|e| format!("implement: language profile: {e}"))?;
     // B2b-3a: parsed pre-commit (beside verify).
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
     // ADR-0027: parsed pre-move (--merge sugar).
@@ -1678,7 +1741,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         instance_id: instance_id.clone(),
     };
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &profile, &repo, &clone);
+    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &repo, &clone);
 
     // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
     // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
@@ -1695,7 +1758,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         &task_id,
         None,
         impl_lsp_cache_vol.as_deref(),
-        &profile,
+        profile.as_ref(),
         &repo,
     )
     .await?;
@@ -1832,7 +1895,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 &impl_session,
                 &clone_cwd,
                 &verify_cfg,
-                &profile,
+                profile.as_ref(),
                 &review_cfg,
                 &wf_map,
                 &executor,
@@ -1918,7 +1981,7 @@ async fn implement_resume_cmd(
     })?;
     let fix_graph = wf_map.get(&fix_wf_id).cloned();
     let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
-    let profile = pick_rust_profile(&cfg)
+    let profile = select_profile(&cfg, &LangArg::Auto, &ck.source_repo)
         .map_err(|e| format!("implement --resume: language profile: {e}"))?;
     let review_cfg = cfg.review.as_ref().map(|t| t.to_config());
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
@@ -1960,7 +2023,8 @@ async fn implement_resume_cmd(
     };
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, &profile, &ck.source_repo, &clone);
+    let impl_lsp_cache_vol =
+        warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &ck.source_repo, &clone);
     let suffix = format!("r{}", implement::nonce(6));
     let warm_impl = build_warm_impl(
         &graph,
@@ -1973,7 +2037,7 @@ async fn implement_resume_cmd(
         &ck.task_id,
         Some(&suffix),
         impl_lsp_cache_vol.as_deref(),
-        &profile,
+        profile.as_ref(),
         &ck.source_repo,
     )
     .await?;
@@ -2045,7 +2109,7 @@ async fn implement_resume_cmd(
         &impl_session,
         &clone_cwd,
         &verify_cfg,
-        &profile,
+        profile.as_ref(),
         &review_cfg,
         &wf_map,
         &executor,
@@ -4069,7 +4133,12 @@ cmd = "true"
 "#;
         let cfg = config::RegistryConfig::parse(toml).expect("parses");
         let verify_cfg = cfg.verify.as_ref().map(|t| t.to_config());
-        let profile = pick_rust_profile(&cfg).expect("rust profile");
+        let profile = select_profile(
+            &cfg,
+            &LangArg::Explicit("rust".into()),
+            std::path::Path::new("/"),
+        )
+        .expect("profile");
         let snapshot = cfg.into_snapshot().expect("snapshots");
         assert!(
             snapshot.allowed_cmds.iter().any(|c| c == "podman")
@@ -4079,7 +4148,7 @@ cmd = "true"
         let gated = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
         let outcome = run_verify_step(
             &gated,
-            &profile,
+            profile.as_ref(),
             &bridge_core::SessionCwd::parse("/tmp").unwrap(),
             std::path::Path::new("/tmp"),
         );
@@ -4414,6 +4483,157 @@ cmd = "true"
             .map(|s| s.to_string())
             .collect();
         assert!(super::parse_implement_args(&bad).is_err());
+    }
+
+    #[test]
+    fn parse_implement_args_lang_flag() {
+        let a = |extra: &[&str]| -> Vec<String> {
+            let mut v = vec!["do X".to_string(), "--repo".to_string(), "/r".to_string()];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            v
+        };
+        let p = super::parse_implement_args(&a(&["--lang", "go"])).unwrap();
+        assert_eq!(p.lang, LangArg::Explicit("go".into()));
+        let p = super::parse_implement_args(&a(&["--lang", "none"])).unwrap();
+        assert_eq!(p.lang, LangArg::None);
+        let p = super::parse_implement_args(&a(&[])).unwrap();
+        assert_eq!(p.lang, LangArg::Auto);
+        // --resume must NOT accept --lang (leaves it erroring on unknown flags)
+        assert!(super::parse_implement_args(&[
+            "--resume".into(),
+            "x".into(),
+            "--lang".into(),
+            "go".into(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn select_profile_explicit_go_finds_profile() {
+        let toml = r#"
+default = "a"
+[[agents]]
+id = "a"
+cmd = "codex-acp"
+[[languages]]
+id = "go"
+fetch = "go mod download"
+warm_cache = "a2a-impl-lsp-cache-go"
+dep_cache_path = "/gopath"
+verify_cache_path = "/cache"
+[[languages.verify]]
+name = "build"
+cmd = "go build ./..."
+"#;
+        let cfg = config::RegistryConfig::parse(toml).expect("parses");
+        let p = super::select_profile(
+            &cfg,
+            &LangArg::Explicit("go".into()),
+            std::path::Path::new("/"),
+        )
+        .expect("ok");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().id, "go");
+    }
+
+    #[test]
+    fn select_profile_explicit_bogus_errors() {
+        let toml = r#"
+default = "a"
+[[agents]]
+id = "a"
+cmd = "codex-acp"
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "a2a-impl-lsp-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/cache"
+[[languages.verify]]
+name = "build"
+cmd = "cargo build --locked"
+"#;
+        let cfg = config::RegistryConfig::parse(toml).expect("parses");
+        let result = super::select_profile(
+            &cfg,
+            &LangArg::Explicit("bogus".into()),
+            std::path::Path::new("/"),
+        );
+        assert!(result.is_err(), "bogus id must error");
+    }
+
+    #[test]
+    fn select_profile_none_returns_option_none() {
+        let toml = r#"
+default = "a"
+[[agents]]
+id = "a"
+cmd = "codex-acp"
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "a2a-impl-lsp-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/cache"
+[[languages.verify]]
+name = "build"
+cmd = "cargo build --locked"
+"#;
+        let cfg = config::RegistryConfig::parse(toml).expect("parses");
+        let result =
+            super::select_profile(&cfg, &LangArg::None, std::path::Path::new("/")).expect("ok");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn select_profile_auto_detects_rust_from_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let toml = r#"
+default = "a"
+[[agents]]
+id = "a"
+cmd = "codex-acp"
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "a2a-impl-lsp-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/cache"
+[[languages.verify]]
+name = "build"
+cmd = "cargo build --locked"
+"#;
+        let cfg = config::RegistryConfig::parse(toml).expect("parses");
+        let result = super::select_profile(&cfg, &LangArg::Auto, dir.path()).expect("ok");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "rust");
+    }
+
+    #[test]
+    fn select_profile_auto_empty_dir_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"
+default = "a"
+[[agents]]
+id = "a"
+cmd = "codex-acp"
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "a2a-impl-lsp-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/cache"
+[[languages.verify]]
+name = "build"
+cmd = "cargo build --locked"
+"#;
+        let cfg = config::RegistryConfig::parse(toml).expect("parses");
+        let result = super::select_profile(&cfg, &LangArg::Auto, dir.path());
+        assert!(
+            result.is_err(),
+            "empty dir (no language markers) must error"
+        );
     }
 
     #[test]

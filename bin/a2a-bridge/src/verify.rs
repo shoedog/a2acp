@@ -104,6 +104,11 @@ pub enum VerifyOutcome {
     /// The step did not run to completion (e.g. a pre-verify worktree reset failed) — the loop sentinel +
     /// catch-all so the always-print hand-off has a defined value. (B2b-3b.)
     Incomplete,
+    /// The user explicitly opted out via `--lang none`; distinct from NotConfigured so the hand-off shows
+    /// SKIPPED rather than "not configured".
+    Skipped {
+        reason: String,
+    },
 }
 
 /// PURE. The hand-off suffix (stdout) for each outcome. Failing-command OUTPUT is dumped to stderr by the
@@ -114,6 +119,7 @@ pub fn outcome_suffix(o: &VerifyOutcome) -> String {
         VerifyOutcome::NotConfigured => "verify: not configured".to_string(),
         VerifyOutcome::ConfigError => "verify: skipped (config error)".to_string(),
         VerifyOutcome::Incomplete => "verify: incomplete (did not finish)".to_string(),
+        VerifyOutcome::Skipped { reason } => format!("verify: SKIPPED ({reason})"),
     }
 }
 
@@ -135,14 +141,23 @@ pub type Runner<'a> = dyn Fn(&str, &[String]) -> std::io::Result<(i32, String)> 
 
 /// Run every configured command as its own container (sharing the per-repo cache volume), reading each
 /// container's exit code. Stops at the FIRST gate failure. Pure given an injected `runner`.
+/// Returns `VerifyOutcome::Skipped` when `profile` is `None` (`--lang none`) without spawning any container.
 pub fn run_verify(
     cfg: &VerifyConfig,
-    profile: &bridge_core::profile::LanguageProfile,
+    profile: Option<&bridge_core::profile::LanguageProfile>,
     clone: &bridge_core::SessionCwd,
     cache_vol: &str,
     runner: &Runner,
     max_bytes: usize,
-) -> VerifyVerdict {
+) -> VerifyOutcome {
+    let profile = match profile {
+        None => {
+            return VerifyOutcome::Skipped {
+                reason: "--lang none".into(),
+            }
+        }
+        Some(p) => p,
+    };
     let mut results = Vec::new();
     let binding = profile.cache_binding(bridge_core::profile::CacheCtx::Verify, "", cache_vol);
     let image = profile.image.as_deref().unwrap_or(&cfg.image);
@@ -170,7 +185,7 @@ pub fn run_verify(
             break; // stop at the first gate failure
         }
     }
-    aggregate(results)
+    VerifyOutcome::Ran(aggregate(results))
 }
 
 /// The real runner: spawn the container, capture stdout+stderr combined, return the exit code.
@@ -246,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn outcome_suffix_covers_three_arms() {
+    fn outcome_suffix_covers_all_arms() {
         let ran = VerifyOutcome::Ran(aggregate(vec![r("fmt", true, true)]));
         assert!(outcome_suffix(&ran).starts_with("verify: PASS"));
         let failed = VerifyOutcome::Ran(aggregate(vec![r("clippy", true, false)]));
@@ -259,13 +274,15 @@ mod tests {
             outcome_suffix(&VerifyOutcome::ConfigError),
             "verify: skipped (config error)"
         );
-    }
-
-    #[test]
-    fn outcome_suffix_incomplete() {
         assert_eq!(
             outcome_suffix(&VerifyOutcome::Incomplete),
             "verify: incomplete (did not finish)"
+        );
+        assert_eq!(
+            outcome_suffix(&VerifyOutcome::Skipped {
+                reason: "--lang none".into()
+            }),
+            "verify: SKIPPED (--lang none)"
         );
     }
 
@@ -357,6 +374,13 @@ mod tests {
         )
     }
 
+    fn unwrap_ran(outcome: VerifyOutcome) -> VerifyVerdict {
+        match outcome {
+            VerifyOutcome::Ran(v) => v,
+            other => panic!("expected VerifyOutcome::Ran, got {other:?}"),
+        }
+    }
+
     #[test]
     fn run_verify_stops_at_first_gate_failure() {
         let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
@@ -369,9 +393,9 @@ mod tests {
                 Ok((0, "ok".into()))
             }
         };
-        let v = run_verify(
+        let v = unwrap_ran(run_verify(
             &cfg(),
-            &profile(
+            Some(&profile(
                 &[
                     ("fmt", true),
                     ("clippy", true),
@@ -379,12 +403,12 @@ mod tests {
                     ("test", true),
                 ],
                 None,
-            ),
+            )),
             &clone,
             "cache-x",
             &runner,
             4096,
-        );
+        ));
         assert!(!v.passed);
         assert_eq!(v.results.len(), 2); // stopped after clippy
         assert_eq!(v.results[1].name, "clippy");
@@ -404,14 +428,14 @@ mod tests {
                 Ok((0, "ok".into()))
             }
         };
-        let v = run_verify(
+        let v = unwrap_ran(run_verify(
             &cfg(),
-            &profile(&[("coverage", false), ("test", true)], None),
+            Some(&profile(&[("coverage", false), ("test", true)], None)),
             &clone,
             "cache-x",
             &runner,
             4096,
-        );
+        ));
         assert!(v.passed); // the non-gate coverage failure doesn't fail the verdict
         assert_eq!(v.results.len(), 2); // the later GATE ran (did NOT stop on the non-gate failure)
         assert_eq!(v.results[1].name, "test");
@@ -424,16 +448,29 @@ mod tests {
         let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
             Err(std::io::Error::other("docker missing"))
         };
-        let v = run_verify(
+        let v = unwrap_ran(run_verify(
             &cfg(),
-            &profile(&[("build", true)], None),
+            Some(&profile(&[("build", true)], None)),
             &clone,
             "cache-x",
             &runner,
             4096,
-        );
+        ));
         assert!(!v.passed);
         assert!(v.results[0].output.contains("docker missing"));
+    }
+
+    #[test]
+    fn run_verify_none_profile_returns_skipped() {
+        let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
+        let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
+            panic!("runner must NOT be called when profile is None")
+        };
+        let outcome = run_verify(&cfg(), None, &clone, "cache-x", &runner, 4096);
+        assert!(
+            matches!(outcome, VerifyOutcome::Skipped { .. }),
+            "None profile must return Skipped, not run any container"
+        );
     }
 
     #[test]
@@ -447,7 +484,7 @@ mod tests {
 
         let _ = run_verify(
             &cfg(),
-            &profile(&[("test", true)], Some("override:img")),
+            Some(&profile(&[("test", true)], Some("override:img"))),
             &clone,
             "cache-x",
             &runner,
@@ -455,7 +492,7 @@ mod tests {
         );
         let _ = run_verify(
             &cfg(),
-            &profile(&[("test", true)], None),
+            Some(&profile(&[("test", true)], None)),
             &clone,
             "cache-x",
             &runner,

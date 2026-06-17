@@ -61,6 +61,7 @@ pub fn classify(attempt: u32, max_attempts: u32, v: &VerifyOutcome, r: &ReviewOu
     let verify_ok = match v {
         VerifyOutcome::Ran(verdict) => verdict.passed,
         VerifyOutcome::NotConfigured => true,
+        VerifyOutcome::Skipped { .. } => true,
         VerifyOutcome::ConfigError | VerifyOutcome::Incomplete => false,
     };
     let review_ok = match r {

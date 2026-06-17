@@ -22,6 +22,7 @@ dependencies = [
  "bridge-store",
  "bridge-workflow",
  "futures",
+ "lsp-mcp",
  "notify",
  "reqwest",
  "serde",

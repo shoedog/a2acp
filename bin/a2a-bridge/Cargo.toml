@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 bridge-core = { path = "../../crates/bridge-core" }
 bridge-workflow = { path = "../../crates/bridge-workflow" }
+lsp-mcp = { path = "../../crates/lsp-mcp" }
 bridge-acp = { path = "../../crates/bridge-acp" }
 bridge-a2a-inbound = { path = "../../crates/bridge-a2a-inbound" }
 bridge-a2a-outbound = { path = "../../crates/bridge-a2a-outbound" }
