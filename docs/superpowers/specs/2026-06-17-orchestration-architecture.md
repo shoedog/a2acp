@@ -209,3 +209,132 @@ Two load-bearing unknowns were spiked LIVE before this pass; both resolved in th
 - The **Turn Channel** mechanism (queued-inject + pending-permission) wire design + the `PermissionDecision`
   extension — the spike-heavy seam; cost it after this pass.
 - The **clear/compact backend reset primitive** API on `AgentBackend`/`AcpBackend`.
+
+---
+
+# PASS 2 SYNTHESIS (codex-xhigh + Opus) — DETAILED DESIGN of the four open questions
+
+Both PASS 2 lenses returned **`sound-with-changes`** and **converged with no contradictions** — only
+complementary refinements (codex = correctness/blockers, Opus = architecture coherence,
+per [[review-agent-roles]]). Grounded by the two SPIKE FINDINGS above. The four OPEN questions are now
+resolved to concrete Rust shapes; what remains is per-slice planning, not architecture.
+
+## OPEN-1 — `OrchEvent` / `OrchResult` schema + 3→1 unification (RESOLVED)
+
+**Canonical internal journal type = `OrchEvent`, sitting ABOVE all four current carriers** (backend
+`Update` `ports.rs:19/21`; `WorkflowEvent` `executor.rs:41`; `translator::Event` `translator.rs:39`;
+the ADR-0015 `WorkflowProgressFrame` SSE wire `reattach.rs:36/55`). The four become **adapters INTO**
+`OrchEvent`; reattach + A2A SSE (`sse.rs:33`) become **projections FROM** the journal. **Do NOT widen the
+backend `Update`** — it stays the minimal set a single ACP turn can physically emit
+(`Text`/`Permission`/**`Usage`** (new)/`Done`); journal-level richness (NodeStarted/Watchdog/Terminal)
+lives only in `OrchEvent`, adapted inside `AcpBackend` (Opus cross-cut #1 — the leaky-port guard).
+
+- **Envelope (tagged payload, NOT a nullable object):** `OrchEvent { v, seq, ts_ms, operation_id,
+  session: Option<SessionHandleRef>, source: Option<SourceId>, #[serde(flatten)] kind }` with
+  `#[serde(tag="kind")]` `OrchEventKind` (Progress, Usage, Question, Flag, PermissionRequest,
+  PermissionDecision, NodeStarted, NodeFinished, SourceFinished, Committed, Terminal). `source` rides the
+  **envelope** (not per-kind) so fan-out identity is uniform and S3's per-source cancel/merge keys off it.
+- **`OrchResult`** = status × payload as **orthogonal axes** (codex, sharper than folding them): `OrchResult
+  { v, operation_id, session, status: TerminalStatus, wall_clock_ms, usage, warnings,
+  #[serde(flatten)] payload }` with `OrchResultPayload` ∈ {Turn, Workflow, Fanout{sources, synthesis:
+  Option<Box<OrchResult>>}, Status, Reset, Released, Error}. The `Fanout` variant already IS Opus's
+  `Vec<(SourceId, OrchResult)> + synthesis` — B2 extends here without touching the envelope.
+- **Ser+De both** (codex): the journal **persists and replays** events → Deserialize is required (Opus's
+  "serialize-only" held only for today's live-projection reattach). Opus's distinct point survives as a
+  **separate `OrchCommand` type** for inbound ops (inject/answer/decision) — do NOT make `OrchEvent`
+  double as the command type.
+- **Migration (additive, W3b/ADR-0015 safe):** keep `TaskStore`'s sequenced writes authoritative FIRST
+  (`record_node_started`/`put_node_checkpoint_sequenced`/`set_terminal_sequenced`, `task_store.rs:136`).
+  The `seq` cursor is **shared with the journal, never a second/parallel cursor** (codex). Journal AFTER the
+  durable write in `DetachedProgressSink`; only later swap `WorkflowProgressFrame` for an `OrchEvent`
+  projection. The executor's `FuturesUnordered` drain-on-cancel (`executor.rs:259/321`) is untouched;
+  CORRECTION-4's permission-forward is a **non-blocking emit** (backend still auto-answers) so cancel/drain
+  semantics don't change. **Lands Slice 0** (types + adapters, no consumers).
+
+## OPEN-2 — `SessionManager` ↔ registry-lease ↔ `TaskStore` ownership (RESOLVED)
+
+Serve-side, **in-memory**, sibling to registry + TaskStore. Owns the **resolved backend lease** while a
+handle is live (the registry's retirement drain `registry.rs:248/256` already blocks on leases → a held
+warm lease correctly pins the backend for free). `by_context: contextId→handle` + `by_handle:
+handle→SessionRecord` live **only here** — NOT in `TaskStore` (`session_for` is the per-task durable axis,
+a different concern). Fixes the identity coupling: `server.rs:346` `session-{task}`, `server.rs:660`
+task-id-as-contextId, `server.rs:2867` `task-1` fallback.
+
+- **`SessionRecord`** carries: handle, context_id, owner/auth, agent, `backend: Arc<dyn AgentBackend>`,
+  `lease: Box<dyn Lease>`, `generation: SessionGeneration`, `backend_session: SessionId`, spec +
+  `config_fingerprint` (CORRECTION-3), `usage`, `state`, `queued_inputs: VecDeque`, `idle_deadline_ms`.
+- **Lifecycle state machine:** `Idle → Running{op,gen} → Idle` (turn end); `→ Resetting` (clear/compact);
+  `→ Canceling{op}`; `→ Released`/`Expired`. TTL/idle + manual `release` are **SessionManager-driven** →
+  drop the lease → registry retirement reaps the backend (and its `:ro`/`:rw` container via the existing
+  reaper). Container crash reapers stay process/container-level (`reaper.rs:67`), not session-level.
+- **Durability decision (decisive, both):** warm table is **non-durable**. `resume_working_tasks`
+  (`server.rs:1818`) resumes durable *workflow* tasks from checkpoints, but the agent's in-context memory
+  is **gone** after a serve restart. So a post-restart `continue(handle)` returns a **typed
+  `session_expired`/`SessionNotFound`**, never a silent cold remint (silent remint erases the very state
+  the handle promises). Optional opt-in rehydrate from TaskStore checkpoints = compact-like, explicit.
+- **Lands Slice 1** (Slice 0 only un-aliases ids in the types).
+
+## OPEN-3 — Turn Channel (queued-inject + pending-permission) (RESOLVED)
+
+- **Queued inject lives in `SessionManager`, NOT `AcpBackend`** — drained into the next `prompt` before
+  `backend.prompt`. `SessionManager` enforces one turn per handle; ACP's per-session `turn_lock`
+  (`acp_backend.rs:278/1580`) stays the adapter-level serializer. `InjectRequest { handle, text, mode:
+  {PrependNextTurn|AppendNextTurn}, dedupe_key }`. **True mid-turn injection is deferred** — ACP is a single
+  `session/prompt` request/response turn; the only live notification path is agent→client.
+- **Pending permission:** keep the existing `cx.spawn` offload (`acp_backend.rs:820/840` — awaiting inline
+  blocks the SDK dispatch loop). The spawned task publishes `OrchEvent::PermissionRequest`, registers a
+  pending oneshot, **awaits with a bounded timeout**, then responds. Extend the decision type:
+  `PermissionDecision` ∈ {Approve{option_id?}, Deny{option_id?,reason?}, Modify{option_id,note?},
+  Escalate{reason?}} (`domain.rs:274` today is Approve-only; `Deny` is ALREADY mapped at
+  `acp_backend.rs:1048`). **`Modify` = select a specific OFFERED option** (codex — ACP `req.options`
+  `acp_backend.rs:997/1025` cannot rewrite tool args; true arg-mutation deferred). **Timeout default =
+  Deny/reject-once** (fail-safe; an unanswered escalation must not grant a sandbox escape); the existing
+  `turn_kill` (`acp_backend.rs:297/1606`) backstops a wedged driver.
+- `PermissionRequestEvent { request_id, handle, generation, tool_call_id, title, raw_input?, options[],
+  timeout_ms }` (richer than the thin `PermissionRequest` `domain.rs:248` — built at the decide site).
+- **Lands Slice 5.** Minimum = queued-inject + routed Approve/Deny/explicit-option-Modify. Deferred = true
+  mid-turn inject, indefinite human-escalation-with-resume, real tool-arg mutation.
+
+## OPEN-4 — clear/compact backend reset primitive (RESOLVED)
+
+`forget_session` (`acp_backend.rs:1805`) only drops the config stash — it does NOT touch `sessions[id]`, so
+today's freshness is the accident of per-node fresh `SessionId` mint (SPIKE A). For a warm handle the
+mapping is stable, so we need an explicit primitive:
+
+- **Mechanism (codex, adjudicated over Opus):** `reset_session` mints a **new bridge `SessionId` carrying
+  the generation** and **releases the old** — `ensure_session` then hits the existing `session/new`
+  fresh-mint path (`acp_backend.rs:1184`, keyed by bridge `SessionId` `acp_backend.rs:337`). This reuses
+  the SPIKE-A-proven path with **zero new minting code** and **sidesteps the `OnceCell` reinit hazard** that
+  Opus correctly flagged (`AgentSession.agent_id`/`minted_cwd` are `OnceCell` `acp_backend.rs:269/277` →
+  in-place reset is impossible). `release_session` must remove **both** `session_cfg` AND `sessions[id]`
+  (today's `forget_session` removes only the former).
+- **Trait:** add `reset_session(ResetSessionRequest{old_session,new_session,new_spec,reason}) ->
+  ResetSessionResult` + `release_session` (default = `forget_session`) to `AgentBackend`. **`release_session`
+  MUST be implemented for `ContainerRwBackend` too** (codex — else warm container sessions survive handle
+  release).
+- **Generation guard:** every op captures `{handle, generation}`; journal-append + terminal-write check it
+  still matches the `SessionRecord` → a stale in-flight turn from an old generation is discarded (or marked
+  `Terminal{stale}` against the OLD op only). clear/compact require `Idle` unless `force_cancel`.
+- **`compact` = composition, not a primitive:** summarize on gen N → `reset_session` to N+1 → queue the
+  summary as a `PrependNextTurn` seed (avoids inventing a system-message channel ACP doesn't expose).
+- **effective_config reseed at reset** (CORRECTION-3): a mismatched-model/effort `continue` is rejected →
+  told to `clear`/`compact` (vs. today's reuse-bound-config follow-up `server.rs:425`).
+- **`release_session` lands Slice 1** (so TTL/release don't leak per-session state); **clear/reset Slice 2**.
+
+## Cross-cutting invariants to write into the spec before slicing
+- **SEQ-AUTHORITY (Opus #3):** a given `OrchEvent` stream has exactly ONE stamping authority — **detached ⇒
+  TaskStore-stamped; warm/attached ⇒ SessionManager-stamped; never a task that is both.** Dual stamping =
+  colliding seq → reattach replay corruption. Migration corollary (codex): no second cursor; ADR-0015
+  clients keep the same `seq` values, old frames projected from journal events.
+- **WATCHDOG-VS-PERMISSION (codex):** a pending (blocked) permission MUST count as activity, or E9 cancels
+  a healthy blocked turn.
+- **UPDATE-MINIMAL (Opus #1):** `Update` only grows variants a single ACP turn can emit (Text/Permission/
+  Usage/Done); everything else is journal-level, adapted inside `AcpBackend`.
+
+## Convergence status
+**Architecture CONVERGED** across 2 codex-xhigh passes + 2 Opus lenses (pass-0 decomposition → pass-1 4-seam
+correction → pass-2 detailed design, all `sound-with-changes`, no open contradictions). Remaining work is
+**per-slice spec→plan→implement**, starting with **Slice 0** (the substrate: core `OrchEvent`/`OrchResult`/
+`SessionHandleId`/`UsageSnapshot` types + the additive event-path adapters + un-alias contextId from task
+id + executor forwards permission/usage additively). No further architecture pass is required unless slicing
+surfaces a redesign-forcing issue.
