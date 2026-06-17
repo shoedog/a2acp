@@ -941,6 +941,7 @@ fn warm_lsp_deps_step(
     profile: Option<&bridge_core::profile::LanguageProfile>,
     repo: &std::path::Path,
     clone: &std::path::Path,
+    read_only: bool,
 ) -> Option<String> {
     let profile = profile?;
     let warn = |reason: String| {
@@ -990,6 +991,7 @@ fn warm_lsp_deps_step(
         &binding,
         &profile.fetch_cmd,
         &egress,
+        read_only,
     );
     eprintln!("[implement] lsp warm-deps: fetching deps into {cache_vol}");
     match verify::docker_runner(&program, &argv) {
@@ -1800,7 +1802,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         instance_id: instance_id.clone(),
     };
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &repo, &clone);
+    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &repo, &clone, false);
 
     // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
     // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
@@ -2097,7 +2099,7 @@ async fn implement_resume_cmd(
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
     let impl_lsp_cache_vol =
-        warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &ck.source_repo, &clone);
+        warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &ck.source_repo, &clone, false);
     let suffix = format!("r{}", implement::nonce(6));
     let warm_impl = build_warm_impl(
         &graph,
