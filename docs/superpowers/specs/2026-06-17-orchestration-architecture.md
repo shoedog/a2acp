@@ -98,3 +98,91 @@ Per the roadmap's own sequencing, but now against the seams:
 Multiple **codex gpt-5.5 xhigh** architecture-analysis passes (lead) + an **Opus** architecture lens
 (complementary, per [[review-agent-roles]]) on THIS doc → revise → converge → then a per-slice spec→plan→
 implement (the proven loop). Implementation is explicitly deferred until the architecture converges.
+
+---
+
+# PASS 1 SYNTHESIS (codex-xhigh + Opus) — REVISED ARCHITECTURE (supersedes the pass-0 seams above)
+
+Both passes returned **sound-with-changes** and CONVERGED. The pass-0 "3 seams" was the right instinct but
+(a) overloaded S1, (b) buried the bidirectional channel, (c) mislabeled S3 (a surface, not a foundation),
+and (d) under-named the execution/scheduling concern. Revised decomposition:
+
+## Revised seams (4 + a sub-seam)
+
+- **S1 — Session Resource.** Handle identity + backend lease + **ACP session *generation*** + cwd/worktree/
+  isolation + owner/auth + usage snapshot + TTL + state. Lives in a **new serve-side `SessionManager`**,
+  sibling to the registry + TaskStore — **NOT in `TaskStore`** (that's task/resume state) and **NOT keyed
+  by task id** (`server.rs:2867` falls back to `task-1` for generic sends — fatal for handle identity).
+  Keyed by `contextId`/a returned handle. **Process⟂context confirmed** (`AcpBackend.sessions` multiplexes
+  many ACP sessions over one warm connection, `acp_backend.rs:337/249`) — but see CORRECTION-1.
+- **S2 — Event/Result Journal.** ONE versioned `OrchEvent`/`OrchResult` schema with **`seq` + replay**
+  (reuse the ADR-0015 reattach seq machinery), usage, questions, permissions, terminal. Adapters FROM:
+  backend `Update` (kept backend-internal — it's only Text/Permission/Done, `ports.rs:19`), `WorkflowEvent`
+  (`executor.rs:41`), fan-out events (`fanout.rs`), A2A SSE (`reattach.rs:36`). **Unify the THREE current
+  event paths** — do not just "extend Update." Result = a **tagged-payload envelope, NOT one giant nullable
+  object** (codex).
+- **S3 — Execution Coordinator** (this is the real foundation, not "tool surface"). run / continue / clear /
+  compact / fan-out / workflow / cancel / retry **semantics over handles** — scheduling, **fan-out identity
+  + per-source cancel + typed per-source results** (fan-out already has bespoke identity/merge/degrade/cancel
+  in `fanout.rs` + a cancel TODO `server.rs:547` → it belongs HERE, not in an MCP wrapper), retries, replay.
+- **S4 — Surfaces.** A2A + CLI + MCP are **co-equal thin adapters over ONE Rust service API** (the
+  Coordinator). **NOT "CLI thins over MCP"** — false today (`run-workflow` is in-process one-shot; only
+  `submit`/`task` are serve clients). Build the **Rust service API first**; A2A/CLI/MCP call it. D1 params =
+  typed operation fields (kills per-role TOML). Reuse the `lsp-mcp` stdio-MCP pattern for the MCP adapter.
+- **Sub-seam: the Turn Channel** (bidirectional, rides S2+S3). orch→agent **does not exist today** + ACP is
+  request/response. Ship **`inject` = queued next-turn input** (prompt serializes via the per-session
+  turn_lock `acp_backend.rs:1546`; true mid-turn injection is deferred) + **pending permission decisions**
+  (today `AcpBackend` auto-answers via policy immediately `acp_backend.rs:820`; `PermissionDecision` only
+  models `Approve` `domain.rs:274` → add deny/modify/escalate). B1 + E2 live here.
+
+## Key corrections to the pass-0 / A1-A2 spec (code-grounded, both reviewers)
+- **CORRECTION-1 — `forget_session` does NOT reset context** (`acp_backend.rs:1805` only drops the config
+  stash; freshness today comes from minting *fresh* `SessionId`s). So **`clear` needs an explicit backend
+  method** to drop/remint a bridge session (or bump a generation key) + a fresh `session/new` on the warm
+  connection. `compact` = summarize → remint → seed. The A1/A2 spec's "keep-warm = opt-out forget" is
+  insufficient — it needs a real reset primitive.
+- **CORRECTION-2 — TELEMETRY IS FEASIBLE (RISK-1/Q4 RESOLVED).** SDK has `UsageUpdate { used, size, cost }`;
+  real `codex-acp.jsonl` corpus emits `used`+`size`; the bridge **drops** it (`map_session_update`
+  `acp_backend.rs:1480`). A4 threshold = precise for emitting agents (codex/claude), degrade to
+  estimated/unknown per-backend. **Not blocked** — just needs plumbing.
+- **CORRECTION-3 — `continue` config-mismatch is a typed-error, not a silent drop.** The handle partitions
+  fields: **frozen-at-mint** (cwd via the immutability guard, the process) vs **per-turn** (prompt) vs
+  **requires-reseed** (model/effort → `clear`/`compact`, not `continue`; the warm-loop "effort silently
+  dropped" gotcha). Carry an effective-config fingerprint; reject a mismatched `continue`.
+- **CORRECTION-4 — keep-warm is a separate execution POLICY**, not a silent change to the executor's
+  per-node `forget` (`executor.rs:152`, load-bearing for W3b drain-on-cancel). The executor must also
+  **forward (not swallow) `Update::Permission`** (`executor.rs:142`) additively in the Slice-0 event
+  unification so the cancel loop is never reopened under schedule pressure later.
+
+## Minimum coherent core (converged Q7) + build order
+**Core = the S1 SessionManager + the S2 event/result schema + seq/replay + run/continue/status/release/
+cancel + usage snapshots + explicit reset/remint — landed with the unified event SHAPE (no consumers).**
+Everything else is additive.
+1. **Slice 0 — substrate (no consumers):** core types (`SessionHandleId`, `OperationId`, `SessionState`,
+   `UsageSnapshot`, `OrchEvent`, `OrchResult`); un-alias contextId from task id; the unified event enum
+   (translator + executor + fanout + reattach → one), executor forwards permission/question additively.
+2. **Slice 1 — S1 `SessionManager` + A1/A2:** contextId→handle, registry lease ownership, config/cwd
+   validation (CORRECTION-3), TTL/release/cancel, warm `run`/`continue`/`status`.
+3. **Slice 2 — telemetry + reset:** plumb `usage_update` (CORRECTION-2) → start/end/queryable + threshold
+   warn; `clear` (generation/remint, CORRECTION-1); then `compact` (summarize/remint/seed). + E9 watchdog.
+4. **Slice 3 — handle-aware workflow execution policy** (keep-warm opt-in) + unify workflow progress into
+   the journal.
+5. **Slice 4 — S4 MCP tool surface + D1 typed params** over the now-stable service.
+6. **Slice 5+ — Turn Channel (B1 queued-inject + E2 deny/modify) → generalized B2 fan-out → E1 worktree →
+   E6 retry/resume → E3 batch → E7/E8.**
+
+## Cut / defer (converged)
+**Defer:** the MCP server (until the service API + schema are stable); true mid-turn inject (ship
+queued-next-turn first); A3 auto-management + auto-compaction (manual release/TTL/warn/clear first);
+weighted B2 panel UX (fix fan-out identity/cancel/typed-results first); E7/E8. **Cut:** one giant nullable
+result object (use a tagged envelope); session-handles-in-TaskStore; task-id-as-handle; relying on
+`forget_session` for context reset.
+
+## Open for PASS 2 (the next codex-xhigh pass on this revised doc)
+- The exact **`OrchEvent`/`OrchResult` schema** (variants + the tagged-payload envelope) + how the 3→1
+  event-path unification is staged without breaking W3b/reattach.
+- The **`SessionManager` ↔ registry-lease ↔ TaskStore** ownership boundaries (who reaps what; restart =
+  warm table is **in-memory/non-durable**, contextIds re-mint cold — state it).
+- The **Turn Channel** mechanism (queued-inject + pending-permission) wire design + the `PermissionDecision`
+  extension — the spike-heavy seam; cost it after this pass.
+- The **clear/compact backend reset primitive** API on `AgentBackend`/`AcpBackend`.
