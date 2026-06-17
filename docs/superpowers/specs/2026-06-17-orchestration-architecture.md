@@ -525,6 +525,16 @@ The corpus README still calls `usage_update` "unmodeled in SDK 0.12.1," but the 
 `unstable_session_usage` + tests assert deserialize-then-drop. The Slice specs should cite the **current
 Cargo features + tests**, not the stale README prose.
 
+## SLICING SUPERSEDED
+> **The embedded Slice 0–5 build order in this doc was BACKED INTO and is SUPERSEDED.** A dedicated slicing &
+> sequencing analysis (codex-xhigh + Opus, both `high`, converged) re-cut it: the backed-into Slice 0 (full
+> journal + 4-path rewrite, consumer-free) front-loaded the riskiest rewrite before any consumer and
+> couldn't be live-gated. **The authoritative ordering is `2026-06-17-orchestration-slicing.md`** (Q1=Option
+> C hybrid: warm-continue-first with a minimal REAL schema; rich journal + 4-path rewrite deferred to land
+> WITH their consumers after the MVP). **First slice = Slice 0 "Live Session Core" (warm continue), MVP =
+> Slices 0–5.** The detailed-design content above (seams, OPEN-1..4, P-1..7, invariants) stands; only the
+> *order/scope-into-increments* is governed by the slicing spec.
+
 ## CONVERGENCE: COMPLETE
 Architecture **converged and ready to slice** across **3 passes × 2 lenses** (pass-0 decomposition → pass-1
 4-seam correction → pass-2 detailed design → pass-2.5 protocol grounding → pass-3 final validation), every
