@@ -1394,6 +1394,39 @@ fn drop_lsp(specs: &mut Vec<bridge_core::mcp::McpServerSpec>) {
     specs.retain(|s| s.name != "lsp");
 }
 
+/// Inject the selected language profile's in-container LSP nav into a `container_rw` agent's `mcp` + sandbox
+/// `volumes`: the profile's Lsp env (e.g. `CARGO_HOME=/cargo`, `CARGO_NET_OFFLINE=true`), the warmed dep
+/// cache mount at `/cargo` (RO; only when `warm_cache_vol` is `Some` — i.e. the warm fetch succeeded), and a
+/// writable per-repo target cache at `/lsp-target` (keyed on the SOURCE repo so it is reused, not leaked per
+/// run). `profile == None` (`--lang none`) drops the lsp server. Shared by `build_warm_impl` (implement) and
+/// the `run-workflow` pre-mutation so the two per-turn flows can't drift.
+fn apply_warm_lsp(
+    mcp: &mut Vec<bridge_core::mcp::McpServerSpec>,
+    volumes: &mut Vec<String>,
+    profile: Option<&bridge_core::profile::LanguageProfile>,
+    warm_cache_vol: Option<&str>,
+    repo: &std::path::Path,
+) {
+    let target_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let target_vol =
+        verify::cache_volume_name("a2a-impl-lsp-target", &target_canon.to_string_lossy());
+    match profile {
+        None => drop_lsp(mcp),
+        Some(p) => {
+            let lsp = p.cache_binding(
+                bridge_core::profile::CacheCtx::Lsp,
+                warm_cache_vol.unwrap_or(""),
+                "",
+            );
+            apply_lsp_env(mcp, &lsp.env);
+            if warm_cache_vol.is_some() {
+                volumes.extend(lsp.mounts);
+            }
+        }
+    }
+    volumes.push(format!("{target_vol}:/lsp-target"));
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_warm_impl(
     graph: &bridge_workflow::graph::WorkflowGraph,
@@ -1433,31 +1466,13 @@ async fn build_warm_impl(
     //   - a writable target dir at /lsp-target so RA's own CARGO_TARGET_DIR persists per-repo across runs.
     // Keyed on the SOURCE repo (like the dep cache + verify), NOT the per-run clone — so it is REUSED and
     // bounded to one volume per repo (review BLOCKER: clone-keying never reuses + leaks a volume per run).
-    let target_canon = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-    let impl_lsp_target_vol =
-        verify::cache_volume_name("a2a-impl-lsp-target", &target_canon.to_string_lossy());
-    match profile {
-        None => {
-            // --lang none: bare run, no in-container language server
-            drop_lsp(&mut ccfg.mcp);
-        }
-        Some(p) => {
-            // ENV: always inject the profile's Lsp env (independent of the warm dep cache)
-            let lsp = p.cache_binding(
-                bridge_core::profile::CacheCtx::Lsp,
-                impl_lsp_cache_vol.unwrap_or(""),
-                "",
-            );
-            apply_lsp_env(&mut ccfg.mcp, &lsp.env);
-            // MOUNT: only when the warm dep cache exists (byte-for-byte with today's mount behavior)
-            if impl_lsp_cache_vol.is_some() {
-                ccfg.sandbox.volumes.extend(lsp.mounts);
-            }
-        }
-    }
-    ccfg.sandbox
-        .volumes
-        .push(format!("{impl_lsp_target_vol}:/lsp-target"));
+    apply_warm_lsp(
+        &mut ccfg.mcp,
+        &mut ccfg.sandbox.volumes,
+        profile,
+        impl_lsp_cache_vol,
+        repo,
+    );
     let warm_owner = container_owner(
         owner_config_path,
         ccfg.sandbox.mount.as_str(),
@@ -1802,7 +1817,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         instance_id: instance_id.clone(),
     };
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let impl_lsp_cache_vol = warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &repo, &clone, false);
+    let impl_lsp_cache_vol =
+        warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &repo, &clone, false);
 
     // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
     // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
@@ -2098,8 +2114,13 @@ async fn implement_resume_cmd(
     };
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
-    let impl_lsp_cache_vol =
-        warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &ck.source_repo, &clone, false);
+    let impl_lsp_cache_vol = warm_lsp_deps_step(
+        &verify_cfg,
+        profile.as_ref(),
+        &ck.source_repo,
+        &clone,
+        false,
+    );
     let suffix = format!("r{}", implement::nonce(6));
     let warm_impl = build_warm_impl(
         &graph,
@@ -4932,5 +4953,58 @@ cmd = "cargo build --locked"
         super::drop_lsp(&mut specs);
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "prism");
+    }
+
+    #[test]
+    fn apply_warm_lsp_injects_env_mounts_and_target_vol() {
+        // NOTE: the hardcoded `rust_profile()` has EMPTY lsp_env (profile.rs:119) — the real lsp_env lives on
+        // the CONFIG profile (containerized.toml). So build a profile WITH lsp_env populated via `from_parts`.
+        // `McpServerSpec.env` and `LanguageProfile.lsp_env` are BOTH `Vec<(String, String)>` (mcp.rs:18,
+        // profile.rs:50). `lsp_env` is private → must use the constructor.
+        let p = bridge_core::profile::LanguageProfile::from_parts(
+            "rust".into(),
+            "cargo fetch --locked".into(),
+            "a2a-impl-lsp-cache".into(),
+            "/cargo".into(),       // dep_cache_path → the Lsp-ctx mount target
+            "/cache/cargo".into(), // verify_cache_path (unused here)
+            vec![],                // fetch_env
+            vec![
+                // lsp_env (the thing under test)
+                ("CARGO_HOME".into(), "/cargo".into()),
+                ("CARGO_NET_OFFLINE".into(), "true".into()),
+            ],
+            vec![], // verify_env
+            None,   // image
+            vec![], // verify_commands
+        );
+        let mut mcp = vec![bridge_core::mcp::McpServerSpec {
+            name: "lsp".into(),
+            command: "/usr/local/bin/lsp-mcp".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+        let mut vols: Vec<String> = vec![];
+        super::apply_warm_lsp(
+            &mut mcp,
+            &mut vols,
+            Some(&p),
+            Some("warmvol"),
+            std::path::Path::new("/tmp/repo"),
+        );
+        // env injected onto the lsp spec (tuple access — env is Vec<(String,String)>)
+        assert!(
+            mcp[0].env.iter().any(|(k, _)| k == "CARGO_HOME"),
+            "lsp env missing CARGO_HOME: {:?}",
+            mcp[0].env
+        );
+        // warm dep cache mounted (because warm vol is Some) + the per-repo target vol mounted
+        assert!(
+            vols.iter().any(|v| v.contains("warmvol")),
+            "missing /cargo mount: {vols:?}"
+        );
+        assert!(
+            vols.iter().any(|v| v.ends_with(":/lsp-target")),
+            "missing /lsp-target mount: {vols:?}"
+        );
     }
 }
