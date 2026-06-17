@@ -1823,6 +1823,64 @@ addr="127.0.0.1:8080"
     }
 
     #[test]
+    fn example_containerized_python_language_profile() {
+        // Check both configs symmetrically — the python profile must be identical in each (guards Docker/
+        // Podman drift + the load-bearing uv/pyvenv command strings; the live gate validated them in-container).
+        for raw in [
+            include_str!("../../../examples/a2a-bridge.containerized.toml"),
+            include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
+        ] {
+            let cfg = RegistryConfig::parse(raw).unwrap();
+            let profiles = cfg.language_profiles().unwrap();
+            let py = profiles
+                .iter()
+                .find(|p| p.id == "python")
+                .expect("python profile present in containerized config");
+            // Python's "dep cache" is the venv at /pyvenv; fetch ALWAYS creates it then best-effort installs
+            // deps (uv sync honors UV_PROJECT_ENVIRONMENT; the requirements fallback honors VIRTUAL_ENV).
+            assert!(
+                py.fetch_cmd.contains("uv venv /pyvenv")
+                    && py
+                        .fetch_cmd
+                        .contains("UV_PROJECT_ENVIRONMENT=/pyvenv uv sync --frozen")
+                    && py
+                        .fetch_cmd
+                        .contains("VIRTUAL_ENV=/pyvenv uv pip install -r requirements.txt"),
+                "python fetch must always-create /pyvenv + dual-path deps: {}",
+                py.fetch_cmd
+            );
+            // The #1d keystone: basedpyright's interpreter override reaches the LSP via the Lsp cache binding.
+            let lsp_env = py
+                .cache_binding(bridge_core::profile::CacheCtx::Lsp, "", "")
+                .env;
+            assert!(
+                lsp_env
+                    .iter()
+                    .any(|(k, v)| k == "LSP_MCP_PYTHON_PATH" && v == "/pyvenv/bin/python"),
+                "python lsp_env must point basedpyright at the venv interpreter: {lsp_env:?}"
+            );
+            // Pin full (name, cmd, gate) verify tuples — same standard as the go profile test.
+            let got: Vec<(&str, &str, bool)> = py
+                .verify_commands
+                .iter()
+                .map(|c| (c.name.as_str(), c.cmd.as_str(), c.gate))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    ("format", "ruff format --check .", true),
+                    ("lint", "ruff check .", true),
+                    (
+                        "test",
+                        "uv venv /cache/venv && { UV_PROJECT_ENVIRONMENT=/cache/venv uv sync --frozen || VIRTUAL_ENV=/cache/venv uv pip install -r requirements.txt; } && /cache/venv/bin/python -m pytest -q",
+                        true
+                    ),
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn example_containerized_impl_lsp_lang_is_auto() {
         // Check both configs symmetrically.
         for raw in [
