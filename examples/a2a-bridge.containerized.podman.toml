@@ -118,6 +118,31 @@ cmd  = "go build ./..."
 name = "test"
 cmd  = "go test ./..."
 
+[[languages]]
+id = "python"
+# Always create the venv at /pyvenv (so the interpreter exists even with no installable deps — the hard
+# LSP_MCP_PYTHON_PATH override would otherwise crash basedpyright). UV_PROJECT_ENVIRONMENT pins the target
+# so uv never writes /work/.venv on the :ro real repo. Deps are best-effort (|| true) → no-lock repos get a
+# bare venv (stdlib resolves; 3rd-party shows unresolved, not a crash). See docs/containerized-mcp-env-trap.md.
+fetch = "uv venv /pyvenv && { UV_PROJECT_ENVIRONMENT=/pyvenv uv sync --frozen || UV_PROJECT_ENVIRONMENT=/pyvenv uv pip install -r requirements.txt || true; }"
+warm_cache = "a2a-impl-lsp-cache-py"
+dep_cache_path = "/pyvenv"
+verify_cache_path = "/cache"
+fetch_env = { UV_CACHE_DIR = "/uvcache" }
+verify_env = { UV_CACHE_DIR = "/cache/uv" }
+# basedpyright reads site-packages via this interpreter. PATH not needed (binaries symlinked to /usr/local/bin,
+# already on codex's stripped PATH). PYTHONDONTWRITEBYTECODE guards a __pycache__ write under the :ro venv.
+lsp_env = { LSP_MCP_PYTHON_PATH = "/pyvenv/bin/python", PYTHONDONTWRITEBYTECODE = "1" }
+[[languages.verify]]
+name = "format"
+cmd  = "ruff format --check ."
+[[languages.verify]]
+name = "lint"
+cmd  = "ruff check ."
+[[languages.verify]]
+name = "test"
+cmd  = "UV_PROJECT_ENVIRONMENT=/cache/venv uv sync --frozen && /cache/venv/bin/pytest -q"
+
 [registry]
 # podman: the container runtime for the impl/kiro/verify sandboxes.
 # codex-acp + claude-agent-acp: host-side reviewer agents (codex/claude run without a sandbox block).
