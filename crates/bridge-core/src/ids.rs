@@ -28,6 +28,20 @@ id_newtype!(SessionId);
 id_newtype!(CallerId);
 id_newtype!(AgentId);
 
+// Slice 0 (orchestration) ids.
+id_newtype!(SessionHandleId);
+id_newtype!(OperationId);
+id_newtype!(ContextId);
+
+/// A warm session's context generation. Hand-written (the `id_newtype!` macros are
+/// String-only); generations are compared/incremented so we add `Copy`/`Ord`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct SessionGeneration(pub u64);
+impl SessionGeneration {
+    pub fn new(n: u64) -> Self { Self(n) }
+    pub fn get(&self) -> u64 { self.0 }
+}
+
 macro_rules! id_newtype_strict {
     ($name:ident) => {
         #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -56,6 +70,25 @@ macro_rules! id_newtype_strict {
 }
 id_newtype_strict!(WorkflowId);
 id_newtype_strict!(NodeId);
+
+#[cfg(test)]
+mod slice0_id_tests {
+    use super::*;
+    #[test]
+    fn new_orch_ids_parse_and_roundtrip() {
+        assert_eq!(SessionHandleId::parse("h-1").unwrap().as_str(), "h-1");
+        assert_eq!(OperationId::parse("op-1").unwrap().as_str(), "op-1");
+        assert_eq!(ContextId::parse("ctx-1").unwrap().as_str(), "ctx-1");
+        assert!(ContextId::parse("").is_err());
+    }
+    #[test]
+    fn session_generation_orders_and_increments() {
+        let g0 = SessionGeneration::new(0);
+        let g1 = SessionGeneration::new(g0.get() + 1);
+        assert!(g1 > g0);
+        assert_eq!(g1.get(), 1);
+    }
+}
 
 #[cfg(test)]
 mod tests {
