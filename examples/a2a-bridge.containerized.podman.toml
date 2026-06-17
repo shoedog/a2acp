@@ -124,7 +124,7 @@ id = "python"
 # LSP_MCP_PYTHON_PATH override would otherwise crash basedpyright). UV_PROJECT_ENVIRONMENT pins the target
 # so uv never writes /work/.venv on the :ro real repo. Deps are best-effort (|| true) → no-lock repos get a
 # bare venv (stdlib resolves; 3rd-party shows unresolved, not a crash). See docs/containerized-mcp-env-trap.md.
-fetch = "uv venv /pyvenv && { UV_PROJECT_ENVIRONMENT=/pyvenv uv sync --frozen || UV_PROJECT_ENVIRONMENT=/pyvenv uv pip install -r requirements.txt || true; }"
+fetch = "uv venv /pyvenv && { UV_PROJECT_ENVIRONMENT=/pyvenv uv sync --frozen || VIRTUAL_ENV=/pyvenv uv pip install -r requirements.txt || true; }"
 warm_cache = "a2a-impl-lsp-cache-py"
 dep_cache_path = "/pyvenv"
 verify_cache_path = "/cache"
