@@ -429,8 +429,110 @@ trace-context ids for cross-surface correlation. Cheap, additive, foundation-cor
   `session/load` rehydration path for post-restart `continue`.
 - **Deferred (new):** `session/load`/`resume` rehydration; slash-command forwarding; fs/terminal surface.
 
-## Convergence status
+## Convergence status (pre-PASS-3)
 Architecture converged through pass-2; **PASS 2.5 protocol grounding folded** → re-review in **PASS 3**
 (full deep codex-xhigh + Opus) + a **targeted narrow pass** on the adjudicated divergences (OnceCell vs
 new-SessionId reset; `OrchEvent` Ser/De vs a separate `OrchCommand`) and the 3 cross-cutting invariants
 (SEQ-AUTHORITY, WATCHDOG-VS-PERMISSION, UPDATE-MINIMAL). Slice 0 begins after PASS 3 converges.
+
+---
+
+# PASS 3 SYNTHESIS (codex-xhigh + Opus) — FINAL, READY-TO-SLICE
+
+Both PASS 3 lenses returned **`ready-with-changes`** and **fully converged** (no contradictions); both state
+**no further redesign pass is needed**. The "changes" are **spec-precision items folded into the Slice-0/1
+specs**, not architecture rework. The 4-seam + Turn-Channel decomposition survives protocol grounding intact.
+
+## Protocol-fold validation (PART A results)
+- **P-1 NEEDS-CHANGE (both):** the bridge applies model/effort/mode **only inside the `session/new` init
+  closure** (`acp_backend.rs:1186-1260`) — there is **NO mid-session reconcile path**. So P-1 requires a
+  **new backend method** `reconcile_config(session, delta) -> {Applied|NotAdvertised|Rejected}` (lift the
+  existing three-surface logic — codex `config_options`, kiro `session/set_model`, mode `set_mode` — out of
+  the init closure to be callable on a warm session). **`continue` reconcile algorithm:** cwd-delta →
+  reject (frozen); model/effort-delta → `reconcile_config` (Applied→proceed+update fingerprint;
+  NotAdvertised/Rejected→typed `ConfigReseedRequired{field}`); **mode-delta → straight to clear/compact**
+  (mid-session `set_mode` rejection is unrecoverable on some agents). **NEVER silently reset on `continue`**
+  (that destroys the context `continue` promises).
+- **P-2 NEEDS-CHANGE (minor, codex):** `session/delete` is behind the SDK feature **`unstable_session_delete`
+  which `bridge-acp` does NOT enable** (it enables `unstable_session_usage` + `unstable_session_model`). So
+  Slice 0 records `delete`/`list`/`resume`/`close`/`load` as **raw capability metadata** (not typed SDK
+  calls) until a slice deliberately enables the feature. Default post-restart `SessionExpired` confirmed
+  coherent (disjoint from `resume_working_tasks` `server.rs:1818`).
+- **P-3 NEEDS-CHANGE (both):** confirmed dropped today (`map_session_update` only `agent_message_chunk`→Text,
+  `acp_backend.rs:1476/1490`). Slice 0 adds `Plan`/`ToolCall`/`ToolCallUpdate`/usage/config/mode/commands
+  variants **and must preserve semantics in the schema NOW:** `Plan` = **complete-replacement** (latest wins
+  at projection), `ToolCallUpdate` = **patch** over a prior `tool_call` keyed by **`tool_call_id`** (capture
+  it as a Slice-0 envelope/payload field — else orphaned partial updates). No behavioral handling forced into
+  Slice 0; lifecycle is reconstructed at projection time.
+- **P-4 CONFIRMED (both):** stop-reason→TerminalStatus right; keep `max_tokens` distinct (A4 failure mode);
+  keep the verbatim `stop_reason` string too; add an explicit `unknown_stop_reason` failure path (today
+  stringified `"unknown"` `acp_backend.rs:1499`).
+- **P-5 CONFIRMED (both):** outcome = `cancelled | selected{optionId}`; `Modify`=select-offered-option only;
+  inject carries `Vec<ContentBlock>`. **P-6 CONFIRMED** (stdio newline framing `framing.rs:22`; fs/terminal
+  rejected today `acp_backend.rs:855`; slash-cmds/fs/terminal deferred). **P-7 CONFIRMED** (`_meta`
+  vendor-scoped is greenfield + correct; `_meta` is the cross-boundary echo, journal `operation_id`/`seq`
+  is the primary key).
+
+## Divergence rulings (PART C — both UNANIMOUS)
+- **DIVERGENCE-1 → new bridge `SessionId` per generation + release old** (both, decisively over
+  replace-the-Arc). The `sessions` map is keyed by bridge `SessionId` with non-resettable `OnceCell`s
+  (`agent_id`/`minted_cwd`, `acp_backend.rs:266/269/277`); an in-flight turn holds the **old** `Arc`/
+  `turn_lock`/routing-sender, so replacing the value under a stable key leaves stale writes hard to isolate.
+  **Shape:** stable handle in `SessionManager`; `backend_session` is generation-scoped (`{handle}-{gen}` /
+  `{ctx}#g{N}`); **`reset_session` requires `Idle` (or drained `Canceling`)**, removes old `session_cfg` +
+  `sessions[old]`, configures the new id, then `ensure_session` hits the existing `session/new` path
+  (SPIKE-A-proven, zero new minting code). **`release_session` is a NEW method removing BOTH `session_cfg`
+  AND `sessions[id]`** (today's `forget_session` removes only the former, `acp_backend.rs:1810`); it MUST
+  also be implemented on **`ContainerRwBackend`** (else warm containers leak on release).
+- **DIVERGENCE-2 → `OrchEvent` Ser+De; inbound = separate `OrchCommand` (one enum, per-op request struct
+  variants)** (both). **codex's load-bearing refinement:** use **bridge-owned DTOs, NOT raw SDK enums**, in
+  the journal — SDK shapes shift under feature flags (`unstable_*`), so persisting them couples replay to
+  SDK-feature drift. **Opus's dual-store (correcting the doc's stated rationale):** today replay does NOT
+  deserialize — `WorkflowProgressFrame` is serialize-only (`reattach.rs:60`) and reattach **re-projects from
+  typed rows** (`server.rs:977-1004`). The real reason for Ser+De: the rich P-3 journal (plan/tool_call
+  partial-fields) can't get a SQL column per variant → persist `OrchEvent` as a **serialized journal row**.
+  So **DUAL STORE:** (a) typed columns = W3b workflow-resume state (node checkpoints/terminal, **no serde
+  dependency** — keep resume correctness decoupled from schema-evolution); (b) serialized `OrchEvent` rows =
+  the rich journal (Ser+De). **One shared `next_seq`** (`task_store.rs:236`), never a parallel cursor.
+
+## Invariants (refined + the missing set to write before slicing)
+- **SEQ-AUTHORITY — restate as stream ownership + add the MECHANISM.** One `OperationId` stream has exactly
+  one stamper: TaskStore (detached) or SessionManager (warm/attached). A detached workflow MAY internally use
+  warm handles, but its **public** stream stays TaskStore-stamped (or uses **child streams with separate
+  cursors**). **Enforcement (was only an assertion):** SessionManager refuses to create a handle for a
+  contextId with a `Working` task; detached `submit` refuses a contextId with a live handle (`HandleBusy`).
+- **WATCHDOG — fire on "no JOURNAL event for N s," not "no text."** Any `ToolCall`/`ToolCallUpdate`/`Plan`/
+  `Usage`/text event = liveness (the FN-1 `_dyld_start` case is a long `in_progress` tool_call). Pending
+  permission counts as activity. **Separate the idle timeout from a hard wall-clock timeout** (the no-chunk
+  long model turn is the residual case → `turn_kill` backstop `acp_backend.rs:297/1606`).
+- **UPDATE-MINIMAL — holds.** `Update` grows only to `Usage` (a single-turn emission); `Plan`/`ToolCall`/
+  config/mode/commands stay journal-level, adapted inside the ACP turn/event adapter (the `map_session_update`
+  site `acp_backend.rs:796`), never pushed into the backend port. Verified: `AcpBackend` never produces
+  `Update::Permission` → the executor's additive permission-forward is dead-safe (cannot reopen W3b cancel).
+- **MISSING INVARIANTS to write into the Slice specs (union of both):**
+  1. **GENERATION-MONOTONICITY / stale-write guard** (load-bearing — DIVERGENCE-1's safety depends on it): a
+     stale-generation event never advances the live handle's seq; it may only finalize its own (old) op.
+  2. **CANCEL-RESOLVES-PENDING-PERMISSION** (Slice 5): `session/cancel` must resolve the pending permission
+     oneshot with `Cancelled`, else a cancel leaks a hung await + the turn never ends.
+  3. **CONFIG-RECONCILE-PRESERVES-CONTEXT** (codex): `continue` never silently resets — see P-1.
+  4. **NONBLOCKING-ACP-HANDLERS** (codex): permission/decision handling stays on the `cx.spawn` offload
+     (`acp_backend.rs:840`) — awaiting inline blocks the SDK dispatch loop.
+  5. **CAPABILITY-BEFORE-METHOD**: check the advertised capability before any gated session method.
+  6. **PLAN-REPLACEMENT / TOOLCALL-PATCH** projection semantics (P-3).
+
+## Doc-hygiene note (codex)
+The corpus README still calls `usage_update` "unmodeled in SDK 0.12.1," but the crate now enables
+`unstable_session_usage` + tests assert deserialize-then-drop. The Slice specs should cite the **current
+Cargo features + tests**, not the stale README prose.
+
+## CONVERGENCE: COMPLETE
+Architecture **converged and ready to slice** across **3 passes × 2 lenses** (pass-0 decomposition → pass-1
+4-seam correction → pass-2 detailed design → pass-2.5 protocol grounding → pass-3 final validation), every
+pass `sound/ready-with-changes`, the last two with **no contradictions** and both saying **no further
+redesign needed**. Next: **Slice 0 spec** (per the proven spec→dual-review→plan→implement loop), scoped to:
+bridge-owned `OrchEvent`/`OrchResult`/`OrchCommand` DTOs (Ser+De, tagged payload, `tool_call_id`
+correlation, Plan-replace/ToolCall-patch semantics, stop-reason+`unknown` mapping, `Usage` on `Update`);
+the un-aliased `SessionHandleId`/`OperationId`/`SessionGeneration`; capability-metadata recording (raw, no
+`unstable_session_delete`); the additive event-path adapters (translator/executor/fanout/reattach →
+`OrchEvent`, dual-store, shared `next_seq`); executor permission/usage forward; and the GENERATION-
+MONOTONICITY + SEQ-AUTHORITY-mechanism invariants encoded. No consumers in Slice 0.
