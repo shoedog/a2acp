@@ -125,17 +125,24 @@ pub fn compose_verify(
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(" ");
+    // Only `mkdir -p` env values that are ABSOLUTE PATHS (start with `/`). Non-path env (e.g. Go's
+    // `GOFLAGS=-mod=readonly`) must NOT be mkdir'd — `mkdir -p … -mod=readonly` parses the leading `-`
+    // as an option and aborts the `&&` chain before the command runs. Rust's verify_env is all `/`-paths,
+    // so this is byte-for-byte the old script for rust.
     let mkdirs = cache
         .env
         .iter()
+        .filter(|(_, v)| v.starts_with('/'))
         .map(|(k, _)| format!("\"${k}\""))
         .collect::<Vec<_>>()
         .join(" ");
-    // Only emit the `export …/mkdir -p …` prefix when the binding HAS env — an empty binding would
-    // otherwise produce malformed `export  && mkdir -p  &&` (a future no-verify-env profile). For the
-    // rust binding (2 vars) this is byte-for-byte the old script.
+    // Emit the prefix only when the binding HAS env (empty → no malformed `export  && …`). `mkdir -p`
+    // is added only when at least one env value is a path (else export-only — a profile whose verify_env
+    // is all non-path vars still gets its exports).
     let prefix = if cache.env.is_empty() {
         String::new()
+    } else if mkdirs.is_empty() {
+        format!("export {exports} && ")
     } else {
         format!("export {exports} && mkdir -p {mkdirs} && ")
     };
@@ -517,6 +524,35 @@ mod tests {
             "{argv:?}"
         );
         let _ = prog;
+    }
+
+    #[test]
+    fn compose_verify_mkdir_skips_non_path_env() {
+        // A Go-like verify binding: two path vars + a non-path GOFLAGS. mkdir must target ONLY the
+        // path vars — `mkdir -p … -mod=readonly` would parse the `-` as an option and abort the chain.
+        use crate::profile::CacheBinding;
+        use crate::session_cwd::SessionCwd;
+        let clone = SessionCwd::parse("/clones/go-1").unwrap();
+        let binding = CacheBinding {
+            env: vec![
+                ("GOMODCACHE".into(), "/cache/gomodcache".into()),
+                ("GOCACHE".into(), "/cache/go-build".into()),
+                ("GOFLAGS".into(), "-mod=readonly".into()),
+            ],
+            mounts: vec!["a2a-verify-cache-x:/cache".into()],
+        };
+        let (_prog, argv) = compose_verify(
+            None,
+            "img:latest",
+            &EgressPolicy::Open,
+            &clone,
+            &binding,
+            "go build ./...",
+        );
+        assert_eq!(
+            argv.last().unwrap(),
+            "cd '/clones/go-1' && export GOMODCACHE=/cache/gomodcache GOCACHE=/cache/go-build GOFLAGS=-mod=readonly && mkdir -p \"$GOMODCACHE\" \"$GOCACHE\" && go build ./..."
+        );
     }
 
     #[test]
