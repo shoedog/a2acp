@@ -176,8 +176,10 @@ impl SessionManager {
             if !still_ours {
                 return Err(BridgeError::SessionExpired);
             }
-            let cancelled_or_released =
-                tab.get(ctx).map(|h| h.expire_after_reconcile).unwrap_or(true);
+            let cancelled_or_released = tab
+                .get(ctx)
+                .map(|h| h.expire_after_reconcile)
+                .unwrap_or(true);
             let clean = matches!(outcome, Ok(ReconcileOutcome::Applied)) && !cancelled_or_released;
             if clean {
                 let h = tab.get_mut(ctx).expect("still_ours");

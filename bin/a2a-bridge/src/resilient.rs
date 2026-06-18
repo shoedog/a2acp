@@ -172,6 +172,7 @@ mod tests {
             BridgeError::UnknownAgent { .. } => "UnknownAgent",
             BridgeError::ConfigInvalid { .. } => "ConfigInvalid",
             BridgeError::ConfigMismatch { .. } => "ConfigMismatch",
+            BridgeError::ConfigReseedRequired { .. } => "ConfigReseedRequired",
             BridgeError::SessionExpired => "SessionExpired",
             BridgeError::HandleBusy => "HandleBusy",
         }
@@ -213,6 +214,10 @@ mod tests {
                 Death::Fatal,
             ),
             (BridgeError::ConfigMismatch { field: "x" }, Death::Fatal),
+            (
+                BridgeError::ConfigReseedRequired { field: "x" },
+                Death::Fatal,
+            ),
             (BridgeError::SessionExpired, Death::Fatal),
             (BridgeError::HandleBusy, Death::Fatal),
         ];
