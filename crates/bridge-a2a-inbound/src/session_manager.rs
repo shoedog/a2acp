@@ -19,6 +19,13 @@ use tokio::sync::Mutex;
 pub enum SessionState {
     Idle,
     Running,
+    /// A warm reconcile (model/effort re-apply) is in flight. The handle is OWNED by that reconcile:
+    /// not re-claimable (checkout -> HandleBusy) and not removable (cancel/release set
+    /// `expire_after_reconcile` instead) until it resolves. Closes the ABA + release-reuse races.
+    Reconciling,
+    /// A non-clean reconcile is tearing the handle down (release_session in flight). Held as a tombstone
+    /// so a concurrent checkout (HandleBusy) can't re-mint the same backend_session id before release ends.
+    Expiring,
 }
 
 struct WarmHandle {
@@ -32,6 +39,9 @@ struct WarmHandle {
     fingerprint: SessionSpecFingerprint,
     lease: Box<dyn Lease>,
     state: SessionState,
+    /// Set by cancel()/release() while `Reconciling` so the in-flight reconcile expires the handle on
+    /// resolve (the handle is never mutated/removed out from under an active reconcile). [PF-2/9/10]
+    expire_after_reconcile: bool,
     #[allow(dead_code)]
     op: Option<OperationId>,
     last_used: Instant,
@@ -95,7 +105,8 @@ impl SessionManager {
             if h.lease.is_retired() {
                 return Err(BridgeError::SessionExpired);
             }
-            if h.state == SessionState::Running {
+            if h.state != SessionState::Idle {
+                // Running / Reconciling / Expiring all mean the handle is busy.
                 return Err(BridgeError::HandleBusy);
             }
             let resolved = self.registry.resolve(&agent).await?;
@@ -138,8 +149,10 @@ impl SessionManager {
             let claimed_id = h.id.clone();
             let backend = h.backend.clone();
             let backend_session = h.backend_session.clone();
-            h.state = SessionState::Running;
-            h.op = Some(op.clone());
+            // Claim the handle as Reconciling: a concurrent checkout is now HandleBusy (no ABA re-claim) and
+            // cancel/release defer (set expire_after_reconcile) rather than mutate/remove it.
+            h.state = SessionState::Reconciling;
+            h.expire_after_reconcile = false;
             h.last_used = (self.now)();
             drop(tab);
 
@@ -152,45 +165,47 @@ impl SessionManager {
                     },
                 )
                 .await;
+
             let mut tab = self.by_context.lock().await;
-            return match outcome {
-                Ok(ReconcileOutcome::Applied) => {
-                    let Some(current) = tab.get_mut(ctx) else {
-                        return Err(BridgeError::SessionExpired);
-                    };
-                    if current.id != claimed_id {
-                        return Err(BridgeError::SessionExpired);
-                    }
-                    if current.state != SessionState::Running {
-                        let h = tab.remove(ctx).expect("checked current handle exists");
-                        let backend = h.backend.clone();
-                        let backend_session = h.backend_session.clone();
-                        drop(tab);
-                        backend.release_session(&backend_session).await;
-                        drop(h.lease);
-                        return Err(BridgeError::SessionExpired);
-                    }
-                    current.fingerprint = fp;
-                    current.op = Some(op);
-                    current.last_used = (self.now)();
-                    Ok(WarmTurn {
-                        backend: current.backend.clone(),
-                        session: current.backend_session.clone(),
-                    })
-                }
-                Ok(ReconcileOutcome::NotAdvertised) | Ok(ReconcileOutcome::Rejected) | Err(_) => {
-                    if tab.get(ctx).is_some_and(|h| h.id == claimed_id) {
-                        let h = tab.remove(ctx).expect("checked current handle exists");
-                        let backend = h.backend.clone();
-                        let backend_session = h.backend_session.clone();
-                        drop(tab);
-                        backend.release_session(&backend_session).await;
-                        drop(h.lease);
-                    }
-                    Err(BridgeError::ConfigReseedRequired {
-                        field: reseed_field,
-                    })
-                }
+            // Re-validate the EXACT claim: the handle must still be the one we set Reconciling. Given the
+            // invariants (Reconciling blocks re-claim/remove), anything else is a logic error -> bail.
+            let still_ours = matches!(
+                tab.get(ctx),
+                Some(h) if h.id == claimed_id && h.state == SessionState::Reconciling
+            );
+            if !still_ours {
+                return Err(BridgeError::SessionExpired);
+            }
+            let cancelled_or_released =
+                tab.get(ctx).map(|h| h.expire_after_reconcile).unwrap_or(true);
+            let clean = matches!(outcome, Ok(ReconcileOutcome::Applied)) && !cancelled_or_released;
+            if clean {
+                let h = tab.get_mut(ctx).expect("still_ours");
+                h.fingerprint = fp;
+                h.state = SessionState::Running;
+                h.op = Some(op);
+                h.last_used = (self.now)();
+                return Ok(WarmTurn {
+                    backend: h.backend.clone(),
+                    session: h.backend_session.clone(),
+                });
+            }
+            // Non-clean (failed reconcile OR cancel/release arrived mid-window): EXPIRE via an `Expiring`
+            // tombstone held across release_session().await so a concurrent checkout (HandleBusy on Expiring)
+            // can't re-mint the same backend_session id before release completes.
+            tab.get_mut(ctx).expect("still_ours").state = SessionState::Expiring;
+            drop(tab);
+            backend.release_session(&backend_session).await;
+            let mut tab = self.by_context.lock().await;
+            if let Some(h) = tab.remove(ctx) {
+                drop(h.lease);
+            }
+            return if cancelled_or_released {
+                Err(BridgeError::SessionExpired)
+            } else {
+                Err(BridgeError::ConfigReseedRequired {
+                    field: reseed_field,
+                })
             };
         }
 
@@ -225,6 +240,7 @@ impl SessionManager {
                 fingerprint: fp,
                 lease: resolved.lease,
                 state: SessionState::Running,
+                expire_after_reconcile: false,
                 op: Some(op),
                 last_used: (self.now)(),
             },
@@ -247,6 +263,8 @@ impl SessionManager {
             state: match h.state {
                 SessionState::Idle => "idle",
                 SessionState::Running => "running",
+                SessionState::Reconciling => "reconciling",
+                SessionState::Expiring => "expiring",
             },
             agent: h.agent.as_str().to_string(),
             generation: h.generation.get(),
@@ -256,7 +274,18 @@ impl SessionManager {
     }
 
     pub async fn release(&self, ctx: &ContextId) {
-        let h = self.by_context.lock().await.remove(ctx);
+        let h = {
+            let mut tab = self.by_context.lock().await;
+            if let Some(h) = tab.get_mut(ctx) {
+                // A reconcile owns the handle: defer teardown to its resolve (don't remove it out from
+                // under the in-flight release / let the backend_session id be reused mid-release).
+                if h.state == SessionState::Reconciling || h.state == SessionState::Expiring {
+                    h.expire_after_reconcile = true;
+                    return;
+                }
+            }
+            tab.remove(ctx)
+        };
         if let Some(h) = h {
             h.backend.release_session(&h.backend_session).await;
             drop(h.lease);
@@ -270,6 +299,12 @@ impl SessionManager {
             let Some(h) = tab.get_mut(ctx) else {
                 return Err(BridgeError::SessionNotFound);
             };
+            // A reconcile owns the handle: flag it to expire on resolve rather than resetting to Idle
+            // (which would let a third checkout re-claim it under the in-flight reconcile — the ABA bug).
+            if h.state == SessionState::Reconciling || h.state == SessionState::Expiring {
+                h.expire_after_reconcile = true;
+                return Ok(());
+            }
             h.state = SessionState::Idle;
             h.op = None;
             (h.backend.clone(), h.backend_session.clone())
@@ -976,7 +1011,9 @@ mod tests {
         backend.wait_for_reconcile().await;
 
         manager.release(&ctx).await;
-        manager
+        // During the reconcile/release window the handle is OWNED (Reconciling): a concurrent checkout must
+        // be HandleBusy — no fresh re-mint of the same backend_session id mid-reconcile (closes the reuse race).
+        let busy = manager
             .checkout_turn(
                 &ctx,
                 agent(),
@@ -985,15 +1022,18 @@ mod tests {
                 op("op-3"),
             )
             .await
+            .err()
             .unwrap();
+        assert_eq!(busy, BridgeError::HandleBusy);
         unblock.send(()).unwrap();
 
+        // The in-flight reconcile observes the deferred release and EXPIRES the handle.
         assert_eq!(
             in_flight.await.unwrap().err().unwrap(),
             BridgeError::SessionExpired
         );
-        assert_eq!(manager.status(&ctx).await.unwrap().state, "running");
-        manager.finish_turn(&ctx).await;
+        // Handle is gone -> a subsequent checkout mints fresh (cold).
+        assert!(manager.status(&ctx).await.is_none());
         manager
             .checkout_turn(
                 &ctx,
