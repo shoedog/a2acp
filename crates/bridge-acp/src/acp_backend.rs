@@ -1615,17 +1615,34 @@ impl AcpBackend {
     /// and mapped through the exact same code that runs in production — that is what
     /// makes the corpus replay a real conformance proof, not a circular one.
     ///
-    /// Only `agent_message_chunk` with text content is modeled today (→
-    /// `Update::Text`); every other `SessionUpdate` variant (thought chunks, plans,
-    /// tool-call updates, …) and non-text content is a tolerant-reader DROP (`None`).
+    /// `agent_message_chunk` with text content is modeled as `Update::Text`, and
+    /// `usage_update` is modeled as `Update::Usage`. Every other `SessionUpdate`
+    /// variant (thought chunks, plans, tool-call updates, ...) and non-text content
+    /// is a tolerant-reader DROP (`None`).
     #[must_use]
     pub fn map_session_update(notif: SessionNotification) -> Option<Update> {
-        if let SessionUpdate::AgentMessageChunk(chunk) = notif.update {
-            if let ContentBlock::Text(t) = chunk.content {
-                return Some(Update::Text(t.text));
+        match notif.update {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                if let ContentBlock::Text(t) = chunk.content {
+                    return Some(Update::Text(t.text));
+                }
+                None
             }
+            // Slice 2: surface context-window usage. Clock-free (at_ms stamped downstream at record_usage)
+            // so the corpus-replay conformance test stays deterministic.
+            SessionUpdate::UsageUpdate(u) => {
+                Some(Update::Usage(bridge_core::orch::UsageSnapshot {
+                    used: Some(u.used),
+                    size: Some(u.size),
+                    cost: u.cost.map(|c| bridge_core::orch::UsageCost {
+                        amount: c.amount,
+                        currency: c.currency,
+                    }),
+                    at_ms: 0,
+                }))
+            }
+            _ => None, // tolerant reader: unmodeled variants / non-text chunk content
         }
-        None
     }
 
     /// Map an ACP `StopReason` to the bridge's `Update::Done` stop_reason string.
@@ -2158,6 +2175,25 @@ mod tests {
             cwd: std::path::PathBuf::from("/tmp"),
             handshake_timeout: Duration::from_millis(200),
             ..AcpConfig::default()
+        }
+    }
+
+    #[test]
+    fn map_session_update_maps_usage_to_update_usage_clock_free() {
+        use agent_client_protocol::schema::UsageUpdate;
+
+        let notif = SessionNotification::new(
+            AgentSessionId::from("s"),
+            SessionUpdate::UsageUpdate(UsageUpdate::new(14584, 258400)),
+        );
+        match AcpBackend::map_session_update(notif).expect("usage maps") {
+            Update::Usage(s) => {
+                assert_eq!(s.used, Some(14584));
+                assert_eq!(s.size, Some(258400));
+                assert_eq!(s.cost, None);
+                assert_eq!(s.at_ms, 0);
+            }
+            other => panic!("expected Update::Usage, got {other:?}"),
         }
     }
 

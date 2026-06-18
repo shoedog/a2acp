@@ -103,9 +103,9 @@ fn replay(frame: &Value) -> Option<ReplayOutcome> {
             // `SessionNotification` (the real parse boundary) and map via the
             // production helper.
             //
-            // MODELED DROP (`Ok` arm): a variant the SDK knows but the backend doesn't
-            // surface (e.g. `usage_update`, now modeled via the `unstable_session_usage`
-            // feature) deserializes fine and `map_session_update` returns `None` → dropped.
+            // MODELED UPDATE (`Ok` arm): a variant the SDK knows and the backend
+            // surfaces (e.g. `usage_update`) deserializes fine and
+            // `map_session_update` returns the typed bridge `Update`.
             //
             // `Err` arm = a GENUINELY unmodeled variant. CAVEAT (live-found): the real SDK
             // is NOT benign here — on a deser failure its typed dispatch auto-emits a
@@ -214,10 +214,10 @@ fn kiro_real_capture_replays_through_backend() {
 // Real round-trip captured off the wire from zed-industries/codex-acp 0.15.0
 // (initialize → authenticate(chatgpt) → session/new → set_mode(read-only) →
 // session/prompt → 2× agent_message_chunk → end_turn result). The codex agent
-// streamed `PONG` across two chunks ("P" + "ONG"), and emitted several unmodeled
+// streamed `PONG` across two chunks ("P" + "ONG"), and emitted several modeled
 // `session/update` variants (`available_commands_update`, `config_option_update`,
-// `usage_update`) that the tolerant reader must DROP. We replay the recv frames
-// through the SAME production path the kiro test uses.
+// `usage_update`). Usage is surfaced; non-text config/commands still drop. We
+// replay the recv frames through the SAME production path the kiro test uses.
 
 #[test]
 fn codex_real_capture_replays_pong_and_drops_unmodeled() {
@@ -231,6 +231,7 @@ fn codex_real_capture_replays_pong_and_drops_unmodeled() {
     let mut texts: Vec<String> = Vec::new();
     let mut done: Option<String> = None;
     let mut modeled = 0usize;
+    let mut usage_seen = 0usize;
 
     for frame in corpus.recv_frames() {
         match replay(frame) {
@@ -238,13 +239,20 @@ fn codex_real_capture_replays_pong_and_drops_unmodeled() {
                 modeled += 1;
                 texts.push(t);
             }
+            Some(ReplayOutcome::Update(Update::Usage(s))) => {
+                usage_seen += 1;
+                assert_eq!(s.used, Some(14584));
+                assert_eq!(s.size, Some(258400));
+                assert_eq!(s.cost, None);
+                assert_eq!(s.at_ms, 0);
+            }
             Some(ReplayOutcome::Done(stop)) => {
                 modeled += 1;
                 done = Some(stop);
             }
             Some(other) => panic!("unexpected modeled outcome from codex capture: {other:?}"),
             // tolerant DROP: the unmodeled available_commands_update /
-            // config_option_update / usage_update session/updates, plus the
+            // config_option_update session/updates, plus the
             // initialize/authenticate/session-new/set_mode results.
             None => {}
         }
@@ -267,12 +275,16 @@ fn codex_real_capture_replays_pong_and_drops_unmodeled() {
         Some("end_turn"),
         "the real codex prompt result must replay to Update::Done{{end_turn}}"
     );
-    // Exactly the two text chunks + the result are modeled; the three unmodeled
-    // session/update variants contributed nothing (tolerant DROP).
+    // Exactly the two text chunks + the result are counted as text/done outcomes;
+    // usage is surfaced and tracked separately from that legacy modeled count.
     assert_eq!(
         modeled, 3,
         "only the 2 text chunks + the prompt result are modeled; \
-         available_commands_update/config_option_update/usage_update are DROPPED"
+         available_commands_update/config_option_update are DROPPED"
+    );
+    assert_eq!(
+        usage_seen, 1,
+        "the codex usage_update frame must surface as Update::Usage"
     );
 }
 
@@ -343,13 +355,13 @@ fn gemini_available_commands_update_is_modeled_not_parse_error() {
 }
 
 #[test]
-fn usage_update_is_modeled_and_dropped_not_a_minus_32602() {
+fn usage_update_is_modeled_and_surfaced_not_a_minus_32602() {
     // Regression for the live HANG: claude-agent-acp emits a `session/update` of variant
     // `usage_update` (with a `cost`). WITHOUT the `unstable_session_usage` feature the SDK's
     // internally-tagged `SessionUpdate` enum (no `#[serde(other)]`) HARD-FAILS to deserialize it,
     // the live SDK auto-emits a spurious `-32602` to the agent, and the turn stalls (multi-minute
     // hang). With the feature on, it deserializes into the modeled `UsageUpdate` variant and
-    // `map_session_update` drops it (no assistant text) → None. MUST be a MODELED drop (Ok), not a
+    // `map_session_update` surfaces it as `Update::Usage`. MUST be a MODELED update (Ok), not a
     // parse error (Err).
     let params = serde_json::json!({
         "sessionId": "s1",
@@ -364,10 +376,17 @@ fn usage_update_is_modeled_and_dropped_not_a_minus_32602() {
         "usage_update MUST deserialize (modeled via unstable_session_usage) — a parse error here \
          is the live-hang bug (the SDK would emit a turn-stalling -32602)",
     );
-    assert!(
-        AcpBackend::map_session_update(notif).is_none(),
-        "usage_update carries no assistant text → dropped at the map layer (None)"
-    );
+    match AcpBackend::map_session_update(notif).expect("usage_update maps") {
+        Update::Usage(s) => {
+            assert_eq!(s.used, Some(55011));
+            assert_eq!(s.size, Some(1000000));
+            let cost = s.cost.expect("cost maps when provided");
+            assert!((cost.amount - 0.74405).abs() < f64::EPSILON);
+            assert_eq!(cost.currency, "USD");
+            assert_eq!(s.at_ms, 0);
+        }
+        other => panic!("expected Update::Usage, got {other:?}"),
+    }
 }
 
 // ── claude-agent-acp: REAL capture (DoD gate MET) ────────────────────────────
@@ -382,11 +401,24 @@ fn claude_agent_acp_real_capture_replays_through_backend() {
     let mut texts: Vec<String> = Vec::new();
     let mut done: Option<String> = None;
     let mut modeled = 0usize;
+    let mut usage_seen = 0usize;
     for frame in corpus.recv_frames() {
         match replay(frame) {
             Some(ReplayOutcome::Update(Update::Text(t))) => {
                 modeled += 1;
                 texts.push(t);
+            }
+            Some(ReplayOutcome::Update(Update::Usage(s))) => {
+                usage_seen += 1;
+                assert!(
+                    s.used.is_some(),
+                    "claude usage_update must carry used tokens"
+                );
+                assert!(
+                    s.size.is_some(),
+                    "claude usage_update must carry window size"
+                );
+                assert_eq!(s.at_ms, 0);
             }
             Some(ReplayOutcome::Done(stop)) => {
                 modeled += 1;
@@ -399,7 +431,7 @@ fn claude_agent_acp_real_capture_replays_through_backend() {
             Some(ReplayOutcome::PermissionOutcome(_)) => {}
             // Update::Permission / Update::Done are unexpected mid-stream — flag them.
             Some(other) => panic!("unexpected modeled outcome from claude capture: {other:?}"),
-            None => {} // DROP: available_commands_update / config_option_update / usage_update / agent_thought_chunk + init/session-new results
+            None => {} // DROP: available_commands_update / config_option_update / agent_thought_chunk + init/session-new results
         }
     }
     assert_eq!(
@@ -415,6 +447,10 @@ fn claude_agent_acp_real_capture_replays_through_backend() {
     assert!(
         modeled >= 2,
         "at least one text chunk + the result must be modeled"
+    );
+    assert!(
+        usage_seen >= 1,
+        "claude usage_update frame(s) must surface as Update::Usage"
     );
 }
 
