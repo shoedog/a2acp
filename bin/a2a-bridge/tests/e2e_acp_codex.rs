@@ -87,6 +87,7 @@ async fn real_codex_acp_prompt_round_trip_with_mode_applied() {
             match stream.next().await {
                 Some(Ok(Update::Text(t))) => texts.push(t),
                 Some(Ok(Update::Permission(_))) => {}
+                Some(Ok(Update::Usage(_))) => {}
                 Some(Ok(Update::Done { stop_reason })) => return (texts.join(""), stop_reason),
                 Some(Err(e)) => panic!("codex turn surfaced terminal error before Done: {e:?}"),
                 None => panic!("codex stream ended without a terminal Update::Done"),

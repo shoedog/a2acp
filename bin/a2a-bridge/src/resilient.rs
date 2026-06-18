@@ -171,6 +171,9 @@ mod tests {
             BridgeError::InvalidStateTransition => "InvalidStateTransition",
             BridgeError::UnknownAgent { .. } => "UnknownAgent",
             BridgeError::ConfigInvalid { .. } => "ConfigInvalid",
+            BridgeError::ConfigMismatch { .. } => "ConfigMismatch",
+            BridgeError::SessionExpired => "SessionExpired",
+            BridgeError::HandleBusy => "HandleBusy",
         }
     }
 
@@ -209,6 +212,9 @@ mod tests {
                 BridgeError::ConfigInvalid { reason: "x".into() },
                 Death::Fatal,
             ),
+            (BridgeError::ConfigMismatch { field: "x" }, Death::Fatal),
+            (BridgeError::SessionExpired, Death::Fatal),
+            (BridgeError::HandleBusy, Death::Fatal),
         ];
         for (err, want) in cases {
             let _ = table_key(&err);

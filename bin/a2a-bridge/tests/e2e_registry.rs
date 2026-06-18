@@ -302,6 +302,7 @@ async fn route_and_prompt(
                 Some(Ok(Update::Permission(_))) => {
                     eprintln!("(note) {id} issued a permission request on a plain text prompt");
                 }
+                Some(Ok(Update::Usage(_))) => {}
                 Some(Ok(Update::Done { stop_reason })) => {
                     // Hold the lease until Done so retirement can't drain us mid-turn.
                     drop(resolved);
@@ -491,6 +492,7 @@ async fn drain_one_turn(
             match stream.next().await {
                 Some(Ok(Update::Text(t))) => texts.push(t),
                 Some(Ok(Update::Permission(_))) => {}
+                Some(Ok(Update::Usage(_))) => {}
                 Some(Ok(Update::Done { stop_reason })) => return (texts.join(""), stop_reason),
                 Some(Err(e)) => panic!("turn surfaced a terminal error before Done: {e:?}"),
                 None => panic!("stream ended WITHOUT a terminal Update::Done"),

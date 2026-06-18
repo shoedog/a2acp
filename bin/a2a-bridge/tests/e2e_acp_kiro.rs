@@ -132,6 +132,7 @@ async fn run_round_trip() -> (Vec<String>, String) {
     loop {
         match stream.next().await {
             Some(Ok(Update::Text(t))) => texts.push(t),
+            Some(Ok(Update::Usage(_))) => {}
             Some(Ok(Update::Permission(_))) => {
                 // A plain text prompt should not require a tool permission; the
                 // backend auto-approves by default, so we just note and continue.
