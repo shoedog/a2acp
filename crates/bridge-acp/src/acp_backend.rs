@@ -41,6 +41,7 @@ use bridge_core::domain::{
 };
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
+use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
 use bridge_core::ports::{
     AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED,
 };
@@ -1928,6 +1929,74 @@ impl AgentBackend for AcpBackend {
         }
     }
 
+    /// Re-apply warm-session model/effort against the cached ACP config surface.
+    /// cwd/mode are mint-only here; callers route those before asking for a warm
+    /// reconcile.
+    async fn reconcile_config(
+        &self,
+        session: &SessionId,
+        spec: &SessionSpec,
+    ) -> Result<ReconcileOutcome, BridgeError> {
+        let entry = self.session_entry(session).await;
+        if entry.agent_id.get().is_none() {
+            self.configure_session(session, spec).await?;
+            let _aid = self.ensure_session(session).await?;
+            return Ok(ReconcileOutcome::Applied);
+        }
+
+        let aid = self.ensure_session(session).await?;
+        let _g = Arc::clone(&entry.turn_lock).lock_owned().await;
+        let surface = entry
+            .config_surface
+            .lock()
+            .expect("config_surface lock")
+            .clone()
+            .unwrap_or_default();
+        let agent_id = self
+            .config
+            .as_ref()
+            .map(|c| c.agent_id.clone())
+            .unwrap_or_default();
+        let cx = self.cx()?;
+        match Self::apply_model_effort(
+            cx,
+            &aid,
+            &agent_id,
+            &surface,
+            spec.config.model.as_deref(),
+            spec.config.effort,
+            ApplyPurpose::Warm,
+        )
+        .await
+        {
+            Ok((refreshed, _)) => {
+                *entry.config_surface.lock().expect("config_surface lock") = Some(refreshed);
+                Ok(ReconcileOutcome::Applied)
+            }
+            Err(ApplyConfigError::NotAdvertised(b)) => {
+                tracing::warn!(?b, "reconcile not advertised");
+                Ok(ReconcileOutcome::NotAdvertised)
+            }
+            Err(ApplyConfigError::Rejected(b)) => {
+                tracing::warn!(?b, "reconcile rejected");
+                Ok(ReconcileOutcome::Rejected)
+            }
+        }
+    }
+
+    fn capabilities(&self) -> AgentSessionCaps {
+        match self.agent_capabilities() {
+            Some(c) => AgentSessionCaps {
+                load_session: c.load_session,
+                resume: c.session_capabilities.resume.is_some(),
+                close: c.session_capabilities.close.is_some(),
+                list: c.session_capabilities.list.is_some(),
+                delete: false,
+            },
+            None => AgentSessionCaps::default(),
+        }
+    }
+
     /// Release a warm ACP session: best-effort cancel any in-flight turn, drop the
     /// agent-side `AgentSession` (a later reuse re-mints a fresh `session/new`), and drop
     /// the config stash. Does NOT `retire()` the shared process (warm for serve's lifetime,
@@ -1986,7 +2055,8 @@ mod tests {
 
     use agent_client_protocol::schema::{
         AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodId, InitializeRequest,
-        InitializeResponse, ProtocolVersion,
+        InitializeResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities,
+        SessionListCapabilities, SessionResumeCapabilities,
     };
     use agent_client_protocol::{Agent, Channel};
 
@@ -2152,6 +2222,38 @@ mod tests {
         );
         let methods = be.auth_methods().expect("auth methods captured");
         assert_eq!(methods.len(), 1, "advertised auth method round-trips");
+    }
+
+    #[tokio::test]
+    async fn capabilities_maps_agent_session_capabilities() {
+        let (client_side, agent_side) = Channel::duplex();
+        let agent_caps = AgentCapabilities::new()
+            .load_session(true)
+            .session_capabilities(
+                SessionCapabilities::new()
+                    .list(SessionListCapabilities::new())
+                    .resume(SessionResumeCapabilities::new())
+                    .close(SessionCloseCapabilities::new()),
+            );
+        spawn_fake_agent(
+            agent_side,
+            InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(agent_caps),
+        );
+
+        let be = AcpBackend::connect(client_side, test_config())
+            .await
+            .expect("initialize handshake succeeds");
+
+        assert_eq!(
+            be.capabilities(),
+            bridge_core::orch::AgentSessionCaps {
+                load_session: true,
+                resume: true,
+                close: true,
+                list: true,
+                delete: false,
+            }
+        );
     }
 
     #[tokio::test]
@@ -4739,6 +4841,101 @@ mod tests {
         assert_eq!(
             select_current(&surface.opts, "effort").as_deref(),
             Some("high")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_config_on_minted_session_applies_changed_model() {
+        let rec = Recorder::new("agent-sess-RECON-MODEL");
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-RECON-MODEL");
+
+        be.ensure_session(&key).await.unwrap();
+        let outcome = be
+            .reconcile_config(
+                &key,
+                &SessionSpec::from_config(EffectiveConfig {
+                    model: Some("m".to_string()),
+                    effort: None,
+                    mode: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, bridge_core::orch::ReconcileOutcome::Applied);
+        assert_eq!(
+            rec.set_config_options.lock().await.as_slice(),
+            &[("model".to_string(), "m".to_string())],
+            "warm reconcile must apply the changed model via session/set_config_option"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_config_unadvertised_model_returns_not_advertised() {
+        let rec = Recorder::new("agent-sess-RECON-BADMODEL");
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-RECON-BADMODEL");
+
+        be.ensure_session(&key).await.unwrap();
+        let outcome = be
+            .reconcile_config(
+                &key,
+                &SessionSpec::from_config(EffectiveConfig {
+                    model: Some("not-a-model".to_string()),
+                    effort: None,
+                    mode: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, bridge_core::orch::ReconcileOutcome::NotAdvertised);
+        assert!(
+            rec.set_config_options.lock().await.is_empty(),
+            "unadvertised model must fail before sending set_config_option"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_config_refreshes_cache_between_warm_effort_applies() {
+        let rec = Recorder::new("agent-sess-RECON-EFFORT");
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-RECON-EFFORT");
+
+        be.ensure_session(&key).await.unwrap();
+        let high = be
+            .reconcile_config(
+                &key,
+                &SessionSpec::from_config(EffectiveConfig {
+                    model: None,
+                    effort: Some(Effort::High),
+                    mode: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let low = be
+            .reconcile_config(
+                &key,
+                &SessionSpec::from_config(EffectiveConfig {
+                    model: None,
+                    effort: Some(Effort::Low),
+                    mode: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(high, bridge_core::orch::ReconcileOutcome::Applied);
+        assert_eq!(low, bridge_core::orch::ReconcileOutcome::Applied);
+        assert_eq!(
+            rec.set_config_options.lock().await.as_slice(),
+            &[
+                ("effort".to_string(), "high".to_string()),
+                ("effort".to_string(), "low".to_string())
+            ],
+            "warm effort reconcile must use the refreshed cache so high then low both apply"
         );
     }
 
