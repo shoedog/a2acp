@@ -16,9 +16,20 @@
   errors; caps `{loadSession,resume,close,list,delete=false}`). 8 tasks, each codex-xhigh increment-reviewed;
   the apply-or-expire concurrency (ABA + release-reuse) was caught + fixed via a targeted re-review
   (Reconciling/Expiring non-reusable claim).
-- **NEXT = Slice 2 — Usage telemetry** (plumb `usage_update`→start/end/`session-status`+pre-task threshold
-  warn). Then S3 clear/reset → S4 compact → S5 serve-backed `run-workflow --serve --context` [MVP cut] →
-  S6 journal → S7 observability+E9 → S8 MCP → S9 Turn Channel → tail. Follow the proven loop below.
+- **Slice 2 — Usage telemetry: SHIPPED + MERGED** to `main` (`007b356`, NOT yet pushed). Plumbs the ACP
+  `usage_update` (received-but-dropped at TWO gates) end-to-end: map→`Update::Usage`→`TurnEvent::Usage`
+  pipeline→translator `EventKind::Usage`→warm-handle `record_usage`→`session/status` (`used/size/windowFraction/
+  cost/atMs/overThreshold`)→pre-task `warm_usage_warn_fraction` warn; usage NEVER on the A2A wire (DoD-5).
+  8 tasks, each codex-xhigh increment-reviewed. **Live-gated on real codex AND claude:** codex `used/size`
+  (windowFraction 0.116), claude `used/size`+**`cost`** ($0.074→$0.087), `used` rose across warm turns,
+  `usage_threshold_warn` fired pre-task (turn-2 checkout from carried usage), `overThreshold:true`, zero serve
+  errors. **KEY FINDINGS:** the un-drop was a 3-site bridge-acp change (`map_session_update` alone insufficient —
+  handler `:973`+`TurnEvent`+`unfold` also dropped non-text); `#[cfg(feature="unstable_session_usage")]` is a
+  DEPENDENCY feature NOT a bridge-acp crate feature (a `cfg` compiles it OUT — use unconditional code); the
+  pre-existing unary last-chunk truncation re-confirmed live (`PONG`→`ONG`, NOT Slice-2; a real follow-up).
+- **NEXT = Slice 3 — Clear / reset** (`reset_session` = new SessionId per generation + `clear`; generation
+  guard). Then S4 compact → S5 serve-backed `run-workflow --serve --context` [MVP cut] → S6 journal →
+  S7 observability+E9 → S8 MCP → S9 Turn Channel → tail. Follow the proven loop below.
 
 ## Canonical docs (read these — they are the source of truth)
 
@@ -51,8 +62,8 @@ never both); `_meta` for cross-boundary correlation.
 |---|---|---|
 | **0 Live Session Core** | warm continue keyed by contextId; SessionManager; minimal OrchEvent/OrchResult; session CLI/methods | ✅ SHIPPED+MERGED |
 | **1 Config reconcile + capabilities** | reconcile model/effort on warm continue (else typed reseed); record agent caps | ✅ SHIPPED+MERGED |
-| **2 Usage telemetry** | plumb `usage_update` → start/end/`session-status` + pre-task threshold warn | ◀ NEXT |
-| **3 Clear / reset** | `reset_session` (new SessionId per generation) + `clear`; generation guard | |
+| **2 Usage telemetry** | plumb `usage_update` → start/end/`session-status` + pre-task threshold warn | ✅ SHIPPED+MERGED |
+| **3 Clear / reset** | `reset_session` (new SessionId per generation) + `clear`; generation guard | ◀ NEXT |
 | **4 Compact** | summarize → reset → seed-as-PrependNextTurn | |
 | **5 Serve-backed `run-workflow --serve --context`** | CLI as serve client + executor keep-warm policy | **— MVP CUT-LINE (S0–S5) —** |
 | **6 Event-journal dual-store** | full OrchEvent/OrchResult/OrchCommand Ser+De; the 4-path adapter rewrite; shared `next_seq` | the deferred risky rewrite |
