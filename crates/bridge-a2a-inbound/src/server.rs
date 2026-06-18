@@ -669,6 +669,9 @@ async fn jsonrpc(
         m if m == methods::CANCEL_TASK => cancel_task(srv, headers, id, params).await,
         m if m == methods::GET_TASK => get_task(srv, headers, id, params).await,
         m if m == methods::LIST_TASKS => list_tasks(srv, headers, id, params).await,
+        "SessionStatus" => session_status(srv, headers, id, params).await,
+        "SessionRelease" => session_release(srv, headers, id, params).await,
+        "SessionCancel" => session_cancel(srv, headers, id, params).await,
         "" => jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "missing method"),
         _ => jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "method not found"),
     }
@@ -2802,6 +2805,95 @@ async fn cancel_task(
         id,
         json!({ "task": { "id": task.as_str(), "state": "TASK_STATE_CANCELED" } }),
     )
+}
+
+fn authorize_headers(srv: &InboundServer, headers: &HeaderMap) -> Result<(), BridgeError> {
+    let inbound = match bearer_token(headers) {
+        Some(t) => InboundRequest::with_token(&t),
+        None => InboundRequest::anon(),
+    };
+    srv.auth.authorize(&inbound).map(|_| ())
+}
+
+fn context_id_arg(params: &Value) -> Result<ContextId, BridgeError> {
+    params
+        .get("contextId")
+        .and_then(|v| v.as_str())
+        .ok_or(BridgeError::InvalidRequest { field: "contextId" })
+        .and_then(ContextId::parse)
+}
+
+async fn session_status(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(sm) = srv.session_manager.clone() else {
+        return jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "no session manager");
+    };
+    let ctx = match context_id_arg(&params) {
+        Ok(c) => c,
+        Err(e) => return bridge_err_to_jsonrpc(id, &e),
+    };
+    match sm.status(&ctx).await {
+        Some(s) => jsonrpc_ok(
+            id,
+            json!({
+                "contextId": ctx.as_str(),
+                "state": s.state,
+                "agent": s.agent,
+                "generation": s.generation,
+                "idleAgeMs": s.idle_age_ms,
+            }),
+        ),
+        None => bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound),
+    }
+}
+
+async fn session_release(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(sm) = srv.session_manager.clone() else {
+        return jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "no session manager");
+    };
+    let ctx = match context_id_arg(&params) {
+        Ok(c) => c,
+        Err(e) => return bridge_err_to_jsonrpc(id, &e),
+    };
+    sm.release(&ctx).await;
+    jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "released": true }))
+}
+
+async fn session_cancel(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(sm) = srv.session_manager.clone() else {
+        return jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "no session manager");
+    };
+    let ctx = match context_id_arg(&params) {
+        Ok(c) => c,
+        Err(e) => return bridge_err_to_jsonrpc(id, &e),
+    };
+    match sm.cancel(&ctx).await {
+        Ok(()) => jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "canceled": true })),
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    }
 }
 
 /// `GetTask` -> return the task's last-known state (v1 stub from the store).
@@ -5905,7 +5997,10 @@ mod tests {
         assert_eq!(resp1.status(), StatusCode::OK);
         let _ = body_string(resp1).await;
         for _ in 0..50 {
-            if matches!(sm.status(&ctx).await.as_ref().map(|s| s.state), Some("idle")) {
+            if matches!(
+                sm.status(&ctx).await.as_ref().map(|s| s.state),
+                Some("idle")
+            ) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -5926,7 +6021,10 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::OK);
         let _ = body_string(resp2).await;
         for _ in 0..50 {
-            if matches!(sm.status(&ctx).await.as_ref().map(|s| s.state), Some("idle")) {
+            if matches!(
+                sm.status(&ctx).await.as_ref().map(|s| s.state),
+                Some("idle")
+            ) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -5950,6 +6048,133 @@ mod tests {
                 .as_str(),
             "ctx-c1-g0"
         );
+    }
+
+    #[tokio::test]
+    async fn session_status_release_cancel_dispatch() {
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry_for_sm: Arc<dyn AgentRegistry> = registry.clone();
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_for_sm,
+            std::time::Duration::from_secs(60),
+        ));
+        let registry_for_srv: Arc<dyn AgentRegistry> = registry;
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_for_srv,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm.clone()),
+        );
+        let ctx = ContextId::parse("c1").unwrap();
+        let warm_params = json!({
+            "message": {
+                "contextId": "c1",
+                "text": "go",
+                "metadata": { "a2a-bridge.agent": "a" }
+            }
+        });
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, warm_params, "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+        for _ in 0..50 {
+            if matches!(
+                sm.status(&ctx).await.as_ref().map(|s| s.state),
+                Some("idle")
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                "SessionStatus",
+                json!({ "contextId": "c1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["contextId"], "c1");
+        assert_eq!(v["result"]["state"], "idle");
+        assert_eq!(v["result"]["agent"], "a");
+        assert_eq!(v["result"]["generation"], 0);
+        assert!(v["result"]["idleAgeMs"].is_number());
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                "SessionCancel",
+                json!({ "contextId": "c1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["contextId"], "c1");
+        assert_eq!(v["result"]["canceled"], true);
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                "SessionStatus",
+                json!({ "contextId": "c1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["state"], "idle");
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                "SessionRelease",
+                json!({ "contextId": "c1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["contextId"], "c1");
+        assert_eq!(v["result"]["released"], true);
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionStatus",
+                json!({ "contextId": "c1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(v["error"]["message"], "session not found");
     }
 
     #[tokio::test]
