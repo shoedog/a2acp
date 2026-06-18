@@ -45,6 +45,8 @@ impl From<toml::de::Error> for ConfigError {
 pub struct ServerConfig {
     #[serde(default = "default_addr")]
     pub addr: String,
+    #[serde(default = "default_warm_idle_ttl_secs")]
+    pub warm_idle_ttl_secs: u64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -64,6 +66,10 @@ pub struct DelegationConfig {
 
 fn default_addr() -> String {
     "127.0.0.1:8080".into()
+}
+
+fn default_warm_idle_ttl_secs() -> u64 {
+    1800
 }
 
 fn default_timeout_secs() -> u64 {
@@ -2244,6 +2250,24 @@ mod session_cwd_cfg_tests {
 #[cfg(test)]
 mod store_cfg_tests {
     use super::*;
+
+    #[test]
+    fn warm_idle_ttl_defaults_and_overrides() {
+        let base = r#"
+default = "a"
+[[agents]]
+id = "a"
+cmd = "echo"
+[server]
+addr = "127.0.0.1:8080"
+"#;
+        let cfg: RegistryConfig = RegistryConfig::parse(base).unwrap();
+        assert_eq!(cfg.server.warm_idle_ttl_secs, 1800);
+
+        let cfg2: RegistryConfig =
+            RegistryConfig::parse(&format!("{base}warm_idle_ttl_secs = 5\n")).unwrap();
+        assert_eq!(cfg2.server.warm_idle_ttl_secs, 5);
+    }
 
     #[test]
     fn store_path_parses_when_present() {

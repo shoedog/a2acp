@@ -3653,6 +3653,25 @@ async fn main() -> Result<(), BoxError> {
         catalog_probe::probe_all(&probe_entries, &probe_cwd).await,
     ));
 
+    // Slice 0 warm sessions: share the live registry with the SessionManager and reap idle handles.
+    let warm_ttl = cfg.server.warm_idle_ttl_secs;
+    let registry_for_sessions: Arc<dyn AgentRegistry> = registry.clone();
+    let session_manager = Arc::new(bridge_a2a_inbound::session_manager::SessionManager::new(
+        registry_for_sessions,
+        Duration::from_secs(warm_ttl),
+    ));
+    {
+        let sm = session_manager.clone();
+        let period = Duration::from_secs(warm_ttl.min(30).max(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            loop {
+                ticker.tick().await;
+                sm.reap_idle().await;
+            }
+        });
+    }
+
     // 8. Construct the inbound server.
     //    InboundServer::new(registry, store, policy, route, auth, base_url, delegation, local_source_label)
     // The inbound server holds the agent registry (3b): first-message LOCAL dispatch
@@ -3671,6 +3690,7 @@ async fn main() -> Result<(), BoxError> {
         )
         .with_workflows(executor, wf_map.clone())
         .with_task_store(task_store)
+        .with_session_manager(session_manager)
         .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
         .with_model_catalog(Arc::clone(&model_catalog)),
     );
