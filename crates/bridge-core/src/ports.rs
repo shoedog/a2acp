@@ -55,6 +55,20 @@ pub trait AgentBackend: Send + Sync {
     async fn release_session(&self, session: &SessionId) {
         self.forget_session(session).await;
     }
+    /// Reconcile model/effort on a LIVE warm session (Slice 1). Default: NotAdvertised
+    /// (non-ACP/non-process backends can't reconcile a live session). cwd/mode are NOT
+    /// reconciled here (the caller routes those). [Slice 1]
+    async fn reconcile_config(
+        &self,
+        _session: &SessionId,
+        _spec: &crate::domain::SessionSpec,
+    ) -> Result<crate::orch::ReconcileOutcome, BridgeError> {
+        Ok(crate::orch::ReconcileOutcome::NotAdvertised)
+    }
+    /// Agent session-lifecycle capabilities (initialize-time). Default: empty. [Slice 1]
+    fn capabilities(&self) -> crate::orch::AgentSessionCaps {
+        crate::orch::AgentSessionCaps::default()
+    }
     /// Graceful async teardown (the registry drains leases before calling this). Default: no-op. [§5.4]
     async fn retire(&self) -> Result<(), BridgeError> {
         Ok(())
@@ -400,6 +414,13 @@ mod tests {
             .await;
         f.release_session(&crate::ids::SessionId::parse("s").unwrap())
             .await;
+        let _ = f
+            .reconcile_config(
+                &crate::ids::SessionId::parse("s").unwrap(),
+                &crate::domain::SessionSpec::from_config(Default::default()),
+            )
+            .await;
+        let _ = f.capabilities();
         f.retire().await.unwrap();
         let _obj: std::sync::Arc<dyn AgentBackend> = std::sync::Arc::new(Fake); // object-safe
     }
