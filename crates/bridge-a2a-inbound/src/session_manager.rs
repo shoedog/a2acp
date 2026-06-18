@@ -64,6 +64,17 @@ pub struct SessionStatusInfo {
     pub usage: UsageSnapshot,
 }
 
+impl SessionStatusInfo {
+    /// `used/size` when both are known and `size > 0`, else `None` (degrade-safe:
+    /// codex/claude always carry used+size; a non-ACP backend may not). [Slice 2]
+    pub fn window_fraction(&self) -> Option<f64> {
+        match (self.usage.used, self.usage.size) {
+            (Some(u), Some(s)) if s > 0 => Some(u as f64 / s as f64),
+            _ => None,
+        }
+    }
+}
+
 pub struct SessionManager {
     registry: Arc<dyn AgentRegistry>,
     by_context: Mutex<HashMap<ContextId, WarmHandle>>,
@@ -1166,6 +1177,19 @@ mod tests {
         let s = manager.status(&c).await.unwrap();
         assert_eq!(s.usage.used, Some(42));
         assert!(s.usage.at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn session_status_window_fraction_degrades_without_window() {
+        let (manager, _b, _r) = manager();
+        let c = ctx("missing-usage-window");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+
+        let s = manager.status(&c).await.unwrap();
+        assert_eq!(s.window_fraction(), None);
     }
 
     #[tokio::test]

@@ -2874,6 +2874,15 @@ async fn session_status(
                     "list": s.capabilities.list,
                     "delete": s.capabilities.delete,
                 },
+                "usage": {
+                    "used": s.usage.used,
+                    "size": s.usage.size,
+                    "windowFraction": s.window_fraction(),
+                    "cost": s.usage.cost.as_ref().map(|c| serde_json::json!({
+                        "amount": c.amount, "currency": c.currency
+                    })),
+                    "atMs": s.usage.at_ms,
+                },
             }),
         ),
         None => bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound),
@@ -6346,6 +6355,16 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        sm.record_usage(
+            &ctx,
+            UsageSnapshot {
+                used: Some(14584),
+                size: Some(258400),
+                cost: None,
+                at_ms: 0,
+            },
+        )
+        .await;
 
         let resp = router(srv.clone())
             .oneshot(post_request(
@@ -6373,6 +6392,12 @@ mod tests {
                 "delete": false,
             })
         );
+        assert_eq!(v["result"]["usage"]["used"], 14584);
+        assert_eq!(v["result"]["usage"]["size"], 258400);
+        let wf = v["result"]["usage"]["windowFraction"].as_f64().unwrap();
+        assert!((wf - 0.0564).abs() < 1e-3, "windowFraction was {wf}");
+        assert!(v["result"]["usage"]["atMs"].as_u64().unwrap() > 0);
+        assert!(v["result"]["usage"]["cost"].is_null());
 
         let resp = router(srv.clone())
             .oneshot(post_request(
