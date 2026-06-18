@@ -4,5 +4,6 @@ pub mod card;
 pub mod fanout;
 pub(crate) mod reattach;
 pub mod server;
+pub mod session_manager;
 pub mod sse;
 pub(crate) mod workflow_sink;
