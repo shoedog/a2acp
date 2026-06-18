@@ -43,6 +43,73 @@ controller verifies+commits (the `_dyld_start` flake). **Gate enum additions wit
 
 ---
 
+## v2 — dual plan-review fixes folded (codex-xhigh + Opus, both `fix-then-execute`)
+
+All findings investigated against the code and confirmed accurate. These resolutions amend the tasks below;
+where they conflict, THESE win. codex (correctness lead) found the deeper concurrency/semantics issues.
+
+- **PF-1 (BLOCKER, codex B1 + Opus M1) — helper contract preserves mint, serves warm.** `apply_model_effort`
+  must NOT collapse mint's detailed errors into a fieldless outcome. Signature:
+  `apply_model_effort(cx, agent_session_id, agent_id, surface, model, effort, purpose: ApplyPurpose)
+  -> Result<(ConfigSurface, String /*current_model*/), ApplyConfigError>` where
+  `enum ApplyPurpose { Mint, Warm }` and `enum ApplyConfigError { NotAdvertised(BridgeError),
+  Rejected(BridgeError) }` (carries the NATIVE error so the message is preserved). **Mint caller:**
+  `.map_err(|e| match e { NotAdvertised(b) | Rejected(b) => b })?` → re-raises the exact `config_invalid`/
+  `agent_crashed` (mint byte-identical; the "valid models: …" detail intact). **Warm caller
+  (`reconcile_config`):** maps `NotAdvertised(_) → ReconcileOutcome::NotAdvertised`, `Rejected(b) →
+  {log b; ReconcileOutcome::Rejected}`. **Effort nuance:** at `Mint`, effort-with-no-surface stays Skip
+  (non-fatal, today's behavior); at `Warm`, a *requested* effort with **no effort surface** → `Err(
+  NotAdvertised)` (NOT Applied). The `purpose` arg drives this one divergence; everything else is identical.
+- **PF-2 (BLOCKER, codex B2) — stale-handle race across the dropped lock.** `release()` does NOT guard on
+  `Running`, so during the reconcile await it can remove the claimed handle, and a fresh checkout can re-mint
+  a new handle under the same `contextId`; the old reconcile must not mutate/return the new one. **Fix:**
+  before `drop(tab)` capture `let claimed_id = h.id.clone();` (and `backend_session`, `generation`). After
+  re-acquire: `match tab.get_mut(ctx) { Some(h) if h.id == claimed_id && h.state == SessionState::Running =>
+  { ...advance/return... } _ => return Err(BridgeError::SessionExpired) }` — never mutate a non-matching or
+  released handle. **Requires `WarmHandle.id` be comparable** (it's a `SessionHandleId`, derives `PartialEq`
+  via the macro). Add a unit test: release + fresh checkout while a fake `reconcile_config` is blocked → the
+  in-flight reconcile returns `SessionExpired`, does not corrupt the new handle.
+- **PF-3 (MAJOR, codex M1) — unminted reconcile.** `reconcile_config`: if `entry.agent_id.get().is_none()`
+  (not yet minted) → `self.configure_session(session, spec).await?` THEN `ensure_session` (mints with the new
+  spec) → return `Applied`. If already minted → do NOT `configure_session` (avoid the `minted_cwd` guard);
+  `ensure_session` returns the existing id, then `apply_model_effort`. (In the warm-continue flow it's always
+  already-minted, but handle both.)
+- **PF-4 (MAJOR, codex M2) — serialize reconcile under `turn_lock`.** `reconcile_config` must hold the
+  per-session ACP turn boundary: `let _g = Arc::clone(&entry.turn_lock).lock_owned().await;` around
+  `apply_model_effort` (after any PF-3 pre-mint stash). Matches how `prompt` guards the live session
+  (`acp_backend.rs:1577`). No deadlock (released before return; the subsequent prompt re-acquires).
+- **PF-5 (MAJOR, codex M3) — keep the cache fresh.** `set_config_option` returns refreshed opts but
+  `apply_effort_walkdown` discards them. Change the effort helper to return the LAST successful refreshed
+  `Vec<SessionConfigOption>` (e.g. `-> (EffortDecision, Option<Vec<SessionConfigOption>>)`); `apply_model_effort`
+  folds it into the returned `ConfigSurface.opts` (so a 2nd warm effort reconcile reads fresh values). For the
+  kiro `set_model` path, update the cached `models.current_model_id` (or store only available model values if
+  current is intentionally unused — document which). Add a "high → low" warm-effort test proving TWO
+  `set_config_option` RPCs fire AND the cache updates between them.
+- **PF-6 (MAJOR, codex M4) — clearing an override must not silently lie.** `model:None`/`effort:None` mean
+  "leave as-is" in the existing helpers, so a `Some(x) → None` warm delta would return `Applied` while the
+  live session keeps the old value. **Fix (in the SessionManager routing, Task 6):** for a `{model,effort}`
+  delta where the NEW effective value is `None` (override cleared, no entry default), return
+  `ConfigReseedRequired{field}` — do NOT reconcile a clear. (Only `Some→Some'` changes reconcile.) Add
+  SessionManager tests for clearing model + clearing effort.
+- **PF-7 (MINOR, both) — import path.** `bridge-core` does not re-export `orch` types at the crate root. Use
+  `use bridge_core::orch::{ReconcileOutcome, AgentSessionCaps};` in `session_manager.rs` (Task 6) and
+  `acp_backend.rs` (Task 5) — NOT `crate::ReconcileOutcome`.
+- **PF-8 (process) — gate enum additions with `--all-targets`.** Every task that adds a variant/type uses
+  `cargo test --workspace --no-run` (not `cargo build`) before commit. The SessionManager caps unit test
+  needs a fake-backend `capabilities()` OVERRIDE to prove non-default recording (default-all-false only
+  covers JSON shape). The ACP `capabilities()` mapping test uses the `spawn_fake_agent` seam
+  (`acp_backend.rs:~1880`) with a non-default `AgentCapabilities` (the `Recorder` advertises defaults) —
+  mirror `connect_runs_initialize_and_captures_agent_capabilities` (`:2018`).
+
+> **Net effect on tasks:** T1 unchanged. T2 unchanged. T3 unchanged (defaults fine). **T4** grows: the helper
+> returns `Result<(ConfigSurface,String), ApplyConfigError>` + `ApplyPurpose`, the effort helper returns
+> refreshed opts (PF-1/PF-5). **T5** grows: PF-3 (mint-if-absent) + PF-4 (turn_lock) + map `ApplyConfigError`
+> → `ReconcileOutcome` + cache-fresh on Applied (PF-5) + import (PF-7) + caps test via `spawn_fake_agent`
+> (PF-8). **T6** grows: PF-2 (identity revalidation) + PF-6 (clearing→reseed) + import (PF-7). T7 unchanged.
+> T8 uses `--all-targets` gate (PF-8).
+
+---
+
 ## Task 1: `ReconcileOutcome` + `AgentSessionCaps` + `BridgeError::ConfigReseedRequired`
 
 **Files:** `crates/bridge-core/src/orch.rs` (add the two types); `crates/bridge-core/src/error.rs` (variant +
