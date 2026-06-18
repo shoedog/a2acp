@@ -21,6 +21,7 @@ pub const STOP_REASON_CANCELLED: &str = "cancelled";
 pub enum Update {
     Text(String),
     Permission(PermissionRequest),
+    Usage(crate::orch::UsageSnapshot),
     Done { stop_reason: String },
 }
 
@@ -48,6 +49,12 @@ pub trait AgentBackend: Send + Sync {
     /// Drop per-session state (config stash, etc.) when a task/session ends. Default: no-op.
     /// MUST be a trait method — the inbound binding eviction (T11) calls it through `Arc<dyn AgentBackend>`.
     async fn forget_session(&self, _session: &SessionId) {}
+    /// Release a warm session: drop ALL per-session backend state + reap any per-session
+    /// resource (e.g. a `:rw` container). Default = `forget_session` (correct for
+    /// non-warm/non-process backends). Warm backends override. [Slice 0]
+    async fn release_session(&self, session: &SessionId) {
+        self.forget_session(session).await;
+    }
     /// Graceful async teardown (the registry drains leases before calling this). Default: no-op. [§5.4]
     async fn retire(&self) -> Result<(), BridgeError> {
         Ok(())
@@ -384,6 +391,8 @@ mod tests {
         .await
         .unwrap();
         f.forget_session(&crate::ids::SessionId::parse("s").unwrap())
+            .await;
+        f.release_session(&crate::ids::SessionId::parse("s").unwrap())
             .await;
         f.retire().await.unwrap();
         let _obj: std::sync::Arc<dyn AgentBackend> = std::sync::Arc::new(Fake); // object-safe

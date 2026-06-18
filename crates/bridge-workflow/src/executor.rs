@@ -140,6 +140,7 @@ impl WorkflowExecutor {
                 item = stream.next() => match item {
                     Some(Ok(Update::Text(t))) => text.push_str(&t),
                     Some(Ok(Update::Permission(_))) => {} // safe: backends resolve permission internally
+                    Some(Ok(Update::Usage(_))) => { /* Slice 0: ignore */ }
                     Some(Ok(Update::Done { stop_reason })) => {
                         if stop_reason == STOP_REASON_CANCELLED { ok = false; }
                         break;

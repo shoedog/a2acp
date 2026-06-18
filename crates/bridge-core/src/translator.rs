@@ -154,6 +154,9 @@ impl Translator {
                             }
                         }
                     }
+                    Ok(Update::Usage(_)) => {
+                        continue;
+                    }
                     Ok(Update::Done { stop_reason }) => {
                         // Flush any pending coalesced text first.
                         if !acc.is_empty() {
