@@ -144,11 +144,9 @@ mod slice0_error_tests {
 
     #[test]
     fn config_mismatch_client_message_is_safe() {
-        assert!(
-            BridgeError::ConfigMismatch { field: "effort" }
-                .client_message()
-                .contains("effort")
-        );
+        assert!(BridgeError::ConfigMismatch { field: "effort" }
+            .client_message()
+            .contains("effort"));
     }
 }
 

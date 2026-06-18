@@ -8,29 +8,52 @@ pub const ORCH_V: u16 = 1;
 
 /// ACP usage cost is `{amount, currency}` — NOT guaranteed USD.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UsageCost { pub amount: f64, pub currency: String }
+pub struct UsageCost {
+    pub amount: f64,
+    pub currency: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
-pub struct UsageSnapshot { pub used: Option<u64>, pub size: Option<u64>, pub cost: Option<UsageCost>, pub at_ms: i64 }
+pub struct UsageSnapshot {
+    pub used: Option<u64>,
+    pub size: Option<u64>,
+    pub cost: Option<UsageCost>,
+    pub at_ms: i64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrchEvent {
-    pub v: u16, pub seq: i64, pub ts_ms: i64, pub operation_id: OperationId,
-    #[serde(flatten)] pub kind: OrchEventKind,
+    pub v: u16,
+    pub seq: i64,
+    pub ts_ms: i64,
+    pub operation_id: OperationId,
+    #[serde(flatten)]
+    pub kind: OrchEventKind,
 }
 
 /// Struct variants only — serde internally-tagged enums reject bare tuple variants.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OrchEventKind {
-    Progress { text: String },
-    Usage { #[serde(flatten)] usage: UsageSnapshot },
-    Terminal { status: TerminalStatus },
+    Progress {
+        text: String,
+    },
+    Usage {
+        #[serde(flatten)]
+        usage: UsageSnapshot,
+    },
+    Terminal {
+        status: TerminalStatus,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum TerminalStatus { Completed, Failed { reason: String }, Canceled }
+pub enum TerminalStatus {
+    Completed,
+    Failed { reason: String },
+    Canceled,
+}
 
 impl TerminalStatus {
     /// ACP `StopReason` → terminal status. `end_turn`→Completed; `cancelled`→Canceled; else→Failed.
@@ -38,15 +61,21 @@ impl TerminalStatus {
         match stop_reason {
             "end_turn" => TerminalStatus::Completed,
             "cancelled" => TerminalStatus::Canceled,
-            other => TerminalStatus::Failed { reason: other.to_string() },
+            other => TerminalStatus::Failed {
+                reason: other.to_string(),
+            },
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrchResult {
-    pub v: u16, pub operation_id: OperationId, pub status: TerminalStatus,
-    pub wall_clock_ms: u64, pub usage: UsageSnapshot, pub output: String,
+    pub v: u16,
+    pub operation_id: OperationId,
+    pub status: TerminalStatus,
+    pub wall_clock_ms: u64,
+    pub usage: UsageSnapshot,
+    pub output: String,
 }
 
 #[cfg(test)]
@@ -55,9 +84,18 @@ mod tests {
     #[test]
     fn orch_event_roundtrips_with_internal_kind_tag() {
         let ev = OrchEvent {
-            v: ORCH_V, seq: 3, ts_ms: 100,
+            v: ORCH_V,
+            seq: 3,
+            ts_ms: 100,
             operation_id: crate::ids::OperationId::parse("op-1").unwrap(),
-            kind: OrchEventKind::Usage { usage: UsageSnapshot { used: Some(10), size: Some(200), cost: None, at_ms: 100 } },
+            kind: OrchEventKind::Usage {
+                usage: UsageSnapshot {
+                    used: Some(10),
+                    size: Some(200),
+                    cost: None,
+                    at_ms: 100,
+                },
+            },
         };
         let j = serde_json::to_value(&ev).unwrap();
         assert_eq!(j["kind"], "usage");
@@ -67,16 +105,29 @@ mod tests {
     }
     #[test]
     fn usage_cost_carries_amount_and_currency() {
-        let j = serde_json::to_value(&UsageCost { amount: 1.5, currency: "USD".into() }).unwrap();
+        let j = serde_json::to_value(&UsageCost {
+            amount: 1.5,
+            currency: "USD".into(),
+        })
+        .unwrap();
         assert_eq!(j["amount"], 1.5);
         assert_eq!(j["currency"], "USD");
     }
     #[test]
     fn terminal_status_from_each_stop_reason() {
-        assert!(matches!(TerminalStatus::from_stop_reason("end_turn"), TerminalStatus::Completed));
-        assert!(matches!(TerminalStatus::from_stop_reason("cancelled"), TerminalStatus::Canceled));
+        assert!(matches!(
+            TerminalStatus::from_stop_reason("end_turn"),
+            TerminalStatus::Completed
+        ));
+        assert!(matches!(
+            TerminalStatus::from_stop_reason("cancelled"),
+            TerminalStatus::Canceled
+        ));
         for s in ["refusal", "max_tokens", "max_turn_requests", "weird"] {
-            assert!(matches!(TerminalStatus::from_stop_reason(s), TerminalStatus::Failed { .. }));
+            assert!(matches!(
+                TerminalStatus::from_stop_reason(s),
+                TerminalStatus::Failed { .. }
+            ));
         }
     }
 }

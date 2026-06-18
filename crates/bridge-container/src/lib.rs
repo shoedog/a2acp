@@ -1303,21 +1303,13 @@ mod tests {
         let s = SessionId::parse("ctx-a-g0").unwrap();
         be.configure_session(&s, &spec_cwd(root)).await.unwrap();
         let mut stream = be
-            .prompt(
-                &s,
-                vec![Part {
-                    text: "hi".into(),
-                }],
-            )
+            .prompt(&s, vec![Part { text: "hi".into() }])
             .await
             .unwrap();
         while stream.next().await.is_some() {}
 
         be.release_session(&s).await;
-        assert!(
-            be.warm.lock().await.get(&s).is_none(),
-            "warm entry removed"
-        );
+        assert!(be.warm.lock().await.get(&s).is_none(), "warm entry removed");
         assert_eq!(
             reaps.load(Ordering::SeqCst),
             1,

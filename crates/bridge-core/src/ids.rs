@@ -35,11 +35,17 @@ id_newtype!(ContextId);
 
 /// A warm session's context generation. Hand-written (the `id_newtype!` macros are
 /// String-only); generations are compared/incremented so we add `Copy`/`Ord`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct SessionGeneration(pub u64);
 impl SessionGeneration {
-    pub fn new(n: u64) -> Self { Self(n) }
-    pub fn get(&self) -> u64 { self.0 }
+    pub fn new(n: u64) -> Self {
+        Self(n)
+    }
+    pub fn get(&self) -> u64 {
+        self.0
+    }
 }
 
 macro_rules! id_newtype_strict {
