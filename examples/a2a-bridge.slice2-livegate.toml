@@ -1,0 +1,17 @@
+# Slice 2 live-gate: host codex-acp + claude-agent-acp + warm sessions + a LOW usage warn fraction so turn-1
+# usage crosses it (DoD-3 pre-task warn). Larger TTL than the Slice-0 gate so the session survives two submits.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "low"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[agents]]
+id = "claude"
+cmd = "claude-agent-acp"
+model = "sonnet"
+[server]
+addr = "127.0.0.1:8097"
+warm_idle_ttl_secs = 300
+warm_usage_warn_fraction = 0.01
