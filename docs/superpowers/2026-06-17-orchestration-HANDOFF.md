@@ -10,10 +10,15 @@
   (codex-xhigh + Opus) + a dedicated slicing analysis. Do NOT re-litigate the decomposition.
 - **Slice 0 — Live Session Core (warm continue): SHIPPED + MERGED to `main`** (`ded3e3c`, pushed). Live-gated
   on real codex.
-- **Slice 1 — Config reconcile + capabilities: IN PROGRESS** on branch `feat/slice-1-config-reconcile`. As of
-  writing: T1–T5 + the T5 review-blocker fix committed (through ~`d2e8aaa`); **T6 (SessionManager
-  reconcile routing / apply-or-expire) running**; T7 (status caps JSON) + T8 (gate + live-gate + merge)
-  remain. See "Resume Slice 1" below.
+- **Slice 1 — Config reconcile + capabilities: SHIPPED + MERGED** to `main` (`469db07`, pushed). Reconcile
+  model/effort on warm continue (apply-or-expire); cwd→ConfigMismatch; mode→ConfigReseedRequired; agent caps
+  recorded + surfaced in `session/status`. Live-gated on real codex (effort reconcile applied; cwd/mode typed
+  errors; caps `{loadSession,resume,close,list,delete=false}`). 8 tasks, each codex-xhigh increment-reviewed;
+  the apply-or-expire concurrency (ABA + release-reuse) was caught + fixed via a targeted re-review
+  (Reconciling/Expiring non-reusable claim).
+- **NEXT = Slice 2 — Usage telemetry** (plumb `usage_update`→start/end/`session-status`+pre-task threshold
+  warn). Then S3 clear/reset → S4 compact → S5 serve-backed `run-workflow --serve --context` [MVP cut] →
+  S6 journal → S7 observability+E9 → S8 MCP → S9 Turn Channel → tail. Follow the proven loop below.
 
 ## Canonical docs (read these — they are the source of truth)
 
@@ -45,8 +50,8 @@ never both); `_meta` for cross-boundary correlation.
 | Slice | Scope | Status |
 |---|---|---|
 | **0 Live Session Core** | warm continue keyed by contextId; SessionManager; minimal OrchEvent/OrchResult; session CLI/methods | ✅ SHIPPED+MERGED |
-| **1 Config reconcile + capabilities** | reconcile model/effort on warm continue (else typed reseed); record agent caps | 🔄 IN PROGRESS (T6 running) |
-| **2 Usage telemetry** | plumb `usage_update` → start/end/`session-status` + pre-task threshold warn | next after S1 |
+| **1 Config reconcile + capabilities** | reconcile model/effort on warm continue (else typed reseed); record agent caps | ✅ SHIPPED+MERGED |
+| **2 Usage telemetry** | plumb `usage_update` → start/end/`session-status` + pre-task threshold warn | ◀ NEXT |
 | **3 Clear / reset** | `reset_session` (new SessionId per generation) + `clear`; generation guard | |
 | **4 Compact** | summarize → reset → seed-as-PrependNextTurn | |
 | **5 Serve-backed `run-workflow --serve --context`** | CLI as serve client + executor keep-warm policy | **— MVP CUT-LINE (S0–S5) —** |
