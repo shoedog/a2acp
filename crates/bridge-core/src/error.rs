@@ -29,6 +29,12 @@ pub enum BridgeError {
     TaskNotFound,
     #[error("session not found")]
     SessionNotFound,
+    #[error("config mismatch: {field}")]
+    ConfigMismatch { field: &'static str },
+    #[error("session expired")]
+    SessionExpired,
+    #[error("session busy")]
+    HandleBusy,
     #[error("auth required")]
     AuthRequired { request_id: String },
     #[error("permission required")]
@@ -99,9 +105,13 @@ impl BridgeError {
         use A2aState as S;
         use BridgeError::*;
         match self {
-            A2aVersionMismatch | InvalidRequest { .. } | TaskNotFound | SessionNotFound => {
-                RejectRequest
-            }
+            A2aVersionMismatch
+            | InvalidRequest { .. }
+            | TaskNotFound
+            | SessionNotFound
+            | ConfigMismatch { .. }
+            | SessionExpired
+            | HandleBusy => RejectRequest,
             AuthRequired { .. } | AgentNotAuthenticated => SetState(S::AuthRequired),
             PermissionRequired { .. } => SetState(S::InputRequired),
             CancelTimeout => SetState(S::Canceled),
@@ -114,6 +124,31 @@ impl BridgeError {
             self,
             BridgeError::AuthRequired { .. } | BridgeError::PermissionRequired { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod slice0_error_tests {
+    use super::*;
+
+    #[test]
+    fn slice0_errors_reject_request() {
+        for e in [
+            BridgeError::ConfigMismatch { field: "model" },
+            BridgeError::SessionExpired,
+            BridgeError::HandleBusy,
+        ] {
+            assert_eq!(e.disposition(), A2aDisposition::RejectRequest);
+        }
+    }
+
+    #[test]
+    fn config_mismatch_client_message_is_safe() {
+        assert!(
+            BridgeError::ConfigMismatch { field: "effort" }
+                .client_message()
+                .contains("effort")
+        );
     }
 }
 
