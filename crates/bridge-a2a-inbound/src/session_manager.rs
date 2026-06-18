@@ -52,6 +52,15 @@ struct WarmHandle {
 pub struct WarmTurn {
     pub backend: Arc<dyn AgentBackend>,
     pub session: SessionId,
+    pub usage_warning: Option<UsageWarning>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageWarning {
+    pub used: u64,
+    pub size: u64,
+    pub fraction: f64,
+    pub threshold: f64,
 }
 
 /// Status snapshot (spec §5).
@@ -62,6 +71,7 @@ pub struct SessionStatusInfo {
     pub idle_age_ms: u128,
     pub capabilities: AgentSessionCaps,
     pub usage: UsageSnapshot,
+    pub over_threshold: Option<bool>,
 }
 
 impl SessionStatusInfo {
@@ -79,6 +89,7 @@ pub struct SessionManager {
     registry: Arc<dyn AgentRegistry>,
     by_context: Mutex<HashMap<ContextId, WarmHandle>>,
     idle_ttl: Duration,
+    warn_fraction: Option<f64>,
     now: Box<dyn Fn() -> Instant + Send + Sync>,
     seq: std::sync::atomic::AtomicU64,
 }
@@ -97,8 +108,37 @@ impl SessionManager {
             registry,
             by_context: Mutex::new(HashMap::new()),
             idle_ttl,
+            warn_fraction: None,
             now,
             seq: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn with_warn_fraction(mut self, f: Option<f64>) -> Self {
+        self.warn_fraction = f.filter(|v| *v > 0.0 && *v <= 1.0);
+        self
+    }
+
+    fn eval_warn(&self, u: &UsageSnapshot) -> Option<UsageWarning> {
+        let thr = self.warn_fraction?;
+        match (u.used, u.size) {
+            (Some(used), Some(size)) if size > 0 && (used as f64 / size as f64) >= thr => {
+                Some(UsageWarning {
+                    used,
+                    size,
+                    fraction: used as f64 / size as f64,
+                    threshold: thr,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn over_threshold(&self, u: &UsageSnapshot) -> Option<bool> {
+        let thr = self.warn_fraction?;
+        match (u.used, u.size) {
+            (Some(used), Some(size)) if size > 0 => Some((used as f64 / size as f64) >= thr),
+            _ => None,
         }
     }
 
@@ -131,12 +171,14 @@ impl SessionManager {
             };
             let d = h.fingerprint.diff(&fp);
             if d.is_empty() {
+                let usage_warning = self.eval_warn(&h.usage);
                 h.state = SessionState::Running;
                 h.op = Some(op);
                 h.last_used = (self.now)();
                 return Ok(WarmTurn {
                     backend: h.backend.clone(),
                     session: h.backend_session.clone(),
+                    usage_warning,
                 });
             }
             if d.contains(&"agent") {
@@ -196,6 +238,7 @@ impl SessionManager {
             let clean = matches!(outcome, Ok(ReconcileOutcome::Applied)) && !cancelled_or_released;
             if clean {
                 let h = tab.get_mut(ctx).expect("still_ours");
+                let usage_warning = self.eval_warn(&h.usage);
                 h.fingerprint = fp;
                 h.state = SessionState::Running;
                 h.op = Some(op);
@@ -203,6 +246,7 @@ impl SessionManager {
                 return Ok(WarmTurn {
                     backend: h.backend.clone(),
                     session: h.backend_session.clone(),
+                    usage_warning,
                 });
             }
             // Non-clean (failed reconcile OR cancel/release arrived mid-window): EXPIRE via an `Expiring`
@@ -242,6 +286,7 @@ impl SessionManager {
         let turn = WarmTurn {
             backend: resolved.backend.clone(),
             session: backend_session.clone(),
+            usage_warning: None,
         };
         tab.insert(
             ctx.clone(),
@@ -287,6 +332,7 @@ impl SessionManager {
             idle_age_ms: (self.now)().duration_since(h.last_used).as_millis(),
             capabilities: h.caps.clone(),
             usage: h.usage.clone(),
+            over_threshold: self.over_threshold(&h.usage),
         })
     }
 
@@ -1190,6 +1236,129 @@ mod tests {
 
         let s = manager.status(&c).await.unwrap();
         assert_eq!(s.window_fraction(), None);
+    }
+
+    #[tokio::test]
+    async fn checkout_warns_when_carried_usage_at_or_above_fraction() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let manager =
+            SessionManager::new(registry, Duration::from_secs(30)).with_warn_fraction(Some(0.8));
+        let c = ctx("warn");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&c).await;
+        manager
+            .record_usage(
+                &c,
+                UsageSnapshot {
+                    used: Some(90),
+                    size: Some(100),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .await
+            .unwrap();
+        let w = turn.usage_warning.expect("0.90 >= 0.80 warns");
+        assert_eq!((w.used, w.size), (90, 100));
+        assert_eq!(manager.status(&c).await.unwrap().over_threshold, Some(true));
+    }
+
+    #[tokio::test]
+    async fn mint_never_warns_and_below_threshold_is_none() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let manager =
+            SessionManager::new(registry, Duration::from_secs(30)).with_warn_fraction(Some(0.8));
+        let c = ctx("below");
+        let mint = manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        assert!(mint.usage_warning.is_none(), "mint has no carried usage");
+        manager.finish_turn(&c).await;
+        manager
+            .record_usage(
+                &c,
+                UsageSnapshot {
+                    used: Some(10),
+                    size: Some(100),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .await
+            .unwrap();
+        assert!(turn.usage_warning.is_none(), "0.10 < 0.80");
+        assert_eq!(
+            manager.status(&c).await.unwrap().over_threshold,
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_disabled_and_degraded_are_none() {
+        let (manager, _b, _r) = manager();
+        let c = ctx("disabled");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&c).await;
+        manager
+            .record_usage(
+                &c,
+                UsageSnapshot {
+                    used: Some(99),
+                    size: Some(100),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .await
+            .unwrap();
+        assert!(turn.usage_warning.is_none());
+        assert_eq!(manager.status(&c).await.unwrap().over_threshold, None);
+
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let manager =
+            SessionManager::new(registry, Duration::from_secs(30)).with_warn_fraction(Some(0.8));
+        let c = ctx("degraded");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&c).await;
+        manager
+            .record_usage(
+                &c,
+                UsageSnapshot {
+                    used: Some(99),
+                    size: None,
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .await
+            .unwrap();
+        assert!(turn.usage_warning.is_none());
+        assert_eq!(manager.status(&c).await.unwrap().over_threshold, None);
     }
 
     #[tokio::test]

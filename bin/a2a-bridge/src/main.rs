@@ -3656,10 +3656,13 @@ async fn main() -> Result<(), BoxError> {
     // Slice 0 warm sessions: share the live registry with the SessionManager and reap idle handles.
     let warm_ttl = cfg.server.warm_idle_ttl_secs;
     let registry_for_sessions: Arc<dyn AgentRegistry> = registry.clone();
-    let session_manager = Arc::new(bridge_a2a_inbound::session_manager::SessionManager::new(
-        registry_for_sessions,
-        Duration::from_secs(warm_ttl),
-    ));
+    let session_manager = Arc::new(
+        bridge_a2a_inbound::session_manager::SessionManager::new(
+            registry_for_sessions,
+            Duration::from_secs(warm_ttl),
+        )
+        .with_warn_fraction(cfg.server.warm_usage_warn_fraction),
+    );
     {
         let sm = session_manager.clone();
         let period = Duration::from_secs(warm_ttl.clamp(1, 30));

@@ -568,12 +568,19 @@ async fn warm_local_dispatch(
         )
         .await
     {
-        Ok(turn) => Some(Ok(LocalDispatch {
-            backend: turn.backend,
-            session: turn.session,
-            guard: None,
-            warm_guard: Some(WarmTurnGuard { sm, ctx }),
-        })),
+        Ok(turn) => {
+            if let Some(w) = &turn.usage_warning {
+                tracing::warn!(target: "a2a_bridge::usage", ctx = %ctx.as_str(),
+                    used = w.used, size = w.size, fraction = w.fraction, threshold = w.threshold,
+                    "usage_threshold_warn");
+            }
+            Some(Ok(LocalDispatch {
+                backend: turn.backend,
+                session: turn.session,
+                guard: None,
+                warm_guard: Some(WarmTurnGuard { sm, ctx }),
+            }))
+        }
         Err(e) => Some(Err(e)),
     }
 }
@@ -2878,6 +2885,7 @@ async fn session_status(
                     "used": s.usage.used,
                     "size": s.usage.size,
                     "windowFraction": s.window_fraction(),
+                    "overThreshold": s.over_threshold,
                     "cost": s.usage.cost.as_ref().map(|c| serde_json::json!({
                         "amount": c.amount, "currency": c.currency
                     })),
