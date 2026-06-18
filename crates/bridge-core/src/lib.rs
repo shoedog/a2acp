@@ -15,6 +15,7 @@ pub mod run_identity;
 pub mod sandbox;
 pub mod session;
 pub mod session_cwd;
+pub mod session_fingerprint;
 pub mod task;
 pub mod task_store;
 pub mod translator;
