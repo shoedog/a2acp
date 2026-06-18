@@ -2848,6 +2848,13 @@ async fn session_status(
                 "agent": s.agent,
                 "generation": s.generation,
                 "idleAgeMs": s.idle_age_ms,
+                "capabilities": {
+                    "loadSession": s.capabilities.load_session,
+                    "resume": s.capabilities.resume,
+                    "close": s.capabilities.close,
+                    "list": s.capabilities.list,
+                    "delete": s.capabilities.delete,
+                },
             }),
         ),
         None => bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound),
@@ -6120,6 +6127,16 @@ mod tests {
         assert_eq!(v["result"]["agent"], "a");
         assert_eq!(v["result"]["generation"], 0);
         assert!(v["result"]["idleAgeMs"].is_number());
+        assert_eq!(
+            v["result"]["capabilities"],
+            json!({
+                "loadSession": false,
+                "resume": false,
+                "close": false,
+                "list": false,
+                "delete": false,
+            })
+        );
 
         let resp = router(srv.clone())
             .oneshot(post_request(
