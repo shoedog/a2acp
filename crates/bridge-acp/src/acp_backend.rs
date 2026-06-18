@@ -1963,11 +1963,10 @@ impl AgentBackend for AcpBackend {
         // Already minted (checked above): read the live id DIRECTLY from this entry — do NOT call
         // `ensure_session` (it re-fetches the map by key, racing `release_session`, and re-runs the
         // `minted_cwd` immutability guard). We only reconcile model/effort on the live session.
-        let aid = entry
-            .agent_id
-            .get()
-            .cloned()
-            .ok_or_else(|| BridgeError::agent_crashed("warm reconcile: agent session vanished"))?;
+        let aid =
+            entry.agent_id.get().cloned().ok_or_else(|| {
+                BridgeError::agent_crashed("warm reconcile: agent session vanished")
+            })?;
         let _g = Arc::clone(&entry.turn_lock).lock_owned().await;
         let surface = entry
             .config_surface
