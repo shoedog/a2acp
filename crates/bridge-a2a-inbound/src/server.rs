@@ -38,7 +38,7 @@ use bridge_core::domain::{
     PeerTaskId, RouteTarget, SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
-use bridge_core::ids::{AgentId, ContextId, SessionId, TaskId};
+use bridge_core::ids::{AgentId, ContextId, OperationId, SessionId, TaskId};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
     RouteDecision, SessionStore,
@@ -173,6 +173,7 @@ pub struct InboundServer {
     /// Durable task control-plane store (W3a). Defaults to an in-memory store;
     /// replace with a persistent backend via [`InboundServer::with_task_store`].
     task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+    session_manager: Option<std::sync::Arc<crate::session_manager::SessionManager>>,
     /// Global root path that gates which per-request session cwds are permitted
     /// (session_cwd increment). `None` → no global root restriction.
     /// Wired from `allowed_cwd_root` in the top-level config via
@@ -222,6 +223,7 @@ impl InboundServer {
             workflows: Arc::new(HashMap::new()),
             workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            session_manager: None,
             allowed_cwd_root: None,
             progress_hubs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             model_catalog: Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -256,6 +258,15 @@ impl InboundServer {
         task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
     ) -> Self {
         self.task_store = task_store;
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_manager(
+        mut self,
+        sm: std::sync::Arc<crate::session_manager::SessionManager>,
+    ) -> Self {
+        self.session_manager = Some(sm);
         self
     }
 
@@ -430,7 +441,27 @@ fn local_agent_id(srv: &InboundServer, target: &RouteTarget) -> AgentId {
 /// live binding when its own short-lived call ends).
 struct LocalDispatch {
     backend: Arc<dyn AgentBackend>,
+    /// The session to prompt against — warm `ctx-…` session, or legacy `session-{task}`.
+    session: SessionId,
     guard: Option<BindingGuard>,
+    /// Warm path only: finishes the warm turn (→ Idle) on drop. Mutually exclusive with `guard`.
+    warm_guard: Option<WarmTurnGuard>,
+}
+
+/// Drops the warm turn back to Idle on producer exit (mirrors BindingGuard::Drop's spawn pattern).
+struct WarmTurnGuard {
+    sm: std::sync::Arc<crate::session_manager::SessionManager>,
+    ctx: bridge_core::ids::ContextId,
+}
+
+impl Drop for WarmTurnGuard {
+    fn drop(&mut self) {
+        let sm = self.sm.clone();
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            sm.finish_turn(&ctx).await;
+        });
+    }
 }
 
 /// LOCAL dispatch — binding-driven (T11). If the task already has a [`TaskBinding`]
@@ -475,7 +506,9 @@ async fn resolve_configure_bind(
                 .await?;
             return Ok(LocalDispatch {
                 backend,
+                session: session.clone(),
                 guard: None,
+                warm_guard: None,
             });
         }
     }
@@ -509,8 +542,40 @@ async fn resolve_configure_bind(
     };
     Ok(LocalDispatch {
         backend,
+        session: session.clone(),
         guard: Some(guard),
+        warm_guard: None,
     })
+}
+
+/// Slice 0 warm path. Returns None when there's no contextId or no SessionManager (caller uses
+/// the legacy resolve_configure_bind). Resolves ONCE inside the manager.
+async fn warm_local_dispatch(
+    srv: &Arc<InboundServer>,
+    agent_id: &AgentId,
+    routed: &RoutedCall,
+    op: OperationId,
+) -> Option<Result<LocalDispatch, BridgeError>> {
+    let ctx = routed.context_id.clone()?;
+    let sm = srv.session_manager.clone()?;
+    match sm
+        .checkout_turn(
+            &ctx,
+            agent_id.clone(),
+            routed.overrides.clone(),
+            routed.session_cwd.clone(),
+            op,
+        )
+        .await
+    {
+        Ok(turn) => Some(Ok(LocalDispatch {
+            backend: turn.backend,
+            session: turn.session,
+            guard: None,
+            warm_guard: Some(WarmTurnGuard { sm, ctx }),
+        })),
+        Err(e) => Some(Err(e)),
+    }
 }
 
 /// Fan-out variant of [`resolve_configure_bind`]: resolve the local agent, apply
@@ -629,6 +694,11 @@ async fn stream_message(
     // exact channel -> SSE wiring (DRY).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, BridgeError>>(64);
     let task_id_str = routed.task.as_str().to_owned();
+    let context_id_str = routed
+        .context_id
+        .as_ref()
+        .map(|c| c.as_str().to_string())
+        .unwrap_or_else(|| task_id_str.clone());
 
     match routed.target {
         RouteTarget::Local(_) => {
@@ -639,17 +709,26 @@ async fn stream_message(
             // SSE frame rather than a JSON-RPC error (streaming has already committed
             // to an SSE response).
             let agent_id = local_agent_id(&srv, &routed.target);
-            match resolve_configure_bind(
-                &srv,
-                &agent_id,
-                &routed.task,
-                &routed.session,
-                routed.overrides.as_ref(),
-                routed.session_cwd.clone(),
-            )
-            .await
-            {
-                Ok(dispatch) => spawn_local_producer(&srv, routed, dispatch, tx),
+            let op = OperationId::parse(format!("op-{}", routed.task.as_str())).unwrap();
+            let dispatch = match warm_local_dispatch(&srv, &agent_id, &routed, op).await {
+                Some(r) => r,
+                None => {
+                    resolve_configure_bind(
+                        &srv,
+                        &agent_id,
+                        &routed.task,
+                        &routed.session,
+                        routed.overrides.as_ref(),
+                        routed.session_cwd.clone(),
+                    )
+                    .await
+                }
+            };
+            match dispatch {
+                Ok(dispatch) => {
+                    let _ = srv.store.put(&routed.task, &dispatch.session).await;
+                    spawn_local_producer(&srv, routed, dispatch, tx)
+                }
                 Err(e) => {
                     tokio::spawn(async move {
                         let _ = tx.send(Err(e)).await;
@@ -668,8 +747,6 @@ async fn stream_message(
         }
     }
 
-    // Use the task id as the context id for now (consistent within a single stream).
-    let context_id_str = task_id_str.clone();
     let sse_stream = sse_event_stream(rx, task_id_str, context_id_str);
     Sse::new(sse_stream)
         .keep_alive(KeepAlive::default())
@@ -1037,15 +1114,17 @@ fn spawn_local_producer(
     let store = srv.store.clone();
     let policy = srv.policy.clone();
     let task = routed.task;
-    let session = routed.session;
+    let session = dispatch.session.clone();
     let parts = routed.parts;
     let backend = dispatch.backend;
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
+    let warm = dispatch.warm_guard;
 
     tokio::spawn(async move {
         // Hold the guard for the whole producer; dropped on every return path below.
         let _guard = guard;
+        let _warm = warm;
 
         let translator = Translator::new();
         let mut events = translator.run(
@@ -2209,22 +2288,30 @@ async fn unary_message(
             // for the call's DURATION (so an interleaved cancel finds the binding) and
             // is dropped at the end of this scope → eviction after `collect().await`.
             // A follow-up reuses the binding and carries no guard (no premature evict).
-            let dispatch = match resolve_configure_bind(
-                &srv,
-                agent_id,
-                &routed.task,
-                &routed.session,
-                routed.overrides.as_ref(),
-                routed.session_cwd.clone(),
-            )
-            .await
-            {
+            let op = OperationId::parse(format!("op-{}", routed.task.as_str())).unwrap();
+            let dispatch = match warm_local_dispatch(&srv, agent_id, &routed, op).await {
+                Some(r) => r,
+                None => {
+                    resolve_configure_bind(
+                        &srv,
+                        agent_id,
+                        &routed.task,
+                        &routed.session,
+                        routed.overrides.as_ref(),
+                        routed.session_cwd.clone(),
+                    )
+                    .await
+                }
+            };
+            let dispatch = match dispatch {
                 Ok(d) => d,
                 Err(e) => return bridge_err_to_jsonrpc(id, &e),
             };
+            let _ = srv.store.put(&routed.task, &dispatch.session).await;
             // Held until this arm returns; its Drop evicts the binding/lease/stash
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
+            let _warm = dispatch.warm_guard;
             let translator = Translator::new();
             translator
                 .run(
@@ -2232,7 +2319,7 @@ async fn unary_message(
                     srv.store.as_ref(),
                     srv.policy.as_ref(),
                     &routed.task,
-                    &routed.session,
+                    &dispatch.session,
                     routed.parts,
                 )
                 .collect()
@@ -5487,6 +5574,45 @@ mod tests {
         }
     }
 
+    struct WarmRecordingBackend {
+        sessions: Arc<Mutex<Vec<String>>>,
+        forgotten: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WarmRecordingBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                sessions: Arc::new(Mutex::new(Vec::new())),
+                forgotten: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for WarmRecordingBackend {
+        async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+            self.sessions.lock().unwrap().push(s.as_str().to_owned());
+            let updates = vec![
+                Ok(Update::Text("warm".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn forget_session(&self, session: &SessionId) {
+            self.forgotten
+                .lock()
+                .unwrap()
+                .push(session.as_str().to_owned());
+        }
+    }
+
     /// A route that honors `meta.agent` (resolving to `Local(agent)`), falling back
     /// to the registry default — mirrors the real binary `SkillRoute` for the local
     /// arm so the registry-resolution path is exercised by agent id.
@@ -5729,6 +5855,101 @@ mod tests {
             Arc::new(NoDelegation),
             "a",
         ))
+    }
+
+    #[tokio::test]
+    async fn warm_continue_reuses_session_no_binding_guard() {
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry_for_sm: Arc<dyn AgentRegistry> = registry.clone();
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_for_sm,
+            std::time::Duration::from_secs(60),
+        ));
+        let registry_for_srv: Arc<dyn AgentRegistry> = registry;
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_for_srv,
+                store.clone(),
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm.clone()),
+        );
+
+        let ctx = ContextId::parse("c1").unwrap();
+        let params = || {
+            json!({
+                "message": {
+                    "contextId": "c1",
+                    "text": "go",
+                    "metadata": { "a2a-bridge.agent": "a" }
+                }
+            })
+        };
+
+        let resp1 = router(srv.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let _ = body_string(resp1).await;
+        for _ in 0..50 {
+            if matches!(sm.status(&ctx).await.as_ref().map(|s| s.state), Some("idle")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            sm.status(&ctx).await.as_ref().map(|s| s.state),
+            Some("idle")
+        ));
+        assert!(
+            backend.forgotten.lock().unwrap().is_empty(),
+            "warm dispatch must not install/drop a BindingGuard between turns"
+        );
+
+        let resp2 = router(srv.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let _ = body_string(resp2).await;
+        for _ in 0..50 {
+            if matches!(sm.status(&ctx).await.as_ref().map(|s| s.state), Some("idle")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            *backend.sessions.lock().unwrap(),
+            vec!["ctx-c1-g0".to_string(), "ctx-c1-g0".to_string()]
+        );
+        assert!(
+            backend.forgotten.lock().unwrap().is_empty(),
+            "warm turns finish through WarmTurnGuard, not BindingGuard::forget_session"
+        );
+        let task = TaskId::parse("task-1").unwrap();
+        assert_eq!(
+            store
+                .session_for(&task)
+                .await
+                .unwrap()
+                .expect("task session stored")
+                .as_str(),
+            "ctx-c1-g0"
+        );
     }
 
     #[tokio::test]
