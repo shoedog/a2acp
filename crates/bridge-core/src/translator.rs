@@ -19,6 +19,7 @@ use futures::{Stream, StreamExt};
 use crate::domain::{Part, PendingKind, PendingRequest, SessionContext};
 use crate::error::BridgeError;
 use crate::ids::{SessionId, TaskId};
+use crate::orch::UsageSnapshot;
 use crate::ports::{AgentBackend, PolicyEngine, SessionStore, Update, STOP_REASON_CANCELLED};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,7 @@ pub enum EventKind {
     Status,
     Artifact,
     Terminal,
+    Usage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +43,7 @@ pub struct Event {
     text: String,
     source: Option<String>,
     outcome: Option<TaskOutcome>,
+    usage: Option<UsageSnapshot>,
 }
 
 impl Event {
@@ -63,12 +66,16 @@ impl Event {
     pub fn outcome(&self) -> Option<TaskOutcome> {
         self.outcome
     }
+    pub fn usage_snapshot(&self) -> Option<&UsageSnapshot> {
+        self.usage.as_ref()
+    }
     pub fn status(t: impl Into<String>) -> Self {
         Self {
             kind: EventKind::Status,
             text: t.into(),
             source: None,
             outcome: None,
+            usage: None,
         }
     }
     pub fn artifact(t: impl Into<String>) -> Self {
@@ -78,6 +85,7 @@ impl Event {
             text,
             source: None,
             outcome: None,
+            usage: None,
         }
     }
     pub fn terminal(o: TaskOutcome) -> Self {
@@ -86,6 +94,16 @@ impl Event {
             text: String::new(),
             source: None,
             outcome: Some(o),
+            usage: None,
+        }
+    }
+    pub fn usage(snap: UsageSnapshot) -> Self {
+        Self {
+            kind: EventKind::Usage,
+            text: String::new(),
+            source: None,
+            outcome: None,
+            usage: Some(snap),
         }
     }
 }
@@ -127,14 +145,14 @@ impl Translator {
                         while acc.chars().count() >= max_chunk {
                             let chunk: String = acc.chars().take(max_chunk).collect();
                             acc = acc.chars().skip(max_chunk).collect();
-                            yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
+                            yield Event::status(chunk);
                         }
                     }
                     Ok(Update::Permission(req)) => {
                         // Flush pending text before handling the permission boundary.
                         if !acc.is_empty() {
                             let chunk = std::mem::take(&mut acc);
-                            yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
+                            yield Event::status(chunk);
                         }
                         let ctx = SessionContext;
                         match policy.decide(&req, &ctx) {
@@ -154,14 +172,14 @@ impl Translator {
                             }
                         }
                     }
-                    Ok(Update::Usage(_)) => {
-                        continue;
+                    Ok(Update::Usage(snap)) => {
+                        yield Event::usage(snap);
                     }
                     Ok(Update::Done { stop_reason }) => {
                         // Flush any pending coalesced text first.
                         if !acc.is_empty() {
                             let chunk = std::mem::take(&mut acc);
-                            yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
+                            yield Event::status(chunk);
                         }
                         // A user-cancelled turn ends with stop_reason == STOP_REASON_CANCELLED
                         // (the ACP wire string for StopReason::Cancelled). Detect it
@@ -174,7 +192,7 @@ impl Translator {
                         } else {
                             stop_reason
                         };
-                        yield Event { kind: EventKind::Artifact, text: payload, source: None, outcome: None };
+                        yield Event::artifact(payload);
                         // A cancelled Done drives a terminal Canceled outcome so the
                         // local-backend producer reports Canceled (not Completed) to the
                         // A2A caller. A normal end_turn emits no terminal here, leaving
@@ -188,7 +206,7 @@ impl Translator {
                         // Flush pending text as a Status event, then fail (no restart).
                         if !acc.is_empty() {
                             let chunk = std::mem::take(&mut acc);
-                            yield Event { kind: EventKind::Status, text: chunk, source: None, outcome: None };
+                            yield Event::status(chunk);
                         }
                         Err(e)?;
                     }
@@ -196,7 +214,7 @@ impl Translator {
             }
             // Stream ended without a terminal Done: flush any remaining text.
             if !acc.is_empty() {
-                yield Event { kind: EventKind::Status, text: acc, source: None, outcome: None };
+                yield Event::status(acc);
             }
         })
     }
@@ -359,6 +377,46 @@ mod tests {
         let evs: Vec<Event> = evs.into_iter().map(|r| r.unwrap()).collect();
         assert_eq!(evs.first().unwrap().kind(), &EventKind::Status);
         assert!(evs.iter().any(|e| e.kind() == &EventKind::Artifact));
+    }
+
+    #[tokio::test]
+    async fn usage_update_emits_usage_event_and_not_artifact_text() {
+        let be = FakeBackend::new(vec![
+            Ok(Update::Usage(UsageSnapshot {
+                used: Some(7),
+                size: Some(9),
+                cost: None,
+                at_ms: 0,
+            })),
+            Ok(Update::Text("body".into())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ]);
+        let st = FakeStore::default();
+        let pol = AutoApprove;
+        let (t, s) = ids();
+        let evs: Vec<Event> = Translator::new()
+            .run(&be, &st, &pol, &t, &s, vec![])
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let usage = evs
+            .iter()
+            .find(|e| e.kind() == &EventKind::Usage)
+            .expect("usage event");
+        assert_eq!(usage.usage_snapshot().and_then(|s| s.used), Some(7));
+        assert_eq!(usage.text(), "");
+
+        let artifact = evs
+            .iter()
+            .rev()
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .expect("artifact event");
+        assert_eq!(artifact.text(), "body");
     }
 
     #[tokio::test]

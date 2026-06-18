@@ -105,21 +105,28 @@ pub fn event_to_streamresponse(ev: &Event, task_id: &str, context_id: &str) -> a
                 metadata: source_metadata(ev),
             })
         }
+        EventKind::Usage => {
+            unreachable!("usage events are telemetry; filtered before SSE conversion")
+        }
     }
 }
 
 /// Convert one pipeline [`Event`] into an SSE frame carrying a real
 /// `a2a::StreamResponse` as the `data:` JSON payload.
-pub fn event_to_sse(ev: &Event, task_id: &str, context_id: &str) -> SseEvent {
+pub fn event_to_sse(ev: &Event, task_id: &str, context_id: &str) -> Option<SseEvent> {
+    if matches!(ev.kind(), EventKind::Usage) {
+        return None;
+    }
     let sr = event_to_streamresponse(ev, task_id, context_id);
     let event_name = match ev.kind() {
         EventKind::Status => EVENT_STATUS,
         EventKind::Artifact => EVENT_ARTIFACT,
         // Terminal events are mapped in Task 2; use status-update as a placeholder.
         EventKind::Terminal => EVENT_STATUS,
+        EventKind::Usage => unreachable!("filtered above"),
     };
     let data = serde_json::to_string(&sr).expect("a2a::StreamResponse always serializes");
-    SseEvent::default().event(event_name).data(data)
+    Some(SseEvent::default().event(event_name).data(data))
 }
 
 #[cfg(test)]
@@ -198,8 +205,8 @@ mod tests {
     #[test]
     fn event_to_sse_produces_correct_event_names() {
         // Verify the event: field is set correctly (inspect via Debug).
-        let status_sse = event_to_sse(&Event::status("hi"), "t", "c");
-        let artifact_sse = event_to_sse(&Event::artifact("bye"), "t", "c");
+        let status_sse = event_to_sse(&Event::status("hi"), "t", "c").unwrap();
+        let artifact_sse = event_to_sse(&Event::artifact("bye"), "t", "c").unwrap();
         // The SseEvent Debug output includes the event name — use it as a proxy.
         let status_debug = format!("{status_sse:?}");
         let artifact_debug = format!("{artifact_sse:?}");
@@ -211,6 +218,17 @@ mod tests {
             artifact_debug.contains("artifact-update"),
             "artifact SSE event name wrong: {artifact_debug}"
         );
+    }
+
+    #[test]
+    fn usage_event_produces_no_sse_frame() {
+        let snap = bridge_core::orch::UsageSnapshot {
+            used: Some(7),
+            size: Some(9),
+            cost: None,
+            at_ms: 0,
+        };
+        assert!(event_to_sse(&Event::usage(snap), "t", "c").is_none());
     }
 
     // ---- integration-style: verify the full translator→sse pipeline ----
@@ -405,7 +423,7 @@ mod tests {
             _ => panic!("expected ArtifactUpdate"),
         }
         // event_to_sse must not panic.
-        let _sse = event_to_sse(last, "t", "t");
-        let _status = event_to_sse(evs.first().unwrap(), "t", "t");
+        let _sse = event_to_sse(last, "t", "t").unwrap();
+        let _status = event_to_sse(evs.first().unwrap(), "t", "t").unwrap();
     }
 }

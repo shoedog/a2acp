@@ -2246,19 +2246,19 @@ fn sse_event_stream(
     task_id: String,
     context_id: String,
 ) -> impl Stream<Item = Result<SseEvent, std::convert::Infallible>> {
-    tokio_stream::wrappers::ReceiverStream::new(rx).map(move |item| {
-        let frame = match item {
-            Ok(ev) => event_to_sse(&ev, &task_id, &context_id),
+    tokio_stream::wrappers::ReceiverStream::new(rx).filter_map(move |item| {
+        let out: Option<Result<SseEvent, std::convert::Infallible>> = match item {
+            Ok(ev) => event_to_sse(&ev, &task_id, &context_id).map(Ok),
             Err(e) => {
                 tracing::warn!(error = %e, "workflow stream error");
-                SseEvent::default()
+                Some(Ok(SseEvent::default()
                     .event("error")
                     // Static category to the wire; full reason logged above.
                     .json_data(json!({ "kind": "error", "text": e.client_message() }))
-                    .expect("serde_json::Value serializes")
+                    .expect("serde_json::Value serializes")))
             }
         };
-        Ok(frame)
+        std::future::ready(out)
     })
 }
 
