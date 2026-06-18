@@ -101,6 +101,34 @@ where they conflict, THESE win. codex (correctness lead) found the deeper concur
   (`acp_backend.rs:~1880`) with a non-default `AgentCapabilities` (the `Recorder` advertises defaults) —
   mirror `connect_runs_initialize_and_captures_agent_capabilities` (`:2018`).
 
+### v3 — targeted re-review fix (codex-xhigh): reconcile is "apply-or-expire" (transactional by discard)
+
+The re-review found PF-1/2/5 insufficient on ATOMICITY: `apply_model_effort` applies model then effort
+(`acp_backend.rs:1225`), so a partial apply (model ok, effort fails/falls-back) leaves the live session in a
+state the bridge's fingerprint doesn't reflect — and the infallible `apply_effort_walkdown` hides effort
+failures. Because the live ACP session can't be cheaply rolled back, the fix is **discard-on-doubt**:
+
+- **PF-9 (BLOCKER) — `reconcile_config`/`apply_model_effort` returns `Applied` ONLY on an EXACT full apply.**
+  Warm semantics: every requested-AND-changed field must apply to EXACTLY the requested value. Make the
+  effort helper report exact-apply (it's infallible today): change `apply_effort_walkdown` to return
+  `(EffortDecision, Option<Vec<SessionConfigOption>> /*refreshed*/)` and have `apply_model_effort` (purpose
+  `Warm`) treat **no-effort-surface OR Unsupported OR FellBack OR Skip-of-a-requested-change** as
+  `Err(ApplyConfigError::NotAdvertised)`, and an effort RPC **rejection** as `Err(Rejected)`. At purpose
+  `Mint`, keep today's NON-fatal fallback (FellBack/Skip are fine — mint behavior byte-identical). Preserve
+  the `resolved_log_line` logging (log inside the helper, or return the `EffortDecision` for the caller).
+- **PF-10 (BLOCKER) — SessionManager EXPIRES the handle on any non-clean reconcile.** In the Task-6 reconcile
+  branch, after re-acquiring the lock: on `Ok(Applied)` AND the PF-2 identity revalidation passing (same
+  `claimed_id`, still `Running`) → advance fingerprint + proceed. On **ANYTHING else** — `NotAdvertised` /
+  `Rejected` / transport `Err`, OR revalidation failing (handle released / id-mismatch / no longer `Running`
+  because `cancel()` flipped it) — **EXPIRE the handle**: remove it from `by_context`, `backend.release_session
+  (&backend_session).await`, drop the lease; return `ConfigReseedRequired{field}` (config cases) or
+  `SessionExpired` (concurrent-change/identity cases). **Never return a potentially-dirty handle to `Idle`
+  with a stale fingerprint.** This makes reconcile transactional-by-discard: the warm session is either
+  EXACTLY the requested config, or gone (the next continue cold-remints correctly). No rollback needed.
+- **Tests (add):** (a) model applies then effort fails → handle expired, next `checkout_turn` → fresh mint
+  (cold); (b) `cancel()` during a blocked fake `reconcile_config` → handle expired, no dirty reuse; (c) a
+  warm effort that can only FellBack → `ConfigReseedRequired` + handle expired (not a lying `Applied`).
+
 > **Net effect on tasks:** T1 unchanged. T2 unchanged. T3 unchanged (defaults fine). **T4** grows: the helper
 > returns `Result<(ConfigSurface,String), ApplyConfigError>` + `ApplyPurpose`, the effort helper returns
 > refreshed opts (PF-1/PF-5). **T5** grows: PF-3 (mint-if-absent) + PF-4 (turn_lock) + map `ApplyConfigError`
