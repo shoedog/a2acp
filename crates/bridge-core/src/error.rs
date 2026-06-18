@@ -31,6 +31,8 @@ pub enum BridgeError {
     SessionNotFound,
     #[error("config mismatch: {field}")]
     ConfigMismatch { field: &'static str },
+    #[error("config reseed required: {field}")]
+    ConfigReseedRequired { field: &'static str },
     #[error("session expired")]
     SessionExpired,
     #[error("session busy")]
@@ -110,6 +112,7 @@ impl BridgeError {
             | TaskNotFound
             | SessionNotFound
             | ConfigMismatch { .. }
+            | ConfigReseedRequired { .. }
             | SessionExpired
             | HandleBusy => RejectRequest,
             AuthRequired { .. } | AgentNotAuthenticated => SetState(S::AuthRequired),
@@ -147,6 +150,17 @@ mod slice0_error_tests {
         assert!(BridgeError::ConfigMismatch { field: "effort" }
             .client_message()
             .contains("effort"));
+    }
+
+    #[test]
+    fn config_reseed_required_rejects_request() {
+        assert_eq!(
+            BridgeError::ConfigReseedRequired { field: "model" }.disposition(),
+            A2aDisposition::RejectRequest
+        );
+        assert!(BridgeError::ConfigReseedRequired { field: "mode" }
+            .client_message()
+            .contains("mode"));
     }
 }
 

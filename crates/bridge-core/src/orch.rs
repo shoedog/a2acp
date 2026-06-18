@@ -6,6 +6,27 @@ use serde::{Deserialize, Serialize};
 
 pub const ORCH_V: u16 = 1;
 
+/// Outcome of reconciling model/effort on a LIVE warm session (Slice 1). Fieldless —
+/// the backend LOGS any rejection reason internally (no wire leak).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    Applied,
+    NotAdvertised,
+    Rejected,
+}
+
+/// Bridge-owned agent SESSION-LIFECYCLE capabilities (distinct from `catalog::AgentCaps`, which is
+/// model-catalog data). Sourced from initialize-time ACP `AgentCapabilities`. `delete` is behind the SDK
+/// `unstable_session_delete` feature (NOT enabled) -> always false in Slice 1.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionCaps {
+    pub load_session: bool,
+    pub resume: bool,
+    pub close: bool,
+    pub list: bool,
+    pub delete: bool,
+}
+
 /// ACP usage cost is `{amount, currency}` — NOT guaranteed USD.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsageCost {
@@ -81,6 +102,19 @@ pub struct OrchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_session_caps_default_is_all_false() {
+        let c = AgentSessionCaps::default();
+        assert!(!c.load_session && !c.resume && !c.close && !c.list && !c.delete);
+    }
+
+    #[test]
+    fn reconcile_outcome_eq() {
+        assert_eq!(ReconcileOutcome::Applied, ReconcileOutcome::Applied);
+        assert_ne!(ReconcileOutcome::Applied, ReconcileOutcome::NotAdvertised);
+    }
+
     #[test]
     fn orch_event_roundtrips_with_internal_kind_tag() {
         let ev = OrchEvent {
