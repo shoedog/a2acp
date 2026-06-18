@@ -116,6 +116,70 @@ byte-identical via native-error re-raise; warm requires EXACT model+effort apply
   Opus arch; `max_attempts=3`; dual review at spec AND plan; each increment codex-xhigh reviewed (current
   directive); LIVE-GATE before merge.
 
+## Deferred items / backlog (explicitly NOT in the current slices)
+
+Consolidated from the architecture/slicing/spec "OUT/defer/cut" sections. Track these so nothing is silently
+dropped. Most map to later slices; a few are standalone follow-ups.
+
+**Mapped to later slices (sequenced):**
+- **Full journal + 4-path adapter rewrite + dual-store + shared seq** — deferred to **Slice 6** (lands WITH
+  its consumers; do NOT front-load it — that was the backed-into-order bug).
+- **Rich `session/update` variants** (Plan, ToolCall/ToolCallUpdate, config/mode/commands updates) + **E9
+  watchdog** — **Slice 7** (watchdog fires on "no JOURNAL event for N s"; needs the journal variants first).
+- **MCP server surface (D2) + D1 typed params + CLI-as-thin-client** — **Slice 8** (after the Rust service
+  API + ops are stable, to avoid divergence).
+- **Turn Channel: queued-inject + pending-permission** + **PermissionDecision Deny/Modify/Escalate** (B1/E2)
+  — **Slice 9** (spike-heavy, last). **True mid-turn injection** is deferred even within S9 (ACP is
+  request/response; ship queued-next-turn first). **Escalate** bounded with default-DENY.
+- **B2 weighted fan-out panel** (pros/cons/cost/benefit/risk) — **Slice 10+** (fix fan-out identity/cancel/
+  typed-results first; fan-out already works, so this is UX, not foundation).
+- **E1 worktree-per-session · E6 retry/resume · E3 batch · E7 typed task-spec · E8 prompt-template lib** —
+  **Slice 10+ tail.**
+- **A3 auto-heuristic** (bridge auto-deciding keep-vs-tear-down) + **auto-compaction** — deferred; the slices
+  give the orchestrator MANUAL levers (continue/compact/clear/release/TTL/threshold-warn) first.
+
+**Capability-gated ACP actions (recorded in Slice 1, ACTIONS deferred):**
+- `session/load` (replay history) + `session/resume` (reconnect) + `session/close` (teardown) +
+  `session/delete` (purge history) + `session/list` (enumerate). Slice 1 RECORDS the caps
+  (`AgentSessionCaps`); acting on them is later. **`session/delete` is behind the SDK
+  `unstable_session_delete` feature — NOT enabled** in `crates/bridge-acp/Cargo.toml` (record `delete=false`;
+  enabling it is a deliberate future step).
+- **Post-restart `continue` rehydration via `session/load`** — default is typed `SessionExpired` (warm table
+  is in-memory/non-durable); the `loadSession`-based rehydration is a documented future upgrade.
+- **Slash-command forwarding** (`available_commands_update` → `/name` parts) — deferred (S4-adjacent).
+- **fs/terminal client-method surface** (agent→client `fs/*`, `terminal/*`) — the controlled-environment seam
+  for E1/E2 containerization; currently the bridge rejects them (`acp_backend.rs ~855`).
+
+**Standalone follow-ups (not a slice):**
+- **Pre-existing unary `result.artifact.text` truncation** (multi-chunk reply → last chunk only;
+  "ZEBRA"→"RA"; reproduces on the legacy non-warm path). Real bug, affects all unary sends; relates to the
+  **C1 typed-result** work. Fix in the unary `Translator::run(...).collect()` → artifact path in `server.rs`.
+- **`usage_update` SDK-version handling / `AgentCrashedKind` enum** — older deferrals (see memory); low priority.
+- **`SmallSet` vs `Vec` for `SessionSpecFingerprint::diff`** — used `Vec` (only `.contains`/`.any`); fine.
+
+## ACP v1 spec links (source of the protocol decisions)
+
+Full folded quick-reference: **`docs/references/acp-protocol-v1.md`**. Original spec pages:
+- Overview — <https://agentclientprotocol.com/protocol/v1/overview.md>
+- Initialization — <https://agentclientprotocol.com/protocol/v1/initialization.md>
+- Session Setup (new/load/resume/close) — <https://agentclientprotocol.com/protocol/v1/session-setup.md>
+- Session List — <https://agentclientprotocol.com/protocol/v1/session-list.md>
+- Session Delete — <https://agentclientprotocol.com/protocol/v1/session-delete.md>
+- Session Modes — <https://agentclientprotocol.com/protocol/v1/session-modes.md>
+- Session Config Options — <https://agentclientprotocol.com/protocol/v1/session-config-options.md>
+- Prompt Turn — <https://agentclientprotocol.com/protocol/v1/prompt-turn.md>
+- Content — <https://agentclientprotocol.com/protocol/v1/content.md>
+- Tool Calls — <https://agentclientprotocol.com/protocol/v1/tool-calls.md>
+- File System — <https://agentclientprotocol.com/protocol/v1/file-system.md>
+- Agent Plan — <https://agentclientprotocol.com/protocol/v1/agent-plan.md>
+- Slash Commands — <https://agentclientprotocol.com/protocol/v1/slash-commands.md>
+- Transports — <https://agentclientprotocol.com/protocol/v1/transports.md>
+- Extensibility — <https://agentclientprotocol.com/protocol/v1/extensibility.md>
+- (also) Authentication / Terminals / Schema — `/protocol/v1/{authentication,terminals,schema}.md`
+
+SDK: `agent-client-protocol = =0.12.1` (re-exports `agent-client-protocol-schema 0.13.2`); features enabled
+in `crates/bridge-acp/Cargo.toml`: `unstable_session_usage` + `unstable_session_model` only.
+
 ## Scaffolding (reusable)
 
 - `examples/a2a-bridge.slice0-impl-codex.toml` + `prompts/slice0-impl-node.md` — the codex gpt-5.5/high host
