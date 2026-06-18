@@ -18,6 +18,58 @@ config-options) into the warm handle — raw metadata now; the *actions* (S2-P2)
 This slice is purely an upgrade of the Slice-0 `checkout_turn` mismatch path + a lifted backend method + a
 capabilities accessor. No new surfaces, no clear/compact, no journal.
 
+## v2 — dual spec-review fixes folded (codex-xhigh + Opus, both `fix-then-ship`)
+
+Both lenses converged; these resolutions SUPERSEDE the conflicting detail in the sections below. No redesign —
+the reconcile-on-continue + bridge-owned caps + typed-error shape is sound; the gaps were lift-mechanics.
+
+- **FIX-1 (BLOCKER, both) — multi-field mismatch routing.** `first_mismatch` (returns only the FIRST field)
+  is unsafe: a `model+cwd` or `effort+mode` continue would route to the reconcilable branch, reconcile, then
+  advance the fingerprint to include the *unreconciled* frozen field. **Compute the FULL mismatch set**
+  (`SessionSpecFingerprint::diff(&other) -> SmallSet<&'static str>`): if it contains `agent` or `cwd` →
+  `ConfigMismatch` (reject); else if it contains `mode` → `ConfigReseedRequired{mode}`; else (set ⊆
+  `{model, effort}`, non-empty) → reconcile. Add `diff()`; keep `first_mismatch` for the Slice-0 callers
+  unchanged (or migrate them).
+- **FIX-2 (BLOCKER, both) — cache the config surface for warm reconcile.** `configure_model_option`
+  (`acp_backend.rs:524`) + the effort walk-down need `opts0: &[SessionConfigOption]` + `models0:
+  Option<&SessionModelState>` from the `session/new` response — `AgentSession` (`acp_backend.rs:266`) caches
+  NEITHER (consumed inline at mint `:1197/1201`, discarded). **Add config-surface state to `AgentSession`**
+  (e.g. `config_surface: OnceCell<(Vec<SessionConfigOption>, Option<SessionModelState>)>` or a small struct),
+  populated in the mint closure from `NewSessionResponse`, refreshed from `set_config_option` responses
+  (which return updated `config_options`); `reconcile_config` reads it. The shared helper becomes
+  `apply_model_effort(cx, agent_session_id, surface, spec) -> (ReconcileOutcome, refreshed_surface)` and the
+  mint closure refactors to call it with the freshly-minted surface (model→effort threads via `refreshed`).
+- **FIX-3 (MAJOR, both) — `AgentCaps` name collides + fields unsourceable.** `bridge_core::catalog::AgentCaps`
+  ALREADY EXISTS (model-catalog data, live consumers `card.rs`/`acp_backend.rs:1398`). **Rename to
+  `AgentSessionCaps`** (lifecycle caps only). **Source ONLY from `agent_capabilities()`** (initialize-time):
+  `{ load_session, resume, close, list }` (all on ACP `AgentCapabilities`/`SessionCapabilities`). **`delete`
+  is behind `unstable_session_delete` (NOT enabled, slicing-row confirms) → record `delete: false`
+  explicitly** (do not read the cfg-gated field). **Drop `config_options`** from the caps struct entirely —
+  it is per-session (`session/new`), NOT an initialize-time capability; it does not belong in lifecycle caps.
+- **FIX-4 (MAJOR, both) — the helper must return reconcile outcomes.** The mint path maps a missing model
+  surface → `ConfigInvalid`, an RPC rejection → `AgentCrashed`, a missing effort → silent Skip
+  (`acp_backend.rs:577/660/1265`). `apply_model_effort` must return `ReconcileOutcome`
+  (`Applied`/`NotAdvertised`/`Rejected`) for the warm path WHILE preserving mint's existing error/skip
+  behavior (mint maps the outcome back to its current semantics; reconcile surfaces it directly).
+- **FIX-5 (MAJOR, Opus) — concurrency + live `agent_session_id`.** `checkout_turn` holds the **table-wide**
+  `by_context` `tokio::Mutex` across the resume branch; calling the async `reconcile_config` under it blocks
+  ALL warm sessions. **Discipline:** on a reconcilable mismatch, set `state = Running` (claim the handle),
+  **drop the lock**, call `reconcile_config`, **re-acquire**, advance `fingerprint` on `Applied` (the handle
+  is claimed → no concurrent mutation), reset to `Idle` + return the typed error otherwise. `reconcile_config`
+  must reach the EXISTING minted `AgentSessionId` (add an internal accessor by bridge `SessionId`); it does
+  **NOT** re-mint and re-stashes ONLY model/effort (never cwd → never arms the `minted_cwd` immutability
+  guard `acp_backend.rs:1298`).
+- **FIX-6 (MINOR→required) — wire `ConfigReseedRequired` into `disposition()`** (`error.rs` RejectRequest arm,
+  alongside `ConfigMismatch`) + extend the slice0 error test; else the catch-all makes it `Failed`. **Drop
+  `ReconcileOutcome::Rejected{reason}`'s field** (fieldless 3-variant enum; the backend logs the reason
+  internally — avoids the dead-data + wire-leak trap). **Define the `session/status` `capabilities` JSON
+  shape** explicitly (manual assembly at `server.rs:2842`): `"capabilities": {"loadSession":bool,
+  "resume":bool,"close":bool,"list":bool,"delete":false}`.
+- **FIX-7 (DoD) — strengthen the live proof.** "normal reply proves effort applied" is weak (codex). DoD-1
+  must assert the `set_config_option`/`set_session_model` request ACTUALLY FIRED (recording-transport unit
+  assertion + a serve-log line on the live gate). DoD-4 (`NotAdvertised`) is **unit-test-gated** (codex
+  advertises everything → unreachable live; kiro is NOT in the live loop).
+
 ## Findings (grounded in the code)
 
 - **Config is applied ONLY inside the `session/new` init closure** (P-1, confirmed): `ensure_session`
