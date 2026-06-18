@@ -6,7 +6,7 @@ use bridge_core::error::BridgeError;
 use bridge_core::ids::{
     AgentId, ContextId, OperationId, SessionGeneration, SessionHandleId, SessionId,
 };
-use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
+use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome, UsageSnapshot};
 use bridge_core::ports::{AgentBackend, AgentRegistry, Lease};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::session_fingerprint::SessionSpecFingerprint;
@@ -39,6 +39,7 @@ struct WarmHandle {
     fingerprint: SessionSpecFingerprint,
     lease: Box<dyn Lease>,
     state: SessionState,
+    usage: UsageSnapshot,
     /// Set by cancel()/release() while `Reconciling` so the in-flight reconcile expires the handle on
     /// resolve (the handle is never mutated/removed out from under an active reconcile). [PF-2/9/10]
     expire_after_reconcile: bool,
@@ -60,6 +61,7 @@ pub struct SessionStatusInfo {
     pub generation: u64,
     pub idle_age_ms: u128,
     pub capabilities: AgentSessionCaps,
+    pub usage: UsageSnapshot,
 }
 
 pub struct SessionManager {
@@ -242,6 +244,7 @@ impl SessionManager {
                 fingerprint: fp,
                 lease: resolved.lease,
                 state: SessionState::Running,
+                usage: UsageSnapshot::default(),
                 expire_after_reconcile: false,
                 op: Some(op),
                 last_used: (self.now)(),
@@ -272,7 +275,19 @@ impl SessionManager {
             generation: h.generation.get(),
             idle_age_ms: (self.now)().duration_since(h.last_used).as_millis(),
             capabilities: h.caps.clone(),
+            usage: h.usage.clone(),
         })
+    }
+
+    /// Record the latest usage snapshot for a warm handle (latest-wins). Stamps `at_ms` here
+    /// (the inbound layer has a wall clock; SessionManager.now is monotonic). FIX-7: does NOT
+    /// touch `last_used` (usage during a turn is already covered by Running + finish_turn's
+    /// refresh; bumping it here only races reap_idle). No-ops a missing/removed handle. [Slice 2]
+    pub async fn record_usage(&self, ctx: &ContextId, mut snap: UsageSnapshot) {
+        snap.at_ms = crate::workflow_sink::now_ms();
+        if let Some(h) = self.by_context.lock().await.get_mut(ctx) {
+            h.usage = snap;
+        }
     }
 
     pub async fn release(&self, ctx: &ContextId) {
@@ -1116,6 +1131,82 @@ mod tests {
             .unwrap();
 
         assert_eq!(manager.status(&ctx).await.unwrap().capabilities, caps);
+    }
+
+    #[tokio::test]
+    async fn record_usage_latest_wins_stamps_at_ms() {
+        let (manager, _b, _r) = manager();
+        let c = ctx("u");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager
+            .record_usage(
+                &c,
+                UsageSnapshot {
+                    used: Some(10),
+                    size: Some(100),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        manager
+            .record_usage(
+                &c,
+                UsageSnapshot {
+                    used: Some(42),
+                    size: Some(100),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        let s = manager.status(&c).await.unwrap();
+        assert_eq!(s.usage.used, Some(42));
+        assert!(s.usage.at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn record_usage_noops_unknown_ctx() {
+        let (manager, _b, _r) = manager();
+        manager
+            .record_usage(&ctx("nope"), UsageSnapshot::default())
+            .await;
+        assert!(manager.status(&ctx("nope")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_usage_does_not_refresh_idle_ttl() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let clock = ManualClock::new();
+        let manager =
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.reader());
+        let c = ctx("idle-usage");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&c).await;
+        clock.advance(Duration::from_secs(6));
+        manager
+            .record_usage(
+                &c,
+                UsageSnapshot {
+                    used: Some(1),
+                    size: Some(2),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        manager.reap_idle().await;
+        assert!(
+            manager.status(&c).await.is_none(),
+            "record_usage must NOT have refreshed last_used"
+        );
     }
 
     #[tokio::test]
