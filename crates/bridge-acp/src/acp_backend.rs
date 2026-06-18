@@ -36,7 +36,9 @@ use crate::model_effort::{
     model_values, resolve_effort, resolve_model, resolved_log_line, EffortDecision, ModelDecision,
     EFFORT_ORDER,
 };
-use bridge_core::domain::{PermissionDecision, PermissionRequest, SessionContext, SessionSpec};
+use bridge_core::domain::{
+    Effort, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
+};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{
@@ -280,6 +282,9 @@ struct AgentSession {
     /// field) so `prompt` can take an OWNED guard (`lock_owned`) and move it into
     /// the driver task that holds it for the whole streamed turn.
     turn_lock: Arc<Mutex<()>>,
+    /// The advertised config surface from `session/new`, refreshed by later
+    /// `session/set_config_option` calls so warm config reconcile can reuse it.
+    config_surface: StdMutex<Option<ConfigSurface>>,
     /// Cancel latch: set by `request_cancel` when a cancel arrives before the
     /// agent session exists, so the minting task can fire `session/cancel` as
     /// soon as the id is known.
@@ -303,10 +308,29 @@ impl AgentSession {
             agent_id: OnceCell::new(),
             minted_cwd: OnceCell::new(),
             turn_lock: Arc::new(Mutex::new(())),
+            config_surface: StdMutex::new(None),
             cancel_requested: AtomicBool::new(false),
             turn_kill: Arc::new(StdMutex::new(None)),
         }
     }
+}
+
+#[derive(Clone, Default)]
+struct ConfigSurface {
+    opts: Vec<SessionConfigOption>,
+    models: Option<SessionModelState>,
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum ApplyPurpose {
+    Mint,
+    Warm,
+}
+
+enum ApplyConfigError {
+    NotAdvertised(BridgeError),
+    Rejected(BridgeError),
 }
 
 // ── Public struct ────────────────────────────────────────────────────────────
@@ -619,13 +643,131 @@ impl AcpBackend {
         Ok(())
     }
 
+    /// Apply model + effort against an advertised surface on a live agent session.
+    /// This is the mint-time config sequence lifted so warm reconcile can call the
+    /// same code without re-minting. Mint preserves today's permissive effort
+    /// behavior; warm requires an exact requested effort apply.
+    async fn apply_model_effort(
+        cx: &ConnectionTo<Agent>,
+        agent_session_id: &AgentSessionId,
+        agent_id: &str,
+        surface: &ConfigSurface,
+        model: Option<&str>,
+        effort: Option<Effort>,
+        purpose: ApplyPurpose,
+    ) -> Result<(ConfigSurface, String), ApplyConfigError> {
+        let (mut refreshed_opts, model_current) = Self::configure_model_option(
+            cx,
+            agent_session_id,
+            agent_id,
+            &surface.opts,
+            surface.models.as_ref(),
+            model,
+        )
+        .await
+        .map_err(|err| match err {
+            err @ BridgeError::ConfigInvalid { .. } => ApplyConfigError::NotAdvertised(err),
+            err @ BridgeError::AgentCrashed { .. } => ApplyConfigError::Rejected(err),
+            err => ApplyConfigError::Rejected(err),
+        })?;
+
+        let mut refreshed_models = surface.models.clone();
+        if model.is_some() && model_values(&surface.opts).is_none() {
+            if let Some(state) = refreshed_models.as_ref() {
+                refreshed_models = Some(SessionModelState::new(
+                    model_current.clone(),
+                    state.available_models.clone(),
+                ));
+            }
+        }
+
+        let effort_outcome = match effort_opt(&refreshed_opts) {
+            Some(advertised) => {
+                let decision = resolve_effort(effort, &advertised);
+                match decision {
+                    EffortDecision::Unsupported { from } => {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            effort = %from,
+                            valid = ?advertised.levels,
+                            "configured effort is below the lowest advertised effort level; skipping"
+                        );
+                        EffortDecision::Unsupported { from }
+                    }
+                    EffortDecision::Skip => EffortDecision::Skip,
+                    decision @ (EffortDecision::Apply { .. } | EffortDecision::FellBack { .. }) => {
+                        match Self::apply_effort_walkdown(
+                            cx,
+                            agent_session_id,
+                            agent_id,
+                            decision,
+                            &advertised.levels,
+                        )
+                        .await
+                        {
+                            Ok((decision, refreshed)) => {
+                                if let Some(opts) = refreshed {
+                                    refreshed_opts = opts;
+                                }
+                                decision
+                            }
+                            Err(err) => {
+                                if matches!(purpose, ApplyPurpose::Warm) {
+                                    return Err(ApplyConfigError::Rejected(err));
+                                }
+                                EffortDecision::Skip
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                if let Some(effort) = effort {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        effort = ?effort,
+                        "agent advertised no effort option; skipping configured effort"
+                    );
+                }
+                EffortDecision::Skip
+            }
+        };
+        tracing::info!(
+            "{}",
+            resolved_log_line(agent_id, &model_current, &effort_outcome)
+        );
+
+        if matches!(purpose, ApplyPurpose::Warm) && effort.is_some() {
+            match &effort_outcome {
+                EffortDecision::Apply { .. } => {}
+                EffortDecision::Skip
+                | EffortDecision::FellBack { .. }
+                | EffortDecision::Unsupported { .. } => {
+                    return Err(ApplyConfigError::NotAdvertised(
+                        BridgeError::config_invalid(format!(
+                            "agent {agent_id} did not apply requested effort exactly"
+                        )),
+                    ));
+                }
+            }
+        }
+
+        Ok((
+            ConfigSurface {
+                opts: refreshed_opts,
+                models: refreshed_models,
+            },
+            model_current,
+        ))
+    }
+
     async fn apply_effort_walkdown(
         cx: &ConnectionTo<Agent>,
         agent_session_id: &AgentSessionId,
         agent_id: &str,
         initial: EffortDecision,
         advertised_levels: &[String],
-    ) -> EffortDecision {
+    ) -> Result<(EffortDecision, Option<Vec<SessionConfigOption>>), BridgeError> {
         let (config_id, requested_from, mut level) = match initial {
             EffortDecision::Apply { config_id, level } => (config_id, level.clone(), level),
             EffortDecision::FellBack {
@@ -641,21 +783,26 @@ impl AcpBackend {
                 );
                 (config_id, from, to)
             }
-            EffortDecision::Skip => return EffortDecision::Skip,
-            EffortDecision::Unsupported { from } => return EffortDecision::Unsupported { from },
+            EffortDecision::Skip => return Ok((EffortDecision::Skip, None)),
+            EffortDecision::Unsupported { from } => {
+                return Ok((EffortDecision::Unsupported { from }, None));
+            }
         };
 
         loop {
             match Self::set_config_option(cx, agent_session_id, &config_id, &level).await {
-                Ok(_) => {
+                Ok(refreshed) => {
                     if level == requested_from {
-                        return EffortDecision::Apply { config_id, level };
+                        return Ok((EffortDecision::Apply { config_id, level }, Some(refreshed)));
                     }
-                    return EffortDecision::FellBack {
-                        config_id,
-                        from: requested_from,
-                        to: level,
-                    };
+                    return Ok((
+                        EffortDecision::FellBack {
+                            config_id,
+                            from: requested_from,
+                            to: level,
+                        },
+                        Some(refreshed),
+                    ));
                 }
                 Err(e) => {
                     let code = Self::error_code_i64(e.code);
@@ -667,7 +814,9 @@ impl AcpBackend {
                             error = ?e,
                             "session/set_config_option(effort) failed; stopping effort walk-down"
                         );
-                        return EffortDecision::Skip;
+                        return Err(BridgeError::agent_crashed(format!(
+                            "session/set_config_option({config_id}) rejected: {e}"
+                        )));
                     }
 
                     let Some(next) = Self::next_lower_effort(&level, advertised_levels) else {
@@ -678,9 +827,12 @@ impl AcpBackend {
                             error = ?e,
                             "session/set_config_option(effort) unsupported and no lower advertised level remains"
                         );
-                        return EffortDecision::Unsupported {
-                            from: requested_from,
-                        };
+                        return Ok((
+                            EffortDecision::Unsupported {
+                                from: requested_from,
+                            },
+                            None,
+                        ));
                     };
                     tracing::warn!(
                         agent = %agent_id,
@@ -1218,65 +1370,28 @@ impl AcpBackend {
                         })?;
                 }
 
-                // (3) model — HARD validation against the agent-advertised model
-                // config option, then apply through session/set_config_option. A
-                // configured model that the agent did not advertise is operator
-                // config drift, so mint fails before any prompt is sent.
-                let (refreshed_opts, model_current) = Self::configure_model_option(
+                // (3) model + (4) effort. Model remains a hard mint error; effort
+                // remains best-effort at mint. The helper carries native errors so
+                // this mapping re-raises the exact config_invalid/agent_crashed.
+                let surface = ConfigSurface {
+                    opts: opts0,
+                    models: models0,
+                };
+                let (refreshed_surface, _model_current) = Self::apply_model_effort(
                     cx,
                     &id,
                     &agent_id_for_mint,
-                    &opts0,
-                    models0.as_ref(),
+                    &surface,
                     model.as_deref(),
+                    effort,
+                    ApplyPurpose::Mint,
                 )
-                .await?;
-
-                // (4) effort — resolve against the refreshed post-model options.
-                // Applying effort is non-fatal, but only unsupported-effort internal
-                // errors trigger walk-down; unrelated errors stop immediately.
-                let effort_outcome = match effort_opt(&refreshed_opts) {
-                    Some(advertised) => {
-                        let decision = resolve_effort(effort, &advertised);
-                        match decision {
-                            EffortDecision::Unsupported { from } => {
-                                tracing::warn!(
-                                    agent = %agent_id_for_mint,
-                                    effort = %from,
-                                    valid = ?advertised.levels,
-                                    "configured effort is below the lowest advertised effort level; skipping"
-                                );
-                                EffortDecision::Unsupported { from }
-                            }
-                            EffortDecision::Skip => EffortDecision::Skip,
-                            decision @ (EffortDecision::Apply { .. }
-                            | EffortDecision::FellBack { .. }) => {
-                                Self::apply_effort_walkdown(
-                                    cx,
-                                    &id,
-                                    &agent_id_for_mint,
-                                    decision,
-                                    &advertised.levels,
-                                )
-                                .await
-                            }
-                        }
-                    }
-                    None => {
-                        if let Some(effort) = effort {
-                            tracing::warn!(
-                                agent = %agent_id_for_mint,
-                                effort = ?effort,
-                                "agent advertised no effort option; skipping configured effort"
-                            );
-                        }
-                        EffortDecision::Skip
-                    }
-                };
-                tracing::info!(
-                    "{}",
-                    resolved_log_line(&agent_id_for_mint, &model_current, &effort_outcome)
-                );
+                .await
+                .map_err(|err| match err {
+                    ApplyConfigError::NotAdvertised(err) | ApplyConfigError::Rejected(err) => err,
+                })?;
+                *entry.config_surface.lock().expect("config_surface lock") =
+                    Some(refreshed_surface);
 
                 // (5) Record the cwd that was actually used to mint this session so
                 // the immutability guard below can compare future requests against
@@ -4592,6 +4707,38 @@ mod tests {
                 ("effort".to_string(), "high".to_string())
             ],
             "effort must resolve from model's refreshed config_options, not stale session/new options"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_populates_config_surface_cache_with_refreshed_opts() {
+        let rec = Recorder::new("agent-sess-CACHE");
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-CACHE");
+
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("m".to_string()),
+                effort: Some(Effort::High),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+        be.ensure_session(&key).await.unwrap();
+
+        let entry = be.session_entry(&key).await;
+        let surface = entry
+            .config_surface
+            .lock()
+            .expect("config_surface lock")
+            .clone()
+            .expect("mint must cache the refreshed config surface");
+        assert_eq!(select_current(&surface.opts, "model").as_deref(), Some("m"));
+        assert_eq!(
+            select_current(&surface.opts, "effort").as_deref(),
+            Some("high")
         );
     }
 
