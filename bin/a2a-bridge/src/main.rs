@@ -3662,7 +3662,7 @@ async fn main() -> Result<(), BoxError> {
     ));
     {
         let sm = session_manager.clone();
-        let period = Duration::from_secs(warm_ttl.min(30).max(1));
+        let period = Duration::from_secs(warm_ttl.clamp(1, 30));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(period);
             loop {

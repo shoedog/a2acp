@@ -1,0 +1,11 @@
+# Slice 0 live-gate: host codex-acp agent + warm sessions on serve (tiny TTL for DoD-8).
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "low"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[server]
+addr = "127.0.0.1:8097"
+warm_idle_ttl_secs = 5
