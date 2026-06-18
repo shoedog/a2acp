@@ -99,7 +99,9 @@ SUBCOMMANDS:
   init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
   serve               Run the A2A server.  [--config <path>]
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
-  submit | task       Detached workflow submit + durable task store.
+  submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
+  task                Durable task store.  get | list | cancel | watch
+  session             Warm session control.  status | release | cancel <contextId>
 
 Run `a2a-bridge <subcommand> --help` for details. Quickstart + cwd/creds/concurrency notes: AGENTS.md.";
 
@@ -2594,25 +2596,73 @@ async fn rpc_call(
 }
 
 async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
-    let skill = args.first().cloned().ok_or("submit: missing <skill>")?;
     let input_path = flag(args, "--input").ok_or("submit: --input <file> required")?;
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
     let text = std::fs::read_to_string(input_path)?;
-    let params = serde_json::json!({
-        "message": {
-            "text": text,
-            "metadata": { "a2a-bridge.skill": skill }
+    let mut md = serde_json::Map::new();
+    let flagvals: std::collections::HashSet<&str> = [
+        "--input",
+        "--url",
+        "--context",
+        "--agent",
+        "--model",
+        "--effort",
+        "--mode",
+        "--cwd",
+    ]
+    .iter()
+    .filter_map(|f| flag(args, f))
+    .collect();
+    let skill = args
+        .iter()
+        .find(|a| !a.starts_with("--") && !flagvals.contains(a.as_str()))
+        .cloned();
+    if let Some(s) = &skill {
+        md.insert("a2a-bridge.skill".into(), s.clone().into());
+    }
+    for (f, key) in [
+        ("--agent", "a2a-bridge.agent"),
+        ("--model", "a2a-bridge.model"),
+        ("--effort", "a2a-bridge.effort"),
+        ("--mode", "a2a-bridge.mode"),
+        ("--cwd", "a2a-bridge.cwd"),
+    ] {
+        if let Some(v) = flag(args, f) {
+            md.insert(key.into(), v.into());
         }
-    });
-    let v = rpc_call(url, a2a::methods::SEND_MESSAGE, params).await?;
+    }
+    let mut message = serde_json::Map::new();
+    message.insert("text".into(), text.into());
+    message.insert("metadata".into(), serde_json::Value::Object(md));
+    if let Some(c) = flag(args, "--context") {
+        message.insert("contextId".into(), c.into());
+    }
+    let v = rpc_call(
+        url,
+        a2a::methods::SEND_MESSAGE,
+        serde_json::json!({ "message": message }),
+    )
+    .await?;
     if let Some(err) = v.get("error") {
         return Err(format!("submit failed: {err}").into());
     }
-    let id = v["result"]["task"]["id"]
+    let out = v["result"]["artifact"]["text"]
         .as_str()
-        .ok_or("no task id in response")?;
-    println!("{id}");
+        .or_else(|| {
+            v["result"]["artifacts"]
+                .as_array()
+                .and_then(|artifacts| artifacts.iter().find_map(artifact_text))
+        })
+        .or_else(|| v["result"]["task"]["id"].as_str())
+        .unwrap_or("ok");
+    println!("{out}");
     Ok(())
+}
+
+fn artifact_text(artifact: &serde_json::Value) -> Option<&str> {
+    artifact["parts"]
+        .as_array()
+        .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()))
 }
 
 async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
@@ -2668,6 +2718,27 @@ async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
         }
         other => return Err(format!("task: unknown subcommand {other:?}").into()),
     }
+    Ok(())
+}
+
+async fn session_cmd(args: &[String]) -> Result<(), BoxError> {
+    let sub = args
+        .first()
+        .map(|s| s.as_str())
+        .ok_or("session: missing subcommand (status|release|cancel)")?;
+    let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
+    let ctx = args.get(1).cloned().ok_or("session: missing <contextId>")?;
+    let method = match sub {
+        "status" => "SessionStatus",
+        "release" => "SessionRelease",
+        "cancel" => "SessionCancel",
+        other => return Err(format!("session: unknown subcommand {other:?}").into()),
+    };
+    let v = rpc_call(url, method, serde_json::json!({ "contextId": ctx })).await?;
+    if let Some(err) = v.get("error") {
+        return Err(format!("session {sub} failed: {err}").into());
+    }
+    println!("{}", serde_json::to_string_pretty(&v["result"])?);
     Ok(())
 }
 
@@ -3292,6 +3363,7 @@ async fn main() -> Result<(), BoxError> {
         Some("containers") => return containers_cmd(&raw_args[2..]),
         Some("submit") => return submit_cmd(&raw_args[2..]).await,
         Some("task") => return task_cmd(&raw_args[2..]).await,
+        Some("session") => return session_cmd(&raw_args[2..]).await,
         Some("init") => return init_cmd(&raw_args[2..]),
         Some("help") | Some("--help") | Some("-h") => {
             println!("{TOP_USAGE}");
@@ -3303,7 +3375,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         Some(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | models | implement | merge | containers | submit | task | init | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | models | implement | merge | containers | submit | task | session | init | help)"
             )
             .into());
         }
