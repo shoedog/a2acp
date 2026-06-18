@@ -1127,7 +1127,7 @@ fn spawn_local_producer(
     tokio::spawn(async move {
         // Hold the guard for the whole producer; dropped on every return path below.
         let _guard = guard;
-        let _warm = warm;
+        let warm = warm;
 
         let translator = Translator::new();
         let mut events = translator.run(
@@ -1161,6 +1161,15 @@ fn spawn_local_producer(
                     return;
                 }
             };
+            // Slice 2: usage is telemetry — record it on the warm handle, never forward to SSE.
+            if let Ok(e) = &ev {
+                if e.kind() == &EventKind::Usage {
+                    if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
+                        w.sm.record_usage(&w.ctx, snap.clone()).await;
+                    }
+                    continue;
+                }
+            }
             // Track whether the stream ended with an error.
             if ev.is_err() {
                 errored = true;
@@ -1379,7 +1388,7 @@ fn local_kiro_source(
             // emit a terminal Canceled on a cancelled local Done (used by the
             // local-only producer); swallow it here so it doesn't leak into the
             // merge as a labeled mid-stream terminal.
-            if matches!(&ev, Ok(e) if e.kind() == &EventKind::Terminal) {
+            if matches!(&ev, Ok(e) if e.kind() == &EventKind::Terminal || e.kind() == &EventKind::Usage) {
                 continue;
             }
             yield ev;
@@ -2314,19 +2323,29 @@ async fn unary_message(
             // Held until this arm returns; its Drop evicts the binding/lease/stash
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
-            let _warm = dispatch.warm_guard;
+            let warm = dispatch.warm_guard;
             let translator = Translator::new();
-            translator
-                .run(
-                    dispatch.backend.as_ref(),
-                    srv.store.as_ref(),
-                    srv.policy.as_ref(),
-                    &routed.task,
-                    &dispatch.session,
-                    routed.parts,
-                )
-                .collect()
-                .await
+            let mut events = translator.run(
+                dispatch.backend.as_ref(),
+                srv.store.as_ref(),
+                srv.policy.as_ref(),
+                &routed.task,
+                &dispatch.session,
+                routed.parts,
+            );
+            let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
+            while let Some(ev) = events.next().await {
+                if let Ok(e) = &ev {
+                    if e.kind() == &EventKind::Usage {
+                        if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
+                            w.sm.record_usage(&w.ctx, snap.clone()).await;
+                        }
+                        continue; // exclude usage from the unary output
+                    }
+                }
+                collected.push(ev);
+            }
+            collected
         }
         RouteTarget::Delegate => {
             match srv
@@ -3284,6 +3303,7 @@ mod tests {
     };
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, CallerId};
+    use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::*;
     use bridge_core::ports::{Delegation, DelegationPort, DelegationStream};
     use bridge_core::translator::Event;
@@ -4862,6 +4882,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_kiro_source_drops_usage_events() {
+        let source = local_kiro_source(
+            "kiro".into(),
+            Arc::new(UsageThenTextBackend),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            TaskId::parse("task-usage").unwrap(),
+            SessionId::parse("session-usage").unwrap(),
+            vec![Part { text: "go".into() }],
+        );
+
+        let out: Vec<Result<Event, BridgeError>> = source.stream.collect().await;
+        // Usage is swallowed before the fan-out merge; the translator still emits its
+        // Status flush + final Artifact for the text, so NO Usage event may survive.
+        assert!(
+            out.iter()
+                .all(|r| r.as_ref().map_or(true, |e| e.kind() != &EventKind::Usage)),
+            "no Usage event may survive the fan-out source",
+        );
+        let artifact = out
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .expect("artifact present");
+        assert_eq!(artifact.text(), "ok");
+    }
+
+    #[tokio::test]
     async fn fanout_streaming_merges_both_sources_with_terminal() {
         // FakeBackend yields Text("KIRO") + Done -> kiro artifact "KIRO".
         // FakeDelegation yields status("work") + artifact("PEER") -> peer artifact.
@@ -5712,6 +5760,35 @@ mod tests {
         }
     }
 
+    struct UsageThenTextBackend;
+
+    #[async_trait::async_trait]
+    impl AgentBackend for UsageThenTextBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates = vec![
+                Ok(Update::Usage(UsageSnapshot {
+                    used: Some(123),
+                    size: Some(1000),
+                    cost: None,
+                    at_ms: 0,
+                })),
+                Ok(Update::Text("ok".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
     /// A route that honors `meta.agent` (resolving to `Local(agent)`), falling back
     /// to the registry default — mirrors the real binary `SkillRoute` for the local
     /// arm so the registry-resolution path is exercised by agent id.
@@ -6055,6 +6132,165 @@ mod tests {
                 .as_str(),
             "ctx-c1-g0"
         );
+    }
+
+    #[tokio::test]
+    async fn warm_streaming_records_usage_without_emitting_usage_frame() {
+        let backend: Arc<dyn AgentBackend> = Arc::new(UsageThenTextBackend);
+        let registry = FakeRegistry::with_entries("a", vec![(bare_entry("a"), backend)]);
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry_for_sm: Arc<dyn AgentRegistry> = registry.clone();
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_for_sm,
+            std::time::Duration::from_secs(60),
+        ));
+        let registry_for_srv: Arc<dyn AgentRegistry> = registry;
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_for_srv,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm.clone()),
+        );
+        let ctx = ContextId::parse("c1").unwrap();
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({
+                    "message": {
+                        "contextId": "c1",
+                        "text": "go",
+                        "metadata": { "a2a-bridge.agent": "a" }
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        let mut usage = None;
+        for _ in 0..50 {
+            usage = sm.status(&ctx).await.map(|s| s.usage);
+            if usage.as_ref().and_then(|u| u.used) == Some(123) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let usage = usage.expect("warm handle should still exist after turn");
+        assert_eq!(usage.used, Some(123));
+        assert_eq!(usage.size, Some(1000));
+
+        let payloads = sse_data_payloads(&body);
+        // The normal Slice-1 frame sequence is UNCHANGED (DoD-5): the translator's Status flush
+        // ("ok") + the final Artifact ("ok") + the terminal Completed. Usage adds NO frame.
+        assert_eq!(
+            payloads.len(),
+            3,
+            "usage telemetry must not add an SSE frame: {body}"
+        );
+        assert!(
+            !body.contains("123") && !body.contains("1000"),
+            "usage telemetry must not be present on the wire: {body}"
+        );
+        // The artifact frame carries the agent text; usage never appears as its own frame.
+        let artifact = payloads
+            .iter()
+            .find_map(
+                |p| match serde_json::from_str::<a2a::StreamResponse>(p).unwrap() {
+                    a2a::StreamResponse::ArtifactUpdate(e) => Some(e),
+                    _ => None,
+                },
+            )
+            .expect("an artifact frame must be present");
+        let data = serde_json::to_value(&artifact.artifact).unwrap();
+        assert_eq!(data["parts"][0]["text"], "ok");
+        let terminal: a2a::StreamResponse = serde_json::from_str(payloads.last().unwrap()).unwrap();
+        assert!(
+            matches!(
+                terminal,
+                a2a::StreamResponse::StatusUpdate(e)
+                    if e.status.state == a2a::TaskState::Completed
+            ),
+            "last payload must be terminal Completed: {}",
+            payloads.last().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_unary_records_usage_without_emitting_usage_on_wire() {
+        // The unary (collect) recording path: a warm SEND_MESSAGE turn whose backend emits
+        // Update::Usage records it on the handle, the artifact is the agent text, and usage
+        // never appears in the unary response (DoD-5).
+        let backend: Arc<dyn AgentBackend> = Arc::new(UsageThenTextBackend);
+        let registry = FakeRegistry::with_entries("a", vec![(bare_entry("a"), backend)]);
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry_for_sm: Arc<dyn AgentRegistry> = registry.clone();
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_for_sm,
+            std::time::Duration::from_secs(60),
+        ));
+        let registry_for_srv: Arc<dyn AgentRegistry> = registry;
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_for_srv,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm.clone()),
+        );
+        let ctx = ContextId::parse("c-unary").unwrap();
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "message": {
+                        "contextId": "c-unary",
+                        "text": "go",
+                        "metadata": { "a2a-bridge.agent": "a" }
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"]["artifact"]["text"], "ok",
+            "unary artifact must be the agent text, usage excluded: {body}"
+        );
+        assert!(
+            !body.contains("123") && !body.contains("1000"),
+            "usage telemetry must not be present on the unary wire: {body}"
+        );
+        // The unary loop records usage synchronously before the response is built.
+        let usage = sm
+            .status(&ctx)
+            .await
+            .expect("warm handle should still exist after the turn")
+            .usage;
+        assert_eq!(usage.used, Some(123));
+        assert_eq!(usage.size, Some(1000));
     }
 
     #[tokio::test]
