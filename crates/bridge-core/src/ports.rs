@@ -414,13 +414,16 @@ mod tests {
             .await;
         f.release_session(&crate::ids::SessionId::parse("s").unwrap())
             .await;
-        let _ = f
-            .reconcile_config(
+        assert_eq!(
+            f.reconcile_config(
                 &crate::ids::SessionId::parse("s").unwrap(),
                 &crate::domain::SessionSpec::from_config(Default::default()),
             )
-            .await;
-        let _ = f.capabilities();
+            .await
+            .unwrap(),
+            crate::orch::ReconcileOutcome::NotAdvertised,
+        );
+        assert_eq!(f.capabilities(), crate::orch::AgentSessionCaps::default());
         f.retire().await.unwrap();
         let _obj: std::sync::Arc<dyn AgentBackend> = std::sync::Arc::new(Fake); // object-safe
     }
