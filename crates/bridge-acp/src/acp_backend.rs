@@ -672,6 +672,22 @@ impl AcpBackend {
             err => ApplyConfigError::Rejected(err),
         })?;
 
+        // PF-9: a WARM reconcile must apply the requested model EXACTLY. `configure_model_option`
+        // can return Ok with a stale/unchanged `current` (e.g. empty refreshed opts) — at Warm
+        // that is NOT an exact apply, so fail rather than let the fingerprint advance to a model
+        // the live session may not be using. (Mint keeps today's lenient behavior.)
+        if matches!(purpose, ApplyPurpose::Warm) {
+            if let Some(want) = model {
+                if model_current != want {
+                    return Err(ApplyConfigError::NotAdvertised(BridgeError::config_invalid(
+                        format!(
+                            "warm reconcile: model not applied exactly (requested {want}, current {model_current})"
+                        ),
+                    )));
+                }
+            }
+        }
+
         let mut refreshed_models = surface.models.clone();
         if model.is_some() && model_values(&surface.opts).is_none() {
             if let Some(state) = refreshed_models.as_ref() {
@@ -1944,7 +1960,14 @@ impl AgentBackend for AcpBackend {
             return Ok(ReconcileOutcome::Applied);
         }
 
-        let aid = self.ensure_session(session).await?;
+        // Already minted (checked above): read the live id DIRECTLY from this entry — do NOT call
+        // `ensure_session` (it re-fetches the map by key, racing `release_session`, and re-runs the
+        // `minted_cwd` immutability guard). We only reconcile model/effort on the live session.
+        let aid = entry
+            .agent_id
+            .get()
+            .cloned()
+            .ok_or_else(|| BridgeError::agent_crashed("warm reconcile: agent session vanished"))?;
         let _g = Arc::clone(&entry.turn_lock).lock_owned().await;
         let surface = entry
             .config_surface
