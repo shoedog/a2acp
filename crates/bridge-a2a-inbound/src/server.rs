@@ -38,7 +38,7 @@ use bridge_core::domain::{
     PeerTaskId, RouteTarget, SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
-use bridge_core::ids::{AgentId, SessionId, TaskId};
+use bridge_core::ids::{AgentId, ContextId, SessionId, TaskId};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
     RouteDecision, SessionStore,
@@ -338,6 +338,13 @@ impl InboundServer {
         let task_meta = task_meta_from_params(params)?;
         let target = self.route.route(&task_meta)?;
 
+        let context_id = context_id_from_params(params)?;
+        if context_id.is_some() && !matches!(target, RouteTarget::Local(_)) {
+            return Err(BridgeError::InvalidRequest {
+                field: "contextId is only supported on the local route in Slice 0",
+            });
+        }
+
         // 3b. Parse + validate the per-request cwd (a2a-bridge.cwd).  Validation
         //     must happen BEFORE task/session ids are derived so a malformed request
         //     is rejected before any state is created.
@@ -356,6 +363,7 @@ impl InboundServer {
             // Per-request overrides ride along so LOCAL dispatch can compute the
             // effective config (entry defaults layered with these) before the prompt.
             overrides: task_meta.overrides,
+            context_id,
             session_cwd,
         })
     }
@@ -395,6 +403,9 @@ struct RoutedCall {
     /// [`effective_config`] before `configure_session`. The selected `AgentId`
     /// itself is carried by `target` (`RouteTarget::Local(id)`).
     overrides: Option<AgentOverride>,
+    /// A2A contextId for warm continuation (Slice 0). Honored only on the Local route. None = legacy.
+    #[allow(dead_code)]
+    context_id: Option<ContextId>,
     /// Per-request working directory parsed from `a2a-bridge.cwd`.
     /// Distinct from `AgentOverride` so it reaches both single-agent and workflow
     /// dispatch (AgentOverride is dropped for workflows). `None` when absent.
@@ -2868,7 +2879,8 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// or a nested `message.taskId`. Falls back to a generated id for fresh sends.
 fn task_id_from_params(params: &Value) -> Result<TaskId, BridgeError> {
     let candidate = params
-        .get("taskId")
+        .get("id")
+        .or_else(|| params.get("taskId"))
         .or_else(|| params.get("task_id"))
         .or_else(|| params.get("message").and_then(|m| m.get("taskId")))
         .and_then(|v| v.as_str());
@@ -2876,6 +2888,27 @@ fn task_id_from_params(params: &Value) -> Result<TaskId, BridgeError> {
         Some(s) if !s.is_empty() => TaskId::parse(s),
         // Fresh SendMessage with no task id: synthesize a stable stub id.
         _ => TaskId::parse("task-1"),
+    }
+}
+
+/// A2A contextId: `message.contextId` (camelCase) → top-level `contextId` → `a2a-bridge.context`
+/// metadata fallback. `None` if absent; empty → error.
+fn context_id_from_params(params: &Value) -> Result<Option<ContextId>, BridgeError> {
+    let raw = params
+        .get("message")
+        .and_then(|m| m.get("contextId"))
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("contextId").and_then(|v| v.as_str()))
+        .or_else(|| {
+            params
+                .get("message")
+                .and_then(|m| m.get("metadata"))
+                .and_then(|md| md.get("a2a-bridge.context"))
+                .and_then(|v| v.as_str())
+        });
+    match raw {
+        Some(s) => Ok(Some(ContextId::parse(s)?)),
+        None => Ok(None),
     }
 }
 
@@ -3907,6 +3940,52 @@ mod tests {
     fn no_skill_metadata_is_none() {
         let p = serde_json::json!({"message":{"text":"hi"}});
         assert_eq!(task_meta_from_params(&p).unwrap().skill, None);
+    }
+
+    #[test]
+    fn context_id_parsed_from_field_and_metadata() {
+        let v = serde_json::json!({ "message": { "contextId": "c-1", "text": "hi" } });
+        assert_eq!(context_id_from_params(&v).unwrap().unwrap().as_str(), "c-1");
+        let v2 = serde_json::json!({ "message": { "metadata": { "a2a-bridge.context": "c-2" }, "text": "hi" } });
+        assert_eq!(
+            context_id_from_params(&v2).unwrap().unwrap().as_str(),
+            "c-2"
+        );
+        assert!(
+            context_id_from_params(&serde_json::json!({ "message": { "text": "hi" } }))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn task_id_accepts_standard_id_field() {
+        let v = serde_json::json!({ "id": "t-9", "message": { "text": "hi" } });
+        assert_eq!(task_id_from_params(&v).unwrap().as_str(), "t-9");
+    }
+
+    #[test]
+    fn context_id_rejected_on_delegate_route() {
+        let srv = build_delegate(
+            FakeBackend::new(),
+            Arc::new(FakeStore::default()),
+            Arc::new(NoDelegation),
+        );
+        let params = serde_json::json!({
+            "message": {
+                "contextId": "c-1",
+                "text": "hi",
+                "metadata": { "a2a-bridge.skill": "delegate" }
+            }
+        });
+
+        match srv.gate(&HeaderMap::new(), &params) {
+            Err(BridgeError::InvalidRequest {
+                field: "contextId is only supported on the local route in Slice 0",
+            }) => {}
+            Err(other) => panic!("expected contextId Local-only rejection, got: {other:?}"),
+            Ok(_) => panic!("expected contextId Local-only rejection, got Ok"),
+        }
     }
 
     // ---- Task 9: task_meta_from_params reads agent + overrides ----
