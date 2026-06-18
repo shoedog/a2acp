@@ -211,6 +211,9 @@ type UpdateRegistry = Arc<StdMutex<HashMap<AgentSessionId, UpdateSender>>>;
 enum TurnEvent {
     /// A streamed chunk of the agent's textual response.
     Text(String),
+    /// A streamed context-window usage snapshot (ACP `usage_update`). Non-terminal,
+    /// routed exactly like `Text`. [Slice 2]
+    Usage(bridge_core::orch::UsageSnapshot),
     /// The terminal turn result. Pushed by the driver after the `PromptResponse`
     /// arrives, carrying the mapped `Update::Done`. Always the last event on a
     /// turn that the agent COMPLETED (incl. a real `StopReason::Cancelled`).
@@ -970,12 +973,17 @@ impl AcpBackend {
                             // via the SAME pure helper the corpus replay tests drive,
                             // so a captured real-agent frame exercises this exact path.
                             let session_id = notif.session_id.clone();
-                            if let Some(Update::Text(text)) = Self::map_session_update(notif) {
+                            let te = match Self::map_session_update(notif) {
+                                Some(Update::Text(text)) => Some(TurnEvent::Text(text)),
+                                Some(Update::Usage(snap)) => Some(TurnEvent::Usage(snap)),
+                                _ => None, // unmodeled / non-text (tolerant reader)
+                            };
+                            if let Some(te) = te {
                                 // Plain get + non-blocking send under a
                                 // std::Mutex: no await is held across the lock.
                                 if let Ok(map) = updates.lock() {
                                     if let Some(tx) = map.get(&session_id) {
-                                        let _ = tx.send(TurnEvent::Text(text));
+                                        let _ = tx.send(te);
                                     }
                                 }
                             }
@@ -1854,6 +1862,7 @@ impl AgentBackend for AcpBackend {
             }
             match rx.recv().await {
                 Some(TurnEvent::Text(t)) => Some((Ok(Update::Text(t)), (rx, false))),
+                Some(TurnEvent::Usage(snap)) => Some((Ok(Update::Usage(snap)), (rx, false))),
                 Some(TurnEvent::Done(u)) => Some((Ok(u), (rx, true))),
                 // Terminal failure: yield the Err as the final stream item, then
                 // end. Downstream re-yields the Err → producer marks `errored` →
@@ -2456,6 +2465,8 @@ mod tests {
         Thought(&'static str),
         /// `session/update` with an empty `plan` (unmodeled → dropped).
         Plan,
+        /// `session/update` with a context-window `usage_update`.
+        Usage(u64, u64),
     }
 
     #[derive(Clone)]
@@ -2997,6 +3008,13 @@ mod tests {
                                             ScriptedUpdate::Plan => SessionUpdate::Plan(
                                                 agent_client_protocol::schema::Plan::new(vec![]),
                                             ),
+                                            ScriptedUpdate::Usage(used, size) => {
+                                                SessionUpdate::UsageUpdate(
+                                                    agent_client_protocol::schema::UsageUpdate::new(
+                                                        used, size,
+                                                    ),
+                                                )
+                                            }
                                         };
                                         cx2.send_notification(SessionNotification::new(
                                             sid.clone(),
@@ -3451,6 +3469,35 @@ mod tests {
             matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none(), "stream terminates after Done");
+    }
+
+    #[tokio::test]
+    async fn usage_update_reaches_prompt_stream() {
+        let rec = Recorder::new("agent-sess-USAGE");
+        rec.set_updates(vec![
+            ScriptedUpdate::Usage(100, 1000),
+            ScriptedUpdate::Text("hi"),
+        ])
+        .await;
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-USAGE");
+
+        let mut stream = be.prompt(&key, vec![]).await.unwrap();
+        let mut items = Vec::new();
+        while let Some(it) = stream.next().await {
+            items.push(it);
+        }
+
+        let usage_pos = items
+            .iter()
+            .position(|it| matches!(it, Ok(Update::Usage(s)) if s.used == Some(100)));
+        let done_pos = items
+            .iter()
+            .position(|it| matches!(it, Ok(Update::Done { .. })));
+        assert!(
+            matches!(usage_pos.zip(done_pos), Some((u, d)) if u < d),
+            "usage must traverse TurnEvent -> unfold -> BackendStream before Done"
+        );
     }
 
     #[tokio::test]
