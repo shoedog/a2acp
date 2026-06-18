@@ -1813,6 +1813,18 @@ impl AgentBackend for AcpBackend {
         }
     }
 
+    /// Release a warm ACP session: best-effort cancel any in-flight turn, drop the
+    /// agent-side `AgentSession` (a later reuse re-mints a fresh `session/new`), and drop
+    /// the config stash. Does NOT `retire()` the shared process (warm for serve's lifetime,
+    /// shared across sessions). [Slice 0]
+    async fn release_session(&self, session: &SessionId) {
+        let _ = self.cancel(session).await;
+        self.sessions.lock().await.remove(session);
+        if let Ok(mut m) = self.session_cfg.lock() {
+            m.remove(session);
+        }
+    }
+
     /// Graceful async teardown of the agent process (Increment 3b §5.4). IDEMPOTENT
     /// by construction: TAKE the `Supervised` child out of the shared slot (exactly
     /// once — a concurrent/second caller sees `None`) and SIGTERM→SIGKILL it. Both
@@ -4634,6 +4646,26 @@ mod tests {
         assert!(
             !modes.contains(&"doomed-mode".to_string()),
             "the forgotten stash entry must NOT drive set_mode, got {modes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_session_removes_both_sessions_and_cfg_entries() {
+        let rec = Recorder::new("agent-sess-RELEASE");
+        let be = connect_recording(rec).await;
+        let s = SessionId::parse("ctx-x-g0").unwrap();
+        be.configure_session(&s, &SessionSpec::from_config(Default::default()))
+            .await
+            .unwrap();
+        let _ = be.session_entry(&s).await;
+        be.release_session(&s).await;
+        assert!(
+            be.session_cfg.lock().unwrap().get(&s).is_none(),
+            "cfg stash removed"
+        );
+        assert!(
+            be.sessions.lock().await.get(&s).is_none(),
+            "agent session removed"
         );
     }
 
