@@ -111,7 +111,13 @@ mod tests {
 
     #[test]
     fn agent_session_caps_roundtrips() {
-        let c = AgentSessionCaps { load_session: true, resume: true, close: false, list: true, delete: false };
+        let c = AgentSessionCaps {
+            load_session: true,
+            resume: true,
+            close: false,
+            list: true,
+            delete: false,
+        };
         let j = serde_json::to_value(&c).unwrap();
         assert_eq!(j["load_session"], true);
         assert_eq!(j["close"], false);
