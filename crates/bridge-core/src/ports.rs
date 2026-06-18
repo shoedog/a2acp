@@ -133,7 +133,13 @@ pub trait AuthMiddleware: Send + Sync {
 // ─── Registry / config-source ports (Increment 3b §4.5) ──────────────────────
 
 /// Lease guard: while held, a registry slot's active-task count is incremented; decremented on drop. [§4.5]
-pub trait Lease: Send + Sync {}
+pub trait Lease: Send + Sync {
+    /// True once the slot this lease belongs to has been retired/replaced (config reload).
+    /// A warm SessionManager checks this to expire a handle. Default `false`. [Slice 0]
+    fn is_retired(&self) -> bool {
+        false
+    }
+}
 
 /// Result of resolving an agent: its entry config, the (lazily-spawned) backend, and a lease keeping the slot alive.
 pub struct Resolved {

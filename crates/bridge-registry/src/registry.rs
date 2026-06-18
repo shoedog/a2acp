@@ -32,7 +32,7 @@ pub(crate) const DEFAULT_RETIRE_GRACE: Duration = Duration::from_secs(30);
 pub(crate) struct Slot {
     pub entry: ArcSwap<AgentEntry>,
     pub backend: OnceCell<Arc<dyn AgentBackend>>,
-    pub retired: AtomicBool,
+    pub retired: Arc<AtomicBool>,
     pub leases: Arc<AtomicUsize>,
     /// Notified on every lease drop so the detached retirement task wakes the
     /// instant `leases` reaches zero (no sleep-polling).
@@ -44,7 +44,7 @@ impl Slot {
         Arc::new(Self {
             entry: ArcSwap::from_pointee(entry),
             backend: OnceCell::new(),
-            retired: AtomicBool::new(false),
+            retired: Arc::new(AtomicBool::new(false)),
             leases: Arc::new(AtomicUsize::new(0)),
             lease_notify: Arc::new(Notify::new()),
         })
@@ -63,11 +63,16 @@ pub(crate) struct State {
 struct LeaseGuard {
     count: Arc<AtomicUsize>,
     notify: Arc<Notify>,
+    retired: Arc<AtomicBool>,
 }
 impl LeaseGuard {
-    fn new(count: Arc<AtomicUsize>, notify: Arc<Notify>) -> Self {
+    fn new(count: Arc<AtomicUsize>, notify: Arc<Notify>, retired: Arc<AtomicBool>) -> Self {
         count.fetch_add(1, SeqCst);
-        Self { count, notify }
+        Self {
+            count,
+            notify,
+            retired,
+        }
     }
 }
 impl Drop for LeaseGuard {
@@ -77,7 +82,11 @@ impl Drop for LeaseGuard {
         self.notify.notify_waiters();
     }
 }
-impl Lease for LeaseGuard {}
+impl Lease for LeaseGuard {
+    fn is_retired(&self) -> bool {
+        self.retired.load(SeqCst)
+    }
+}
 
 /// Runtime-mutable agent registry: lazy-spawns backends and hands out leases.
 pub struct Registry {
@@ -305,7 +314,11 @@ impl AgentRegistry for Registry {
             // CRUX: take the lease (fetch_add) BEFORE checking `retired`. This closes
             // the window where a concurrent retirement could observe leases==0 between
             // our retired-check and our increment, and drain the backend out from under us.
-            let lease = LeaseGuard::new(slot.leases.clone(), slot.lease_notify.clone());
+            let lease = LeaseGuard::new(
+                slot.leases.clone(),
+                slot.lease_notify.clone(),
+                slot.retired.clone(),
+            );
             if slot.retired.load(SeqCst) {
                 // Lost the spawn/retire race: give the lease back so retirement can
                 // drain, retire our (possibly freshly-spawned) backend, then re-resolve
@@ -845,6 +858,33 @@ mod tests {
         assert_eq!(reg.lease_count(&a), 1, "lease incremented while held");
         drop(resolved);
         assert_eq!(reg.lease_count(&a), 0, "lease decremented on drop");
+    }
+
+    #[tokio::test]
+    async fn lease_reports_retired_after_slot_removed() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            snapshot(&["a", "b"]),
+            counting_spawn_recording(count, 0, retired.clone()),
+        )
+        .unwrap();
+        let a = AgentId::parse("a").unwrap();
+
+        let resolved = reg.resolve(&a).await.unwrap();
+        assert!(
+            !resolved.lease.is_retired(),
+            "lease should start live before removal"
+        );
+
+        reg.apply(snapshot(&["b"])).await.unwrap();
+
+        assert!(
+            resolved.lease.is_retired(),
+            "lease should report retired after slot removal"
+        );
+        drop(resolved);
+        await_retired(&retired, 1).await;
     }
 
     #[tokio::test]
