@@ -6,6 +6,7 @@ use bridge_core::error::BridgeError;
 use bridge_core::ids::{
     AgentId, ContextId, OperationId, SessionGeneration, SessionHandleId, SessionId,
 };
+use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
 use bridge_core::ports::{AgentBackend, AgentRegistry, Lease};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::session_fingerprint::SessionSpecFingerprint;
@@ -26,6 +27,7 @@ struct WarmHandle {
     agent: AgentId,
     backend: Arc<dyn AgentBackend>,
     backend_session: SessionId,
+    caps: AgentSessionCaps,
     generation: SessionGeneration,
     fingerprint: SessionSpecFingerprint,
     lease: Box<dyn Lease>,
@@ -47,6 +49,7 @@ pub struct SessionStatusInfo {
     pub agent: String,
     pub generation: u64,
     pub idle_age_ms: u128,
+    pub capabilities: AgentSessionCaps,
 }
 
 pub struct SessionManager {
@@ -102,16 +105,93 @@ impl SessionManager {
                 config: eff,
                 cwd: cwd.as_ref().map(|c| c.as_str().to_string()),
             };
-            if let Some(field) = h.fingerprint.first_mismatch(&fp) {
-                return Err(BridgeError::ConfigMismatch { field });
+            let d = h.fingerprint.diff(&fp);
+            if d.is_empty() {
+                h.state = SessionState::Running;
+                h.op = Some(op);
+                h.last_used = (self.now)();
+                return Ok(WarmTurn {
+                    backend: h.backend.clone(),
+                    session: h.backend_session.clone(),
+                });
             }
+            if d.contains(&"agent") {
+                return Err(BridgeError::ConfigMismatch { field: "agent" });
+            }
+            if d.contains(&"cwd") {
+                return Err(BridgeError::ConfigMismatch { field: "cwd" });
+            }
+            if d.contains(&"mode") {
+                return Err(BridgeError::ConfigReseedRequired { field: "mode" });
+            }
+            if d.contains(&"model") && fp.config.model.is_none() {
+                return Err(BridgeError::ConfigReseedRequired { field: "model" });
+            }
+            if d.contains(&"effort") && fp.config.effort.is_none() {
+                return Err(BridgeError::ConfigReseedRequired { field: "effort" });
+            }
+            let reseed_field = if d.contains(&"model") {
+                "model"
+            } else {
+                "effort"
+            };
+            let claimed_id = h.id.clone();
+            let backend = h.backend.clone();
+            let backend_session = h.backend_session.clone();
             h.state = SessionState::Running;
-            h.op = Some(op);
+            h.op = Some(op.clone());
             h.last_used = (self.now)();
-            return Ok(WarmTurn {
-                backend: h.backend.clone(),
-                session: h.backend_session.clone(),
-            });
+            drop(tab);
+
+            let outcome = backend
+                .reconcile_config(
+                    &backend_session,
+                    &SessionSpec {
+                        config: fp.config.clone(),
+                        cwd: cwd.clone(),
+                    },
+                )
+                .await;
+            let mut tab = self.by_context.lock().await;
+            return match outcome {
+                Ok(ReconcileOutcome::Applied) => {
+                    let Some(current) = tab.get_mut(ctx) else {
+                        return Err(BridgeError::SessionExpired);
+                    };
+                    if current.id != claimed_id {
+                        return Err(BridgeError::SessionExpired);
+                    }
+                    if current.state != SessionState::Running {
+                        let h = tab.remove(ctx).expect("checked current handle exists");
+                        let backend = h.backend.clone();
+                        let backend_session = h.backend_session.clone();
+                        drop(tab);
+                        backend.release_session(&backend_session).await;
+                        drop(h.lease);
+                        return Err(BridgeError::SessionExpired);
+                    }
+                    current.fingerprint = fp;
+                    current.op = Some(op);
+                    current.last_used = (self.now)();
+                    Ok(WarmTurn {
+                        backend: current.backend.clone(),
+                        session: current.backend_session.clone(),
+                    })
+                }
+                Ok(ReconcileOutcome::NotAdvertised) | Ok(ReconcileOutcome::Rejected) | Err(_) => {
+                    if tab.get(ctx).is_some_and(|h| h.id == claimed_id) {
+                        let h = tab.remove(ctx).expect("checked current handle exists");
+                        let backend = h.backend.clone();
+                        let backend_session = h.backend_session.clone();
+                        drop(tab);
+                        backend.release_session(&backend_session).await;
+                        drop(h.lease);
+                    }
+                    Err(BridgeError::ConfigReseedRequired {
+                        field: reseed_field,
+                    })
+                }
+            };
         }
 
         let resolved = self.registry.resolve(&agent).await?;
@@ -128,6 +208,7 @@ impl SessionManager {
             .backend
             .configure_session(&backend_session, &SessionSpec { config: eff, cwd })
             .await?;
+        let caps = resolved.backend.capabilities();
         let turn = WarmTurn {
             backend: resolved.backend.clone(),
             session: backend_session.clone(),
@@ -139,6 +220,7 @@ impl SessionManager {
                 agent,
                 backend: resolved.backend,
                 backend_session,
+                caps,
                 generation: SessionGeneration::new(0),
                 fingerprint: fp,
                 lease: resolved.lease,
@@ -169,6 +251,7 @@ impl SessionManager {
             agent: h.agent.as_str().to_string(),
             generation: h.generation.get(),
             idle_age_ms: (self.now)().duration_since(h.last_used).as_millis(),
+            capabilities: h.caps.clone(),
         })
     }
 
@@ -217,10 +300,11 @@ impl SessionManager {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
+    use bridge_core::domain::{AgentEntry, AgentKind, Effort, Part, RegistrySnapshot};
     use bridge_core::ports::{BackendStream, Resolved, Update};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
+    use tokio::sync::{oneshot, Notify};
 
     struct NoopLease;
     impl Lease for NoopLease {}
@@ -242,6 +326,12 @@ mod tests {
         releases: StdMutex<Vec<String>>,
         cancels: StdMutex<Vec<String>>,
         configured: StdMutex<Vec<String>>,
+        reconciled: StdMutex<Vec<(String, SessionSpec)>>,
+        reconcile_result: StdMutex<Result<ReconcileOutcome, BridgeError>>,
+        reconcile_gate: StdMutex<Option<oneshot::Receiver<()>>>,
+        reconcile_started: Notify,
+        reconcile_started_count: AtomicUsize,
+        capabilities: AgentSessionCaps,
     }
 
     impl FakeBackend {
@@ -251,11 +341,48 @@ mod tests {
                 releases: StdMutex::new(Vec::new()),
                 cancels: StdMutex::new(Vec::new()),
                 configured: StdMutex::new(Vec::new()),
+                reconciled: StdMutex::new(Vec::new()),
+                reconcile_result: StdMutex::new(Ok(ReconcileOutcome::Applied)),
+                reconcile_gate: StdMutex::new(None),
+                reconcile_started: Notify::new(),
+                reconcile_started_count: AtomicUsize::new(0),
+                capabilities: AgentSessionCaps::default(),
+            }
+        }
+
+        fn with_capabilities(reply: impl Into<String>, capabilities: AgentSessionCaps) -> Self {
+            Self {
+                capabilities,
+                ..Self::new(reply)
             }
         }
 
         fn releases(&self) -> Vec<String> {
             self.releases.lock().unwrap().clone()
+        }
+
+        fn configured(&self) -> Vec<String> {
+            self.configured.lock().unwrap().clone()
+        }
+
+        fn reconciled(&self) -> Vec<(String, SessionSpec)> {
+            self.reconciled.lock().unwrap().clone()
+        }
+
+        fn set_reconcile_result(&self, result: Result<ReconcileOutcome, BridgeError>) {
+            *self.reconcile_result.lock().unwrap() = result;
+        }
+
+        fn block_next_reconcile(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.reconcile_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        async fn wait_for_reconcile(&self) {
+            while self.reconcile_started_count.load(Ordering::SeqCst) == 0 {
+                self.reconcile_started.notified().await;
+            }
         }
     }
 
@@ -292,17 +419,39 @@ mod tests {
             Ok(())
         }
 
+        async fn reconcile_config(
+            &self,
+            session: &SessionId,
+            spec: &SessionSpec,
+        ) -> Result<ReconcileOutcome, BridgeError> {
+            self.reconciled
+                .lock()
+                .unwrap()
+                .push((session.as_str().to_string(), spec.clone()));
+            let gate = self.reconcile_gate.lock().unwrap().take();
+            self.reconcile_started_count.fetch_add(1, Ordering::SeqCst);
+            self.reconcile_started.notify_waiters();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            self.reconcile_result.lock().unwrap().clone()
+        }
+
         async fn release_session(&self, session: &SessionId) {
             self.releases
                 .lock()
                 .unwrap()
                 .push(session.as_str().to_string());
         }
+
+        fn capabilities(&self) -> AgentSessionCaps {
+            self.capabilities.clone()
+        }
     }
 
     /// Registry resolving a fixed agent entry and a shared recording backend.
     struct FakeRegistry {
-        entry: AgentEntry,
+        entries: Vec<AgentEntry>,
         backend: Arc<FakeBackend>,
         retired: Arc<AtomicBool>,
     }
@@ -310,7 +459,15 @@ mod tests {
     impl FakeRegistry {
         fn new(entry: AgentEntry, backend: Arc<FakeBackend>) -> Self {
             Self {
-                entry,
+                entries: vec![entry],
+                backend,
+                retired: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn with_entries(entries: Vec<AgentEntry>, backend: Arc<FakeBackend>) -> Self {
+            Self {
+                entries,
                 backend,
                 retired: Arc::new(AtomicBool::new(false)),
             }
@@ -324,13 +481,13 @@ mod tests {
     #[async_trait]
     impl AgentRegistry for FakeRegistry {
         async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
-            if self.entry.id != *id {
+            let Some(entry) = self.entries.iter().find(|entry| entry.id == *id) else {
                 return Err(BridgeError::UnknownAgent {
                     id: id.as_str().into(),
                 });
-            }
+            };
             Ok(Resolved {
-                entry: Arc::new(self.entry.clone()),
+                entry: Arc::new(entry.clone()),
                 backend: self.backend.clone(),
                 lease: Box::new(RetiringLease {
                     retired: self.retired.clone(),
@@ -339,7 +496,7 @@ mod tests {
         }
 
         fn default_id(&self) -> AgentId {
-            self.entry.id.clone()
+            self.entries[0].id.clone()
         }
 
         async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
@@ -347,7 +504,7 @@ mod tests {
         }
 
         fn list(&self) -> Vec<AgentId> {
-            vec![self.entry.id.clone()]
+            self.entries.iter().map(|entry| entry.id.clone()).collect()
         }
     }
 
@@ -397,6 +554,31 @@ mod tests {
 
     fn op(id: &str) -> OperationId {
         OperationId::parse(id).unwrap()
+    }
+
+    fn model_override(model: &str) -> AgentOverride {
+        AgentOverride {
+            model: Some(model.into()),
+            ..Default::default()
+        }
+    }
+
+    fn effort_override(effort: Effort) -> AgentOverride {
+        AgentOverride {
+            effort: Some(effort),
+            ..Default::default()
+        }
+    }
+
+    fn mode_override(mode: &str) -> AgentOverride {
+        AgentOverride {
+            mode: Some(mode.into()),
+            ..Default::default()
+        }
+    }
+
+    fn cwd(path: &str) -> Option<SessionCwd> {
+        Some(SessionCwd::parse(path).unwrap())
     }
 
     #[derive(Clone)]
@@ -459,18 +641,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_override_mismatch_returns_config_mismatch() {
-        let (manager, _backend, _registry) = manager();
+    async fn model_override_change_reconciles_and_advances_fingerprint() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = SessionManager::new(registry, Duration::from_secs(30));
         let ctx = ctx("model");
 
         manager
             .checkout_turn(
                 &ctx,
                 agent(),
-                Some(AgentOverride {
-                    model: Some("gpt-5.5".into()),
-                    ..Default::default()
-                }),
+                Some(model_override("gpt-5.5")),
                 None,
                 op("op-1"),
             )
@@ -481,17 +662,418 @@ mod tests {
             .checkout_turn(
                 &ctx,
                 agent(),
-                Some(AgentOverride {
-                    model: Some("gpt-5.4".into()),
-                    ..Default::default()
-                }),
+                Some(model_override("gpt-5.4")),
+                None,
+                op("op-2"),
+            )
+            .await;
+
+        assert!(err.is_ok());
+        assert_eq!(backend.reconciled().len(), 1);
+        assert_eq!(
+            backend.reconciled()[0].1.config.model.as_deref(),
+            Some("gpt-5.4")
+        );
+
+        manager.finish_turn(&ctx).await;
+        backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.4")),
+                None,
+                op("op-3"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.reconciled().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn effort_override_change_reconciles() {
+        let (manager, backend, _registry) = manager();
+        let ctx = ctx("effort");
+
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(effort_override(Effort::Low)),
+                None,
+                op("op-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&ctx).await;
+
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(effort_override(Effort::High)),
                 None,
                 op("op-2"),
             )
             .await
-            .err();
+            .unwrap();
 
-        assert_eq!(err, Some(BridgeError::ConfigMismatch { field: "model" }));
+        assert_eq!(backend.reconciled().len(), 1);
+        assert_eq!(backend.reconciled()[0].1.config.effort, Some(Effort::High));
+    }
+
+    #[tokio::test]
+    async fn reconcile_not_advertised_expires_handle_and_next_checkout_mints_cold() {
+        let (manager, backend, _registry) = manager();
+        let ctx = ctx("not-advertised");
+
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                None,
+                op("op-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&ctx).await;
+        backend.set_reconcile_result(Ok(ReconcileOutcome::NotAdvertised));
+
+        let err = manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.4")),
+                None,
+                op("op-2"),
+            )
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::ConfigReseedRequired { field: "model" });
+        assert!(manager.status(&ctx).await.is_none());
+        assert_eq!(backend.releases(), vec!["ctx-not-advertised-g0"]);
+
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.4")),
+                None,
+                op("op-3"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.configured(),
+            vec!["ctx-not-advertised-g0", "ctx-not-advertised-g0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejected_expires_handle() {
+        let (manager, backend, _registry) = manager();
+        let ctx = ctx("rejected");
+
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                None,
+                op("op-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&ctx).await;
+        backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
+
+        let err = manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.4")),
+                None,
+                op("op-2"),
+            )
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::ConfigReseedRequired { field: "model" });
+        assert!(manager.status(&ctx).await.is_none());
+        assert_eq!(backend.releases(), vec!["ctx-rejected-g0"]);
+    }
+
+    #[tokio::test]
+    async fn mode_change_requires_reseed_without_reconcile() {
+        let (manager, backend, _registry) = manager();
+        let ctx = ctx("mode");
+
+        manager
+            .checkout_turn(&ctx, agent(), Some(mode_override("fast")), None, op("op-1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&ctx).await;
+
+        let err = manager
+            .checkout_turn(&ctx, agent(), Some(mode_override("slow")), None, op("op-2"))
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::ConfigReseedRequired { field: "mode" });
+        assert_eq!(backend.reconciled().len(), 0);
+        assert_eq!(manager.status(&ctx).await.unwrap().state, "idle");
+    }
+
+    #[tokio::test]
+    async fn cwd_change_beats_model_change_as_config_mismatch() {
+        let (manager, backend, _registry) = manager();
+        let ctx = ctx("cwd");
+
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                cwd("/work/a"),
+                op("op-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&ctx).await;
+
+        let err = manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.4")),
+                cwd("/work/b"),
+                op("op-2"),
+            )
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::ConfigMismatch { field: "cwd" });
+        assert_eq!(backend.reconciled().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_change_is_config_mismatch() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::with_entries(
+            vec![fake_entry("codex"), fake_entry("claude")],
+            backend.clone(),
+        ));
+        let manager = SessionManager::new(registry, Duration::from_secs(30));
+        let ctx = ctx("agent");
+
+        manager
+            .checkout_turn(&ctx, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&ctx).await;
+
+        let err = manager
+            .checkout_turn(
+                &ctx,
+                AgentId::parse("claude").unwrap(),
+                None,
+                None,
+                op("op-2"),
+            )
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::ConfigMismatch { field: "agent" });
+        assert_eq!(backend.reconciled().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn clearing_model_or_effort_requires_reseed_without_reconcile() {
+        let (manager, backend, _registry) = manager();
+        let model_ctx = ctx("clear-model");
+
+        manager
+            .checkout_turn(
+                &model_ctx,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                None,
+                op("op-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&model_ctx).await;
+        let err = manager
+            .checkout_turn(&model_ctx, agent(), None, None, op("op-2"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err, BridgeError::ConfigReseedRequired { field: "model" });
+
+        let effort_ctx = ctx("clear-effort");
+        manager
+            .checkout_turn(
+                &effort_ctx,
+                agent(),
+                Some(effort_override(Effort::High)),
+                None,
+                op("op-3"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&effort_ctx).await;
+        let err = manager
+            .checkout_turn(&effort_ctx, agent(), None, None, op("op-4"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err, BridgeError::ConfigReseedRequired { field: "effort" });
+        assert_eq!(backend.reconciled().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn release_during_reconcile_returns_session_expired_and_preserves_fresh_handle() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let ctx = ctx("release-race");
+
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                None,
+                op("op-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&ctx).await;
+        let unblock = backend.block_next_reconcile();
+
+        let in_flight = {
+            let manager = manager.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                manager
+                    .checkout_turn(
+                        &ctx,
+                        agent(),
+                        Some(model_override("gpt-5.4")),
+                        None,
+                        op("op-2"),
+                    )
+                    .await
+            })
+        };
+        backend.wait_for_reconcile().await;
+
+        manager.release(&ctx).await;
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.3")),
+                None,
+                op("op-3"),
+            )
+            .await
+            .unwrap();
+        unblock.send(()).unwrap();
+
+        assert_eq!(
+            in_flight.await.unwrap().err().unwrap(),
+            BridgeError::SessionExpired
+        );
+        assert_eq!(manager.status(&ctx).await.unwrap().state, "running");
+        manager.finish_turn(&ctx).await;
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.3")),
+                None,
+                op("op-4"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_during_reconcile_expires_claimed_handle() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let ctx = ctx("cancel-race");
+
+        manager
+            .checkout_turn(
+                &ctx,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                None,
+                op("op-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&ctx).await;
+        let unblock = backend.block_next_reconcile();
+
+        let in_flight = {
+            let manager = manager.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                manager
+                    .checkout_turn(
+                        &ctx,
+                        agent(),
+                        Some(model_override("gpt-5.4")),
+                        None,
+                        op("op-2"),
+                    )
+                    .await
+            })
+        };
+        backend.wait_for_reconcile().await;
+
+        manager.cancel(&ctx).await.unwrap();
+        unblock.send(()).unwrap();
+
+        assert_eq!(
+            in_flight.await.unwrap().err().unwrap(),
+            BridgeError::SessionExpired
+        );
+        assert!(manager.status(&ctx).await.is_none());
+        assert_eq!(backend.releases(), vec!["ctx-cancel-race-g0"]);
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_recorded_on_handle_and_status() {
+        let caps = AgentSessionCaps {
+            load_session: true,
+            resume: true,
+            close: true,
+            list: true,
+            delete: false,
+        };
+        let backend = Arc::new(FakeBackend::with_capabilities("ok", caps.clone()));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let manager = SessionManager::new(registry, Duration::from_secs(30));
+        let ctx = ctx("caps");
+
+        manager
+            .checkout_turn(&ctx, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(manager.status(&ctx).await.unwrap().capabilities, caps);
     }
 
     #[tokio::test]
