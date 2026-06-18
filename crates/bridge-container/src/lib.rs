@@ -296,8 +296,8 @@ impl ContainerRwBackend {
     /// REUSE-turn error (configure/prompt) clears `turn_active`, does NOT reap, and returns `Err` — a
     /// transient error must not nuke the warm container (the loop converts it to `FixIncomplete`). A
     /// cache-MISS prompt error reaps + removes the just-opened entry (no cumulative work to protect). The
-    /// stream's `TurnGuard` clears `turn_active` on end/early-drop and NEVER reaps; the sole warm reap site
-    /// is `retire_warm`.
+    /// stream's `TurnGuard` clears `turn_active` on end/early-drop and NEVER reaps; warm reaping is owned
+    /// by `retire_warm`/`release_warm`.
     async fn prompt_warm(
         &self,
         session: &SessionId,
@@ -407,8 +407,8 @@ impl ContainerRwBackend {
         Ok(())
     }
 
-    /// Warm retire — the SOLE warm reap site. Drain the cache; per entry: cancel the inner, reap once,
-    /// and clear any stale `turn_active` marker (a held/raced stream could leave one behind).
+    /// Warm retire. Drain the cache; per entry: cancel the inner, reap once, and clear any stale
+    /// `turn_active` marker (a held/raced stream could leave one behind).
     async fn retire_warm(&self) -> Result<(), BridgeError> {
         let entries: Vec<(SessionId, WarmInner)> = { self.warm.lock().await.drain().collect() };
         let runtime = self.cfg.sandbox.runtime().to_string();
@@ -418,6 +418,21 @@ impl ContainerRwBackend {
             self.turn_active.lock().await.remove(&s);
         }
         Ok(())
+    }
+
+    /// Reap ONE warm session's container (per-session analogue of `retire_warm`).
+    async fn release_warm(&self, session: &SessionId) {
+        let wi = self.warm.lock().await.remove(session);
+        if let Some(wi) = wi {
+            let _ = wi.inner.cancel(session).await;
+            reap_once(
+                &self.reap_fn,
+                self.cfg.sandbox.runtime(),
+                &wi.name,
+                &wi.reaped,
+            );
+        }
+        self.turn_active.lock().await.remove(session);
     }
 }
 
@@ -532,6 +547,13 @@ impl AgentBackend for ContainerRwBackend {
 
     /// Stash-only (uniform with the ACP/API backends). Does NOT reap — the stream owns the reaper.
     async fn forget_session(&self, session: &SessionId) {
+        self.session_cfg.lock().await.remove(session);
+    }
+
+    async fn release_session(&self, session: &SessionId) {
+        if self.is_warm() {
+            self.release_warm(session).await;
+        }
         self.session_cfg.lock().await.remove(session);
     }
 
@@ -1241,7 +1263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_retire_is_the_sole_reap_site() {
+    async fn warm_retire_reaps_cached_container() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
         let spawn = CountingSpawn::new(false);
@@ -1270,6 +1292,37 @@ mod tests {
             "reaped exactly once at retire"
         );
         assert!(be.warm.lock().await.is_empty(), "warm cache drained");
+    }
+
+    #[tokio::test]
+    async fn release_session_reaps_only_that_warm_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let (reap, reaps) = counting_reap();
+        let be = warm_backend(root, CountingSpawn::new(false), reap).await;
+        let s = SessionId::parse("ctx-a-g0").unwrap();
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        let mut stream = be
+            .prompt(
+                &s,
+                vec![Part {
+                    text: "hi".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        be.release_session(&s).await;
+        assert!(
+            be.warm.lock().await.get(&s).is_none(),
+            "warm entry removed"
+        );
+        assert_eq!(
+            reaps.load(Ordering::SeqCst),
+            1,
+            "exactly one container reaped"
+        );
     }
 
     #[tokio::test]
