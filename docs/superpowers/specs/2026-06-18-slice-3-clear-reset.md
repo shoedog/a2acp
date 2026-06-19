@@ -72,9 +72,11 @@ verb all confirmed; the gaps are force-path concurrency + a fallible-await stran
   `finish_turn`/`record_usage` would mutate the resetting handle. **Fix:** `finish_turn(ctx, gen)` /
   `record_usage(ctx, gen, snap)` apply **only if `gen == handle.generation` AND `handle.state == Running`**;
   on ANY mismatch (stale generation OR a claim state `Resetting`/`Reconciling`/`Expiring`) they are a
-  **read-only NO-OP — touch NOTHING** (not `state`, not `op`, not `last_used`, not `usage`). Key solely on
-  `(ctx, generation)`; **ignore `op`** (it is task-derived `op-{task}` → a force-clear + same-task follow-up
-  can collide on `op`, so it is not a safe discriminator).
+  **read-only NO-OP — touch NOTHING** (not `state`, not `op`, not `last_used`, not `usage`). **[SUPERSEDED by
+  FIX-12]** — the guard now ALSO requires `op` (`gen == generation && op == Some(op) && Running`); but `op` is
+  task-derived, so it only PARTIALLY closes the cancel race (see FIX-12's round-2 caveat + "## Deferred
+  hardening"). The prescient note here — "task-derived `op` can collide on a same-task follow-up" — is exactly
+  the residue that's deferred.
 - **FIX-4 (MAJOR — blocking, codex) — fallible `configure_session` must not strand the handle.**
   `configure_session` returns `Result` (`ports.rs:42`); §Arch step 5's `.await?` before the re-acquire would
   leave the handle permanently `Resetting`. **Fix (mirror the Slice-1 reconcile non-clean path,
@@ -120,6 +122,17 @@ verb all confirmed; the gaps are force-path concurrency + a fallible-await stran
   producer's late completion no-ops. + a `stale_finish_turn_after_cancel_does_not_idle_new_same_generation_turn`
   test. (The whole-branch xhigh review caught this — the per-increment reviews, seeing commits in isolation,
   did not.)
+  - **ROUND-2 CAVEAT — FIX-12 is PARTIAL; the residue is DEFERRED (merge-as-is decision).** The whole-branch
+    re-review found the `OperationId` is **task-derived** at the server edge (`op-{taskId}`, `"task-1"` fallback
+    when omitted, `server.rs:732/2321/3158`) — so a `cancel` + same-context send with the **same or omitted
+    `taskId`** still collides on `op`, leaving the cancel race reachable on the REAL wire path (the unit test
+    used distinct `op-1`/`op-2`). It ALSO surfaced a second race: `clear --force` can fire in the gap between
+    `checkout_turn` marking `Running` and the producer calling `backend.prompt` (`server.rs:749/2340`),
+    resurrecting the released old session via ACP's lazy re-mint. **Both are PRE-EXISTING and DEFERRED** to a
+    foundational follow-up (see "## Deferred hardening" below) — the proper fix is a manager-minted UNIQUE
+    per-checkout op token + a per-turn ABORT token threaded through the producer/translator. Slice 3 ships the
+    sound core (clear + the generation guard, live-gate-proven); FIX-12 NARROWS the cancel race (distinct-op +
+    the gen case) but does not fully close it.
 
 **D1–D4 — both lenses UNANIMOUS:** D1 **composition** (no new backend method) + the FIX-4 cleanup path; D2
 **include `force`** (claim-before-cancel, FIX-2); D3 **explicit generation thread** + the FIX-3 state guard;
@@ -308,3 +321,32 @@ not verbatim**. **Dual spec-review (codex xhigh + Opus) before planning** + **du
   reads)? Recommend the explicit generation thread (typed, matches the captured-generation invariant).
 - **D4 — `clear` vs `reset` naming on the wire.** `session/clear` (user verb) mapping `reset_session`
   (primitive). Confirm `clear` is the right public name (compact reuses the primitive, not the verb).
+
+## Deferred hardening (whole-branch review round 2 — TRACKED follow-ups, merge-as-is decision)
+
+Slice 3 SHIPPED the sound core — `clear` = new-generation reset + the generation(+partial-op) guard,
+live-gate-proven (codeword forgotten, process warm, generation advances, usage reset). The whole-branch
+codex-xhigh review (round 2) surfaced two **PRE-EXISTING** concurrency races the warm-session lifecycle has had
+since Slice 0/1/2; the `force` feature + the generation guard make them visible. Per the merge-as-is decision
+they are DEFERRED to a foundational follow-up (they need a per-turn cancellation mechanism the architecture
+never scoped into Slice 3). **Do NOT assume the cancel/force paths are race-free under concurrency until this
+lands.**
+
+1. **Cancel→next-turn op collision (FIX-12 is partial).** `OperationId` is task-derived at the server edge
+   (`op-{taskId}`, `"task-1"` fallback when omitted — `server.rs:732/2321/3158`). A `SessionCancel` + a
+   same-context send with the SAME or OMITTED `taskId` reuses the op, so the old producer's late
+   `finish_turn`/`record_usage` can still pass `gen && op && Running` and idle/clobber the new turn.
+   **Fix:** mint a UNIQUE per-checkout operation token in `SessionManager` (a nonce, independent of client
+   `taskId`); the guard keys on it. (The generation guard alone already prevents the post-reset case; this is
+   the cancel/no-gen-bump case.)
+2. **`clear --force` vs producer start.** `checkout_turn` marks the handle `Running`, but the streaming/unary
+   handlers await `store.put` BEFORE spawning the producer (`server.rs:749/2340`). A concurrent
+   `SessionClear --force` can claim→release the old id in that gap; the original handler then resumes and
+   prompts the released session, which ACP lazy re-mints (`acp_backend.rs:2052` → `translator.rs:133`) —
+   resurrecting the force-cleared context. **Fix:** a per-turn abort/cancellation token owned by the manager,
+   cancelled under the reset claim during `force`; the producer/translator `select!`s on it before and while
+   entering `backend.prompt`. (Deferring `force` entirely also closes this — `clear` requires `Idle` then.)
+
+**Recommended follow-up slice:** "warm-turn cancellation tokens" — manager-minted unique op + a per-turn abort
+token wired through the producer/translator, which closes BOTH races and makes `force`-clear truly abortive.
+Sequence it before any feature that relies on `force`/cancel under concurrency.

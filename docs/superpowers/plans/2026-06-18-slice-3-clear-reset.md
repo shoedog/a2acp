@@ -46,6 +46,14 @@ controller verifies+commits (the `_dyld_start` flake). **Gate enum/signature cha
 
 ---
 
+> **POST-MERGE NOTE (whole-branch review FIX-12 + Deferred hardening):** after the per-task plan executed, a
+> whole-branch codex-xhigh review added **FIX-12** — `finish_turn`/`record_usage` ALSO require the
+> `OperationId` (`gen == generation && op == Some(op) && state == Running`) and `WarmTurn`/`WarmTurnGuard`
+> carry it. So the `finish_turn`/`record_usage` pseudocode below (`(ctx, gen)` only) is STALE — see the SPEC's
+> FIX-12 + "## Deferred hardening" for the shipped guard + the two PRE-EXISTING races (task-derived op
+> collision; `force`-clear vs producer-start) that are DEFERRED to a "warm-turn cancellation tokens"
+> follow-up. Do NOT re-implement `finish_turn`/`record_usage` from the pseudocode below without the `op`.
+
 ## v2 — dual plan-review fixes folded (codex-xhigh + Opus, both `fix-then-execute`)
 
 Both lenses verified the ALGORITHM is sound (Opus independently confirmed: the gen-guard closes the
