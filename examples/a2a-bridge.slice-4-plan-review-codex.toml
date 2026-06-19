@@ -1,0 +1,17 @@
+# Codex gpt-5.5 XHIGH PLAN review of Slice 4 (compact). Read-only navigation of the bridge repo.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "plan-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/slice-4-plan-review.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8111"

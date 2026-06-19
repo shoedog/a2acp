@@ -136,3 +136,17 @@ adopted, it's the user's actual loop). **First slice to spec: Slice 0 — Live S
 ## Constraints (carried)
 sonnet implementor; codex high-risk + final, Opus arch; `max_attempts=3`; reviewers judge **intent, not
 verbatim**; **each slice dual spec-reviewed (codex xhigh + Opus) before planning + LIVE-GATED before merge.**
+
+## Tracked post-merge follow-ups (discovered during execution — NOT in the slices above)
+
+These were surfaced AFTER this spec was authored (by per-slice whole-branch reviews) and are tracked here so
+the durable plan owns them; they are not silently dropped when per-session handoffs are superseded.
+
+- **Warm-turn cancellation tokens** (deferred from Slice 3, merge-as-is 2026-06-18). Two PRE-EXISTING
+  concurrency races in the warm-session lifecycle (cancel→next-turn op collision; `clear --force` vs
+  producer-start resurrecting the cleared context). Fix = manager-minted unique op nonce + a per-turn abort
+  token through the producer/translator. **Sequence before any feature relying on `force`/cancel under
+  concurrency** (Slices 4 compact + 5 serve-CLI do NOT — both are require-Idle / no-force, so this does not
+  block the MVP; earliest natural slot is post-MVP). Full detail + code anchors:
+  `docs/superpowers/2026-06-18-FOLLOWUP-warm-turn-cancellation-tokens.md` (← the durable home), sourced from
+  `docs/superpowers/specs/2026-06-18-slice-3-clear-reset.md` "## Deferred hardening".

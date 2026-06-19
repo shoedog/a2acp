@@ -182,6 +182,12 @@ dropped. Most map to later slices; a few are standalone follow-ups.
   for E1/E2 containerization; currently the bridge rejects them (`acp_backend.rs ~855`).
 
 **Standalone follow-ups (not a slice):**
+- **Warm-turn cancellation tokens** (DEFERRED from Slice 3, merge-as-is 2026-06-18) — two PRE-EXISTING warm-
+  session concurrency races (cancel→next-turn op collision; `clear --force` vs producer-start resurrects the
+  cleared context). Fix = manager-minted unique op nonce + per-turn abort token through producer/translator.
+  **Sequence before any `force`/cancel-under-concurrency feature**; does NOT block Slice 4/5. Durable tracking:
+  `docs/superpowers/2026-06-18-FOLLOWUP-warm-turn-cancellation-tokens.md` (also in the slicing spec's
+  "Tracked post-merge follow-ups" + the slice-3 spec's "Deferred hardening").
 - **Pre-existing unary `result.artifact.text` truncation** (multi-chunk reply → last chunk only;
   "ZEBRA"→"RA"; reproduces on the legacy non-warm path). Real bug, affects all unary sends; relates to the
   **C1 typed-result** work. Fix in the unary `Translator::run(...).collect()` → artifact path in `server.rs`.
