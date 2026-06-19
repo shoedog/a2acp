@@ -153,6 +153,17 @@ Round-8 again found NO blockers — two tightenings exposed by the round-7 error
   use a `RunGuard` whose `Drop` spawns the async removal of `workflow_runs[C]`+`workflow_cancels[task]` (fires on
   normal exit, early-return, AND panic); + `workflow_producer_panic_frees_context`.
 
+### v10 — round-9 plan-review folds (codex xhigh; **NO BLOCKERS** — execution-edge fixes)
+Round-9 again found NO blockers — three execution-edge fixes:
+- T8 (MAJOR): the serve-client must mint a UNIQUE `message.taskId = a2a::new_task_id()` per invocation (else the
+  server falls back to `"task-1"` → two runs collide on `workflow_cancels` + repeat node `OperationId`s); +
+  `serve_client_requests_have_distinct_task_ids`.
+- T6 (MAJOR): the producer frees the guard INLINE+awaited on normal/early exits (a Drop-only spawn is DEFERRED →
+  a just-finished `C` lingers → false `HandleBusy`); the armed `RunGuard` is the PANIC-ONLY fallback (idempotent
+  `release_run`).
+- T4/T6/T7 (MAJOR): run the WHOLE relevant test target at each boundary (narrow `--lib`/`--test` filters missed
+  several new + regression tests).
+
 ---
 
 ## File Structure
@@ -331,7 +342,10 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
     !snapshot.is_empty() => ResetOutcome::Cleared { generation: 0 }, ResetOutcome::NotFound =>
     ResetOutcome::NotFound })` (round-3 BLOCKER-2 — unknown ctx with no children stays `NotFound`; `generation: 0`
     = workflow-parent sentinel, the parent is never a handle).
-- [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib with_children && cargo test --workspace --no-run`. Commit.
+- [ ] **Step 3:** **round-9 MAJOR — run the WHOLE lib target (the `cancel` change is core; a narrow filter misses
+  `cancel_then_release_frees_children`/`clear_then_release_frees_children`/`cancel_idle_handle_skips_backend_cancel`
+  + regresses existing cancel tests):** `cargo test -p bridge-a2a-inbound --lib && cargo test --workspace
+  --no-run`. Commit.
 
 ---
 
@@ -394,26 +408,28 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   &BridgeError::HandleBusy); } let t = CancellationToken::new(); runs.insert(c.clone(), t.clone()); Some((c, t)) }
   else { None };` (the `HandleBusy` returns BEFORE any `store.put` → no state mutation; the cold
   no-context workflow gets `None` → unchanged). Thread `workflow_token: Option<(ContextId,
-  CancellationToken)>` into the Workflow arm → `spawn_workflow_producer`. **round-6/8 MAJOR — explicit warm/cold
-  branch + PANIC-SAFE `Drop`-guard cleanup** (the absent-executor/graph early-return at `:1697` AND a producer
-  PANIC — backend `prompt()` panics propagate through workflow exec, `tests/workflow_producer.rs:1384` — must
-  BOTH release the guard; a plain post-`.await` cleanup is SKIPPED on unwind, so use a `Drop` guard that spawns
-  the async removal):
+  CancellationToken)>` into the Workflow arm → `spawn_workflow_producer`. **round-6/8/9 MAJOR — explicit
+  warm/cold branch + INLINE-awaited cleanup on every normal/early exit + a `RunGuard` PANIC-ONLY fallback**
+  (round-9: a Drop-ONLY `tokio::spawn` removal is DEFERRED, so a just-finished `C` lingers in `workflow_runs` and
+  an immediate 2nd `--serve --context C` gets a FALSE `HandleBusy`; remove the maps INLINE+awaited on the normal
+  paths, keep the guard only for the panic path — backend `prompt()` panics propagate, `tests/workflow_producer.rs:1384`):
 ```rust
-struct RunGuard { srv: Arc<InboundServer>, task: TaskId, ctx: Option<ContextId> }
-impl Drop for RunGuard {
-    fn drop(&mut self) {              // fires on normal exit, early-return, AND panic-unwind
+async fn release_run(srv: &Arc<InboundServer>, task: &TaskId, ctx: &Option<ContextId>) { // idempotent
+    srv.workflow_cancels.lock().await.remove(task);                    // (HashMap::remove no-ops on absent)
+    if let Some(c) = ctx { srv.workflow_runs.lock().await.remove(c); }
+}
+struct RunGuard { srv: Arc<InboundServer>, task: TaskId, ctx: Option<ContextId>, armed: bool }
+impl Drop for RunGuard {                 // ONLY fires when release() was NOT reached (panic / un-disarmed early exit)
+    fn drop(&mut self) {
+        if !self.armed { return; }       // disarmed by the inline cleanup on normal paths
         let (srv, task, ctx) = (self.srv.clone(), self.task.clone(), self.ctx.take());
-        tokio::spawn(async move {     // Drop can't .await -> spawn the removal (we're in runtime ctx)
-            srv.workflow_cancels.lock().await.remove(&task);
-            if let Some(c) = ctx { srv.workflow_runs.lock().await.remove(&c); }
-        });
+        tokio::spawn(async move { release_run(&srv, &task, &ctx).await; }); // Drop can't .await -> spawn (panic fallback)
     }
 }
 tokio::spawn(async move {
-    let _guard = RunGuard { srv: srv.clone(), task: task.clone(),
-                            ctx: workflow_token.as_ref().map(|(c, _)| c.clone()) };
-    // existing executor/graph resolve + early-return on absent (:1695-1701) — _guard still drops
+    let ctx = workflow_token.as_ref().map(|(c, _)| c.clone());
+    let mut guard = RunGuard { srv: srv.clone(), task: task.clone(), ctx: ctx.clone(), armed: true };
+    // existing executor/graph resolve; on absent: `release_run(&srv,&task,&ctx).await; guard.armed=false; return;`
     let token = match &workflow_token { Some((_, t)) => t.clone(), None => CancellationToken::new() };
     srv.workflow_cancels.lock().await.insert(task.clone(), token.clone()); // backs CancelTask :2832
     let stream = match &workflow_token {
@@ -424,13 +440,15 @@ tokio::spawn(async move {
             })),
         None => executor.run_with_context(graph, input, task.as_str().into(), token, wf_ctx), // COLD, byte-identical
     };
-    // drain + terminal fallback — UNCHANGED (:1720-1730). `_guard` drops here OR on panic -> async removal.
+    // drain + terminal fallback — UNCHANGED (:1720-1730)
+    release_run(&srv, &task, &ctx).await; guard.armed = false; // INLINE+awaited normal cleanup -> no false-busy window
+    // (on a PANIC before here, `guard` is still armed -> Drop spawns release_run as the fallback)
 });
 ```
   The `None` arm keeps no-context streaming workflows on the cold `run_with_context` path (back-compat — the
-  `with_workflows`-without-SM tests stay green); the `RunGuard` removes BOTH maps on EVERY exit incl. early-return
-  AND panic-unwind (mirrors `workflow_cancels` :1711/:1731; note the `routed.task`/`session_cwd` move order
-  :1690/:1716). In `session_cancel`
+  `with_workflows`-without-SM tests stay green); the INLINE `release_run` frees `C` immediately on normal/early
+  exits (no false-busy), and the armed `RunGuard` covers the panic path (mirrors `workflow_cancels`
+  :1711/:1731; note the `routed.task`/`session_cwd` move order :1690/:1716). In `session_cancel`
   (`server.rs:3104`): **round-4 BLOCKER — GET, do NOT remove the guard.** `let token = { workflow_runs.lock()
   .await.get(C).cloned() };` (clone the token, LEAVE the entry — the guard is released ONLY on producer exit,
   mirroring `workflow_cancels`; removing it here lets a 2nd same-context run pass the guard and re-claim a child
@@ -444,9 +462,10 @@ tokio::spawn(async move {
   Do NOT fall back to bare `sm.cancel(C)`. (The producer `RunGuard` removes `workflow_runs[C]` +
   `workflow_cancels[task]`.)
 - [ ] **Step 3:** **round-6 MINOR — the concurrency/cancel tests live in the `tests/workflow_producer.rs`
-  INTEGRATION target (the `with_workflows` harness), NOT `--lib`:** `cargo test -p bridge-a2a-inbound --test
-  workflow_producer 'workflow_handle_busy|session_cancel|one_backend_cancel' && cargo test -p bridge-a2a-inbound
-  --lib session_cancel_cancels && cargo test --workspace --no-run`. Commit.
+  INTEGRATION target (the `with_workflows` harness), NOT `--lib`. round-9 MAJOR — run the WHOLE integration target
+  (a narrow filter misses `workflow_producer_panic_frees_context`):** `cargo test -p bridge-a2a-inbound --test
+  workflow_producer && cargo test -p bridge-a2a-inbound --lib session_cancel && cargo test --workspace
+  --no-run`. Commit.
 
 ---
 
@@ -473,8 +492,9 @@ tokio::spawn(async move {
   the helper returns `Cleared` whenever children were swept and `NotFound` ONLY for an unknown ctx with no
   children, so an unknown-clear still 400s (existing test green) while a workflow parent succeeds. (The
   `SessionCancel` sweep + token-success is in T6.)
-- [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib 'gate_|session_release_workflow' && cargo test
-  --workspace --no-run`. Commit.
+- [ ] **Step 3:** **round-9 MAJOR — run the WHOLE lib target (a narrow filter misses the unknown-clear
+  regression `session_clear_unknown_context_still_not_found` + the existing `server.rs:6955` 400 test):** `cargo
+  test -p bridge-a2a-inbound --lib && cargo test --workspace --no-run`. Commit.
 
 ---
 
@@ -487,8 +507,9 @@ tokio::spawn(async move {
   Option); `run_workflow_serve_flags_before_workflow_id` (round-6 MAJOR / PFIX-8 — parse `run-workflow --serve
   --context C <wf>`: flags consumed ANYWHERE, exactly ONE non-flag token = the workflow id; the current parser
   assumes arg-0 is the id at `main.rs:543`); `run_workflow_serve_requires_context` (round-7 MAJOR — `--serve`
-  without `--context` → error); `serve_client_builds_streaming_message` (the message map has `contextId`,
-  `metadata ["a2a-bridge.skill"]=<wf>`, parts). **round-7 MAJOR — a fake-HTTP-server CLI client test** (use the
+  without `--context` → error); `serve_client_builds_streaming_message` (the message map has `contextId`, a
+  UNIQUE `taskId`, `metadata ["a2a-bridge.skill"]=<wf>`, parts); `serve_client_requests_have_distinct_task_ids`
+  (round-9 MAJOR — two built requests carry DIFFERENT `message.taskId`s). **round-7 MAJOR — a fake-HTTP-server CLI client test** (use the
   existing `wiremock`/`axum` test dep to stand up a fake serve endpoint): (a) Completed — SSE frames with an
   `ArtifactUpdate` then a terminal `StatusUpdate{state:Completed, message:None}` → client prints the artifact
   text to stdout/`--out` + exit 0; (b) Failed/Canceled terminal → nonzero exit; (c) a pre-SSE JSON-RPC ERROR
@@ -502,7 +523,10 @@ tokio::spawn(async move {
   (`:2233`): **MAJOR-2 — the `--serve` branch must EARLY-RETURN before the local config read (`main.rs:2242`) and
   any workflow lookup** (the workflow lives in the running serve's config, not locally). Right after parsing args
   + reading the input file: if `--serve` → build a `SendStreamingMessage` message map (`message.contextId=C`,
-  `metadata["a2a-bridge.skill"]=<wf>`, parts=input, cwd from `--session-cwd`) — its OWN map, NOT via
+  **`message.taskId = a2a::new_task_id()` — round-9 MAJOR: mint a UNIQUE task id per invocation** (else the server
+  falls back to the fixed `"task-1"` at `server.rs:3280` → two serve runs collide on `workflow_cancels` + repeat
+  node `OperationId`s; `a2a::new_task_id()` is what `new_detached_task_id` uses), `metadata["a2a-bridge.skill"]=<wf>`,
+  parts=input, cwd from `--session-cwd`) — its OWN map, NOT via
   `submit_cmd`'s skill-guesser (PFIX-7) — POST to `--url`, then drain the SSE byte-stream (the `task_watch_cmd`
   loop is INLINE `:2756`, no parser fn — extract/duplicate it), JSON-parsing each `data:` frame as
   `a2a::StreamResponse` to find the terminal `StatusUpdate{state∈{Completed,Failed,Canceled}}` (exit code) +
