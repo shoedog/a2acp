@@ -488,6 +488,8 @@ struct LocalDispatch {
     backend: Arc<dyn AgentBackend>,
     /// The session to prompt against — warm `ctx-…` session, or legacy `session-{task}`.
     session: SessionId,
+    /// Warm-session summary seed to prepend to the prompt parts, when present.
+    seed: Option<String>,
     guard: Option<BindingGuard>,
     /// Warm path only: finishes the warm turn (→ Idle) on drop. Mutually exclusive with `guard`.
     warm_guard: Option<WarmTurnGuard>,
@@ -556,6 +558,7 @@ async fn resolve_configure_bind(
             return Ok(LocalDispatch {
                 backend,
                 session: session.clone(),
+                seed: None,
                 guard: None,
                 warm_guard: None,
             });
@@ -592,6 +595,7 @@ async fn resolve_configure_bind(
     Ok(LocalDispatch {
         backend,
         session: session.clone(),
+        seed: None,
         guard: Some(guard),
         warm_guard: None,
     })
@@ -626,6 +630,7 @@ async fn warm_local_dispatch(
             Some(Ok(LocalDispatch {
                 backend: turn.backend,
                 session: turn.session,
+                seed: turn.seed,
                 guard: None,
                 warm_guard: Some(WarmTurnGuard {
                     sm,
@@ -1181,6 +1186,15 @@ fn spawn_local_producer(
     let task = routed.task;
     let session = dispatch.session.clone();
     let parts = routed.parts;
+    let mut parts = parts;
+    if let Some(seed) = dispatch.seed {
+        parts.insert(
+            0,
+            Part {
+                text: format!("[Summary of earlier context in this session]\n{seed}"),
+            },
+        );
+    }
     let backend = dispatch.backend;
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
@@ -2387,6 +2401,15 @@ async fn unary_message(
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
             let warm = dispatch.warm_guard;
+            let mut parts = routed.parts;
+            if let Some(seed) = dispatch.seed {
+                parts.insert(
+                    0,
+                    Part {
+                        text: format!("[Summary of earlier context in this session]\n{seed}"),
+                    },
+                );
+            }
             let translator = Translator::new();
             let mut events = translator.run(
                 dispatch.backend.as_ref(),
@@ -2394,7 +2417,7 @@ async fn unary_message(
                 srv.policy.as_ref(),
                 &routed.task,
                 &dispatch.session,
-                routed.parts,
+                parts,
             );
             let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
             while let Some(ev) = events.next().await {
@@ -5901,6 +5924,7 @@ mod tests {
     struct WarmRecordingBackend {
         sessions: Arc<Mutex<Vec<String>>>,
         forgotten: Arc<Mutex<Vec<String>>>,
+        prompted_parts: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     impl WarmRecordingBackend {
@@ -5908,13 +5932,26 @@ mod tests {
             Arc::new(Self {
                 sessions: Arc::new(Mutex::new(Vec::new())),
                 forgotten: Arc::new(Mutex::new(Vec::new())),
+                prompted_parts: Arc::new(Mutex::new(Vec::new())),
             })
+        }
+
+        fn prompted_parts(&self) -> Vec<Vec<String>> {
+            self.prompted_parts.lock().unwrap().clone()
+        }
+
+        fn clear_prompted_parts(&self) {
+            self.prompted_parts.lock().unwrap().clear();
         }
     }
 
     #[async_trait::async_trait]
     impl AgentBackend for WarmRecordingBackend {
-        async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        async fn prompt(&self, s: &SessionId, p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+            self.prompted_parts
+                .lock()
+                .unwrap()
+                .push(p.iter().map(|x| x.text.clone()).collect());
             self.sessions.lock().unwrap().push(s.as_str().to_owned());
             let updates = vec![
                 Ok(Update::Usage(UsageSnapshot {
@@ -5941,6 +5978,120 @@ mod tests {
                 .unwrap()
                 .push(session.as_str().to_owned());
         }
+    }
+
+    // Build the warm-session test server (mirrors session_clear_dispatch :6510-6536).
+    fn seed_test_server() -> (
+        Arc<InboundServer>,
+        Arc<crate::session_manager::SessionManager>,
+        Arc<WarmRecordingBackend>,
+    ) {
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry.clone() as Arc<dyn AgentRegistry>,
+            std::time::Duration::from_secs(60),
+        ));
+        let srv = Arc::new(
+            InboundServer::new(
+                registry as Arc<dyn AgentRegistry>,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm.clone()),
+        );
+        (srv, sm, backend)
+    }
+
+    async fn wait_idle(sm: &crate::session_manager::SessionManager, ctx: &ContextId) {
+        for _ in 0..50 {
+            if matches!(sm.status(ctx).await.as_ref().map(|s| s.state), Some("idle")) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("session did not reach idle");
+    }
+
+    fn warm_msg(text: &str) -> serde_json::Value {
+        json!({ "message": { "contextId": "c1", "text": text, "metadata": { "a2a-bridge.agent": "a" } } })
+    }
+
+    #[tokio::test]
+    async fn seed_prepended_unary() {
+        let (srv, sm, backend) = seed_test_server();
+        let ctx = ContextId::parse("c1").unwrap();
+        let r = router(srv.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, warm_msg("go"), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let _ = body_string(r).await;
+        wait_idle(&sm, &ctx).await;
+        sm.compact_session(&ctx, |_b, _s| async { Ok("S".to_string()) })
+            .await
+            .unwrap();
+        backend.clear_prompted_parts(); // drop the warm-up turn; only the seeded turn remains
+        let r = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                warm_msg("hello"),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let _ = body_string(r).await;
+        let parts = backend.prompted_parts();
+        let turn = parts.last().expect("a seeded turn was prompted");
+        assert_eq!(turn[0], "[Summary of earlier context in this session]\nS");
+        assert_eq!(turn[1], "hello");
+    }
+
+    #[tokio::test]
+    async fn seed_prepended_streaming() {
+        let (srv, sm, backend) = seed_test_server();
+        let ctx = ContextId::parse("c1").unwrap();
+        let r = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                warm_msg("go"),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let _ = collect_sse_frames(r).await;
+        wait_idle(&sm, &ctx).await;
+        sm.compact_session(&ctx, |_b, _s| async { Ok("S".to_string()) })
+            .await
+            .unwrap();
+        backend.clear_prompted_parts();
+        let r = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                warm_msg("hello"),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let _ = collect_sse_frames(r).await;
+        let parts = backend.prompted_parts();
+        let turn = parts.last().expect("a seeded turn was prompted");
+        assert_eq!(turn[0], "[Summary of earlier context in this session]\nS");
+        assert_eq!(turn[1], "hello");
     }
 
     struct UsageThenTextBackend;
