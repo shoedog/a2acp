@@ -218,13 +218,14 @@ impl SessionManager {
                 h.state = SessionState::Running;
                 h.op = Some(op.clone());
                 h.last_used = (self.now)();
+                let seed = h.pending_seed.take();
                 return Ok(WarmTurn {
                     backend: h.backend.clone(),
                     session: h.backend_session.clone(),
                     usage_warning,
                     generation: h.generation,
                     op,
-                    seed: None,
+                    seed,
                 });
             }
             if d.contains(&"agent") {
@@ -289,13 +290,14 @@ impl SessionManager {
                 h.state = SessionState::Running;
                 h.op = Some(op.clone());
                 h.last_used = (self.now)();
+                let seed = h.pending_seed.take();
                 return Ok(WarmTurn {
                     backend: h.backend.clone(),
                     session: h.backend_session.clone(),
                     usage_warning,
                     generation: h.generation,
                     op,
-                    seed: None,
+                    seed,
                 });
             }
             // Non-clean (failed reconcile OR cancel/release arrived mid-window): EXPIRE via an `Expiring`
@@ -540,6 +542,7 @@ impl SessionManager {
         h.generation = new_gen;
         h.usage = UsageSnapshot::default();
         h.op = None;
+        h.pending_seed = None;
         h.state = SessionState::Idle;
         h.last_used = (self.now)();
         Ok(ResetOutcome::Cleared {
@@ -1273,6 +1276,80 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, BridgeError::ConfigInvalid { .. })); // FIX-3: configure error, NOT SessionExpired
         assert!(m.status(&c).await.is_none()); // handle EXPIRED (removed)
+    }
+
+    #[tokio::test]
+    async fn checkout_consumes_seed_once() {
+        let (m, _f, _r) = manager();
+        let c = ctx("c");
+        let t = m
+            .checkout_turn(&c, agent(), None, None, op("t0"))
+            .await
+            .unwrap();
+        m.finish_turn(&c, t.generation, &t.op).await;
+        m.compact_session(&c, |_b, _s| async { Ok("SUMMARY".into()) })
+            .await
+            .unwrap();
+        // First checkout after compact carries the seed; clear it; second sees None.
+        let t1 = m
+            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .await
+            .unwrap();
+        assert_eq!(t1.seed.as_deref(), Some("SUMMARY"));
+        m.finish_turn(&c, t1.generation, &t1.op).await;
+        let t2 = m
+            .checkout_turn(&c, agent(), None, None, op("t2"))
+            .await
+            .unwrap();
+        assert_eq!(t2.seed, None);
+    }
+
+    #[tokio::test]
+    async fn seed_delivered_on_reconcile_checkout() {
+        // FIX-10: the seed is ALSO taken at the post-reconcile clean resume return (:261-275), not only clean-diff.
+        // Mirror the clean-reconcile setup in `model_override_change_reconciles_and_advances_fingerprint` (:1277).
+        let (m, fake, _r) = manager();
+        let c = ctx("c");
+        let t = m
+            .checkout_turn(&c, agent(), None, None, op("t0"))
+            .await
+            .unwrap();
+        m.finish_turn(&c, t.generation, &t.op).await;
+        m.compact_session(&c, |_b, _s| async { Ok("SUMMARY".into()) })
+            .await
+            .unwrap();
+        // A model-override checkout takes the reconcile path; the seed must still be delivered.
+        let t1 = m
+            .checkout_turn(&c, agent(), Some(model_override("m1")), None, op("t1"))
+            .await
+            .unwrap();
+        assert_eq!(t1.seed.as_deref(), Some("SUMMARY"));
+        assert!(
+            !fake.reconciled().is_empty(),
+            "exercised the reconcile resume path"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_drops_pending_seed() {
+        let (m, _f, _r) = manager();
+        let c = ctx("c");
+        let t = m
+            .checkout_turn(&c, agent(), None, None, op("t0"))
+            .await
+            .unwrap();
+        m.finish_turn(&c, t.generation, &t.op).await;
+        m.compact_session(&c, |_b, _s| async { Ok("SUMMARY".into()) })
+            .await
+            .unwrap();
+        m.reset_session(&c, ResetOpts { force: false })
+            .await
+            .unwrap(); // plain clear after compact
+        let t1 = m
+            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .await
+            .unwrap();
+        assert_eq!(t1.seed, None, "clear drops the pending seed");
     }
 
     #[tokio::test]
