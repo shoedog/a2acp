@@ -69,13 +69,29 @@ Both reviewers returned `fix-then-execute`; layering keystone confirmed sound. T
   for a workflow parent (never a handle), a children-only `clear_with_children` must return SUCCESS — change the
   handler, not just the SM helper.
 
+### v3 — round-2 plan-review folds (codex xhigh; the PFIX intent folded INTO the task bodies)
+Round-2 confirmed the seam is sound but flagged stale/non-compiling TASK-BODY snippets. Folded directly into the
+tasks so a literal implementor is correct without cross-referencing the PFIX list:
+- T2/T6/File-Structure: parameter-threaded dispatcher everywhere (no `node_dispatch` field); warm branch `match`
+  on `d.checkout` (not `?`); warm cancel does NOT double-`backend.cancel`; KEEP the `:76` cancel pre-check before
+  the warm branch (don't mint a child for an already-canceled run).
+- T3/T4 (BLOCKER): `checkout_child_turn` HOLDS `children` across `checkout_turn`+insert; `*_with_children` sweeps
+  take `children` FIRST and hold across the sweep (order children→by_context, no deadlock).
+- T5 (BLOCKER, compile): derive the child id with `parent.as_str()`/`wf_id`/`node.id.as_str()` (ids have no
+  `Display`).
+- T6 (BLOCKER): `session_cancel` ALWAYS `cancel_with_children(C)` (no bare-`cancel` fallback); register the run
+  token in BOTH `workflow_runs[C]` (SessionCancel) AND `workflow_cancels[task]` (CancelTask). New post-run test.
+- T7 (MAJOR): place the unary workflow+context reject AFTER `gate()` but BEFORE `store.put` (`:2371`) — no state
+  mutation on a rejected request.
+
 ---
 
 ## File Structure
 - `crates/bridge-workflow/Cargo.toml` — `async-trait` dev→`[dependencies]` (FIX-1).
 - `crates/bridge-workflow/src/executor.rs` — `WorkflowNodeDispatcher` trait + `NodeTurn`/`NodeTurnExit`/
-  `NodeTurnCleanup`; `WorkflowExecutor.node_dispatch: Option<Arc<dyn WorkflowNodeDispatcher>>`; the
-  `*_and_dispatcher` entry methods; `run_node` warm branch (cold inline UNCHANGED) + seed prepend.
+  `NodeTurnCleanup`; the `*_and_dispatcher` entry methods that THREAD `dispatcher: Arc<dyn WorkflowNodeDispatcher>`
+  as a parameter into `run_node` (PFIX-1 — NO struct field; `run_node` gains `dispatcher: Option<&Arc<dyn
+  WorkflowNodeDispatcher>>`); `run_node` warm branch (cold inline UNCHANGED) + seed prepend.
 - `crates/bridge-a2a-inbound/src/session_manager.rs` — `children` map + `checkout_child_turn` +
   `{release,clear,cancel}_with_children` + `expire_turn` (FIX-2).
 - `crates/bridge-a2a-inbound/src/server.rs` — `WarmWorkflowNodeDispatcher` (FIX-2/5/6/7); the workflow-run
@@ -142,8 +158,10 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
   the dispatcher's session, `cleanup.on_exit(Normal)` ran. (c) `warm_seed_prepended` — `NodeTurn.seed=Some("S")`
   → the prompt's FIRST part is the wrapped seed. (d) `dispatcher_cancel_drains` — cancel mid-run →
   `on_exit(Canceled)` + the `FuturesUnordered` drain still completes (W3b).
-- [ ] **Step 3 (impl):** in `run_node`, branch at the top on the threaded param: `match dispatcher { Some(d) =>
-  WARM, None => COLD }`. WARM path: `let turn = match d.checkout(wf_id, node, run_id, ctx).await { Ok(t) => t,
+- [ ] **Step 3 (impl):** in `run_node`, KEEP the existing `:76` `if cancel.is_cancelled() { return (format!(
+  "[node {} canceled]", node.id.as_str()), false) }` pre-check FIRST (MINOR-2: an already-canceled warm run must
+  NOT mint/claim a child session), THEN branch on the threaded param: `match dispatcher { Some(d) => WARM, None
+  => COLD }`. WARM path: `let turn = match d.checkout(wf_id, node, run_id, ctx).await { Ok(t) => t,
   Err(e) => return (format!("[node {} failed: {:?}]", node.id, e), false) };` (PFIX-2 — `run_node` returns
   `(String,bool)`, NOT `Result`; mirror the cold marker `executor.rs:98/100`, do NOT `?`/panic). Build `parts` =
   `seed`-prepended (if `turn.seed`, `parts.insert(0, Part{text: format!("[Summary of earlier context in this
@@ -173,13 +191,20 @@ pub async fn checkout_child_turn(
     &self, parent: &ContextId, child: &ContextId, agent: AgentId,
     overrides: Option<AgentOverride>, cwd: Option<SessionCwd>, op: OperationId,
 ) -> Result<WarmTurn, BridgeError> {
+    // PFIX-4 (FIX-2 atomicity): hold `children` ACROSS checkout_turn + insert. A concurrent
+    // `*_with_children` sweep takes `children` FIRST (Task 4), so it WAITS for an in-progress
+    // child checkout instead of missing it — closes the register-after-release leak window.
+    // Lock order is children → by_context (checkout_turn locks by_context internally); the
+    // sweeps use the same order, so no deadlock.
+    let mut children = self.children.lock().await;
     let turn = self.checkout_turn(child, agent, overrides, cwd, op).await?; // existing warm reuse/mint
-    self.children.lock().await.entry(parent.clone()).or_default().insert(child.clone()); // register on SUCCESS
+    children.entry(parent.clone()).or_default().insert(child.clone());      // register on SUCCESS, lock still held
     Ok(turn)
 }
 pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } // backend process gone (FIX-6)
 ```
-  (Registration AFTER `checkout_turn` success → no stale entry on failure, FIX-2/M3.)
+  (On `checkout_turn` failure the `?` returns BEFORE the insert → no stale entry, FIX-2/M3. The held
+  `children` lock makes register-on-success atomic w.r.t. sweeps.)
 - [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib checkout_child && cargo test --workspace --no-run`. Commit.
 
 ---
@@ -191,10 +216,13 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
 - [ ] **Step 1 (tests):** `release_with_children_sweeps` — register 2 children under C; `release_with_children(C)`
   releases C (if present) + both children + clears the map entry; tolerant of an absent parent handle
   (success). Same shape for `cancel_with_children` (cancel each child + C) and `clear_with_children` (reset each).
-- [ ] **Step 2 (impl):** add the three helpers — each snapshots `children[C]` under the lock, then for the
-  parent + each child calls the existing op (`release`/`cancel`/`reset_session`) tolerant of absent handles;
-  `release_with_children` also removes the `children[C]` entry. (`SessionNotFound` on the absent parent is
-  swallowed → success if any child swept, FIX-11.)
+- [ ] **Step 2 (impl):** add the three helpers. **PFIX-4: each LOCKS `children` FIRST and HOLDS it across the
+  whole sweep** (so it waits for an in-progress `checkout_child_turn` rather than missing a just-registered
+  child); take/`remove` the `children[C]` set, then for the parent + each child call the existing op
+  (`release`/`cancel`/`reset_session`) tolerant of absent handles (the per-op `by_context` lock is acquired
+  WHILE holding `children` — same children→by_context order as `checkout_child_turn`, no deadlock).
+  `release_with_children`/`clear_with_children` remove the `children[C]` entry; `cancel_with_children` likewise.
+  (`SessionNotFound` on the absent parent is swallowed → success even with zero children, FIX-11.)
 - [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib with_children && cargo test --workspace --no-run`. Commit.
 
 ---
@@ -209,7 +237,9 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   `sm.expire_turn(child)`; `on_exit(Error(other))` → `finish_turn`.
 - [ ] **Step 2 (impl):** add `struct WarmWorkflowNodeDispatcher { sm: Arc<SessionManager>, parent: ContextId,
   cwd: Option<SessionCwd> }` implementing `WorkflowNodeDispatcher::checkout`: derive `child =
-  ContextId::parse(format!("{}::workflow::{}::node::{}", parent, wf_id, node.id))`; mint an `op` from
+  ContextId::parse(format!("{}::workflow::{}::node::{}", parent.as_str(), wf_id, node.id.as_str()))?` (BLOCKER —
+  `ContextId`/`NodeId` are String newtypes with `as_str()` and NO `Display`; `wf_id` is already `&str`; the
+  `::`-containing string parses fine because `ContextId` uses the non-strict `id_newtype!` macro); mint an `op` from
   `(run_id, node.id)`; `let turn = sm.checkout_child_turn(parent, &child, node.agent.clone(), None, cwd, op)`;
   return `NodeTurn{ backend: turn.backend, session: turn.session, seed: turn.seed, cleanup: Box::new(WarmNode
   Cleanup{ sm, child, gen: turn.generation, op: turn.op }) }`. The `WarmNodeCleanup::on_exit` matches
@@ -225,7 +255,10 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
 
 - [ ] **Step 1 (tests):** `concurrent_same_context_workflow_handle_busy` — two streaming workflow sends on C →
   the 2nd returns `HandleBusy` (JSON-RPC) early; `session_cancel_cancels_workflow_run` — `SessionCancel C`
-  cancels the parent run token (the executor stops scheduling) + `cancel_with_children(C)`.
+  cancels the parent run token (the executor stops scheduling) + `cancel_with_children(C)`;
+  `session_cancel_workflow_parent_sweeps_children` (PFIX-5) — AFTER the workflow run has finished (token already
+  removed from `workflow_runs`), `SessionCancel C` STILL sweeps the registered children (no token to cancel, but
+  `cancel_with_children(C)` runs unconditionally).
 - [ ] **Step 2 (impl):** add `workflow_runs: Mutex<HashMap<ContextId, CancellationToken>>` to `InboundServer`.
   In the `RouteTarget::Workflow` STREAMING dispatch (`stream_message` → `spawn_workflow_producer`), when
   `routed.context_id` is `Some(C)`: BEFORE returning the SSE response (PFIX-6: in the `stream_message`
@@ -233,9 +266,14 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   `workflow_runs`; if `C` present → `HandleBusy`; else insert `C→token`. Drive the run via
   `executor.run_with_context_and_dispatcher(..., Arc::new(WarmWorkflowNodeDispatcher{sm, parent:C, cwd}))` on the
   `&WorkflowExecutor` (Arc derefs — PFIX-1, NOT `.with_node_dispatch`) + pass the token as the run's cancel. On
-  producer exit, remove `workflow_runs[C]` (mirror `workflow_cancels` :1711/:1731). In
-  `session_cancel` (`server.rs:3104`): if `workflow_runs[C]` exists, `token.cancel()` (stop the scheduler) THEN
-  `sm.cancel_with_children(C)`; else fall back to `sm.cancel(C)`.
+  producer exit, remove `workflow_runs[C]`. **MAJOR-1: also KEEP the existing `workflow_cancels[task]`
+  insert/remove** (it backs `CancelTask` `:2832`) — register the SAME token in BOTH maps (`workflow_runs[C]` for
+  `SessionCancel C`; `workflow_cancels[task]` for `CancelTask`) and remove from BOTH on producer exit (mirror
+  :1711/:1731; note the `routed.task`/`session_cwd` move order :1690/:1716). In `session_cancel`
+  (`server.rs:3104`): **BLOCKER — ALWAYS sweep.** If `workflow_runs[C]` exists, `token.cancel()` (stop the
+  scheduler); THEN call `sm.cancel_with_children(C)` UNCONDITIONALLY (PFIX-5/FIX-11 — sweeps the parent's
+  children even AFTER the run finished; tolerant of an absent parent handle). Do NOT fall back to bare
+  `sm.cancel(C)`.
 - [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib 'workflow_run|session_cancel_cancels' && cargo test
   --workspace --no-run`. Commit.
 
@@ -251,7 +289,9 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
 - [ ] **Step 2 (impl):** in `gate()` (`:352`) change the rejection to `if context_id.is_some() &&
   !matches!(target, RouteTarget::Local(_) | RouteTarget::Workflow(_))` (FIX-10). In the UNARY `SendMessage`
   path, reject `routed.context_id.is_some() && matches!(target, Workflow)` (unary workflow = detached, deferred
-  — FIX-8). Change the `SessionRelease`/`SessionClear` handlers (`server.rs:3005/3030`) to call
+  — FIX-8). **MAJOR-2: place this reject immediately after the successful `gate()` and BEFORE `srv.store.put`
+  (`server.rs:2371`)** — return the JSON-RPC error before ANY task/session store write, so a rejected request
+  never mutates state. Change the `SessionRelease`/`SessionClear` handlers (`server.rs:3005/3030`) to call
   `sm.release_with_children`/`clear_with_children` and treat an absent parent handle as success (FIX-11). (The
   `SessionCancel` sweep was done in T6.)
 - [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib 'gate_|session_release_workflow' && cargo test
