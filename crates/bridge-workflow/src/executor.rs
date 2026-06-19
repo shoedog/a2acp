@@ -5,7 +5,7 @@ use crate::template::render;
 use bridge_core::domain::{effective_config, Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
-use bridge_core::ports::{AgentRegistry, Update, STOP_REASON_CANCELLED};
+use bridge_core::ports::{AgentBackend, AgentRegistry, Update, STOP_REASON_CANCELLED};
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -19,6 +19,37 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default, Clone)]
 pub struct WorkflowRunContext {
     pub session_cwd: Option<SessionCwd>,
+}
+
+pub enum NodeTurnExit {
+    Normal,
+    Canceled,
+    Error(BridgeError),
+}
+
+#[async_trait::async_trait]
+pub trait NodeTurnCleanup: Send {
+    /// Invoked once after prompt+drain on the node's exit branch. Each impl closes over what it owns
+    /// (cold: backend+session for forget; warm: SessionManager+child+gen+op for finish/cancel/expire).
+    async fn on_exit(self: Box<Self>, exit: NodeTurnExit);
+}
+
+pub struct NodeTurn {
+    pub backend: Arc<dyn AgentBackend>,
+    pub session: SessionId,
+    pub seed: Option<String>, // warm-only; prepended to the node prompt parts (Slice-4 seed)
+    pub cleanup: Box<dyn NodeTurnCleanup>,
+}
+
+#[async_trait::async_trait]
+pub trait WorkflowNodeDispatcher: Send + Sync {
+    async fn checkout(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        ctx: &WorkflowRunContext,
+    ) -> Result<NodeTurn, BridgeError>;
 }
 
 /// Uniform future type used in the per-run `FuturesUnordered` pool.
@@ -349,6 +380,7 @@ mod tests {
     use bridge_core::ids::{AgentId, NodeId, SessionId, WorkflowId};
     use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
     use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
 
@@ -461,6 +493,61 @@ mod tests {
                 inputs: vec![],
             }],
         })
+    }
+
+    pub(super) struct CountingCleanup {
+        pub calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeTurnCleanup for CountingCleanup {
+        async fn on_exit(self: Box<Self>, _exit: NodeTurnExit) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) struct FakeDispatcher {
+        pub calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for FakeDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            Ok(NodeTurn {
+                backend: Arc::new(FakeBackend {
+                    reply: String::new(),
+                    rec: Arc::new(Rec::default()),
+                }),
+                session: SessionId::parse("workflow-w-only-run1").unwrap(),
+                seed: None,
+                cleanup: Box::new(CountingCleanup {
+                    calls: self.calls.clone(),
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn node_turn_cleanup_trait_object_runs_on_exit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher = FakeDispatcher {
+            calls: calls.clone(),
+        };
+        let graph = one_node_graph();
+        let turn = dispatcher
+            .checkout("w", &graph.nodes[0], "run1", &WorkflowRunContext::default())
+            .await
+            .unwrap();
+
+        turn.cleanup.on_exit(NodeTurnExit::Normal).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
