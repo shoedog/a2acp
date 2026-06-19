@@ -116,6 +116,7 @@ pub struct SessionManager {
     by_context: Mutex<HashMap<ContextId, WarmHandle>>,
     idle_ttl: Duration,
     warn_fraction: Option<f64>,
+    compact_summarize_timeout: Duration,
     now: Box<dyn Fn() -> Instant + Send + Sync>,
     seq: std::sync::atomic::AtomicU64,
 }
@@ -135,6 +136,7 @@ impl SessionManager {
             by_context: Mutex::new(HashMap::new()),
             idle_ttl,
             warn_fraction: None,
+            compact_summarize_timeout: Duration::from_secs(120),
             now,
             seq: std::sync::atomic::AtomicU64::new(0),
         }
@@ -143,6 +145,21 @@ impl SessionManager {
     pub fn with_warn_fraction(mut self, f: Option<f64>) -> Self {
         self.warn_fraction = f.filter(|v| *v > 0.0 && *v <= 1.0);
         self
+    }
+
+    pub fn with_compact_summarize_timeout(mut self, d: Duration) -> Self {
+        self.compact_summarize_timeout = d;
+        self
+    }
+
+    /// Test-only: observe the stashed next-turn seed (delivery is wired in checkout_turn at Slice-4 T5).
+    #[cfg(test)]
+    async fn pending_seed(&self, ctx: &ContextId) -> Option<String> {
+        self.by_context
+            .lock()
+            .await
+            .get(ctx)
+            .and_then(|h| h.pending_seed.clone())
     }
 
     fn eval_warn(&self, u: &UsageSnapshot) -> Option<UsageWarning> {
@@ -528,6 +545,147 @@ impl SessionManager {
         Ok(ResetOutcome::Cleared {
             generation: new_gen.get(),
         })
+    }
+
+    /// Compact: summarize the gen-N context, reset to N+1, and seed the summary for the next turn.
+    /// require-Idle (no force). On ANY summarize failure the handle is EXPIRED (the old context is already
+    /// mutated by the failed summarize exchange — no rollback). [Slice 4, FIX-1..14]
+    pub async fn compact_session<F, Fut>(
+        &self,
+        ctx: &ContextId,
+        summarize: F,
+    ) -> Result<ResetOutcome, BridgeError>
+    where
+        F: FnOnce(Arc<dyn AgentBackend>, SessionId) -> Fut,
+        Fut: std::future::Future<Output = Result<String, BridgeError>>,
+    {
+        // (1) Claim Idle -> Compacting under one lock; capture incl. the fallible cwd parse BEFORE the flip (FIX-9).
+        let (backend, old_id, claimed_id, new_gen, new_id, spec) = {
+            let mut tab = self.by_context.lock().await;
+            let Some(h) = tab.get_mut(ctx) else {
+                return Ok(ResetOutcome::NotFound);
+            };
+            if h.state != SessionState::Idle {
+                return Err(BridgeError::HandleBusy);
+            }
+            let backend = h.backend.clone();
+            let old_id = h.backend_session.clone();
+            let claimed_id = h.id.clone();
+            let new_gen = SessionGeneration::new(h.generation.get() + 1);
+            let new_id = SessionId::parse(format!("ctx-{}-g{}", ctx.as_str(), new_gen.get()))
+                .map_err(|_| BridgeError::InvalidRequest { field: "contextId" })?;
+            let cwd = match h.fingerprint.cwd.as_deref() {
+                Some(s) => Some(
+                    SessionCwd::parse(s).map_err(|_| BridgeError::ConfigInvalid {
+                        reason: "session cwd".into(),
+                    })?,
+                ),
+                None => None,
+            };
+            let spec = SessionSpec {
+                config: h.fingerprint.config.clone(),
+                cwd,
+            };
+            h.state = SessionState::Compacting;
+            h.expire_after_reconcile = false;
+            (backend, old_id, claimed_id, new_gen, new_id, spec)
+        };
+
+        // (2) Summarize on the gen-N session, TIME-BOUNDED, claim held (FIX-5).
+        let summarized = tokio::time::timeout(
+            self.compact_summarize_timeout,
+            summarize(backend.clone(), old_id.clone()),
+        )
+        .await;
+
+        // (3) Bad summary (Err / empty / timeout) -> EXPIRE (FIX-1/2). Never restore Idle.
+        let summary = match summarized {
+            Ok(Ok(s)) if !s.trim().is_empty() => s,
+            bad => {
+                let err = match bad {
+                    Ok(Ok(_)) => BridgeError::AgentCrashed {
+                        reason: "compact summary was empty".into(),
+                    },
+                    Ok(Err(e)) => e,
+                    Err(_) => BridgeError::AgentCrashed {
+                        reason: "compact summarize timed out".into(),
+                    },
+                };
+                self.expire_after_summarize(ctx, &claimed_id, backend.as_ref(), &old_id)
+                    .await;
+                return Err(err);
+            }
+        };
+
+        // (4) Good summary -> reset tail under Compacting (mirrors reset_session:475-519), stash seed on commit.
+        backend.release_session(&old_id).await;
+        let cfg = backend.configure_session(&new_id, &spec).await;
+        let mut tab = self.by_context.lock().await;
+        let still_ours = matches!(tab.get(ctx), Some(h) if h.id == claimed_id && h.state == SessionState::Compacting);
+        let new_stashed = cfg.is_ok();
+        if !still_ours {
+            drop(tab);
+            if new_stashed {
+                backend.release_session(&new_id).await;
+            }
+            return Err(BridgeError::SessionExpired);
+        }
+        let deferred = tab
+            .get(ctx)
+            .map(|h| h.expire_after_reconcile)
+            .unwrap_or(true);
+        if cfg.is_err() || deferred {
+            drop(tab);
+            if new_stashed {
+                backend.release_session(&new_id).await;
+            }
+            let mut tab = self.by_context.lock().await;
+            if let Some(h) = tab.remove(ctx) {
+                drop(h.lease);
+            }
+            return match cfg {
+                Err(e) => Err(e), // FIX-3: configure error, NOT SessionExpired
+                Ok(()) => Err(BridgeError::SessionExpired),
+            };
+        }
+        let h = tab.get_mut(ctx).expect("still_ours");
+        h.backend_session = new_id;
+        h.generation = new_gen;
+        h.usage = UsageSnapshot::default();
+        h.op = None;
+        h.pending_seed = Some(summary);
+        h.state = SessionState::Idle;
+        h.last_used = (self.now)();
+        Ok(ResetOutcome::Cleared {
+            generation: new_gen.get(),
+        })
+    }
+
+    /// EXPIRE a Compacting handle after a failed summarize: tombstone -> release old -> remove + drop lease.
+    /// Mirrors the non-clean tail of `checkout_turn` (:276-292).
+    async fn expire_after_summarize(
+        &self,
+        ctx: &ContextId,
+        claimed_id: &SessionHandleId,
+        backend: &dyn AgentBackend,
+        old_id: &SessionId,
+    ) {
+        {
+            let mut tab = self.by_context.lock().await;
+            let still_ours = matches!(
+                tab.get(ctx),
+                Some(h) if h.id == *claimed_id && h.state == SessionState::Compacting
+            );
+            if !still_ours {
+                return;
+            }
+            tab.get_mut(ctx).expect("still_ours").state = SessionState::Expiring;
+        }
+        backend.release_session(old_id).await;
+        let mut tab = self.by_context.lock().await;
+        if let Some(h) = tab.remove(ctx) {
+            drop(h.lease);
+        }
     }
 
     /// Reap only idle warm sessions past the TTL (never an active turn).
@@ -956,6 +1114,56 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(out, ResetOutcome::NotFound));
+    }
+
+    #[tokio::test]
+    async fn compact_advances_generation_and_seeds() {
+        let (m, fake, _r) = manager();
+        let c = ctx("c1");
+        // Warm + idle a session at gen 0.
+        let turn = m
+            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .await
+            .unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        let out = m
+            .compact_session(&c, |_b, _s| async { Ok("THE SUMMARY".to_string()) })
+            .await
+            .unwrap();
+        assert_eq!(out, ResetOutcome::Cleared { generation: 1 });
+        let st = m.status(&c).await.unwrap();
+        assert_eq!(st.generation, 1);
+        assert_eq!(st.state, "idle");
+        // Exactly the old session is released, once (no double-release).
+        assert_eq!(fake.releases(), vec!["ctx-c1-g0".to_string()]);
+        assert!(fake.configured().iter().any(|s| s == "ctx-c1-g1")); // new configured
+                                                                     // The summary is stashed as the pending seed (delivered to the next checkout in T5).
+        assert_eq!(m.pending_seed(&c).await.as_deref(), Some("THE SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn compact_on_running_is_handle_busy() {
+        let (m, _f, _r) = manager();
+        let c = ctx("c2");
+        let _turn = m
+            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .await
+            .unwrap(); // Running
+        let err = m
+            .compact_session(&c, |_b, _s| async { Ok("x".to_string()) })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::HandleBusy);
+    }
+
+    #[tokio::test]
+    async fn compact_unknown_ctx_is_not_found() {
+        let (m, _f, _r) = manager();
+        let out = m
+            .compact_session(&ctx("nope"), |_b, _s| async { Ok("x".to_string()) })
+            .await
+            .unwrap();
+        assert_eq!(out, ResetOutcome::NotFound);
     }
 
     #[tokio::test]
