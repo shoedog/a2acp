@@ -50,6 +50,8 @@ pub struct ServerConfig {
     /// Advisory pre-task warn when carried context usage >= this window fraction in (0,1]. None = off. [Slice 2]
     #[serde(default)]
     pub warm_usage_warn_fraction: Option<f64>,
+    #[serde(default)]
+    pub compact_summarize_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2267,13 +2269,15 @@ addr = "127.0.0.1:8080"
         let cfg: RegistryConfig = RegistryConfig::parse(base).unwrap();
         assert_eq!(cfg.server.warm_idle_ttl_secs, 1800);
         assert_eq!(cfg.server.warm_usage_warn_fraction, None);
+        assert_eq!(cfg.server.compact_summarize_timeout_secs, None);
 
         let cfg2: RegistryConfig = RegistryConfig::parse(&format!(
-            "{base}warm_idle_ttl_secs = 5\nwarm_usage_warn_fraction = 0.8\n"
+            "{base}warm_idle_ttl_secs = 5\nwarm_usage_warn_fraction = 0.8\ncompact_summarize_timeout_secs = 7\n"
         ))
         .unwrap();
         assert_eq!(cfg2.server.warm_idle_ttl_secs, 5);
         assert_eq!(cfg2.server.warm_usage_warn_fraction, Some(0.8));
+        assert_eq!(cfg2.server.compact_summarize_timeout_secs, Some(7));
     }
 
     #[test]

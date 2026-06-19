@@ -402,17 +402,14 @@ async fn try_win_cancel_key(
     guard.lock().await.insert(key)
 }
 
-#[allow(dead_code)]
 const SUMMARIZE_PROMPT: &str = "Summarize the conversation so far into a faithful, self-contained summary that \
 a fresh session could continue from. Preserve durable facts, decisions, and identifiers; exclude any values \
 explicitly marked temporary or throwaway. Do NOT use tools, read files, or run commands — reply with the \
 summary text only.";
-#[allow(dead_code)]
 const MAX_SUMMARY_BYTES: usize = 32 * 1024;
 
 /// Drive a single summarize turn on `session` and collect the FULL text (routes around the unary
 /// last-chunk truncation). Bounds bytes during the drain; treats a permission update as a failure. [Slice 4]
-#[allow(dead_code)]
 async fn summarize_collect(
     backend: Arc<dyn AgentBackend>,
     session: SessionId,
@@ -739,6 +736,7 @@ async fn jsonrpc(
         "SessionRelease" => session_release(srv, headers, id, params).await,
         "SessionCancel" => session_cancel(srv, headers, id, params).await,
         "SessionClear" => session_clear(srv, headers, id, params).await,
+        "SessionCompact" => session_compact(srv, headers, id, params).await,
         "" => jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "missing method"),
         _ => jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "method not found"),
     }
@@ -3024,6 +3022,37 @@ async fn session_clear(
         Ok(crate::session_manager::ResetOutcome::Cleared { generation }) => jsonrpc_ok(
             id,
             json!({ "contextId": ctx.as_str(), "cleared": true, "generation": generation }),
+        ),
+        Ok(crate::session_manager::ResetOutcome::NotFound) => {
+            bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound)
+        }
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    }
+}
+
+async fn session_compact(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(sm) = srv.session_manager.clone() else {
+        return jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "no session manager");
+    };
+    let ctx = match context_id_arg(&params) {
+        Ok(c) => c,
+        Err(e) => return bridge_err_to_jsonrpc(id, &e),
+    };
+    match sm
+        .compact_session(&ctx, summarize_collect)
+        .await
+    {
+        Ok(crate::session_manager::ResetOutcome::Cleared { generation }) => jsonrpc_ok(
+            id,
+            json!({ "contextId": ctx.as_str(), "compacted": true, "generation": generation }),
         ),
         Ok(crate::session_manager::ResetOutcome::NotFound) => {
             bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound)
@@ -6092,6 +6121,52 @@ mod tests {
         let turn = parts.last().expect("a seeded turn was prompted");
         assert_eq!(turn[0], "[Summary of earlier context in this session]\nS");
         assert_eq!(turn[1], "hello");
+    }
+
+    #[tokio::test]
+    async fn session_compact_dispatch() {
+        let (srv, sm, _backend) = seed_test_server();
+        let ctx = ContextId::parse("c1").unwrap();
+        let r = router(srv.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, warm_msg("go"), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let _ = body_string(r).await;
+        wait_idle(&sm, &ctx).await;
+        // The handler's summarize_collect drives WarmRecordingBackend::prompt -> "warm" (non-empty) -> compacts.
+        let r = router(srv)
+            .oneshot(post_request(
+                "SessionCompact",
+                json!({ "contextId": "c1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(
+            v["result"],
+            json!({ "contextId": "c1", "compacted": true, "generation": 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn session_compact_unknown_ctx_is_not_found() {
+        let (srv, _sm, _backend) = seed_test_server();
+        let r = router(srv)
+            .oneshot(post_request(
+                "SessionCompact",
+                json!({ "contextId": "nope" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        // SessionNotFound is RejectRequest -> HTTP 400 (matches session_clear_unknown_ctx_is_not_found :6617-6621).
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let v: Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(v["error"]["message"], "session not found");
     }
 
     struct UsageThenTextBackend;
