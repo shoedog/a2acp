@@ -990,6 +990,17 @@ mod tests {
         )
     }
 
+    fn manager_with_timeout(d: Duration) -> (SessionManager, Arc<FakeBackend>, Arc<FakeRegistry>) {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        (
+            SessionManager::new(registry.clone(), Duration::from_secs(30))
+                .with_compact_summarize_timeout(d),
+            backend,
+            registry,
+        )
+    }
+
     fn agent() -> AgentId {
         AgentId::parse("codex").unwrap()
     }
@@ -1164,6 +1175,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, ResetOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn compact_bad_summary_expires_handle() {
+        for bad in ["__ERR__", "   "] {
+            let (m, fake, _r) = manager();
+            let c = ctx("c");
+            let turn = m
+                .checkout_turn(&c, agent(), None, None, op("t1"))
+                .await
+                .unwrap();
+            m.finish_turn(&c, turn.generation, &turn.op).await;
+            let b = bad.to_string();
+            let err = m
+                .compact_session(&c, move |_b, _s| {
+                    let b = b.clone();
+                    async move {
+                        if b == "__ERR__" {
+                            Err(BridgeError::AgentCrashed {
+                                reason: "boom".into(),
+                            })
+                        } else {
+                            Ok(b)
+                        } // whitespace-only -> empty
+                    }
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BridgeError::AgentCrashed { .. }));
+            assert!(
+                m.status(&c).await.is_none(),
+                "handle EXPIRED (removed), not restored Idle"
+            );
+            assert!(
+                fake.releases().iter().any(|s| s == "ctx-c-g0"),
+                "old session released"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_summary_timeout_expires() {
+        let (m, _f, _r) = manager_with_timeout(std::time::Duration::from_millis(10));
+        let c = ctx("c");
+        let turn = m
+            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .await
+            .unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        let err = m
+            .compact_session(&c, |_b, _s| async {
+                futures::future::pending::<()>().await; // never resolves
+                Ok(String::new())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::AgentCrashed { .. }));
+        assert!(m.status(&c).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn compact_oversize_summary_expires() {
+        // PFIX-10: a MessageTooLarge from the closure EXPIRES the handle (FIX-1/7) — explicit manager-level test.
+        let (m, fake, _r) = manager();
+        let c = ctx("c");
+        let turn = m
+            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .await
+            .unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        let err = m
+            .compact_session(&c, |_b, _s| async { Err(BridgeError::MessageTooLarge) })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::MessageTooLarge);
+        assert!(m.status(&c).await.is_none());
+        assert!(fake.releases().iter().any(|s| s == "ctx-c-g0"));
+    }
+
+    #[tokio::test]
+    async fn compact_configure_failure_returns_configure_error() {
+        // PFIX-3: set the configure failure AFTER the warm-up (the fake fails EVERY configure incl. g0).
+        let (m, fake, _r) = manager();
+        let c = ctx("c");
+        let turn = m
+            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .await
+            .unwrap(); // configures g0 OK
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        fake.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "test".into(),
+        })); // g1 will fail
+        let err = m
+            .compact_session(&c, |_b, _s| async { Ok("good summary".to_string()) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::ConfigInvalid { .. })); // FIX-3: configure error, NOT SessionExpired
+        assert!(m.status(&c).await.is_none()); // handle EXPIRED (removed)
     }
 
     #[tokio::test]
