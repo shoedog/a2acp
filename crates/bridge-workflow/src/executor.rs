@@ -95,6 +95,7 @@ impl WorkflowExecutor {
 
     /// Run one node: render its prompt from `vars`, resolve+configure+prompt+drain, forget.
     /// Returns (text, ok). On any failure returns the error marker + ok=false.
+    #[allow(clippy::too_many_arguments)]
     async fn run_node(
         &self,
         wf_id: &str,
@@ -103,9 +104,81 @@ impl WorkflowExecutor {
         run_id: &str,
         cancel: &CancellationToken,
         ctx: &WorkflowRunContext,
+        dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>,
     ) -> (String, bool) {
         if cancel.is_cancelled() {
             return (format!("[node {} canceled]", node.id.as_str()), false);
+        }
+        if let Some(d) = dispatcher {
+            let rendered = render(&node.prompt_template, vars);
+            let turn = match d.checkout(wf_id, node, run_id, ctx).await {
+                Ok(t) => t,
+                Err(e) => {
+                    return (
+                        format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                        false,
+                    )
+                }
+            };
+            if cancel.is_cancelled() {
+                turn.cleanup.on_exit(NodeTurnExit::Normal).await;
+                return (format!("[node {} canceled]", node.id.as_str()), false);
+            }
+
+            let mut parts = vec![Part { text: rendered }];
+            if let Some(seed) = turn.seed {
+                parts.insert(
+                    0,
+                    Part {
+                        text: format!("[Summary of earlier context in this session]\n{seed}"),
+                    },
+                );
+            }
+
+            let mut stream = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    turn.cleanup.on_exit(NodeTurnExit::Normal).await;
+                    return (format!("[node {} canceled]", node.id.as_str()), false);
+                }
+                s = turn.backend.prompt(&turn.session, parts) => match s {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
+                        turn.cleanup.on_exit(NodeTurnExit::Error(e)).await;
+                        return (text, false);
+                    }
+                },
+            };
+            let mut text = String::new();
+            let mut ok = true;
+            let exit = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        ok = false;
+                        text = format!("[node {} canceled]", node.id.as_str());
+                        break NodeTurnExit::Canceled;
+                    }
+                    item = stream.next() => match item {
+                        Some(Ok(Update::Text(t))) => text.push_str(&t),
+                        Some(Ok(Update::Permission(_))) => {}
+                        Some(Ok(Update::Usage(_))) => {}
+                        Some(Ok(Update::Done { stop_reason })) => {
+                            if stop_reason == STOP_REASON_CANCELLED { ok = false; }
+                            break NodeTurnExit::Normal;
+                        }
+                        Some(Err(e)) => {
+                            ok = false;
+                            text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
+                            break NodeTurnExit::Error(e);
+                        }
+                        None => break NodeTurnExit::Normal,
+                    }
+                }
+            };
+            turn.cleanup.on_exit(exit).await;
+            return (text, ok);
         }
         let rendered = render(&node.prompt_template, vars);
         let session = match SessionId::parse(format!(
@@ -210,6 +283,26 @@ impl WorkflowExecutor {
         self.run_from_with_context(graph, input, run_id, cancel, HashMap::new(), ctx)
     }
 
+    pub fn run_with_context_and_dispatcher(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        ctx: WorkflowRunContext,
+        dispatcher: Arc<dyn WorkflowNodeDispatcher>,
+    ) -> WorkflowStream {
+        self.run_from_with_context_and_dispatcher(
+            graph,
+            input,
+            run_id,
+            cancel,
+            HashMap::new(),
+            ctx,
+            dispatcher,
+        )
+    }
+
     /// Resume a workflow from a pre-loaded seed of already-completed node outputs.
     /// Seeded nodes are treated as done; only un-seeded nodes actually run.
     /// `run()` is a thin wrapper over this with an empty seed and default context.
@@ -249,6 +342,34 @@ impl WorkflowExecutor {
         cancel: CancellationToken,
         seed: HashMap<String, (String, bool)>,
         ctx: WorkflowRunContext,
+    ) -> WorkflowStream {
+        self.run_from_with_context_inner(graph, input, run_id, cancel, seed, ctx, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_from_with_context_and_dispatcher(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: HashMap<String, (String, bool)>,
+        ctx: WorkflowRunContext,
+        dispatcher: Arc<dyn WorkflowNodeDispatcher>,
+    ) -> WorkflowStream {
+        self.run_from_with_context_inner(graph, input, run_id, cancel, seed, ctx, Some(dispatcher))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_from_with_context_inner(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: HashMap<String, (String, bool)>,
+        ctx: WorkflowRunContext,
+        dispatcher: Option<Arc<dyn WorkflowNodeDispatcher>>,
     ) -> WorkflowStream {
         let this = WorkflowExecutor {
             registry: self.registry.clone(),
@@ -329,11 +450,12 @@ impl WorkflowExecutor {
                                 let cancel = cancel.clone();
                                 let wf_id = graph.id.as_str().to_string();
                                 let ctx = ctx.clone();
+                                let dispatcher = dispatcher.clone();
                                 let this = &this;
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
                                         owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                                    let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel, &ctx).await;
+                                    let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel, &ctx, dispatcher.as_ref()).await;
                                     (node.id.clone(), text, ok)
                                 }) as NodeFut);
                             }
@@ -388,7 +510,10 @@ mod tests {
     pub(super) struct Rec {
         pub configured: Mutex<bool>,
         pub prompts: Mutex<Vec<String>>,
+        pub prompt_parts: Mutex<Vec<Vec<Part>>>,
+        pub prompt_sessions: Mutex<Vec<SessionId>>,
         pub cancels: Mutex<u32>,
+        pub forgets: Mutex<u32>,
     }
     pub(super) struct FakeBackend {
         pub reply: String,
@@ -406,6 +531,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(parts.iter().map(|p| p.text.clone()).collect());
+            self.rec.prompt_parts.lock().unwrap().push(parts);
+            self.rec.prompt_sessions.lock().unwrap().push(_s.clone());
             let updates = vec![
                 Ok(Update::Text(self.reply.clone())),
                 Ok(Update::Done {
@@ -417,6 +544,9 @@ mod tests {
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
             *self.rec.cancels.lock().unwrap() += 1;
             Ok(())
+        }
+        async fn forget_session(&self, _s: &SessionId) {
+            *self.rec.forgets.lock().unwrap() += 1;
         }
         async fn configure_session(
             &self,
@@ -497,17 +627,28 @@ mod tests {
 
     pub(super) struct CountingCleanup {
         pub calls: Arc<AtomicUsize>,
+        pub exits: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
     impl NodeTurnCleanup for CountingCleanup {
-        async fn on_exit(self: Box<Self>, _exit: NodeTurnExit) {
+        async fn on_exit(self: Box<Self>, exit: NodeTurnExit) {
+            let label = match exit {
+                NodeTurnExit::Normal => "normal".to_string(),
+                NodeTurnExit::Canceled => "canceled".to_string(),
+                NodeTurnExit::Error(e) => format!("error:{e:?}"),
+            };
+            self.exits.lock().unwrap().push(label);
             self.calls.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     pub(super) struct FakeDispatcher {
         pub calls: Arc<AtomicUsize>,
+        pub exits: Arc<Mutex<Vec<String>>>,
+        pub rec: Arc<Rec>,
+        pub session: SessionId,
+        pub seed: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -519,15 +660,17 @@ mod tests {
             _run_id: &str,
             _ctx: &WorkflowRunContext,
         ) -> Result<NodeTurn, BridgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(NodeTurn {
                 backend: Arc::new(FakeBackend {
-                    reply: String::new(),
-                    rec: Arc::new(Rec::default()),
+                    reply: "WARM".into(),
+                    rec: self.rec.clone(),
                 }),
-                session: SessionId::parse("workflow-w-only-run1").unwrap(),
-                seed: None,
+                session: self.session.clone(),
+                seed: self.seed.clone(),
                 cleanup: Box::new(CountingCleanup {
                     calls: self.calls.clone(),
+                    exits: self.exits.clone(),
                 }),
             })
         }
@@ -536,8 +679,13 @@ mod tests {
     #[tokio::test]
     async fn node_turn_cleanup_trait_object_runs_on_exit() {
         let calls = Arc::new(AtomicUsize::new(0));
+        let exits = Arc::new(Mutex::new(Vec::new()));
         let dispatcher = FakeDispatcher {
             calls: calls.clone(),
+            exits: exits.clone(),
+            rec: Arc::new(Rec::default()),
+            session: SessionId::parse("workflow-w-only-run1").unwrap(),
+            seed: None,
         };
         let graph = one_node_graph();
         let turn = dispatcher
@@ -547,7 +695,385 @@ mod tests {
 
         turn.cleanup.on_exit(NodeTurnExit::Normal).await;
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(exits.lock().unwrap().as_slice(), ["normal"]);
+    }
+
+    #[tokio::test]
+    async fn warm_dispatch_no_forget() {
+        let rec = Arc::new(Rec::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let exits = Arc::new(Mutex::new(Vec::new()));
+        let session = SessionId::parse("warm-session").unwrap();
+        let dispatcher = Arc::new(FakeDispatcher {
+            calls: calls.clone(),
+            exits: exits.clone(),
+            rec: rec.clone(),
+            session: session.clone(),
+            seed: None,
+        });
+        let ex = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: std::collections::HashMap::new(),
+        }));
+
+        let events: Vec<_> = ex
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "run1".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                dispatcher,
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(matches!(
+            events.last().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                output
+            } if output == "WARM"
+        ));
+        assert_eq!(*rec.forgets.lock().unwrap(), 0, "warm path must not forget");
+        assert_eq!(rec.prompt_sessions.lock().unwrap().as_slice(), [session]);
+        assert_eq!(exits.lock().unwrap().as_slice(), ["normal"]);
+    }
+
+    #[tokio::test]
+    async fn warm_seed_prepended() {
+        let rec = Arc::new(Rec::default());
+        let dispatcher = Arc::new(FakeDispatcher {
+            calls: Arc::new(AtomicUsize::new(0)),
+            exits: Arc::new(Mutex::new(Vec::new())),
+            rec: rec.clone(),
+            session: SessionId::parse("warm-session").unwrap(),
+            seed: Some("S".into()),
+        });
+        let ex = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: std::collections::HashMap::new(),
+        }));
+
+        let _events: Vec<_> = ex
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "run1".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                dispatcher,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        let parts = rec.prompt_parts.lock().unwrap();
+        assert_eq!(
+            parts[0][0].text,
+            "[Summary of earlier context in this session]\nS"
+        );
+        assert_eq!(parts[0][1].text, "echo DIFF");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_cancel_drains() {
+        use tokio::sync::Notify;
+
+        struct Shared {
+            entered: AtomicUsize,
+            exits: Mutex<Vec<String>>,
+            both_in_flight: Notify,
+        }
+        struct PendingWarmBackend {
+            shared: Arc<Shared>,
+        }
+        #[async_trait::async_trait]
+        impl AgentBackend for PendingWarmBackend {
+            async fn prompt(
+                &self,
+                _s: &SessionId,
+                _p: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                if self.shared.entered.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                    self.shared.both_in_flight.notify_one();
+                }
+                Ok(Box::pin(futures::stream::pending()))
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                panic!("warm in-drain cancel is owned by cleanup")
+            }
+        }
+        struct ExitCleanup {
+            shared: Arc<Shared>,
+        }
+        #[async_trait::async_trait]
+        impl NodeTurnCleanup for ExitCleanup {
+            async fn on_exit(self: Box<Self>, exit: NodeTurnExit) {
+                let label = match exit {
+                    NodeTurnExit::Normal => "normal",
+                    NodeTurnExit::Canceled => "canceled",
+                    NodeTurnExit::Error(_) => "error",
+                };
+                self.shared.exits.lock().unwrap().push(label.to_string());
+            }
+        }
+        struct WarmPendingDispatcher {
+            shared: Arc<Shared>,
+        }
+        #[async_trait::async_trait]
+        impl WorkflowNodeDispatcher for WarmPendingDispatcher {
+            async fn checkout(
+                &self,
+                _wf_id: &str,
+                node: &WorkflowNode,
+                _run_id: &str,
+                _ctx: &WorkflowRunContext,
+            ) -> Result<NodeTurn, BridgeError> {
+                Ok(NodeTurn {
+                    backend: Arc::new(PendingWarmBackend {
+                        shared: self.shared.clone(),
+                    }),
+                    session: SessionId::parse(format!("warm-{}", node.id.as_str())).unwrap(),
+                    seed: None,
+                    cleanup: Box::new(ExitCleanup {
+                        shared: self.shared.clone(),
+                    }),
+                })
+            }
+        }
+
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("g").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("a").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("b").unwrap(),
+                    agent: AgentId::parse("b").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("t").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{a}}{{b}}".into(),
+                    inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
+                },
+            ],
+        });
+        let shared = Arc::new(Shared {
+            entered: AtomicUsize::new(0),
+            exits: Mutex::new(Vec::new()),
+            both_in_flight: Notify::new(),
+        });
+        let token = CancellationToken::new();
+        let t2 = token.clone();
+        let s2 = shared.clone();
+        tokio::spawn(async move {
+            if s2.entered.load(Ordering::SeqCst) < 2 {
+                s2.both_in_flight.notified().await;
+            }
+            t2.cancel();
+        });
+        let ex = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: std::collections::HashMap::new(),
+        }));
+
+        let events: Vec<_> = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ex.run_with_context_and_dispatcher(
+                graph,
+                "x".into(),
+                "r".into(),
+                token,
+                WorkflowRunContext::default(),
+                Arc::new(WarmPendingDispatcher {
+                    shared: shared.clone(),
+                }),
+            )
+            .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("warm cancel must drain in-flight nodes")
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+        assert!(matches!(
+            events.last().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Canceled,
+                ..
+            }
+        ));
+        assert_eq!(
+            shared.exits.lock().unwrap().as_slice(),
+            ["canceled", "canceled"]
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_done_cancelled_finishes_not_cancels() {
+        struct DoneCancelledBackend {
+            rec: Arc<Rec>,
+        }
+        #[async_trait::async_trait]
+        impl AgentBackend for DoneCancelledBackend {
+            async fn prompt(
+                &self,
+                s: &SessionId,
+                parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                self.rec.prompt_sessions.lock().unwrap().push(s.clone());
+                self.rec.prompt_parts.lock().unwrap().push(parts);
+                Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
+                    stop_reason: STOP_REASON_CANCELLED.into(),
+                })])))
+            }
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                *self.rec.cancels.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+        struct DoneCancelledDispatcher {
+            rec: Arc<Rec>,
+            exits: Arc<Mutex<Vec<String>>>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl WorkflowNodeDispatcher for DoneCancelledDispatcher {
+            async fn checkout(
+                &self,
+                _wf_id: &str,
+                _node: &WorkflowNode,
+                _run_id: &str,
+                _ctx: &WorkflowRunContext,
+            ) -> Result<NodeTurn, BridgeError> {
+                Ok(NodeTurn {
+                    backend: Arc::new(DoneCancelledBackend {
+                        rec: self.rec.clone(),
+                    }),
+                    session: SessionId::parse("warm-session").unwrap(),
+                    seed: None,
+                    cleanup: Box::new(CountingCleanup {
+                        calls: self.calls.clone(),
+                        exits: self.exits.clone(),
+                    }),
+                })
+            }
+        }
+
+        let rec = Arc::new(Rec::default());
+        let exits = Arc::new(Mutex::new(Vec::new()));
+        let ex = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: std::collections::HashMap::new(),
+        }));
+        let events: Vec<_> = ex
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "run1".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                Arc::new(DoneCancelledDispatcher {
+                    rec: rec.clone(),
+                    exits: exits.clone(),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(matches!(
+            events
+                .iter()
+                .find(|e| matches!(e, WorkflowEvent::NodeFinished { .. }))
+                .unwrap(),
+            WorkflowEvent::NodeFinished { ok: false, .. }
+        ));
+        assert_eq!(*rec.cancels.lock().unwrap(), 0);
+        assert_eq!(exits.lock().unwrap().as_slice(), ["normal"]);
+    }
+
+    #[tokio::test]
+    async fn warm_cancel_after_checkout_finishes_no_prompt_no_cancel() {
+        struct CancelAfterCheckoutDispatcher {
+            token: CancellationToken,
+            rec: Arc<Rec>,
+            exits: Arc<Mutex<Vec<String>>>,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl WorkflowNodeDispatcher for CancelAfterCheckoutDispatcher {
+            async fn checkout(
+                &self,
+                _wf_id: &str,
+                _node: &WorkflowNode,
+                _run_id: &str,
+                _ctx: &WorkflowRunContext,
+            ) -> Result<NodeTurn, BridgeError> {
+                self.token.cancel();
+                Ok(NodeTurn {
+                    backend: Arc::new(FakeBackend {
+                        reply: "UNUSED".into(),
+                        rec: self.rec.clone(),
+                    }),
+                    session: SessionId::parse("warm-session").unwrap(),
+                    seed: None,
+                    cleanup: Box::new(CountingCleanup {
+                        calls: self.calls.clone(),
+                        exits: self.exits.clone(),
+                    }),
+                })
+            }
+        }
+
+        let rec = Arc::new(Rec::default());
+        let exits = Arc::new(Mutex::new(Vec::new()));
+        let token = CancellationToken::new();
+        let ex = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: std::collections::HashMap::new(),
+        }));
+
+        let events: Vec<_> = ex
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "run1".into(),
+                token.clone(),
+                WorkflowRunContext::default(),
+                Arc::new(CancelAfterCheckoutDispatcher {
+                    token,
+                    rec: rec.clone(),
+                    exits: exits.clone(),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(matches!(
+            events.last().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Canceled,
+                ..
+            }
+        ));
+        assert!(rec.prompt_parts.lock().unwrap().is_empty(), "no prompt");
+        assert_eq!(*rec.cancels.lock().unwrap(), 0, "no backend.cancel");
+        assert_eq!(exits.lock().unwrap().as_slice(), ["normal"]);
     }
 
     #[tokio::test]
@@ -578,6 +1104,39 @@ mod tests {
             rec.prompts.lock().unwrap()[0],
             "echo DIFF",
             "template rendered with {{input}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_path_unchanged() {
+        // The `None` (cold) branch must be byte-identical to pre-Slice-5 behavior: the cold session id
+        // `workflow-{wf}-{node}-{run_id}` AND `forget_session` at the end (NOT the warm dispatcher path).
+        let rec = Arc::new(Rec::default());
+        let reg = Arc::new(FakeRegistry {
+            backends: [("codex".to_string(), ("HELLO".to_string(), rec.clone()))].into(),
+        });
+        let ex = WorkflowExecutor::new(reg);
+        let _events: Vec<WorkflowEvent> = ex
+            .run(
+                one_node_graph(),
+                "DIFF".into(),
+                "run1".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rec.prompt_sessions.lock().unwrap().as_slice(),
+            [SessionId::parse("workflow-w-only-run1").unwrap()],
+            "cold path uses the cold workflow-wf-node-runid session id"
+        );
+        assert_eq!(
+            *rec.forgets.lock().unwrap(),
+            1,
+            "cold path forgets the session (no warm keep-alive)"
         );
     }
 
