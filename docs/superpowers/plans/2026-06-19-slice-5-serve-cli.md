@@ -185,6 +185,17 @@ Round-11 confirmed ordering sound; 2 MAJOR + 1 MINOR:
   NOT `backend.cancel` there), `ok=false` carried only in the node-result; + `warm_done_cancelled_finishes_not_cancels`.
 - MINOR: Self-review FIX→task map corrected (FIX-8/10 are T6, not T7/T8).
 
+### v13 — round-12 plan-review folds (codex xhigh; 1 BLOCKER + 2 MAJOR + 1 MINOR)
+- T6 (BLOCKER, compile): borrowed `matches!(&routed.target, ..)` in the guard AND the unary reject — a by-value
+  `matches!` partial-MOVEs `routed.target` before the later route `match` (`:782`/`:2381`).
+- T2 (MAJOR): the warm PRE-prompt cancel sites (cold `:114`/`:121`) FINISH the child (`on_exit(Normal)`/
+  `finish_turn`, no `sm.cancel` — no in-flight turn); `Canceled`→`sm.cancel` is reserved for the in-drain `:136`
+  arm only; + `warm_cancel_after_checkout_finishes_no_prompt_no_cancel`.
+- T6 (MAJOR): the `RunGuard::Drop` ABORT fallback ALSO `release_with_children(C)` (a v11 regression — abort
+  after checkout leaves a child `Running`, same as the panic path).
+- T8 (MINOR): branch on `--serve` immediately after parse; the serve branch reads its OWN input (don't hoist the
+  read — local keeps config@`:2242`→input@`:2360`); update `RUN_WORKFLOW_USAGE`.
+
 ---
 
 ## File Structure
@@ -276,9 +287,18 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
   token) → `NodeTurnExit::Normal` (the cold path here does NOT `backend.cancel`, it just `forget`s → the warm
   child must FINISH/idle via `finish_turn`, NOT `sm.cancel`); the `ok=false` is carried ONLY in the returned
   `(text, false)` node-result, not the session lifecycle. `Update::Done{other}` / `None` → `Normal`; `Err(e)` →
-  `Error(e)`. **PFIX-3:** the WARM loop's `cancel.cancelled()` arm must NOT call `backend.cancel` (the cleanup
-  owns cancel via `sm.cancel(child)` in `on_exit(Canceled)`) — give the warm path its own loop body or an
-  `is_warm` flag gating the `:137` `backend.cancel`. ELSE (`None`) → the EXISTING inline cold path UNCHANGED
+  `Error(e)`. **round-12 MAJOR — the PRE-prompt cancel sites finish, they do NOT `sm.cancel`:** the cold path
+  cancels at THREE sites — after `configure` before `prompt` (`:114`), the `prompt`-select arm (`:121`), and the
+  in-drain arm (`:136`); only `:136` calls `backend.cancel` (a turn is in flight), `:114`/`:121` just `forget`
+  (no turn started). The WARM path must mirror this: after `checkout` succeeds, `if cancel.is_cancelled() {
+  turn.cleanup.on_exit(Normal); return ("[node X canceled]", false) }` and wrap `backend.prompt` in a
+  `tokio::select!` whose `cancel.cancelled()` arm ALSO `on_exit(Normal)` (FINISH/idle the warm child — NO
+  `sm.cancel`, no backend turn exists yet). `NodeTurnExit::Canceled` (→ `sm.cancel(child)`) is reserved for the
+  IN-DRAIN `:136` arm ONLY. Add `warm_cancel_after_checkout_finishes_no_prompt_no_cancel` (cancel right after
+  checkout → NO `prompt`, NO `backend.cancel`, child idled via `finish_turn`). **PFIX-3:** the WARM loop's
+  in-drain `cancel.cancelled()` arm must NOT call `backend.cancel` (the cleanup owns cancel via `sm.cancel(child)`
+  in `on_exit(Canceled)`) — give the warm path its own loop body or an `is_warm` flag gating the `:137`
+  `backend.cancel`. ELSE (`None`) → the EXISTING inline cold path UNCHANGED
   (byte-identical: same id, `backend.cancel` at `:137`, `forget` at every site). Keep the `FuturesUnordered`
   scheduler (`:322`) untouched.
 - [ ] **Step 4:** `cargo test -p bridge-workflow --lib && cargo test --workspace --no-run`. Commit.
@@ -440,20 +460,22 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   guard:** in `gate()` (`:352`) change the rejection to `if context_id.is_some() && !matches!(target,
   RouteTarget::Local(_) | RouteTarget::Workflow(_))` and update the stale error `field` string (`:355`,
   "contextId is only supported on the local route in Slice 0" → "contextId is not supported for this route"). In
-  the UNARY `SendMessage` path, reject `routed.context_id.is_some() && matches!(target, Workflow)` IMMEDIATELY
-  after the successful `gate()` and BEFORE `srv.store.put` (`server.rs:2371`) — JSON-RPC error before ANY store
-  write (unary workflow = detached, deferred; MAJOR-2 placement). THEN — the guard: add `workflow_runs:
+  the UNARY `SendMessage` path, reject `routed.context_id.is_some() && matches!(&routed.target,
+  RouteTarget::Workflow(_))` (round-12 BLOCKER — BORROWED `matches!`, else a partial-move before `:2381`)
+  IMMEDIATELY after the successful `gate()` and BEFORE `srv.store.put` (`server.rs:2371`) — JSON-RPC error before
+  ANY store write (unary workflow = detached, deferred; MAJOR-2 placement). THEN — the guard: add `workflow_runs:
   Mutex<HashMap<ContextId, CancellationToken>>` to `InboundServer`.
   **round-5 MAJOR — guard BEFORE `store.put`:** `stream_message` persists `task→session` at `server.rs:769`
   BEFORE the route match, so a guard placed in the Workflow arm (`:823`) would let a rejected 2nd workflow mutate
   `SessionStore`. Place the guard RIGHT AFTER `gate()` (`:763`) and BEFORE the `:769` `store.put` — **and ONLY when a
   SessionManager exists** (round-6 MAJOR — no SM ⇒ stay cold; the `with_workflows`-without-SM integration tests
-  must not be warmed): `let workflow_token = if matches!(routed.target, RouteTarget::Workflow(_)) &&
+  must not be warmed): `let workflow_token = if matches!(&routed.target, RouteTarget::Workflow(_)) &&
   routed.context_id.is_some() && srv.session_manager.is_some() { let c = routed.context_id.clone().unwrap(); let
   mut runs = srv.workflow_runs.lock().await; if runs.contains_key(&c) { return bridge_err_to_jsonrpc(id,
   &BridgeError::HandleBusy); } let t = CancellationToken::new(); runs.insert(c.clone(), t.clone()); Some((c, t)) }
-  else { None };` (the `HandleBusy` returns BEFORE any `store.put` → no state mutation; the cold
-  no-context workflow gets `None` → unchanged). Thread `workflow_token: Option<(ContextId,
+  else { None };` (**round-12 BLOCKER — use the BORROWED `matches!(&routed.target, ..)`; a by-value
+  `matches!(routed.target, ..)` partial-MOVEs `routed.target` before the later route `match` at `:782`.** The
+  `HandleBusy` returns BEFORE any `store.put` → no state mutation; the cold no-context workflow gets `None`). Thread `workflow_token: Option<(ContextId,
   CancellationToken)>` into the Workflow arm → `spawn_workflow_producer`. **round-6/8/9/11 MAJOR — explicit
   warm/cold branch + `catch_unwind` so ALL cleanup (incl. the panic path) is INLINE-awaited** (round-11: a
   Drop-`tokio::spawn` removal is EVENTUAL/racy — an immediate next same-context request can still see
@@ -470,7 +492,10 @@ impl Drop for RunGuard {                 // LAST-RESORT ONLY: task aborted/dropp
     fn drop(&mut self) {
         if !self.armed { return; }       // disarmed once the inline cleanup completes
         let (srv, task, ctx) = (self.srv.clone(), self.task.clone(), self.ctx.take());
-        tokio::spawn(async move { release_run(&srv, &task, &ctx).await; });
+        tokio::spawn(async move {        // round-12 MAJOR: abort-after-checkout leaves a child Running too ->
+            if let (Some(c), Some(sm)) = (&ctx, &srv.session_manager) { sm.release_with_children(c).await; } // free it
+            release_run(&srv, &task, &ctx).await;
+        });
     }
 }
 tokio::spawn(async move {
@@ -573,9 +598,12 @@ tokio::spawn(async move {
   also reject `--serve` WITHOUT `--context`** (the slice's purpose is warm reuse keyed by context; a contextless
   serve run is cold and pointless — the spec form is `--serve [--url U] --context C <wf>`); reject explicit
   `--config` with `--serve` (check the raw Option BEFORE the `CONFIG_PATH` default). In `run_workflow_cmd`
-  (`:2233`): **MAJOR-2 — the `--serve` branch must EARLY-RETURN before the local config read (`main.rs:2242`) and
-  any workflow lookup** (the workflow lives in the running serve's config, not locally). Right after parsing args
-  + reading the input file: if `--serve` → build a `SendStreamingMessage` message map (`message.contextId=C`,
+  (`:2233`): **MAJOR-2 — branch on `--serve` IMMEDIATELY after parsing args, BEFORE the local config read
+  (`main.rs:2242`) and any workflow lookup** (the workflow lives in the running serve's config, not locally).
+  **round-12 MINOR — the serve branch reads its OWN input file then returns; do NOT hoist the input read into the
+  shared path** (local currently reads config@`:2242` THEN input@`:2360` — keep that order UNCHANGED for
+  back-compat). Also update `RUN_WORKFLOW_USAGE` (`:534`) for the `--serve [--url U] --context C <wf>` form. In
+  the serve branch: read the input, build a `SendStreamingMessage` message map (`message.contextId=C`,
   **`message.taskId = a2a::new_task_id()` — round-9 MAJOR: mint a UNIQUE task id per invocation** (else the server
   falls back to the fixed `"task-1"` at `server.rs:3280` → two serve runs collide on `workflow_cancels` + repeat
   node `OperationId`s; `a2a::new_task_id()` is what `new_detached_task_id` uses), `metadata["a2a-bridge.skill"]=<wf>`,
