@@ -452,14 +452,16 @@ struct LocalDispatch {
 struct WarmTurnGuard {
     sm: std::sync::Arc<crate::session_manager::SessionManager>,
     ctx: bridge_core::ids::ContextId,
+    generation: bridge_core::ids::SessionGeneration,
 }
 
 impl Drop for WarmTurnGuard {
     fn drop(&mut self) {
         let sm = self.sm.clone();
         let ctx = self.ctx.clone();
+        let generation = self.generation;
         tokio::spawn(async move {
-            sm.finish_turn(&ctx).await;
+            sm.finish_turn(&ctx, generation).await;
         });
     }
 }
@@ -578,7 +580,11 @@ async fn warm_local_dispatch(
                 backend: turn.backend,
                 session: turn.session,
                 guard: None,
-                warm_guard: Some(WarmTurnGuard { sm, ctx }),
+                warm_guard: Some(WarmTurnGuard {
+                    sm,
+                    ctx,
+                    generation: turn.generation,
+                }),
             }))
         }
         Err(e) => Some(Err(e)),
@@ -1172,7 +1178,7 @@ fn spawn_local_producer(
             if let Ok(e) = &ev {
                 if e.kind() == &EventKind::Usage {
                     if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
-                        w.sm.record_usage(&w.ctx, snap.clone()).await;
+                        w.sm.record_usage(&w.ctx, w.generation, snap.clone()).await;
                     }
                     continue;
                 }
@@ -2345,7 +2351,7 @@ async fn unary_message(
                 if let Ok(e) = &ev {
                     if e.kind() == &EventKind::Usage {
                         if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
-                            w.sm.record_usage(&w.ctx, snap.clone()).await;
+                            w.sm.record_usage(&w.ctx, w.generation, snap.clone()).await;
                         }
                         continue; // exclude usage from the unary output
                     }
@@ -5757,6 +5763,12 @@ mod tests {
         async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
             self.sessions.lock().unwrap().push(s.as_str().to_owned());
             let updates = vec![
+                Ok(Update::Usage(UsageSnapshot {
+                    used: Some(14584),
+                    size: Some(258400),
+                    cost: None,
+                    at_ms: 0,
+                })),
                 Ok(Update::Text("warm".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
@@ -6363,17 +6375,6 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        sm.record_usage(
-            &ctx,
-            UsageSnapshot {
-                used: Some(14584),
-                size: Some(258400),
-                cost: None,
-                at_ms: 0,
-            },
-        )
-        .await;
-
         let resp = router(srv.clone())
             .oneshot(post_request(
                 "SessionStatus",
