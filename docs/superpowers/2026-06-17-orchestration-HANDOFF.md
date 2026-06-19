@@ -27,9 +27,24 @@
   handler `:973`+`TurnEvent`+`unfold` also dropped non-text); `#[cfg(feature="unstable_session_usage")]` is a
   DEPENDENCY feature NOT a bridge-acp crate feature (a `cfg` compiles it OUT — use unconditional code); the
   pre-existing unary last-chunk truncation re-confirmed live (`PONG`→`ONG`, NOT Slice-2; a real follow-up).
-- **NEXT = Slice 3 — Clear / reset** (`reset_session` = new SessionId per generation + `clear`; generation
-  guard). Then S4 compact → S5 serve-backed `run-workflow --serve --context` [MVP cut] → S6 journal →
-  S7 observability+E9 → S8 MCP → S9 Turn Channel → tail. Follow the proven loop below.
+- **Slice 3 — Clear / reset: SHIPPED + MERGED + PUSHED** to `main` (`a5e6f9e`). `SessionClear` =
+  `reset_session` (NEW bridge `SessionId` per generation, DIVERGENCE-1; release old + configure new + bump gen;
+  process/lease/handle stay warm) + the GENERATION-MONOTONICITY guard (`finish_turn`/`record_usage` no-op
+  unless `gen==generation && op==Some(op) && Running`) + `Resetting` claim + `is_claimed` deferral + CLI
+  `session clear [--force]`. 3 tasks + a post-merge hardening, each codex-xhigh increment-reviewed; spec
+  dual-reviewed + plan dual-reviewed-then-codex-iterated to ready-to-execute over 4 rounds; **live-gated on
+  real codex** (codeword forgotten across clear; same warm process; generation 0→1; usage null). **A
+  whole-branch codex-xhigh review** (run vs `main`) caught a real cross-task race the per-increment reviews
+  missed (FIX-12). **DEFERRED HARDENING (tracked, merge-as-is):** the spec's "## Deferred hardening" section
+  records two PRE-EXISTING races `force` surfaces — (1) FIX-12's op-token is PARTIAL (op is task-derived →
+  same/omitted `taskId` collides on the cancel→next-turn path); (2) `clear --force` can fire in the
+  checkout→`backend.prompt` gap and resurrect the released session. Both need a **"warm-turn cancellation
+  tokens" follow-up** (manager-minted unique op + a per-turn abort token through the producer/translator);
+  **sequence it before any feature that relies on `force`/cancel under concurrency.**
+- **NEXT = Slice 4 — Compact** (summarize → `reset_session` → seed as `PrependNextTurn`; reuses the Slice-3
+  clear primitive, require-Idle — does NOT need `force`, so the deferred hardening is not a blocker for S4).
+  Then S5 serve-backed `run-workflow --serve --context` [MVP cut] → S6 journal → S7 observability+E9 → S8 MCP →
+  S9 Turn Channel → tail. Follow the proven loop below.
 
 ## Canonical docs (read these — they are the source of truth)
 
@@ -63,8 +78,8 @@ never both); `_meta` for cross-boundary correlation.
 | **0 Live Session Core** | warm continue keyed by contextId; SessionManager; minimal OrchEvent/OrchResult; session CLI/methods | ✅ SHIPPED+MERGED |
 | **1 Config reconcile + capabilities** | reconcile model/effort on warm continue (else typed reseed); record agent caps | ✅ SHIPPED+MERGED |
 | **2 Usage telemetry** | plumb `usage_update` → start/end/`session-status` + pre-task threshold warn | ✅ SHIPPED+MERGED |
-| **3 Clear / reset** | `reset_session` (new SessionId per generation) + `clear`; generation guard | ◀ NEXT |
-| **4 Compact** | summarize → reset → seed-as-PrependNextTurn | |
+| **3 Clear / reset** | `reset_session` (new SessionId per generation) + `clear`; generation guard | ✅ SHIPPED+MERGED (deferred: warm-turn cancellation tokens) |
+| **4 Compact** | summarize → reset → seed-as-PrependNextTurn | ◀ NEXT |
 | **5 Serve-backed `run-workflow --serve --context`** | CLI as serve client + executor keep-warm policy | **— MVP CUT-LINE (S0–S5) —** |
 | **6 Event-journal dual-store** | full OrchEvent/OrchResult/OrchCommand Ser+De; the 4-path adapter rewrite; shared `next_seq` | the deferred risky rewrite |
 | **7 Rich observability + E9 watchdog** | Plan/ToolCall/config/mode/commands events; watchdog on no-journal-event | |
