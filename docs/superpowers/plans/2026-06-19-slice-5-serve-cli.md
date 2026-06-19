@@ -32,7 +32,7 @@ Both reviewers returned `fix-then-execute`; layering keystone confirmed sound. T
   add a struct field). T6 calls `executor.run_with_context_and_dispatcher(..., Arc::new(WarmWorkflowNode
   Dispatcher{..}))` on the `&WorkflowExecutor` (Arc derefs). DELETE the `node_dispatch` field + `with_node_dispatch`.
 - **PFIX-2 (BLOCKER — `run_node` returns `(String,bool)`, not `Result`).** The warm branch must `match
-  dispatcher.checkout(...).await { Ok(t)=>.., Err(e)=> return (format!("[node {} failed: {:?}]", node.id, e),
+  dispatcher.checkout(...).await { Ok(t)=>.., Err(e)=> return (format!("[node {} failed: {:?}]", node.id.as_str(), e),
   false) }` — NOT `?` (mirror the cold marker `executor.rs:98/100`).
 - **PFIX-3 (BLOCKER — warm cancel must NOT double-cancel).** The cold drain loop calls `backend.cancel` at
   `:137`. In the WARM path the loop's cancel arm must NOT call `backend.cancel` (the cleanup owns cancel via
@@ -121,6 +121,19 @@ Round-5 re-confirmed seam/ordering/T8-early-return and caught 3 narrower issues:
 - T5 (MAJOR, compile): `checkout` takes `&self` → use `&self.parent`/`self.cwd.clone()`/`self.sm` (can't move
   `self.cwd` out of `&self`; `checkout_child_turn` takes an owned `Option<SessionCwd>`).
 
+### v7 — round-6 plan-review folds (codex xhigh; warm/cold back-compat + guard cleanup + last compile nit)
+Round-6 re-confirmed the seam a 6th time; narrow folds into T2/T6/T8:
+- T2 (BLOCKER, compile): the warm error marker uses `node.id.as_str()` (was bare `node.id`; `NodeId` has no
+  `Display` — same trap as T5, in both PFIX-2 and the T2 Step-3 snippet).
+- T6 (MAJOR, back-compat): the warm guard fires ONLY when `Workflow + context + SessionManager`; the producer
+  branches explicitly `Some((c,token)) → run_with_context_and_dispatcher` / `None → run_with_context` (cold,
+  byte-identical) so no-context (and no-SM) streaming workflows stay cold.
+- T6 (MAJOR, lifecycle): async scope-guard — wrap the producer body, then UNCONDITIONALLY remove
+  `workflow_runs[C]` + `workflow_cancels[task]` after `.await`, so the absent-executor early-return (`:1697`)
+  can't permanently busy `C` (Drop can't `.await`).
+- T8 (MAJOR): added the `run_workflow_serve_flags_before_workflow_id` parser test (flags-anywhere + one positional).
+- T6 (MINOR): the concurrency/cancel tests run on the `--test workflow_producer` integration target, not `--lib`.
+
 ---
 
 ## File Structure
@@ -199,7 +212,7 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
   "[node {} canceled]", node.id.as_str()), false) }` pre-check FIRST (MINOR-2: an already-canceled warm run must
   NOT mint/claim a child session), THEN branch on the threaded param: `match dispatcher { Some(d) => WARM, None
   => COLD }`. WARM path: `let turn = match d.checkout(wf_id, node, run_id, ctx).await { Ok(t) => t,
-  Err(e) => return (format!("[node {} failed: {:?}]", node.id, e), false) };` (PFIX-2 — `run_node` returns
+  Err(e) => return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false) };` (PFIX-2 — `run_node` returns
   `(String,bool)`, NOT `Result`; mirror the cold marker `executor.rs:98/100`, do NOT `?`/panic). Build `parts` =
   `seed`-prepended (if `turn.seed`, `parts.insert(0, Part{text: format!("[Summary of earlier context in this
   session]\n{seed}")})`) then the rendered prompt; run the prompt+drain loop on `turn.backend`/`turn.session`;
@@ -344,19 +357,42 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
 - [ ] **Step 2 (impl):** add `workflow_runs: Mutex<HashMap<ContextId, CancellationToken>>` to `InboundServer`.
   **round-5 MAJOR — guard BEFORE `store.put`:** `stream_message` persists `task→session` at `server.rs:769`
   BEFORE the route match, so a guard placed in the Workflow arm (`:823`) would let a rejected 2nd workflow mutate
-  `SessionStore`. Place the guard RIGHT AFTER `gate()` (`:763`) and BEFORE the `:769` `store.put`: `let
-  workflow_token = if let (RouteTarget::Workflow(_), Some(c)) = (&routed.target, &routed.context_id) { let mut
-  runs = srv.workflow_runs.lock().await; if runs.contains_key(c) { return bridge_err_to_jsonrpc(id,
-  &BridgeError::HandleBusy); } let t = CancellationToken::new(); runs.insert(c.clone(), t.clone()); Some((c.clone(),
-  t)) } else { None };` (the `HandleBusy` returns BEFORE any `store.put` → no state mutation; the cold
-  no-context workflow gets `None` → unchanged). Thread `workflow_token` into the Workflow arm →
-  `spawn_workflow_producer` (its signature gains the `Option<(ContextId, CancellationToken)>`). Drive the run via
-  `executor.run_with_context_and_dispatcher(..., Arc::new(WarmWorkflowNodeDispatcher{sm, parent:C, cwd}))` on the
-  `&WorkflowExecutor` (Arc derefs — PFIX-1, NOT `.with_node_dispatch`) + pass the token as the run's cancel. On
-  producer exit, remove `workflow_runs[C]`. **MAJOR-1: also KEEP the existing `workflow_cancels[task]`
-  insert/remove** (it backs `CancelTask` `:2832`) — register the SAME token in BOTH maps (`workflow_runs[C]` for
-  `SessionCancel C`; `workflow_cancels[task]` for `CancelTask`) and remove from BOTH on producer exit (mirror
-  :1711/:1731; note the `routed.task`/`session_cwd` move order :1690/:1716). In `session_cancel`
+  `SessionStore`. Place the guard RIGHT AFTER `gate()` (`:763`) and BEFORE the `:769` `store.put` — **and ONLY when a
+  SessionManager exists** (round-6 MAJOR — no SM ⇒ stay cold; the `with_workflows`-without-SM integration tests
+  must not be warmed): `let workflow_token = if matches!(routed.target, RouteTarget::Workflow(_)) &&
+  routed.context_id.is_some() && srv.session_manager.is_some() { let c = routed.context_id.clone().unwrap(); let
+  mut runs = srv.workflow_runs.lock().await; if runs.contains_key(&c) { return bridge_err_to_jsonrpc(id,
+  &BridgeError::HandleBusy); } let t = CancellationToken::new(); runs.insert(c.clone(), t.clone()); Some((c, t)) }
+  else { None };` (the `HandleBusy` returns BEFORE any `store.put` → no state mutation; the cold
+  no-context workflow gets `None` → unchanged). Thread `workflow_token: Option<(ContextId,
+  CancellationToken)>` into the Workflow arm → `spawn_workflow_producer`. **round-6 MAJOR — explicit warm/cold
+  branch + async scope-guard cleanup** (Drop can't `.await`, and the absent-executor/graph early-return at
+  `:1697` must NOT strand `workflow_runs[C]`): wrap the producer body so cleanup ALWAYS runs:
+```rust
+tokio::spawn(async move {
+    let _ = async {
+        // existing executor/graph resolve + early-return on absent (:1695-1701) ...
+        let token = match &workflow_token { Some((_, t)) => t.clone(), None => CancellationToken::new() };
+        srv.workflow_cancels.lock().await.insert(task.clone(), token.clone()); // backs CancelTask :2832
+        let stream = match &workflow_token {
+            Some((c, _)) => executor.run_with_context_and_dispatcher(  // WARM (PFIX-1, on &WorkflowExecutor)
+                graph, input, task.as_str().into(), token, wf_ctx,
+                Arc::new(WarmWorkflowNodeDispatcher {
+                    sm: srv.session_manager.clone().unwrap(),
+                    parent: c.clone(), cwd: routed.session_cwd.clone(),
+                })),
+            None => executor.run_with_context(graph, input, task.as_str().into(), token, wf_ctx), // COLD, byte-identical
+        };
+        // drain + terminal fallback — UNCHANGED (:1720-1730)
+    }.await;
+    // UNCONDITIONAL cleanup on EVERY exit (early-return or normal) — no permanently-busy C:
+    srv.workflow_cancels.lock().await.remove(&task);
+    if let Some((c, _)) = &workflow_token { srv.workflow_runs.lock().await.remove(c); }
+});
+```
+  The `None` arm keeps no-context streaming workflows on the cold `run_with_context` path (back-compat — the
+  `with_workflows`-without-SM tests stay green); the post-`.await` block removes BOTH maps even on the early
+  failure (mirrors `workflow_cancels` :1711/:1731; note the `routed.task`/`session_cwd` move order :1690/:1716). In `session_cancel`
   (`server.rs:3104`): **round-4 BLOCKER — GET, do NOT remove the guard.** `let token = { workflow_runs.lock()
   .await.get(C).cloned() };` (clone the token, LEAVE the entry — the guard is released ONLY on producer exit,
   mirroring `workflow_cancels`; removing it here lets a 2nd same-context run pass the guard and re-claim a child
@@ -366,8 +402,10 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   finished). Respond OK if `token.is_some() || swept.is_ok()`; else map `swept`'s `Err(SessionNotFound)` to the
   wire error (round-3 BLOCKER-2 — an active run token counts as success even with zero minted children). Do NOT
   fall back to bare `sm.cancel(C)`. (The producer exit path removes `workflow_runs[C]` + `workflow_cancels[task]`.)
-- [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib 'workflow_run|session_cancel_cancels' && cargo test
-  --workspace --no-run`. Commit.
+- [ ] **Step 3:** **round-6 MINOR — the concurrency/cancel tests live in the `tests/workflow_producer.rs`
+  INTEGRATION target (the `with_workflows` harness), NOT `--lib`:** `cargo test -p bridge-a2a-inbound --test
+  workflow_producer 'workflow_handle_busy|session_cancel|one_backend_cancel' && cargo test -p bridge-a2a-inbound
+  --lib session_cancel_cancels && cargo test --workspace --no-run`. Commit.
 
 ---
 
@@ -403,8 +441,10 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
 
 - [ ] **Step 1 (tests):** `run_workflow_context_requires_serve` (`--context` without `--serve` → error);
   `run_workflow_config_rejected_with_serve` (`--config` + `--serve` → error, detected on the un-defaulted
-  Option); `serve_client_builds_streaming_message` (the message map has `contextId`, `metadata
-  ["a2a-bridge.skill"]=<wf>`, parts).
+  Option); `run_workflow_serve_flags_before_workflow_id` (round-6 MAJOR / PFIX-8 — parse `run-workflow --serve
+  --context C <wf>`: flags consumed ANYWHERE, exactly ONE non-flag token = the workflow id; the current parser
+  assumes arg-0 is the id at `main.rs:543`); `serve_client_builds_streaming_message` (the message map has
+  `contextId`, `metadata ["a2a-bridge.skill"]=<wf>`, parts).
 - [ ] **Step 2 (impl):** extend `parse_run_workflow_args` (`:543`) with `--serve` (bool), `--url`
   (default `http://127.0.0.1:8080`), `--context` (Option); reject `--context` without `--serve`; reject explicit
   `--config` with `--serve` (check the raw Option BEFORE the `CONFIG_PATH` default). In `run_workflow_cmd`
