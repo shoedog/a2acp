@@ -571,6 +571,14 @@ impl SessionManager {
             if h.state != SessionState::Idle {
                 return Err(BridgeError::HandleBusy);
             }
+            // A pending (undelivered) seed means the last compact's summary is the session's ONLY retained
+            // context (the gen N+1 ACP session is empty until the next turn injects it). Re-compacting now
+            // would summarize that empty session and OVERWRITE the good summary -> data loss. Reject until the
+            // seed is consumed by a real turn. (Whole-branch review; the spawn-detached handler makes a
+            // lost-response retry reachable.)
+            if h.pending_seed.is_some() {
+                return Err(BridgeError::HandleBusy);
+            }
             let backend = h.backend.clone();
             let old_id = h.backend_session.clone();
             let claimed_id = h.id.clone();
@@ -705,7 +713,26 @@ impl SessionManager {
                 .collect()
         };
         for c in expired {
-            self.release(&c).await;
+            // Re-validate under the lock and REMOVE atomically: only reap a STILL-Idle, STILL-expired handle.
+            // A claim that landed after the snapshot (compact/reset/reconcile flips the state off Idle) OWNS
+            // the lifecycle — the reaper must SKIP it, never route through `release` (which would set the
+            // deferred-expire flag and make the claim's commit tail kill the handle). [whole-branch review]
+            let h = {
+                let mut tab = self.by_context.lock().await;
+                match tab.get(&c) {
+                    Some(h)
+                        if h.state == SessionState::Idle
+                            && now.duration_since(h.last_used) >= self.idle_ttl =>
+                    {
+                        tab.remove(&c)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(h) = h {
+                h.backend.release_session(&h.backend_session).await;
+                drop(h.lease);
+            }
         }
     }
 }
@@ -2426,6 +2453,87 @@ mod tests {
 
         assert!(manager.status(&idle).await.is_none());
         assert_eq!(manager.status(&running).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn compact_rejects_when_seed_pending() {
+        // Whole-branch review: a second compact before the seed is delivered would summarize the empty
+        // gen N+1 session and overwrite the good summary. Reject it; the original seed must survive.
+        let (m, _f, _r) = manager();
+        let c = ctx("c");
+        let turn = m
+            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .await
+            .unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        m.compact_session(&c, |_b, _s| async { Ok("GOOD SUMMARY".to_string()) })
+            .await
+            .unwrap();
+        let err = m
+            .compact_session(&c, |_b, _s| async {
+                Ok("EMPTY SESSION SUMMARY".to_string())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::HandleBusy);
+        // The good summary is preserved (delivered on the next checkout).
+        let t2 = m
+            .checkout_turn(&c, agent(), None, None, op("t2"))
+            .await
+            .unwrap();
+        assert_eq!(t2.seed.as_deref(), Some("GOOD SUMMARY"));
+    }
+
+    #[tokio::test]
+    async fn reap_idle_does_not_reap_compacting_handle() {
+        // Whole-branch review: a handle claimed Compacting must survive reap_idle even past the TTL (the
+        // claim owns the lifecycle; the reaper must not defer-expire it).
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let clock = ManualClock::new();
+        let manager = Arc::new(SessionManager::new_with_clock(
+            registry,
+            Duration::from_secs(5),
+            clock.reader(),
+        ));
+        let c = ctx("c");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+
+        // Start a compact whose summarize blocks until signalled -> the handle stays Compacting.
+        let gate = Arc::new(Notify::new());
+        let (m2, c2, g2) = (manager.clone(), c.clone(), gate.clone());
+        let compact = tokio::spawn(async move {
+            m2.compact_session(&c2, move |_b, _s| {
+                let g2 = g2.clone();
+                async move {
+                    g2.notified().await;
+                    Ok("SUMMARY".to_string())
+                }
+            })
+            .await
+        });
+        for _ in 0..1000 {
+            if manager.status(&c).await.map(|s| s.state) == Some("compacting") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(manager.status(&c).await.unwrap().state, "compacting");
+
+        clock.advance(Duration::from_secs(10));
+        manager.reap_idle().await;
+        assert!(
+            manager.status(&c).await.is_some(),
+            "reap must not touch a Compacting handle"
+        );
+
+        gate.notify_one();
+        let out = compact.await.unwrap().unwrap();
+        assert_eq!(out, ResetOutcome::Cleared { generation: 1 });
     }
 
     #[tokio::test]
