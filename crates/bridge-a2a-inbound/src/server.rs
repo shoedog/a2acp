@@ -3189,7 +3189,7 @@ async fn session_release(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    sm.release(&ctx).await;
+    sm.release_with_children(&ctx).await;
     jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "released": true }))
 }
 
@@ -3213,10 +3213,7 @@ async fn session_clear(
         .get("force")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    match sm
-        .reset_session(&ctx, crate::session_manager::ResetOpts { force })
-        .await
-    {
+    match sm.clear_with_children(&ctx, force).await {
         Ok(crate::session_manager::ResetOutcome::Cleared { generation }) => jsonrpc_ok(
             id,
             json!({ "contextId": ctx.as_str(), "cleared": true, "generation": generation }),
@@ -7400,6 +7397,66 @@ mod tests {
             v["result"],
             json!({ "contextId": "c1", "cleared": true, "generation": 1 })
         );
+    }
+
+    #[tokio::test]
+    async fn session_release_workflow_parent_sweeps_children() {
+        let (srv, sm, _) = seed_test_server();
+        let parent = ContextId::parse("c-workflow").unwrap();
+        let child = ContextId::parse("c-workflow::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &parent,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-child").unwrap(),
+        )
+        .await
+        .expect("child checkout");
+        assert!(
+            sm.status(&child).await.is_some(),
+            "child handle should exist before release"
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionRelease",
+                json!({ "contextId": "c-workflow" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"],
+            json!({ "contextId": "c-workflow", "released": true })
+        );
+        assert!(
+            sm.status(&child).await.is_none(),
+            "release on the workflow parent must free child handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_clear_unknown_context_still_not_found() {
+        let (srv, _, _) = seed_test_server();
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionClear",
+                json!({ "contextId": "nope" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(v["error"]["message"], "session not found");
     }
 
     #[tokio::test]
