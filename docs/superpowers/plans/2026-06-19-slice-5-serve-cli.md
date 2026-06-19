@@ -134,6 +134,16 @@ Round-6 re-confirmed the seam a 6th time; narrow folds into T2/T6/T8:
 - T8 (MAJOR): added the `run_workflow_serve_flags_before_workflow_id` parser test (flags-anywhere + one positional).
 - T6 (MINOR): the concurrency/cancel tests run on the `--test workflow_producer` integration target, not `--lib`.
 
+### v8 — round-7 plan-review folds (codex xhigh; **NO BLOCKERS** — behavioral/test gaps only)
+Round-7 declared the seam/ordering implementable and found NO blockers — only behavioral/test gaps:
+- T4 (MAJOR): `cancel_with_children` propagates REAL child cancel errors (ignore stale `SessionNotFound`, move
+  the error in `return` since `BridgeError` isn't `Clone`); + `cancel_with_children_propagates_real_child_error`.
+- T8 (MAJOR): `--serve` REQUIRES `--context` (a contextless serve run is cold → defeats warm reuse); +
+  `run_workflow_serve_requires_context`.
+- T8 (MAJOR): a fake-HTTP-server (`wiremock`/`axum`, already dev-deps) CLI client test — Completed→artifact+exit
+  0, Failed/Canceled→nonzero, and a pre-SSE JSON-RPC error (`HandleBusy`) surfaced WITHOUT SSE-parsing.
+- T7 (MINOR): update the stale `gate()` error string (Workflow now accepts contextId too).
+
 ---
 
 ## File Structure
@@ -276,6 +286,9 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   **`cancel_idle_handle_skips_backend_cancel` (round-5 BLOCKER):** checkout (Running) → `cancel` (1 backend
   cancel) → `cancel` again while Idle → STILL 1 backend cancel (the 2nd is a no-op; assert `FakeBackend.cancels()`
   len stays 1).
+  **`cancel_with_children_propagates_real_child_error` (round-7 MAJOR):** a registered Running child whose backend
+  `cancel` returns `Err` → `cancel_with_children(C)` returns that `Err` (NOT `Ok`); a stale `SessionNotFound`
+  child is still ignored.
 - [ ] **Step 2 (impl):** **FIRST (round-5 BLOCKER — idempotent `cancel`):** modify `SessionManager::cancel`
   (`:441`): after `h.state = Idle; h.op = None;`, if `!was_running` `return Ok(())` (skip the `:461`
   `backend.cancel` — no in-flight turn to cancel; matches the method's "cancel an in-flight turn" contract). This
@@ -291,10 +304,13 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   - `release_with_children(&self, ctx)`: `self.release(ctx).await` + `self.release(child).await` for each child;
     THEN `children.remove(ctx)` (still holding the guard). Returns `()` (release is idempotent — wire success
     unchanged).
-  - `cancel_with_children(&self, ctx) -> Result<(), BridgeError>`: `let p = self.cancel(ctx).await;` (Ok / Err
-    SessionNotFound); `for child { let _ = self.cancel(child).await; }`; **KEEP `children[ctx]`.** Return `Ok(())`
-    if `p.is_ok() || !snapshot.is_empty()` else `Err(SessionNotFound)` (round-3 BLOCKER-2 — unknown ctx stays
-    not-found).
+  - `cancel_with_children(&self, ctx) -> Result<(), BridgeError>` (round-7 MAJOR — propagate REAL child errors,
+    do NOT `let _ =`; `BridgeError` isn't `Clone` so MOVE the error in the `return`): `let parent_found = match
+    self.cancel(ctx).await { Ok(()) => true, Err(BridgeError::SessionNotFound) => false, Err(e) => return Err(e)
+    };` then `for child { match self.cancel(child).await { Ok(()) => {}, Err(BridgeError::SessionNotFound) => {}
+    /* stale child */, Err(e) => return Err(e) /* a real backend cancel failure propagates */ } }`; **KEEP
+    `children[ctx]`.** Return `Ok(())` if `parent_found || !snapshot.is_empty()` else `Err(SessionNotFound)`
+    (round-3 BLOCKER-2 — unknown ctx stays not-found).
   - `clear_with_children(&self, ctx, force: bool) -> Result<ResetOutcome, BridgeError>` (round-3 MAJOR-1 — thread
     `force`; `ResetOpts` is neither `Copy` nor `Clone`, so take `force: bool` and build `ResetOpts { force }` per
     call): `let p = self.reset_session(ctx, ResetOpts { force }).await?;`; `for child { match
@@ -419,7 +435,9 @@ tokio::spawn(async move {
   BLOCKER-2 — an unknown ctx with no children + no handle STILL returns HTTP 400 `SessionNotFound`, preserving
   the existing test at `server.rs:6955`).
 - [ ] **Step 2 (impl):** in `gate()` (`:352`) change the rejection to `if context_id.is_some() &&
-  !matches!(target, RouteTarget::Local(_) | RouteTarget::Workflow(_))` (FIX-10). In the UNARY `SendMessage`
+  !matches!(target, RouteTarget::Local(_) | RouteTarget::Workflow(_))` (FIX-10), AND update the now-stale error
+  `field` string (`:355`, currently "contextId is only supported on the local route in Slice 0") to e.g.
+  "contextId is not supported for this route" (round-7 MINOR — Workflow now also accepts contextId). In the UNARY `SendMessage`
   path, reject `routed.context_id.is_some() && matches!(target, Workflow)` (unary workflow = detached, deferred
   — FIX-8). **MAJOR-2: place this reject immediately after the successful `gate()` and BEFORE `srv.store.put`
   (`server.rs:2371`)** — return the JSON-RPC error before ANY task/session store write, so a rejected request
@@ -443,10 +461,18 @@ tokio::spawn(async move {
   `run_workflow_config_rejected_with_serve` (`--config` + `--serve` → error, detected on the un-defaulted
   Option); `run_workflow_serve_flags_before_workflow_id` (round-6 MAJOR / PFIX-8 — parse `run-workflow --serve
   --context C <wf>`: flags consumed ANYWHERE, exactly ONE non-flag token = the workflow id; the current parser
-  assumes arg-0 is the id at `main.rs:543`); `serve_client_builds_streaming_message` (the message map has
-  `contextId`, `metadata ["a2a-bridge.skill"]=<wf>`, parts).
+  assumes arg-0 is the id at `main.rs:543`); `run_workflow_serve_requires_context` (round-7 MAJOR — `--serve`
+  without `--context` → error); `serve_client_builds_streaming_message` (the message map has `contextId`,
+  `metadata ["a2a-bridge.skill"]=<wf>`, parts). **round-7 MAJOR — a fake-HTTP-server CLI client test** (use the
+  existing `wiremock`/`axum` test dep to stand up a fake serve endpoint): (a) Completed — SSE frames with an
+  `ArtifactUpdate` then a terminal `StatusUpdate{state:Completed, message:None}` → client prints the artifact
+  text to stdout/`--out` + exit 0; (b) Failed/Canceled terminal → nonzero exit; (c) a pre-SSE JSON-RPC ERROR
+  body (e.g. `HandleBusy`) → the client surfaces it as a nonzero exit WITHOUT trying to parse it as SSE (terminal
+  frames are `StatusUpdate` with `message:None`, `sse.rs:91`).
 - [ ] **Step 2 (impl):** extend `parse_run_workflow_args` (`:543`) with `--serve` (bool), `--url`
-  (default `http://127.0.0.1:8080`), `--context` (Option); reject `--context` without `--serve`; reject explicit
+  (default `http://127.0.0.1:8080`), `--context` (Option); reject `--context` without `--serve`; **round-7 MAJOR —
+  also reject `--serve` WITHOUT `--context`** (the slice's purpose is warm reuse keyed by context; a contextless
+  serve run is cold and pointless — the spec form is `--serve [--url U] --context C <wf>`); reject explicit
   `--config` with `--serve` (check the raw Option BEFORE the `CONFIG_PATH` default). In `run_workflow_cmd`
   (`:2233`): **MAJOR-2 — the `--serve` branch must EARLY-RETURN before the local config read (`main.rs:2242`) and
   any workflow lookup** (the workflow lives in the running serve's config, not locally). Right after parsing args
