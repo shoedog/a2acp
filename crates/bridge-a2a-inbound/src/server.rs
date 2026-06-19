@@ -19,6 +19,7 @@
 // auth->route->translate pipeline. axum 0.7 is already proven in this workspace.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use axum::{
@@ -29,7 +30,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
@@ -174,6 +175,14 @@ pub struct InboundServer {
             >,
         >,
     >,
+    workflow_runs: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                bridge_core::ids::ContextId,
+                tokio_util::sync::CancellationToken,
+            >,
+        >,
+    >,
     /// Durable task control-plane store (W3a). Defaults to an in-memory store;
     /// replace with a persistent backend via [`InboundServer::with_task_store`].
     task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
@@ -226,6 +235,7 @@ impl InboundServer {
             executor: None,
             workflows: Arc::new(HashMap::new()),
             workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            workflow_runs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
             session_manager: None,
             allowed_cwd_root: None,
@@ -354,9 +364,11 @@ impl InboundServer {
         let target = self.route.route(&task_meta)?;
 
         let context_id = context_id_from_params(params)?;
-        if context_id.is_some() && !matches!(target, RouteTarget::Local(_)) {
+        if context_id.is_some()
+            && !matches!(target, RouteTarget::Local(_) | RouteTarget::Workflow(_))
+        {
             return Err(BridgeError::InvalidRequest {
-                field: "contextId is only supported on the local route in Slice 0",
+                field: "contextId is not supported for this route",
             });
         }
 
@@ -845,6 +857,22 @@ async fn stream_message(
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
 
+    let workflow_token = if matches!(&routed.target, RouteTarget::Workflow(_))
+        && routed.context_id.is_some()
+        && srv.session_manager.is_some()
+    {
+        let c = routed.context_id.clone().unwrap();
+        let mut runs = srv.workflow_runs.lock().await;
+        if runs.contains_key(&c) {
+            return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
+        }
+        let t = tokio_util::sync::CancellationToken::new();
+        runs.insert(c.clone(), t.clone());
+        Some((c, t))
+    } else {
+        None
+    };
+
     // Persist task->session before driving the backend.
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
@@ -902,7 +930,7 @@ async fn stream_message(
         // consumes it for `task`/`parts`).
         RouteTarget::Workflow(ref id) => {
             let id = id.clone();
-            spawn_workflow_producer(&srv, routed, id, tx)
+            spawn_workflow_producer(&srv, routed, id, tx, workflow_token)
         }
     }
 
@@ -1760,55 +1788,126 @@ impl crate::workflow_sink::WorkflowSink for SseSink {
 /// terminal frame mapped from the workflow outcome. A per-task cancellation
 /// token is registered in `workflow_cancels` for the run's duration so
 /// `cancel_task` can preempt it, and removed on exit.
+async fn release_run(srv: &Arc<InboundServer>, task: &TaskId, ctx: &Option<ContextId>) {
+    srv.workflow_cancels.lock().await.remove(task);
+    if let Some(c) = ctx {
+        srv.workflow_runs.lock().await.remove(c);
+    }
+}
+
+struct RunGuard {
+    srv: Arc<InboundServer>,
+    task: TaskId,
+    ctx: Option<ContextId>,
+    armed: bool,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (srv, task, ctx) = (self.srv.clone(), self.task.clone(), self.ctx.take());
+        tokio::spawn(async move {
+            if let (Some(c), Some(sm)) = (&ctx, &srv.session_manager) {
+                sm.release_with_children(c).await;
+            }
+            release_run(&srv, &task, &ctx).await;
+        });
+    }
+}
+
 fn spawn_workflow_producer(
     srv: &Arc<InboundServer>,
     routed: RoutedCall,
     wf_id: bridge_core::ids::WorkflowId,
     tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+    workflow_token: Option<(ContextId, tokio_util::sync::CancellationToken)>,
 ) {
     let srv = srv.clone();
-    let task = routed.task;
+    let task = routed.task.clone();
     let parts = routed.parts.clone();
     tokio::spawn(async move {
-        // Resolve the executor + graph; absent either → fail the task with a
-        // terminal Failed frame (no executor wired, or an unknown workflow id).
-        let (executor, graph) = match (&srv.executor, srv.workflows.get(&wf_id)) {
-            (Some(e), Some(g)) => (e.clone(), g.clone()),
-            _ => {
+        let ctx = workflow_token.as_ref().map(|(c, _)| c.clone());
+        let mut guard = RunGuard {
+            srv: srv.clone(),
+            task: task.clone(),
+            ctx: ctx.clone(),
+            armed: true,
+        };
+        let (srv2, task2, ctx2, tx2) = (srv.clone(), task.clone(), ctx.clone(), tx.clone());
+        let outcome = AssertUnwindSafe(async move {
+            // Resolve the executor + graph; absent either → fail the task with a
+            // terminal Failed frame (no executor wired, or an unknown workflow id).
+            let (executor, graph) = match (&srv.executor, srv.workflows.get(&wf_id)) {
+                (Some(e), Some(g)) => (e.clone(), g.clone()),
+                _ => {
+                    let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+                    return;
+                }
+            };
+            // The workflow input is the concatenation of the request's text parts.
+            let input: String = parts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Register the cancel token before driving the stream so an inbound
+            // CancelTask can never race the bind window.
+            let token = match &workflow_token {
+                Some((_, t)) => t.clone(),
+                None => tokio_util::sync::CancellationToken::new(),
+            };
+            srv.workflow_cancels
+                .lock()
+                .await
+                .insert(task.clone(), token.clone());
+            let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
+                session_cwd: routed.session_cwd.clone(),
+            };
+            let stream = match &workflow_token {
+                Some((c, _)) => executor.run_with_context_and_dispatcher(
+                    graph,
+                    input,
+                    task.as_str().into(),
+                    token,
+                    wf_ctx,
+                    Arc::new(WarmWorkflowNodeDispatcher {
+                        sm: srv.session_manager.clone().unwrap(),
+                        parent: c.clone(),
+                        cwd: routed.session_cwd.clone(),
+                    }),
+                ),
+                None => executor.run_with_context(
+                    graph,
+                    input,
+                    task.as_str().to_string(),
+                    token,
+                    wf_ctx,
+                ),
+            };
+            let mut sink = SseSink { tx: tx.clone() };
+            // SseSink never errors (sends are best-effort); on a hypothetical error
+            // treat it as no-terminal so the existing no-terminal fallback fires.
+            let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink)
+                .await
+                .unwrap_or(false);
+            // The executor always emits a Terminal, but guard against an early stream
+            // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
+            if !terminal_seen {
                 let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
-                return;
             }
-        };
-        // The workflow input is the concatenation of the request's text parts.
-        let input: String = parts
-            .iter()
-            .map(|p| p.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Register the cancel token before driving the stream so an inbound
-        // CancelTask can never race the bind window.
-        let token = tokio_util::sync::CancellationToken::new();
-        srv.workflow_cancels
-            .lock()
-            .await
-            .insert(task.clone(), token.clone());
-        let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
-            session_cwd: routed.session_cwd.clone(),
-        };
-        let stream =
-            executor.run_with_context(graph, input, task.as_str().to_string(), token, wf_ctx);
-        let mut sink = SseSink { tx: tx.clone() };
-        // SseSink never errors (sends are best-effort); on a hypothetical error
-        // treat it as no-terminal so the existing no-terminal fallback fires.
-        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink)
-            .await
-            .unwrap_or(false);
-        // The executor always emits a Terminal, but guard against an early stream
-        // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
-        if !terminal_seen {
-            let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+        })
+        .catch_unwind()
+        .await;
+        if outcome.is_err() {
+            if let (Some(c), Some(sm)) = (&ctx2, &srv2.session_manager) {
+                sm.release_with_children(c).await;
+            }
+            let _ = tx2.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
         }
-        srv.workflow_cancels.lock().await.remove(&task);
+        release_run(&srv2, &task2, &ctx2).await;
+        guard.armed = false;
     });
 }
 
@@ -2448,6 +2547,14 @@ async fn unary_message(
         Ok(r) => r,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
+    if routed.context_id.is_some() && matches!(&routed.target, RouteTarget::Workflow(_)) {
+        return bridge_err_to_jsonrpc(
+            id,
+            &BridgeError::InvalidRequest {
+                field: "contextId is not supported for this route",
+            },
+        );
+    }
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
     // Fan-out unary: collect all fanout::run events and build an a2a::Task
@@ -3181,9 +3288,17 @@ async fn session_cancel(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    match sm.cancel(&ctx).await {
-        Ok(()) => jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "canceled": true })),
-        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    let token = { srv.workflow_runs.lock().await.get(&ctx).cloned() };
+    if let Some(t) = &token {
+        t.cancel();
+    }
+    let swept = sm.cancel_with_children(&ctx).await;
+    match (token.is_some(), swept) {
+        (_, Ok(())) => jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "canceled": true })),
+        (true, Err(BridgeError::SessionNotFound)) => {
+            jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "canceled": true }))
+        }
+        (_, Err(e)) => bridge_err_to_jsonrpc(id, &e),
     }
 }
 
@@ -4533,11 +4648,123 @@ mod tests {
 
         match srv.gate(&HeaderMap::new(), &params) {
             Err(BridgeError::InvalidRequest {
-                field: "contextId is only supported on the local route in Slice 0",
+                field: "contextId is not supported for this route",
             }) => {}
             Err(other) => panic!("expected contextId Local-only rejection, got: {other:?}"),
             Ok(_) => panic!("expected contextId Local-only rejection, got Ok"),
         }
+    }
+
+    struct WorkflowOnlyRoute;
+    impl RouteDecision for WorkflowOnlyRoute {
+        fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            Ok(RouteTarget::Workflow(bridge_core::ids::WorkflowId::parse(
+                "code-review",
+            )?))
+        }
+    }
+
+    fn build_workflow_route(store: Arc<FakeStore>) -> Arc<InboundServer> {
+        Arc::new(InboundServer::new(
+            FakeRegistry::single("kiro", Arc::new(PanicBackend)),
+            store,
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowOnlyRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ))
+    }
+
+    #[test]
+    fn gate_allows_contextid_on_workflow_streaming() {
+        let srv = build_workflow_route(Arc::new(FakeStore::default()));
+        let params = serde_json::json!({
+            "message": {
+                "contextId": "c-1",
+                "text": "hi",
+                "metadata": { "a2a-bridge.skill": "code-review" }
+            }
+        });
+
+        let routed = srv
+            .gate(&HeaderMap::new(), &params)
+            .expect("workflow route must accept contextId at the shared gate");
+
+        assert_eq!(routed.context_id.unwrap().as_str(), "c-1");
+        assert!(matches!(routed.target, RouteTarget::Workflow(_)));
+    }
+
+    #[tokio::test]
+    async fn gate_rejects_unary_workflow_contextid() {
+        let store = Arc::new(FakeStore::default());
+        let srv = build_workflow_route(store.clone());
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                serde_json::json!({
+                    "message": {
+                        "contextId": "c-1",
+                        "text": "hi",
+                        "metadata": { "a2a-bridge.skill": "code-review" }
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            body.get("error").is_some(),
+            "unary workflow+contextId must be rejected: {body}"
+        );
+        assert!(
+            store.map.lock().unwrap().is_empty(),
+            "unary workflow+contextId reject must happen before SessionStore::put"
+        );
+    }
+
+    #[test]
+    fn gate_still_rejects_delegate_fanout_contextid() {
+        let delegate = build_delegate(
+            FakeBackend::new(),
+            Arc::new(FakeStore::default()),
+            Arc::new(NoDelegation),
+        );
+        let delegate_params = serde_json::json!({
+            "message": {
+                "contextId": "c-1",
+                "text": "hi",
+                "metadata": { "a2a-bridge.skill": "delegate" }
+            }
+        });
+        assert!(matches!(
+            delegate.gate(&HeaderMap::new(), &delegate_params),
+            Err(BridgeError::InvalidRequest {
+                field: "contextId is not supported for this route"
+            })
+        ));
+
+        let fanout = build_fanout(
+            FakeBackend::new(),
+            Arc::new(FakeStore::default()),
+            Arc::new(NoDelegation),
+        );
+        let fanout_params = serde_json::json!({
+            "message": {
+                "contextId": "c-1",
+                "text": "hi",
+                "metadata": { "a2a-bridge.skill": "fan-out" }
+            }
+        });
+        assert!(matches!(
+            fanout.gate(&HeaderMap::new(), &fanout_params),
+            Err(BridgeError::InvalidRequest {
+                field: "contextId is not supported for this route"
+            })
+        ));
     }
 
     // ---- Task 9: task_meta_from_params reads agent + overrides ----
