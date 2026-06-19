@@ -27,12 +27,16 @@ pub enum SessionState {
     /// so a concurrent checkout (HandleBusy) can't re-mint the same backend_session id before release ends.
     Expiring,
     Resetting,
+    Compacting,
 }
 
 fn is_claimed(s: SessionState) -> bool {
     matches!(
         s,
-        SessionState::Reconciling | SessionState::Expiring | SessionState::Resetting
+        SessionState::Reconciling
+            | SessionState::Expiring
+            | SessionState::Resetting
+            | SessionState::Compacting
     )
 }
 
@@ -53,6 +57,7 @@ struct WarmHandle {
     expire_after_reconcile: bool,
     #[allow(dead_code)]
     op: Option<OperationId>,
+    pending_seed: Option<String>,
     last_used: Instant,
 }
 
@@ -63,6 +68,7 @@ pub struct WarmTurn {
     pub usage_warning: Option<UsageWarning>,
     pub generation: SessionGeneration,
     pub op: OperationId,
+    pub seed: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -201,6 +207,7 @@ impl SessionManager {
                     usage_warning,
                     generation: h.generation,
                     op,
+                    seed: None,
                 });
             }
             if d.contains(&"agent") {
@@ -271,6 +278,7 @@ impl SessionManager {
                     usage_warning,
                     generation: h.generation,
                     op,
+                    seed: None,
                 });
             }
             // Non-clean (failed reconcile OR cancel/release arrived mid-window): EXPIRE via an `Expiring`
@@ -313,6 +321,7 @@ impl SessionManager {
             usage_warning: None,
             generation: SessionGeneration::new(0),
             op: op.clone(),
+            seed: None,
         };
         tab.insert(
             ctx.clone(),
@@ -329,6 +338,7 @@ impl SessionManager {
                 usage: UsageSnapshot::default(),
                 expire_after_reconcile: false,
                 op: Some(op),
+                pending_seed: None,
                 last_used: (self.now)(),
             },
         );
@@ -358,6 +368,7 @@ impl SessionManager {
                 SessionState::Reconciling => "reconciling",
                 SessionState::Expiring => "expiring",
                 SessionState::Resetting => "resetting",
+                SessionState::Compacting => "compacting",
             },
             agent: h.agent.as_str().to_string(),
             generation: h.generation.get(),
@@ -856,6 +867,11 @@ mod tests {
 
     fn cwd(path: &str) -> Option<SessionCwd> {
         Some(SessionCwd::parse(path).unwrap())
+    }
+
+    #[test]
+    fn is_claimed_includes_compacting() {
+        assert!(super::is_claimed(super::SessionState::Compacting));
     }
 
     #[derive(Clone)]
