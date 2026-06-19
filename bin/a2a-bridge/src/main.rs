@@ -568,6 +568,7 @@ fn parse_run_workflow_args(
     let mut session_cwd: Option<String> = None;
     let mut serve = false;
     let mut url = "http://127.0.0.1:8080".to_string();
+    let mut url_explicit = false;
     let mut context: Option<String> = None;
     let mut idx = 0;
     while idx < args.len() {
@@ -611,6 +612,7 @@ fn parse_run_workflow_args(
             }
             "--url" => {
                 idx += 1;
+                url_explicit = true;
                 url = args
                     .get(idx)
                     .ok_or("run-workflow: --url requires a value")?
@@ -647,6 +649,9 @@ fn parse_run_workflow_args(
     let workflow_id = positionals.remove(0);
     if context.is_some() && !serve {
         return Err("run-workflow: --context requires --serve".into());
+    }
+    if url_explicit && !serve {
+        return Err("run-workflow: --url requires --serve".into());
     }
     if serve && context.is_none() {
         return Err("run-workflow: --serve requires --context".into());
@@ -4856,6 +4861,21 @@ cmd = "true"
             .to_string();
         assert!(
             err.contains("--context requires --serve"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_workflow_url_requires_serve() {
+        let args: Vec<String> = ["wf", "--input", "in.md", "--url", "http://127.0.0.1:9090"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = super::parse_run_workflow_args(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--url requires --serve"),
             "unexpected error: {err}"
         );
     }

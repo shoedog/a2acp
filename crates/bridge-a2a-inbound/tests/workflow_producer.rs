@@ -1041,6 +1041,51 @@ async fn active_session_cancel_one_backend_cancel_per_child() {
 }
 
 #[tokio::test]
+async fn cancel_task_warm_workflow_cancels_checked_out_child() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let srv = build_server_per_agent_with_session_manager(
+        Arc::new(FakeStore::default()),
+        blocking_backends(gate, stats.clone()),
+    );
+    let body = start_warm_stream(&srv, "warm-cancel-task-1", "ctx-warm-cancel-task").await;
+    wait_for(
+        || stats.prompts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "workflow did not park a checked-out child in prompt before CancelTask",
+    )
+    .await;
+
+    let cancel_resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": "warm-cancel-task-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), axum::http::StatusCode::OK);
+    let cancel = json_response(cancel_resp).await;
+    assert_eq!(
+        cancel["result"]["task"]["state"], "TASK_STATE_CANCELED",
+        "{cancel}"
+    );
+
+    let raw = body.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+    let cancels = stats.cancels.lock().unwrap();
+    assert!(
+        cancels
+            .iter()
+            .any(|s| s.contains("ctx-warm-cancel-task::workflow::code-review::node::")),
+        "CancelTask must cancel a checked-out warm child: {cancels:?}"
+    );
+}
+
+#[tokio::test]
 async fn active_session_cancel_propagates_child_backend_error() {
     let gate = Arc::new((
         std::sync::atomic::AtomicBool::new(false),
