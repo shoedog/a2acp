@@ -1,0 +1,12 @@
+# Slice 3 live-gate: host codex-acp + warm sessions with a long TTL so the session survives across a `clear`
+# (DoD-1 recall=none after clear; DoD-2 process stays warm; DoD-3 generation advances).
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "low"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[server]
+addr = "127.0.0.1:8097"
+warm_idle_ttl_secs = 600
