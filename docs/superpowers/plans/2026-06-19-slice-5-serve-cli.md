@@ -144,6 +144,15 @@ Round-7 declared the seam/ordering implementable and found NO blockers — only 
   0, Failed/Canceled→nonzero, and a pre-SSE JSON-RPC error (`HandleBusy`) surfaced WITHOUT SSE-parsing.
 - T7 (MINOR): update the stale `gate()` error string (Workflow now accepts contextId too).
 
+### v9 — round-8 plan-review folds (codex xhigh; **NO BLOCKERS** — two Task-6 consistency follow-ons)
+Round-8 again found NO blockers — two tightenings exposed by the round-7 error-propagation change:
+- T6 (MAJOR): the `session_cancel` response must NOT mask real errors behind `token.is_some()` — match
+  `(token.is_some(), swept)`: `Ok→ok`; `(true, NotFound)→ok`; `(_, Err(e))→error`; +
+  `active_session_cancel_propagates_child_backend_error`.
+- T6 (MAJOR): the producer cleanup must survive a PANIC — a plain post-`.await` cleanup is skipped on unwind, so
+  use a `RunGuard` whose `Drop` spawns the async removal of `workflow_runs[C]`+`workflow_cancels[task]` (fires on
+  normal exit, early-return, AND panic); + `workflow_producer_panic_frees_context`.
+
 ---
 
 ## File Structure
@@ -369,7 +378,11 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   `active_session_cancel_one_backend_cancel_per_child` (round-5 BLOCKER) — an ACTIVE workflow `SessionCancel C`
   (token cancel + `cancel_with_children`) PLUS the executor cleanup's `on_exit(Canceled)→sm.cancel(child)` yields
   EXACTLY ONE `backend.cancel` per child (assert via the gated workflow backend's cancel count), proving the
-  idempotent-`cancel` fix.
+  idempotent-`cancel` fix; `active_session_cancel_propagates_child_backend_error` (round-8 MAJOR) — an active
+  `SessionCancel C` where a registered child's backend `cancel` returns `Err` → JSON-RPC ERROR (NOT ok), proving
+  the response rule doesn't mask it behind the token; `workflow_producer_panic_frees_context` (round-8 MAJOR) — a
+  producer whose backend `prompt()` PANICS → after unwind the `RunGuard` drops, so a fresh workflow send on the
+  SAME C succeeds (NOT `HandleBusy`) — `workflow_runs[C]` was not leaked.
 - [ ] **Step 2 (impl):** add `workflow_runs: Mutex<HashMap<ContextId, CancellationToken>>` to `InboundServer`.
   **round-5 MAJOR — guard BEFORE `store.put`:** `stream_message` persists `task→session` at `server.rs:769`
   BEFORE the route match, so a guard placed in the Workflow arm (`:823`) would let a rejected 2nd workflow mutate
@@ -381,43 +394,55 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   &BridgeError::HandleBusy); } let t = CancellationToken::new(); runs.insert(c.clone(), t.clone()); Some((c, t)) }
   else { None };` (the `HandleBusy` returns BEFORE any `store.put` → no state mutation; the cold
   no-context workflow gets `None` → unchanged). Thread `workflow_token: Option<(ContextId,
-  CancellationToken)>` into the Workflow arm → `spawn_workflow_producer`. **round-6 MAJOR — explicit warm/cold
-  branch + async scope-guard cleanup** (Drop can't `.await`, and the absent-executor/graph early-return at
-  `:1697` must NOT strand `workflow_runs[C]`): wrap the producer body so cleanup ALWAYS runs:
+  CancellationToken)>` into the Workflow arm → `spawn_workflow_producer`. **round-6/8 MAJOR — explicit warm/cold
+  branch + PANIC-SAFE `Drop`-guard cleanup** (the absent-executor/graph early-return at `:1697` AND a producer
+  PANIC — backend `prompt()` panics propagate through workflow exec, `tests/workflow_producer.rs:1384` — must
+  BOTH release the guard; a plain post-`.await` cleanup is SKIPPED on unwind, so use a `Drop` guard that spawns
+  the async removal):
 ```rust
+struct RunGuard { srv: Arc<InboundServer>, task: TaskId, ctx: Option<ContextId> }
+impl Drop for RunGuard {
+    fn drop(&mut self) {              // fires on normal exit, early-return, AND panic-unwind
+        let (srv, task, ctx) = (self.srv.clone(), self.task.clone(), self.ctx.take());
+        tokio::spawn(async move {     // Drop can't .await -> spawn the removal (we're in runtime ctx)
+            srv.workflow_cancels.lock().await.remove(&task);
+            if let Some(c) = ctx { srv.workflow_runs.lock().await.remove(&c); }
+        });
+    }
+}
 tokio::spawn(async move {
-    let _ = async {
-        // existing executor/graph resolve + early-return on absent (:1695-1701) ...
-        let token = match &workflow_token { Some((_, t)) => t.clone(), None => CancellationToken::new() };
-        srv.workflow_cancels.lock().await.insert(task.clone(), token.clone()); // backs CancelTask :2832
-        let stream = match &workflow_token {
-            Some((c, _)) => executor.run_with_context_and_dispatcher(  // WARM (PFIX-1, on &WorkflowExecutor)
-                graph, input, task.as_str().into(), token, wf_ctx,
-                Arc::new(WarmWorkflowNodeDispatcher {
-                    sm: srv.session_manager.clone().unwrap(),
-                    parent: c.clone(), cwd: routed.session_cwd.clone(),
-                })),
-            None => executor.run_with_context(graph, input, task.as_str().into(), token, wf_ctx), // COLD, byte-identical
-        };
-        // drain + terminal fallback — UNCHANGED (:1720-1730)
-    }.await;
-    // UNCONDITIONAL cleanup on EVERY exit (early-return or normal) — no permanently-busy C:
-    srv.workflow_cancels.lock().await.remove(&task);
-    if let Some((c, _)) = &workflow_token { srv.workflow_runs.lock().await.remove(c); }
+    let _guard = RunGuard { srv: srv.clone(), task: task.clone(),
+                            ctx: workflow_token.as_ref().map(|(c, _)| c.clone()) };
+    // existing executor/graph resolve + early-return on absent (:1695-1701) — _guard still drops
+    let token = match &workflow_token { Some((_, t)) => t.clone(), None => CancellationToken::new() };
+    srv.workflow_cancels.lock().await.insert(task.clone(), token.clone()); // backs CancelTask :2832
+    let stream = match &workflow_token {
+        Some((c, _)) => executor.run_with_context_and_dispatcher(  // WARM (PFIX-1, on &WorkflowExecutor)
+            graph, input, task.as_str().into(), token, wf_ctx,
+            Arc::new(WarmWorkflowNodeDispatcher {
+                sm: srv.session_manager.clone().unwrap(), parent: c.clone(), cwd: routed.session_cwd.clone(),
+            })),
+        None => executor.run_with_context(graph, input, task.as_str().into(), token, wf_ctx), // COLD, byte-identical
+    };
+    // drain + terminal fallback — UNCHANGED (:1720-1730). `_guard` drops here OR on panic -> async removal.
 });
 ```
   The `None` arm keeps no-context streaming workflows on the cold `run_with_context` path (back-compat — the
-  `with_workflows`-without-SM tests stay green); the post-`.await` block removes BOTH maps even on the early
-  failure (mirrors `workflow_cancels` :1711/:1731; note the `routed.task`/`session_cwd` move order :1690/:1716). In `session_cancel`
+  `with_workflows`-without-SM tests stay green); the `RunGuard` removes BOTH maps on EVERY exit incl. early-return
+  AND panic-unwind (mirrors `workflow_cancels` :1711/:1731; note the `routed.task`/`session_cwd` move order
+  :1690/:1716). In `session_cancel`
   (`server.rs:3104`): **round-4 BLOCKER — GET, do NOT remove the guard.** `let token = { workflow_runs.lock()
   .await.get(C).cloned() };` (clone the token, LEAVE the entry — the guard is released ONLY on producer exit,
   mirroring `workflow_cancels`; removing it here lets a 2nd same-context run pass the guard and re-claim a child
   that `SessionManager::cancel` already marked Idle at `:454` but is still tearing down via `backend.cancel` at
   `:461`). `if let Some(t) = &token { t.cancel(); }` (stop the scheduler if a run is active); THEN `let swept =
   sm.cancel_with_children(C).await;` UNCONDITIONALLY (PFIX-5/FIX-11 — sweeps children even AFTER the run
-  finished). Respond OK if `token.is_some() || swept.is_ok()`; else map `swept`'s `Err(SessionNotFound)` to the
-  wire error (round-3 BLOCKER-2 — an active run token counts as success even with zero minted children). Do NOT
-  fall back to bare `sm.cancel(C)`. (The producer exit path removes `workflow_runs[C]` + `workflow_cancels[task]`.)
+  finished). **round-8 MAJOR — respond per `(token.is_some(), swept)`, do NOT mask real errors behind
+  `token.is_some()`:** `(_, Ok(())) => jsonrpc_ok`; `(true, Err(BridgeError::SessionNotFound)) => jsonrpc_ok` (an
+  active run token = success even with zero minted children, round-3 BLOCKER-2); `(_, Err(e)) =>
+  bridge_err_to_jsonrpc(id, &e)` (a REAL child cancel failure — or `SessionNotFound` with NO token — propagates).
+  Do NOT fall back to bare `sm.cancel(C)`. (The producer `RunGuard` removes `workflow_runs[C]` +
+  `workflow_cancels[task]`.)
 - [ ] **Step 3:** **round-6 MINOR — the concurrency/cancel tests live in the `tests/workflow_producer.rs`
   INTEGRATION target (the `with_workflows` harness), NOT `--lib`:** `cargo test -p bridge-a2a-inbound --test
   workflow_producer 'workflow_handle_busy|session_cancel|one_backend_cancel' && cargo test -p bridge-a2a-inbound
