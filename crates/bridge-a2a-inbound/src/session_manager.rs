@@ -173,6 +173,11 @@ impl SessionManager {
             .is_some_and(|children| children.contains(child))
     }
 
+    #[cfg(test)]
+    async fn child_parent_registered(&self, parent: &ContextId) -> bool {
+        self.children.lock().await.contains_key(parent)
+    }
+
     fn eval_warn(&self, u: &UsageSnapshot) -> Option<UsageWarning> {
         let thr = self.warn_fraction?;
         match (u.used, u.size) {
@@ -811,27 +816,41 @@ impl SessionManager {
                 .map(|(c, _)| c.clone())
                 .collect()
         };
-        for c in expired {
-            // Re-validate under the lock and REMOVE atomically: only reap a STILL-Idle, STILL-expired handle.
-            // A claim that landed after the snapshot (compact/reset/reconcile flips the state off Idle) OWNS
-            // the lifecycle — the reaper must SKIP it, never route through `release` (which would set the
-            // deferred-expire flag and make the claim's commit tail kill the handle). [whole-branch review]
-            let h = {
-                let mut tab = self.by_context.lock().await;
-                match tab.get(&c) {
+        let mut handles = Vec::new();
+        {
+            let mut children = self.children.lock().await;
+            let mut tab = self.by_context.lock().await;
+            let mut reaped = HashSet::new();
+            for c in expired {
+                // Re-validate under the lock and REMOVE atomically: only reap a STILL-Idle,
+                // STILL-expired handle. A claim that landed after the snapshot
+                // (compact/reset/reconcile flips the state off Idle) OWNS the lifecycle — the
+                // reaper must SKIP it, never route through `release` (which would set the
+                // deferred-expire flag and make the claim's commit tail kill the handle).
+                // [whole-branch review]
+                let should_reap = matches!(
+                    tab.get(&c),
                     Some(h)
                         if h.state == SessionState::Idle
-                            && now.duration_since(h.last_used) >= self.idle_ttl =>
-                    {
-                        tab.remove(&c)
+                            && now.duration_since(h.last_used) >= self.idle_ttl
+                );
+                if should_reap {
+                    if let Some(h) = tab.remove(&c) {
+                        reaped.insert(c);
+                        handles.push(h);
                     }
-                    _ => None,
                 }
-            };
-            if let Some(h) = h {
-                h.backend.release_session(&h.backend_session).await;
-                drop(h.lease);
             }
+            if !reaped.is_empty() {
+                for set in children.values_mut() {
+                    set.retain(|child| !reaped.contains(child));
+                }
+                children.retain(|_, set| !set.is_empty());
+            }
+        }
+        for h in handles {
+            h.backend.release_session(&h.backend_session).await;
+            drop(h.lease);
         }
     }
 }
@@ -2885,6 +2904,36 @@ mod tests {
 
         assert!(manager.status(&idle).await.is_none());
         assert_eq!(manager.status(&running).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn reap_idle_prunes_child_registration() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let clock = ManualClock::new();
+        let manager =
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.reader());
+        let parent = ctx("reap-child-parent");
+        let child = ctx("reap-child");
+
+        let turn = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+        assert!(manager.child_parent_registered(&parent).await);
+
+        clock.advance(Duration::from_secs(6));
+        manager.reap_idle().await;
+
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+        assert_eq!(
+            manager.cancel_with_children(&parent).await.err(),
+            Some(BridgeError::SessionNotFound)
+        );
     }
 
     #[tokio::test]
