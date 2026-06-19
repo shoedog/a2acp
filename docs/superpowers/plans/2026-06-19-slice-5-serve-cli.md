@@ -174,6 +174,17 @@ Round-10 found a genuine ordering BLOCKER and a deep panic-lifecycle MAJOR:
   per-node `on_exit`, leaving warm children `Running`; freeing only the parent maps lets the next run pass the
   parent guard then hit child `HandleBusy`. The panic test now asserts the next same-context run COMPLETES.
 
+### v12 — round-11 plan-review folds (codex xhigh; NO BLOCKERS — 2 lifecycle clarifications)
+Round-11 confirmed ordering sound; 2 MAJOR + 1 MINOR:
+- T6 (MAJOR): the producer wraps its body in `AssertUnwindSafe(..).catch_unwind().await` and AWAITS the cleanup
+  (`release_with_children` on panic + `release_run`) INLINE — a Drop-`tokio::spawn` removal is eventual/racy (a
+  next same-context request could still see `workflow_runs[C]`/a `Running` child); `RunGuard::Drop` is now the
+  abort-only last resort.
+- T2 (MAJOR): warm exit classification mirrors the cold loop — `NodeTurnExit::Canceled` ONLY for the explicit
+  `cancel.cancelled()` token branch; `Update::Done{STOP_REASON_CANCELLED}` → `Normal`/`finish_turn` (cold does
+  NOT `backend.cancel` there), `ok=false` carried only in the node-result; + `warm_done_cancelled_finishes_not_cancels`.
+- MINOR: Self-review FIX→task map corrected (FIX-8/10 are T6, not T7/T8).
+
 ---
 
 ## File Structure
@@ -247,7 +258,9 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
   — a `FakeDispatcher` (None-forget) + a recording backend → assert NO `forget_session`, the node prompted on
   the dispatcher's session, `cleanup.on_exit(Normal)` ran. (c) `warm_seed_prepended` — `NodeTurn.seed=Some("S")`
   → the prompt's FIRST part is the wrapped seed. (d) `dispatcher_cancel_drains` — cancel mid-run →
-  `on_exit(Canceled)` + the `FuturesUnordered` drain still completes (W3b).
+  `on_exit(Canceled)` + the `FuturesUnordered` drain still completes (W3b). (e) `warm_done_cancelled_finishes_not_cancels`
+  (round-11 MAJOR) — a backend that emits `Update::Done{stop_reason:STOP_REASON_CANCELLED}` (no token cancel) →
+  `on_exit(Normal)`/`finish_turn` (NOT `sm.cancel`); assert NO `backend.cancel`, node-result bool is `false`.
 - [ ] **Step 3 (impl):** in `run_node`, KEEP the existing `:76` `if cancel.is_cancelled() { return (format!(
   "[node {} canceled]", node.id.as_str()), false) }` pre-check FIRST (MINOR-2: an already-canceled warm run must
   NOT mint/claim a child session), THEN branch on the threaded param: `match dispatcher { Some(d) => WARM, None
@@ -256,9 +269,15 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
   `(String,bool)`, NOT `Result`; mirror the cold marker `executor.rs:98/100`, do NOT `?`/panic). Build `parts` =
   `seed`-prepended (if `turn.seed`, `parts.insert(0, Part{text: format!("[Summary of earlier context in this
   session]\n{seed}")})`) then the rendered prompt; run the prompt+drain loop on `turn.backend`/`turn.session`;
-  on each exit branch call `turn.cleanup.on_exit(exit)` with the right `NodeTurnExit` (Normal / Canceled /
-  Error(e)) — REPLACING the cold `forget_session` calls. **PFIX-3:** the WARM loop's cancel arm must NOT call
-  `backend.cancel` (the cleanup owns cancel via `sm.cancel(child)`) — give the warm path its own loop body or an
+  on each exit branch call `turn.cleanup.on_exit(exit)` with the right `NodeTurnExit` — REPLACING the cold
+  `forget_session` calls. **round-11 MAJOR — exit classification MUST mirror the cold loop's branches
+  (`executor.rs:133-154`):** `NodeTurnExit::Canceled` is used ONLY for the explicit `cancel.cancelled()` token
+  branch (`:136`). `Update::Done { stop_reason: STOP_REASON_CANCELLED }` (`:144-145`, agent-reported, NOT our
+  token) → `NodeTurnExit::Normal` (the cold path here does NOT `backend.cancel`, it just `forget`s → the warm
+  child must FINISH/idle via `finish_turn`, NOT `sm.cancel`); the `ok=false` is carried ONLY in the returned
+  `(text, false)` node-result, not the session lifecycle. `Update::Done{other}` / `None` → `Normal`; `Err(e)` →
+  `Error(e)`. **PFIX-3:** the WARM loop's `cancel.cancelled()` arm must NOT call `backend.cancel` (the cleanup
+  owns cancel via `sm.cancel(child)` in `on_exit(Canceled)`) — give the warm path its own loop body or an
   `is_warm` flag gating the `:137` `backend.cancel`. ELSE (`None`) → the EXISTING inline cold path UNCHANGED
   (byte-identical: same id, `backend.cancel` at `:137`, `forget` at every site). Keep the `FuturesUnordered`
   scheduler (`:322`) untouched.
@@ -435,53 +454,57 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   &BridgeError::HandleBusy); } let t = CancellationToken::new(); runs.insert(c.clone(), t.clone()); Some((c, t)) }
   else { None };` (the `HandleBusy` returns BEFORE any `store.put` → no state mutation; the cold
   no-context workflow gets `None` → unchanged). Thread `workflow_token: Option<(ContextId,
-  CancellationToken)>` into the Workflow arm → `spawn_workflow_producer`. **round-6/8/9 MAJOR — explicit
-  warm/cold branch + INLINE-awaited cleanup on every normal/early exit + a `RunGuard` PANIC-ONLY fallback**
-  (round-9: a Drop-ONLY `tokio::spawn` removal is DEFERRED, so a just-finished `C` lingers in `workflow_runs` and
-  an immediate 2nd `--serve --context C` gets a FALSE `HandleBusy`; remove the maps INLINE+awaited on the normal
-  paths, keep the guard only for the panic path — backend `prompt()` panics propagate, `tests/workflow_producer.rs:1384`):
+  CancellationToken)>` into the Workflow arm → `spawn_workflow_producer`. **round-6/8/9/11 MAJOR — explicit
+  warm/cold branch + `catch_unwind` so ALL cleanup (incl. the panic path) is INLINE-awaited** (round-11: a
+  Drop-`tokio::spawn` removal is EVENTUAL/racy — an immediate next same-context request can still see
+  `workflow_runs[C]` or a `Running` child; so wrap the body in `AssertUnwindSafe(..).catch_unwind().await` and
+  AWAIT the cleanup before the task ends; the `RunGuard::Drop` stays ONLY as a last-resort for a task aborted/
+  dropped before reaching the inline cleanup):
 ```rust
 async fn release_run(srv: &Arc<InboundServer>, task: &TaskId, ctx: &Option<ContextId>) { // idempotent
     srv.workflow_cancels.lock().await.remove(task);                    // (HashMap::remove no-ops on absent)
     if let Some(c) = ctx { srv.workflow_runs.lock().await.remove(c); }
 }
 struct RunGuard { srv: Arc<InboundServer>, task: TaskId, ctx: Option<ContextId>, armed: bool }
-impl Drop for RunGuard {                 // ONLY fires when release() was NOT reached (panic / un-disarmed early exit)
+impl Drop for RunGuard {                 // LAST-RESORT ONLY: task aborted/dropped before the inline cleanup ran
     fn drop(&mut self) {
-        if !self.armed { return; }       // disarmed by the inline cleanup on normal paths
+        if !self.armed { return; }       // disarmed once the inline cleanup completes
         let (srv, task, ctx) = (self.srv.clone(), self.task.clone(), self.ctx.take());
-        tokio::spawn(async move {        // Drop can't .await -> spawn (panic fallback)
-            // round-10 MAJOR: a panic skips per-node on_exit, so warm children stay `Running` (checkout marks
-            // Running at :216/:345; finish_turn only idles on cleanup). FREE them (release, not keep-warm — the
-            // post-panic state is unknown) so the next same-context run re-mints instead of hitting child HandleBusy.
-            if let (Some(c), Some(sm)) = (&ctx, &srv.session_manager) { sm.release_with_children(c).await; }
-            release_run(&srv, &task, &ctx).await;
-        });
+        tokio::spawn(async move { release_run(&srv, &task, &ctx).await; });
     }
 }
 tokio::spawn(async move {
+    use futures::FutureExt;
     let ctx = workflow_token.as_ref().map(|(c, _)| c.clone());
     let mut guard = RunGuard { srv: srv.clone(), task: task.clone(), ctx: ctx.clone(), armed: true };
-    // existing executor/graph resolve; on absent: `release_run(&srv,&task,&ctx).await; guard.armed=false; return;`
-    let token = match &workflow_token { Some((_, t)) => t.clone(), None => CancellationToken::new() };
-    srv.workflow_cancels.lock().await.insert(task.clone(), token.clone()); // backs CancelTask :2832
-    let stream = match &workflow_token {
-        Some((c, _)) => executor.run_with_context_and_dispatcher(  // WARM (PFIX-1, on &WorkflowExecutor)
-            graph, input, task.as_str().into(), token, wf_ctx,
-            Arc::new(WarmWorkflowNodeDispatcher {
-                sm: srv.session_manager.clone().unwrap(), parent: c.clone(), cwd: routed.session_cwd.clone(),
-            })),
-        None => executor.run_with_context(graph, input, task.as_str().into(), token, wf_ctx), // COLD, byte-identical
-    };
-    // drain + terminal fallback — UNCHANGED (:1720-1730)
-    release_run(&srv, &task, &ctx).await; guard.armed = false; // INLINE+awaited normal cleanup -> no false-busy window
-    // (on a PANIC before here, `guard` is still armed -> Drop spawns release_run as the fallback)
+    // clone what the post-cleanup needs (the body `async move`s the consumed run values + a `tx.clone()` sink):
+    let (srv2, task2, ctx2, tx2) = (srv.clone(), task.clone(), ctx.clone(), tx.clone());
+    let outcome = AssertUnwindSafe(async move {
+        // executor/graph resolve + early-return on absent (:1695-1701) -> Ok, no children minted;
+        let token = match &workflow_token { Some((_, t)) => t.clone(), None => CancellationToken::new() };
+        srv.workflow_cancels.lock().await.insert(task.clone(), token.clone()); // backs CancelTask :2832
+        let stream = match &workflow_token {
+            Some((c, _)) => executor.run_with_context_and_dispatcher(  // WARM (PFIX-1, on &WorkflowExecutor)
+                graph, input, task.as_str().into(), token, wf_ctx,
+                Arc::new(WarmWorkflowNodeDispatcher {
+                    sm: srv.session_manager.clone().unwrap(), parent: c.clone(), cwd: routed.session_cwd.clone() })),
+            None => executor.run_with_context(graph, input, task.as_str().into(), token, wf_ctx), // COLD, byte-identical
+        };
+        // drain + terminal fallback — UNCHANGED (:1720-1730), sink = SseSink { tx: tx.clone() }
+    }).catch_unwind().await;
+    if outcome.is_err() {                 // PANICKED: per-node on_exit skipped -> warm children stuck `Running`
+        if let (Some(c), Some(sm)) = (&ctx2, &srv2.session_manager) { sm.release_with_children(c).await; } // FREE them
+        let _ = tx2.send(Ok(Event::terminal(TaskOutcome::Failed))).await;  // SSE still sees a terminal
+    }
+    release_run(&srv2, &task2, &ctx2).await;  // INLINE+awaited on BOTH Ok and panic -> no false-busy / no stuck child
+    guard.armed = false;                      // inline cleanup done -> Drop is a no-op (abort-only last resort)
 });
 ```
   The `None` arm keeps no-context streaming workflows on the cold `run_with_context` path (back-compat — the
-  `with_workflows`-without-SM tests stay green); the INLINE `release_run` frees `C` immediately on normal/early
-  exits (no false-busy), and the armed `RunGuard` covers the panic path (mirrors `workflow_cancels`
-  :1711/:1731; note the `routed.task`/`session_cwd` move order :1690/:1716). In `session_cancel`
+  `with_workflows`-without-SM tests stay green); `catch_unwind` makes the panic cleanup (free children + remove
+  maps) INLINE-awaited so an immediate next same-context request never races a deferred removal; `RunGuard` is the
+  abort-only last resort (mirrors `workflow_cancels` :1711/:1731; note the `routed.task`/`session_cwd` move order
+  :1690/:1716). In `session_cancel`
   (`server.rs:3104`): **round-4 BLOCKER — GET, do NOT remove the guard.** `let token = { workflow_runs.lock()
   .await.get(C).cloned() };` (clone the token, LEAVE the entry — the guard is released ONLY on producer exit,
   mirroring `workflow_cancels`; removing it here lets a 2nd same-context run pass the guard and re-claim a child
@@ -584,7 +607,8 @@ tokio::spawn(async move {
 
 ## Self-review
 - **Spec coverage:** FIX-1 (T1), FIX-2 (T3/T4/T5), FIX-3 (T6), FIX-4 (T2), FIX-5 (T1/T2/T5), FIX-6/7 (T5),
-  FIX-8/10/11 (T7/T8), FIX-9 (scope, no code). Every FIX maps. ✓
+  FIX-8 (T6, round-11), FIX-10 (T6, round-11), FIX-11 (T7 sweep handlers + T6 `SessionCancel` + T8 CLI), FIX-9
+  (scope, no code). Every FIX maps. ✓
 - **Back-compat:** the cold executor path + local `run-workflow` are the `None`/no-`--serve` branches, untouched
   (T2/T8). Existing executor + run-workflow tests lock them.
 - **Type consistency:** `WorkflowNodeDispatcher`/`NodeTurn`/`NodeTurnExit`/`NodeTurnCleanup` (T1) used in T2/T5;
