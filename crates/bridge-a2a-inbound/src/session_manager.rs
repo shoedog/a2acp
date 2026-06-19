@@ -10,7 +10,7 @@ use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome, UsageSnapshot};
 use bridge_core::ports::{AgentBackend, AgentRegistry, Lease};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::session_fingerprint::SessionSpecFingerprint;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -114,6 +114,7 @@ impl SessionStatusInfo {
 pub struct SessionManager {
     registry: Arc<dyn AgentRegistry>,
     by_context: Mutex<HashMap<ContextId, WarmHandle>>,
+    children: Mutex<HashMap<ContextId, HashSet<ContextId>>>,
     idle_ttl: Duration,
     warn_fraction: Option<f64>,
     compact_summarize_timeout: Duration,
@@ -134,6 +135,7 @@ impl SessionManager {
         Self {
             registry,
             by_context: Mutex::new(HashMap::new()),
+            children: Mutex::new(HashMap::new()),
             idle_ttl,
             warn_fraction: None,
             compact_summarize_timeout: Duration::from_secs(120),
@@ -160,6 +162,15 @@ impl SessionManager {
             .await
             .get(ctx)
             .and_then(|h| h.pending_seed.clone())
+    }
+
+    #[cfg(test)]
+    async fn child_registered(&self, parent: &ContextId, child: &ContextId) -> bool {
+        self.children
+            .lock()
+            .await
+            .get(parent)
+            .is_some_and(|children| children.contains(child))
     }
 
     fn eval_warn(&self, u: &UsageSnapshot) -> Option<UsageWarning> {
@@ -362,6 +373,32 @@ impl SessionManager {
             },
         );
         Ok(turn)
+    }
+
+    pub async fn checkout_child_turn(
+        &self,
+        parent: &ContextId,
+        child: &ContextId,
+        agent: AgentId,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        op: OperationId,
+    ) -> Result<WarmTurn, BridgeError> {
+        // PFIX-4 (FIX-2 atomicity): hold `children` ACROSS checkout_turn + insert. A concurrent
+        // `*_with_children` sweep (Task 4) takes `children` FIRST, so it WAITS for an in-progress child
+        // checkout instead of missing it — closes the register-after-release leak window. Lock order is
+        // children -> by_context (checkout_turn locks by_context internally); the sweeps use the same order.
+        let mut children = self.children.lock().await;
+        let turn = self.checkout_turn(child, agent, overrides, cwd, op).await?;
+        children
+            .entry(parent.clone())
+            .or_default()
+            .insert(child.clone());
+        Ok(turn)
+    }
+
+    pub async fn expire_turn(&self, ctx: &ContextId) {
+        self.release(ctx).await;
     }
 
     /// Mark the current turn finished -> Idle (keep warm). FIX-3: no-op unless this is the SAME generation
@@ -1691,6 +1728,71 @@ mod tests {
 
         assert_eq!(first.session.as_str(), "ctx-abc-g0");
         assert_eq!(first.session, second.session);
+    }
+
+    #[tokio::test]
+    async fn checkout_child_turn_registers_and_reuses() {
+        let (manager, _backend, _registry) = manager();
+        let parent = ctx("parent");
+        let child = ctx("child");
+        let first_op = op("op-1");
+
+        let first = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, first_op.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.session.as_str(), "ctx-child-g0");
+        assert_eq!(first.generation, SessionGeneration::new(0));
+        assert_eq!(first.op, first_op);
+        assert!(manager.child_registered(&parent, &child).await);
+
+        manager
+            .finish_turn(&child, first.generation, &first.op)
+            .await;
+        let second_op = op("op-2");
+        let second = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, second_op.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(second.session, first.session);
+        assert_eq!(second.generation, SessionGeneration::new(0));
+        assert_eq!(second.op, second_op);
+        assert!(manager.child_registered(&parent, &child).await);
+    }
+
+    #[tokio::test]
+    async fn checkout_child_turn_failure_does_not_register() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("parent-fail");
+        let missing_child = ctx("missing-child");
+
+        let err = manager
+            .checkout_child_turn(
+                &parent,
+                &missing_child,
+                AgentId::parse("missing").unwrap(),
+                None,
+                None,
+                op("op-1"),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, BridgeError::UnknownAgent { .. }));
+        assert!(!manager.child_registered(&parent, &missing_child).await);
+
+        backend.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "boom".into(),
+        }));
+        let configure_child = ctx("configure-child");
+        let err = manager
+            .checkout_child_turn(&parent, &configure_child, agent(), None, None, op("op-2"))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, BridgeError::ConfigInvalid { .. }));
+        assert!(!manager.child_registered(&parent, &configure_child).await);
     }
 
     #[tokio::test]
