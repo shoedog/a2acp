@@ -78,6 +78,27 @@ One foundational follow-up closes BOTH races and makes `force`-clear truly abort
 - Race 2: a `clear --force` fired in the checkout→prompt window leaves the context **cleared** (recall=none),
   never resurrected — the in-flight producer is aborted, not allowed to re-mint.
 
+## Related: claim-held-across-await robustness (added 2026-06-19, Slice-4 whole-branch review)
+
+The Slice-4 whole-branch review surfaced two robustness patterns in the claim-held-across-await design that
+Slice 4 FIXED for compact but which also (with a SMALLER window) exist in the SHIPPED `reset_session`/clear
+path:
+
+1. **Caller-future-drop strands a claim.** A handler that `await`s a claim-held op (`reset_session` /
+   `compact_session`) directly will, if its future is dropped mid-op (client disconnect / a request-timeout
+   layer), leave the handle stranded in the claim state forever (`reap_idle` skips claimed states; release/
+   cancel only defer). Slice 4 fixed COMPACT by running `compact_session` on a DETACHED `tokio::spawn` task in
+   `session_compact` (the task always drives to commit-or-EXPIRE). `reset_session` (via `session_clear`) still
+   awaits directly — its window is tiny (local release+configure, ms) vs compact's full summarize turn, but the
+   same spawn-detach would close it. **Follow-up: apply spawn-detach to `session_clear` too.**
+2. **reap-vs-claim TOCTOU (already fixed for ALL claims).** `reap_idle` snapshotted Idle contexts, dropped the
+   lock, then `release`d — a claim landing in that gap got defer-expired, killing it. Slice 4 fixed this
+   GENERALLY (reap now re-validates + removes atomically under the lock, skipping any claimed handle), so it is
+   already closed for reset/reconcile/compact. No further action.
+
+These are robustness hardening (not the op-collision / force-clear races above); sequence with the cancellation-
+token work or as a small standalone `session_clear` spawn-detach fix.
+
 ## Source / provenance
 - Full detail + the merge-as-is decision: `docs/superpowers/specs/2026-06-18-slice-3-clear-reset.md`
   → **"## Deferred hardening (whole-branch review round 2)"**.

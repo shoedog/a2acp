@@ -41,10 +41,24 @@
   checkout→`backend.prompt` gap and resurrect the released session. Both need a **"warm-turn cancellation
   tokens" follow-up** (manager-minted unique op + a per-turn abort token through the producer/translator);
   **sequence it before any feature that relies on `force`/cancel under concurrency.**
-- **NEXT = Slice 4 — Compact** (summarize → `reset_session` → seed as `PrependNextTurn`; reuses the Slice-3
-  clear primitive, require-Idle — does NOT need `force`, so the deferred hardening is not a blocker for S4).
-  Then S5 serve-backed `run-workflow --serve --context` [MVP cut] → S6 journal → S7 observability+E9 → S8 MCP →
-  S9 Turn Channel → tail. Follow the proven loop below.
+- **Slice 4 — Compact: SHIPPED + MERGED + PUSHED** to `main` (`98358c1`). `compact` = summarize gen N →
+  `reset_session` to N+1 → seed the summary as the next turn's first `Part` (`PrependNextTurn`); require-Idle,
+  no force; new `Compacting` claim state. `SessionManager::compact_session(ctx, summarize_fn)` (claim-held,
+  EXPIRE on any summarize failure) + `summarize_collect` (direct `backend.prompt` drain, routes around the
+  unary truncation) + `pending_seed` take-and-clear at the two resume checkouts + dual-site prepend +
+  `SessionCompact` wire + `session compact` CLI + `compact_summarize_timeout_secs` knob. 7 TDD tasks
+  (T2/T4/T6 increment-reviewed); spec + plan dual-reviewed (plan codex-iterated to ready-to-execute over 5
+  rounds). **Live-gated on real codex** (codeword survived via the seed, throwaway gone, same warm codex-acp
+  pid, gen 0→1, usage reset). **The whole-branch codex-xhigh review (iterate-to-clean: r1 2 MAJORs → r2 2
+  MAJORs → r3 merge-clean) caught 4 real lifecycle bugs the per-increment reviews missed** (EOF-without-Done →
+  partial-seed; caller-future-drop strands `Compacting`; double-compact overwrites the only summary; reap
+  TOCTOU defer-expires a claimed handle) — all fixed + regression-tested. See `[[slice-4-compact-shipped]]`.
+- **NEXT = Slice 5 — Serve-backed `run-workflow --serve --context`** [MVP CUT-LINE; closes S0–S5]. Then S6
+  journal → S7 observability+E9 → S8 MCP → S9 Turn Channel → tail. Follow the proven loop below.
+- **NEW FOLLOW-UP (from the Slice-4 whole-branch review):** the caller-future-drop + reap-vs-claim TOCTOU
+  patterns also exist (smaller window) in the SHIPPED `reset_session`/clear path. Slice 4 fixed compact's
+  (wider) version + made `reap_idle` claim-safe for ALL claims; consider the same spawn-detach for
+  `session_clear`. Logged in `docs/superpowers/2026-06-18-FOLLOWUP-warm-turn-cancellation-tokens.md`.
 
 ## Canonical docs (read these — they are the source of truth)
 
@@ -79,8 +93,8 @@ never both); `_meta` for cross-boundary correlation.
 | **1 Config reconcile + capabilities** | reconcile model/effort on warm continue (else typed reseed); record agent caps | ✅ SHIPPED+MERGED |
 | **2 Usage telemetry** | plumb `usage_update` → start/end/`session-status` + pre-task threshold warn | ✅ SHIPPED+MERGED |
 | **3 Clear / reset** | `reset_session` (new SessionId per generation) + `clear`; generation guard | ✅ SHIPPED+MERGED (deferred: warm-turn cancellation tokens) |
-| **4 Compact** | summarize → reset → seed-as-PrependNextTurn | ◀ NEXT |
-| **5 Serve-backed `run-workflow --serve --context`** | CLI as serve client + executor keep-warm policy | **— MVP CUT-LINE (S0–S5) —** |
+| **4 Compact** | summarize → reset → seed-as-PrependNextTurn | ✅ SHIPPED+MERGED (whole-branch review caught 4 lifecycle bugs, all fixed) |
+| **5 Serve-backed `run-workflow --serve --context`** | CLI as serve client + executor keep-warm policy | ◀ NEXT **— MVP CUT-LINE (S0–S5) —** |
 | **6 Event-journal dual-store** | full OrchEvent/OrchResult/OrchCommand Ser+De; the 4-path adapter rewrite; shared `next_seq` | the deferred risky rewrite |
 | **7 Rich observability + E9 watchdog** | Plan/ToolCall/config/mode/commands events; watchdog on no-journal-event | |
 | **8 MCP surface + D1 typed params** | stdio MCP adapter over a stable Rust service API; CLI thin client | |
