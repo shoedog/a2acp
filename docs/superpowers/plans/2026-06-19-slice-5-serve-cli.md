@@ -97,6 +97,18 @@ Round-3 confirmed the seam/ordering again, and caught deeper semantic bugs (not 
 - T8 (MAJOR): the `--serve` branch **early-returns before the local config read (`:2242`)** + any workflow
   lookup — `--config` must not be required in serve mode.
 
+### v5 — round-4 plan-review folds (codex xhigh; producer-owned guard lifetime + clear strictness)
+Round-4 re-confirmed seam/ordering and caught a guard-lifetime regression I introduced in v3:
+- T6 (BLOCKER): `session_cancel` **GETs+clones the run token (does NOT remove it)** — the guard is released ONLY
+  on producer exit. Removing it on cancel lets a 2nd same-context run overlap the still-draining first run and
+  re-claim a child that `cancel` marked Idle (`:454`) but is still tearing down (`backend.cancel` `:461`). New
+  test `session_cancel_keeps_context_busy_until_producer_exits`.
+- T4 (MAJOR): `clear_with_children` **propagates real child errors** (`HandleBusy` on a Running child without
+  `force`) instead of `let _ =`-swallowing them; `Ok(_)` still accepts `Cleared`/stale-`NotFound`. New test
+  `clear_with_children_running_child_without_force_is_busy`.
+- T5 (MINOR): derive the `op` as `OperationId::parse(format!("workflow-{run_id}-node-{}", node.id.as_str()))?`
+  (`NodeId` has no `Display`).
+
 ---
 
 ## File Structure
@@ -234,6 +246,8 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   (round-3 BLOCKER-2):** no parent handle + no children → `Ok(ResetOutcome::NotFound)`;
   `cancel_with_children_unknown_is_not_found` → `Err(SessionNotFound)`. **`clear_with_children_threads_force`
   (round-3 MAJOR-1):** a Running child + `force=true` → child reset (NOT `HandleBusy`).
+  **`clear_with_children_running_child_without_force_is_busy` (round-4 MAJOR):** a Running child + `force=false` →
+  `clear_with_children` returns `Err(HandleBusy)` (the real child error propagates, NOT blanket success).
 - [ ] **Step 2 (impl):** add the three helpers. **Each LOCKS `children` FIRST and HOLDS the guard across the whole
   sweep** (PFIX-4 — waits for an in-progress `checkout_child_turn`; lock order children→by_context, no deadlock;
   tokio `MutexGuard` is `Send` so holding across the per-child `.await` is fine). Snapshot `children[C]` (CLONE,
@@ -249,8 +263,11 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
     not-found).
   - `clear_with_children(&self, ctx, force: bool) -> Result<ResetOutcome, BridgeError>` (round-3 MAJOR-1 — thread
     `force`; `ResetOpts` is neither `Copy` nor `Clone`, so take `force: bool` and build `ResetOpts { force }` per
-    call): `let p = self.reset_session(ctx, ResetOpts { force }).await?;`; `for child { let _ =
-    self.reset_session(child, ResetOpts { force }).await; }`; **KEEP `children[ctx]`.** Return `Ok(match p {
+    call): `let p = self.reset_session(ctx, ResetOpts { force }).await?;`; `for child { match
+    self.reset_session(child, ResetOpts { force }).await { Ok(_) => {}, Err(e) => return Err(e) } }` (**round-4
+    MAJOR — do NOT `let _ =`: `Ok(_)` accepts both `Cleared` and a stale child's `NotFound`, but a real error
+    (`HandleBusy` from a Running child without `force`) PROPAGATES; "clear every child" must not report success
+    while a child rejected the reset**); **KEEP `children[ctx]`.** Return `Ok(match p {
     ResetOutcome::Cleared { generation } => ResetOutcome::Cleared { generation }, ResetOutcome::NotFound if
     !snapshot.is_empty() => ResetOutcome::Cleared { generation: 0 }, ResetOutcome::NotFound =>
     ResetOutcome::NotFound })` (round-3 BLOCKER-2 — unknown ctx with no children stays `NotFound`; `generation: 0`
@@ -271,8 +288,10 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   cwd: Option<SessionCwd> }` implementing `WorkflowNodeDispatcher::checkout`: derive `child =
   ContextId::parse(format!("{}::workflow::{}::node::{}", parent.as_str(), wf_id, node.id.as_str()))?` (BLOCKER —
   `ContextId`/`NodeId` are String newtypes with `as_str()` and NO `Display`; `wf_id` is already `&str`; the
-  `::`-containing string parses fine because `ContextId` uses the non-strict `id_newtype!` macro); mint an `op` from
-  `(run_id, node.id)`; `let turn = sm.checkout_child_turn(parent, &child, node.agent.clone(), None, cwd, op)`;
+  `::`-containing string parses fine because `ContextId` uses the non-strict `id_newtype!` macro); mint the `op`
+  as `OperationId::parse(format!("workflow-{run_id}-node-{}", node.id.as_str()))?` (round-4 MINOR — `run_id` is
+  already `&str` so `{run_id}` inlines, but `NodeId` has no `Display` → `.as_str()`); `let turn =
+  sm.checkout_child_turn(parent, &child, node.agent.clone(), None, cwd, op)`;
   return `NodeTurn{ backend: turn.backend, session: turn.session, seed: turn.seed, cleanup: Box::new(WarmNode
   Cleanup{ sm, child, gen: turn.generation, op: turn.op }) }`. The `WarmNodeCleanup::on_exit` matches
   `NodeTurnExit` per FIX-6/7 (Normal/Error(other)→`finish_turn(child,gen,&op)`; Canceled→`sm.cancel(child)`;
@@ -290,7 +309,9 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   cancels the parent run token (the executor stops scheduling) + `cancel_with_children(C)`;
   `session_cancel_workflow_parent_sweeps_children` (PFIX-5) — AFTER the workflow run has finished (token already
   removed from `workflow_runs`), `SessionCancel C` STILL sweeps the registered children (no token to cancel, but
-  `cancel_with_children(C)` runs unconditionally).
+  `cancel_with_children(C)` runs unconditionally); `session_cancel_keeps_context_busy_until_producer_exits`
+  (round-4 BLOCKER) — while a run is DRAINING after `SessionCancel C` (token cancelled but producer not yet
+  exited), a 2nd same-context workflow send STILL gets `HandleBusy` (the guard is NOT removed by `session_cancel`).
 - [ ] **Step 2 (impl):** add `workflow_runs: Mutex<HashMap<ContextId, CancellationToken>>` to `InboundServer`.
   In the `RouteTarget::Workflow` STREAMING dispatch (`stream_message` → `spawn_workflow_producer`), when
   `routed.context_id` is `Some(C)`: BEFORE returning the SSE response (PFIX-6: in the `stream_message`
@@ -302,12 +323,15 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   insert/remove** (it backs `CancelTask` `:2832`) — register the SAME token in BOTH maps (`workflow_runs[C]` for
   `SessionCancel C`; `workflow_cancels[task]` for `CancelTask`) and remove from BOTH on producer exit (mirror
   :1711/:1731; note the `routed.task`/`session_cwd` move order :1690/:1716). In `session_cancel`
-  (`server.rs:3104`): **BLOCKER — ALWAYS sweep.** `let had_token = workflow_runs.lock().await.remove(C).map(|t|
-  { t.cancel(); true }).unwrap_or(false);` (stop the scheduler if a run is active); THEN `let swept =
+  (`server.rs:3104`): **round-4 BLOCKER — GET, do NOT remove the guard.** `let token = { workflow_runs.lock()
+  .await.get(C).cloned() };` (clone the token, LEAVE the entry — the guard is released ONLY on producer exit,
+  mirroring `workflow_cancels`; removing it here lets a 2nd same-context run pass the guard and re-claim a child
+  that `SessionManager::cancel` already marked Idle at `:454` but is still tearing down via `backend.cancel` at
+  `:461`). `if let Some(t) = &token { t.cancel(); }` (stop the scheduler if a run is active); THEN `let swept =
   sm.cancel_with_children(C).await;` UNCONDITIONALLY (PFIX-5/FIX-11 — sweeps children even AFTER the run
-  finished). Respond OK if `had_token || swept.is_ok()`; else map `swept`'s `Err(SessionNotFound)` to the wire
-  error (round-3 BLOCKER-2 — an active run token counts as success even with zero minted children). Do NOT fall
-  back to bare `sm.cancel(C)`.
+  finished). Respond OK if `token.is_some() || swept.is_ok()`; else map `swept`'s `Err(SessionNotFound)` to the
+  wire error (round-3 BLOCKER-2 — an active run token counts as success even with zero minted children). Do NOT
+  fall back to bare `sm.cancel(C)`. (The producer exit path removes `workflow_runs[C]` + `workflow_cancels[task]`.)
 - [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib 'workflow_run|session_cancel_cancels' && cargo test
   --workspace --no-run`. Commit.
 
