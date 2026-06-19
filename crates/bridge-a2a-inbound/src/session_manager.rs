@@ -26,6 +26,14 @@ pub enum SessionState {
     /// A non-clean reconcile is tearing the handle down (release_session in flight). Held as a tombstone
     /// so a concurrent checkout (HandleBusy) can't re-mint the same backend_session id before release ends.
     Expiring,
+    Resetting,
+}
+
+fn is_claimed(s: SessionState) -> bool {
+    matches!(
+        s,
+        SessionState::Reconciling | SessionState::Expiring | SessionState::Resetting
+    )
 }
 
 struct WarmHandle {
@@ -62,6 +70,16 @@ pub struct UsageWarning {
     pub size: u64,
     pub fraction: f64,
     pub threshold: f64,
+}
+
+pub struct ResetOpts {
+    pub force: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ResetOutcome {
+    Cleared { generation: u64 },
+    NotFound,
 }
 
 /// Status snapshot (spec §5).
@@ -334,6 +352,7 @@ impl SessionManager {
                 SessionState::Running => "running",
                 SessionState::Reconciling => "reconciling",
                 SessionState::Expiring => "expiring",
+                SessionState::Resetting => "resetting",
             },
             agent: h.agent.as_str().to_string(),
             generation: h.generation.get(),
@@ -368,7 +387,7 @@ impl SessionManager {
             if let Some(h) = tab.get_mut(ctx) {
                 // A reconcile owns the handle: defer teardown to its resolve (don't remove it out from
                 // under the in-flight release / let the backend_session id be reused mid-release).
-                if h.state == SessionState::Reconciling || h.state == SessionState::Expiring {
+                if is_claimed(h.state) {
                     h.expire_after_reconcile = true;
                     return;
                 }
@@ -390,7 +409,7 @@ impl SessionManager {
             };
             // A reconcile owns the handle: flag it to expire on resolve rather than resetting to Idle
             // (which would let a third checkout re-claim it under the in-flight reconcile — the ABA bug).
-            if h.state == SessionState::Reconciling || h.state == SessionState::Expiring {
+            if is_claimed(h.state) {
                 h.expire_after_reconcile = true;
                 return Ok(());
             }
@@ -403,6 +422,94 @@ impl SessionManager {
             (h.backend.clone(), h.backend_session.clone())
         };
         backend.cancel(&session).await
+    }
+
+    pub async fn reset_session(
+        &self,
+        ctx: &ContextId,
+        opts: ResetOpts,
+    ) -> Result<ResetOutcome, BridgeError> {
+        // (1)+(2)+(3) claim under ONE lock hold (FIX-2: never bounce through Idle, never call self.cancel).
+        let (backend, old_id, claimed_id, new_gen, new_id, spec) = {
+            let mut tab = self.by_context.lock().await;
+            let Some(h) = tab.get_mut(ctx) else {
+                return Ok(ResetOutcome::NotFound);
+            };
+            match h.state {
+                SessionState::Idle => {}
+                SessionState::Running if opts.force => {}
+                _ => return Err(BridgeError::HandleBusy),
+            }
+            let backend = h.backend.clone();
+            let old_id = h.backend_session.clone();
+            let claimed_id = h.id.clone();
+            let new_gen = SessionGeneration::new(h.generation.get() + 1);
+            let new_id = SessionId::parse(format!("ctx-{}-g{}", ctx.as_str(), new_gen.get()))
+                .map_err(|_| BridgeError::InvalidRequest { field: "contextId" })?;
+            let cwd = match h.fingerprint.cwd.as_deref() {
+                Some(s) => Some(
+                    SessionCwd::parse(s).map_err(|_| BridgeError::ConfigInvalid {
+                        reason: "session cwd".into(),
+                    })?,
+                ),
+                None => None,
+            };
+            let spec = SessionSpec {
+                config: h.fingerprint.config.clone(),
+                cwd,
+            };
+            h.state = SessionState::Resetting;
+            h.expire_after_reconcile = false;
+            (backend, old_id, claimed_id, new_gen, new_id, spec)
+        };
+
+        // (4)+(5) PF-13: force pre-cancel (trait-default release_session does NOT cancel, e.g. ApiBackend);
+        // release(old) is the drain; FIX-4: CAPTURE configure, no `?`.
+        if opts.force {
+            let _ = backend.cancel(&old_id).await;
+        }
+        backend.release_session(&old_id).await;
+        let cfg = backend.configure_session(&new_id, &spec).await;
+
+        // (6) re-acquire + revalidate exact claim; commit or EXPIRE (PF-7/PF-15 release the stashed new_id).
+        let mut tab = self.by_context.lock().await;
+        let still_ours = matches!(tab.get(ctx), Some(h) if h.id == claimed_id && h.state == SessionState::Resetting);
+        let new_stashed = cfg.is_ok();
+        if !still_ours {
+            drop(tab);
+            if new_stashed {
+                backend.release_session(&new_id).await;
+            }
+            return Err(BridgeError::SessionExpired);
+        }
+        let deferred = tab
+            .get(ctx)
+            .map(|h| h.expire_after_reconcile)
+            .unwrap_or(true);
+        if cfg.is_err() || deferred {
+            drop(tab);
+            if new_stashed {
+                backend.release_session(&new_id).await;
+            }
+            let mut tab = self.by_context.lock().await;
+            if let Some(h) = tab.remove(ctx) {
+                drop(h.lease);
+            }
+            return match cfg {
+                Err(e) => Err(e),
+                Ok(()) => Err(BridgeError::SessionExpired),
+            };
+        }
+        let h = tab.get_mut(ctx).expect("still_ours");
+        h.backend_session = new_id;
+        h.generation = new_gen;
+        h.usage = UsageSnapshot::default();
+        h.op = None;
+        h.state = SessionState::Idle;
+        h.last_used = (self.now)();
+        Ok(ResetOutcome::Cleared {
+            generation: new_gen.get(),
+        })
     }
 
     /// Reap only idle warm sessions past the TTL (never an active turn).
@@ -455,6 +562,10 @@ mod tests {
         cancels: StdMutex<Vec<String>>,
         configured: StdMutex<Vec<String>>,
         reconciled: StdMutex<Vec<(String, SessionSpec)>>,
+        configure_result: StdMutex<Result<(), BridgeError>>,
+        configure_gate: StdMutex<Option<oneshot::Receiver<()>>>,
+        configure_started: Notify,
+        configure_started_count: AtomicUsize,
         reconcile_result: StdMutex<Result<ReconcileOutcome, BridgeError>>,
         reconcile_gate: StdMutex<Option<oneshot::Receiver<()>>>,
         reconcile_started: Notify,
@@ -470,6 +581,10 @@ mod tests {
                 cancels: StdMutex::new(Vec::new()),
                 configured: StdMutex::new(Vec::new()),
                 reconciled: StdMutex::new(Vec::new()),
+                configure_result: StdMutex::new(Ok(())),
+                configure_gate: StdMutex::new(None),
+                configure_started: Notify::new(),
+                configure_started_count: AtomicUsize::new(0),
                 reconcile_result: StdMutex::new(Ok(ReconcileOutcome::Applied)),
                 reconcile_gate: StdMutex::new(None),
                 reconcile_started: Notify::new(),
@@ -489,12 +604,33 @@ mod tests {
             self.releases.lock().unwrap().clone()
         }
 
+        fn cancels(&self) -> Vec<String> {
+            self.cancels.lock().unwrap().clone()
+        }
+
         fn configured(&self) -> Vec<String> {
             self.configured.lock().unwrap().clone()
         }
 
         fn reconciled(&self) -> Vec<(String, SessionSpec)> {
             self.reconciled.lock().unwrap().clone()
+        }
+
+        fn set_configure_result(&self, result: Result<(), BridgeError>) {
+            *self.configure_result.lock().unwrap() = result;
+        }
+
+        fn block_next_configure(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.configure_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        #[allow(dead_code)]
+        async fn wait_for_configure(&self) {
+            while self.configure_started_count.load(Ordering::SeqCst) == 0 {
+                self.configure_started.notified().await;
+            }
         }
 
         fn set_reconcile_result(&self, result: Result<ReconcileOutcome, BridgeError>) {
@@ -544,7 +680,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(session.as_str().to_string());
-            Ok(())
+            let gate = self.configure_gate.lock().unwrap().take();
+            self.configure_started_count.fetch_add(1, Ordering::SeqCst);
+            self.configure_started.notify_waiters();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            self.configure_result.lock().unwrap().clone()
         }
 
         async fn reconcile_config(
@@ -730,6 +872,238 @@ mod tests {
             let mut now = self.now.lock().unwrap();
             *now += by;
         }
+    }
+
+    #[tokio::test]
+    async fn reset_on_idle_bumps_generation_releases_old_configures_new_zeroes_usage() {
+        let (manager, backend, _r) = manager();
+        let c = ctx("reset");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager
+            .record_usage(
+                &c,
+                turn.generation,
+                UsageSnapshot {
+                    used: Some(7),
+                    size: Some(9),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        manager.finish_turn(&c, turn.generation).await;
+        let out = manager
+            .reset_session(&c, ResetOpts { force: false })
+            .await
+            .unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+        let s = manager.status(&c).await.unwrap();
+        assert_eq!(s.generation, 1);
+        assert_eq!(s.usage.used, None);
+        assert_eq!(s.state, "idle");
+        assert_eq!(backend.releases(), vec!["ctx-reset-g0"]);
+        assert!(backend.configured().contains(&"ctx-reset-g1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reset_on_running_without_force_is_handle_busy() {
+        let (manager, _b, _r) = manager();
+        let c = ctx("reset-busy");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        let err = manager
+            .reset_session(&c, ResetOpts { force: false })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err, BridgeError::HandleBusy);
+    }
+
+    #[tokio::test]
+    async fn reset_unknown_ctx_is_not_found() {
+        let (manager, _b, _r) = manager();
+        let out = manager
+            .reset_session(&ctx("nope"), ResetOpts { force: false })
+            .await
+            .unwrap();
+        assert!(matches!(out, ResetOutcome::NotFound));
+    }
+
+    #[tokio::test]
+    async fn stale_completion_during_resetting_window_is_dropped() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let c = ctx("reset-window");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager
+            .record_usage(
+                &c,
+                SessionGeneration::new(0),
+                UsageSnapshot {
+                    used: Some(7),
+                    size: Some(9),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        let unblock = backend.block_next_configure();
+        let in_flight = {
+            let (m, c2) = (manager.clone(), c.clone());
+            tokio::spawn(async move { m.reset_session(&c2, ResetOpts { force: true }).await })
+        };
+        loop {
+            if manager.status(&c).await.map(|s| s.state) == Some("resetting") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        manager.finish_turn(&c, SessionGeneration::new(0)).await;
+        manager
+            .record_usage(
+                &c,
+                SessionGeneration::new(0),
+                UsageSnapshot {
+                    used: Some(99),
+                    size: Some(100),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        let mid = manager.status(&c).await.unwrap();
+        assert_eq!(mid.state, "resetting");
+        assert_eq!(mid.usage.used, Some(7));
+        unblock.send(()).unwrap();
+        assert!(matches!(
+            in_flight.await.unwrap().unwrap(),
+            ResetOutcome::Cleared { generation: 1 }
+        ));
+        let s = manager.status(&c).await.unwrap();
+        assert_eq!(s.generation, 1);
+        assert_eq!(s.state, "idle");
+        assert_eq!(s.usage.used, None);
+    }
+
+    #[tokio::test]
+    async fn reset_configure_failure_expires_handle_and_returns_error() {
+        let (manager, backend, _r) = manager();
+        let c = ctx("reset-cfg-fail");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&c, SessionGeneration::new(0)).await;
+        backend.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "boom".into(),
+        }));
+        let err = manager
+            .reset_session(&c, ResetOpts { force: false })
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, BridgeError::ConfigInvalid { .. }));
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases(), vec!["ctx-reset-cfg-fail-g0"]);
+    }
+
+    #[tokio::test]
+    async fn checkout_and_release_during_resetting_are_deferred() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let c = ctx("reset-defer");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&c, SessionGeneration::new(0)).await;
+        let unblock = backend.block_next_configure();
+        let in_flight = {
+            let (m, c2) = (manager.clone(), c.clone());
+            tokio::spawn(async move { m.reset_session(&c2, ResetOpts { force: false }).await })
+        };
+        loop {
+            if manager.status(&c).await.map(|s| s.state) == Some("resetting") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let busy = manager
+            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(busy, BridgeError::HandleBusy);
+        manager.release(&c).await;
+        unblock.send(()).unwrap();
+        assert_eq!(
+            in_flight.await.unwrap().err().unwrap(),
+            BridgeError::SessionExpired
+        );
+        assert!(manager.status(&c).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_during_resetting_is_deferred() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let c = ctx("reset-cancel-defer");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.finish_turn(&c, SessionGeneration::new(0)).await;
+        let unblock = backend.block_next_configure();
+        let in_flight = {
+            let (m, c2) = (manager.clone(), c.clone());
+            tokio::spawn(async move { m.reset_session(&c2, ResetOpts { force: false }).await })
+        };
+        loop {
+            if manager.status(&c).await.map(|s| s.state) == Some("resetting") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        manager.cancel(&c).await.unwrap();
+        unblock.send(()).unwrap();
+        assert_eq!(
+            in_flight.await.unwrap().err().unwrap(),
+            BridgeError::SessionExpired
+        );
+        assert!(manager.status(&c).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn force_reset_cancels_and_releases_old_id() {
+        let (manager, backend, _r) = manager();
+        let c = ctx("reset-force");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        let out = manager
+            .reset_session(&c, ResetOpts { force: true })
+            .await
+            .unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+        assert!(backend
+            .cancels()
+            .contains(&"ctx-reset-force-g0".to_string()));
+        assert!(backend
+            .releases()
+            .contains(&"ctx-reset-force-g0".to_string()));
+        assert_eq!(manager.status(&c).await.unwrap().generation, 1);
     }
 
     #[tokio::test]
