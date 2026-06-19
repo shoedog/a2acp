@@ -685,6 +685,7 @@ async fn jsonrpc(
         "SessionStatus" => session_status(srv, headers, id, params).await,
         "SessionRelease" => session_release(srv, headers, id, params).await,
         "SessionCancel" => session_cancel(srv, headers, id, params).await,
+        "SessionClear" => session_clear(srv, headers, id, params).await,
         "" => jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "missing method"),
         _ => jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "method not found"),
     }
@@ -2921,6 +2922,41 @@ async fn session_release(
     };
     sm.release(&ctx).await;
     jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "released": true }))
+}
+
+async fn session_clear(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(sm) = srv.session_manager.clone() else {
+        return jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "no session manager");
+    };
+    let ctx = match context_id_arg(&params) {
+        Ok(c) => c,
+        Err(e) => return bridge_err_to_jsonrpc(id, &e),
+    };
+    let force = params
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    match sm
+        .reset_session(&ctx, crate::session_manager::ResetOpts { force })
+        .await
+    {
+        Ok(crate::session_manager::ResetOutcome::Cleared { generation }) => jsonrpc_ok(
+            id,
+            json!({ "contextId": ctx.as_str(), "cleared": true, "generation": generation }),
+        ),
+        Ok(crate::session_manager::ResetOutcome::NotFound) => {
+            bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound)
+        }
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    }
 }
 
 async fn session_cancel(
@@ -6453,6 +6489,122 @@ mod tests {
             .oneshot(post_request(
                 "SessionStatus",
                 json!({ "contextId": "c1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(v["error"]["message"], "session not found");
+    }
+
+    #[tokio::test]
+    async fn session_clear_dispatch() {
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry_for_sm: Arc<dyn AgentRegistry> = registry.clone();
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_for_sm,
+            std::time::Duration::from_secs(60),
+        ));
+        let registry_for_srv: Arc<dyn AgentRegistry> = registry;
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_for_srv,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm.clone()),
+        );
+        let ctx = ContextId::parse("c1").unwrap();
+        let warm_params = json!({
+            "message": {
+                "contextId": "c1",
+                "text": "go",
+                "metadata": { "a2a-bridge.agent": "a" }
+            }
+        });
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, warm_params, "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+        for _ in 0..50 {
+            if matches!(
+                sm.status(&ctx).await.as_ref().map(|s| s.state),
+                Some("idle")
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionClear",
+                json!({ "contextId": "c1" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"],
+            json!({ "contextId": "c1", "cleared": true, "generation": 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn session_clear_unknown_ctx_is_not_found() {
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry_for_sm: Arc<dyn AgentRegistry> = registry.clone();
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_for_sm,
+            std::time::Duration::from_secs(60),
+        ));
+        let registry_for_srv: Arc<dyn AgentRegistry> = registry;
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_for_srv,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm),
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionClear",
+                json!({ "contextId": "nope" }),
                 "1.0",
             ))
             .await

@@ -101,7 +101,7 @@ SUBCOMMANDS:
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
-  session             Warm session control.  status | release | cancel <contextId>
+  session             Warm session control.  status | release | cancel | clear <contextId>
 
 Run `a2a-bridge <subcommand> --help` for details. Quickstart + cwd/creds/concurrency notes: AGENTS.md.";
 
@@ -2725,16 +2725,23 @@ async fn session_cmd(args: &[String]) -> Result<(), BoxError> {
     let sub = args
         .first()
         .map(|s| s.as_str())
-        .ok_or("session: missing subcommand (status|release|cancel)")?;
+        .ok_or("session: missing subcommand (status|release|cancel|clear)")?;
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
     let ctx = args.get(1).cloned().ok_or("session: missing <contextId>")?;
     let method = match sub {
         "status" => "SessionStatus",
         "release" => "SessionRelease",
         "cancel" => "SessionCancel",
+        "clear" => "SessionClear",
         other => return Err(format!("session: unknown subcommand {other:?}").into()),
     };
-    let v = rpc_call(url, method, serde_json::json!({ "contextId": ctx })).await?;
+    let force = args.iter().any(|a| a == "--force");
+    let params = if sub == "clear" {
+        serde_json::json!({ "contextId": ctx, "force": force })
+    } else {
+        serde_json::json!({ "contextId": ctx })
+    };
+    let v = rpc_call(url, method, params).await?;
     if let Some(err) = v.get("error") {
         return Err(format!("session {sub} failed: {err}").into());
     }
