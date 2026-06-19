@@ -107,6 +107,19 @@ verb all confirmed; the gaps are force-path concurrency + a fallible-await stran
 - **FIX-11 (MINOR, Opus) — pin `UsageSnapshot::default()` = `used: None, size: None`** (null, not `Some(0)`):
   DoD-3 asserts the wire `windowFraction` is `null` after clear, and the degrade paths
   (`session_manager.rs:80`) rely on `None`.
+- **FIX-12 (BLOCKER, whole-branch review — folded post-implementation) — the GENERATION-MONOTONICITY guard
+  must ALSO require the `OperationId`, to close the same-generation `cancel → next-turn` race.** The guard
+  `gen == handle.generation && state == Running` protects `clear` (which BUMPS the generation) but NOT `cancel`
+  (which keeps the SAME generation): after `SessionCancel` returns the handle to `Idle`, a new same-context
+  checkout starts at the same generation, and the OLD producer's late `WarmTurnGuard::Drop`→`finish_turn` /
+  `record_usage` then matches (`gen == generation && Running`) and IDLES / CLOBBERS the NEW turn. **Pre-existing**
+  (Slice-0/1/2 had it UNCONDITIONAL; the generation guard makes it visible but doesn't close it; not a Slice-3
+  regression — but the branch should complete the guarantee it builds). **Fix:** thread the captured
+  `OperationId` through `WarmTurn`/`WarmTurnGuard` and require `gen == handle.generation && handle.op ==
+  Some(op) && state == Running`. A new checkout sets a NEW `op`; `cancel`/`finish_turn` clear `op`; so the old
+  producer's late completion no-ops. + a `stale_finish_turn_after_cancel_does_not_idle_new_same_generation_turn`
+  test. (The whole-branch xhigh review caught this — the per-increment reviews, seeing commits in isolation,
+  did not.)
 
 **D1–D4 — both lenses UNANIMOUS:** D1 **composition** (no new backend method) + the FIX-4 cleanup path; D2
 **include `force`** (claim-before-cancel, FIX-2); D3 **explicit generation thread** + the FIX-3 state guard;

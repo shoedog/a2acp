@@ -62,6 +62,7 @@ pub struct WarmTurn {
     pub session: SessionId,
     pub usage_warning: Option<UsageWarning>,
     pub generation: SessionGeneration,
+    pub op: OperationId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -192,13 +193,14 @@ impl SessionManager {
             if d.is_empty() {
                 let usage_warning = self.eval_warn(&h.usage);
                 h.state = SessionState::Running;
-                h.op = Some(op);
+                h.op = Some(op.clone());
                 h.last_used = (self.now)();
                 return Ok(WarmTurn {
                     backend: h.backend.clone(),
                     session: h.backend_session.clone(),
                     usage_warning,
                     generation: h.generation,
+                    op,
                 });
             }
             if d.contains(&"agent") {
@@ -261,13 +263,14 @@ impl SessionManager {
                 let usage_warning = self.eval_warn(&h.usage);
                 h.fingerprint = fp;
                 h.state = SessionState::Running;
-                h.op = Some(op);
+                h.op = Some(op.clone());
                 h.last_used = (self.now)();
                 return Ok(WarmTurn {
                     backend: h.backend.clone(),
                     session: h.backend_session.clone(),
                     usage_warning,
                     generation: h.generation,
+                    op,
                 });
             }
             // Non-clean (failed reconcile OR cancel/release arrived mid-window): EXPIRE via an `Expiring`
@@ -309,6 +312,7 @@ impl SessionManager {
             session: backend_session.clone(),
             usage_warning: None,
             generation: SessionGeneration::new(0),
+            op: op.clone(),
         };
         tab.insert(
             ctx.clone(),
@@ -332,11 +336,12 @@ impl SessionManager {
     }
 
     /// Mark the current turn finished -> Idle (keep warm). FIX-3: no-op unless this is the SAME generation
-    /// AND the handle is Running (a turn only legitimately idles a Running handle); a stale (reset-away or
-    /// claim-state) completion touches NOTHING.
-    pub async fn finish_turn(&self, ctx: &ContextId, gen: SessionGeneration) {
+    /// and operation AND the handle is Running (a turn only legitimately idles a Running handle); a stale
+    /// (reset-away, cancelled, or claim-state) completion touches NOTHING.
+    pub async fn finish_turn(&self, ctx: &ContextId, gen: SessionGeneration, op: &OperationId) {
         if let Some(h) = self.by_context.lock().await.get_mut(ctx) {
-            if h.generation == gen && h.state == SessionState::Running {
+            if h.generation == gen && h.op.as_ref() == Some(op) && h.state == SessionState::Running
+            {
                 h.state = SessionState::Idle;
                 h.op = None;
                 h.last_used = (self.now)();
@@ -371,11 +376,13 @@ impl SessionManager {
         &self,
         ctx: &ContextId,
         gen: SessionGeneration,
+        op: &OperationId,
         mut snap: UsageSnapshot,
     ) {
         snap.at_ms = crate::workflow_sink::now_ms();
         if let Some(h) = self.by_context.lock().await.get_mut(ctx) {
-            if h.generation == gen && h.state == SessionState::Running {
+            if h.generation == gen && h.op.as_ref() == Some(op) && h.state == SessionState::Running
+            {
                 h.usage = snap;
             }
         }
@@ -886,6 +893,7 @@ mod tests {
             .record_usage(
                 &c,
                 turn.generation,
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(7),
                     size: Some(9),
@@ -894,7 +902,7 @@ mod tests {
                 },
             )
             .await;
-        manager.finish_turn(&c, turn.generation).await;
+        manager.finish_turn(&c, turn.generation, &op("op-1")).await;
         let out = manager
             .reset_session(&c, ResetOpts { force: false })
             .await
@@ -948,6 +956,7 @@ mod tests {
             .record_usage(
                 &c,
                 SessionGeneration::new(0),
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(7),
                     size: Some(9),
@@ -967,11 +976,14 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        manager.finish_turn(&c, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
+            .await;
         manager
             .record_usage(
                 &c,
                 SessionGeneration::new(0),
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(99),
                     size: Some(100),
@@ -1002,7 +1014,9 @@ mod tests {
             .checkout_turn(&c, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&c, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
+            .await;
         backend.set_configure_result(Err(BridgeError::ConfigInvalid {
             reason: "boom".into(),
         }));
@@ -1026,7 +1040,9 @@ mod tests {
             .checkout_turn(&c, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&c, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
+            .await;
         let unblock = backend.block_next_configure();
         let in_flight = {
             let (m, c2) = (manager.clone(), c.clone());
@@ -1063,7 +1079,9 @@ mod tests {
             .checkout_turn(&c, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&c, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
+            .await;
         let unblock = backend.block_next_configure();
         let in_flight = {
             let (m, c2) = (manager.clone(), c.clone());
@@ -1114,7 +1132,7 @@ mod tests {
             .checkout_turn(&c, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&c, turn.generation).await;
+        manager.finish_turn(&c, turn.generation, &op("op-1")).await;
         assert_eq!(manager.status(&c).await.unwrap().state, "idle");
     }
 
@@ -1126,7 +1144,9 @@ mod tests {
             .checkout_turn(&c, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&c, SessionGeneration::new(99)).await;
+        manager
+            .finish_turn(&c, SessionGeneration::new(99), &op("op-1"))
+            .await;
         assert_eq!(manager.status(&c).await.unwrap().state, "running");
     }
 
@@ -1142,6 +1162,7 @@ mod tests {
             .record_usage(
                 &c,
                 SessionGeneration::new(99),
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(5),
                     size: Some(9),
@@ -1167,7 +1188,7 @@ mod tests {
             .unwrap();
         clock.advance(Duration::from_secs(6));
         manager.cancel(&c).await.unwrap();
-        manager.finish_turn(&c, turn.generation).await;
+        manager.finish_turn(&c, turn.generation, &op("op-1")).await;
         manager.reap_idle().await;
         assert!(
             manager.status(&c).await.is_some(),
@@ -1179,6 +1200,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_finish_turn_after_cancel_does_not_idle_new_same_generation_turn() {
+        let (manager, _b, _r) = manager();
+        let c = ctx("cancel-race");
+        let t1 = manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        let t2 = manager
+            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .await
+            .unwrap();
+
+        manager.finish_turn(&c, t1.generation, &t1.op).await;
+        assert_eq!(manager.status(&c).await.unwrap().state, "running");
+
+        manager
+            .record_usage(
+                &c,
+                t1.generation,
+                &t1.op,
+                UsageSnapshot {
+                    used: Some(99),
+                    size: Some(100),
+                    cost: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        assert_eq!(manager.status(&c).await.unwrap().usage.used, None);
+
+        manager.finish_turn(&c, t2.generation, &t2.op).await;
+        assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+    }
+
+    #[tokio::test]
     async fn resumes_same_backend_session_after_finish() {
         let (manager, _backend, _registry) = manager();
         let ctx = ctx("abc");
@@ -1187,7 +1244,9 @@ mod tests {
             .checkout_turn(&ctx, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&ctx, first.generation).await;
+        manager
+            .finish_turn(&ctx, first.generation, &op("op-1"))
+            .await;
         let second = manager
             .checkout_turn(&ctx, agent(), None, None, op("op-2"))
             .await
@@ -1231,7 +1290,9 @@ mod tests {
             )
             .await
             .unwrap();
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
+            .await;
         let err = manager
             .checkout_turn(
                 &ctx,
@@ -1249,7 +1310,9 @@ mod tests {
             Some("gpt-5.4")
         );
 
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-2"))
+            .await;
         backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
         manager
             .checkout_turn(
@@ -1279,7 +1342,9 @@ mod tests {
             )
             .await
             .unwrap();
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
+            .await;
 
         manager
             .checkout_turn(
@@ -1311,7 +1376,9 @@ mod tests {
             )
             .await
             .unwrap();
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
+            .await;
         backend.set_reconcile_result(Ok(ReconcileOutcome::NotAdvertised));
 
         let err = manager
@@ -1361,7 +1428,9 @@ mod tests {
             )
             .await
             .unwrap();
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
+            .await;
         backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
 
         let err = manager
@@ -1390,7 +1459,9 @@ mod tests {
             .checkout_turn(&ctx, agent(), Some(mode_override("fast")), None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
+            .await;
 
         let err = manager
             .checkout_turn(&ctx, agent(), Some(mode_override("slow")), None, op("op-2"))
@@ -1418,7 +1489,9 @@ mod tests {
             )
             .await
             .unwrap();
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
+            .await;
 
         let err = manager
             .checkout_turn(
@@ -1450,7 +1523,9 @@ mod tests {
             .checkout_turn(&ctx, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
+            .await;
 
         let err = manager
             .checkout_turn(
@@ -1484,7 +1559,7 @@ mod tests {
             .await
             .unwrap();
         manager
-            .finish_turn(&model_ctx, SessionGeneration::new(0))
+            .finish_turn(&model_ctx, SessionGeneration::new(0), &op("op-1"))
             .await;
         let err = manager
             .checkout_turn(&model_ctx, agent(), None, None, op("op-2"))
@@ -1505,7 +1580,7 @@ mod tests {
             .await
             .unwrap();
         manager
-            .finish_turn(&effort_ctx, SessionGeneration::new(0))
+            .finish_turn(&effort_ctx, SessionGeneration::new(0), &op("op-3"))
             .await;
         let err = manager
             .checkout_turn(&effort_ctx, agent(), None, None, op("op-4"))
@@ -1533,7 +1608,9 @@ mod tests {
             )
             .await
             .unwrap();
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
+            .await;
         let unblock = backend.block_next_reconcile();
 
         let in_flight = {
@@ -1606,7 +1683,9 @@ mod tests {
             )
             .await
             .unwrap();
-        manager.finish_turn(&ctx, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
+            .await;
         let unblock = backend.block_next_reconcile();
 
         let in_flight = {
@@ -1671,6 +1750,7 @@ mod tests {
             .record_usage(
                 &c,
                 turn.generation,
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(10),
                     size: Some(100),
@@ -1683,6 +1763,7 @@ mod tests {
             .record_usage(
                 &c,
                 turn.generation,
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(42),
                     size: Some(100),
@@ -1724,6 +1805,7 @@ mod tests {
             .record_usage(
                 &c,
                 SessionGeneration::new(0),
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(90),
                     size: Some(100),
@@ -1732,7 +1814,9 @@ mod tests {
                 },
             )
             .await;
-        manager.finish_turn(&c, SessionGeneration::new(0)).await;
+        manager
+            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
+            .await;
         let turn = manager
             .checkout_turn(&c, agent(), None, None, op("op-2"))
             .await
@@ -1758,6 +1842,7 @@ mod tests {
             .record_usage(
                 &c,
                 mint.generation,
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(10),
                     size: Some(100),
@@ -1766,7 +1851,7 @@ mod tests {
                 },
             )
             .await;
-        manager.finish_turn(&c, mint.generation).await;
+        manager.finish_turn(&c, mint.generation, &op("op-1")).await;
         let turn = manager
             .checkout_turn(&c, agent(), None, None, op("op-2"))
             .await
@@ -1790,6 +1875,7 @@ mod tests {
             .record_usage(
                 &c,
                 first.generation,
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(99),
                     size: Some(100),
@@ -1798,7 +1884,7 @@ mod tests {
                 },
             )
             .await;
-        manager.finish_turn(&c, first.generation).await;
+        manager.finish_turn(&c, first.generation, &op("op-1")).await;
         let turn = manager
             .checkout_turn(&c, agent(), None, None, op("op-2"))
             .await
@@ -1819,6 +1905,7 @@ mod tests {
             .record_usage(
                 &c,
                 first.generation,
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(99),
                     size: None,
@@ -1827,7 +1914,7 @@ mod tests {
                 },
             )
             .await;
-        manager.finish_turn(&c, first.generation).await;
+        manager.finish_turn(&c, first.generation, &op("op-1")).await;
         let turn = manager
             .checkout_turn(&c, agent(), None, None, op("op-2"))
             .await
@@ -1843,6 +1930,7 @@ mod tests {
             .record_usage(
                 &ctx("nope"),
                 SessionGeneration::new(0),
+                &op("op-1"),
                 UsageSnapshot::default(),
             )
             .await;
@@ -1861,12 +1949,13 @@ mod tests {
             .checkout_turn(&c, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&c, turn.generation).await;
+        manager.finish_turn(&c, turn.generation, &op("op-1")).await;
         clock.advance(Duration::from_secs(6));
         manager
             .record_usage(
                 &c,
                 turn.generation,
+                &op("op-1"),
                 UsageSnapshot {
                     used: Some(1),
                     size: Some(2),
@@ -1891,7 +1980,9 @@ mod tests {
             .checkout_turn(&ctx, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&ctx, turn.generation).await;
+        manager
+            .finish_turn(&ctx, turn.generation, &op("op-1"))
+            .await;
         manager.release(&ctx).await;
 
         assert!(manager.status(&ctx).await.is_none());
@@ -1912,7 +2003,9 @@ mod tests {
             .checkout_turn(&idle, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&idle, idle_turn.generation).await;
+        manager
+            .finish_turn(&idle, idle_turn.generation, &op("op-1"))
+            .await;
         manager
             .checkout_turn(&running, agent(), None, None, op("op-2"))
             .await
@@ -1934,7 +2027,9 @@ mod tests {
             .checkout_turn(&ctx, agent(), None, None, op("op-1"))
             .await
             .unwrap();
-        manager.finish_turn(&ctx, turn.generation).await;
+        manager
+            .finish_turn(&ctx, turn.generation, &op("op-1"))
+            .await;
         registry.retire();
         let err = manager
             .checkout_turn(&ctx, agent(), None, None, op("op-2"))

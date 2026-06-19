@@ -453,6 +453,7 @@ struct WarmTurnGuard {
     sm: std::sync::Arc<crate::session_manager::SessionManager>,
     ctx: bridge_core::ids::ContextId,
     generation: bridge_core::ids::SessionGeneration,
+    op: bridge_core::ids::OperationId,
 }
 
 impl Drop for WarmTurnGuard {
@@ -460,8 +461,9 @@ impl Drop for WarmTurnGuard {
         let sm = self.sm.clone();
         let ctx = self.ctx.clone();
         let generation = self.generation;
+        let op = self.op.clone();
         tokio::spawn(async move {
-            sm.finish_turn(&ctx, generation).await;
+            sm.finish_turn(&ctx, generation, &op).await;
         });
     }
 }
@@ -584,6 +586,7 @@ async fn warm_local_dispatch(
                     sm,
                     ctx,
                     generation: turn.generation,
+                    op: turn.op.clone(),
                 }),
             }))
         }
@@ -1179,7 +1182,8 @@ fn spawn_local_producer(
             if let Ok(e) = &ev {
                 if e.kind() == &EventKind::Usage {
                     if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
-                        w.sm.record_usage(&w.ctx, w.generation, snap.clone()).await;
+                        w.sm.record_usage(&w.ctx, w.generation, &w.op, snap.clone())
+                            .await;
                     }
                     continue;
                 }
@@ -2352,7 +2356,8 @@ async fn unary_message(
                 if let Ok(e) = &ev {
                     if e.kind() == &EventKind::Usage {
                         if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
-                            w.sm.record_usage(&w.ctx, w.generation, snap.clone()).await;
+                            w.sm.record_usage(&w.ctx, w.generation, &w.op, snap.clone())
+                                .await;
                         }
                         continue; // exclude usage from the unary output
                     }
