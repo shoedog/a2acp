@@ -474,6 +474,17 @@ impl SessionManager {
         }
     }
 
+    pub async fn release_with_children(&self, ctx: &ContextId) {
+        let mut children = self.children.lock().await;
+        let snapshot = children.get(ctx).cloned().unwrap_or_default();
+
+        self.release(ctx).await;
+        for child in &snapshot {
+            self.release(child).await;
+        }
+        children.remove(ctx);
+    }
+
     /// Cancel an in-flight turn but keep the session warm (-> Idle).
     pub async fn cancel(&self, ctx: &ContextId) -> Result<(), BridgeError> {
         let (backend, session) = {
@@ -490,12 +501,63 @@ impl SessionManager {
             let was_running = h.state == SessionState::Running;
             h.state = SessionState::Idle;
             h.op = None;
-            if was_running {
-                h.last_used = (self.now)();
+            if !was_running {
+                return Ok(());
             }
+            // was_running is necessarily true here (the !was_running case returned above).
+            h.last_used = (self.now)();
             (h.backend.clone(), h.backend_session.clone())
         };
         backend.cancel(&session).await
+    }
+
+    pub async fn cancel_with_children(&self, ctx: &ContextId) -> Result<(), BridgeError> {
+        let children = self.children.lock().await;
+        let snapshot = children.get(ctx).cloned().unwrap_or_default();
+
+        let parent_found = match self.cancel(ctx).await {
+            Ok(()) => true,
+            Err(BridgeError::SessionNotFound) => false,
+            Err(e) => return Err(e),
+        };
+        for child in &snapshot {
+            match self.cancel(child).await {
+                Ok(()) => {}
+                Err(BridgeError::SessionNotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if parent_found || !snapshot.is_empty() {
+            Ok(())
+        } else {
+            Err(BridgeError::SessionNotFound)
+        }
+    }
+
+    pub async fn clear_with_children(
+        &self,
+        ctx: &ContextId,
+        force: bool,
+    ) -> Result<ResetOutcome, BridgeError> {
+        let children = self.children.lock().await;
+        let snapshot = children.get(ctx).cloned().unwrap_or_default();
+
+        let p = self.reset_session(ctx, ResetOpts { force }).await?;
+        for child in &snapshot {
+            match self.reset_session(child, ResetOpts { force }).await {
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(match p {
+            ResetOutcome::Cleared { generation } => ResetOutcome::Cleared { generation },
+            ResetOutcome::NotFound if !snapshot.is_empty() => {
+                ResetOutcome::Cleared { generation: 0 }
+            }
+            ResetOutcome::NotFound => ResetOutcome::NotFound,
+        })
     }
 
     pub async fn reset_session(
@@ -805,6 +867,7 @@ mod tests {
         cancels: StdMutex<Vec<String>>,
         configured: StdMutex<Vec<String>>,
         reconciled: StdMutex<Vec<(String, SessionSpec)>>,
+        cancel_result: StdMutex<Result<(), BridgeError>>,
         configure_result: StdMutex<Result<(), BridgeError>>,
         configure_gate: StdMutex<Option<oneshot::Receiver<()>>>,
         configure_started: Notify,
@@ -824,6 +887,7 @@ mod tests {
                 cancels: StdMutex::new(Vec::new()),
                 configured: StdMutex::new(Vec::new()),
                 reconciled: StdMutex::new(Vec::new()),
+                cancel_result: StdMutex::new(Ok(())),
                 configure_result: StdMutex::new(Ok(())),
                 configure_gate: StdMutex::new(None),
                 configure_started: Notify::new(),
@@ -857,6 +921,10 @@ mod tests {
 
         fn reconciled(&self) -> Vec<(String, SessionSpec)> {
             self.reconciled.lock().unwrap().clone()
+        }
+
+        fn set_cancel_result(&self, result: Result<(), BridgeError>) {
+            *self.cancel_result.lock().unwrap() = result;
         }
 
         fn set_configure_result(&self, result: Result<(), BridgeError>) {
@@ -911,7 +979,7 @@ mod tests {
 
         async fn cancel(&self, s: &SessionId) -> Result<(), BridgeError> {
             self.cancels.lock().unwrap().push(s.as_str().to_string());
-            Ok(())
+            self.cancel_result.lock().unwrap().clone()
         }
 
         async fn configure_session(
@@ -1793,6 +1861,268 @@ mod tests {
             .unwrap();
         assert!(matches!(err, BridgeError::ConfigInvalid { .. }));
         assert!(!manager.child_registered(&parent, &configure_child).await);
+    }
+
+    #[tokio::test]
+    async fn release_with_children_sweeps() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("sweep-parent");
+        let child_a = ctx("sweep-child-a");
+        let child_b = ctx("sweep-child-b");
+
+        manager
+            .checkout_turn(&parent, agent(), None, None, op("op-parent"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_a, agent(), None, None, op("op-child-a"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_b, agent(), None, None, op("op-child-b"))
+            .await
+            .unwrap();
+
+        manager.release_with_children(&parent).await;
+
+        assert!(manager.status(&parent).await.is_none());
+        assert!(manager.status(&child_a).await.is_none());
+        assert!(manager.status(&child_b).await.is_none());
+        assert!(!manager.child_registered(&parent, &child_a).await);
+        assert!(!manager.child_registered(&parent, &child_b).await);
+        let mut releases = backend.releases();
+        releases.sort();
+        assert_eq!(
+            releases,
+            vec![
+                "ctx-sweep-child-a-g0".to_string(),
+                "ctx-sweep-child-b-g0".to_string(),
+                "ctx-sweep-parent-g0".to_string(),
+            ]
+        );
+
+        manager.release_with_children(&parent).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_then_release_frees_children() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("cancel-release-parent");
+        let child_a = ctx("cancel-release-child-a");
+        let child_b = ctx("cancel-release-child-b");
+
+        manager
+            .checkout_turn(&parent, agent(), None, None, op("op-parent"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_a, agent(), None, None, op("op-child-a"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_b, agent(), None, None, op("op-child-b"))
+            .await
+            .unwrap();
+
+        manager.cancel_with_children(&parent).await.unwrap();
+
+        assert_eq!(manager.status(&parent).await.unwrap().state, "idle");
+        assert_eq!(manager.status(&child_a).await.unwrap().state, "idle");
+        assert_eq!(manager.status(&child_b).await.unwrap().state, "idle");
+        assert!(manager.child_registered(&parent, &child_a).await);
+        assert!(manager.child_registered(&parent, &child_b).await);
+
+        manager.release_with_children(&parent).await;
+
+        assert!(manager.status(&parent).await.is_none());
+        assert!(manager.status(&child_a).await.is_none());
+        assert!(manager.status(&child_b).await.is_none());
+        let mut releases = backend.releases();
+        releases.sort();
+        assert_eq!(
+            releases,
+            vec![
+                "ctx-cancel-release-child-a-g0".to_string(),
+                "ctx-cancel-release-child-b-g0".to_string(),
+                "ctx-cancel-release-parent-g0".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_then_release_frees_children() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("clear-release-parent");
+        let child_a = ctx("clear-release-child-a");
+        let child_b = ctx("clear-release-child-b");
+
+        manager
+            .checkout_turn(&parent, agent(), None, None, op("op-parent"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_a, agent(), None, None, op("op-child-a"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_b, agent(), None, None, op("op-child-b"))
+            .await
+            .unwrap();
+
+        let out = manager.clear_with_children(&parent, true).await.unwrap();
+
+        assert_eq!(out, ResetOutcome::Cleared { generation: 1 });
+        assert_eq!(manager.status(&parent).await.unwrap().state, "idle");
+        assert_eq!(manager.status(&child_a).await.unwrap().state, "idle");
+        assert_eq!(manager.status(&child_b).await.unwrap().state, "idle");
+        assert!(manager.child_registered(&parent, &child_a).await);
+        assert!(manager.child_registered(&parent, &child_b).await);
+
+        manager.release_with_children(&parent).await;
+
+        assert!(manager.status(&parent).await.is_none());
+        assert!(manager.status(&child_a).await.is_none());
+        assert!(manager.status(&child_b).await.is_none());
+        let mut releases = backend.releases();
+        releases.sort();
+        assert_eq!(
+            releases,
+            vec![
+                "ctx-clear-release-child-a-g0".to_string(),
+                "ctx-clear-release-child-a-g1".to_string(),
+                "ctx-clear-release-child-b-g0".to_string(),
+                "ctx-clear-release-child-b-g1".to_string(),
+                "ctx-clear-release-parent-g0".to_string(),
+                "ctx-clear-release-parent-g1".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_with_children_unknown_is_not_found() {
+        let (manager, _backend, _registry) = manager();
+        let out = manager
+            .clear_with_children(&ctx("clear-unknown"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(out, ResetOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn cancel_with_children_unknown_is_not_found() {
+        let (manager, _backend, _registry) = manager();
+        let err = manager
+            .cancel_with_children(&ctx("cancel-unknown"))
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::SessionNotFound);
+    }
+
+    #[tokio::test]
+    async fn clear_with_children_threads_force() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("clear-force-parent");
+        let child = ctx("clear-force-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+
+        let out = manager.clear_with_children(&parent, true).await.unwrap();
+
+        assert_eq!(out, ResetOutcome::Cleared { generation: 0 });
+        let status = manager.status(&child).await.unwrap();
+        assert_eq!(status.state, "idle");
+        assert_eq!(status.generation, 1);
+        assert_eq!(backend.cancels(), vec!["ctx-clear-force-child-g0"]);
+        assert!(backend
+            .releases()
+            .contains(&"ctx-clear-force-child-g0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn clear_with_children_running_child_without_force_is_busy() {
+        let (manager, _backend, _registry) = manager();
+        let parent = ctx("clear-busy-parent");
+        let child = ctx("clear-busy-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+
+        let err = manager
+            .clear_with_children(&parent, false)
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::HandleBusy);
+        assert_eq!(manager.status(&child).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn cancel_idle_handle_skips_backend_cancel() {
+        let (manager, backend, _registry) = manager();
+        let c = ctx("cancel-idle");
+
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        manager.cancel(&c).await.unwrap();
+
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-idle-g0"]);
+        assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+    }
+
+    #[tokio::test]
+    async fn cancel_with_children_propagates_real_child_error() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("cancel-error-parent");
+        let stale_child = ctx("cancel-error-stale-child");
+        let error_child = ctx("cancel-error-child");
+
+        manager
+            .checkout_child_turn(
+                &parent,
+                &stale_child,
+                agent(),
+                None,
+                None,
+                op("op-stale-child"),
+            )
+            .await
+            .unwrap();
+        manager.release(&stale_child).await;
+        manager
+            .checkout_child_turn(
+                &parent,
+                &error_child,
+                agent(),
+                None,
+                None,
+                op("op-error-child"),
+            )
+            .await
+            .unwrap();
+        backend.set_cancel_result(Err(BridgeError::AgentCrashed {
+            reason: "cancel failed".into(),
+        }));
+
+        let err = manager.cancel_with_children(&parent).await.err().unwrap();
+
+        assert_eq!(
+            err,
+            BridgeError::AgentCrashed {
+                reason: "cancel failed".into()
+            }
+        );
     }
 
     #[tokio::test]
