@@ -38,13 +38,17 @@ use bridge_core::domain::{
     PeerTaskId, RouteTarget, SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
-use bridge_core::ids::{AgentId, ContextId, OperationId, SessionId, TaskId};
+use bridge_core::ids::{AgentId, ContextId, OperationId, SessionGeneration, SessionId, TaskId};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
     RouteDecision, SessionStore, Update,
 };
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 use bridge_core::SessionCwd;
+use bridge_workflow::executor::{
+    NodeTurn, NodeTurnCleanup, NodeTurnExit, WorkflowNodeDispatcher, WorkflowRunContext,
+};
+use bridge_workflow::graph::WorkflowNode;
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
 use crate::fanout::{self, Source};
@@ -649,6 +653,82 @@ async fn warm_local_dispatch(
             }))
         }
         Err(e) => Some(Err(e)),
+    }
+}
+
+#[allow(dead_code)] // wired into the workflow producer in the next approved slice task
+struct WarmWorkflowNodeDispatcher {
+    sm: Arc<crate::session_manager::SessionManager>,
+    parent: ContextId,
+    cwd: Option<SessionCwd>,
+}
+
+#[async_trait::async_trait]
+impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
+    async fn checkout(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        _ctx: &WorkflowRunContext,
+    ) -> Result<NodeTurn, BridgeError> {
+        let child = ContextId::parse(format!(
+            "{}::workflow::{}::node::{}",
+            self.parent.as_str(),
+            wf_id,
+            node.id.as_str()
+        ))?;
+        let op = OperationId::parse(format!("workflow-{run_id}-node-{}", node.id.as_str()))?;
+        let turn = self
+            .sm
+            .checkout_child_turn(
+                &self.parent,
+                &child,
+                node.agent.clone(),
+                None,
+                self.cwd.clone(),
+                op,
+            )
+            .await?;
+        Ok(NodeTurn {
+            backend: turn.backend,
+            session: turn.session,
+            seed: turn.seed,
+            cleanup: Box::new(WarmNodeCleanup {
+                sm: self.sm.clone(),
+                child,
+                gen: turn.generation,
+                op: turn.op,
+            }),
+        })
+    }
+}
+
+#[allow(dead_code)] // constructed by WarmWorkflowNodeDispatcher once the producer is wired
+struct WarmNodeCleanup {
+    sm: Arc<crate::session_manager::SessionManager>,
+    child: ContextId,
+    gen: SessionGeneration,
+    op: OperationId,
+}
+
+#[async_trait::async_trait]
+impl NodeTurnCleanup for WarmNodeCleanup {
+    async fn on_exit(self: Box<Self>, exit: NodeTurnExit) {
+        match exit {
+            NodeTurnExit::Normal => {
+                self.sm.finish_turn(&self.child, self.gen, &self.op).await;
+            }
+            NodeTurnExit::Canceled => {
+                let _ = self.sm.cancel(&self.child).await;
+            }
+            NodeTurnExit::Error(BridgeError::AgentCrashed { .. }) => {
+                self.sm.expire_turn(&self.child).await;
+            }
+            NodeTurnExit::Error(_) => {
+                self.sm.finish_turn(&self.child, self.gen, &self.op).await;
+            }
+        }
     }
 }
 
@@ -5987,9 +6067,13 @@ mod tests {
         }
     }
 
+    type ConfiguredSessions = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
     struct WarmRecordingBackend {
         sessions: Arc<Mutex<Vec<String>>>,
         forgotten: Arc<Mutex<Vec<String>>>,
+        cancels: Arc<Mutex<Vec<String>>>,
+        configured: ConfiguredSessions,
         prompted_parts: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
@@ -5998,6 +6082,8 @@ mod tests {
             Arc::new(Self {
                 sessions: Arc::new(Mutex::new(Vec::new())),
                 forgotten: Arc::new(Mutex::new(Vec::new())),
+                cancels: Arc::new(Mutex::new(Vec::new())),
+                configured: Arc::new(Mutex::new(Vec::new())),
                 prompted_parts: Arc::new(Mutex::new(Vec::new())),
             })
         }
@@ -6008,6 +6094,18 @@ mod tests {
 
         fn clear_prompted_parts(&self) {
             self.prompted_parts.lock().unwrap().clear();
+        }
+
+        fn configured(&self) -> Vec<(String, Option<String>)> {
+            self.configured.lock().unwrap().clone()
+        }
+
+        fn cancels(&self) -> Vec<String> {
+            self.cancels.lock().unwrap().clone()
+        }
+
+        fn forgotten(&self) -> Vec<String> {
+            self.forgotten.lock().unwrap().clone()
         }
     }
 
@@ -6035,6 +6133,19 @@ mod tests {
         }
 
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            self.cancels.lock().unwrap().push(_s.as_str().to_owned());
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            session: &SessionId,
+            spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            self.configured.lock().unwrap().push((
+                session.as_str().to_owned(),
+                spec.cwd.as_ref().map(|cwd| cwd.as_str().to_owned()),
+            ));
             Ok(())
         }
 
@@ -6088,6 +6199,118 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("session did not reach idle");
+    }
+
+    #[tokio::test]
+    async fn warm_workflow_dispatch_checks_out_child() {
+        use bridge_workflow::executor::{NodeTurnExit, WorkflowNodeDispatcher, WorkflowRunContext};
+        use bridge_workflow::graph::WorkflowNode;
+
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry as Arc<dyn AgentRegistry>,
+            std::time::Duration::from_secs(60),
+        ));
+        let parent = ContextId::parse("parent").unwrap();
+        let child = ContextId::parse("parent::workflow::wf::node::n1").unwrap();
+        let cwd = SessionCwd::parse("/tmp/a2a-warm-workflow").unwrap();
+        let dispatcher = WarmWorkflowNodeDispatcher {
+            sm: sm.clone(),
+            parent: parent.clone(),
+            cwd: Some(cwd.clone()),
+        };
+        let node = WorkflowNode {
+            id: bridge_core::ids::NodeId::parse("n1").unwrap(),
+            agent: AgentId::parse("a").unwrap(),
+            prompt_template: "go".into(),
+            inputs: vec![],
+        };
+        let ctx = WorkflowRunContext {
+            session_cwd: Some(cwd.clone()),
+        };
+
+        let turn = dispatcher
+            .checkout("wf", &node, "run-1", &ctx)
+            .await
+            .expect("checkout child");
+        assert_eq!(turn.seed, None);
+        assert_eq!(
+            turn.session.as_str(),
+            "ctx-parent::workflow::wf::node::n1-g0"
+        );
+        assert_eq!(
+            sm.status(&child).await.as_ref().map(|s| s.state),
+            Some("running")
+        );
+        assert_eq!(
+            backend.configured(),
+            vec![(
+                "ctx-parent::workflow::wf::node::n1-g0".to_string(),
+                Some(cwd.as_str().to_string())
+            )]
+        );
+
+        turn.cleanup.on_exit(NodeTurnExit::Normal).await;
+        assert_eq!(
+            sm.status(&child).await.as_ref().map(|s| s.state),
+            Some("idle")
+        );
+        assert!(
+            backend.forgotten().is_empty(),
+            "normal exit must finish_turn, not release"
+        );
+
+        let turn = dispatcher
+            .checkout("wf", &node, "run-2", &WorkflowRunContext::default())
+            .await
+            .expect("checkout child after normal finish");
+        turn.cleanup.on_exit(NodeTurnExit::Canceled).await;
+        assert_eq!(
+            sm.status(&child).await.as_ref().map(|s| s.state),
+            Some("idle")
+        );
+        assert_eq!(
+            backend.cancels(),
+            vec!["ctx-parent::workflow::wf::node::n1-g0".to_string()]
+        );
+
+        let turn = dispatcher
+            .checkout("wf", &node, "run-3", &WorkflowRunContext::default())
+            .await
+            .expect("checkout child after cancel");
+        turn.cleanup
+            .on_exit(NodeTurnExit::Error(BridgeError::AgentCrashed {
+                reason: "backend died".into(),
+            }))
+            .await;
+        assert!(
+            sm.status(&child).await.is_none(),
+            "agent crash must expire/release the child"
+        );
+        assert_eq!(
+            backend.forgotten(),
+            vec!["ctx-parent::workflow::wf::node::n1-g0".to_string()]
+        );
+
+        let turn = dispatcher
+            .checkout("wf", &node, "run-4", &WorkflowRunContext::default())
+            .await
+            .expect("checkout child after expire");
+        turn.cleanup
+            .on_exit(NodeTurnExit::Error(BridgeError::FrameError))
+            .await;
+        assert_eq!(
+            sm.status(&child).await.as_ref().map(|s| s.state),
+            Some("idle")
+        );
+        assert_eq!(
+            backend.forgotten(),
+            vec!["ctx-parent::workflow::wf::node::n1-g0".to_string()]
+        );
     }
 
     fn warm_msg(text: &str) -> serde_json::Value {
