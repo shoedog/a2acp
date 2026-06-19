@@ -424,6 +424,7 @@ async fn summarize_collect(
         )
         .await?;
     let mut out = String::new();
+    let mut saw_done = false;
     while let Some(update) = stream.next().await {
         match update? {
             Update::Text(t) => {
@@ -438,8 +439,18 @@ async fn summarize_collect(
                     reason: "compact summarize requested a permission".into(),
                 });
             }
-            Update::Done { .. } => break,
+            Update::Done { .. } => {
+                saw_done = true;
+                break;
+            }
         }
+    }
+    // A stream that ends WITHOUT Done = a crashed/truncated turn -> failure (EXPIRE), never seed a partial
+    // summary (whole-branch review). The manager's bad-summary path then EXPIREs the handle.
+    if !saw_done {
+        return Err(BridgeError::AgentCrashed {
+            reason: "compact summarize ended without Done".into(),
+        });
     }
     Ok(out)
 }
@@ -3046,18 +3057,31 @@ async fn session_compact(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    match sm
-        .compact_session(&ctx, summarize_collect)
-        .await
-    {
-        Ok(crate::session_manager::ResetOutcome::Cleared { generation }) => jsonrpc_ok(
+    // Run compact on a DETACHED task so a dropped caller future (client disconnect / request-timeout layer)
+    // cannot strand the handle in `Compacting`: the spawned task always drives compact_session to its
+    // commit-or-EXPIRE resolution. The handler awaits the join handle for the normal response; if the caller
+    // future is dropped, only this await is dropped — the task keeps running. (Whole-branch review fix; compact
+    // widens the claim-held-across-await window to a full summarize turn.)
+    let outcome = {
+        let sm = sm.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move { sm.compact_session(&ctx, summarize_collect).await }).await
+    };
+    match outcome {
+        Ok(Ok(crate::session_manager::ResetOutcome::Cleared { generation })) => jsonrpc_ok(
             id,
             json!({ "contextId": ctx.as_str(), "compacted": true, "generation": generation }),
         ),
-        Ok(crate::session_manager::ResetOutcome::NotFound) => {
+        Ok(Ok(crate::session_manager::ResetOutcome::NotFound)) => {
             bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound)
         }
-        Err(e) => bridge_err_to_jsonrpc(id, &e),
+        Ok(Err(e)) => bridge_err_to_jsonrpc(id, &e),
+        Err(_join) => bridge_err_to_jsonrpc(
+            id,
+            &BridgeError::AgentCrashed {
+                reason: "compact task failed".into(),
+            },
+        ),
     }
 }
 
@@ -3805,6 +3829,19 @@ mod tests {
         use bridge_core::domain::PermissionRequest; // PFIX-6: real ctor, imported at server.rs:3364
         let b = Arc::new(ScriptedBackend::with_updates(vec![Update::Permission(
             PermissionRequest::read(),
+        )]));
+        let err = super::summarize_collect(b, SessionId::parse("s").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::AgentCrashed { .. }));
+    }
+
+    #[tokio::test]
+    async fn summarize_collect_eof_without_done_fails() {
+        // Whole-branch review: a stream that ends WITHOUT Done is a crashed/truncated turn -> failure
+        // (never seed a partial summary). The manager then EXPIREs the handle.
+        let b = Arc::new(ScriptedBackend::with_updates(vec![Update::Text(
+            "partial".into(),
         )]));
         let err = super::summarize_collect(b, SessionId::parse("s").unwrap())
             .await
