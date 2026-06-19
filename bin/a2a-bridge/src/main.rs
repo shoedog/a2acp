@@ -533,65 +533,140 @@ fn make_spawn_fn(
 /// subcommand name at position 1).
 const RUN_WORKFLOW_USAGE: &str = "\
 usage: a2a-bridge run-workflow <workflow-id> --input <file> [--session-cwd <repo>] [--config <path>] [--out <file>]
+       a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file> [--session-cwd <repo>] [--out <file>]
   <workflow-id>   design | code-review | spec-review | plan-review | … (whatever your --config defines)
   --input <file>  the problem statement / material the workflow acts on (required)
   --session-cwd   the repo the agents read/work in (per-request cwd; without it they use the launch cwd)
   --config <path> registry config (default: ./a2a-bridge.toml)
+  --serve         call a running a2a-bridge serve via SendStreamingMessage instead of local execution
+  --url <url>     serve URL for --serve (default: http://127.0.0.1:8080)
+  --context       warm workflow parent context id for --serve (required with --serve)
   --out <file>    write the terminal node's output here (default: stdout)";
 
 #[allow(clippy::type_complexity)]
 fn parse_run_workflow_args(
     args: &[String],
-) -> Result<(String, PathBuf, Option<PathBuf>, PathBuf, Option<String>), BoxError> {
-    let mut iter = args.iter().peekable();
-    // Positional: workflow id
-    let workflow_id = iter
-        .next()
-        .cloned()
-        .ok_or_else(|| format!("run-workflow: missing <workflow-id>\n{RUN_WORKFLOW_USAGE}"))?;
+) -> Result<
+    (
+        String,
+        PathBuf,
+        Option<PathBuf>,
+        PathBuf,
+        Option<String>,
+        bool,
+        String,
+        Option<String>,
+    ),
+    BoxError,
+> {
+    let mut positionals: Vec<String> = Vec::new();
     let mut input: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
     // The per-request ACP session cwd (the writable target for a container_rw agent, or the repo a
     // reader works in). Without it, run-workflow agents run in the LAUNCH cwd, not the target repo.
     let mut session_cwd: Option<String> = None;
-    while let Some(flag) = iter.next() {
-        match flag.as_str() {
+    let mut serve = false;
+    let mut url = "http://127.0.0.1:8080".to_string();
+    let mut context: Option<String> = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--serve" => {
+                serve = true;
+                idx += 1;
+            }
             "--input" => {
+                idx += 1;
                 input = Some(PathBuf::from(
-                    iter.next()
+                    args.get(idx)
                         .ok_or("run-workflow: --input requires a value")?,
                 ));
+                idx += 1;
             }
             "--out" => {
+                idx += 1;
                 out = Some(PathBuf::from(
-                    iter.next().ok_or("run-workflow: --out requires a value")?,
+                    args.get(idx)
+                        .ok_or("run-workflow: --out requires a value")?,
                 ));
+                idx += 1;
             }
             "--config" => {
+                idx += 1;
                 config = Some(PathBuf::from(
-                    iter.next()
+                    args.get(idx)
                         .ok_or("run-workflow: --config requires a value")?,
                 ));
+                idx += 1;
             }
             "--session-cwd" => {
+                idx += 1;
                 session_cwd = Some(
-                    iter.next()
+                    args.get(idx)
                         .ok_or("run-workflow: --session-cwd requires a value")?
                         .clone(),
                 );
+                idx += 1;
             }
-            other => {
+            "--url" => {
+                idx += 1;
+                url = args
+                    .get(idx)
+                    .ok_or("run-workflow: --url requires a value")?
+                    .clone();
+                idx += 1;
+            }
+            "--context" => {
+                idx += 1;
+                context = Some(
+                    args.get(idx)
+                        .ok_or("run-workflow: --context requires a value")?
+                        .clone(),
+                );
+                idx += 1;
+            }
+            other if other.starts_with("--") => {
                 return Err(
                     format!("run-workflow: unknown flag {other:?}\n{RUN_WORKFLOW_USAGE}").into(),
                 );
             }
+            other => {
+                positionals.push(other.to_string());
+                idx += 1;
+            }
         }
+    }
+    if positionals.len() != 1 {
+        return Err(format!(
+            "run-workflow: expected exactly one <workflow-id>, got {}\n{RUN_WORKFLOW_USAGE}",
+            positionals.len()
+        )
+        .into());
+    }
+    let workflow_id = positionals.remove(0);
+    if context.is_some() && !serve {
+        return Err("run-workflow: --context requires --serve".into());
+    }
+    if serve && context.is_none() {
+        return Err("run-workflow: --serve requires --context".into());
+    }
+    if serve && config.is_some() {
+        return Err("run-workflow: --config cannot be used with --serve".into());
     }
     let input = input
         .ok_or_else(|| format!("run-workflow: --input <file> is required\n{RUN_WORKFLOW_USAGE}"))?;
     let config = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
-    Ok((workflow_id, input, out, config, session_cwd))
+    Ok((
+        workflow_id,
+        input,
+        out,
+        config,
+        session_cwd,
+        serve,
+        url,
+        context,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2230,14 +2305,200 @@ async fn implement_resume_cmd(
 /// Loads the config, resolves the workflow graph, runs the executor,
 /// prints NodeStarted/NodeFinished to stderr and the terminal output to stdout
 /// (or `--out <file>`).
+fn build_run_workflow_streaming_request(
+    workflow_id: &str,
+    input: &str,
+    context: &str,
+    session_cwd: Option<&str>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("a2a-bridge.skill".to_string(), workflow_id.into());
+    if let Some(cwd) = session_cwd {
+        metadata.insert("a2a-bridge.cwd".to_string(), cwd.into());
+    }
+
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": a2a::methods::SEND_STREAMING_MESSAGE,
+        "params": {
+            "message": {
+                "contextId": context,
+                "taskId": a2a::new_task_id(),
+                "metadata": metadata,
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": input
+                    }
+                ]
+            }
+        }
+    })
+}
+
+fn collect_artifact_text(artifact: &a2a::Artifact) -> String {
+    artifact
+        .parts
+        .iter()
+        .filter_map(|part| part.as_text())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn message_text(message: &a2a::Message) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| part.as_text())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+async fn run_workflow_serve_client(
+    workflow_id: &str,
+    input_path: &Path,
+    out_path: Option<&Path>,
+    url: &str,
+    context: &str,
+    session_cwd: Option<&str>,
+) -> Result<(), BoxError> {
+    let input = std::fs::read_to_string(input_path)
+        .map_err(|e| format!("run-workflow: cannot read input {:?}: {e}", input_path))?;
+    let body = build_run_workflow_streaming_request(workflow_id, &input, context, session_cwd);
+    let resp = reqwest::Client::new()
+        .post(url)
+        .header(a2a::SVC_PARAM_VERSION, a2a::VERSION)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            format!("cannot reach serve at {url} — is `a2a-bridge serve` running? ({e})")
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        eprintln!("error: HTTP {status}\n{text}");
+        return Err(format!("run-workflow --serve: server returned {status}").into());
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if content_type
+        .split(';')
+        .any(|part| part.trim().eq_ignore_ascii_case("application/json"))
+    {
+        let text = resp.text().await.unwrap_or_default();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(err) = v.get("error") {
+                return Err(format!("run-workflow --serve failed: {err}").into());
+            }
+        }
+        return Err("run-workflow --serve: expected SSE response, got JSON response".into());
+    }
+
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut output = String::new();
+    let mut terminal: Option<a2a::TaskState> = None;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("run-workflow --serve: stream error: {e}"))?;
+        let text = String::from_utf8_lossy(&chunk);
+        buf.push_str(&text);
+
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim_end_matches('\r').to_string();
+            buf.drain(..=pos);
+
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = data.trim_start();
+            let response: a2a::StreamResponse = serde_json::from_str(payload)
+                .map_err(|e| format!("run-workflow --serve: bad SSE data frame: {e}"))?;
+            match response {
+                a2a::StreamResponse::ArtifactUpdate(update) => {
+                    output.push_str(&collect_artifact_text(&update.artifact));
+                }
+                a2a::StreamResponse::StatusUpdate(update) => {
+                    eprintln!("[workflow] status {:?}", update.status.state);
+                    if let Some(message) = &update.status.message {
+                        let text = message_text(message);
+                        if !text.is_empty() {
+                            eprintln!("{text}");
+                        }
+                    }
+                    if update.status.message.is_none()
+                        && matches!(
+                            update.status.state,
+                            a2a::TaskState::Completed
+                                | a2a::TaskState::Failed
+                                | a2a::TaskState::Canceled
+                        )
+                    {
+                        terminal = Some(update.status.state);
+                    }
+                }
+                a2a::StreamResponse::Message(message) => {
+                    let text = message_text(&message);
+                    if !text.is_empty() {
+                        eprintln!("{text}");
+                    }
+                }
+                a2a::StreamResponse::Task(task) => {
+                    eprintln!("[workflow] task state {:?}", task.status.state);
+                }
+            }
+        }
+    }
+
+    if let Some(out) = out_path {
+        std::fs::write(out, &output)
+            .map_err(|e| format!("run-workflow: cannot write output {:?}: {e}", out))?;
+    } else {
+        print!("{output}");
+    }
+
+    match terminal {
+        Some(a2a::TaskState::Completed) => Ok(()),
+        Some(a2a::TaskState::Failed) | Some(a2a::TaskState::Canceled) => {
+            Err("run-workflow --serve: workflow did not complete successfully".into())
+        }
+        Some(other) => {
+            Err(format!("run-workflow --serve: non-terminal final state {other:?}").into())
+        }
+        None => Err("run-workflow --serve: stream ended without terminal status".into()),
+    }
+}
+
 async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{RUN_WORKFLOW_USAGE}");
         return Ok(());
     }
     bridge_observ::init();
-    let (workflow_id, input_path, out_path, config_path, session_cwd) =
+    let (workflow_id, input_path, out_path, config_path, session_cwd, serve, url, context) =
         parse_run_workflow_args(args)?;
+
+    if serve {
+        let context = context.expect("parse_run_workflow_args requires --context with --serve");
+        return run_workflow_serve_client(
+            &workflow_id,
+            &input_path,
+            out_path.as_deref(),
+            &url,
+            &context,
+            session_cwd.as_deref(),
+        )
+        .await;
+    }
 
     // Load config.
     let raw = std::fs::read_to_string(&config_path)
@@ -4564,10 +4825,13 @@ cmd = "true"
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (id, input, _out, _cfg, scwd) = super::parse_run_workflow_args(&args).unwrap();
+        let (id, input, _out, _cfg, scwd, serve, _url, context) =
+            super::parse_run_workflow_args(&args).unwrap();
         assert_eq!(id, "wf");
         assert_eq!(input, std::path::PathBuf::from("in.md"));
         assert_eq!(scwd.as_deref(), Some("/work/repo"));
+        assert!(!serve);
+        assert!(context.is_none());
     }
 
     #[test]
@@ -4576,8 +4840,240 @@ cmd = "true"
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (_id, _input, _out, _cfg, scwd) = super::parse_run_workflow_args(&args).unwrap();
+        let (_id, _input, _out, _cfg, scwd, _serve, _url, _context) =
+            super::parse_run_workflow_args(&args).unwrap();
         assert!(scwd.is_none());
+    }
+
+    #[test]
+    fn run_workflow_context_requires_serve() {
+        let args: Vec<String> = ["wf", "--input", "in.md", "--context", "C"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = super::parse_run_workflow_args(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--context requires --serve"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_workflow_config_rejected_with_serve() {
+        let args: Vec<String> = [
+            "--serve",
+            "--context",
+            "C",
+            "--config",
+            "local.toml",
+            "wf",
+            "--input",
+            "in.md",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let err = super::parse_run_workflow_args(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--config cannot be used with --serve"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_workflow_serve_flags_before_workflow_id() {
+        let args: Vec<String> = ["--serve", "--context", "C", "wf", "--input", "in.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (id, input, _out, _cfg, scwd, serve, url, context) =
+            super::parse_run_workflow_args(&args).unwrap();
+        assert_eq!(id, "wf");
+        assert_eq!(input, std::path::PathBuf::from("in.md"));
+        assert!(scwd.is_none());
+        assert!(serve);
+        assert_eq!(url, "http://127.0.0.1:8080");
+        assert_eq!(context.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn run_workflow_serve_requires_context() {
+        let args: Vec<String> = ["--serve", "wf", "--input", "in.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = super::parse_run_workflow_args(&args)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--serve requires --context"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn serve_client_builds_streaming_message() {
+        let req =
+            super::build_run_workflow_streaming_request("wf", "hello", "C", Some("/work/repo"));
+        assert_eq!(req["method"], a2a::methods::SEND_STREAMING_MESSAGE);
+        let message = &req["params"]["message"];
+        assert_eq!(message["contextId"], "C");
+        assert!(
+            message["taskId"].as_str().is_some_and(|s| !s.is_empty()),
+            "taskId missing from {req}"
+        );
+        assert_eq!(message["metadata"]["a2a-bridge.skill"], "wf");
+        assert_eq!(message["metadata"]["a2a-bridge.cwd"], "/work/repo");
+        assert_eq!(message["parts"][0]["kind"], "text");
+        assert_eq!(message["parts"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn serve_client_requests_have_distinct_task_ids() {
+        let first = super::build_run_workflow_streaming_request("wf", "hello", "C", None);
+        let second = super::build_run_workflow_streaming_request("wf", "hello", "C", None);
+        assert_ne!(
+            first["params"]["message"]["taskId"],
+            second["params"]["message"]["taskId"]
+        );
+    }
+
+    fn stream_response_sse(resp: a2a::StreamResponse) -> String {
+        format!("data: {}\n\n", serde_json::to_string(&resp).unwrap())
+    }
+
+    fn artifact_update(text: &str) -> a2a::StreamResponse {
+        a2a::StreamResponse::ArtifactUpdate(a2a::TaskArtifactUpdateEvent {
+            task_id: "task-1".to_string(),
+            context_id: "C".to_string(),
+            artifact: a2a::Artifact {
+                artifact_id: a2a::new_artifact_id(),
+                name: Some("output".to_string()),
+                description: None,
+                parts: vec![a2a::Part::text(text)],
+                metadata: None,
+                extensions: None,
+            },
+            append: None,
+            last_chunk: Some(true),
+            metadata: None,
+        })
+    }
+
+    fn terminal_update(state: a2a::TaskState) -> a2a::StreamResponse {
+        a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+            task_id: "task-1".to_string(),
+            context_id: "C".to_string(),
+            status: a2a::TaskStatus {
+                state,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        })
+    }
+
+    async fn run_workflow_with_fake_serve(
+        body: String,
+    ) -> Result<(String, Result<(), String>), BoxError> {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.md");
+        let out = dir.path().join("out.md");
+        std::fs::write(&input, "hello").unwrap();
+        let args: Vec<String> = vec![
+            "--serve".into(),
+            "--url".into(),
+            server.uri(),
+            "--context".into(),
+            "C".into(),
+            "wf".into(),
+            "--input".into(),
+            input.to_string_lossy().to_string(),
+            "--out".into(),
+            out.to_string_lossy().to_string(),
+        ];
+        let result = super::run_workflow_cmd(&args)
+            .await
+            .map_err(|err| err.to_string());
+        let output = std::fs::read_to_string(out).unwrap_or_default();
+        Ok((output, result))
+    }
+
+    #[tokio::test]
+    async fn run_workflow_serve_completed_writes_artifact_and_exits_zero() {
+        let body = format!(
+            "{}{}",
+            stream_response_sse(artifact_update("done")),
+            stream_response_sse(terminal_update(a2a::TaskState::Completed))
+        );
+        let (output, result) = run_workflow_with_fake_serve(body).await.unwrap();
+        assert!(result.is_ok(), "unexpected error: {result:?}");
+        assert_eq!(output, "done");
+    }
+
+    #[tokio::test]
+    async fn run_workflow_serve_failed_terminal_is_nonzero() {
+        let body = stream_response_sse(terminal_update(a2a::TaskState::Failed));
+        let (_output, result) = run_workflow_with_fake_serve(body).await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_workflow_serve_canceled_terminal_is_nonzero() {
+        let body = stream_response_sse(terminal_update(a2a::TaskState::Canceled));
+        let (_output, result) = run_workflow_with_fake_serve(body).await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_workflow_serve_jsonrpc_error_is_nonzero_without_sse_parse() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {
+                            "code": -32000,
+                            "message": "HandleBusy"
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.md");
+        std::fs::write(&input, "hello").unwrap();
+        let args: Vec<String> = vec![
+            "--serve".into(),
+            "--url".into(),
+            server.uri(),
+            "--context".into(),
+            "C".into(),
+            "wf".into(),
+            "--input".into(),
+            input.to_string_lossy().to_string(),
+        ];
+        let err = super::run_workflow_cmd(&args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HandleBusy"), "unexpected error: {err}");
     }
 
     // ---- T10: `models` subcommand arg-parsing ----
