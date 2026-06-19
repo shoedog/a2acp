@@ -1,0 +1,15 @@
+# Slice 4 live-gate: host codex-acp + warm sessions with a long TTL + a long compact-summarize timeout, so a
+# `compact` (summarize an idle session -> reset -> seed) completes against real codex.
+# DoD: a long-context summary survives compact (codeword recalled); raw throwaway detail is gone; same warm
+# process (codex-acp child pid set unchanged across the compact); generation advances; usage resets to null.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "low"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[server]
+addr = "127.0.0.1:8098"
+warm_idle_ttl_secs = 600
+compact_summarize_timeout_secs = 180
