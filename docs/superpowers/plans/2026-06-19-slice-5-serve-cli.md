@@ -164,6 +164,16 @@ Round-9 again found NO blockers — three execution-edge fixes:
 - T4/T6/T7 (MAJOR): run the WHOLE relevant test target at each boundary (narrow `--lib`/`--test` filters missed
   several new + regression tests).
 
+### v11 — round-10 plan-review folds (codex xhigh; 1 BLOCKER + 1 MAJOR — real ordering + panic lifecycle)
+Round-10 found a genuine ordering BLOCKER and a deep panic-lifecycle MAJOR:
+- BLOCKER (ordering): the gate lift (FIX-10) + unary reject (FIX-8) MOVED from old-T7 into T6 (and FIRST in its
+  impl). The shared `gate()` rejects `contextId` on non-Local routes, so T6's context-backed workflow tests
+  could not even reach the guard until the gate is lifted; lifting it for streaming also exposes the unary path
+  → both must land together. T7 now owns ONLY the release/clear sweep (FIX-11).
+- MAJOR (panic): the producer `RunGuard` panic fallback now ALSO `release_with_children(C)` — a panic skips
+  per-node `on_exit`, leaving warm children `Running`; freeing only the parent maps lets the next run pass the
+  parent guard then hit child `HandleBusy`. The panic test now asserts the next same-context run COMPLETES.
+
 ---
 
 ## File Structure
@@ -377,11 +387,19 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
 
 ---
 
-### Task 6: Workflow-run guard + spawn_workflow_producer warm wiring + SessionCancel scheduler-cancel (FIX-3)
+### Task 6: gate lift + unary workflow reject + workflow-run guard + producer warm wiring + SessionCancel (FIX-3/8/10)
+
+> **round-10 BLOCKER — ordering:** the gate lift (FIX-10) + unary reject (FIX-8) MOVED here from the old T7 and
+> land FIRST, because the shared `gate()` (`:352`) currently rejects ANY `contextId` on a non-Local route — so a
+> context-backed streaming workflow request never reaches the guard until the gate is lifted. Lifting it for
+> streaming ALSO exposes the unary workflow+context path, so the unary reject (FIX-8) must land in the SAME task.
+> T7 keeps only the release/clear sweep handlers (FIX-11).
 
 **Files:** `crates/bridge-a2a-inbound/src/server.rs`
 
-- [ ] **Step 1 (tests):** `concurrent_same_context_workflow_handle_busy` — two streaming workflow sends on C →
+- [ ] **Step 1 (tests):** (gate, moved from old T7) `gate_allows_contextid_on_workflow_streaming`;
+  `gate_rejects_unary_workflow_contextid`; `gate_still_rejects_delegate_fanout_contextid`. (guard)
+  `concurrent_same_context_workflow_handle_busy` — two streaming workflow sends on C →
   the 2nd returns `HandleBusy` (JSON-RPC) early; `session_cancel_cancels_workflow_run` — `SessionCancel C`
   cancels the parent run token (the executor stops scheduling) + `cancel_with_children(C)`;
   `session_cancel_workflow_parent_sweeps_children` (PFIX-5) — AFTER the workflow run has finished (token already
@@ -394,10 +412,19 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   EXACTLY ONE `backend.cancel` per child (assert via the gated workflow backend's cancel count), proving the
   idempotent-`cancel` fix; `active_session_cancel_propagates_child_backend_error` (round-8 MAJOR) — an active
   `SessionCancel C` where a registered child's backend `cancel` returns `Err` → JSON-RPC ERROR (NOT ok), proving
-  the response rule doesn't mask it behind the token; `workflow_producer_panic_frees_context` (round-8 MAJOR) — a
-  producer whose backend `prompt()` PANICS → after unwind the `RunGuard` drops, so a fresh workflow send on the
-  SAME C succeeds (NOT `HandleBusy`) — `workflow_runs[C]` was not leaked.
-- [ ] **Step 2 (impl):** add `workflow_runs: Mutex<HashMap<ContextId, CancellationToken>>` to `InboundServer`.
+  the response rule doesn't mask it behind the token; `workflow_producer_panic_frees_context` (round-8/10 MAJOR) — a
+  producer whose backend `prompt()` PANICS → after unwind the `RunGuard` `release_with_children(C)` + `release_run`
+  fire, so a fresh workflow send on the SAME C **actually COMPLETES** (not just past the parent guard — round-10:
+  assert the 2nd run reaches a terminal Completed, proving the warm CHILD was freed and re-minted, NOT left
+  `Running` → child `HandleBusy`).
+- [ ] **Step 2 (impl):** **FIRST — lift the gate (FIX-10) + unary reject (FIX-8), round-10 BLOCKER, BEFORE the
+  guard:** in `gate()` (`:352`) change the rejection to `if context_id.is_some() && !matches!(target,
+  RouteTarget::Local(_) | RouteTarget::Workflow(_))` and update the stale error `field` string (`:355`,
+  "contextId is only supported on the local route in Slice 0" → "contextId is not supported for this route"). In
+  the UNARY `SendMessage` path, reject `routed.context_id.is_some() && matches!(target, Workflow)` IMMEDIATELY
+  after the successful `gate()` and BEFORE `srv.store.put` (`server.rs:2371`) — JSON-RPC error before ANY store
+  write (unary workflow = detached, deferred; MAJOR-2 placement). THEN — the guard: add `workflow_runs:
+  Mutex<HashMap<ContextId, CancellationToken>>` to `InboundServer`.
   **round-5 MAJOR — guard BEFORE `store.put`:** `stream_message` persists `task→session` at `server.rs:769`
   BEFORE the route match, so a guard placed in the Workflow arm (`:823`) would let a rejected 2nd workflow mutate
   `SessionStore`. Place the guard RIGHT AFTER `gate()` (`:763`) and BEFORE the `:769` `store.put` — **and ONLY when a
@@ -423,7 +450,13 @@ impl Drop for RunGuard {                 // ONLY fires when release() was NOT re
     fn drop(&mut self) {
         if !self.armed { return; }       // disarmed by the inline cleanup on normal paths
         let (srv, task, ctx) = (self.srv.clone(), self.task.clone(), self.ctx.take());
-        tokio::spawn(async move { release_run(&srv, &task, &ctx).await; }); // Drop can't .await -> spawn (panic fallback)
+        tokio::spawn(async move {        // Drop can't .await -> spawn (panic fallback)
+            // round-10 MAJOR: a panic skips per-node on_exit, so warm children stay `Running` (checkout marks
+            // Running at :216/:345; finish_turn only idles on cleanup). FREE them (release, not keep-warm — the
+            // post-panic state is unknown) so the next same-context run re-mints instead of hitting child HandleBusy.
+            if let (Some(c), Some(sm)) = (&ctx, &srv.session_manager) { sm.release_with_children(c).await; }
+            release_run(&srv, &task, &ctx).await;
+        });
     }
 }
 tokio::spawn(async move {
@@ -463,29 +496,26 @@ tokio::spawn(async move {
   `workflow_cancels[task]`.)
 - [ ] **Step 3:** **round-6 MINOR — the concurrency/cancel tests live in the `tests/workflow_producer.rs`
   INTEGRATION target (the `with_workflows` harness), NOT `--lib`. round-9 MAJOR — run the WHOLE integration target
-  (a narrow filter misses `workflow_producer_panic_frees_context`):** `cargo test -p bridge-a2a-inbound --test
-  workflow_producer && cargo test -p bridge-a2a-inbound --lib session_cancel && cargo test --workspace
-  --no-run`. Commit.
+  (a narrow filter misses `workflow_producer_panic_frees_context`); round-10 — also run the WHOLE `--lib` (T6 now
+  owns the `gate_*` lib tests):** `cargo test -p bridge-a2a-inbound --test workflow_producer && cargo test -p
+  bridge-a2a-inbound --lib && cargo test --workspace --no-run`. Commit.
 
 ---
 
-### Task 7: gate lift (streaming-only) + unary reject + sweep wire handlers (FIX-8/10/11)
+### Task 7: release/clear sweep wire handlers (FIX-11)
+
+> **round-10 BLOCKER:** the gate lift (FIX-10) + unary reject (FIX-8) MOVED to T6 (they gate T6's own tests). T7
+> now owns only the `SessionRelease`/`SessionClear` sweep rewire. (The `SessionCancel` sweep + token-success was
+> already in T6.)
 
 **Files:** `crates/bridge-a2a-inbound/src/server.rs`
 
-- [ ] **Step 1 (tests):** `gate_allows_contextid_on_workflow_streaming`; `gate_rejects_unary_workflow_contextid`;
-  `gate_still_rejects_delegate_fanout_contextid`; `session_release_workflow_parent_sweeps_children` (release C
+- [ ] **Step 1 (tests):** `session_release_workflow_parent_sweeps_children` (release C
   on a workflow parent succeeds + frees children); `session_clear_unknown_context_still_not_found` (round-3
   BLOCKER-2 — an unknown ctx with no children + no handle STILL returns HTTP 400 `SessionNotFound`, preserving
   the existing test at `server.rs:6955`).
-- [ ] **Step 2 (impl):** in `gate()` (`:352`) change the rejection to `if context_id.is_some() &&
-  !matches!(target, RouteTarget::Local(_) | RouteTarget::Workflow(_))` (FIX-10), AND update the now-stale error
-  `field` string (`:355`, currently "contextId is only supported on the local route in Slice 0") to e.g.
-  "contextId is not supported for this route" (round-7 MINOR — Workflow now also accepts contextId). In the UNARY `SendMessage`
-  path, reject `routed.context_id.is_some() && matches!(target, Workflow)` (unary workflow = detached, deferred
-  — FIX-8). **MAJOR-2: place this reject immediately after the successful `gate()` and BEFORE `srv.store.put`
-  (`server.rs:2371`)** — return the JSON-RPC error before ANY task/session store write, so a rejected request
-  never mutates state. Rewire the handlers (`server.rs:3005/3030`): `SessionRelease` → `sm.release_with_children(ctx)` (returns `()`,
+- [ ] **Step 2 (impl):** (the gate lift FIX-10 + unary reject FIX-8 are done in T6.) Rewire the handlers
+  (`server.rs:3005/3030`): `SessionRelease` → `sm.release_with_children(ctx)` (returns `()`,
   always `released:true` — unchanged, release is idempotent). `SessionClear` → `sm.clear_with_children(ctx,
   force)` (round-3 MAJOR-1 — thread the already-parsed `force` bool) and **KEEP the existing outcome mapping**
   (`Ok(Cleared{generation})`→ok; `Ok(NotFound)`→`SessionNotFound` error; `Err(e)`→jsonrpc). Round-3 BLOCKER-2:
