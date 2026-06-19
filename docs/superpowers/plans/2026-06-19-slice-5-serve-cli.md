@@ -84,6 +84,19 @@ tasks so a literal implementor is correct without cross-referencing the PFIX lis
 - T7 (MAJOR): place the unary workflow+context reject AFTER `gate()` but BEFORE `store.put` (`:2371`) — no state
   mutation on a rejected request.
 
+### v4 — round-3 plan-review folds (codex xhigh; child-map LIFECYCLE + back-compat)
+Round-3 confirmed the seam/ordering again, and caught deeper semantic bugs (not snippets). Folded into T4/T6/T7/T8:
+- T4 (BLOCKER): **only `release_with_children` removes `children[C]`** — `cancel` idles & `reset_session` keeps
+  the handle WARM, so cancel/clear must RETAIN the mapping (else a later `release C` strands the warm children).
+  Added `cancel_then_release_frees_children` / `clear_then_release_frees_children`.
+- T4/T7 (BLOCKER): **no blanket "zero children = success"** — `clear_with_children`/`cancel_with_children` return
+  `NotFound`/`Err(SessionNotFound)` for an unknown ctx with no handle AND no children, preserving the existing
+  unknown-clear 400 test (`server.rs:6955`). `SessionCancel` is success when an active run token existed.
+- T4/T7 (MAJOR): **`clear_with_children(ctx, force: bool)`** threads `force` (ResetOpts is neither Copy nor
+  Clone → build `ResetOpts { force }` per call); handler passes the parsed `force`.
+- T8 (MAJOR): the `--serve` branch **early-returns before the local config read (`:2242`)** + any workflow
+  lookup — `--config` must not be required in serve mode.
+
 ---
 
 ## File Structure
@@ -214,15 +227,34 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
 **Files:** `crates/bridge-a2a-inbound/src/session_manager.rs`
 
 - [ ] **Step 1 (tests):** `release_with_children_sweeps` — register 2 children under C; `release_with_children(C)`
-  releases C (if present) + both children + clears the map entry; tolerant of an absent parent handle
-  (success). Same shape for `cancel_with_children` (cancel each child + C) and `clear_with_children` (reset each).
-- [ ] **Step 2 (impl):** add the three helpers. **PFIX-4: each LOCKS `children` FIRST and HOLDS it across the
-  whole sweep** (so it waits for an in-progress `checkout_child_turn` rather than missing a just-registered
-  child); take/`remove` the `children[C]` set, then for the parent + each child call the existing op
-  (`release`/`cancel`/`reset_session`) tolerant of absent handles (the per-op `by_context` lock is acquired
-  WHILE holding `children` — same children→by_context order as `checkout_child_turn`, no deadlock).
-  `release_with_children`/`clear_with_children` remove the `children[C]` entry; `cancel_with_children` likewise.
-  (`SessionNotFound` on the absent parent is swallowed → success even with zero children, FIX-11.)
+  releases C (if present) + both children + removes the `children[C]` entry; tolerant of an absent parent handle
+  (success). **`cancel_then_release_frees_children` (round-3 BLOCKER-1):** register 2 children; `cancel_with_children(C)`
+  idles them but KEEPS `children[C]`; a subsequent `release_with_children(C)` STILL frees both. Same for
+  `clear_then_release_frees_children` with `clear_with_children`. **`clear_with_children_unknown_is_not_found`
+  (round-3 BLOCKER-2):** no parent handle + no children → `Ok(ResetOutcome::NotFound)`;
+  `cancel_with_children_unknown_is_not_found` → `Err(SessionNotFound)`. **`clear_with_children_threads_force`
+  (round-3 MAJOR-1):** a Running child + `force=true` → child reset (NOT `HandleBusy`).
+- [ ] **Step 2 (impl):** add the three helpers. **Each LOCKS `children` FIRST and HOLDS the guard across the whole
+  sweep** (PFIX-4 — waits for an in-progress `checkout_child_turn`; lock order children→by_context, no deadlock;
+  tokio `MutexGuard` is `Send` so holding across the per-child `.await` is fine). Snapshot `children[C]` (CLONE,
+  do NOT remove yet). **Round-3 BLOCKER-1 — only `release` frees a handle; `cancel` idles it and `reset_session`
+  keeps it warm, so cancel/clear MUST RETAIN `children[C]` (else a later `release C` can't free the still-warm
+  children):**
+  - `release_with_children(&self, ctx)`: `self.release(ctx).await` + `self.release(child).await` for each child;
+    THEN `children.remove(ctx)` (still holding the guard). Returns `()` (release is idempotent — wire success
+    unchanged).
+  - `cancel_with_children(&self, ctx) -> Result<(), BridgeError>`: `let p = self.cancel(ctx).await;` (Ok / Err
+    SessionNotFound); `for child { let _ = self.cancel(child).await; }`; **KEEP `children[ctx]`.** Return `Ok(())`
+    if `p.is_ok() || !snapshot.is_empty()` else `Err(SessionNotFound)` (round-3 BLOCKER-2 — unknown ctx stays
+    not-found).
+  - `clear_with_children(&self, ctx, force: bool) -> Result<ResetOutcome, BridgeError>` (round-3 MAJOR-1 — thread
+    `force`; `ResetOpts` is neither `Copy` nor `Clone`, so take `force: bool` and build `ResetOpts { force }` per
+    call): `let p = self.reset_session(ctx, ResetOpts { force }).await?;`; `for child { let _ =
+    self.reset_session(child, ResetOpts { force }).await; }`; **KEEP `children[ctx]`.** Return `Ok(match p {
+    ResetOutcome::Cleared { generation } => ResetOutcome::Cleared { generation }, ResetOutcome::NotFound if
+    !snapshot.is_empty() => ResetOutcome::Cleared { generation: 0 }, ResetOutcome::NotFound =>
+    ResetOutcome::NotFound })` (round-3 BLOCKER-2 — unknown ctx with no children stays `NotFound`; `generation: 0`
+    = workflow-parent sentinel, the parent is never a handle).
 - [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib with_children && cargo test --workspace --no-run`. Commit.
 
 ---
@@ -270,10 +302,12 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
   insert/remove** (it backs `CancelTask` `:2832`) — register the SAME token in BOTH maps (`workflow_runs[C]` for
   `SessionCancel C`; `workflow_cancels[task]` for `CancelTask`) and remove from BOTH on producer exit (mirror
   :1711/:1731; note the `routed.task`/`session_cwd` move order :1690/:1716). In `session_cancel`
-  (`server.rs:3104`): **BLOCKER — ALWAYS sweep.** If `workflow_runs[C]` exists, `token.cancel()` (stop the
-  scheduler); THEN call `sm.cancel_with_children(C)` UNCONDITIONALLY (PFIX-5/FIX-11 — sweeps the parent's
-  children even AFTER the run finished; tolerant of an absent parent handle). Do NOT fall back to bare
-  `sm.cancel(C)`.
+  (`server.rs:3104`): **BLOCKER — ALWAYS sweep.** `let had_token = workflow_runs.lock().await.remove(C).map(|t|
+  { t.cancel(); true }).unwrap_or(false);` (stop the scheduler if a run is active); THEN `let swept =
+  sm.cancel_with_children(C).await;` UNCONDITIONALLY (PFIX-5/FIX-11 — sweeps children even AFTER the run
+  finished). Respond OK if `had_token || swept.is_ok()`; else map `swept`'s `Err(SessionNotFound)` to the wire
+  error (round-3 BLOCKER-2 — an active run token counts as success even with zero minted children). Do NOT fall
+  back to bare `sm.cancel(C)`.
 - [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib 'workflow_run|session_cancel_cancels' && cargo test
   --workspace --no-run`. Commit.
 
@@ -285,15 +319,21 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
 
 - [ ] **Step 1 (tests):** `gate_allows_contextid_on_workflow_streaming`; `gate_rejects_unary_workflow_contextid`;
   `gate_still_rejects_delegate_fanout_contextid`; `session_release_workflow_parent_sweeps_children` (release C
-  on a workflow parent succeeds + frees children).
+  on a workflow parent succeeds + frees children); `session_clear_unknown_context_still_not_found` (round-3
+  BLOCKER-2 — an unknown ctx with no children + no handle STILL returns HTTP 400 `SessionNotFound`, preserving
+  the existing test at `server.rs:6955`).
 - [ ] **Step 2 (impl):** in `gate()` (`:352`) change the rejection to `if context_id.is_some() &&
   !matches!(target, RouteTarget::Local(_) | RouteTarget::Workflow(_))` (FIX-10). In the UNARY `SendMessage`
   path, reject `routed.context_id.is_some() && matches!(target, Workflow)` (unary workflow = detached, deferred
   — FIX-8). **MAJOR-2: place this reject immediately after the successful `gate()` and BEFORE `srv.store.put`
   (`server.rs:2371`)** — return the JSON-RPC error before ANY task/session store write, so a rejected request
-  never mutates state. Change the `SessionRelease`/`SessionClear` handlers (`server.rs:3005/3030`) to call
-  `sm.release_with_children`/`clear_with_children` and treat an absent parent handle as success (FIX-11). (The
-  `SessionCancel` sweep was done in T6.)
+  never mutates state. Rewire the handlers (`server.rs:3005/3030`): `SessionRelease` → `sm.release_with_children(ctx)` (returns `()`,
+  always `released:true` — unchanged, release is idempotent). `SessionClear` → `sm.clear_with_children(ctx,
+  force)` (round-3 MAJOR-1 — thread the already-parsed `force` bool) and **KEEP the existing outcome mapping**
+  (`Ok(Cleared{generation})`→ok; `Ok(NotFound)`→`SessionNotFound` error; `Err(e)`→jsonrpc). Round-3 BLOCKER-2:
+  the helper returns `Cleared` whenever children were swept and `NotFound` ONLY for an unknown ctx with no
+  children, so an unknown-clear still 400s (existing test green) while a workflow parent succeeds. (The
+  `SessionCancel` sweep + token-success is in T6.)
 - [ ] **Step 3:** `cargo test -p bridge-a2a-inbound --lib 'gate_|session_release_workflow' && cargo test
   --workspace --no-run`. Commit.
 
@@ -310,11 +350,15 @@ pub async fn expire_turn(&self, ctx: &ContextId) { self.release(ctx).await; } //
 - [ ] **Step 2 (impl):** extend `parse_run_workflow_args` (`:543`) with `--serve` (bool), `--url`
   (default `http://127.0.0.1:8080`), `--context` (Option); reject `--context` without `--serve`; reject explicit
   `--config` with `--serve` (check the raw Option BEFORE the `CONFIG_PATH` default). In `run_workflow_cmd`
-  (`:2233`): if `--serve`, build a `SendStreamingMessage` message map (`message.contextId=C`,
-  `metadata["a2a-bridge.skill"]=<wf>`, parts=input, cwd from `--session-cwd`) — build its OWN map, NOT via
-  `submit_cmd` — POST to `--url`, consume the SSE stream (reuse the `task_watch_cmd` SSE PARSER `:2756`),
-  printing artifact text to stdout/`--out` + statuses to stderr, exit code from the terminal state. ELSE the
-  existing local one-shot path (UNCHANGED).
+  (`:2233`): **MAJOR-2 — the `--serve` branch must EARLY-RETURN before the local config read (`main.rs:2242`) and
+  any workflow lookup** (the workflow lives in the running serve's config, not locally). Right after parsing args
+  + reading the input file: if `--serve` → build a `SendStreamingMessage` message map (`message.contextId=C`,
+  `metadata["a2a-bridge.skill"]=<wf>`, parts=input, cwd from `--session-cwd`) — its OWN map, NOT via
+  `submit_cmd`'s skill-guesser (PFIX-7) — POST to `--url`, then drain the SSE byte-stream (the `task_watch_cmd`
+  loop is INLINE `:2756`, no parser fn — extract/duplicate it), JSON-parsing each `data:` frame as
+  `a2a::StreamResponse` to find the terminal `StatusUpdate{state∈{Completed,Failed,Canceled}}` (exit code) +
+  collect `ArtifactUpdate` text (stdout/`--out`); statuses to stderr. ELSE the existing local one-shot path
+  (snapshot/lease/spawn/registry/executor `:2282-2358`) UNCHANGED.
 - [ ] **Step 3:** `cargo test -p a2a-bridge run_workflow && cargo test --workspace --no-run`. Commit.
 
 ---
