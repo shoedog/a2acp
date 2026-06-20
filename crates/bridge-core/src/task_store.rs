@@ -44,6 +44,17 @@ impl TaskRecordStatus {
     }
 }
 
+pub fn terminal_status_from_record(s: &TaskRecordStatus) -> crate::orch::TerminalStatus {
+    use crate::orch::TerminalStatus;
+    match s {
+        TaskRecordStatus::Completed => TerminalStatus::Completed,
+        TaskRecordStatus::Canceled => TerminalStatus::Canceled,
+        other => TerminalStatus::Failed {
+            reason: other.as_str().to_string(),
+        },
+    }
+}
+
 /// One durable task row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskRecord {
@@ -530,6 +541,29 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+        }
+    }
+
+    #[test]
+    fn task_record_status_maps_total() {
+        use crate::orch::TerminalStatus;
+        assert!(matches!(
+            terminal_status_from_record(&TaskRecordStatus::Completed),
+            TerminalStatus::Completed
+        ));
+        assert!(matches!(
+            terminal_status_from_record(&TaskRecordStatus::Canceled),
+            TerminalStatus::Canceled
+        ));
+        for s in [
+            TaskRecordStatus::Failed,
+            TaskRecordStatus::Interrupted,
+            TaskRecordStatus::Working,
+        ] {
+            assert!(matches!(
+                terminal_status_from_record(&s),
+                TerminalStatus::Failed { .. }
+            ));
         }
     }
 
