@@ -1086,6 +1086,54 @@ async fn cancel_task_warm_workflow_cancels_checked_out_child() {
 }
 
 #[tokio::test]
+async fn cancel_task_immediately_after_warm_stream_send_cancels_workflow() {
+    let pending: Arc<dyn AgentBackend> = Arc::new(PendingBackend);
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), pending.clone()),
+        ("claude".to_string(), pending.clone()),
+        ("synth".to_string(), pending.clone()),
+    ]
+    .into();
+    let srv = build_server_per_agent_with_session_manager(Arc::new(FakeStore::default()), backends);
+
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            workflow_stream_params("warm-immediate-cancel-1", "ctx-warm-immediate-cancel"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    let cancel_resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": "warm-immediate-cancel-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), axum::http::StatusCode::OK);
+    let cancel = json_response(cancel_resp).await;
+    assert_eq!(
+        cancel["result"]["task"]["state"], "TASK_STATE_CANCELED",
+        "{cancel}"
+    );
+
+    let raw = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        axum::body::to_bytes(resp.into_body(), usize::MAX),
+    )
+    .await
+    .expect("warm workflow SSE must terminate after immediate CancelTask")
+    .unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+}
+
+#[tokio::test]
 async fn active_session_cancel_propagates_child_backend_error() {
     let gate = Arc::new((
         std::sync::atomic::AtomicBool::new(false),

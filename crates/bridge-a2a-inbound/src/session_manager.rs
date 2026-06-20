@@ -403,6 +403,13 @@ impl SessionManager {
     }
 
     pub async fn expire_turn(&self, ctx: &ContextId) {
+        {
+            let mut children = self.children.lock().await;
+            for set in children.values_mut() {
+                set.retain(|c| c != ctx);
+            }
+            children.retain(|_, set| !set.is_empty());
+        }
         self.release(ctx).await;
     }
 
@@ -1846,6 +1853,29 @@ mod tests {
         assert_eq!(second.generation, SessionGeneration::new(0));
         assert_eq!(second.op, second_op);
         assert!(manager.child_registered(&parent, &child).await);
+    }
+
+    #[tokio::test]
+    async fn expire_turn_prunes_child_registration() {
+        let (manager, _backend, _registry) = manager();
+        let parent = ctx("expire-parent");
+        let child = ctx("expire-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        assert!(manager.child_registered(&parent, &child).await);
+
+        manager.expire_turn(&child).await;
+
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+        assert_eq!(
+            manager.cancel_with_children(&parent).await.err(),
+            Some(BridgeError::SessionNotFound)
+        );
     }
 
     #[tokio::test]

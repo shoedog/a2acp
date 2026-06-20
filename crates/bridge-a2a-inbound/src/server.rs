@@ -868,13 +868,20 @@ async fn stream_message(
         }
         let t = tokio_util::sync::CancellationToken::new();
         runs.insert(c.clone(), t.clone());
+        drop(runs);
+        srv.workflow_cancels
+            .lock()
+            .await
+            .insert(routed.task.clone(), t.clone());
         Some((c, t))
     } else {
         None
     };
     let mut pre_producer_run_guard = workflow_token.as_ref().map(|(c, _)| PreProducerRunGuard {
         workflow_runs: srv.workflow_runs.clone(),
+        workflow_cancels: srv.workflow_cancels.clone(),
         ctx: c.clone(),
+        task: routed.task.clone(),
         armed: true,
     });
 
@@ -1805,7 +1812,9 @@ async fn release_run(srv: &Arc<InboundServer>, task: &TaskId, ctx: &Option<Conte
 
 struct PreProducerRunGuard {
     workflow_runs: Arc<tokio::sync::Mutex<HashMap<ContextId, tokio_util::sync::CancellationToken>>>,
+    workflow_cancels: Arc<tokio::sync::Mutex<HashMap<TaskId, tokio_util::sync::CancellationToken>>>,
     ctx: ContextId,
+    task: TaskId,
     armed: bool,
 }
 
@@ -1815,9 +1824,12 @@ impl Drop for PreProducerRunGuard {
             return;
         }
         let workflow_runs = self.workflow_runs.clone();
+        let workflow_cancels = self.workflow_cancels.clone();
         let ctx = self.ctx.clone();
+        let task = self.task.clone();
         tokio::spawn(async move {
             workflow_runs.lock().await.remove(&ctx);
+            workflow_cancels.lock().await.remove(&task);
         });
     }
 }
@@ -1879,16 +1891,19 @@ fn spawn_workflow_producer(
                 .map(|p| p.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            // Register the cancel token before driving the stream so an inbound
-            // CancelTask can never race the bind window.
             let token = match &workflow_token {
                 Some((_, t)) => t.clone(),
-                None => tokio_util::sync::CancellationToken::new(),
+                None => {
+                    // Cold workflow streams create their token here; warm streams
+                    // are registered synchronously by stream_message.
+                    let token = tokio_util::sync::CancellationToken::new();
+                    srv.workflow_cancels
+                        .lock()
+                        .await
+                        .insert(task.clone(), token.clone());
+                    token
+                }
             };
-            srv.workflow_cancels
-                .lock()
-                .await
-                .insert(task.clone(), token.clone());
             let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
                 session_cwd: routed.session_cwd.clone(),
             };
@@ -6567,14 +6582,19 @@ mod tests {
     #[tokio::test]
     async fn pre_producer_run_guard_drop_releases_context_unless_disarmed() {
         let runs = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let cancels = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let ctx = ContextId::parse("ctx-pre-producer").unwrap();
+        let task = TaskId::parse("task-pre-producer").unwrap();
         let token = tokio_util::sync::CancellationToken::new();
-        runs.lock().await.insert(ctx.clone(), token);
+        runs.lock().await.insert(ctx.clone(), token.clone());
+        cancels.lock().await.insert(task.clone(), token);
 
         {
             let _guard = PreProducerRunGuard {
                 workflow_runs: runs.clone(),
+                workflow_cancels: cancels.clone(),
                 ctx: ctx.clone(),
+                task: task.clone(),
                 armed: true,
             };
         }
@@ -6588,14 +6608,22 @@ mod tests {
             !runs.lock().await.contains_key(&ctx),
             "armed pre-producer guard must remove workflow_runs[context]"
         );
+        assert!(
+            !cancels.lock().await.contains_key(&task),
+            "armed pre-producer guard must remove workflow_cancels[task]"
+        );
 
         let keep_ctx = ContextId::parse("ctx-pre-producer-keep").unwrap();
+        let keep_task = TaskId::parse("task-pre-producer-keep").unwrap();
         let token = tokio_util::sync::CancellationToken::new();
-        runs.lock().await.insert(keep_ctx.clone(), token);
+        runs.lock().await.insert(keep_ctx.clone(), token.clone());
+        cancels.lock().await.insert(keep_task.clone(), token);
         {
             let _guard = PreProducerRunGuard {
                 workflow_runs: runs.clone(),
+                workflow_cancels: cancels.clone(),
                 ctx: keep_ctx.clone(),
+                task: keep_task.clone(),
                 armed: false,
             };
         }
@@ -6603,6 +6631,10 @@ mod tests {
         assert!(
             runs.lock().await.contains_key(&keep_ctx),
             "disarmed pre-producer guard transfers cleanup to RunGuard"
+        );
+        assert!(
+            cancels.lock().await.contains_key(&keep_task),
+            "disarmed pre-producer guard transfers cancel cleanup to RunGuard"
         );
     }
 
