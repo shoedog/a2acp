@@ -212,6 +212,53 @@ pub struct TaskProgressSnapshot {
     pub cut_seq: i64,
 }
 
+#[derive(Clone, Debug)]
+pub struct JournalScalars {
+    pub status: TaskRecordStatus,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub terminal_seq: Option<i64>,
+    pub cut_seq: i64,
+}
+
+pub fn fold_journal_to_snapshot(
+    events: &[crate::orch::OrchEvent],
+    scalars: &JournalScalars,
+) -> Result<TaskProgressSnapshot, BridgeError> {
+    let mut checkpoints = Vec::new();
+    let mut starts: Vec<(NodeId, i64)> = Vec::new();
+
+    for event in events {
+        match &event.kind {
+            crate::orch::OrchEventKind::NodeStarted { node } => {
+                let node = NodeId::parse(node)?;
+                starts.retain(|(started, _seq)| started != &node);
+                starts.push((node, event.seq));
+            }
+            crate::orch::OrchEventKind::NodeFinished { node, ok, output } => {
+                let node = NodeId::parse(node)?;
+                starts.retain(|(started, _seq)| started != &node);
+                checkpoints.push((node, output.clone(), *ok, event.seq));
+            }
+            crate::orch::OrchEventKind::Terminal { .. } => {
+                starts.clear();
+            }
+            crate::orch::OrchEventKind::Progress { .. }
+            | crate::orch::OrchEventKind::Usage { .. } => {}
+        }
+    }
+
+    Ok(TaskProgressSnapshot {
+        status: scalars.status,
+        result: scalars.result.clone(),
+        error: scalars.error.clone(),
+        checkpoints,
+        starts,
+        terminal_seq: scalars.terminal_seq,
+        cut_seq: scalars.cut_seq,
+    })
+}
+
 /// `(output, ok, ts, seq)` stored per `(task_id, node_id)` checkpoint key.
 type CheckpointValue = (String, bool, i64, i64);
 
@@ -526,7 +573,8 @@ impl TaskStore for MemoryTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::NodeId;
+    use crate::ids::{NodeId, OperationId};
+    use crate::orch::{OrchEvent, OrchEventKind, ORCH_V};
 
     fn rec(id: &str, ms: i64) -> TaskRecord {
         TaskRecord {
@@ -542,6 +590,88 @@ mod tests {
             resume_attempts: 0,
             session_cwd: None,
         }
+    }
+
+    #[test]
+    fn fold_collapses_started_then_finished() {
+        let op = OperationId::parse("op-t").unwrap();
+        let ev = |seq, kind| OrchEvent {
+            v: ORCH_V,
+            seq,
+            ts_ms: 0,
+            operation_id: op.clone(),
+            session: None,
+            source: None,
+            kind,
+        };
+        let events = vec![
+            ev(1, OrchEventKind::NodeStarted { node: "a".into() }),
+            ev(
+                2,
+                OrchEventKind::NodeFinished {
+                    node: "a".into(),
+                    ok: true,
+                    output: "oA".into(),
+                },
+            ),
+            ev(3, OrchEventKind::NodeStarted { node: "b".into() }),
+        ];
+        let scalars = JournalScalars {
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            terminal_seq: None,
+            cut_seq: 3,
+        };
+        let snap = fold_journal_to_snapshot(&events, &scalars).unwrap();
+        assert_eq!(
+            snap.checkpoints
+                .iter()
+                .map(|c| (c.0.as_str().to_string(), c.3))
+                .collect::<Vec<_>>(),
+            vec![("a".into(), 2)]
+        );
+        assert_eq!(
+            snap.starts
+                .iter()
+                .map(|s| (s.0.as_str().to_string(), s.1))
+                .collect::<Vec<_>>(),
+            vec![("b".into(), 3)]
+        );
+        assert_eq!(snap.cut_seq, 3);
+    }
+
+    #[test]
+    fn fold_repeated_start_keeps_latest_only() {
+        let op = OperationId::parse("op-t").unwrap();
+        let ev = |seq, kind| OrchEvent {
+            v: ORCH_V,
+            seq,
+            ts_ms: 0,
+            operation_id: op.clone(),
+            session: None,
+            source: None,
+            kind,
+        };
+        let events = vec![
+            ev(1, OrchEventKind::NodeStarted { node: "a".into() }),
+            ev(4, OrchEventKind::NodeStarted { node: "a".into() }),
+        ];
+        let scalars = JournalScalars {
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            terminal_seq: None,
+            cut_seq: 4,
+        };
+        let snap = fold_journal_to_snapshot(&events, &scalars).unwrap();
+        assert_eq!(
+            snap.starts
+                .iter()
+                .map(|s| (s.0.as_str().to_string(), s.1))
+                .collect::<Vec<_>>(),
+            vec![("a".into(), 4)]
+        );
     }
 
     #[test]
