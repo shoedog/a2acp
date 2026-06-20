@@ -3235,6 +3235,9 @@ async fn session_release(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
+    if srv.workflow_runs.lock().await.contains_key(&ctx) {
+        return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
+    }
     sm.release_with_children(&ctx).await;
     jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "released": true }))
 }
@@ -3255,6 +3258,9 @@ async fn session_clear(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
+    if srv.workflow_runs.lock().await.contains_key(&ctx) {
+        return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
+    }
     let force = params
         .get("force")
         .and_then(|v| v.as_bool())
@@ -7543,6 +7549,54 @@ mod tests {
             sm.status(&child).await.is_none(),
             "release on the workflow parent must free child handles"
         );
+    }
+
+    #[tokio::test]
+    async fn session_release_rejects_during_active_workflow_run() {
+        let (srv, _, _) = seed_test_server();
+        let ctx = ContextId::parse("c-active-release").unwrap();
+        srv.workflow_runs
+            .lock()
+            .await
+            .insert(ctx.clone(), tokio_util::sync::CancellationToken::new());
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionRelease",
+                json!({ "contextId": "c-active-release" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(v["error"]["message"], "session busy");
+    }
+
+    #[tokio::test]
+    async fn session_clear_rejects_during_active_workflow_run() {
+        let (srv, _, _) = seed_test_server();
+        let ctx = ContextId::parse("c-active-clear").unwrap();
+        srv.workflow_runs
+            .lock()
+            .await
+            .insert(ctx.clone(), tokio_util::sync::CancellationToken::new());
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionClear",
+                json!({ "contextId": "c-active-clear" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(v["error"]["message"], "session busy");
     }
 
     #[tokio::test]

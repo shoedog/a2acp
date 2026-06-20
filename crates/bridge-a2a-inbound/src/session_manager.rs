@@ -235,16 +235,36 @@ impl SessionManager {
         cwd: Option<SessionCwd>,
         op: OperationId,
     ) -> Result<WarmTurn, BridgeError> {
+        let (res, removed) = self
+            .checkout_turn_inner(ctx, agent, overrides, cwd, op)
+            .await;
+        for ctx in &removed {
+            self.prune_child_registration(ctx).await;
+        }
+        res
+    }
+
+    async fn checkout_turn_inner(
+        &self,
+        ctx: &ContextId,
+        agent: AgentId,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        op: OperationId,
+    ) -> (Result<WarmTurn, BridgeError>, Vec<ContextId>) {
         let mut tab = self.by_context.lock().await;
         if let Some(h) = tab.get_mut(ctx) {
             if h.lease.is_retired() {
-                return Err(BridgeError::SessionExpired);
+                return (Err(BridgeError::SessionExpired), Vec::new());
             }
             if h.state != SessionState::Idle {
                 // Running / Reconciling / Expiring all mean the handle is busy.
-                return Err(BridgeError::HandleBusy);
+                return (Err(BridgeError::HandleBusy), Vec::new());
             }
-            let resolved = self.registry.resolve(&agent).await?;
+            let resolved = match self.registry.resolve(&agent).await {
+                Ok(resolved) => resolved,
+                Err(e) => return (Err(e), Vec::new()),
+            };
             let eff = effective_config(&resolved.entry, overrides.as_ref());
             let fp = SessionSpecFingerprint {
                 agent: agent.clone(),
@@ -258,29 +278,47 @@ impl SessionManager {
                 h.op = Some(op.clone());
                 h.last_used = (self.now)();
                 let seed = h.pending_seed.take();
-                return Ok(WarmTurn {
-                    backend: h.backend.clone(),
-                    session: h.backend_session.clone(),
-                    usage_warning,
-                    generation: h.generation,
-                    op,
-                    seed,
-                });
+                return (
+                    Ok(WarmTurn {
+                        backend: h.backend.clone(),
+                        session: h.backend_session.clone(),
+                        usage_warning,
+                        generation: h.generation,
+                        op,
+                        seed,
+                    }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"agent") {
-                return Err(BridgeError::ConfigMismatch { field: "agent" });
+                return (
+                    Err(BridgeError::ConfigMismatch { field: "agent" }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"cwd") {
-                return Err(BridgeError::ConfigMismatch { field: "cwd" });
+                return (
+                    Err(BridgeError::ConfigMismatch { field: "cwd" }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"mode") {
-                return Err(BridgeError::ConfigReseedRequired { field: "mode" });
+                return (
+                    Err(BridgeError::ConfigReseedRequired { field: "mode" }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"model") && fp.config.model.is_none() {
-                return Err(BridgeError::ConfigReseedRequired { field: "model" });
+                return (
+                    Err(BridgeError::ConfigReseedRequired { field: "model" }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"effort") && fp.config.effort.is_none() {
-                return Err(BridgeError::ConfigReseedRequired { field: "effort" });
+                return (
+                    Err(BridgeError::ConfigReseedRequired { field: "effort" }),
+                    Vec::new(),
+                );
             }
             let reseed_field = if d.contains(&"model") {
                 "model"
@@ -315,7 +353,7 @@ impl SessionManager {
                 Some(h) if h.id == claimed_id && h.state == SessionState::Reconciling
             );
             if !still_ours {
-                return Err(BridgeError::SessionExpired);
+                return (Err(BridgeError::SessionExpired), Vec::new());
             }
             let cancelled_or_released = tab
                 .get(ctx)
@@ -330,14 +368,17 @@ impl SessionManager {
                 h.op = Some(op.clone());
                 h.last_used = (self.now)();
                 let seed = h.pending_seed.take();
-                return Ok(WarmTurn {
-                    backend: h.backend.clone(),
-                    session: h.backend_session.clone(),
-                    usage_warning,
-                    generation: h.generation,
-                    op,
-                    seed,
-                });
+                return (
+                    Ok(WarmTurn {
+                        backend: h.backend.clone(),
+                        session: h.backend_session.clone(),
+                        usage_warning,
+                        generation: h.generation,
+                        op,
+                        seed,
+                    }),
+                    Vec::new(),
+                );
             }
             // Non-clean (failed reconcile OR cancel/release arrived mid-window): EXPIRE via an `Expiring`
             // tombstone held across release_session().await so a concurrent checkout (HandleBusy on Expiring)
@@ -351,17 +392,22 @@ impl SessionManager {
                     drop(h.lease);
                 }
             }
-            self.prune_child_registration(ctx).await;
-            return if cancelled_or_released {
-                Err(BridgeError::SessionExpired)
-            } else {
-                Err(BridgeError::ConfigReseedRequired {
-                    field: reseed_field,
-                })
-            };
+            return (
+                if cancelled_or_released {
+                    Err(BridgeError::SessionExpired)
+                } else {
+                    Err(BridgeError::ConfigReseedRequired {
+                        field: reseed_field,
+                    })
+                },
+                vec![ctx.clone()],
+            );
         }
 
-        let resolved = self.registry.resolve(&agent).await?;
+        let resolved = match self.registry.resolve(&agent).await {
+            Ok(resolved) => resolved,
+            Err(e) => return (Err(e), Vec::new()),
+        };
         let eff = effective_config(&resolved.entry, overrides.as_ref());
         let fp = SessionSpecFingerprint {
             agent: agent.clone(),
@@ -369,12 +415,22 @@ impl SessionManager {
             cwd: cwd.as_ref().map(|c| c.as_str().to_string()),
         };
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let backend_session = SessionId::parse(format!("ctx-{}-g0", ctx.as_str()))
-            .map_err(|_| BridgeError::InvalidRequest { field: "contextId" })?;
-        resolved
+        let backend_session = match SessionId::parse(format!("ctx-{}-g0", ctx.as_str())) {
+            Ok(backend_session) => backend_session,
+            Err(_) => {
+                return (
+                    Err(BridgeError::InvalidRequest { field: "contextId" }),
+                    Vec::new(),
+                )
+            }
+        };
+        if let Err(e) = resolved
             .backend
             .configure_session(&backend_session, &SessionSpec { config: eff, cwd })
-            .await?;
+            .await
+        {
+            return (Err(e), Vec::new());
+        }
         let caps = resolved.backend.capabilities();
         let turn = WarmTurn {
             backend: resolved.backend.clone(),
@@ -403,7 +459,7 @@ impl SessionManager {
                 last_used: (self.now)(),
             },
         );
-        Ok(turn)
+        (Ok(turn), Vec::new())
     }
 
     pub async fn checkout_child_turn(
@@ -420,7 +476,11 @@ impl SessionManager {
         // checkout instead of missing it — closes the register-after-release leak window. Lock order is
         // children -> by_context (checkout_turn locks by_context internally); the sweeps use the same order.
         let mut children = self.children.lock().await;
-        let turn = self.checkout_turn(child, agent, overrides, cwd, op).await?;
+        let (turn, removed) = self
+            .checkout_turn_inner(child, agent, overrides, cwd, op)
+            .await;
+        Self::prune_child_registration_locked(&mut children, &removed);
+        let turn = turn?;
         children
             .entry(parent.clone())
             .or_default()
@@ -2130,6 +2190,49 @@ mod tests {
             .await
             .err()
             .unwrap();
+
+        assert_eq!(err, BridgeError::ConfigReseedRequired { field: "model" });
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn checkout_child_turn_reconcile_expiry_does_not_deadlock() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("child-reconcile-expire-parent");
+        let child = ctx("child-reconcile-expire-child");
+
+        let turn = manager
+            .checkout_child_turn(
+                &parent,
+                &child,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                None,
+                op("op-child-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+
+        backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
+        let err = tokio::time::timeout(
+            Duration::from_millis(200),
+            manager.checkout_child_turn(
+                &parent,
+                &child,
+                agent(),
+                Some(model_override("gpt-5.4")),
+                None,
+                op("op-child-2"),
+            ),
+        )
+        .await
+        .expect("checkout_child_turn must not deadlock")
+        .err()
+        .unwrap();
 
         assert_eq!(err, BridgeError::ConfigReseedRequired { field: "model" });
         assert!(manager.status(&child).await.is_none());
