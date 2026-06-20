@@ -6,7 +6,7 @@
 // and asserts the SSE frames: at least one node Status, a final synth Artifact, and
 // a terminal Completed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use a2a::{methods, SVC_PARAM_VERSION};
@@ -119,6 +119,7 @@ impl AgentRegistry for FakeRegistry {
 #[derive(Default)]
 struct FakeStore {
     map: std::sync::Mutex<HashMap<String, String>>,
+    cancels: std::sync::Mutex<HashSet<String>>,
 }
 #[async_trait]
 impl SessionStore for FakeStore {
@@ -149,11 +150,12 @@ impl SessionStore for FakeStore {
     async fn peer_task_for(&self, _t: &TaskId) -> Result<Option<PeerTaskId>, BridgeError> {
         Ok(None)
     }
-    async fn request_cancel(&self, _t: &TaskId) -> Result<(), BridgeError> {
+    async fn request_cancel(&self, t: &TaskId) -> Result<(), BridgeError> {
+        self.cancels.lock().unwrap().insert(t.as_str().into());
         Ok(())
     }
-    async fn cancel_requested(&self, _t: &TaskId) -> Result<bool, BridgeError> {
-        Ok(false)
+    async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
+        Ok(self.cancels.lock().unwrap().contains(t.as_str()))
     }
     async fn set_fanout(&self, _t: &TaskId) -> Result<(), BridgeError> {
         Ok(())
@@ -664,6 +666,602 @@ fn build_server_per_agent(backends: HashMap<String, Arc<dyn AgentBackend>>) -> A
         )
         .with_workflows(executor, map),
     )
+}
+
+fn build_server_per_agent_with_session_manager(
+    store: Arc<FakeStore>,
+    backends: HashMap<String, Arc<dyn AgentBackend>>,
+) -> Arc<InboundServer> {
+    let registry = Arc::new(PerAgentRegistry { backends });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>
+    ));
+    let sm = Arc::new(bridge_a2a_inbound::session_manager::SessionManager::new(
+        registry.clone() as Arc<dyn AgentRegistry>,
+        std::time::Duration::from_secs(60),
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            store,
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_workflows(executor, map)
+        .with_session_manager(sm),
+    )
+}
+
+fn workflow_stream_params(task: &str, ctx: &str) -> Value {
+    json!({
+        "taskId": task,
+        "message": {
+            "contextId": ctx,
+            "text": "DIFF",
+            "metadata": { "a2a-bridge.skill": "code-review" }
+        }
+    })
+}
+
+async fn json_response(resp: axum::response::Response) -> Value {
+    serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+async fn session_cancel_response(srv: &Arc<InboundServer>, ctx: &str) -> Value {
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request("SessionCancel", json!({ "contextId": ctx })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    json_response(resp).await
+}
+
+async fn wait_for(mut pred: impl FnMut() -> bool, message: &str) {
+    for _ in 0..200 {
+        if pred() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{message}");
+}
+
+#[derive(Default)]
+struct CancelStats {
+    prompts: std::sync::atomic::AtomicUsize,
+    cancels: std::sync::Mutex<Vec<String>>,
+}
+
+struct BlockingCountBackend {
+    reply: String,
+    stats: Arc<CancelStats>,
+    gate: Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>,
+    fail_cancel: bool,
+    panic_once: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[async_trait]
+impl AgentBackend for BlockingCountBackend {
+    async fn prompt(&self, _s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        self.stats
+            .prompts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .panic_once
+            .as_ref()
+            .is_some_and(|p| p.swap(false, std::sync::atomic::Ordering::SeqCst))
+        {
+            panic!("boom: injected workflow producer panic");
+        }
+        while !self.gate.0.load(std::sync::atomic::Ordering::Acquire) {
+            self.gate.1.notified().await;
+        }
+        let reply = self.reply.clone();
+        let updates = vec![
+            Ok(Update::Text(reply)),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(updates)))
+    }
+
+    async fn cancel(&self, s: &SessionId) -> Result<(), BridgeError> {
+        self.stats
+            .cancels
+            .lock()
+            .unwrap()
+            .push(s.as_str().to_owned());
+        if self.fail_cancel {
+            Err(BridgeError::AgentCrashed {
+                reason: "cancel failed".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn blocking_backends(
+    gate: Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>,
+    stats: Arc<CancelStats>,
+) -> HashMap<String, Arc<dyn AgentBackend>> {
+    [
+        ("codex".to_string(), "CODEX_REVIEW"),
+        ("claude".to_string(), "CLAUDE_REVIEW"),
+        ("synth".to_string(), "SYNTH_FINAL"),
+    ]
+    .into_iter()
+    .map(|(id, reply)| {
+        (
+            id,
+            Arc::new(BlockingCountBackend {
+                reply: reply.to_string(),
+                stats: stats.clone(),
+                gate: gate.clone(),
+                fail_cancel: false,
+                panic_once: None,
+            }) as Arc<dyn AgentBackend>,
+        )
+    })
+    .collect()
+}
+
+fn release_gate(gate: &Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>) {
+    gate.0.store(true, std::sync::atomic::Ordering::Release);
+    gate.1.notify_waiters();
+}
+
+async fn start_warm_stream(
+    srv: &Arc<InboundServer>,
+    task: &str,
+    ctx: &str,
+) -> tokio::task::JoinHandle<axum::body::Bytes> {
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            workflow_stream_params(task, ctx),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    tokio::spawn(async move {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    })
+}
+
+fn assert_terminal_state(body: &[u8], state: a2a::TaskState) {
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let payloads = sse_data_payloads(&text);
+    let last = payloads
+        .last()
+        .unwrap_or_else(|| panic!("no SSE payloads: {text}"));
+    let parsed: a2a::StreamResponse = serde_json::from_str(last)
+        .unwrap_or_else(|e| panic!("last payload must parse: {e}: {last}"));
+    assert!(
+        matches!(parsed, a2a::StreamResponse::StatusUpdate(e) if e.status.state == state),
+        "final state mismatch in SSE body: {text}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_context_workflow_handle_busy() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let store = Arc::new(FakeStore::default());
+    let srv = build_server_per_agent_with_session_manager(
+        store.clone(),
+        blocking_backends(gate.clone(), stats.clone()),
+    );
+
+    let body = start_warm_stream(&srv, "busy-1", "ctx-busy").await;
+    wait_for(
+        || stats.prompts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "workflow did not start root nodes",
+    )
+    .await;
+
+    let second = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            workflow_stream_params("busy-2", "ctx-busy"),
+        ))
+        .await
+        .unwrap();
+    let body_json = json_response(second).await;
+    assert_eq!(body_json["error"]["code"], -32600, "{body_json}");
+    assert!(
+        store
+            .session_for(&TaskId::parse("busy-2").unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "HandleBusy must be returned before SessionStore::put"
+    );
+
+    release_gate(&gate);
+    let raw = body.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Completed);
+}
+
+#[tokio::test]
+async fn session_cancel_cancels_workflow_run() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let srv = build_server_per_agent_with_session_manager(
+        Arc::new(FakeStore::default()),
+        blocking_backends(gate, stats.clone()),
+    );
+    let body = start_warm_stream(&srv, "cancel-1", "ctx-cancel").await;
+    wait_for(
+        || stats.prompts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "workflow did not start before SessionCancel",
+    )
+    .await;
+
+    let cancel = session_cancel_response(&srv, "ctx-cancel").await;
+    assert!(cancel.get("result").is_some(), "{cancel}");
+    let raw = body.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+}
+
+#[tokio::test]
+async fn session_cancel_workflow_parent_sweeps_children() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(true),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let srv = build_server_per_agent_with_session_manager(
+        Arc::new(FakeStore::default()),
+        blocking_backends(gate, stats),
+    );
+    let body = start_warm_stream(&srv, "sweep-1", "ctx-sweep").await;
+    let raw = body.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Completed);
+
+    let cancel = session_cancel_response(&srv, "ctx-sweep").await;
+    assert_eq!(cancel["result"]["canceled"], true, "{cancel}");
+}
+
+#[tokio::test]
+async fn workflow_producer_normal_exit_frees_context() {
+    // A workflow that COMPLETES normally on context C must free workflow_runs[C] on the producer's
+    // NORMAL exit (the inline awaited release_run) -> an immediate second same-context send must
+    // reach terminal Completed, NOT HandleBusy. This proves the normal-path guard cleanup, the
+    // complement to workflow_producer_panic_frees_context (which only proves the panic path); without
+    // it a leaked workflow_runs[C] could hide behind SessionCancel's active-token success rule.
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(true),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let srv = build_server_per_agent_with_session_manager(
+        Arc::new(FakeStore::default()),
+        blocking_backends(gate, stats),
+    );
+
+    let first = start_warm_stream(&srv, "norm-1", "ctx-norm").await;
+    let raw = first.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Completed);
+
+    // Second run on the SAME context: must Complete (guard freed on the first producer's normal exit).
+    let second = start_warm_stream(&srv, "norm-2", "ctx-norm").await;
+    let raw = second.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Completed);
+}
+
+#[tokio::test]
+async fn session_cancel_keeps_context_busy_until_producer_exits() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let srv = build_server_per_agent_with_session_manager(
+        Arc::new(FakeStore::default()),
+        blocking_backends(gate, stats.clone()),
+    );
+    let body = start_warm_stream(&srv, "drain-1", "ctx-drain").await;
+    wait_for(
+        || stats.prompts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "workflow did not start before SessionCancel",
+    )
+    .await;
+
+    let cancel = session_cancel_response(&srv, "ctx-drain").await;
+    assert!(cancel.get("result").is_some(), "{cancel}");
+    let second = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            workflow_stream_params("drain-2", "ctx-drain"),
+        ))
+        .await
+        .unwrap();
+    let second = json_response(second).await;
+    assert_eq!(second["error"]["code"], -32600, "{second}");
+
+    let raw = body.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+}
+
+#[tokio::test]
+async fn active_session_cancel_one_backend_cancel_per_child() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let srv = build_server_per_agent_with_session_manager(
+        Arc::new(FakeStore::default()),
+        blocking_backends(gate, stats.clone()),
+    );
+    let body = start_warm_stream(&srv, "once-1", "ctx-once").await;
+    wait_for(
+        || stats.prompts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "workflow did not start before SessionCancel",
+    )
+    .await;
+
+    let cancel = session_cancel_response(&srv, "ctx-once").await;
+    assert!(cancel.get("result").is_some(), "{cancel}");
+    let raw = body.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+    assert_eq!(
+        stats.cancels.lock().unwrap().len(),
+        2,
+        "exactly one backend.cancel per active root child"
+    );
+}
+
+#[tokio::test]
+async fn cancel_task_warm_workflow_cancels_checked_out_child() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let srv = build_server_per_agent_with_session_manager(
+        Arc::new(FakeStore::default()),
+        blocking_backends(gate, stats.clone()),
+    );
+    let body = start_warm_stream(&srv, "warm-cancel-task-1", "ctx-warm-cancel-task").await;
+    wait_for(
+        || stats.prompts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "workflow did not park a checked-out child in prompt before CancelTask",
+    )
+    .await;
+
+    let cancel_resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": "warm-cancel-task-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), axum::http::StatusCode::OK);
+    let cancel = json_response(cancel_resp).await;
+    assert_eq!(
+        cancel["result"]["task"]["state"], "TASK_STATE_CANCELED",
+        "{cancel}"
+    );
+
+    let raw = body.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+    let cancels = stats.cancels.lock().unwrap();
+    assert!(
+        cancels
+            .iter()
+            .any(|s| s.contains("ctx-warm-cancel-task::workflow::code-review::node::")),
+        "CancelTask must cancel a checked-out warm child: {cancels:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_task_immediately_after_warm_stream_send_cancels_workflow() {
+    let pending: Arc<dyn AgentBackend> = Arc::new(PendingBackend);
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), pending.clone()),
+        ("claude".to_string(), pending.clone()),
+        ("synth".to_string(), pending.clone()),
+    ]
+    .into();
+    let srv = build_server_per_agent_with_session_manager(Arc::new(FakeStore::default()), backends);
+
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            workflow_stream_params("warm-immediate-cancel-1", "ctx-warm-immediate-cancel"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    let cancel_resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": "warm-immediate-cancel-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), axum::http::StatusCode::OK);
+    let cancel = json_response(cancel_resp).await;
+    assert_eq!(
+        cancel["result"]["task"]["state"], "TASK_STATE_CANCELED",
+        "{cancel}"
+    );
+
+    let raw = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        axum::body::to_bytes(resp.into_body(), usize::MAX),
+    )
+    .await
+    .expect("warm workflow SSE must terminate after immediate CancelTask")
+    .unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+}
+
+#[tokio::test]
+async fn cancel_task_before_warm_workflow_token_registration_cancels_run() {
+    let pending: Arc<dyn AgentBackend> = Arc::new(PendingBackend);
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), pending.clone()),
+        ("claude".to_string(), pending.clone()),
+        ("synth".to_string(), pending.clone()),
+    ]
+    .into();
+    let srv = build_server_per_agent_with_session_manager(Arc::new(FakeStore::default()), backends);
+
+    let cancel_resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": "warm-early-cancel-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), axum::http::StatusCode::OK);
+    let cancel = json_response(cancel_resp).await;
+    assert_eq!(
+        cancel["result"]["task"]["state"], "TASK_STATE_CANCELED",
+        "{cancel}"
+    );
+
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            workflow_stream_params("warm-early-cancel-1", "ctx-warm-early-cancel"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    let raw = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        axum::body::to_bytes(resp.into_body(), usize::MAX),
+    )
+    .await
+    .expect("warm workflow SSE must terminate from the pre-registered CancelTask latch")
+    .unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+}
+
+#[tokio::test]
+async fn active_session_cancel_propagates_child_backend_error() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), true),
+        ("claude".to_string(), false),
+        ("synth".to_string(), false),
+    ]
+    .into_iter()
+    .map(|(id, fail_cancel)| {
+        (
+            id,
+            Arc::new(BlockingCountBackend {
+                reply: "OUT".to_string(),
+                stats: stats.clone(),
+                gate: gate.clone(),
+                fail_cancel,
+                panic_once: None,
+            }) as Arc<dyn AgentBackend>,
+        )
+    })
+    .collect();
+    let srv = build_server_per_agent_with_session_manager(Arc::new(FakeStore::default()), backends);
+    let body = start_warm_stream(&srv, "err-1", "ctx-err").await;
+    wait_for(
+        || stats.prompts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "workflow did not start before SessionCancel",
+    )
+    .await;
+
+    let cancel = session_cancel_response(&srv, "ctx-err").await;
+    assert!(
+        cancel.get("error").is_some(),
+        "cancel error must propagate: {cancel}"
+    );
+    let raw = body.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+}
+
+#[tokio::test]
+async fn workflow_producer_panic_frees_context() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(true),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let panic_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), "CODEX_REVIEW"),
+        ("claude".to_string(), "CLAUDE_REVIEW"),
+        ("synth".to_string(), "SYNTH_FINAL"),
+    ]
+    .into_iter()
+    .map(|(id, reply)| {
+        (
+            id,
+            Arc::new(BlockingCountBackend {
+                reply: reply.to_string(),
+                stats: stats.clone(),
+                gate: gate.clone(),
+                fail_cancel: false,
+                panic_once: Some(panic_once.clone()),
+            }) as Arc<dyn AgentBackend>,
+        )
+    })
+    .collect();
+    let srv = build_server_per_agent_with_session_manager(Arc::new(FakeStore::default()), backends);
+
+    let first = start_warm_stream(&srv, "panic-ctx-1", "ctx-panic").await;
+    let raw = first.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Failed);
+
+    let second = start_warm_stream(&srv, "panic-ctx-2", "ctx-panic").await;
+    let raw = second.await.unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Completed);
 }
 
 /// **synth_got_both_reviews**: the synth node's prompt must contain both the

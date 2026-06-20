@@ -19,6 +19,7 @@
 // auth->route->translate pipeline. axum 0.7 is already proven in this workspace.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use axum::{
@@ -29,7 +30,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
@@ -38,13 +39,17 @@ use bridge_core::domain::{
     PeerTaskId, RouteTarget, SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
-use bridge_core::ids::{AgentId, ContextId, OperationId, SessionId, TaskId};
+use bridge_core::ids::{AgentId, ContextId, OperationId, SessionGeneration, SessionId, TaskId};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
     RouteDecision, SessionStore, Update,
 };
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 use bridge_core::SessionCwd;
+use bridge_workflow::executor::{
+    NodeTurn, NodeTurnCleanup, NodeTurnExit, WorkflowNodeDispatcher, WorkflowRunContext,
+};
+use bridge_workflow::graph::WorkflowNode;
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
 use crate::fanout::{self, Source};
@@ -170,6 +175,14 @@ pub struct InboundServer {
             >,
         >,
     >,
+    workflow_runs: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                bridge_core::ids::ContextId,
+                tokio_util::sync::CancellationToken,
+            >,
+        >,
+    >,
     /// Durable task control-plane store (W3a). Defaults to an in-memory store;
     /// replace with a persistent backend via [`InboundServer::with_task_store`].
     task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
@@ -222,6 +235,7 @@ impl InboundServer {
             executor: None,
             workflows: Arc::new(HashMap::new()),
             workflow_cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            workflow_runs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
             session_manager: None,
             allowed_cwd_root: None,
@@ -350,9 +364,11 @@ impl InboundServer {
         let target = self.route.route(&task_meta)?;
 
         let context_id = context_id_from_params(params)?;
-        if context_id.is_some() && !matches!(target, RouteTarget::Local(_)) {
+        if context_id.is_some()
+            && !matches!(target, RouteTarget::Local(_) | RouteTarget::Workflow(_))
+        {
             return Err(BridgeError::InvalidRequest {
-                field: "contextId is only supported on the local route in Slice 0",
+                field: "contextId is not supported for this route",
             });
         }
 
@@ -652,6 +668,82 @@ async fn warm_local_dispatch(
     }
 }
 
+#[allow(dead_code)] // wired into the workflow producer in the next approved slice task
+struct WarmWorkflowNodeDispatcher {
+    sm: Arc<crate::session_manager::SessionManager>,
+    parent: ContextId,
+    cwd: Option<SessionCwd>,
+}
+
+#[async_trait::async_trait]
+impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
+    async fn checkout(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        _ctx: &WorkflowRunContext,
+    ) -> Result<NodeTurn, BridgeError> {
+        let child = ContextId::parse(format!(
+            "{}::workflow::{}::node::{}",
+            self.parent.as_str(),
+            wf_id,
+            node.id.as_str()
+        ))?;
+        let op = OperationId::parse(format!("workflow-{run_id}-node-{}", node.id.as_str()))?;
+        let turn = self
+            .sm
+            .checkout_child_turn(
+                &self.parent,
+                &child,
+                node.agent.clone(),
+                None,
+                self.cwd.clone(),
+                op,
+            )
+            .await?;
+        Ok(NodeTurn {
+            backend: turn.backend,
+            session: turn.session,
+            seed: turn.seed,
+            cleanup: Box::new(WarmNodeCleanup {
+                sm: self.sm.clone(),
+                child,
+                gen: turn.generation,
+                op: turn.op,
+            }),
+        })
+    }
+}
+
+#[allow(dead_code)] // constructed by WarmWorkflowNodeDispatcher once the producer is wired
+struct WarmNodeCleanup {
+    sm: Arc<crate::session_manager::SessionManager>,
+    child: ContextId,
+    gen: SessionGeneration,
+    op: OperationId,
+}
+
+#[async_trait::async_trait]
+impl NodeTurnCleanup for WarmNodeCleanup {
+    async fn on_exit(self: Box<Self>, exit: NodeTurnExit) {
+        match exit {
+            NodeTurnExit::Normal => {
+                self.sm.finish_turn(&self.child, self.gen, &self.op).await;
+            }
+            NodeTurnExit::Canceled => {
+                let _ = self.sm.cancel(&self.child).await;
+            }
+            NodeTurnExit::Error(BridgeError::AgentCrashed { .. }) => {
+                self.sm.expire_turn(&self.child).await;
+            }
+            NodeTurnExit::Error(_) => {
+                self.sm.finish_turn(&self.child, self.gen, &self.op).await;
+            }
+        }
+    }
+}
+
 /// Fan-out variant of [`resolve_configure_bind`]: resolve the local agent, apply
 /// its effective config, and return the `(backend, lease)` so the fan-out producer
 /// can HOLD them for the source's lifetime — the same instance drives the prompt
@@ -765,6 +857,35 @@ async fn stream_message(
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
 
+    let (workflow_token, mut pre_producer_run_guard) =
+        if matches!(&routed.target, RouteTarget::Workflow(_))
+            && routed.context_id.is_some()
+            && srv.session_manager.is_some()
+        {
+            let c = routed.context_id.clone().unwrap();
+            let mut runs = srv.workflow_runs.lock().await;
+            if runs.contains_key(&c) {
+                return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
+            }
+            let t = tokio_util::sync::CancellationToken::new();
+            runs.insert(c.clone(), t.clone());
+            let guard = PreProducerRunGuard {
+                workflow_runs: srv.workflow_runs.clone(),
+                workflow_cancels: srv.workflow_cancels.clone(),
+                ctx: c.clone(),
+                task: routed.task.clone(),
+                armed: true,
+            };
+            drop(runs);
+            srv.workflow_cancels
+                .lock()
+                .await
+                .insert(routed.task.clone(), t.clone());
+            (Some((c, t)), Some(guard))
+        } else {
+            (None, None)
+        };
+
     // Persist task->session before driving the backend.
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
@@ -822,7 +943,10 @@ async fn stream_message(
         // consumes it for `task`/`parts`).
         RouteTarget::Workflow(ref id) => {
             let id = id.clone();
-            spawn_workflow_producer(&srv, routed, id, tx)
+            spawn_workflow_producer(&srv, routed, id, tx, workflow_token);
+            if let Some(guard) = &mut pre_producer_run_guard {
+                guard.armed = false;
+            }
         }
     }
 
@@ -1680,55 +1804,156 @@ impl crate::workflow_sink::WorkflowSink for SseSink {
 /// terminal frame mapped from the workflow outcome. A per-task cancellation
 /// token is registered in `workflow_cancels` for the run's duration so
 /// `cancel_task` can preempt it, and removed on exit.
+async fn release_run(srv: &Arc<InboundServer>, task: &TaskId, ctx: &Option<ContextId>) {
+    srv.workflow_cancels.lock().await.remove(task);
+    if let Some(c) = ctx {
+        srv.workflow_runs.lock().await.remove(c);
+    }
+}
+
+struct PreProducerRunGuard {
+    workflow_runs: Arc<tokio::sync::Mutex<HashMap<ContextId, tokio_util::sync::CancellationToken>>>,
+    workflow_cancels: Arc<tokio::sync::Mutex<HashMap<TaskId, tokio_util::sync::CancellationToken>>>,
+    ctx: ContextId,
+    task: TaskId,
+    armed: bool,
+}
+
+impl Drop for PreProducerRunGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let workflow_runs = self.workflow_runs.clone();
+        let workflow_cancels = self.workflow_cancels.clone();
+        let ctx = self.ctx.clone();
+        let task = self.task.clone();
+        tokio::spawn(async move {
+            workflow_runs.lock().await.remove(&ctx);
+            workflow_cancels.lock().await.remove(&task);
+        });
+    }
+}
+
+struct RunGuard {
+    srv: Arc<InboundServer>,
+    task: TaskId,
+    ctx: Option<ContextId>,
+    armed: bool,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (srv, task, ctx) = (self.srv.clone(), self.task.clone(), self.ctx.take());
+        tokio::spawn(async move {
+            if let (Some(c), Some(sm)) = (&ctx, &srv.session_manager) {
+                sm.release_with_children(c).await;
+            }
+            release_run(&srv, &task, &ctx).await;
+        });
+    }
+}
+
 fn spawn_workflow_producer(
     srv: &Arc<InboundServer>,
     routed: RoutedCall,
     wf_id: bridge_core::ids::WorkflowId,
     tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+    workflow_token: Option<(ContextId, tokio_util::sync::CancellationToken)>,
 ) {
     let srv = srv.clone();
-    let task = routed.task;
+    let task = routed.task.clone();
     let parts = routed.parts.clone();
     tokio::spawn(async move {
-        // Resolve the executor + graph; absent either → fail the task with a
-        // terminal Failed frame (no executor wired, or an unknown workflow id).
-        let (executor, graph) = match (&srv.executor, srv.workflows.get(&wf_id)) {
-            (Some(e), Some(g)) => (e.clone(), g.clone()),
-            _ => {
-                let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
-                return;
+        let ctx = workflow_token.as_ref().map(|(c, _)| c.clone());
+        let mut guard = RunGuard {
+            srv: srv.clone(),
+            task: task.clone(),
+            ctx: ctx.clone(),
+            armed: true,
+        };
+        let (srv2, task2, ctx2, tx2) = (srv.clone(), task.clone(), ctx.clone(), tx.clone());
+        let outcome = AssertUnwindSafe(async move {
+            // Resolve the executor + graph; absent either → fail the task with a
+            // terminal Failed frame (no executor wired, or an unknown workflow id).
+            let (executor, graph) = match (&srv.executor, srv.workflows.get(&wf_id)) {
+                (Some(e), Some(g)) => (e.clone(), g.clone()),
+                _ => {
+                    let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+                    return;
+                }
+            };
+            // The workflow input is the concatenation of the request's text parts.
+            let input: String = parts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let token = match &workflow_token {
+                Some((_, t)) => t.clone(),
+                None => {
+                    // Cold workflow streams create their token here; warm streams
+                    // are registered synchronously by stream_message.
+                    let token = tokio_util::sync::CancellationToken::new();
+                    srv.workflow_cancels
+                        .lock()
+                        .await
+                        .insert(task.clone(), token.clone());
+                    token
+                }
+            };
+            if srv.store.cancel_requested(&task).await.unwrap_or(false) {
+                token.cancel();
             }
-        };
-        // The workflow input is the concatenation of the request's text parts.
-        let input: String = parts
-            .iter()
-            .map(|p| p.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Register the cancel token before driving the stream so an inbound
-        // CancelTask can never race the bind window.
-        let token = tokio_util::sync::CancellationToken::new();
-        srv.workflow_cancels
-            .lock()
-            .await
-            .insert(task.clone(), token.clone());
-        let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
-            session_cwd: routed.session_cwd.clone(),
-        };
-        let stream =
-            executor.run_with_context(graph, input, task.as_str().to_string(), token, wf_ctx);
-        let mut sink = SseSink { tx: tx.clone() };
-        // SseSink never errors (sends are best-effort); on a hypothetical error
-        // treat it as no-terminal so the existing no-terminal fallback fires.
-        let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink)
-            .await
-            .unwrap_or(false);
-        // The executor always emits a Terminal, but guard against an early stream
-        // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
-        if !terminal_seen {
-            let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+            let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
+                session_cwd: routed.session_cwd.clone(),
+            };
+            let stream = match &workflow_token {
+                Some((c, _)) => executor.run_with_context_and_dispatcher(
+                    graph,
+                    input,
+                    task.as_str().into(),
+                    token,
+                    wf_ctx,
+                    Arc::new(WarmWorkflowNodeDispatcher {
+                        sm: srv.session_manager.clone().unwrap(),
+                        parent: c.clone(),
+                        cwd: routed.session_cwd.clone(),
+                    }),
+                ),
+                None => executor.run_with_context(
+                    graph,
+                    input,
+                    task.as_str().to_string(),
+                    token,
+                    wf_ctx,
+                ),
+            };
+            let mut sink = SseSink { tx: tx.clone() };
+            // SseSink never errors (sends are best-effort); on a hypothetical error
+            // treat it as no-terminal so the existing no-terminal fallback fires.
+            let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink)
+                .await
+                .unwrap_or(false);
+            // The executor always emits a Terminal, but guard against an early stream
+            // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
+            if !terminal_seen {
+                let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+            }
+        })
+        .catch_unwind()
+        .await;
+        if outcome.is_err() {
+            if let (Some(c), Some(sm)) = (&ctx2, &srv2.session_manager) {
+                sm.release_with_children(c).await;
+            }
+            let _ = tx2.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
         }
-        srv.workflow_cancels.lock().await.remove(&task);
+        release_run(&srv2, &task2, &ctx2).await;
+        guard.armed = false;
     });
 }
 
@@ -2368,6 +2593,14 @@ async fn unary_message(
         Ok(r) => r,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
+    if routed.context_id.is_some() && matches!(&routed.target, RouteTarget::Workflow(_)) {
+        return bridge_err_to_jsonrpc(
+            id,
+            &BridgeError::InvalidRequest {
+                field: "contextId is not supported for this route",
+            },
+        );
+    }
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
     // Fan-out unary: collect all fanout::run events and build an a2a::Task
@@ -3002,7 +3235,12 @@ async fn session_release(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    sm.release(&ctx).await;
+    let runs = srv.workflow_runs.lock().await;
+    if runs.contains_key(&ctx) {
+        return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
+    }
+    sm.release_with_children(&ctx).await;
+    drop(runs);
     jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "released": true }))
 }
 
@@ -3022,14 +3260,17 @@ async fn session_clear(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
+    let runs = srv.workflow_runs.lock().await;
+    if runs.contains_key(&ctx) {
+        return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
+    }
     let force = params
         .get("force")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    match sm
-        .reset_session(&ctx, crate::session_manager::ResetOpts { force })
-        .await
-    {
+    let result = sm.clear_with_children(&ctx, force).await;
+    drop(runs);
+    match result {
         Ok(crate::session_manager::ResetOutcome::Cleared { generation }) => jsonrpc_ok(
             id,
             json!({ "contextId": ctx.as_str(), "cleared": true, "generation": generation }),
@@ -3101,9 +3342,17 @@ async fn session_cancel(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    match sm.cancel(&ctx).await {
-        Ok(()) => jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "canceled": true })),
-        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    let token = { srv.workflow_runs.lock().await.get(&ctx).cloned() };
+    if let Some(t) = &token {
+        t.cancel();
+    }
+    let swept = sm.cancel_with_children(&ctx).await;
+    match (token.is_some(), swept) {
+        (_, Ok(())) => jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "canceled": true })),
+        (true, Err(BridgeError::SessionNotFound)) => {
+            jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "canceled": true }))
+        }
+        (_, Err(e)) => bridge_err_to_jsonrpc(id, &e),
     }
 }
 
@@ -3492,8 +3741,9 @@ mod tests {
     use bridge_core::ports::*;
     use bridge_core::ports::{Delegation, DelegationPort, DelegationStream};
     use bridge_core::translator::Event;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::oneshot;
     use tower::ServiceExt;
 
     // ---- inline fakes ----
@@ -4453,11 +4703,123 @@ mod tests {
 
         match srv.gate(&HeaderMap::new(), &params) {
             Err(BridgeError::InvalidRequest {
-                field: "contextId is only supported on the local route in Slice 0",
+                field: "contextId is not supported for this route",
             }) => {}
             Err(other) => panic!("expected contextId Local-only rejection, got: {other:?}"),
             Ok(_) => panic!("expected contextId Local-only rejection, got Ok"),
         }
+    }
+
+    struct WorkflowOnlyRoute;
+    impl RouteDecision for WorkflowOnlyRoute {
+        fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            Ok(RouteTarget::Workflow(bridge_core::ids::WorkflowId::parse(
+                "code-review",
+            )?))
+        }
+    }
+
+    fn build_workflow_route(store: Arc<FakeStore>) -> Arc<InboundServer> {
+        Arc::new(InboundServer::new(
+            FakeRegistry::single("kiro", Arc::new(PanicBackend)),
+            store,
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowOnlyRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ))
+    }
+
+    #[test]
+    fn gate_allows_contextid_on_workflow_streaming() {
+        let srv = build_workflow_route(Arc::new(FakeStore::default()));
+        let params = serde_json::json!({
+            "message": {
+                "contextId": "c-1",
+                "text": "hi",
+                "metadata": { "a2a-bridge.skill": "code-review" }
+            }
+        });
+
+        let routed = srv
+            .gate(&HeaderMap::new(), &params)
+            .expect("workflow route must accept contextId at the shared gate");
+
+        assert_eq!(routed.context_id.unwrap().as_str(), "c-1");
+        assert!(matches!(routed.target, RouteTarget::Workflow(_)));
+    }
+
+    #[tokio::test]
+    async fn gate_rejects_unary_workflow_contextid() {
+        let store = Arc::new(FakeStore::default());
+        let srv = build_workflow_route(store.clone());
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                serde_json::json!({
+                    "message": {
+                        "contextId": "c-1",
+                        "text": "hi",
+                        "metadata": { "a2a-bridge.skill": "code-review" }
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            body.get("error").is_some(),
+            "unary workflow+contextId must be rejected: {body}"
+        );
+        assert!(
+            store.map.lock().unwrap().is_empty(),
+            "unary workflow+contextId reject must happen before SessionStore::put"
+        );
+    }
+
+    #[test]
+    fn gate_still_rejects_delegate_fanout_contextid() {
+        let delegate = build_delegate(
+            FakeBackend::new(),
+            Arc::new(FakeStore::default()),
+            Arc::new(NoDelegation),
+        );
+        let delegate_params = serde_json::json!({
+            "message": {
+                "contextId": "c-1",
+                "text": "hi",
+                "metadata": { "a2a-bridge.skill": "delegate" }
+            }
+        });
+        assert!(matches!(
+            delegate.gate(&HeaderMap::new(), &delegate_params),
+            Err(BridgeError::InvalidRequest {
+                field: "contextId is not supported for this route"
+            })
+        ));
+
+        let fanout = build_fanout(
+            FakeBackend::new(),
+            Arc::new(FakeStore::default()),
+            Arc::new(NoDelegation),
+        );
+        let fanout_params = serde_json::json!({
+            "message": {
+                "contextId": "c-1",
+                "text": "hi",
+                "metadata": { "a2a-bridge.skill": "fan-out" }
+            }
+        });
+        assert!(matches!(
+            fanout.gate(&HeaderMap::new(), &fanout_params),
+            Err(BridgeError::InvalidRequest {
+                field: "contextId is not supported for this route"
+            })
+        ));
     }
 
     // ---- Task 9: task_meta_from_params reads agent + overrides ----
@@ -5987,10 +6349,17 @@ mod tests {
         }
     }
 
+    type ConfiguredSessions = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
     struct WarmRecordingBackend {
         sessions: Arc<Mutex<Vec<String>>>,
         forgotten: Arc<Mutex<Vec<String>>>,
+        cancels: Arc<Mutex<Vec<String>>>,
+        configured: ConfiguredSessions,
         prompted_parts: Arc<Mutex<Vec<Vec<String>>>>,
+        release_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        release_started: Arc<tokio::sync::Notify>,
+        release_started_count: AtomicUsize,
     }
 
     impl WarmRecordingBackend {
@@ -5998,7 +6367,12 @@ mod tests {
             Arc::new(Self {
                 sessions: Arc::new(Mutex::new(Vec::new())),
                 forgotten: Arc::new(Mutex::new(Vec::new())),
+                cancels: Arc::new(Mutex::new(Vec::new())),
+                configured: Arc::new(Mutex::new(Vec::new())),
                 prompted_parts: Arc::new(Mutex::new(Vec::new())),
+                release_gate: Arc::new(Mutex::new(None)),
+                release_started: Arc::new(tokio::sync::Notify::new()),
+                release_started_count: AtomicUsize::new(0),
             })
         }
 
@@ -6008,6 +6382,38 @@ mod tests {
 
         fn clear_prompted_parts(&self) {
             self.prompted_parts.lock().unwrap().clear();
+        }
+
+        fn configured(&self) -> Vec<(String, Option<String>)> {
+            self.configured.lock().unwrap().clone()
+        }
+
+        fn cancels(&self) -> Vec<String> {
+            self.cancels.lock().unwrap().clone()
+        }
+
+        fn forgotten(&self) -> Vec<String> {
+            self.forgotten.lock().unwrap().clone()
+        }
+
+        fn gate_release_session(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.release_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        async fn wait_release_started(&self) {
+            for _ in 0..50 {
+                if self.release_started_count.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                let notified = self.release_started.notified();
+                if self.release_started_count.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(10), notified).await;
+            }
+            panic!("release_session did not start");
         }
     }
 
@@ -6035,6 +6441,19 @@ mod tests {
         }
 
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            self.cancels.lock().unwrap().push(_s.as_str().to_owned());
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            session: &SessionId,
+            spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            self.configured.lock().unwrap().push((
+                session.as_str().to_owned(),
+                spec.cwd.as_ref().map(|cwd| cwd.as_str().to_owned()),
+            ));
             Ok(())
         }
 
@@ -6043,6 +6462,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(session.as_str().to_owned());
+        }
+
+        async fn release_session(&self, session: &SessionId) {
+            self.forgotten
+                .lock()
+                .unwrap()
+                .push(session.as_str().to_owned());
+            let gate = self.release_gate.lock().unwrap().take();
+            self.release_started_count.fetch_add(1, Ordering::SeqCst);
+            self.release_started.notify_waiters();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
         }
     }
 
@@ -6088,6 +6520,177 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("session did not reach idle");
+    }
+
+    #[tokio::test]
+    async fn warm_workflow_dispatch_checks_out_child() {
+        use bridge_workflow::executor::{NodeTurnExit, WorkflowNodeDispatcher, WorkflowRunContext};
+        use bridge_workflow::graph::WorkflowNode;
+
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry as Arc<dyn AgentRegistry>,
+            std::time::Duration::from_secs(60),
+        ));
+        let parent = ContextId::parse("parent").unwrap();
+        let child = ContextId::parse("parent::workflow::wf::node::n1").unwrap();
+        let cwd = SessionCwd::parse("/tmp/a2a-warm-workflow").unwrap();
+        let dispatcher = WarmWorkflowNodeDispatcher {
+            sm: sm.clone(),
+            parent: parent.clone(),
+            cwd: Some(cwd.clone()),
+        };
+        let node = WorkflowNode {
+            id: bridge_core::ids::NodeId::parse("n1").unwrap(),
+            agent: AgentId::parse("a").unwrap(),
+            prompt_template: "go".into(),
+            inputs: vec![],
+        };
+        let ctx = WorkflowRunContext {
+            session_cwd: Some(cwd.clone()),
+        };
+
+        let turn = dispatcher
+            .checkout("wf", &node, "run-1", &ctx)
+            .await
+            .expect("checkout child");
+        assert_eq!(turn.seed, None);
+        assert_eq!(
+            turn.session.as_str(),
+            "ctx-parent::workflow::wf::node::n1-g0"
+        );
+        assert_eq!(
+            sm.status(&child).await.as_ref().map(|s| s.state),
+            Some("running")
+        );
+        assert_eq!(
+            backend.configured(),
+            vec![(
+                "ctx-parent::workflow::wf::node::n1-g0".to_string(),
+                Some(cwd.as_str().to_string())
+            )]
+        );
+
+        turn.cleanup.on_exit(NodeTurnExit::Normal).await;
+        assert_eq!(
+            sm.status(&child).await.as_ref().map(|s| s.state),
+            Some("idle")
+        );
+        assert!(
+            backend.forgotten().is_empty(),
+            "normal exit must finish_turn, not release"
+        );
+
+        let turn = dispatcher
+            .checkout("wf", &node, "run-2", &WorkflowRunContext::default())
+            .await
+            .expect("checkout child after normal finish");
+        turn.cleanup.on_exit(NodeTurnExit::Canceled).await;
+        assert_eq!(
+            sm.status(&child).await.as_ref().map(|s| s.state),
+            Some("idle")
+        );
+        assert_eq!(
+            backend.cancels(),
+            vec!["ctx-parent::workflow::wf::node::n1-g0".to_string()]
+        );
+
+        let turn = dispatcher
+            .checkout("wf", &node, "run-3", &WorkflowRunContext::default())
+            .await
+            .expect("checkout child after cancel");
+        turn.cleanup
+            .on_exit(NodeTurnExit::Error(BridgeError::AgentCrashed {
+                reason: "backend died".into(),
+            }))
+            .await;
+        assert!(
+            sm.status(&child).await.is_none(),
+            "agent crash must expire/release the child"
+        );
+        assert_eq!(
+            backend.forgotten(),
+            vec!["ctx-parent::workflow::wf::node::n1-g0".to_string()]
+        );
+
+        let turn = dispatcher
+            .checkout("wf", &node, "run-4", &WorkflowRunContext::default())
+            .await
+            .expect("checkout child after expire");
+        turn.cleanup
+            .on_exit(NodeTurnExit::Error(BridgeError::FrameError))
+            .await;
+        assert_eq!(
+            sm.status(&child).await.as_ref().map(|s| s.state),
+            Some("idle")
+        );
+        assert_eq!(
+            backend.forgotten(),
+            vec!["ctx-parent::workflow::wf::node::n1-g0".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_producer_run_guard_drop_releases_context_unless_disarmed() {
+        let runs = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let cancels = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let ctx = ContextId::parse("ctx-pre-producer").unwrap();
+        let task = TaskId::parse("task-pre-producer").unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        runs.lock().await.insert(ctx.clone(), token.clone());
+        cancels.lock().await.insert(task.clone(), token);
+
+        {
+            let _guard = PreProducerRunGuard {
+                workflow_runs: runs.clone(),
+                workflow_cancels: cancels.clone(),
+                ctx: ctx.clone(),
+                task: task.clone(),
+                armed: true,
+            };
+        }
+        for _ in 0..50 {
+            if !runs.lock().await.contains_key(&ctx) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !runs.lock().await.contains_key(&ctx),
+            "armed pre-producer guard must remove workflow_runs[context]"
+        );
+        assert!(
+            !cancels.lock().await.contains_key(&task),
+            "armed pre-producer guard must remove workflow_cancels[task]"
+        );
+
+        let keep_ctx = ContextId::parse("ctx-pre-producer-keep").unwrap();
+        let keep_task = TaskId::parse("task-pre-producer-keep").unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        runs.lock().await.insert(keep_ctx.clone(), token.clone());
+        cancels.lock().await.insert(keep_task.clone(), token);
+        {
+            let _guard = PreProducerRunGuard {
+                workflow_runs: runs.clone(),
+                workflow_cancels: cancels.clone(),
+                ctx: keep_ctx.clone(),
+                task: keep_task.clone(),
+                armed: false,
+            };
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            runs.lock().await.contains_key(&keep_ctx),
+            "disarmed pre-producer guard transfers cleanup to RunGuard"
+        );
+        assert!(
+            cancels.lock().await.contains_key(&keep_task),
+            "disarmed pre-producer guard transfers cancel cleanup to RunGuard"
+        );
     }
 
     fn warm_msg(text: &str) -> serde_json::Value {
@@ -6950,6 +7553,242 @@ mod tests {
             v["result"],
             json!({ "contextId": "c1", "cleared": true, "generation": 1 })
         );
+    }
+
+    #[tokio::test]
+    async fn session_release_workflow_parent_sweeps_children() {
+        let (srv, sm, _) = seed_test_server();
+        let parent = ContextId::parse("c-workflow").unwrap();
+        let child = ContextId::parse("c-workflow::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &parent,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-child").unwrap(),
+        )
+        .await
+        .expect("child checkout");
+        assert!(
+            sm.status(&child).await.is_some(),
+            "child handle should exist before release"
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionRelease",
+                json!({ "contextId": "c-workflow" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"],
+            json!({ "contextId": "c-workflow", "released": true })
+        );
+        assert!(
+            sm.status(&child).await.is_none(),
+            "release on the workflow parent must free child handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_release_rejects_during_active_workflow_run() {
+        let (srv, sm, _) = seed_test_server();
+        let ctx = ContextId::parse("c-active-release").unwrap();
+        let child = ContextId::parse("c-active-release::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &ctx,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-active-release").unwrap(),
+        )
+        .await
+        .expect("child checkout");
+        srv.workflow_runs
+            .lock()
+            .await
+            .insert(ctx.clone(), tokio_util::sync::CancellationToken::new());
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionRelease",
+                json!({ "contextId": "c-active-release" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(v["error"]["message"], "session busy");
+        assert!(
+            sm.status(&child).await.is_some(),
+            "busy release must not sweep an active workflow child"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_release_during_run_start_is_atomic() {
+        let (srv, sm, backend) = seed_test_server();
+        let parent = ContextId::parse("c-release-atomic").unwrap();
+        let child = ContextId::parse("c-release-atomic::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &parent,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-release-atomic").unwrap(),
+        )
+        .await
+        .expect("child checkout");
+        let release_gate = backend.gate_release_session();
+
+        let release = tokio::spawn({
+            let srv = srv.clone();
+            async move {
+                router(srv)
+                    .oneshot(post_request(
+                        "SessionRelease",
+                        json!({ "contextId": "c-release-atomic" }),
+                        "1.0",
+                    ))
+                    .await
+                    .unwrap()
+            }
+        });
+
+        backend.wait_release_started().await;
+        let workflow_runs_locked = srv.workflow_runs.try_lock().is_err();
+
+        release_gate.send(()).unwrap();
+        let resp = release.await.unwrap();
+        assert!(
+            workflow_runs_locked,
+            "SessionRelease must hold workflow_runs while sweeping children"
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"],
+            json!({ "contextId": "c-release-atomic", "released": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn session_clear_rejects_during_active_workflow_run() {
+        let (srv, sm, _) = seed_test_server();
+        let ctx = ContextId::parse("c-active-clear").unwrap();
+        let child = ContextId::parse("c-active-clear::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &ctx,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-active-clear").unwrap(),
+        )
+        .await
+        .expect("child checkout");
+        srv.workflow_runs
+            .lock()
+            .await
+            .insert(ctx.clone(), tokio_util::sync::CancellationToken::new());
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionClear",
+                json!({ "contextId": "c-active-clear" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(v["error"]["message"], "session busy");
+        assert!(
+            sm.status(&child).await.is_some(),
+            "busy clear must not sweep an active workflow child"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_clear_during_run_start_is_atomic() {
+        let (srv, sm, backend) = seed_test_server();
+        let parent = ContextId::parse("c-clear-atomic").unwrap();
+        let child = ContextId::parse("c-clear-atomic::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &parent,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-clear-atomic").unwrap(),
+        )
+        .await
+        .expect("child checkout");
+        let release_gate = backend.gate_release_session();
+
+        let clear = tokio::spawn({
+            let srv = srv.clone();
+            async move {
+                router(srv)
+                    .oneshot(post_request(
+                        "SessionClear",
+                        json!({ "contextId": "c-clear-atomic", "force": true }),
+                        "1.0",
+                    ))
+                    .await
+                    .unwrap()
+            }
+        });
+
+        backend.wait_release_started().await;
+        let workflow_runs_locked = srv.workflow_runs.try_lock().is_err();
+
+        release_gate.send(()).unwrap();
+        let resp = clear.await.unwrap();
+        assert!(
+            workflow_runs_locked,
+            "SessionClear must hold workflow_runs while sweeping children"
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"],
+            json!({ "contextId": "c-clear-atomic", "cleared": true, "generation": 0 })
+        );
+    }
+
+    #[tokio::test]
+    async fn session_clear_unknown_context_still_not_found() {
+        let (srv, _, _) = seed_test_server();
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionClear",
+                json!({ "contextId": "nope" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(v["error"]["message"], "session not found");
     }
 
     #[tokio::test]

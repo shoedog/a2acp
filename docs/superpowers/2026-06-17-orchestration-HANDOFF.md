@@ -53,8 +53,30 @@
   MAJORs → r3 merge-clean) caught 4 real lifecycle bugs the per-increment reviews missed** (EOF-without-Done →
   partial-seed; caller-future-drop strands `Compacting`; double-compact overwrites the only summary; reap
   TOCTOU defer-expires a claimed handle) — all fixed + regression-tested. See `[[slice-4-compact-shipped]]`.
-- **NEXT = Slice 5 — Serve-backed `run-workflow --serve --context`** [MVP CUT-LINE; closes S0–S5]. Then S6
-  journal → S7 observability+E9 → S8 MCP → S9 Turn Channel → tail. Follow the proven loop below.
+- **Slice 5 — Serve-backed `run-workflow --serve --context`: PLAN READY-TO-EXECUTE** [MVP CUT-LINE; closes
+  S0–S5] on branch `feat/slice-5-serve-cli`. **Design + plan DONE + APPROVED**: analysis (dual-lens CONVERGED) +
+  **spec v2 dual-spec-reviewed** (`specs/2026-06-19-slice-5-serve-cli.md`, FIX-1..11 BINDING) + **plan
+  iterated-to-clear over 13 codex-xhigh rounds → `ready-to-execute`** (`plans/2026-06-19-slice-5-serve-cli.md`, 9
+  tasks; binding fold sections **PFIX-1..11 + v2..v13**). Final verdict (round 13): NO findings; spec-faithfulness
+  + task-ordering + code-correctness ALL PASS. The 13 rounds caught (none visible to per-increment review): the
+  seam-as-parameter divergence, ~6 compile traps (`.as_str()`×N, `(String,bool)` not `?`, borrowed `matches!`,
+  ids no `Display`), child-map LIFECYCLE (only `release` removes `children[C]`; cancel/clear keep warm), the
+  T6↔T7 ORDERING blocker (gate lift FIX-8/10 must precede the guard → MOVED into T6; T7 = FIX-11 sweep only),
+  panic cleanup via `catch_unwind` (await inline, `RunGuard::Drop`=abort-only, frees children), warm cancel
+  classification (`Canceled`→`sm.cancel` only for the in-drain `:136` arm; pre-prompt + `STOP_REASON_CANCELLED`
+  → finish), idempotent `SessionManager::cancel`, always-sweep-children, unique CLI `taskId`, real SSE client.
+  **NEXT = implement T1–T9** via the proven loop (codex-HIGH impl → controller verify+commit → per-increment
+  review for logic tasks T2/T3/T5/T6 → gate → live-gate → whole-branch review → merge = **MVP COMPLETE**).
+  Settled design: `run-workflow --serve --context C <wf>` = a STREAMING serve client (POST
+  `SendStreamingMessage` skill=wf + contextId; `--context` requires `--serve`; `--config` serve-side); a
+  **dependency-inversion `WorkflowNodeDispatcher`** (cold INLINE in bridge-workflow byte-identical = back-compat;
+  warm impl in bridge-a2a-inbound) keyed by derived per-node child contexts `<C>::workflow::<wf>::node::<node>`;
+  **`SessionManager` owns child lifecycle atomically** (`checkout_child_turn` registers parent→child + threads
+  the exact op/gen so `finish_turn` doesn't no-op; `release/clear/cancel_with_children` sweep); a
+  **parent-context workflow-run guard** (concurrent → early `HandleBusy`; `SessionCancel C` cancels the
+  scheduler token then sweeps children, drain-on-cancel preserved); one `on_exit(NodeTurnExit)` cleanup
+  (finish/`sm.cancel`/expire-on-`AgentCrashed`); gate lift STREAMING-ONLY; `async-trait`→`[dependencies]`; warm
+  nodes don't record usage (deferred). Then S6 journal → S7 observability+E9 → S8 MCP → S9 Turn Channel → tail.
 - **NEW FOLLOW-UP (from the Slice-4 whole-branch review):** the caller-future-drop + reap-vs-claim TOCTOU
   patterns also exist (smaller window) in the SHIPPED `reset_session`/clear path. Slice 4 fixed compact's
   (wider) version + made `reap_idle` claim-safe for ALL claims; consider the same spawn-detach for

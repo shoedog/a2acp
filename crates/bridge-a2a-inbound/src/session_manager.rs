@@ -10,7 +10,7 @@ use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome, UsageSnapshot};
 use bridge_core::ports::{AgentBackend, AgentRegistry, Lease};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::session_fingerprint::SessionSpecFingerprint;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -28,6 +28,7 @@ pub enum SessionState {
     Expiring,
     Resetting,
     Compacting,
+    Cancelling,
 }
 
 fn is_claimed(s: SessionState) -> bool {
@@ -37,6 +38,7 @@ fn is_claimed(s: SessionState) -> bool {
             | SessionState::Expiring
             | SessionState::Resetting
             | SessionState::Compacting
+            | SessionState::Cancelling
     )
 }
 
@@ -114,6 +116,7 @@ impl SessionStatusInfo {
 pub struct SessionManager {
     registry: Arc<dyn AgentRegistry>,
     by_context: Mutex<HashMap<ContextId, WarmHandle>>,
+    children: Mutex<HashMap<ContextId, HashSet<ContextId>>>,
     idle_ttl: Duration,
     warn_fraction: Option<f64>,
     compact_summarize_timeout: Duration,
@@ -134,6 +137,7 @@ impl SessionManager {
         Self {
             registry,
             by_context: Mutex::new(HashMap::new()),
+            children: Mutex::new(HashMap::new()),
             idle_ttl,
             warn_fraction: None,
             compact_summarize_timeout: Duration::from_secs(120),
@@ -162,6 +166,20 @@ impl SessionManager {
             .and_then(|h| h.pending_seed.clone())
     }
 
+    #[cfg(test)]
+    async fn child_registered(&self, parent: &ContextId, child: &ContextId) -> bool {
+        self.children
+            .lock()
+            .await
+            .get(parent)
+            .is_some_and(|children| children.contains(child))
+    }
+
+    #[cfg(test)]
+    async fn child_parent_registered(&self, parent: &ContextId) -> bool {
+        self.children.lock().await.contains_key(parent)
+    }
+
     fn eval_warn(&self, u: &UsageSnapshot) -> Option<UsageWarning> {
         let thr = self.warn_fraction?;
         match (u.used, u.size) {
@@ -185,6 +203,27 @@ impl SessionManager {
         }
     }
 
+    async fn prune_child_registration(&self, ctx: &ContextId) {
+        let mut children = self.children.lock().await;
+        for set in children.values_mut() {
+            set.retain(|c| c != ctx);
+        }
+        children.retain(|_, set| !set.is_empty());
+    }
+
+    fn prune_child_registration_locked(
+        children: &mut HashMap<ContextId, HashSet<ContextId>>,
+        expired: &[ContextId],
+    ) {
+        if expired.is_empty() {
+            return;
+        }
+        for set in children.values_mut() {
+            set.retain(|c| !expired.contains(c));
+        }
+        children.retain(|_, set| !set.is_empty());
+    }
+
     /// Start a warm turn: mint (fresh ctx) or resume (known ctx). Resume requires a matching
     /// fingerprint (else ConfigMismatch), a non-retired lease (else SessionExpired), and an Idle
     /// handle (else HandleBusy). Transitions to Running. Resolves the agent exactly once.
@@ -196,16 +235,36 @@ impl SessionManager {
         cwd: Option<SessionCwd>,
         op: OperationId,
     ) -> Result<WarmTurn, BridgeError> {
+        let (res, removed) = self
+            .checkout_turn_inner(ctx, agent, overrides, cwd, op)
+            .await;
+        for ctx in &removed {
+            self.prune_child_registration(ctx).await;
+        }
+        res
+    }
+
+    async fn checkout_turn_inner(
+        &self,
+        ctx: &ContextId,
+        agent: AgentId,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        op: OperationId,
+    ) -> (Result<WarmTurn, BridgeError>, Vec<ContextId>) {
         let mut tab = self.by_context.lock().await;
         if let Some(h) = tab.get_mut(ctx) {
             if h.lease.is_retired() {
-                return Err(BridgeError::SessionExpired);
+                return (Err(BridgeError::SessionExpired), Vec::new());
             }
             if h.state != SessionState::Idle {
                 // Running / Reconciling / Expiring all mean the handle is busy.
-                return Err(BridgeError::HandleBusy);
+                return (Err(BridgeError::HandleBusy), Vec::new());
             }
-            let resolved = self.registry.resolve(&agent).await?;
+            let resolved = match self.registry.resolve(&agent).await {
+                Ok(resolved) => resolved,
+                Err(e) => return (Err(e), Vec::new()),
+            };
             let eff = effective_config(&resolved.entry, overrides.as_ref());
             let fp = SessionSpecFingerprint {
                 agent: agent.clone(),
@@ -219,29 +278,47 @@ impl SessionManager {
                 h.op = Some(op.clone());
                 h.last_used = (self.now)();
                 let seed = h.pending_seed.take();
-                return Ok(WarmTurn {
-                    backend: h.backend.clone(),
-                    session: h.backend_session.clone(),
-                    usage_warning,
-                    generation: h.generation,
-                    op,
-                    seed,
-                });
+                return (
+                    Ok(WarmTurn {
+                        backend: h.backend.clone(),
+                        session: h.backend_session.clone(),
+                        usage_warning,
+                        generation: h.generation,
+                        op,
+                        seed,
+                    }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"agent") {
-                return Err(BridgeError::ConfigMismatch { field: "agent" });
+                return (
+                    Err(BridgeError::ConfigMismatch { field: "agent" }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"cwd") {
-                return Err(BridgeError::ConfigMismatch { field: "cwd" });
+                return (
+                    Err(BridgeError::ConfigMismatch { field: "cwd" }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"mode") {
-                return Err(BridgeError::ConfigReseedRequired { field: "mode" });
+                return (
+                    Err(BridgeError::ConfigReseedRequired { field: "mode" }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"model") && fp.config.model.is_none() {
-                return Err(BridgeError::ConfigReseedRequired { field: "model" });
+                return (
+                    Err(BridgeError::ConfigReseedRequired { field: "model" }),
+                    Vec::new(),
+                );
             }
             if d.contains(&"effort") && fp.config.effort.is_none() {
-                return Err(BridgeError::ConfigReseedRequired { field: "effort" });
+                return (
+                    Err(BridgeError::ConfigReseedRequired { field: "effort" }),
+                    Vec::new(),
+                );
             }
             let reseed_field = if d.contains(&"model") {
                 "model"
@@ -276,7 +353,7 @@ impl SessionManager {
                 Some(h) if h.id == claimed_id && h.state == SessionState::Reconciling
             );
             if !still_ours {
-                return Err(BridgeError::SessionExpired);
+                return (Err(BridgeError::SessionExpired), Vec::new());
             }
             let cancelled_or_released = tab
                 .get(ctx)
@@ -291,14 +368,17 @@ impl SessionManager {
                 h.op = Some(op.clone());
                 h.last_used = (self.now)();
                 let seed = h.pending_seed.take();
-                return Ok(WarmTurn {
-                    backend: h.backend.clone(),
-                    session: h.backend_session.clone(),
-                    usage_warning,
-                    generation: h.generation,
-                    op,
-                    seed,
-                });
+                return (
+                    Ok(WarmTurn {
+                        backend: h.backend.clone(),
+                        session: h.backend_session.clone(),
+                        usage_warning,
+                        generation: h.generation,
+                        op,
+                        seed,
+                    }),
+                    Vec::new(),
+                );
             }
             // Non-clean (failed reconcile OR cancel/release arrived mid-window): EXPIRE via an `Expiring`
             // tombstone held across release_session().await so a concurrent checkout (HandleBusy on Expiring)
@@ -306,20 +386,28 @@ impl SessionManager {
             tab.get_mut(ctx).expect("still_ours").state = SessionState::Expiring;
             drop(tab);
             backend.release_session(&backend_session).await;
-            let mut tab = self.by_context.lock().await;
-            if let Some(h) = tab.remove(ctx) {
-                drop(h.lease);
+            {
+                let mut tab = self.by_context.lock().await;
+                if let Some(h) = tab.remove(ctx) {
+                    drop(h.lease);
+                }
             }
-            return if cancelled_or_released {
-                Err(BridgeError::SessionExpired)
-            } else {
-                Err(BridgeError::ConfigReseedRequired {
-                    field: reseed_field,
-                })
-            };
+            return (
+                if cancelled_or_released {
+                    Err(BridgeError::SessionExpired)
+                } else {
+                    Err(BridgeError::ConfigReseedRequired {
+                        field: reseed_field,
+                    })
+                },
+                vec![ctx.clone()],
+            );
         }
 
-        let resolved = self.registry.resolve(&agent).await?;
+        let resolved = match self.registry.resolve(&agent).await {
+            Ok(resolved) => resolved,
+            Err(e) => return (Err(e), Vec::new()),
+        };
         let eff = effective_config(&resolved.entry, overrides.as_ref());
         let fp = SessionSpecFingerprint {
             agent: agent.clone(),
@@ -327,12 +415,22 @@ impl SessionManager {
             cwd: cwd.as_ref().map(|c| c.as_str().to_string()),
         };
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let backend_session = SessionId::parse(format!("ctx-{}-g0", ctx.as_str()))
-            .map_err(|_| BridgeError::InvalidRequest { field: "contextId" })?;
-        resolved
+        let backend_session = match SessionId::parse(format!("ctx-{}-g0", ctx.as_str())) {
+            Ok(backend_session) => backend_session,
+            Err(_) => {
+                return (
+                    Err(BridgeError::InvalidRequest { field: "contextId" }),
+                    Vec::new(),
+                )
+            }
+        };
+        if let Err(e) = resolved
             .backend
             .configure_session(&backend_session, &SessionSpec { config: eff, cwd })
-            .await?;
+            .await
+        {
+            return (Err(e), Vec::new());
+        }
         let caps = resolved.backend.capabilities();
         let turn = WarmTurn {
             backend: resolved.backend.clone(),
@@ -361,7 +459,37 @@ impl SessionManager {
                 last_used: (self.now)(),
             },
         );
+        (Ok(turn), Vec::new())
+    }
+
+    pub async fn checkout_child_turn(
+        &self,
+        parent: &ContextId,
+        child: &ContextId,
+        agent: AgentId,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        op: OperationId,
+    ) -> Result<WarmTurn, BridgeError> {
+        // PFIX-4 (FIX-2 atomicity): hold `children` ACROSS checkout_turn + insert. A concurrent
+        // `*_with_children` sweep (Task 4) takes `children` FIRST, so it WAITS for an in-progress child
+        // checkout instead of missing it — closes the register-after-release leak window. Lock order is
+        // children -> by_context (checkout_turn locks by_context internally); the sweeps use the same order.
+        let mut children = self.children.lock().await;
+        let (turn, removed) = self
+            .checkout_turn_inner(child, agent, overrides, cwd, op)
+            .await;
+        Self::prune_child_registration_locked(&mut children, &removed);
+        let turn = turn?;
+        children
+            .entry(parent.clone())
+            .or_default()
+            .insert(child.clone());
         Ok(turn)
+    }
+
+    pub async fn expire_turn(&self, ctx: &ContextId) {
+        self.release(ctx).await;
     }
 
     /// Mark the current turn finished -> Idle (keep warm). FIX-3: no-op unless this is the SAME generation
@@ -388,6 +516,7 @@ impl SessionManager {
                 SessionState::Expiring => "expiring",
                 SessionState::Resetting => "resetting",
                 SessionState::Compacting => "compacting",
+                SessionState::Cancelling => "cancelling",
             },
             agent: h.agent.as_str().to_string(),
             generation: h.generation.get(),
@@ -419,6 +548,11 @@ impl SessionManager {
     }
 
     pub async fn release(&self, ctx: &ContextId) {
+        self.release_inner(ctx).await;
+        self.prune_child_registration(ctx).await;
+    }
+
+    async fn release_inner(&self, ctx: &ContextId) {
         let h = {
             let mut tab = self.by_context.lock().await;
             if let Some(h) = tab.get_mut(ctx) {
@@ -437,28 +571,177 @@ impl SessionManager {
         }
     }
 
+    pub async fn release_with_children(&self, ctx: &ContextId) {
+        let mut children = self.children.lock().await;
+        let snapshot = children.get(ctx).cloned().unwrap_or_default();
+
+        self.release_inner(ctx).await;
+        for child in &snapshot {
+            self.release_inner(child).await;
+        }
+        children.remove(ctx);
+    }
+
     /// Cancel an in-flight turn but keep the session warm (-> Idle).
     pub async fn cancel(&self, ctx: &ContextId) -> Result<(), BridgeError> {
-        let (backend, session) = {
+        let (res, expired) = self.cancel_inner(ctx).await;
+        if expired {
+            self.prune_child_registration(ctx).await;
+        }
+        res
+    }
+
+    async fn cancel_inner(&self, ctx: &ContextId) -> (Result<(), BridgeError>, bool) {
+        let (backend, session, claimed_id) = {
             let mut tab = self.by_context.lock().await;
             let Some(h) = tab.get_mut(ctx) else {
-                return Err(BridgeError::SessionNotFound);
+                return (Err(BridgeError::SessionNotFound), false);
             };
             // A reconcile owns the handle: flag it to expire on resolve rather than resetting to Idle
             // (which would let a third checkout re-claim it under the in-flight reconcile — the ABA bug).
+            if h.state == SessionState::Cancelling {
+                return (Ok(()), false);
+            }
             if is_claimed(h.state) {
                 h.expire_after_reconcile = true;
-                return Ok(());
+                return (Ok(()), false);
             }
             let was_running = h.state == SessionState::Running;
-            h.state = SessionState::Idle;
             h.op = None;
-            if was_running {
-                h.last_used = (self.now)();
+            if !was_running {
+                h.state = SessionState::Idle;
+                return (Ok(()), false);
             }
-            (h.backend.clone(), h.backend_session.clone())
+            // was_running is necessarily true here (the !was_running case returned above). Claim the
+            // handle across backend.cancel so a failed teardown cannot leave it reusable.
+            h.state = SessionState::Cancelling;
+            h.last_used = (self.now)();
+            (h.backend.clone(), h.backend_session.clone(), h.id.clone())
         };
-        backend.cancel(&session).await
+        let res = backend.cancel(&session).await;
+
+        let mut expired = None;
+        let mut gone = false;
+        {
+            let mut tab = self.by_context.lock().await;
+            let still_ours = matches!(
+                tab.get(ctx),
+                Some(h) if h.id == claimed_id && h.state == SessionState::Cancelling
+            );
+            if still_ours {
+                let deferred = tab
+                    .get(ctx)
+                    .map(|h| h.expire_after_reconcile)
+                    .unwrap_or(true);
+                if res.is_ok() && !deferred {
+                    tab.get_mut(ctx).expect("still_ours").state = SessionState::Idle;
+                } else if let Some(h) = tab.remove(ctx) {
+                    expired = Some(h);
+                }
+            } else {
+                gone = !tab.contains_key(ctx);
+            }
+        }
+        let expired_handle = expired.is_some();
+        if let Some(h) = expired {
+            backend.release_session(&session).await;
+            drop(h.lease);
+        }
+
+        let res = match res {
+            Ok(()) => Ok(()),
+            Err(e) if gone => Err(e),
+            Err(e) if expired_handle => Err(e),
+            Err(_) => Ok(()),
+        };
+        (res, expired_handle)
+    }
+
+    pub async fn cancel_with_children(&self, ctx: &ContextId) -> Result<(), BridgeError> {
+        let mut children = self.children.lock().await;
+        let snapshot = children.get(ctx).cloned().unwrap_or_default();
+        let mut expired = Vec::new();
+
+        let parent_found = match self.cancel_inner(ctx).await {
+            (Ok(()), parent_expired) => {
+                if parent_expired {
+                    expired.push(ctx.clone());
+                }
+                true
+            }
+            (Err(BridgeError::SessionNotFound), _) => false,
+            (Err(e), parent_expired) => {
+                if parent_expired {
+                    expired.push(ctx.clone());
+                    Self::prune_child_registration_locked(&mut children, &expired);
+                }
+                return Err(e);
+            }
+        };
+        for child in &snapshot {
+            match self.cancel_inner(child).await {
+                (Ok(()), child_expired) => {
+                    if child_expired {
+                        expired.push(child.clone());
+                    }
+                }
+                (Err(BridgeError::SessionNotFound), _) => {}
+                (Err(e), child_expired) => {
+                    if child_expired {
+                        expired.push(child.clone());
+                    }
+                    Self::prune_child_registration_locked(&mut children, &expired);
+                    return Err(e);
+                }
+            }
+        }
+        Self::prune_child_registration_locked(&mut children, &expired);
+
+        if parent_found || !snapshot.is_empty() {
+            Ok(())
+        } else {
+            Err(BridgeError::SessionNotFound)
+        }
+    }
+
+    pub async fn clear_with_children(
+        &self,
+        ctx: &ContextId,
+        force: bool,
+    ) -> Result<ResetOutcome, BridgeError> {
+        let mut children = self.children.lock().await;
+        let snapshot = children.get(ctx).cloned().unwrap_or_default();
+        let mut expired = Vec::new();
+
+        let (p, parent_expired) = self.reset_session_inner(ctx, ResetOpts { force }).await;
+        expired.extend(parent_expired);
+        let p = match p {
+            Ok(p) => p,
+            Err(e) => {
+                Self::prune_child_registration_locked(&mut children, &expired);
+                return Err(e);
+            }
+        };
+        for child in &snapshot {
+            let (res, child_expired) = self.reset_session_inner(child, ResetOpts { force }).await;
+            expired.extend(child_expired);
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    Self::prune_child_registration_locked(&mut children, &expired);
+                    return Err(e);
+                }
+            }
+        }
+        Self::prune_child_registration_locked(&mut children, &expired);
+
+        Ok(match p {
+            ResetOutcome::Cleared { generation } => ResetOutcome::Cleared { generation },
+            ResetOutcome::NotFound if !snapshot.is_empty() => {
+                ResetOutcome::Cleared { generation: 0 }
+            }
+            ResetOutcome::NotFound => ResetOutcome::NotFound,
+        })
     }
 
     pub async fn reset_session(
@@ -466,29 +749,51 @@ impl SessionManager {
         ctx: &ContextId,
         opts: ResetOpts,
     ) -> Result<ResetOutcome, BridgeError> {
+        let (res, expired) = self.reset_session_inner(ctx, opts).await;
+        for ctx in &expired {
+            self.prune_child_registration(ctx).await;
+        }
+        res
+    }
+
+    async fn reset_session_inner(
+        &self,
+        ctx: &ContextId,
+        opts: ResetOpts,
+    ) -> (Result<ResetOutcome, BridgeError>, Vec<ContextId>) {
         // (1)+(2)+(3) claim under ONE lock hold (FIX-2: never bounce through Idle, never call self.cancel).
         let (backend, old_id, claimed_id, new_gen, new_id, spec) = {
             let mut tab = self.by_context.lock().await;
             let Some(h) = tab.get_mut(ctx) else {
-                return Ok(ResetOutcome::NotFound);
+                return (Ok(ResetOutcome::NotFound), Vec::new());
             };
             match h.state {
                 SessionState::Idle => {}
                 SessionState::Running if opts.force => {}
-                _ => return Err(BridgeError::HandleBusy),
+                _ => return (Err(BridgeError::HandleBusy), Vec::new()),
             }
             let backend = h.backend.clone();
             let old_id = h.backend_session.clone();
             let claimed_id = h.id.clone();
             let new_gen = SessionGeneration::new(h.generation.get() + 1);
             let new_id = SessionId::parse(format!("ctx-{}-g{}", ctx.as_str(), new_gen.get()))
-                .map_err(|_| BridgeError::InvalidRequest { field: "contextId" })?;
+                .map_err(|_| BridgeError::InvalidRequest { field: "contextId" });
+            let new_id = match new_id {
+                Ok(new_id) => new_id,
+                Err(e) => return (Err(e), Vec::new()),
+            };
             let cwd = match h.fingerprint.cwd.as_deref() {
-                Some(s) => Some(
-                    SessionCwd::parse(s).map_err(|_| BridgeError::ConfigInvalid {
-                        reason: "session cwd".into(),
-                    })?,
-                ),
+                Some(s) => match SessionCwd::parse(s) {
+                    Ok(cwd) => Some(cwd),
+                    Err(_) => {
+                        return (
+                            Err(BridgeError::ConfigInvalid {
+                                reason: "session cwd".into(),
+                            }),
+                            Vec::new(),
+                        )
+                    }
+                },
                 None => None,
             };
             let spec = SessionSpec {
@@ -517,7 +822,7 @@ impl SessionManager {
             if new_stashed {
                 backend.release_session(&new_id).await;
             }
-            return Err(BridgeError::SessionExpired);
+            return (Err(BridgeError::SessionExpired), Vec::new());
         }
         let deferred = tab
             .get(ctx)
@@ -528,14 +833,22 @@ impl SessionManager {
             if new_stashed {
                 backend.release_session(&new_id).await;
             }
-            let mut tab = self.by_context.lock().await;
-            if let Some(h) = tab.remove(ctx) {
-                drop(h.lease);
-            }
-            return match cfg {
-                Err(e) => Err(e),
-                Ok(()) => Err(BridgeError::SessionExpired),
+            let expired = {
+                let mut tab = self.by_context.lock().await;
+                if let Some(h) = tab.remove(ctx) {
+                    drop(h.lease);
+                    vec![ctx.clone()]
+                } else {
+                    Vec::new()
+                }
             };
+            return (
+                match cfg {
+                    Err(e) => Err(e),
+                    Ok(()) => Err(BridgeError::SessionExpired),
+                },
+                expired,
+            );
         }
         let h = tab.get_mut(ctx).expect("still_ours");
         h.backend_session = new_id;
@@ -545,9 +858,12 @@ impl SessionManager {
         h.pending_seed = None;
         h.state = SessionState::Idle;
         h.last_used = (self.now)();
-        Ok(ResetOutcome::Cleared {
-            generation: new_gen.get(),
-        })
+        (
+            Ok(ResetOutcome::Cleared {
+                generation: new_gen.get(),
+            }),
+            Vec::new(),
+        )
     }
 
     /// Compact: summarize the gen-N context, reset to N+1, and seed the summary for the next turn.
@@ -654,6 +970,8 @@ impl SessionManager {
             if let Some(h) = tab.remove(ctx) {
                 drop(h.lease);
             }
+            drop(tab);
+            self.prune_child_registration(ctx).await;
             return match cfg {
                 Err(e) => Err(e), // FIX-3: configure error, NOT SessionExpired
                 Ok(()) => Err(BridgeError::SessionExpired),
@@ -693,10 +1011,13 @@ impl SessionManager {
             tab.get_mut(ctx).expect("still_ours").state = SessionState::Expiring;
         }
         backend.release_session(old_id).await;
-        let mut tab = self.by_context.lock().await;
-        if let Some(h) = tab.remove(ctx) {
-            drop(h.lease);
+        {
+            let mut tab = self.by_context.lock().await;
+            if let Some(h) = tab.remove(ctx) {
+                drop(h.lease);
+            }
         }
+        self.prune_child_registration(ctx).await;
     }
 
     /// Reap only idle warm sessions past the TTL (never an active turn).
@@ -712,27 +1033,41 @@ impl SessionManager {
                 .map(|(c, _)| c.clone())
                 .collect()
         };
-        for c in expired {
-            // Re-validate under the lock and REMOVE atomically: only reap a STILL-Idle, STILL-expired handle.
-            // A claim that landed after the snapshot (compact/reset/reconcile flips the state off Idle) OWNS
-            // the lifecycle — the reaper must SKIP it, never route through `release` (which would set the
-            // deferred-expire flag and make the claim's commit tail kill the handle). [whole-branch review]
-            let h = {
-                let mut tab = self.by_context.lock().await;
-                match tab.get(&c) {
+        let mut handles = Vec::new();
+        {
+            let mut children = self.children.lock().await;
+            let mut tab = self.by_context.lock().await;
+            let mut reaped = HashSet::new();
+            for c in expired {
+                // Re-validate under the lock and REMOVE atomically: only reap a STILL-Idle,
+                // STILL-expired handle. A claim that landed after the snapshot
+                // (compact/reset/reconcile flips the state off Idle) OWNS the lifecycle — the
+                // reaper must SKIP it, never route through `release` (which would set the
+                // deferred-expire flag and make the claim's commit tail kill the handle).
+                // [whole-branch review]
+                let should_reap = matches!(
+                    tab.get(&c),
                     Some(h)
                         if h.state == SessionState::Idle
-                            && now.duration_since(h.last_used) >= self.idle_ttl =>
-                    {
-                        tab.remove(&c)
+                            && now.duration_since(h.last_used) >= self.idle_ttl
+                );
+                if should_reap {
+                    if let Some(h) = tab.remove(&c) {
+                        reaped.insert(c);
+                        handles.push(h);
                     }
-                    _ => None,
                 }
-            };
-            if let Some(h) = h {
-                h.backend.release_session(&h.backend_session).await;
-                drop(h.lease);
             }
+            if !reaped.is_empty() {
+                for set in children.values_mut() {
+                    set.retain(|child| !reaped.contains(child));
+                }
+                children.retain(|_, set| !set.is_empty());
+            }
+        }
+        for h in handles {
+            h.backend.release_session(&h.backend_session).await;
+            drop(h.lease);
         }
     }
 }
@@ -768,6 +1103,10 @@ mod tests {
         cancels: StdMutex<Vec<String>>,
         configured: StdMutex<Vec<String>>,
         reconciled: StdMutex<Vec<(String, SessionSpec)>>,
+        cancel_result: StdMutex<Result<(), BridgeError>>,
+        cancel_gate: StdMutex<Option<oneshot::Receiver<()>>>,
+        cancel_started: Notify,
+        cancel_started_count: AtomicUsize,
         configure_result: StdMutex<Result<(), BridgeError>>,
         configure_gate: StdMutex<Option<oneshot::Receiver<()>>>,
         configure_started: Notify,
@@ -787,6 +1126,10 @@ mod tests {
                 cancels: StdMutex::new(Vec::new()),
                 configured: StdMutex::new(Vec::new()),
                 reconciled: StdMutex::new(Vec::new()),
+                cancel_result: StdMutex::new(Ok(())),
+                cancel_gate: StdMutex::new(None),
+                cancel_started: Notify::new(),
+                cancel_started_count: AtomicUsize::new(0),
                 configure_result: StdMutex::new(Ok(())),
                 configure_gate: StdMutex::new(None),
                 configure_started: Notify::new(),
@@ -820,6 +1163,22 @@ mod tests {
 
         fn reconciled(&self) -> Vec<(String, SessionSpec)> {
             self.reconciled.lock().unwrap().clone()
+        }
+
+        fn set_cancel_result(&self, result: Result<(), BridgeError>) {
+            *self.cancel_result.lock().unwrap() = result;
+        }
+
+        fn block_next_cancel(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.cancel_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        async fn wait_for_cancel(&self) {
+            while self.cancel_started_count.load(Ordering::SeqCst) == 0 {
+                self.cancel_started.notified().await;
+            }
         }
 
         fn set_configure_result(&self, result: Result<(), BridgeError>) {
@@ -874,7 +1233,13 @@ mod tests {
 
         async fn cancel(&self, s: &SessionId) -> Result<(), BridgeError> {
             self.cancels.lock().unwrap().push(s.as_str().to_string());
-            Ok(())
+            let gate = self.cancel_gate.lock().unwrap().take();
+            self.cancel_started_count.fetch_add(1, Ordering::SeqCst);
+            self.cancel_started.notify_waiters();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            self.cancel_result.lock().unwrap().clone()
         }
 
         async fn configure_session(
@@ -1071,6 +1436,7 @@ mod tests {
     #[test]
     fn is_claimed_includes_compacting() {
         assert!(super::is_claimed(super::SessionState::Compacting));
+        assert!(super::is_claimed(super::SessionState::Cancelling));
     }
 
     #[derive(Clone)]
@@ -1303,6 +1669,32 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, BridgeError::ConfigInvalid { .. })); // FIX-3: configure error, NOT SessionExpired
         assert!(m.status(&c).await.is_none()); // handle EXPIRED (removed)
+    }
+
+    #[tokio::test]
+    async fn compact_configure_failure_prunes_child_registration() {
+        let (m, fake, _r) = manager();
+        let parent = ctx("compact-configure-parent");
+        let child = ctx("compact-configure-child");
+        let turn = m
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("t1"))
+            .await
+            .unwrap();
+        m.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(m.child_registered(&parent, &child).await);
+
+        fake.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "test".into(),
+        }));
+        let err = m
+            .compact_session(&child, |_b, _s| async { Ok("good summary".to_string()) })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BridgeError::ConfigInvalid { .. }));
+        assert!(m.status(&child).await.is_none());
+        assert!(!m.child_registered(&parent, &child).await);
+        assert!(!m.child_parent_registered(&parent).await);
     }
 
     #[tokio::test]
@@ -1691,6 +2083,608 @@ mod tests {
 
         assert_eq!(first.session.as_str(), "ctx-abc-g0");
         assert_eq!(first.session, second.session);
+    }
+
+    #[tokio::test]
+    async fn checkout_child_turn_registers_and_reuses() {
+        let (manager, _backend, _registry) = manager();
+        let parent = ctx("parent");
+        let child = ctx("child");
+        let first_op = op("op-1");
+
+        let first = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, first_op.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.session.as_str(), "ctx-child-g0");
+        assert_eq!(first.generation, SessionGeneration::new(0));
+        assert_eq!(first.op, first_op);
+        assert!(manager.child_registered(&parent, &child).await);
+
+        manager
+            .finish_turn(&child, first.generation, &first.op)
+            .await;
+        let second_op = op("op-2");
+        let second = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, second_op.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(second.session, first.session);
+        assert_eq!(second.generation, SessionGeneration::new(0));
+        assert_eq!(second.op, second_op);
+        assert!(manager.child_registered(&parent, &child).await);
+    }
+
+    #[tokio::test]
+    async fn expire_turn_prunes_child_registration() {
+        let (manager, _backend, _registry) = manager();
+        let parent = ctx("expire-parent");
+        let child = ctx("expire-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        assert!(manager.child_registered(&parent, &child).await);
+
+        manager.expire_turn(&child).await;
+
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+        assert_eq!(
+            manager.cancel_with_children(&parent).await.err(),
+            Some(BridgeError::SessionNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn release_standalone_prunes_child_registration() {
+        let (manager, _backend, _registry) = manager();
+        let parent = ctx("release-parent");
+        let child = ctx("release-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        assert!(manager.child_registered(&parent, &child).await);
+
+        manager.release(&child).await;
+
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn reconcile_expire_prunes_child_registration() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("reconcile-expire-parent");
+        let child = ctx("reconcile-expire-child");
+
+        let turn = manager
+            .checkout_child_turn(
+                &parent,
+                &child,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                None,
+                op("op-child-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+
+        backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
+        let err = manager
+            .checkout_turn(
+                &child,
+                agent(),
+                Some(model_override("gpt-5.4")),
+                None,
+                op("op-child-2"),
+            )
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::ConfigReseedRequired { field: "model" });
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn checkout_child_turn_reconcile_expiry_does_not_deadlock() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("child-reconcile-expire-parent");
+        let child = ctx("child-reconcile-expire-child");
+
+        let turn = manager
+            .checkout_child_turn(
+                &parent,
+                &child,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                None,
+                op("op-child-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+
+        backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
+        let err = tokio::time::timeout(
+            Duration::from_millis(200),
+            manager.checkout_child_turn(
+                &parent,
+                &child,
+                agent(),
+                Some(model_override("gpt-5.4")),
+                None,
+                op("op-child-2"),
+            ),
+        )
+        .await
+        .expect("checkout_child_turn must not deadlock")
+        .err()
+        .unwrap();
+
+        assert_eq!(err, BridgeError::ConfigReseedRequired { field: "model" });
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn reset_reconcile_expire_prunes_child_registration() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("reset-expire-parent");
+        let child = ctx("reset-expire-child");
+
+        let turn = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+
+        backend.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "boom".into(),
+        }));
+        let err = manager
+            .reset_session(&child, ResetOpts { force: false })
+            .await
+            .err()
+            .unwrap();
+
+        assert!(matches!(err, BridgeError::ConfigInvalid { .. }));
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn checkout_child_turn_failure_does_not_register() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("parent-fail");
+        let missing_child = ctx("missing-child");
+
+        let err = manager
+            .checkout_child_turn(
+                &parent,
+                &missing_child,
+                AgentId::parse("missing").unwrap(),
+                None,
+                None,
+                op("op-1"),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, BridgeError::UnknownAgent { .. }));
+        assert!(!manager.child_registered(&parent, &missing_child).await);
+
+        backend.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "boom".into(),
+        }));
+        let configure_child = ctx("configure-child");
+        let err = manager
+            .checkout_child_turn(&parent, &configure_child, agent(), None, None, op("op-2"))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, BridgeError::ConfigInvalid { .. }));
+        assert!(!manager.child_registered(&parent, &configure_child).await);
+    }
+
+    #[tokio::test]
+    async fn release_with_children_sweeps() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("sweep-parent");
+        let child_a = ctx("sweep-child-a");
+        let child_b = ctx("sweep-child-b");
+
+        manager
+            .checkout_turn(&parent, agent(), None, None, op("op-parent"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_a, agent(), None, None, op("op-child-a"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_b, agent(), None, None, op("op-child-b"))
+            .await
+            .unwrap();
+
+        manager.release_with_children(&parent).await;
+
+        assert!(manager.status(&parent).await.is_none());
+        assert!(manager.status(&child_a).await.is_none());
+        assert!(manager.status(&child_b).await.is_none());
+        assert!(!manager.child_registered(&parent, &child_a).await);
+        assert!(!manager.child_registered(&parent, &child_b).await);
+        let mut releases = backend.releases();
+        releases.sort();
+        assert_eq!(
+            releases,
+            vec![
+                "ctx-sweep-child-a-g0".to_string(),
+                "ctx-sweep-child-b-g0".to_string(),
+                "ctx-sweep-parent-g0".to_string(),
+            ]
+        );
+
+        manager.release_with_children(&parent).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_then_release_frees_children() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("cancel-release-parent");
+        let child_a = ctx("cancel-release-child-a");
+        let child_b = ctx("cancel-release-child-b");
+
+        manager
+            .checkout_turn(&parent, agent(), None, None, op("op-parent"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_a, agent(), None, None, op("op-child-a"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_b, agent(), None, None, op("op-child-b"))
+            .await
+            .unwrap();
+
+        manager.cancel_with_children(&parent).await.unwrap();
+
+        assert_eq!(manager.status(&parent).await.unwrap().state, "idle");
+        assert_eq!(manager.status(&child_a).await.unwrap().state, "idle");
+        assert_eq!(manager.status(&child_b).await.unwrap().state, "idle");
+        assert!(manager.child_registered(&parent, &child_a).await);
+        assert!(manager.child_registered(&parent, &child_b).await);
+
+        manager.release_with_children(&parent).await;
+
+        assert!(manager.status(&parent).await.is_none());
+        assert!(manager.status(&child_a).await.is_none());
+        assert!(manager.status(&child_b).await.is_none());
+        let mut releases = backend.releases();
+        releases.sort();
+        assert_eq!(
+            releases,
+            vec![
+                "ctx-cancel-release-child-a-g0".to_string(),
+                "ctx-cancel-release-child-b-g0".to_string(),
+                "ctx-cancel-release-parent-g0".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_then_release_frees_children() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("clear-release-parent");
+        let child_a = ctx("clear-release-child-a");
+        let child_b = ctx("clear-release-child-b");
+
+        manager
+            .checkout_turn(&parent, agent(), None, None, op("op-parent"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_a, agent(), None, None, op("op-child-a"))
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_b, agent(), None, None, op("op-child-b"))
+            .await
+            .unwrap();
+
+        let out = manager.clear_with_children(&parent, true).await.unwrap();
+
+        assert_eq!(out, ResetOutcome::Cleared { generation: 1 });
+        assert_eq!(manager.status(&parent).await.unwrap().state, "idle");
+        assert_eq!(manager.status(&child_a).await.unwrap().state, "idle");
+        assert_eq!(manager.status(&child_b).await.unwrap().state, "idle");
+        assert!(manager.child_registered(&parent, &child_a).await);
+        assert!(manager.child_registered(&parent, &child_b).await);
+
+        manager.release_with_children(&parent).await;
+
+        assert!(manager.status(&parent).await.is_none());
+        assert!(manager.status(&child_a).await.is_none());
+        assert!(manager.status(&child_b).await.is_none());
+        let mut releases = backend.releases();
+        releases.sort();
+        assert_eq!(
+            releases,
+            vec![
+                "ctx-clear-release-child-a-g0".to_string(),
+                "ctx-clear-release-child-a-g1".to_string(),
+                "ctx-clear-release-child-b-g0".to_string(),
+                "ctx-clear-release-child-b-g1".to_string(),
+                "ctx-clear-release-parent-g0".to_string(),
+                "ctx-clear-release-parent-g1".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_with_children_unknown_is_not_found() {
+        let (manager, _backend, _registry) = manager();
+        let out = manager
+            .clear_with_children(&ctx("clear-unknown"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(out, ResetOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn cancel_with_children_unknown_is_not_found() {
+        let (manager, _backend, _registry) = manager();
+        let err = manager
+            .cancel_with_children(&ctx("cancel-unknown"))
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::SessionNotFound);
+    }
+
+    #[tokio::test]
+    async fn clear_with_children_threads_force() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("clear-force-parent");
+        let child = ctx("clear-force-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+
+        let out = manager.clear_with_children(&parent, true).await.unwrap();
+
+        assert_eq!(out, ResetOutcome::Cleared { generation: 0 });
+        let status = manager.status(&child).await.unwrap();
+        assert_eq!(status.state, "idle");
+        assert_eq!(status.generation, 1);
+        assert_eq!(backend.cancels(), vec!["ctx-clear-force-child-g0"]);
+        assert!(backend
+            .releases()
+            .contains(&"ctx-clear-force-child-g0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn clear_with_children_running_child_without_force_is_busy() {
+        let (manager, _backend, _registry) = manager();
+        let parent = ctx("clear-busy-parent");
+        let child = ctx("clear-busy-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+
+        let err = manager
+            .clear_with_children(&parent, false)
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::HandleBusy);
+        assert_eq!(manager.status(&child).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn clear_with_children_reset_failure_does_not_deadlock() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("clear-fail-parent");
+        let child = ctx("clear-fail-child");
+
+        let turn = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+
+        backend.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "boom".into(),
+        }));
+        let out = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.clear_with_children(&parent, false),
+        )
+        .await
+        .expect("clear_with_children must not deadlock");
+
+        assert!(matches!(out, Err(BridgeError::ConfigInvalid { .. })));
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_idle_handle_skips_backend_cancel() {
+        let (manager, backend, _registry) = manager();
+        let c = ctx("cancel-idle");
+
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        manager.cancel(&c).await.unwrap();
+
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-idle-g0"]);
+        assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancel_during_cancelling_is_noop() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let parent = ctx("cancel-race-parent");
+        let child = ctx("cancel-race-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        assert!(manager.child_registered(&parent, &child).await);
+        let unblock = backend.block_next_cancel();
+
+        let first = {
+            let manager = manager.clone();
+            let child = child.clone();
+            tokio::spawn(async move { manager.cancel(&child).await })
+        };
+        backend.wait_for_cancel().await;
+        assert_eq!(manager.status(&child).await.unwrap().state, "cancelling");
+
+        manager.cancel(&child).await.unwrap();
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-race-child-g0"]);
+
+        unblock.send(()).unwrap();
+        first.await.unwrap().unwrap();
+
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-race-child-g0"]);
+        assert!(backend.releases().is_empty());
+        assert_eq!(manager.status(&child).await.unwrap().state, "idle");
+        assert!(manager.child_registered(&parent, &child).await);
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child-2"))
+            .await
+            .unwrap();
+        assert_eq!(backend.configured(), vec!["ctx-cancel-race-child-g0"]);
+        assert_eq!(manager.status(&child).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn cancel_backend_error_expires_handle() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("cancel-error-expire-parent");
+        let child = ctx("cancel-error-expire-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        assert!(manager.child_registered(&parent, &child).await);
+        backend.set_cancel_result(Err(BridgeError::AgentCrashed {
+            reason: "cancel failed".into(),
+        }));
+
+        let err = manager.cancel(&child).await.err().unwrap();
+
+        assert_eq!(
+            err,
+            BridgeError::AgentCrashed {
+                reason: "cancel failed".into()
+            }
+        );
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-error-expire-child-g0"]);
+        assert_eq!(backend.releases(), vec!["ctx-cancel-error-expire-child-g0"]);
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_success_keeps_warm() {
+        let (manager, backend, _registry) = manager();
+        let c = ctx("cancel-success-warm");
+
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+
+        manager.cancel(&c).await.unwrap();
+
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-success-warm-g0"]);
+        assert!(backend.releases().is_empty());
+        assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .await
+            .unwrap();
+        assert_eq!(manager.status(&c).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn cancel_with_children_propagates_real_child_error() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("cancel-error-parent");
+        let stale_child = ctx("cancel-error-stale-child");
+        let error_child = ctx("cancel-error-child");
+
+        manager
+            .checkout_child_turn(
+                &parent,
+                &stale_child,
+                agent(),
+                None,
+                None,
+                op("op-stale-child"),
+            )
+            .await
+            .unwrap();
+        manager.release(&stale_child).await;
+        manager
+            .checkout_child_turn(
+                &parent,
+                &error_child,
+                agent(),
+                None,
+                None,
+                op("op-error-child"),
+            )
+            .await
+            .unwrap();
+        backend.set_cancel_result(Err(BridgeError::AgentCrashed {
+            reason: "cancel failed".into(),
+        }));
+
+        let err = manager.cancel_with_children(&parent).await.err().unwrap();
+
+        assert_eq!(
+            err,
+            BridgeError::AgentCrashed {
+                reason: "cancel failed".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -2453,6 +3447,36 @@ mod tests {
 
         assert!(manager.status(&idle).await.is_none());
         assert_eq!(manager.status(&running).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn reap_idle_prunes_child_registration() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let clock = ManualClock::new();
+        let manager =
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.reader());
+        let parent = ctx("reap-child-parent");
+        let child = ctx("reap-child");
+
+        let turn = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+        assert!(manager.child_parent_registered(&parent).await);
+
+        clock.advance(Duration::from_secs(6));
+        manager.reap_idle().await;
+
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+        assert_eq!(
+            manager.cancel_with_children(&parent).await.err(),
+            Some(BridgeError::SessionNotFound)
+        );
     }
 
     #[tokio::test]
