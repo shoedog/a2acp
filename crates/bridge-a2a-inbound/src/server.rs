@@ -8540,30 +8540,151 @@ mod tests {
         result
     }
 
+    /// Parse an SSE body into the full ordered wire tuple the `task watch` client
+    /// observes: `(id-line value, data.seq, data.kind, data.phase)`.
+    async fn collect_sse_wire_tuples(resp: Response) -> Vec<(String, i64, String, String)> {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut result = Vec::new();
+        for block in body.split("\n\n") {
+            let mut id: Option<String> = None;
+            let mut seq: Option<i64> = None;
+            let mut kind: Option<String> = None;
+            let mut phase: Option<String> = None;
+            for line in block.lines() {
+                if let Some(id_str) = line.strip_prefix("id:") {
+                    id = Some(id_str.trim().to_string());
+                } else if let Some(data_str) = line.strip_prefix("data:") {
+                    let trimmed = data_str.trim();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        seq = v.get("seq").and_then(|seq| seq.as_i64());
+                        kind = v
+                            .get("kind")
+                            .and_then(|kind| kind.as_str())
+                            .map(ToString::to_string);
+                        phase = v
+                            .get("phase")
+                            .and_then(|phase| phase.as_str())
+                            .map(ToString::to_string);
+                    }
+                }
+            }
+            if let (Some(id), Some(seq), Some(kind), Some(phase)) = (id, seq, kind, phase) {
+                assert_eq!(id, seq.to_string(), "SSE id line must equal data.seq");
+                result.push((id, seq, kind, phase));
+            }
+        }
+        result
+    }
+
+    fn working_record(id: &str) -> bridge_core::task_store::TaskRecord {
+        let now = crate::workflow_sink::now_ms();
+        bridge_core::task_store::TaskRecord {
+            id: bridge_core::ids::TaskId::parse(id).unwrap(),
+            workflow: "code-review".to_string(),
+            status: bridge_core::task_store::TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: now,
+            updated_ms: now,
+            input: "test input".to_string(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        }
+    }
+
     /// Seed a `MemoryTaskStore` task record in the Working state.
     async fn seed_task_record(
         store: &std::sync::Arc<bridge_core::task_store::MemoryTaskStore>,
         task_id: &str,
     ) -> bridge_core::ids::TaskId {
         let id = bridge_core::ids::TaskId::parse(task_id).unwrap();
+        store.create(&working_record(task_id)).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn golden_two_node_run_wire_tuples() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = bridge_core::ids::TaskId::parse("task-golden").unwrap();
+        store.create(&working_record("task-golden")).await.unwrap();
+        let node_a = bridge_core::ids::NodeId::parse("a").unwrap();
+        let node_b = bridge_core::ids::NodeId::parse("b").unwrap();
         let now = crate::workflow_sink::now_ms();
-        store
-            .create(&bridge_core::task_store::TaskRecord {
-                id: id.clone(),
-                workflow: "code-review".to_string(),
-                status: bridge_core::task_store::TaskRecordStatus::Working,
-                result: None,
-                error: None,
-                created_ms: now,
-                updated_ms: now,
-                input: "test input".to_string(),
-                workflow_spec_json: None,
-                resume_attempts: 0,
-                session_cwd: None,
-            })
+
+        let s1 = store
+            .record_node_started(&task_id, &node_a, now)
             .await
             .unwrap();
-        id
+        let s2 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .await
+            .unwrap();
+        let s3 = store
+            .record_node_started(&task_id, &node_b, now)
+            .await
+            .unwrap();
+        let s4 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .await
+            .unwrap();
+        let s5 = store
+            .set_terminal_sequenced(
+                &task_id,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!((s1, s2, s3, s4, s5), (1, 2, 3, 4, 5));
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "task-golden" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let frames = collect_sse_wire_tuples(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (
+                    "2".to_string(),
+                    2,
+                    "node_finished".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    "4".to_string(),
+                    4,
+                    "node_finished".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    "4".to_string(),
+                    4,
+                    "snapshot_complete".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    "5".to_string(),
+                    5,
+                    "terminal".to_string(),
+                    "live".to_string(),
+                ),
+            ],
+            "task watch wire tuples must stay byte-identical: {frames:?}"
+        );
     }
 
     /// (8a) Terminal task with 2 checkpoints (seqs 1, 2) + terminal_seq 3, no cursor.
