@@ -276,7 +276,10 @@ pub fn fold_journal_to_snapshot(
                 starts.clear();
             }
             crate::orch::OrchEventKind::Progress { .. }
-            | crate::orch::OrchEventKind::Usage { .. } => {}
+            | crate::orch::OrchEventKind::Usage { .. }
+            | crate::orch::OrchEventKind::Plan { .. }
+            | crate::orch::OrchEventKind::ToolCall { .. }
+            | crate::orch::OrchEventKind::ToolCallUpdate { .. } => {}
         }
     }
 

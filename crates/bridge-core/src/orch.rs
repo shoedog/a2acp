@@ -79,6 +79,44 @@ pub enum OrchEventKind {
         #[serde(flatten)]
         usage: UsageSnapshot,
     },
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
+    ToolCall {
+        tool_call_id: String,
+        title: String,
+        #[serde(rename = "tool_kind")]
+        kind: String,
+        status: String,
+        locations: Vec<String>,
+        content: Option<ContentSummary>,
+    },
+    ToolCallUpdate {
+        tool_call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(rename = "tool_kind", skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        locations: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<ContentSummary>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanEntry {
+    pub content: String,
+    pub priority: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentSummary {
+    pub item_count: usize,
+    pub preview: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -234,6 +272,57 @@ mod tests {
         assert!(j.get("source").is_none());
         let back: OrchEvent = serde_json::from_value(j).unwrap();
         assert_eq!(back.seq, 3);
+    }
+
+    #[test]
+    fn rich_kinds_roundtrip() {
+        let tc = OrchEventKind::ToolCall {
+            tool_call_id: "t1".into(),
+            title: "read".into(),
+            kind: "read".into(),
+            status: "in_progress".into(),
+            locations: vec!["a.rs".into()],
+            content: Some(ContentSummary {
+                item_count: 1,
+                preview: "hello".into(),
+            }),
+        };
+        let ev = OrchEvent {
+            v: ORCH_V,
+            seq: 5,
+            ts_ms: 1,
+            operation_id: crate::ids::OperationId::parse("op-t").unwrap(),
+            session: None,
+            source: None,
+            kind: tc,
+        };
+        let j = serde_json::to_value(&ev).unwrap();
+        assert_eq!(j["kind"], "tool_call");
+        assert_eq!(j["tool_call_id"], "t1");
+        let _back: OrchEvent = serde_json::from_value(j).unwrap();
+
+        let up = serde_json::to_value(&OrchEventKind::ToolCallUpdate {
+            tool_call_id: "t1".into(),
+            title: None,
+            kind: None,
+            status: Some("completed".into()),
+            locations: None,
+            content: None,
+        })
+        .unwrap();
+        assert_eq!(up["kind"], "tool_call_update");
+        assert_eq!(up["status"], "completed");
+        assert!(up.get("title").is_none() && up.get("content").is_none());
+
+        let pl = serde_json::to_value(&OrchEventKind::Plan {
+            entries: vec![PlanEntry {
+                content: "step".into(),
+                priority: "high".into(),
+                status: "pending".into(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(pl["kind"], "plan");
     }
 
     #[test]
