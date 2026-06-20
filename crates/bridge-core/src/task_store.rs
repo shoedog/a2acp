@@ -3,7 +3,7 @@
 //! responsibility. Timestamps are passed IN — the core forbids `Date::now`.
 
 use crate::error::BridgeError;
-use crate::ids::{NodeId, TaskId};
+use crate::ids::{NodeId, OperationId, TaskId};
 
 /// Durable status of a detached task. `Interrupted` is distinct from `Failed`
 /// (a crash mid-run, swept on the next boot) so triage can tell them apart; the
@@ -153,6 +153,7 @@ pub trait TaskStore: Send + Sync {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         ts: i64,
     ) -> Result<i64, BridgeError>;
 
@@ -166,6 +167,7 @@ pub trait TaskStore: Send + Sync {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         output: &str,
         ok: bool,
         ts: i64,
@@ -176,11 +178,18 @@ pub trait TaskStore: Send + Sync {
     async fn set_terminal_sequenced(
         &self,
         task: &TaskId,
+        operation_id: &OperationId,
         status: TaskRecordStatus,
         result: Option<&str>,
         error: Option<&str>,
         ts: i64,
     ) -> Result<i64, BridgeError>;
+
+    async fn journal_from(
+        &self,
+        task: &TaskId,
+        after_seq: i64,
+    ) -> Result<Vec<crate::orch::OrchEvent>, BridgeError>;
 
     /// Reconstruct the current progress state for streaming reattach.
     /// `checkpoints` is ordered by seq (ascending).
@@ -276,6 +285,8 @@ pub struct MemoryTaskStore {
     terminal_seqs: Mutex<HashMap<String, i64>>,
     /// In-progress node starts. Key: (task_id, node_id) → (seq, ts).
     starts: Mutex<HashMap<(String, String), (i64, i64)>>,
+    /// Per-task durable orchestration journal rows. Key: task_id.
+    journals: Mutex<HashMap<String, Vec<(i64, crate::orch::OrchEvent)>>>,
 }
 
 impl MemoryTaskStore {
@@ -286,6 +297,7 @@ impl MemoryTaskStore {
             seq_counters: Mutex::new(HashMap::new()),
             terminal_seqs: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
+            journals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -425,6 +437,7 @@ impl TaskStore for MemoryTaskStore {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         ts: i64,
     ) -> Result<i64, BridgeError> {
         // Task must exist.
@@ -439,6 +452,23 @@ impl TaskStore for MemoryTaskStore {
         let key = (task.as_str().to_string(), node.as_str().to_string());
         // Upsert: re-starting the same node is allowed (resume re-emit).
         g.insert(key, (seq, ts));
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: crate::orch::OrchEventKind::NodeStarted {
+                node: node.as_str().to_string(),
+            },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_string())
+            .or_default()
+            .push((seq, event));
         Ok(seq)
     }
 
@@ -446,6 +476,7 @@ impl TaskStore for MemoryTaskStore {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         output: &str,
         ok: bool,
         ts: i64,
@@ -457,21 +488,47 @@ impl TaskStore for MemoryTaskStore {
                 return Err(BridgeError::StoreFailure);
             }
         }
+        let key = (task.as_str().to_string(), node.as_str().to_string());
+        {
+            let g = self.checkpoints.lock().unwrap();
+            if g.contains_key(&key) {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
         let seq = self.next_seq(task.as_str());
         // Remove start row for this node (it is no longer in progress).
         {
             let mut sg = self.starts.lock().unwrap();
-            sg.remove(&(task.as_str().to_string(), node.as_str().to_string()));
+            sg.remove(&key);
         }
         let mut g = self.checkpoints.lock().unwrap();
-        let key = (task.as_str().to_string(), node.as_str().to_string());
         g.insert(key, (output.to_string(), ok, ts, seq));
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: crate::orch::OrchEventKind::NodeFinished {
+                node: node.as_str().to_string(),
+                ok,
+                output: output.to_string(),
+            },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_string())
+            .or_default()
+            .push((seq, event));
         Ok(seq)
     }
 
     async fn set_terminal_sequenced(
         &self,
         task: &TaskId,
+        operation_id: &OperationId,
         status: TaskRecordStatus,
         result: Option<&str>,
         error: Option<&str>,
@@ -505,7 +562,46 @@ impl TaskStore for MemoryTaskStore {
             let mut sg = self.starts.lock().unwrap();
             sg.retain(|(tid, _nid), _| tid != task.as_str());
         }
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: crate::orch::OrchEventKind::Terminal {
+                status: terminal_status_from_record(&status),
+                output: result.or(error).unwrap_or("").to_string(),
+            },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_string())
+            .or_default()
+            .push((seq, event));
         Ok(seq)
+    }
+
+    async fn journal_from(
+        &self,
+        task: &TaskId,
+        after_seq: i64,
+    ) -> Result<Vec<crate::orch::OrchEvent>, BridgeError> {
+        let g = self.journals.lock().unwrap();
+        let mut out: Vec<crate::orch::OrchEvent> = g
+            .get(task.as_str())
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter(|(seq, _event)| *seq > after_seq)
+            .map(|(seq, event)| {
+                let mut event = event.clone();
+                event.seq = *seq;
+                event
+            })
+            .collect();
+        out.sort_by_key(|event| event.seq);
+        Ok(out)
     }
 
     async fn progress_snapshot(&self, task: &TaskId) -> Result<TaskProgressSnapshot, BridgeError> {
@@ -864,12 +960,13 @@ mod tests {
         let s = MemoryTaskStore::new();
         let t = TaskId::parse("t").unwrap();
         s.create(&rec("t", 1)).await.unwrap(); // use the EXISTING helper for a Working TaskRecord
+        let op = OperationId::parse("op-t").unwrap();
         let s1 = s
-            .record_node_started(&t, &NodeId::parse("a").unwrap(), 1)
+            .record_node_started(&t, &NodeId::parse("a").unwrap(), &op, 1)
             .await
             .unwrap();
         let s2 = s
-            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), "OUT", true, 2)
+            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), &op, "OUT", true, 2)
             .await
             .unwrap();
         assert!(s2 > s1, "seq is monotonic");
@@ -880,7 +977,7 @@ mod tests {
             "checkpoint carries its allocated seq"
         );
         let s3 = s
-            .set_terminal_sequenced(&t, TaskRecordStatus::Completed, Some("R"), None, 3)
+            .set_terminal_sequenced(&t, &op, TaskRecordStatus::Completed, Some("R"), None, 3)
             .await
             .unwrap();
         assert!(s3 > s2);
@@ -895,20 +992,22 @@ mod tests {
         // idempotent re-start (resume re-emit): no error, new seq
         s.create(&rec("t2", 1)).await.unwrap();
         let t2 = TaskId::parse("t2").unwrap();
+        let op2 = OperationId::parse("op-t2").unwrap();
         let a = s
-            .record_node_started(&t2, &NodeId::parse("x").unwrap(), 1)
+            .record_node_started(&t2, &NodeId::parse("x").unwrap(), &op2, 1)
             .await
             .unwrap();
         let b = s
-            .record_node_started(&t2, &NodeId::parse("x").unwrap(), 2)
+            .record_node_started(&t2, &NodeId::parse("x").unwrap(), &op2, 2)
             .await
             .unwrap();
         assert!(b > a, "re-start upserts a fresh seq, no PK error");
         // Fix 4b: mid-flight check — record_node_started on a fresh task, then snapshot.
         s.create(&rec("t3", 1)).await.unwrap();
         let t3 = TaskId::parse("t3").unwrap();
+        let op3 = OperationId::parse("op-t3").unwrap();
         let start_seq = s
-            .record_node_started(&t3, &NodeId::parse("a").unwrap(), 1)
+            .record_node_started(&t3, &NodeId::parse("a").unwrap(), &op3, 1)
             .await
             .unwrap();
         let snap = s.progress_snapshot(&t3).await.unwrap();
@@ -922,6 +1021,28 @@ mod tests {
             "start carries the allocated seq"
         );
         assert!(snap.checkpoints.is_empty(), "no checkpoint yet for t3");
+    }
+
+    #[tokio::test]
+    async fn memory_journal_write() {
+        let s = MemoryTaskStore::new();
+        let t = TaskId::parse("task-j").unwrap();
+        s.create(&rec("task-j", 1)).await.unwrap();
+        let a = NodeId::parse("a").unwrap();
+        let op = OperationId::parse("op-task-j").unwrap();
+        let s1 = s.record_node_started(&t, &a, &op, 1).await.unwrap();
+        let s2 = s
+            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+            .await
+            .unwrap();
+        let evs = s.journal_from(&t, -1).await.unwrap();
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(evs[0].kind, OrchEventKind::NodeStarted { .. }) && evs[0].seq == s1);
+        assert!(
+            matches!(&evs[1].kind, OrchEventKind::NodeFinished { output, .. } if output == "oA")
+                && evs[1].seq == s2
+        );
+        assert_eq!(evs[0].operation_id.as_str(), "op-task-j");
     }
 
     #[tokio::test]

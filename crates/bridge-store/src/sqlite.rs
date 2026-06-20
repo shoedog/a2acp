@@ -3,7 +3,7 @@
 use bridge_core::{
     domain::{PeerTaskId, PendingKind, PendingRequest},
     error::BridgeError,
-    ids::{NodeId, SessionId, TaskId},
+    ids::{NodeId, OperationId, SessionId, TaskId},
     ports::SessionStore,
 };
 use rusqlite::OptionalExtension;
@@ -179,6 +179,20 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE task_node_checkpoints ADD COLUMN seq INTEGER;")?;
     }
 
+    Ok(())
+}
+
+fn insert_journal_event(
+    tx: &rusqlite::Transaction<'_>,
+    task: &TaskId,
+    event: &bridge_core::orch::OrchEvent,
+) -> Result<(), BridgeError> {
+    let event_json = serde_json::to_string(event).map_err(|_| BridgeError::StoreFailure)?;
+    tx.execute(
+        "INSERT INTO task_journal(task_id, seq, event_json) VALUES(?1, ?2, ?3)",
+        rusqlite::params![task.as_str(), event.seq, event_json],
+    )
+    .map_err(|_| BridgeError::StoreFailure)?;
     Ok(())
 }
 
@@ -568,6 +582,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         ts: i64,
     ) -> Result<i64, BridgeError> {
         let conn = self.conn.lock().unwrap();
@@ -599,6 +614,18 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             rusqlite::params![task.as_str(), node.as_str(), seq, ts],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
+        let event = bridge_core::orch::OrchEvent {
+            v: bridge_core::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: bridge_core::orch::OrchEventKind::NodeStarted {
+                node: node.as_str().to_string(),
+            },
+        };
+        insert_journal_event(&tx, task, &event)?;
         tx.commit().map_err(|_| BridgeError::StoreFailure)?;
         Ok(seq)
     }
@@ -607,6 +634,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         output: &str,
         ok: bool,
         ts: i64,
@@ -645,6 +673,20 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             rusqlite::params![task.as_str(), node.as_str()],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
+        let event = bridge_core::orch::OrchEvent {
+            v: bridge_core::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: bridge_core::orch::OrchEventKind::NodeFinished {
+                node: node.as_str().to_string(),
+                ok,
+                output: output.to_string(),
+            },
+        };
+        insert_journal_event(&tx, task, &event)?;
         tx.commit().map_err(|_| BridgeError::StoreFailure)?;
         Ok(seq)
     }
@@ -652,6 +694,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     async fn set_terminal_sequenced(
         &self,
         task: &TaskId,
+        operation_id: &OperationId,
         status: bridge_core::task_store::TaskRecordStatus,
         result: Option<&str>,
         error: Option<&str>,
@@ -690,8 +733,48 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             rusqlite::params![task.as_str()],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
+        let event = bridge_core::orch::OrchEvent {
+            v: bridge_core::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: bridge_core::orch::OrchEventKind::Terminal {
+                status: bridge_core::task_store::terminal_status_from_record(&status),
+                output: result.or(error).unwrap_or("").to_string(),
+            },
+        };
+        insert_journal_event(&tx, task, &event)?;
         tx.commit().map_err(|_| BridgeError::StoreFailure)?;
         Ok(seq)
+    }
+
+    async fn journal_from(
+        &self,
+        task: &TaskId,
+        after_seq: i64,
+    ) -> Result<Vec<bridge_core::orch::OrchEvent>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, event_json FROM task_journal
+                 WHERE task_id=?1 AND seq>?2 ORDER BY seq",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![task.as_str(), after_seq])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            let seq: i64 = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+            let event_json: String = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
+            let mut event: bridge_core::orch::OrchEvent =
+                serde_json::from_str(&event_json).map_err(|_| BridgeError::StoreFailure)?;
+            event.seq = seq;
+            out.push(event);
+        }
+        Ok(out)
     }
 
     async fn progress_snapshot(
@@ -1168,8 +1251,9 @@ mod tests {
             );
             assert_eq!(legacy_cp.unwrap().3, 0, "legacy NULL seq must map to 0");
             // A seq write on the freshly-migrated task works from the DEFAULT 0 baseline.
+            let op = OperationId::parse("op-old").unwrap();
             let first = s
-                .record_node_started(&old, &NodeId::parse("m").unwrap(), 10)
+                .record_node_started(&old, &NodeId::parse("m").unwrap(), &op, 10)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1227,12 +1311,13 @@ mod tests {
         use bridge_core::ids::NodeId;
         let t = TaskId::parse("t").unwrap();
         s.create(&trec("t", 1)).await.unwrap();
+        let op = OperationId::parse("op-t").unwrap();
         let s1 = s
-            .record_node_started(&t, &NodeId::parse("a").unwrap(), 1)
+            .record_node_started(&t, &NodeId::parse("a").unwrap(), &op, 1)
             .await
             .unwrap();
         let s2 = s
-            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), "OUT", true, 2)
+            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), &op, "OUT", true, 2)
             .await
             .unwrap();
         assert!(s2 > s1);
@@ -1241,22 +1326,92 @@ mod tests {
         assert!(snap.starts.is_empty()); // start cleared on finish
                                          // record_node_started is an UPSERT (resume re-emit): no PK error
         let r1 = s
-            .record_node_started(&t, &NodeId::parse("b").unwrap(), 3)
+            .record_node_started(&t, &NodeId::parse("b").unwrap(), &op, 3)
             .await
             .unwrap();
         let r2 = s
-            .record_node_started(&t, &NodeId::parse("b").unwrap(), 4)
+            .record_node_started(&t, &NodeId::parse("b").unwrap(), &op, 4)
             .await
             .unwrap();
         assert!(r2 > r1);
         let term = s
-            .set_terminal_sequenced(&t, TaskRecordStatus::Completed, Some("R"), None, 5)
+            .set_terminal_sequenced(&t, &op, TaskRecordStatus::Completed, Some("R"), None, 5)
             .await
             .unwrap();
         assert_eq!(
             s.progress_snapshot(&t).await.unwrap().terminal_seq,
             Some(term)
         );
+    }
+
+    async fn journal_write_matches_typed<S: bridge_core::task_store::TaskStore>(store: S) {
+        use bridge_core::ids::{NodeId, OperationId};
+        use bridge_core::orch::OrchEventKind;
+        let t = TaskId::parse("task-j").unwrap();
+        store.create(&trec("task-j", 1)).await.unwrap();
+        let a = NodeId::parse("a").unwrap();
+        let op = OperationId::parse("op-task-j").unwrap();
+        let s1 = store.record_node_started(&t, &a, &op, 1).await.unwrap();
+        let s2 = store
+            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+            .await
+            .unwrap();
+        let evs = store.journal_from(&t, -1).await.unwrap();
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(evs[0].kind, OrchEventKind::NodeStarted { .. }) && evs[0].seq == s1);
+        assert!(
+            matches!(&evs[1].kind, OrchEventKind::NodeFinished { output, .. } if output == "oA")
+                && evs[1].seq == s2
+        );
+        assert_eq!(evs[0].operation_id.as_str(), "op-task-j");
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_write() {
+        journal_write_matches_typed(SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_journal_write() {
+        journal_write_matches_typed(bridge_core::task_store::MemoryTaskStore::new()).await;
+    }
+
+    async fn duplicate_sequenced_checkpoint_is_write_once<S: bridge_core::task_store::TaskStore>(
+        store: S,
+    ) {
+        use bridge_core::ids::{NodeId, OperationId};
+        let t = TaskId::parse("task-dup-seq").unwrap();
+        store.create(&trec("task-dup-seq", 1)).await.unwrap();
+        let a = NodeId::parse("a").unwrap();
+        let op = OperationId::parse("op-task-dup-seq").unwrap();
+        let first = store
+            .put_node_checkpoint_sequenced(&t, &a, &op, "first", true, 1)
+            .await
+            .unwrap();
+        let duplicate = store
+            .put_node_checkpoint_sequenced(&t, &a, &op, "second", true, 2)
+            .await;
+        assert!(duplicate.is_err());
+        let snap = store.progress_snapshot(&t).await.unwrap();
+        assert_eq!(snap.checkpoints.len(), 1);
+        assert_eq!(snap.checkpoints[0].1, "first");
+        assert_eq!(snap.checkpoints[0].3, first);
+        let evs = store.journal_from(&t, -1).await.unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].seq, first);
+    }
+
+    #[tokio::test]
+    async fn sqlite_duplicate_sequenced_checkpoint_is_write_once() {
+        duplicate_sequenced_checkpoint_is_write_once(SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_duplicate_sequenced_checkpoint_is_write_once() {
+        duplicate_sequenced_checkpoint_is_write_once(
+            bridge_core::task_store::MemoryTaskStore::new(),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1286,12 +1441,13 @@ mod tests {
         use bridge_core::ids::NodeId;
         let t = TaskId::parse("t").unwrap();
         s.create(&trec("t", 1)).await.unwrap();
+        let op = OperationId::parse("op-t").unwrap();
         let a = s
-            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), "A", true, 1)
+            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), &op, "A", true, 1)
             .await
             .unwrap();
         let b = s
-            .record_node_started(&t, &NodeId::parse("b").unwrap(), 2)
+            .record_node_started(&t, &NodeId::parse("b").unwrap(), &op, 2)
             .await
             .unwrap();
         assert!(b > a, "seq continues across a resumed run, not reset");
