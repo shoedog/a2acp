@@ -751,6 +751,47 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         Ok(seq)
     }
 
+    async fn record_event_sequenced(
+        &self,
+        task: &TaskId,
+        op: &OperationId,
+        ts: i64,
+        kind: bridge_core::orch::OrchEventKind,
+    ) -> Result<i64, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let n = tx
+            .execute(
+                "UPDATE tasks SET last_event_seq = last_event_seq + 1 WHERE id=?1",
+                rusqlite::params![task.as_str()],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if n == 0 {
+            return Err(BridgeError::StoreFailure);
+        }
+        let seq: i64 = tx
+            .query_row(
+                "SELECT last_event_seq FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let event = bridge_core::orch::OrchEvent {
+            v: bridge_core::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: op.clone(),
+            session: None,
+            source: None,
+            kind,
+        };
+        insert_journal_event(&tx, task, &event)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+        Ok(seq)
+    }
+
     async fn journal_from(
         &self,
         task: &TaskId,
@@ -1445,6 +1486,37 @@ mod tests {
     #[tokio::test]
     async fn memory_journal_write() {
         journal_write_matches_typed(bridge_core::task_store::MemoryTaskStore::new()).await;
+    }
+
+    async fn rich_event_journals<S: bridge_core::task_store::TaskStore>(store: S) {
+        use bridge_core::orch::OrchEventKind;
+
+        let t = TaskId::parse("task-r").unwrap();
+        store.create(&trec("task-r", 1)).await.unwrap();
+        let op = OperationId::parse("op-task-r").unwrap();
+        let seq = store
+            .record_event_sequenced(&t, &op, 7, OrchEventKind::Plan { entries: vec![] })
+            .await
+            .unwrap();
+        let evs = store.journal_from(&t, -1).await.unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(
+            matches!(evs[0].kind, OrchEventKind::Plan { .. })
+                && evs[0].seq == seq
+                && evs[0].operation_id.as_str() == "op-task-r"
+        );
+        let snap = store.progress_snapshot(&t).await.unwrap();
+        assert!(snap.checkpoints.is_empty() && snap.starts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_rich_event() {
+        rich_event_journals(SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_rich_event() {
+        rich_event_journals(bridge_core::task_store::MemoryTaskStore::new()).await;
     }
 
     #[tokio::test]

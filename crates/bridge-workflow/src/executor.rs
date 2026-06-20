@@ -5,7 +5,9 @@ use crate::template::render;
 use bridge_core::domain::{effective_config, Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
-use bridge_core::ports::{AgentBackend, AgentRegistry, Update, STOP_REASON_CANCELLED};
+use bridge_core::ports::{
+    AgentBackend, AgentRegistry, RichEventSinkFactory, Update, STOP_REASON_CANCELLED,
+};
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -19,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default, Clone)]
 pub struct WorkflowRunContext {
     pub session_cwd: Option<SessionCwd>,
+    pub make_rich_sink: Option<Arc<dyn RichEventSinkFactory>>,
 }
 
 pub enum NodeTurnExit {
@@ -220,25 +223,50 @@ impl WorkflowExecutor {
             return (format!("[node {} canceled]", node.id.as_str()), false);
         }
         // prompt, with cancel
+        let rich_sink;
         let mut stream = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 resolved.backend.forget_session(&session).await;
                 return (format!("[node {} canceled]", node.id.as_str()), false);
             }
-            s = resolved.backend.prompt(&session, vec![Part { text: rendered }]) => match s {
-                Ok(s) => s,
-                Err(e) => { resolved.backend.forget_session(&session).await;
-                    return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false); }
+            s = async {
+                let sink = ctx.make_rich_sink.as_ref().map(|factory| factory.make(&node.id));
+                let parts = vec![Part { text: rendered }];
+                let stream = match &sink {
+                    Some(sink) => resolved.backend.prompt_observed(&session, parts, sink.clone()).await,
+                    None => resolved.backend.prompt(&session, parts).await,
+                };
+                (sink, stream)
+            } => match s {
+                (sink, Ok(s)) => {
+                    rich_sink = sink;
+                    s
+                }
+                (sink, Err(e)) => {
+                    if let Some(sink) = &sink {
+                        if let Err(flush_err) = sink.flush().await {
+                            eprintln!(
+                                "rich sink flush failed after prompt error for node {}: {:?}",
+                                node.id.as_str(),
+                                flush_err
+                            );
+                        }
+                    }
+                    resolved.backend.forget_session(&session).await;
+                    return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false);
+                }
             },
         };
         let mut text = String::new();
         let mut ok = true;
+        let mut canceled_during_drain = false;
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     let _ = resolved.backend.cancel(&session).await;
+                    canceled_during_drain = true;
                     ok = false; text = format!("[node {} canceled]", node.id.as_str()); break;
                 }
                 item = stream.next() => match item {
@@ -252,6 +280,29 @@ impl WorkflowExecutor {
                     Some(Err(e)) => { ok = false; text = format!("[node {} failed: {:?}]", node.id.as_str(), e); break; }
                     None => break,
                 }
+            }
+        }
+        if let Some(sink) = &rich_sink {
+            if let Err(e) = sink.flush().await {
+                if !ok {
+                    let exit = if canceled_during_drain {
+                        "node cancellation"
+                    } else {
+                        "node failure"
+                    };
+                    eprintln!(
+                        "rich sink flush failed after {exit} for node {}: {:?}",
+                        node.id.as_str(),
+                        e
+                    );
+                    resolved.backend.forget_session(&session).await;
+                    return (text, ok);
+                }
+                resolved.backend.forget_session(&session).await;
+                return (
+                    format!("[node {} rich-flush failed: {:?}]", node.id.as_str(), e),
+                    false,
+                );
             }
         }
         resolved.backend.forget_session(&session).await;
@@ -2068,6 +2119,7 @@ mod tests {
         let ex = WorkflowExecutor::new(reg);
         let ctx = WorkflowRunContext {
             session_cwd: Some(SessionCwd::parse("/req").unwrap()),
+            make_rich_sink: None,
         };
         let _evs: Vec<_> = ex
             .run_from_with_context(
@@ -2129,6 +2181,7 @@ mod tests {
         let ex = WorkflowExecutor::new(reg);
         let ctx = WorkflowRunContext {
             session_cwd: Some(SessionCwd::parse("/req2").unwrap()),
+            make_rich_sink: None,
         };
         let _evs: Vec<_> = ex
             .run_with_context(

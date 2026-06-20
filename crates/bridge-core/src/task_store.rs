@@ -185,6 +185,20 @@ pub trait TaskStore: Send + Sync {
         ts: i64,
     ) -> Result<i64, BridgeError>;
 
+    /// Persist a rich orchestration event with a monotonic seq.
+    ///
+    /// The default keeps custom test/wrapper stores source-compatible; durable
+    /// stores that support the shared journal override it.
+    async fn record_event_sequenced(
+        &self,
+        _task: &TaskId,
+        _op: &OperationId,
+        _ts: i64,
+        _kind: crate::orch::OrchEventKind,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
     async fn journal_from(
         &self,
         task: &TaskId,
@@ -276,7 +290,10 @@ pub fn fold_journal_to_snapshot(
                 starts.clear();
             }
             crate::orch::OrchEventKind::Progress { .. }
-            | crate::orch::OrchEventKind::Usage { .. } => {}
+            | crate::orch::OrchEventKind::Usage { .. }
+            | crate::orch::OrchEventKind::Plan { .. }
+            | crate::orch::OrchEventKind::ToolCall { .. }
+            | crate::orch::OrchEventKind::ToolCallUpdate { .. } => {}
         }
     }
 
@@ -618,6 +635,39 @@ impl TaskStore for MemoryTaskStore {
                 status: terminal_status_from_record(&status),
                 output: result.or(error).unwrap_or("").to_string(),
             },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_string())
+            .or_default()
+            .push((seq, event));
+        Ok(seq)
+    }
+
+    async fn record_event_sequenced(
+        &self,
+        task: &TaskId,
+        op: &OperationId,
+        ts: i64,
+        kind: crate::orch::OrchEventKind,
+    ) -> Result<i64, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        {
+            let inner = self.inner.lock().unwrap();
+            if !inner.contains_key(task.as_str()) {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
+        let seq = self.next_seq(task.as_str());
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: op.clone(),
+            session: None,
+            source: None,
+            kind,
         };
         self.journals
             .lock()

@@ -1,6 +1,7 @@
 // reattach.rs — per-task in-memory broadcast hub + wire types for streaming reattach.
 // Consumed by Task 4 (DetachedProgressSink publishes) and Tasks 7-9 (SubscribeToTask reads).
 
+use bridge_core::orch::{OrchEventKind, PlanEntry};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -37,6 +38,31 @@ impl TerminalOutcome {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum FrameKind {
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
+    ToolCall {
+        tool_call_id: String,
+        title: String,
+        #[serde(rename = "tool_kind")]
+        kind: String,
+        status: String,
+        locations: Vec<String>,
+        content_preview: Option<String>,
+    },
+    ToolCallUpdate {
+        tool_call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(rename = "tool_kind", skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        locations: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_preview: Option<String>,
+    },
     NodeStarted {
         node: String,
     },
@@ -67,6 +93,56 @@ pub(crate) struct WorkflowProgressFrame {
     pub kind: FrameKind,
 }
 
+pub(crate) fn frame_from_orch(
+    kind: &OrchEventKind,
+    phase: Phase,
+    seq: i64,
+) -> WorkflowProgressFrame {
+    let kind = match kind {
+        OrchEventKind::Plan { entries } => FrameKind::Plan {
+            entries: entries.clone(),
+        },
+        OrchEventKind::ToolCall {
+            tool_call_id,
+            title,
+            kind,
+            status,
+            locations,
+            content,
+        } => FrameKind::ToolCall {
+            tool_call_id: tool_call_id.clone(),
+            title: title.clone(),
+            kind: kind.clone(),
+            status: status.clone(),
+            locations: locations.clone(),
+            content_preview: content.as_ref().map(|c| c.preview.clone()),
+        },
+        OrchEventKind::ToolCallUpdate {
+            tool_call_id,
+            title,
+            kind,
+            status,
+            locations,
+            content,
+        } => FrameKind::ToolCallUpdate {
+            tool_call_id: tool_call_id.clone(),
+            title: title.clone(),
+            kind: kind.clone(),
+            status: status.clone(),
+            locations: locations.clone(),
+            content_preview: content.as_ref().map(|c| c.preview.clone()),
+        },
+        _ => unreachable!("frame_from_orch only accepts rich orchestration events"),
+    };
+
+    WorkflowProgressFrame {
+        v: 1,
+        seq,
+        phase,
+        kind,
+    }
+}
+
 /// Per-task in-memory broadcast hub. Wraps a `tokio::sync::broadcast` channel so
 /// the DetachedProgressSink (publisher) and SubscribeToTask handler (subscriber)
 /// can communicate progress frames without sharing a lock.
@@ -93,6 +169,7 @@ impl TaskProgressHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_core::orch::{ContentSummary, OrchEventKind};
 
     #[tokio::test]
     async fn hub_delivers_published_frame_to_active_subscriber() {
@@ -143,5 +220,31 @@ mod tests {
         };
         let sv: serde_json::Value = serde_json::to_value(&sentinel).unwrap();
         assert_eq!(sv["kind"], "snapshot_complete");
+    }
+
+    #[test]
+    fn frame_from_orch_rich() {
+        let f = frame_from_orch(
+            &OrchEventKind::ToolCall {
+                tool_call_id: "t1".into(),
+                title: "x".into(),
+                kind: "read".into(),
+                status: "completed".into(),
+                locations: vec![],
+                content: Some(ContentSummary {
+                    item_count: 1,
+                    preview: "p".into(),
+                }),
+            },
+            Phase::Live,
+            5,
+        );
+        let j = serde_json::to_value(&f).unwrap();
+        assert_eq!(j["kind"], "tool_call");
+        assert_eq!(j["tool_kind"], "read");
+        assert_eq!(j["content_preview"], "p");
+        assert_eq!(f.seq, 5);
+        let pf = frame_from_orch(&OrchEventKind::Plan { entries: vec![] }, Phase::Live, 6);
+        assert!(matches!(pf.kind, FrameKind::Plan { .. }));
     }
 }

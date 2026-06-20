@@ -28,6 +28,16 @@ pub enum Update {
 /// A pinned, boxed stream of `Result<Update, BridgeError>` items. Send-safe.
 pub type BackendStream = Pin<Box<dyn Stream<Item = Result<Update, BridgeError>> + Send>>;
 
+#[async_trait::async_trait]
+pub trait RichEventSink: Send + Sync {
+    fn record(&self, kind: crate::orch::OrchEventKind);
+    async fn flush(&self) -> Result<(), BridgeError>;
+}
+
+pub trait RichEventSinkFactory: Send + Sync {
+    fn make(&self, node: &NodeId) -> std::sync::Arc<dyn RichEventSink>;
+}
+
 /// Streaming agent backend — adapters implement this; core never depends on adapters.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
@@ -36,6 +46,14 @@ pub trait AgentBackend: Send + Sync {
         session: &SessionId,
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError>;
+    async fn prompt_observed(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        _sink: std::sync::Arc<dyn RichEventSink>,
+    ) -> Result<BackendStream, BridgeError> {
+        self.prompt(session, parts).await
+    }
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError>;
 
     /// Stash the per-session spec (config + cwd); applied at lazy ACP mint. Default: no-op. [§4.4]
@@ -305,6 +323,29 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CountingSink {
+        records: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSink {
+        fn count(&self) -> usize {
+            self.records.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RichEventSink for CountingSink {
+        fn record(&self, _kind: crate::orch::OrchEventKind) {
+            self.records
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        async fn flush(&self) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
         fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
@@ -323,6 +364,29 @@ mod tests {
             matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_observed_defaults_to_prompt() {
+        let backend = FakeBackend;
+        let sink = std::sync::Arc::new(CountingSink::default());
+        let dyn_sink: std::sync::Arc<dyn RichEventSink> = sink.clone();
+
+        let mut stream = backend
+            .prompt_observed(&SessionId::parse("s").unwrap(), vec![], dyn_sink)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(Update::Text(text))) if text == "hi"
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+        ));
+        assert!(stream.next().await.is_none());
+        assert_eq!(sink.count(), 0);
     }
 
     #[tokio::test]
