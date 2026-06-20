@@ -322,9 +322,19 @@ impl SessionManager {
             tab.get_mut(ctx).expect("still_ours").state = SessionState::Expiring;
             drop(tab);
             backend.release_session(&backend_session).await;
-            let mut tab = self.by_context.lock().await;
-            if let Some(h) = tab.remove(ctx) {
-                drop(h.lease);
+            {
+                let mut tab = self.by_context.lock().await;
+                if let Some(h) = tab.remove(ctx) {
+                    drop(h.lease);
+                }
+            }
+            // Prune the children map in a separate lock after by_context is dropped.
+            {
+                let mut children = self.children.lock().await;
+                for set in children.values_mut() {
+                    set.retain(|c| c != ctx);
+                }
+                children.retain(|_, set| !set.is_empty());
             }
             return if cancelled_or_released {
                 Err(BridgeError::SessionExpired)
@@ -639,9 +649,19 @@ impl SessionManager {
             if new_stashed {
                 backend.release_session(&new_id).await;
             }
-            let mut tab = self.by_context.lock().await;
-            if let Some(h) = tab.remove(ctx) {
-                drop(h.lease);
+            {
+                let mut tab = self.by_context.lock().await;
+                if let Some(h) = tab.remove(ctx) {
+                    drop(h.lease);
+                }
+            }
+            // Prune the children map in a separate lock after by_context is dropped.
+            {
+                let mut children = self.children.lock().await;
+                for set in children.values_mut() {
+                    set.retain(|c| c != ctx);
+                }
+                children.retain(|_, set| !set.is_empty());
             }
             return match cfg {
                 Err(e) => Err(e),
@@ -804,9 +824,21 @@ impl SessionManager {
             tab.get_mut(ctx).expect("still_ours").state = SessionState::Expiring;
         }
         backend.release_session(old_id).await;
-        let mut tab = self.by_context.lock().await;
-        if let Some(h) = tab.remove(ctx) {
-            drop(h.lease);
+        {
+            let mut tab = self.by_context.lock().await;
+            if let Some(h) = tab.remove(ctx) {
+                drop(h.lease);
+            }
+        }
+        // compact-expire is another `by_context` removal site -> prune `children` too, so a
+        // compacted-then-expired child can't leak a stale parent->child registration (children
+        // leak class). Separate lock AFTER `by_context` is dropped -> children->by_context order.
+        {
+            let mut children = self.children.lock().await;
+            for set in children.values_mut() {
+                set.retain(|c| c != ctx);
+            }
+            children.retain(|_, set| !set.is_empty());
         }
     }
 
@@ -1876,6 +1908,73 @@ mod tests {
             manager.cancel_with_children(&parent).await.err(),
             Some(BridgeError::SessionNotFound)
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_expire_prunes_child_registration() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("reconcile-expire-parent");
+        let child = ctx("reconcile-expire-child");
+
+        let turn = manager
+            .checkout_child_turn(
+                &parent,
+                &child,
+                agent(),
+                Some(model_override("gpt-5.5")),
+                None,
+                op("op-child-1"),
+            )
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+
+        backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
+        let err = manager
+            .checkout_turn(
+                &child,
+                agent(),
+                Some(model_override("gpt-5.4")),
+                None,
+                op("op-child-2"),
+            )
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(err, BridgeError::ConfigReseedRequired { field: "model" });
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn reset_reconcile_expire_prunes_child_registration() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("reset-expire-parent");
+        let child = ctx("reset-expire-child");
+
+        let turn = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+
+        backend.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "boom".into(),
+        }));
+        let err = manager
+            .reset_session(&child, ResetOpts { force: false })
+            .await
+            .err()
+            .unwrap();
+
+        assert!(matches!(err, BridgeError::ConfigInvalid { .. }));
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
     }
 
     #[tokio::test]
