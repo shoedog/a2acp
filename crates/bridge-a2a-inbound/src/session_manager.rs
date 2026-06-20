@@ -539,6 +539,9 @@ impl SessionManager {
             };
             // A reconcile owns the handle: flag it to expire on resolve rather than resetting to Idle
             // (which would let a third checkout re-claim it under the in-flight reconcile — the ABA bug).
+            if h.state == SessionState::Cancelling {
+                return (Ok(()), false);
+            }
             if is_claimed(h.state) {
                 h.expire_after_reconcile = true;
                 return (Ok(()), false);
@@ -646,16 +649,31 @@ impl SessionManager {
         ctx: &ContextId,
         force: bool,
     ) -> Result<ResetOutcome, BridgeError> {
-        let children = self.children.lock().await;
+        let mut children = self.children.lock().await;
         let snapshot = children.get(ctx).cloned().unwrap_or_default();
+        let mut expired = Vec::new();
 
-        let p = self.reset_session(ctx, ResetOpts { force }).await?;
+        let (p, parent_expired) = self.reset_session_inner(ctx, ResetOpts { force }).await;
+        expired.extend(parent_expired);
+        let p = match p {
+            Ok(p) => p,
+            Err(e) => {
+                Self::prune_child_registration_locked(&mut children, &expired);
+                return Err(e);
+            }
+        };
         for child in &snapshot {
-            match self.reset_session(child, ResetOpts { force }).await {
+            let (res, child_expired) = self.reset_session_inner(child, ResetOpts { force }).await;
+            expired.extend(child_expired);
+            match res {
                 Ok(_) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    Self::prune_child_registration_locked(&mut children, &expired);
+                    return Err(e);
+                }
             }
         }
+        Self::prune_child_registration_locked(&mut children, &expired);
 
         Ok(match p {
             ResetOutcome::Cleared { generation } => ResetOutcome::Cleared { generation },
@@ -671,29 +689,51 @@ impl SessionManager {
         ctx: &ContextId,
         opts: ResetOpts,
     ) -> Result<ResetOutcome, BridgeError> {
+        let (res, expired) = self.reset_session_inner(ctx, opts).await;
+        for ctx in &expired {
+            self.prune_child_registration(ctx).await;
+        }
+        res
+    }
+
+    async fn reset_session_inner(
+        &self,
+        ctx: &ContextId,
+        opts: ResetOpts,
+    ) -> (Result<ResetOutcome, BridgeError>, Vec<ContextId>) {
         // (1)+(2)+(3) claim under ONE lock hold (FIX-2: never bounce through Idle, never call self.cancel).
         let (backend, old_id, claimed_id, new_gen, new_id, spec) = {
             let mut tab = self.by_context.lock().await;
             let Some(h) = tab.get_mut(ctx) else {
-                return Ok(ResetOutcome::NotFound);
+                return (Ok(ResetOutcome::NotFound), Vec::new());
             };
             match h.state {
                 SessionState::Idle => {}
                 SessionState::Running if opts.force => {}
-                _ => return Err(BridgeError::HandleBusy),
+                _ => return (Err(BridgeError::HandleBusy), Vec::new()),
             }
             let backend = h.backend.clone();
             let old_id = h.backend_session.clone();
             let claimed_id = h.id.clone();
             let new_gen = SessionGeneration::new(h.generation.get() + 1);
             let new_id = SessionId::parse(format!("ctx-{}-g{}", ctx.as_str(), new_gen.get()))
-                .map_err(|_| BridgeError::InvalidRequest { field: "contextId" })?;
+                .map_err(|_| BridgeError::InvalidRequest { field: "contextId" });
+            let new_id = match new_id {
+                Ok(new_id) => new_id,
+                Err(e) => return (Err(e), Vec::new()),
+            };
             let cwd = match h.fingerprint.cwd.as_deref() {
-                Some(s) => Some(
-                    SessionCwd::parse(s).map_err(|_| BridgeError::ConfigInvalid {
-                        reason: "session cwd".into(),
-                    })?,
-                ),
+                Some(s) => match SessionCwd::parse(s) {
+                    Ok(cwd) => Some(cwd),
+                    Err(_) => {
+                        return (
+                            Err(BridgeError::ConfigInvalid {
+                                reason: "session cwd".into(),
+                            }),
+                            Vec::new(),
+                        )
+                    }
+                },
                 None => None,
             };
             let spec = SessionSpec {
@@ -722,7 +762,7 @@ impl SessionManager {
             if new_stashed {
                 backend.release_session(&new_id).await;
             }
-            return Err(BridgeError::SessionExpired);
+            return (Err(BridgeError::SessionExpired), Vec::new());
         }
         let deferred = tab
             .get(ctx)
@@ -733,17 +773,22 @@ impl SessionManager {
             if new_stashed {
                 backend.release_session(&new_id).await;
             }
-            {
+            let expired = {
                 let mut tab = self.by_context.lock().await;
                 if let Some(h) = tab.remove(ctx) {
                     drop(h.lease);
+                    vec![ctx.clone()]
+                } else {
+                    Vec::new()
                 }
-            }
-            self.prune_child_registration(ctx).await;
-            return match cfg {
-                Err(e) => Err(e),
-                Ok(()) => Err(BridgeError::SessionExpired),
             };
+            return (
+                match cfg {
+                    Err(e) => Err(e),
+                    Ok(()) => Err(BridgeError::SessionExpired),
+                },
+                expired,
+            );
         }
         let h = tab.get_mut(ctx).expect("still_ours");
         h.backend_session = new_id;
@@ -753,9 +798,12 @@ impl SessionManager {
         h.pending_seed = None;
         h.state = SessionState::Idle;
         h.last_used = (self.now)();
-        Ok(ResetOutcome::Cleared {
-            generation: new_gen.get(),
-        })
+        (
+            Ok(ResetOutcome::Cleared {
+                generation: new_gen.get(),
+            }),
+            Vec::new(),
+        )
     }
 
     /// Compact: summarize the gen-N context, reset to N+1, and seed the summary for the next turn.
@@ -996,6 +1044,9 @@ mod tests {
         configured: StdMutex<Vec<String>>,
         reconciled: StdMutex<Vec<(String, SessionSpec)>>,
         cancel_result: StdMutex<Result<(), BridgeError>>,
+        cancel_gate: StdMutex<Option<oneshot::Receiver<()>>>,
+        cancel_started: Notify,
+        cancel_started_count: AtomicUsize,
         configure_result: StdMutex<Result<(), BridgeError>>,
         configure_gate: StdMutex<Option<oneshot::Receiver<()>>>,
         configure_started: Notify,
@@ -1016,6 +1067,9 @@ mod tests {
                 configured: StdMutex::new(Vec::new()),
                 reconciled: StdMutex::new(Vec::new()),
                 cancel_result: StdMutex::new(Ok(())),
+                cancel_gate: StdMutex::new(None),
+                cancel_started: Notify::new(),
+                cancel_started_count: AtomicUsize::new(0),
                 configure_result: StdMutex::new(Ok(())),
                 configure_gate: StdMutex::new(None),
                 configure_started: Notify::new(),
@@ -1053,6 +1107,18 @@ mod tests {
 
         fn set_cancel_result(&self, result: Result<(), BridgeError>) {
             *self.cancel_result.lock().unwrap() = result;
+        }
+
+        fn block_next_cancel(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.cancel_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        async fn wait_for_cancel(&self) {
+            while self.cancel_started_count.load(Ordering::SeqCst) == 0 {
+                self.cancel_started.notified().await;
+            }
         }
 
         fn set_configure_result(&self, result: Result<(), BridgeError>) {
@@ -1107,6 +1173,12 @@ mod tests {
 
         async fn cancel(&self, s: &SessionId) -> Result<(), BridgeError> {
             self.cancels.lock().unwrap().push(s.as_str().to_string());
+            let gate = self.cancel_gate.lock().unwrap().take();
+            self.cancel_started_count.fetch_add(1, Ordering::SeqCst);
+            self.cancel_started.notify_waiters();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
             self.cancel_result.lock().unwrap().clone()
         }
 
@@ -2330,6 +2402,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_with_children_reset_failure_does_not_deadlock() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("clear-fail-parent");
+        let child = ctx("clear-fail-child");
+
+        let turn = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        manager.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(manager.child_registered(&parent, &child).await);
+
+        backend.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "boom".into(),
+        }));
+        let out = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.clear_with_children(&parent, false),
+        )
+        .await
+        .expect("clear_with_children must not deadlock");
+
+        assert!(matches!(out, Err(BridgeError::ConfigInvalid { .. })));
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
     async fn cancel_idle_handle_skips_backend_cancel() {
         let (manager, backend, _registry) = manager();
         let c = ctx("cancel-idle");
@@ -2343,6 +2444,48 @@ mod tests {
 
         assert_eq!(backend.cancels(), vec!["ctx-cancel-idle-g0"]);
         assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancel_during_cancelling_is_noop() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let parent = ctx("cancel-race-parent");
+        let child = ctx("cancel-race-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        assert!(manager.child_registered(&parent, &child).await);
+        let unblock = backend.block_next_cancel();
+
+        let first = {
+            let manager = manager.clone();
+            let child = child.clone();
+            tokio::spawn(async move { manager.cancel(&child).await })
+        };
+        backend.wait_for_cancel().await;
+        assert_eq!(manager.status(&child).await.unwrap().state, "cancelling");
+
+        manager.cancel(&child).await.unwrap();
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-race-child-g0"]);
+
+        unblock.send(()).unwrap();
+        first.await.unwrap().unwrap();
+
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-race-child-g0"]);
+        assert!(backend.releases().is_empty());
+        assert_eq!(manager.status(&child).await.unwrap().state, "idle");
+        assert!(manager.child_registered(&parent, &child).await);
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child-2"))
+            .await
+            .unwrap();
+        assert_eq!(backend.configured(), vec!["ctx-cancel-race-child-g0"]);
+        assert_eq!(manager.status(&child).await.unwrap().state, "running");
     }
 
     #[tokio::test]
