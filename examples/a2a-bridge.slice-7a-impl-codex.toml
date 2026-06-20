@@ -1,0 +1,23 @@
+# Codex (gpt-5.5, effort=high) as the IMPLEMENTER for a2a-bridge Slice 7a (rich ACP journaling + transcript).
+# session-cwd = the a2a-bridge repo; codex EDITS the working tree on feat/slice-7a-rich-acp, runs cargo,
+# but does NOT commit (the controller verifies + commits). Owner-authorized danger-full-access.
+# Run:  target/release/a2a-bridge run-workflow rust-impl --input /tmp/slice7a-Tn.md \
+#         --session-cwd /Users/wesleyjinks/code/a2a-bridge \
+#         --config examples/a2a-bridge.slice-7a-impl-codex.toml --out /tmp/slice7a-Tn-out.md
+
+default = "codex"
+[[agents]]
+id     = "codex"
+cmd    = "codex-acp"
+model  = "gpt-5.5"
+effort = "high"
+args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "rust-impl"
+[[workflows.nodes]]
+id = "impl"
+agent = "codex"
+prompt_file = "../prompts/slice-7a-impl.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8102"

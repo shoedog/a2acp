@@ -1,0 +1,17 @@
+# Codex gpt-5.5 XHIGH architecture-analysis pass (dual-lens 2nd opinion) on Slice 7 (rich ACP + watchdog).
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "slice-7-arch-analysis"
+[[workflows.nodes]]
+id = "analysis"
+agent = "codex"
+prompt_file = "../prompts/slice-7-arch-analysis.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8099"
