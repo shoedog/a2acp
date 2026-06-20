@@ -280,6 +280,11 @@ pub fn fold_journal_to_snapshot(
         }
     }
 
+    // `cut_seq` is trusted verbatim from the tasks-row scalar (= `last_event_seq`), NOT clamped to
+    // the max event seq. This relies on the load-bearing dual-store invariant: every sequenced
+    // writer bumps `last_event_seq` THEN inserts its journal row at `seq == last_event_seq` in the
+    // SAME transaction (SQLite) / under the SAME guard (Memory), so `cut_seq >= max journal seq`
+    // always holds. A future writer that journals WITHOUT bumping `last_event_seq` would break this.
     Ok(TaskProgressSnapshot {
         status: scalars.status,
         result: scalars.result.clone(),

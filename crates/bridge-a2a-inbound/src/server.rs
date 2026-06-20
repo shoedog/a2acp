@@ -8880,6 +8880,9 @@ mod tests {
         );
     }
 
+    // Exercises the trait-DEFAULT `journal_fold_inputs` (complete_from_birth=false) via a wrapper
+    // store that does NOT override it — i.e. the ineligibility a real pre-S6/legacy store hits — NOT
+    // a stored birth flag of 0 (the inner MemoryTaskStore's create still sets birth=true).
     #[tokio::test]
     async fn legacy_task_uses_typed_fallback() {
         let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
