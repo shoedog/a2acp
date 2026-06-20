@@ -1321,6 +1321,7 @@ async fn run_review_step(
     let input = review::build_review_input(task, base_sha, head_sha, slice_ref.as_deref());
     let ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
+        make_rich_sink: None,
     };
     let token = tokio_util::sync::CancellationToken::new();
     let stream = executor.run_with_context(
@@ -2645,6 +2646,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 .map_err(|e| format!("run-workflow: invalid --session-cwd {dir:?}: {e:?}"))?;
             bridge_workflow::executor::WorkflowRunContext {
                 session_cwd: Some(cwd),
+                make_rich_sink: None,
             }
         }
         None => bridge_workflow::executor::WorkflowRunContext::default(),

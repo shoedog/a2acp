@@ -1930,6 +1930,7 @@ fn spawn_workflow_producer(
             }
             let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
                 session_cwd: routed.session_cwd.clone(),
+                make_rich_sink: None,
             };
             let stream = match &workflow_token {
                 Some((c, _)) => executor.run_with_context_and_dispatcher(
@@ -2060,7 +2061,7 @@ fn spawn_detached_workflow(
     run_id: String,
     token: tokio_util::sync::CancellationToken,
     seed: std::collections::HashMap<String, (String, bool)>,
-    ctx: bridge_workflow::executor::WorkflowRunContext,
+    mut ctx: bridge_workflow::executor::WorkflowRunContext,
     hub: Arc<crate::reattach::TaskProgressHub>,
 ) -> tokio::task::JoinHandle<()> {
     let srv = srv.clone();
@@ -2093,6 +2094,30 @@ fn spawn_detached_workflow(
                 return;
             }
         };
+        let op = match OperationId::parse(format!("op-{}", task.as_str())) {
+            Ok(op) => op,
+            Err(_) => {
+                let _ = finalize_detached(
+                    &srv.task_store,
+                    &srv.progress_hubs,
+                    &task,
+                    bridge_core::task_store::TaskRecordStatus::Failed,
+                    None,
+                    Some("bad operation id"),
+                    Some(&hub),
+                )
+                .await;
+                fin.done = true;
+                srv.workflow_cancels.lock().await.remove(&task);
+                return;
+            }
+        };
+        ctx.make_rich_sink = Some(Arc::new(crate::workflow_sink::DetachedRichSinkFactory {
+            store: srv.task_store.clone(),
+            task: task.clone(),
+            op,
+            hub: hub.clone(),
+        }));
         let stream = executor.run_from_with_context(graph, input, run_id, token, seed, ctx);
         // The DetachedProgressSink OWNS the sequenced terminal write: on a clean drain it
         // has already written `set_terminal_sequenced` AND published the Terminal frame.
@@ -2436,6 +2461,7 @@ pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
                     Some(s) => match bridge_core::SessionCwd::parse(s) {
                         Ok(c) => bridge_workflow::executor::WorkflowRunContext {
                             session_cwd: Some(c),
+                            make_rich_sink: None,
                         },
                         Err(_) => {
                             let _ = finalize_detached(
@@ -2827,6 +2853,7 @@ async fn unary_message(
                 std::collections::HashMap::new(),
                 bridge_workflow::executor::WorkflowRunContext {
                     session_cwd: routed.session_cwd.clone(),
+                    make_rich_sink: None,
                 },
                 hub,
             ));
@@ -6580,6 +6607,7 @@ mod tests {
         };
         let ctx = WorkflowRunContext {
             session_cwd: Some(cwd.clone()),
+            make_rich_sink: None,
         };
 
         let turn = dispatcher

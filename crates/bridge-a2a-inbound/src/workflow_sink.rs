@@ -66,8 +66,11 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-use bridge_core::ids::{OperationId, TaskId};
+use bridge_core::ids::{NodeId, OperationId, TaskId};
+use bridge_core::orch::OrchEventKind;
+use bridge_core::ports::{RichEventSink, RichEventSinkFactory};
 use bridge_core::task_store::{TaskRecordStatus, TaskStore};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -185,6 +188,56 @@ impl WorkflowSink for DetachedProgressSink {
             },
         });
         Ok(())
+    }
+}
+
+pub(crate) struct DetachedRichSink {
+    store: Arc<dyn TaskStore>,
+    task: TaskId,
+    op: OperationId,
+    hub: Arc<TaskProgressHub>,
+    queue: std::sync::Mutex<VecDeque<OrchEventKind>>,
+}
+
+#[async_trait::async_trait]
+impl RichEventSink for DetachedRichSink {
+    fn record(&self, kind: OrchEventKind) {
+        self.queue.lock().unwrap().push_back(kind);
+    }
+
+    async fn flush(&self) -> Result<(), BridgeError> {
+        let kinds: Vec<_> = {
+            let mut queue = self.queue.lock().unwrap();
+            queue.drain(..).collect()
+        };
+        for kind in kinds {
+            let seq = self
+                .store
+                .record_event_sequenced(&self.task, &self.op, now_ms(), kind.clone())
+                .await?;
+            self.hub
+                .publish(crate::reattach::frame_from_orch(&kind, Phase::Live, seq));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct DetachedRichSinkFactory {
+    pub(crate) store: Arc<dyn TaskStore>,
+    pub(crate) task: TaskId,
+    pub(crate) op: OperationId,
+    pub(crate) hub: Arc<TaskProgressHub>,
+}
+
+impl RichEventSinkFactory for DetachedRichSinkFactory {
+    fn make(&self, _node: &NodeId) -> Arc<dyn RichEventSink> {
+        Arc::new(DetachedRichSink {
+            store: self.store.clone(),
+            task: self.task.clone(),
+            op: self.op.clone(),
+            hub: self.hub.clone(),
+            queue: std::sync::Mutex::new(VecDeque::new()),
+        })
     }
 }
 
@@ -631,5 +684,162 @@ mod sink_tests {
             rx.try_recv().is_err(),
             "no frame may be published after the write failure (no-publish-on-error)"
         );
+    }
+
+    #[tokio::test]
+    async fn detached_node_journals_rich_before_nodefinished() {
+        use crate::reattach::TaskProgressHub;
+        use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
+        use bridge_core::ids::{AgentId, NodeId, OperationId, SessionId, WorkflowId};
+        use bridge_core::orch::OrchEventKind;
+        use bridge_core::ports::{
+            AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, RichEventSink, Update,
+        };
+        use bridge_core::task_store::{MemoryTaskStore, TaskStore};
+        use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+
+        struct NoopLease;
+        impl Lease for NoopLease {}
+
+        struct RichBackend;
+
+        #[async_trait::async_trait]
+        impl AgentBackend for RichBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                unreachable!("detached rich runs must call prompt_observed")
+            }
+
+            async fn prompt_observed(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+                sink: Arc<dyn RichEventSink>,
+            ) -> Result<BackendStream, BridgeError> {
+                sink.record(OrchEventKind::ToolCall {
+                    tool_call_id: "tc-1".into(),
+                    title: "Read file".into(),
+                    kind: "read".into(),
+                    status: "completed".into(),
+                    locations: vec!["src/lib.rs".into()],
+                    content: None,
+                });
+                Ok(Box::pin(tokio_stream::iter(vec![
+                    Ok(Update::Text("done".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ])))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        struct RichRegistry;
+
+        #[async_trait::async_trait]
+        impl AgentRegistry for RichRegistry {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                Ok(Resolved {
+                    entry: Arc::new(AgentEntry {
+                        id: id.clone(),
+                        cmd: Some("x".into()),
+                        base_url: None,
+                        api_key_env: None,
+                        args: vec![],
+                        kind: AgentKind::Acp,
+                        model_provider: None,
+                        model: None,
+                        effort: None,
+                        mode: None,
+                        cwd: None,
+                        session_cwd: None,
+                        sandbox: None,
+                        auth_method: None,
+                        name: None,
+                        description: None,
+                        tags: vec![],
+                        version: None,
+                        mcp: vec![],
+                        mcp_delivery: Default::default(),
+                        extensions: Default::default(),
+                    }),
+                    backend: Arc::new(RichBackend),
+                    lease: Box::new(NoopLease),
+                })
+            }
+
+            fn default_id(&self) -> AgentId {
+                AgentId::parse("codex").unwrap()
+            }
+
+            async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
+                Ok(())
+            }
+
+            fn list(&self) -> Vec<AgentId> {
+                vec![AgentId::parse("codex").unwrap()]
+            }
+        }
+
+        fn kind_tag(kind: &OrchEventKind) -> &'static str {
+            match kind {
+                OrchEventKind::NodeStarted { .. } => "node_started",
+                OrchEventKind::ToolCall { .. } => "tool_call",
+                OrchEventKind::NodeFinished { .. } => "node_finished",
+                OrchEventKind::Terminal { .. } => "terminal",
+                _ => "other",
+            }
+        }
+
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let task = TaskId::parse("t-rich").unwrap();
+        store.create(&make_task_record("t-rich")).await.unwrap();
+        let hub = Arc::new(TaskProgressHub::new());
+        let op = OperationId::parse(format!("op-{}", task.as_str())).unwrap();
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+            }],
+        });
+        let executor = WorkflowExecutor::new(Arc::new(RichRegistry));
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: Some(Arc::new(DetachedRichSinkFactory {
+                store: store.clone(),
+                task: task.clone(),
+                op,
+                hub: hub.clone(),
+            })),
+        };
+        let stream = executor.run_from_with_context(
+            graph,
+            "input".into(),
+            task.as_str().into(),
+            CancellationToken::new(),
+            std::collections::HashMap::new(),
+            ctx,
+        );
+        let mut sink = DetachedProgressSink::new(store.clone(), task.clone(), hub);
+
+        assert!(drain_workflow(stream, &mut sink).await.unwrap());
+
+        let evs = store.journal_from(&task, -1).await.unwrap();
+        let tags: Vec<&str> = evs
+            .iter()
+            .map(|e| kind_tag(&e.kind))
+            .filter(|tag| *tag != "terminal")
+            .collect();
+        assert_eq!(tags, vec!["node_started", "tool_call", "node_finished"]);
     }
 }
