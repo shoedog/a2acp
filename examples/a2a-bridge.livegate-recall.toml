@@ -1,0 +1,24 @@
+# Slice 5 LIVE-GATE: a 1-node passthrough workflow to PROVE warm session reuse via conversation continuity.
+# Run #1 (--serve --context C) stores a codeword in the node's ACP session; run #2 on the SAME context reuses
+# the SAME warm node session (<C>::workflow::recall::node::echo) -> the agent recalls the codeword. A cold
+# session cannot. Default warm_idle_ttl_secs = 1800s keeps it warm between runs.
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "low"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+
+[[workflows]]
+id = "recall"
+[[workflows.nodes]]
+id = "echo"
+agent = "codex"
+prompt_file = "../prompts/livegate-recall.md"
+inputs = []
+
+[server]
+addr = "127.0.0.1:8091"
+warm_idle_ttl_secs = 1800

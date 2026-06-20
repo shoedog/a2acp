@@ -1,0 +1,24 @@
+# Codex (gpt-5.5, effort=xhigh) WHOLE-BRANCH reviewer for the complete Slice 5 (read-only, no cargo).
+# Run:  target/release/a2a-bridge run-workflow whole-branch-review \
+#         --input /tmp/slice5-wholebranch.md --session-cwd /Users/wesleyjinks/code/a2a-bridge \
+#         --config examples/a2a-bridge.slice-5-whole-branch-review-codex.toml --out /tmp/slice5-wholebranch-out.md
+
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+
+[[workflows]]
+id = "whole-branch-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/slice-5-whole-branch-review.md"
+inputs = []
+
+[server]
+addr = "127.0.0.1:8090"

@@ -1,0 +1,26 @@
+# Codex (gpt-5.5, effort=xhigh) as the PER-INCREMENT REVIEWER for a2a-bridge Slice 5.
+# READ-ONLY by prompt (reads code + git diff; does NOT run cargo, edit, or commit). session-cwd = a2a-bridge.
+# Run:  target/release/a2a-bridge run-workflow increment-review \
+#         --input /tmp/slice5-Tn-review.md \
+#         --session-cwd /Users/wesleyjinks/code/a2a-bridge \
+#         --config examples/a2a-bridge.slice-5-increment-review-codex.toml --out /tmp/slice5-Tn-review-out.md
+
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+
+[[workflows]]
+id = "increment-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/slice-5-increment-review.md"
+inputs = []
+
+[server]
+addr = "127.0.0.1:8089"
