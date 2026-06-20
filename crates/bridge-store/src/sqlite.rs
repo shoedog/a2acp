@@ -130,6 +130,13 @@ impl SqliteStore {
                 ts      INTEGER NOT NULL,
                 PRIMARY KEY (task_id, node_id),
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS task_journal (
+                task_id    TEXT NOT NULL,
+                seq        INTEGER NOT NULL,
+                event_json TEXT NOT NULL,
+                PRIMARY KEY (task_id, seq),
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
             );",
         )
         .map_err(|_| BridgeError::StoreFailure)?;
@@ -155,6 +162,7 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         ("session_cwd", "TEXT"),
         ("last_event_seq", "INTEGER NOT NULL DEFAULT 0"),
         ("terminal_seq", "INTEGER"),
+        ("journal_complete_from_birth", "INTEGER NOT NULL DEFAULT 0"),
     ];
     for (col, def) in additive {
         if !existing.contains(col) {
@@ -1189,6 +1197,28 @@ mod tests {
             assert_eq!(s.node_checkpoints(&old).await.unwrap().len(), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn migration_adds_journal_table_and_birth_flag() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let tbl: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='task_journal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tbl, 1);
+        let col: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='journal_complete_from_birth'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(col, 1);
     }
 
     #[tokio::test]
