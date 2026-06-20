@@ -46,7 +46,7 @@ use bridge_core::orch::{
     AgentSessionCaps, ContentSummary, OrchEventKind, PlanEntry as BridgePlanEntry, ReconcileOutcome,
 };
 use bridge_core::ports::{
-    AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED,
+    AgentBackend, BackendStream, PolicyEngine, RichEventSink, Update, STOP_REASON_CANCELLED,
 };
 
 use bridge_core::process::Supervised;
@@ -220,6 +220,9 @@ enum TurnEvent {
     /// A streamed context-window usage snapshot (ACP `usage_update`). Non-terminal,
     /// routed exactly like `Text`. [Slice 2]
     Usage(bridge_core::orch::UsageSnapshot),
+    /// A rich ACP update routed to the side-channel sink by the stream driver.
+    /// This never surfaces as a public [`Update`].
+    Rich(bridge_core::orch::OrchEventKind),
     /// The terminal turn result. Pushed by the driver after the `PromptResponse`
     /// arrives, carrying the mapped `Update::Done`. Always the last event on a
     /// turn that the agent COMPLETED (incl. a real `StopReason::Cancelled`).
@@ -975,14 +978,19 @@ impl AcpBackend {
                     move |notif: SessionNotification, _cx| {
                         let updates = Arc::clone(&updates_handler);
                         async move {
-                            // Map the inbound `session/update` to a modeled `Update`
-                            // via the SAME pure helper the corpus replay tests drive,
-                            // so a captured real-agent frame exercises this exact path.
+                            // Map rich updates first by borrow, then fall back to the
+                            // value-consuming text/usage mapper. This handler stays
+                            // try-send only: rich sink writes happen in the off-loop
+                            // stream driver.
                             let session_id = notif.session_id.clone();
-                            let te = match Self::map_session_update(notif) {
-                                Some(Update::Text(text)) => Some(TurnEvent::Text(text)),
-                                Some(Update::Usage(snap)) => Some(TurnEvent::Usage(snap)),
-                                _ => None, // unmodeled / non-text (tolerant reader)
+                            let te = if let Some(kind) = Self::map_session_update_rich(&notif) {
+                                Some(TurnEvent::Rich(kind))
+                            } else {
+                                match Self::map_session_update(notif) {
+                                    Some(Update::Text(text)) => Some(TurnEvent::Text(text)),
+                                    Some(Update::Usage(snap)) => Some(TurnEvent::Usage(snap)),
+                                    _ => None, // unmodeled / non-text (tolerant reader)
+                                }
                             };
                             if let Some(te) = te {
                                 // Plain get + non-blocking send under a
@@ -1871,8 +1879,7 @@ impl AcpBackend {
 
 // ── AgentBackend impl ────────────────────────────────────────────────────────
 
-#[async_trait]
-impl AgentBackend for AcpBackend {
+impl AcpBackend {
     /// Conformant streaming `session/prompt`.
     ///
     /// 1. `ensure_session` mints/gets the agent session id (lazy, exactly-once).
@@ -1895,10 +1902,11 @@ impl AgentBackend for AcpBackend {
     /// The returned `BackendStream` yields the streamed `Update::Text`s in order,
     /// then exactly one terminal item: `Ok(Update::Done)` on success, or `Err`
     /// on a transport/agent failure.
-    async fn prompt(
+    async fn prompt_inner(
         &self,
         session: &SessionId,
         parts: Vec<bridge_core::domain::Part>,
+        rich_sink: Option<Arc<dyn RichEventSink>>,
     ) -> Result<BackendStream, BridgeError> {
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
@@ -2027,24 +2035,58 @@ impl AgentBackend for AcpBackend {
 
         // The returned stream drains the per-turn channel, mapping events to
         // `Update`s and terminating after the Done.
-        let stream = futures::stream::unfold((rx, false), |(mut rx, done)| async move {
-            if done {
-                return None;
-            }
-            match rx.recv().await {
-                Some(TurnEvent::Text(t)) => Some((Ok(Update::Text(t)), (rx, false))),
-                Some(TurnEvent::Usage(snap)) => Some((Ok(Update::Usage(snap)), (rx, false))),
-                Some(TurnEvent::Done(u)) => Some((Ok(u), (rx, true))),
-                // Terminal failure: yield the Err as the final stream item, then
-                // end. Downstream re-yields the Err → producer marks `errored` →
-                // terminal frame is `TaskOutcome::Failed` (the correct path).
-                Some(TurnEvent::Failed(e)) => Some((Err(e), (rx, true))),
-                // Channel closed without a Done/Failed (driver dropped) — terminate.
-                None => None,
-            }
-        });
+        let stream =
+            futures::stream::unfold((rx, false, rich_sink), |(mut rx, done, sink)| async move {
+                if done {
+                    return None;
+                }
+
+                loop {
+                    match rx.recv().await {
+                        Some(TurnEvent::Rich(kind)) => {
+                            if let Some(sink) = &sink {
+                                sink.record(kind);
+                            }
+                            continue;
+                        }
+                        Some(TurnEvent::Text(t)) => {
+                            return Some((Ok(Update::Text(t)), (rx, false, sink)));
+                        }
+                        Some(TurnEvent::Usage(snap)) => {
+                            return Some((Ok(Update::Usage(snap)), (rx, false, sink)));
+                        }
+                        Some(TurnEvent::Done(u)) => return Some((Ok(u), (rx, true, sink))),
+                        // Terminal failure: yield the Err as the final stream item, then
+                        // end. Downstream re-yields the Err → producer marks `errored` →
+                        // terminal frame is `TaskOutcome::Failed` (the correct path).
+                        Some(TurnEvent::Failed(e)) => return Some((Err(e), (rx, true, sink))),
+                        // Channel closed without a Done/Failed (driver dropped) — terminate.
+                        None => return None,
+                    }
+                }
+            });
 
         Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl AgentBackend for AcpBackend {
+    async fn prompt(
+        &self,
+        session: &SessionId,
+        parts: Vec<bridge_core::domain::Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        self.prompt_inner(session, parts, None).await
+    }
+
+    async fn prompt_observed(
+        &self,
+        session: &SessionId,
+        parts: Vec<bridge_core::domain::Part>,
+        sink: Arc<dyn RichEventSink>,
+    ) -> Result<BackendStream, BridgeError> {
+        self.prompt_inner(session, parts, Some(sink)).await
     }
 
     /// Cancel the in-flight turn for the bridge session.
@@ -2264,7 +2306,7 @@ mod tests {
     use super::*;
     use bridge_core::domain::EffectiveConfig;
     use bridge_core::error::BridgeError;
-    use bridge_core::ports::{AgentBackend, Update};
+    use bridge_core::ports::{AgentBackend, RichEventSink, Update};
     use bridge_core::process::Supervised;
     use bridge_core::SessionCwd;
     use futures::StreamExt;
@@ -2710,7 +2752,7 @@ mod tests {
         SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
         SessionModelState, SetSessionConfigOptionResponse, SetSessionModeRequest,
         SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse, StopReason,
-        ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     };
     use bridge_core::domain::Effort;
     use std::sync::atomic::AtomicUsize;
@@ -2718,8 +2760,7 @@ mod tests {
 
     /// A scripted `session/update` the fake agent emits mid-turn, before it
     /// returns the `PromptResponse`. Lets a test drive the streaming fan-in:
-    /// text chunks (modeled) and unmodeled variants (thought / tool call) that
-    /// the tolerant reader must drop.
+    /// text chunks (modeled) and rich/unmodeled variants (thought / tool call).
     #[derive(Clone)]
     enum ScriptedUpdate {
         /// `session/update` with an `agent_message_chunk` carrying this text.
@@ -2728,8 +2769,32 @@ mod tests {
         Thought(&'static str),
         /// `session/update` with an empty `plan` (unmodeled → dropped).
         Plan,
+        /// `session/update` with a tool call (rich side-channel when observed).
+        ToolCall,
         /// `session/update` with a context-window `usage_update`.
         Usage(u64, u64),
+    }
+
+    #[derive(Default)]
+    struct CountingSink {
+        records: AtomicUsize,
+    }
+
+    impl CountingSink {
+        fn records(&self) -> usize {
+            self.records.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RichEventSink for CountingSink {
+        fn record(&self, _kind: OrchEventKind) {
+            self.records.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn flush(&self) -> Result<(), BridgeError> {
+            Ok(())
+        }
     }
 
     #[derive(Clone)]
@@ -3271,6 +3336,10 @@ mod tests {
                                             ScriptedUpdate::Plan => SessionUpdate::Plan(
                                                 agent_client_protocol::schema::Plan::new(vec![]),
                                             ),
+                                            ScriptedUpdate::ToolCall => SessionUpdate::ToolCall(
+                                                ToolCall::new("tool-1", "read file")
+                                                    .kind(ToolKind::Read),
+                                            ),
                                             ScriptedUpdate::Usage(used, size) => {
                                                 SessionUpdate::UsageUpdate(
                                                     agent_client_protocol::schema::UsageUpdate::new(
@@ -3732,6 +3801,37 @@ mod tests {
             matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none(), "stream terminates after Done");
+    }
+
+    #[tokio::test]
+    async fn prompt_observed_routes_rich_to_sink() {
+        let rec = Recorder::new("agent-sess-RICH");
+        rec.set_updates(vec![
+            ScriptedUpdate::ToolCall,
+            ScriptedUpdate::Text("visible"),
+        ])
+        .await;
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-RICH");
+        let sink = Arc::new(CountingSink::default());
+        let dyn_sink: Arc<dyn RichEventSink> = sink.clone();
+
+        let mut stream = be.prompt_observed(&key, vec![], dyn_sink).await.unwrap();
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+
+        assert_eq!(sink.records(), 1, "tool call routed to rich sink");
+        assert_eq!(items.len(), 2, "stream yields only text + terminal done");
+        assert!(matches!(&items[0], Ok(Update::Text(t)) if t == "visible"));
+        assert!(matches!(&items[1], Ok(Update::Done { stop_reason }) if stop_reason == "end_turn"));
+        assert!(
+            items
+                .iter()
+                .all(|item| !matches!(item, Ok(Update::Permission(_)))),
+            "rich events must not surface as permission/update stream items"
+        );
     }
 
     #[tokio::test]
