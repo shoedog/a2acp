@@ -28,6 +28,7 @@ pub enum SessionState {
     Expiring,
     Resetting,
     Compacting,
+    Cancelling,
 }
 
 fn is_claimed(s: SessionState) -> bool {
@@ -37,6 +38,7 @@ fn is_claimed(s: SessionState) -> bool {
             | SessionState::Expiring
             | SessionState::Resetting
             | SessionState::Compacting
+            | SessionState::Cancelling
     )
 }
 
@@ -205,6 +207,19 @@ impl SessionManager {
         let mut children = self.children.lock().await;
         for set in children.values_mut() {
             set.retain(|c| c != ctx);
+        }
+        children.retain(|_, set| !set.is_empty());
+    }
+
+    fn prune_child_registration_locked(
+        children: &mut HashMap<ContextId, HashSet<ContextId>>,
+        expired: &[ContextId],
+    ) {
+        if expired.is_empty() {
+            return;
+        }
+        for set in children.values_mut() {
+            set.retain(|c| !expired.contains(c));
         }
         children.retain(|_, set| !set.is_empty());
     }
@@ -441,6 +456,7 @@ impl SessionManager {
                 SessionState::Expiring => "expiring",
                 SessionState::Resetting => "resetting",
                 SessionState::Compacting => "compacting",
+                SessionState::Cancelling => "cancelling",
             },
             agent: h.agent.as_str().to_string(),
             generation: h.generation.get(),
@@ -508,46 +524,115 @@ impl SessionManager {
 
     /// Cancel an in-flight turn but keep the session warm (-> Idle).
     pub async fn cancel(&self, ctx: &ContextId) -> Result<(), BridgeError> {
-        let (backend, session) = {
+        let (res, expired) = self.cancel_inner(ctx).await;
+        if expired {
+            self.prune_child_registration(ctx).await;
+        }
+        res
+    }
+
+    async fn cancel_inner(&self, ctx: &ContextId) -> (Result<(), BridgeError>, bool) {
+        let (backend, session, claimed_id) = {
             let mut tab = self.by_context.lock().await;
             let Some(h) = tab.get_mut(ctx) else {
-                return Err(BridgeError::SessionNotFound);
+                return (Err(BridgeError::SessionNotFound), false);
             };
             // A reconcile owns the handle: flag it to expire on resolve rather than resetting to Idle
             // (which would let a third checkout re-claim it under the in-flight reconcile — the ABA bug).
             if is_claimed(h.state) {
                 h.expire_after_reconcile = true;
-                return Ok(());
+                return (Ok(()), false);
             }
             let was_running = h.state == SessionState::Running;
-            h.state = SessionState::Idle;
             h.op = None;
             if !was_running {
-                return Ok(());
+                h.state = SessionState::Idle;
+                return (Ok(()), false);
             }
-            // was_running is necessarily true here (the !was_running case returned above).
+            // was_running is necessarily true here (the !was_running case returned above). Claim the
+            // handle across backend.cancel so a failed teardown cannot leave it reusable.
+            h.state = SessionState::Cancelling;
             h.last_used = (self.now)();
-            (h.backend.clone(), h.backend_session.clone())
+            (h.backend.clone(), h.backend_session.clone(), h.id.clone())
         };
-        backend.cancel(&session).await
+        let res = backend.cancel(&session).await;
+
+        let mut expired = None;
+        let mut gone = false;
+        {
+            let mut tab = self.by_context.lock().await;
+            let still_ours = matches!(
+                tab.get(ctx),
+                Some(h) if h.id == claimed_id && h.state == SessionState::Cancelling
+            );
+            if still_ours {
+                let deferred = tab
+                    .get(ctx)
+                    .map(|h| h.expire_after_reconcile)
+                    .unwrap_or(true);
+                if res.is_ok() && !deferred {
+                    tab.get_mut(ctx).expect("still_ours").state = SessionState::Idle;
+                } else if let Some(h) = tab.remove(ctx) {
+                    expired = Some(h);
+                }
+            } else {
+                gone = !tab.contains_key(ctx);
+            }
+        }
+        let expired_handle = expired.is_some();
+        if let Some(h) = expired {
+            backend.release_session(&session).await;
+            drop(h.lease);
+        }
+
+        let res = match res {
+            Ok(()) => Ok(()),
+            Err(e) if gone => Err(e),
+            Err(e) if expired_handle => Err(e),
+            Err(_) => Ok(()),
+        };
+        (res, expired_handle)
     }
 
     pub async fn cancel_with_children(&self, ctx: &ContextId) -> Result<(), BridgeError> {
-        let children = self.children.lock().await;
+        let mut children = self.children.lock().await;
         let snapshot = children.get(ctx).cloned().unwrap_or_default();
+        let mut expired = Vec::new();
 
-        let parent_found = match self.cancel(ctx).await {
-            Ok(()) => true,
-            Err(BridgeError::SessionNotFound) => false,
-            Err(e) => return Err(e),
+        let parent_found = match self.cancel_inner(ctx).await {
+            (Ok(()), parent_expired) => {
+                if parent_expired {
+                    expired.push(ctx.clone());
+                }
+                true
+            }
+            (Err(BridgeError::SessionNotFound), _) => false,
+            (Err(e), parent_expired) => {
+                if parent_expired {
+                    expired.push(ctx.clone());
+                    Self::prune_child_registration_locked(&mut children, &expired);
+                }
+                return Err(e);
+            }
         };
         for child in &snapshot {
-            match self.cancel(child).await {
-                Ok(()) => {}
-                Err(BridgeError::SessionNotFound) => {}
-                Err(e) => return Err(e),
+            match self.cancel_inner(child).await {
+                (Ok(()), child_expired) => {
+                    if child_expired {
+                        expired.push(child.clone());
+                    }
+                }
+                (Err(BridgeError::SessionNotFound), _) => {}
+                (Err(e), child_expired) => {
+                    if child_expired {
+                        expired.push(child.clone());
+                    }
+                    Self::prune_child_registration_locked(&mut children, &expired);
+                    return Err(e);
+                }
             }
         }
+        Self::prune_child_registration_locked(&mut children, &expired);
 
         if parent_found || !snapshot.is_empty() {
             Ok(())
@@ -1219,6 +1304,7 @@ mod tests {
     #[test]
     fn is_claimed_includes_compacting() {
         assert!(super::is_claimed(super::SessionState::Compacting));
+        assert!(super::is_claimed(super::SessionState::Cancelling));
     }
 
     #[derive(Clone)]
@@ -2257,6 +2343,58 @@ mod tests {
 
         assert_eq!(backend.cancels(), vec!["ctx-cancel-idle-g0"]);
         assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+    }
+
+    #[tokio::test]
+    async fn cancel_backend_error_expires_handle() {
+        let (manager, backend, _registry) = manager();
+        let parent = ctx("cancel-error-expire-parent");
+        let child = ctx("cancel-error-expire-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        assert!(manager.child_registered(&parent, &child).await);
+        backend.set_cancel_result(Err(BridgeError::AgentCrashed {
+            reason: "cancel failed".into(),
+        }));
+
+        let err = manager.cancel(&child).await.err().unwrap();
+
+        assert_eq!(
+            err,
+            BridgeError::AgentCrashed {
+                reason: "cancel failed".into()
+            }
+        );
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-error-expire-child-g0"]);
+        assert_eq!(backend.releases(), vec!["ctx-cancel-error-expire-child-g0"]);
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_success_keeps_warm() {
+        let (manager, backend, _registry) = manager();
+        let c = ctx("cancel-success-warm");
+
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .await
+            .unwrap();
+
+        manager.cancel(&c).await.unwrap();
+
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-success-warm-g0"]);
+        assert!(backend.releases().is_empty());
+        assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+        manager
+            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .await
+            .unwrap();
+        assert_eq!(manager.status(&c).await.unwrap().state, "running");
     }
 
     #[tokio::test]
