@@ -1657,7 +1657,9 @@ impl AcpBackend {
                     .collect(),
             }),
             SessionUpdate::ToolCall(tool_call) => Some(OrchEventKind::ToolCall {
-                tool_call_id: tool_call.tool_call_id.to_string(),
+                // tool_call_id is agent-controlled + persisted into event_json + the wire frame:
+                // cap it at MAP time like every other persisted string (FIX-11).
+                tool_call_id: Self::cap(&tool_call.tool_call_id.to_string()),
                 title: Self::cap(&tool_call.title),
                 kind: Self::tool_kind_str(&tool_call.kind).to_string(),
                 status: Self::tool_call_status_str(&tool_call.status).to_string(),
@@ -1665,7 +1667,7 @@ impl AcpBackend {
                 content: Self::map_tool_call_content(&tool_call.content),
             }),
             SessionUpdate::ToolCallUpdate(update) => Some(OrchEventKind::ToolCallUpdate {
-                tool_call_id: update.tool_call_id.to_string(),
+                tool_call_id: Self::cap(&update.tool_call_id.to_string()),
                 title: update.fields.title.as_deref().map(Self::cap),
                 kind: update
                     .fields
@@ -2509,6 +2511,23 @@ mod tests {
             panic!("expected rich tool call content");
         };
         assert!(cs.preview.len() <= RICH_CONTENT_CAP);
+    }
+
+    #[test]
+    fn map_rich_caps_tool_call_id() {
+        use agent_client_protocol::schema::ToolCall;
+        // tool_call_id is agent-controlled + persisted into event_json -> must be capped (FIX-11).
+        let big_id = "z".repeat(10_000);
+        let tc = SessionNotification::new(
+            AgentSessionId::from("s"),
+            SessionUpdate::ToolCall(ToolCall::new(big_id, "t")),
+        );
+        let Some(bridge_core::orch::OrchEventKind::ToolCall { tool_call_id, .. }) =
+            AcpBackend::map_session_update_rich(&tc)
+        else {
+            panic!("expected rich tool call");
+        };
+        assert!(tool_call_id.len() <= RICH_CONTENT_CAP);
     }
 
     #[tokio::test]

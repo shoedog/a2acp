@@ -38,11 +38,9 @@ impl TerminalOutcome {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum FrameKind {
-    #[allow(dead_code)] // Task 7 lands before the rich sink/projection callers.
     Plan {
         entries: Vec<PlanEntry>,
     },
-    #[allow(dead_code)] // Task 7 lands before the rich sink/projection callers.
     ToolCall {
         tool_call_id: String,
         title: String,
@@ -52,7 +50,6 @@ pub(crate) enum FrameKind {
         locations: Vec<String>,
         content_preview: Option<String>,
     },
-    #[allow(dead_code)] // Task 7 lands before the rich sink/projection callers.
     ToolCallUpdate {
         tool_call_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,7 +93,6 @@ pub(crate) struct WorkflowProgressFrame {
     pub kind: FrameKind,
 }
 
-#[allow(dead_code)] // Task 7 lands before the rich sink/projection callers.
 pub(crate) fn frame_from_orch(
     kind: &OrchEventKind,
     phase: Phase,

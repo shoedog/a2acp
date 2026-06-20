@@ -1115,15 +1115,30 @@ async fn fold_or_typed_snapshot(
             | bridge_core::task_store::TaskRecordStatus::Interrupted
     );
     let eligible = fi.complete_from_birth && (!is_terminal || fi.scalars.terminal_seq.is_some());
-    let snap = if eligible {
-        bridge_core::task_store::fold_journal_to_snapshot(&fi.events, &fi.scalars)
+    if eligible {
+        // ONE consistent read (journal_fold_inputs): `events` and `snap.cut_seq` agree by construction.
+        let snap = bridge_core::task_store::fold_journal_to_snapshot(&fi.events, &fi.scalars)?;
+        Ok(FoldedProgressSnapshot {
+            snap,
+            events: fi.events,
+        })
     } else {
-        store.progress_snapshot(task).await
-    }?;
-    Ok(FoldedProgressSnapshot {
-        snap,
-        events: fi.events,
-    })
+        // Ineligible (legacy / cancel_if_working- or sweep-terminated): the typed snapshot is a SECOND
+        // store read, so `fi.events` (from the first read) may not cover up to `snap.cut_seq`. Re-read the
+        // journal and BOUND `events` to `snap.cut_seq` — otherwise a rich row committed between the two
+        // reads (seq in (fi.cut_seq, snap.cut_seq]) is absent from the snapshot yet dedup'd out of the live
+        // tail (working_sse `dedup_floor`), dropping it entirely. Bounding keeps `events` ⟂ `cut_seq`
+        // consistent: anything above `cut` is delivered live.
+        let snap = store.progress_snapshot(task).await?;
+        let cut = snap.cut_seq;
+        let events = store
+            .journal_from(task, -1)
+            .await?
+            .into_iter()
+            .filter(|e| e.seq <= cut)
+            .collect();
+        Ok(FoldedProgressSnapshot { snap, events })
+    }
 }
 
 /// Build the streaming working SSE response: subscribe to the task's live progress

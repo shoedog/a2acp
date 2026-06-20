@@ -210,15 +210,32 @@ impl RichEventSink for DetachedRichSink {
             let mut queue = self.queue.lock().unwrap();
             queue.drain(..).collect()
         };
+        // Attempt EVERY queued row (do NOT abort on the first error) so one bad row can't drop the
+        // rest of a node's liveness; report a failure if ANY row failed (the executor's happy-path
+        // barrier maps that to a node failure). Each committed row's seq is strictly < the node's
+        // later NodeFinished seq, so committed rows always precede NodeFinished (the ordering keystone).
+        let mut first_err: Option<BridgeError> = None;
         for kind in kinds {
-            let seq = self
+            match self
                 .store
                 .record_event_sequenced(&self.task, &self.op, now_ms(), kind.clone())
-                .await?;
-            self.hub
-                .publish(crate::reattach::frame_from_orch(&kind, Phase::Live, seq));
+                .await
+            {
+                Ok(seq) => {
+                    self.hub
+                        .publish(crate::reattach::frame_from_orch(&kind, Phase::Live, seq))
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
