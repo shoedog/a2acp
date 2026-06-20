@@ -2450,15 +2450,19 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
         &self,
         task: &TaskId,
         node: &bridge_core::ids::NodeId,
+        operation_id: &bridge_core::ids::OperationId,
         ts: i64,
     ) -> Result<i64, BridgeError> {
-        self.inner.record_node_started(task, node, ts).await
+        self.inner
+            .record_node_started(task, node, operation_id, ts)
+            .await
     }
 
     async fn put_node_checkpoint_sequenced(
         &self,
         _task: &TaskId,
         _node: &bridge_core::ids::NodeId,
+        _operation_id: &bridge_core::ids::OperationId,
         _output: &str,
         _ok: bool,
         _ts: i64,
@@ -2470,14 +2474,23 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
     async fn set_terminal_sequenced(
         &self,
         task: &TaskId,
+        operation_id: &bridge_core::ids::OperationId,
         status: bridge_core::task_store::TaskRecordStatus,
         result: Option<&str>,
         error: Option<&str>,
         ts: i64,
     ) -> Result<i64, BridgeError> {
         self.inner
-            .set_terminal_sequenced(task, status, result, error, ts)
+            .set_terminal_sequenced(task, operation_id, status, result, error, ts)
             .await
+    }
+
+    async fn journal_from(
+        &self,
+        task: &TaskId,
+        after_seq: i64,
+    ) -> Result<Vec<bridge_core::orch::OrchEvent>, BridgeError> {
+        self.inner.journal_from(task, after_seq).await
     }
 
     async fn progress_snapshot(

@@ -1,0 +1,20 @@
+You are doing a FOCUSED RE-REVIEW (read-only) of the Slice-6 "Event-journal dual-store" spec, NOW AT v2. A prior dual spec-review returned `needs-rework`/`fix-then-plan`; v2 folded FIX-1..14 (see the "v2 — dual spec-review fixes folded (BINDING)" section). Your job: confirm the v2 FIXes ACTUALLY resolve the prior blockers AND flag any NEW issue the FIXes introduce (a fold that fixes one bug often introduces another — be alert to that). Ground against the ACTUAL a2a-bridge code (session-cwd = the repo). READ-ONLY: read files, grep, `git log`; do NOT edit/build/test. Decisive, adversarial, concrete.
+
+The v2 spec is below:
+
+{{input}}
+
+The prior blockers v2 must resolve (verify each against the code + the v2 text):
+- **B1 (FIX-1):** durable `Terminal` was lossy — the frozen wire frame is `FrameKind::Terminal{outcome,output}` (`reattach.rs:49`), `output` from `snap.result.or(snap.error)`, `outcome` collapsing `Failed/Interrupted/Working→Failed` (`server.rs:1075-1087`). v2 adds `Terminal{status,output}` + a total `TaskRecordStatus→TerminalStatus` map. CONFIRM it's total and the projection reproduces the exact wire bytes (incl. an Interrupted-finalized task).
+- **B2 (FIX-2, the core):** today's snapshot is a FOLDED state projection — finish DELETES the start row (`sqlite.rs:634`), terminal CLEARS starts (`sqlite.rs:679`), `snapshot_frames` emits `NodeFinished` for checkpoints + `NodeStarted` only for surviving starts (`server.rs:1267/1283`). v2 replaces raw-row replay with `fold_journal_to_snapshot(rows)->TaskProgressSnapshot` feeding the UNCHANGED `snapshot_frames` builder, asserted `== progress_snapshot()`. CONFIRM the fold can actually reproduce `TaskProgressSnapshot` from the journal kinds v2 defines (does the journal carry everything `TaskProgressSnapshot` needs — checkpoints(node,output,ok,seq), starts(node,seq), terminal_seq, status, result/error, cut_seq?). Is anything in `TaskProgressSnapshot` NOT derivable from the journaled `OrchEvent`s? (Read `task_store.rs` `TaskProgressSnapshot` + `progress_snapshot` exactly.)
+- **B3 (FIX-3):** mixed-task fallback — v2 adds `tasks.journaled_from_seq` and uses journal-fold ONLY for fully-journaled tasks, typed path otherwise. CONFIRM this is correct + that `cut_seq`/`terminal_seq` for a folded snapshot match the typed one (FIX-14).
+- **B4 (FIX-4):** object-safe atomic API — writers gain `operation_id:&OperationId`, build+serialize the OrchEvent internally, insert in the same tx. CONFIRM feasibility at all three writers (`sqlite.rs` + Memory) and that no executor-node op leaks (`server.rs:693`).
+
+ALSO pressure-test the NEW v2 surface for newly-introduced problems:
+1. Does `fold_journal_to_snapshot` need `cut_seq`? `progress_snapshot` computes `cut_seq` from somewhere (find it) — can the fold derive the SAME `cut_seq` from journal rows, or does it need a typed read anyway (which would undercut "projection FROM the journal")?
+2. The `journaled_from_seq == first event seq` test for "fully journaled" — is the first event seq always 1, or can a task's first seq differ (e.g. resume, or seq starts at 0)? Could a fresh Slice-6 task ever be misclassified as "mixed" and silently fall back?
+3. FIX-4 adds `operation_id` to all three `TaskStore` writer signatures — enumerate EVERY impl + test that breaks (`sqlite.rs`, `MemoryTaskStore`, `FailingCheckpointStore`, any others). Is the migration `journaled_from_seq` nullable-additive + W3a/W3b-snapshot-version compatible?
+4. Does cutting `OrchResult`/`OrchCommand`/rich variants (FIX-6) leave any DANGLING reference (the analysis or design-of-record assume they exist; does any current code/test reference them)?
+5. Is the `fold_journal_to_snapshot == progress_snapshot` invariant actually testable as stated, given `MemoryTaskStore`'s overwrite-vs-write-once divergence (`task_store.rs:387`)?
+
+OUTPUT: a numbered list — first a B1..B4 RESOLUTION verdict each (`RESOLVED | PARTIAL | NOT-RESOLVED` + why, file:line), then any NEW findings tagged `BLOCKER|MAJOR|MINOR|NIT` with concrete fixes. End with one line: `SPEC VERDICT: ready-to-plan | fix-then-plan | needs-rework`. Do NOT edit files.

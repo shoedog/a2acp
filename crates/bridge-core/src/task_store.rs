@@ -3,7 +3,7 @@
 //! responsibility. Timestamps are passed IN — the core forbids `Date::now`.
 
 use crate::error::BridgeError;
-use crate::ids::{NodeId, TaskId};
+use crate::ids::{NodeId, OperationId, TaskId};
 
 /// Durable status of a detached task. `Interrupted` is distinct from `Failed`
 /// (a crash mid-run, swept on the next boot) so triage can tell them apart; the
@@ -41,6 +41,17 @@ impl TaskRecordStatus {
     }
     pub fn is_terminal(&self) -> bool {
         !matches!(self, TaskRecordStatus::Working)
+    }
+}
+
+pub fn terminal_status_from_record(s: &TaskRecordStatus) -> crate::orch::TerminalStatus {
+    use crate::orch::TerminalStatus;
+    match s {
+        TaskRecordStatus::Completed => TerminalStatus::Completed,
+        TaskRecordStatus::Canceled => TerminalStatus::Canceled,
+        other => TerminalStatus::Failed {
+            reason: other.as_str().to_string(),
+        },
     }
 }
 
@@ -142,6 +153,7 @@ pub trait TaskStore: Send + Sync {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         ts: i64,
     ) -> Result<i64, BridgeError>;
 
@@ -155,6 +167,7 @@ pub trait TaskStore: Send + Sync {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         output: &str,
         ok: bool,
         ts: i64,
@@ -165,11 +178,34 @@ pub trait TaskStore: Send + Sync {
     async fn set_terminal_sequenced(
         &self,
         task: &TaskId,
+        operation_id: &OperationId,
         status: TaskRecordStatus,
         result: Option<&str>,
         error: Option<&str>,
         ts: i64,
     ) -> Result<i64, BridgeError>;
+
+    async fn journal_from(
+        &self,
+        task: &TaskId,
+        after_seq: i64,
+    ) -> Result<Vec<crate::orch::OrchEvent>, BridgeError>;
+
+    async fn journal_fold_inputs(&self, task: &TaskId) -> Result<JournalFoldInputs, BridgeError> {
+        let snap = self.progress_snapshot(task).await?;
+        let events = self.journal_from(task, -1).await?;
+        Ok(JournalFoldInputs {
+            complete_from_birth: false,
+            scalars: JournalScalars {
+                status: snap.status,
+                result: snap.result,
+                error: snap.error,
+                terminal_seq: snap.terminal_seq,
+                cut_seq: snap.cut_seq,
+            },
+            events,
+        })
+    }
 
     /// Reconstruct the current progress state for streaming reattach.
     /// `checkpoints` is ordered by seq (ascending).
@@ -180,7 +216,7 @@ pub trait TaskStore: Send + Sync {
     async fn progress_snapshot(&self, task: &TaskId) -> Result<TaskProgressSnapshot, BridgeError>;
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// Snapshot of a task's current progress for streaming reattach.
@@ -201,6 +237,65 @@ pub struct TaskProgressSnapshot {
     pub cut_seq: i64,
 }
 
+#[derive(Clone, Debug)]
+pub struct JournalScalars {
+    pub status: TaskRecordStatus,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub terminal_seq: Option<i64>,
+    pub cut_seq: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct JournalFoldInputs {
+    pub complete_from_birth: bool,
+    pub scalars: JournalScalars,
+    pub events: Vec<crate::orch::OrchEvent>,
+}
+
+pub fn fold_journal_to_snapshot(
+    events: &[crate::orch::OrchEvent],
+    scalars: &JournalScalars,
+) -> Result<TaskProgressSnapshot, BridgeError> {
+    let mut checkpoints = Vec::new();
+    let mut starts: Vec<(NodeId, i64)> = Vec::new();
+
+    for event in events {
+        match &event.kind {
+            crate::orch::OrchEventKind::NodeStarted { node } => {
+                let node = NodeId::parse(node)?;
+                starts.retain(|(started, _seq)| started != &node);
+                starts.push((node, event.seq));
+            }
+            crate::orch::OrchEventKind::NodeFinished { node, ok, output } => {
+                let node = NodeId::parse(node)?;
+                starts.retain(|(started, _seq)| started != &node);
+                checkpoints.push((node, output.clone(), *ok, event.seq));
+            }
+            crate::orch::OrchEventKind::Terminal { .. } => {
+                starts.clear();
+            }
+            crate::orch::OrchEventKind::Progress { .. }
+            | crate::orch::OrchEventKind::Usage { .. } => {}
+        }
+    }
+
+    // `cut_seq` is trusted verbatim from the tasks-row scalar (= `last_event_seq`), NOT clamped to
+    // the max event seq. This relies on the load-bearing dual-store invariant: every sequenced
+    // writer bumps `last_event_seq` THEN inserts its journal row at `seq == last_event_seq` in the
+    // SAME transaction (SQLite) / under the SAME guard (Memory), so `cut_seq >= max journal seq`
+    // always holds. A future writer that journals WITHOUT bumping `last_event_seq` would break this.
+    Ok(TaskProgressSnapshot {
+        status: scalars.status,
+        result: scalars.result.clone(),
+        error: scalars.error.clone(),
+        checkpoints,
+        starts,
+        terminal_seq: scalars.terminal_seq,
+        cut_seq: scalars.cut_seq,
+    })
+}
+
 /// `(output, ok, ts, seq)` stored per `(task_id, node_id)` checkpoint key.
 type CheckpointValue = (String, bool, i64, i64);
 
@@ -209,7 +304,11 @@ type CheckpointValue = (String, bool, i64, i64);
 /// can default to it WITHOUT depending on `bridge-store`.
 #[derive(Default)]
 pub struct MemoryTaskStore {
+    /// Coarse guard for Memory fold-input consistency across the split maps.
+    journal_fold_guard: Mutex<()>,
     inner: Mutex<HashMap<String, TaskRecord>>,
+    /// Tasks created under S6 code have complete journal coverage from birth.
+    birth: Mutex<HashSet<String>>,
     /// Key: (task_id, node_id) → (output, ok, ts, seq)
     checkpoints: Mutex<HashMap<(String, String), CheckpointValue>>,
     /// Per-task monotonic seq counter. Key: task_id.
@@ -218,16 +317,21 @@ pub struct MemoryTaskStore {
     terminal_seqs: Mutex<HashMap<String, i64>>,
     /// In-progress node starts. Key: (task_id, node_id) → (seq, ts).
     starts: Mutex<HashMap<(String, String), (i64, i64)>>,
+    /// Per-task durable orchestration journal rows. Key: task_id.
+    journals: Mutex<HashMap<String, Vec<(i64, crate::orch::OrchEvent)>>>,
 }
 
 impl MemoryTaskStore {
     pub fn new() -> Self {
         Self {
+            journal_fold_guard: Mutex::new(()),
             inner: Mutex::new(HashMap::new()),
+            birth: Mutex::new(HashSet::new()),
             checkpoints: Mutex::new(HashMap::new()),
             seq_counters: Mutex::new(HashMap::new()),
             terminal_seqs: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
+            journals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -244,11 +348,16 @@ impl MemoryTaskStore {
 #[async_trait::async_trait]
 impl TaskStore for MemoryTaskStore {
     async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         let mut g = self.inner.lock().unwrap();
         if g.contains_key(rec.id.as_str()) {
             return Err(BridgeError::StoreFailure);
         }
         g.insert(rec.id.as_str().to_string(), rec.clone());
+        self.birth
+            .lock()
+            .unwrap()
+            .insert(rec.id.as_str().to_string());
         Ok(())
     }
     async fn set_terminal(
@@ -259,6 +368,7 @@ impl TaskStore for MemoryTaskStore {
         error: Option<&str>,
         updated_ms: i64,
     ) -> Result<(), BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         let mut g = self.inner.lock().unwrap();
         let row = g.get_mut(id.as_str()).ok_or(BridgeError::StoreFailure)?;
         row.status = status;
@@ -278,6 +388,7 @@ impl TaskStore for MemoryTaskStore {
         Ok(v)
     }
     async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         let mut g = self.inner.lock().unwrap();
         let mut n = 0;
         for row in g.values_mut() {
@@ -291,6 +402,7 @@ impl TaskStore for MemoryTaskStore {
         Ok(n)
     }
     async fn cancel_if_working(&self, id: &TaskId, updated_ms: i64) -> Result<bool, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         let mut g = self.inner.lock().unwrap();
         match g.get_mut(id.as_str()) {
             Some(row) if row.status == TaskRecordStatus::Working => {
@@ -367,8 +479,10 @@ impl TaskStore for MemoryTaskStore {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         ts: i64,
     ) -> Result<i64, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         // Task must exist.
         {
             let inner = self.inner.lock().unwrap();
@@ -381,6 +495,23 @@ impl TaskStore for MemoryTaskStore {
         let key = (task.as_str().to_string(), node.as_str().to_string());
         // Upsert: re-starting the same node is allowed (resume re-emit).
         g.insert(key, (seq, ts));
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: crate::orch::OrchEventKind::NodeStarted {
+                node: node.as_str().to_string(),
+            },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_string())
+            .or_default()
+            .push((seq, event));
         Ok(seq)
     }
 
@@ -388,10 +519,12 @@ impl TaskStore for MemoryTaskStore {
         &self,
         task: &TaskId,
         node: &NodeId,
+        operation_id: &OperationId,
         output: &str,
         ok: bool,
         ts: i64,
     ) -> Result<i64, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         // Task must exist.
         {
             let inner = self.inner.lock().unwrap();
@@ -399,26 +532,53 @@ impl TaskStore for MemoryTaskStore {
                 return Err(BridgeError::StoreFailure);
             }
         }
+        let key = (task.as_str().to_string(), node.as_str().to_string());
+        {
+            let g = self.checkpoints.lock().unwrap();
+            if g.contains_key(&key) {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
         let seq = self.next_seq(task.as_str());
         // Remove start row for this node (it is no longer in progress).
         {
             let mut sg = self.starts.lock().unwrap();
-            sg.remove(&(task.as_str().to_string(), node.as_str().to_string()));
+            sg.remove(&key);
         }
         let mut g = self.checkpoints.lock().unwrap();
-        let key = (task.as_str().to_string(), node.as_str().to_string());
         g.insert(key, (output.to_string(), ok, ts, seq));
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: crate::orch::OrchEventKind::NodeFinished {
+                node: node.as_str().to_string(),
+                ok,
+                output: output.to_string(),
+            },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_string())
+            .or_default()
+            .push((seq, event));
         Ok(seq)
     }
 
     async fn set_terminal_sequenced(
         &self,
         task: &TaskId,
+        operation_id: &OperationId,
         status: TaskRecordStatus,
         result: Option<&str>,
         error: Option<&str>,
         ts: i64,
     ) -> Result<i64, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         // Task must exist — check BEFORE allocating a seq (mirrors record_node_started /
         // put_node_checkpoint_sequenced order to avoid leaking a counter increment on
         // a non-existent task).
@@ -447,7 +607,89 @@ impl TaskStore for MemoryTaskStore {
             let mut sg = self.starts.lock().unwrap();
             sg.retain(|(tid, _nid), _| tid != task.as_str());
         }
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: crate::orch::OrchEventKind::Terminal {
+                status: terminal_status_from_record(&status),
+                output: result.or(error).unwrap_or("").to_string(),
+            },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_string())
+            .or_default()
+            .push((seq, event));
         Ok(seq)
+    }
+
+    async fn journal_from(
+        &self,
+        task: &TaskId,
+        after_seq: i64,
+    ) -> Result<Vec<crate::orch::OrchEvent>, BridgeError> {
+        let g = self.journals.lock().unwrap();
+        let mut out: Vec<crate::orch::OrchEvent> = g
+            .get(task.as_str())
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter(|(seq, _event)| *seq > after_seq)
+            .map(|(seq, event)| {
+                let mut event = event.clone();
+                event.seq = *seq;
+                event
+            })
+            .collect();
+        out.sort_by_key(|event| event.seq);
+        Ok(out)
+    }
+
+    async fn journal_fold_inputs(&self, task: &TaskId) -> Result<JournalFoldInputs, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let row = {
+            let g = self.inner.lock().unwrap();
+            g.get(task.as_str())
+                .cloned()
+                .ok_or(BridgeError::StoreFailure)?
+        };
+        let cut_seq = {
+            let g = self.seq_counters.lock().unwrap();
+            *g.get(task.as_str()).unwrap_or(&0)
+        };
+        let terminal_seq = {
+            let g = self.terminal_seqs.lock().unwrap();
+            g.get(task.as_str()).copied()
+        };
+        let complete_from_birth = self.birth.lock().unwrap().contains(task.as_str());
+        let mut events: Vec<crate::orch::OrchEvent> = {
+            let g = self.journals.lock().unwrap();
+            g.get(task.as_str())
+                .into_iter()
+                .flat_map(|rows| rows.iter())
+                .map(|(seq, event)| {
+                    let mut event = event.clone();
+                    event.seq = *seq;
+                    event
+                })
+                .collect()
+        };
+        events.sort_by_key(|event| event.seq);
+        Ok(JournalFoldInputs {
+            complete_from_birth,
+            scalars: JournalScalars {
+                status: row.status,
+                result: row.result,
+                error: row.error,
+                terminal_seq,
+                cut_seq,
+            },
+            events,
+        })
     }
 
     async fn progress_snapshot(&self, task: &TaskId) -> Result<TaskProgressSnapshot, BridgeError> {
@@ -515,7 +757,8 @@ impl TaskStore for MemoryTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::NodeId;
+    use crate::ids::{NodeId, OperationId};
+    use crate::orch::{OrchEvent, OrchEventKind, ORCH_V};
 
     fn rec(id: &str, ms: i64) -> TaskRecord {
         TaskRecord {
@@ -530,6 +773,111 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+        }
+    }
+
+    #[test]
+    fn fold_collapses_started_then_finished() {
+        let op = OperationId::parse("op-t").unwrap();
+        let ev = |seq, kind| OrchEvent {
+            v: ORCH_V,
+            seq,
+            ts_ms: 0,
+            operation_id: op.clone(),
+            session: None,
+            source: None,
+            kind,
+        };
+        let events = vec![
+            ev(1, OrchEventKind::NodeStarted { node: "a".into() }),
+            ev(
+                2,
+                OrchEventKind::NodeFinished {
+                    node: "a".into(),
+                    ok: true,
+                    output: "oA".into(),
+                },
+            ),
+            ev(3, OrchEventKind::NodeStarted { node: "b".into() }),
+        ];
+        let scalars = JournalScalars {
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            terminal_seq: None,
+            cut_seq: 3,
+        };
+        let snap = fold_journal_to_snapshot(&events, &scalars).unwrap();
+        assert_eq!(
+            snap.checkpoints
+                .iter()
+                .map(|c| (c.0.as_str().to_string(), c.3))
+                .collect::<Vec<_>>(),
+            vec![("a".into(), 2)]
+        );
+        assert_eq!(
+            snap.starts
+                .iter()
+                .map(|s| (s.0.as_str().to_string(), s.1))
+                .collect::<Vec<_>>(),
+            vec![("b".into(), 3)]
+        );
+        assert_eq!(snap.cut_seq, 3);
+    }
+
+    #[test]
+    fn fold_repeated_start_keeps_latest_only() {
+        let op = OperationId::parse("op-t").unwrap();
+        let ev = |seq, kind| OrchEvent {
+            v: ORCH_V,
+            seq,
+            ts_ms: 0,
+            operation_id: op.clone(),
+            session: None,
+            source: None,
+            kind,
+        };
+        let events = vec![
+            ev(1, OrchEventKind::NodeStarted { node: "a".into() }),
+            ev(4, OrchEventKind::NodeStarted { node: "a".into() }),
+        ];
+        let scalars = JournalScalars {
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            terminal_seq: None,
+            cut_seq: 4,
+        };
+        let snap = fold_journal_to_snapshot(&events, &scalars).unwrap();
+        assert_eq!(
+            snap.starts
+                .iter()
+                .map(|s| (s.0.as_str().to_string(), s.1))
+                .collect::<Vec<_>>(),
+            vec![("a".into(), 4)]
+        );
+    }
+
+    #[test]
+    fn task_record_status_maps_total() {
+        use crate::orch::TerminalStatus;
+        assert!(matches!(
+            terminal_status_from_record(&TaskRecordStatus::Completed),
+            TerminalStatus::Completed
+        ));
+        assert!(matches!(
+            terminal_status_from_record(&TaskRecordStatus::Canceled),
+            TerminalStatus::Canceled
+        ));
+        for s in [
+            TaskRecordStatus::Failed,
+            TaskRecordStatus::Interrupted,
+            TaskRecordStatus::Working,
+        ] {
+            assert!(matches!(
+                terminal_status_from_record(&s),
+                TerminalStatus::Failed { .. }
+            ));
         }
     }
 
@@ -700,12 +1048,13 @@ mod tests {
         let s = MemoryTaskStore::new();
         let t = TaskId::parse("t").unwrap();
         s.create(&rec("t", 1)).await.unwrap(); // use the EXISTING helper for a Working TaskRecord
+        let op = OperationId::parse("op-t").unwrap();
         let s1 = s
-            .record_node_started(&t, &NodeId::parse("a").unwrap(), 1)
+            .record_node_started(&t, &NodeId::parse("a").unwrap(), &op, 1)
             .await
             .unwrap();
         let s2 = s
-            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), "OUT", true, 2)
+            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), &op, "OUT", true, 2)
             .await
             .unwrap();
         assert!(s2 > s1, "seq is monotonic");
@@ -716,7 +1065,7 @@ mod tests {
             "checkpoint carries its allocated seq"
         );
         let s3 = s
-            .set_terminal_sequenced(&t, TaskRecordStatus::Completed, Some("R"), None, 3)
+            .set_terminal_sequenced(&t, &op, TaskRecordStatus::Completed, Some("R"), None, 3)
             .await
             .unwrap();
         assert!(s3 > s2);
@@ -731,20 +1080,22 @@ mod tests {
         // idempotent re-start (resume re-emit): no error, new seq
         s.create(&rec("t2", 1)).await.unwrap();
         let t2 = TaskId::parse("t2").unwrap();
+        let op2 = OperationId::parse("op-t2").unwrap();
         let a = s
-            .record_node_started(&t2, &NodeId::parse("x").unwrap(), 1)
+            .record_node_started(&t2, &NodeId::parse("x").unwrap(), &op2, 1)
             .await
             .unwrap();
         let b = s
-            .record_node_started(&t2, &NodeId::parse("x").unwrap(), 2)
+            .record_node_started(&t2, &NodeId::parse("x").unwrap(), &op2, 2)
             .await
             .unwrap();
         assert!(b > a, "re-start upserts a fresh seq, no PK error");
         // Fix 4b: mid-flight check — record_node_started on a fresh task, then snapshot.
         s.create(&rec("t3", 1)).await.unwrap();
         let t3 = TaskId::parse("t3").unwrap();
+        let op3 = OperationId::parse("op-t3").unwrap();
         let start_seq = s
-            .record_node_started(&t3, &NodeId::parse("a").unwrap(), 1)
+            .record_node_started(&t3, &NodeId::parse("a").unwrap(), &op3, 1)
             .await
             .unwrap();
         let snap = s.progress_snapshot(&t3).await.unwrap();
@@ -758,6 +1109,46 @@ mod tests {
             "start carries the allocated seq"
         );
         assert!(snap.checkpoints.is_empty(), "no checkpoint yet for t3");
+    }
+
+    #[tokio::test]
+    async fn memory_journal_write() {
+        let s = MemoryTaskStore::new();
+        let t = TaskId::parse("task-j").unwrap();
+        s.create(&rec("task-j", 1)).await.unwrap();
+        let a = NodeId::parse("a").unwrap();
+        let op = OperationId::parse("op-task-j").unwrap();
+        let s1 = s.record_node_started(&t, &a, &op, 1).await.unwrap();
+        let s2 = s
+            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+            .await
+            .unwrap();
+        let evs = s.journal_from(&t, -1).await.unwrap();
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(evs[0].kind, OrchEventKind::NodeStarted { .. }) && evs[0].seq == s1);
+        assert!(
+            matches!(&evs[1].kind, OrchEventKind::NodeFinished { output, .. } if output == "oA")
+                && evs[1].seq == s2
+        );
+        assert_eq!(evs[0].operation_id.as_str(), "op-task-j");
+    }
+
+    #[tokio::test]
+    async fn create_sets_birth_flag_and_fold_inputs_consistent() {
+        let s = MemoryTaskStore::new();
+        let t = TaskId::parse("task-b").unwrap();
+        s.create(&rec("task-b", 1)).await.unwrap();
+        let a = NodeId::parse("a").unwrap();
+        let op = OperationId::parse("op-task-b").unwrap();
+        s.record_node_started(&t, &a, &op, 1).await.unwrap();
+        s.put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+            .await
+            .unwrap();
+
+        let fi = s.journal_fold_inputs(&t).await.unwrap();
+        assert!(fi.complete_from_birth);
+        assert_eq!(fi.events.len(), 2);
+        assert_eq!(fi.scalars.cut_seq, 2);
     }
 
     #[tokio::test]

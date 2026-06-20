@@ -1,0 +1,17 @@
+# Codex gpt-5.5 XHIGH plan-review (lens 1 of the dual plan-review) on Slice 6 (Event-journal dual-store).
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "slice-6-plan-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/slice-6-plan-review.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8095"

@@ -1021,7 +1021,7 @@ async fn subscribe_to_task(
             if rec.status.is_terminal() {
                 // --- Terminal-task flow (Task 8) --- read the snapshot and replay it
                 // as a FINITE SSE stream (snapshot → SnapshotComplete → Terminal → close).
-                let snap = match srv.task_store.progress_snapshot(&task_id).await {
+                let snap = match fold_or_typed_snapshot(&srv.task_store, &task_id).await {
                     Ok(s) => s,
                     Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
                 };
@@ -1099,6 +1099,26 @@ fn terminal_sse_response(
     Sse::new(sse_stream).into_response()
 }
 
+async fn fold_or_typed_snapshot(
+    store: &Arc<dyn bridge_core::task_store::TaskStore>,
+    task: &TaskId,
+) -> Result<bridge_core::task_store::TaskProgressSnapshot, BridgeError> {
+    let fi = store.journal_fold_inputs(task).await?;
+    let is_terminal = matches!(
+        fi.scalars.status,
+        bridge_core::task_store::TaskRecordStatus::Completed
+            | bridge_core::task_store::TaskRecordStatus::Failed
+            | bridge_core::task_store::TaskRecordStatus::Canceled
+            | bridge_core::task_store::TaskRecordStatus::Interrupted
+    );
+    let eligible = fi.complete_from_birth && (!is_terminal || fi.scalars.terminal_seq.is_some());
+    if eligible {
+        bridge_core::task_store::fold_journal_to_snapshot(&fi.events, &fi.scalars)
+    } else {
+        store.progress_snapshot(task).await
+    }
+}
+
 /// Build the streaming working SSE response: subscribe to the task's live progress
 /// hub FIRST (the exactly-once boundary), replay the durable snapshot, emit
 /// `SnapshotComplete`, then live-tail the broadcast receiver until the `Terminal`
@@ -1136,7 +1156,7 @@ async fn working_sse_response(
             // the durable snapshot makes the retry lossless).
             return match srv.task_store.get(task_id).await {
                 Ok(Some(rec)) if rec.status.is_terminal() => {
-                    match srv.task_store.progress_snapshot(task_id).await {
+                    match fold_or_typed_snapshot(&srv.task_store, task_id).await {
                         Ok(snap) => terminal_sse_response(&snap, cursor),
                         Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
                     }
@@ -1157,7 +1177,7 @@ async fn working_sse_response(
     let rx = hub.subscribe();
 
     // Read the durable snapshot.
-    let snap = match srv.task_store.progress_snapshot(task_id).await {
+    let snap = match fold_or_typed_snapshot(&srv.task_store, task_id).await {
         Ok(s) => s,
         Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
     };
@@ -1996,8 +2016,16 @@ pub(crate) async fn finalize_detached(
     // early-returning so the hub is removed REGARDLESS of write success (I-1) — a
     // write-Err must NEVER leak the in-memory hub. The durable Working-row gap on a
     // write-Err is the pre-existing W3b §8 gap, backstopped by the boot sweep.
+    let operation_id = bridge_core::ids::OperationId::parse(format!("op-{}", task.as_str()))?;
     let write = store
-        .set_terminal_sequenced(task, status, result, error, crate::workflow_sink::now_ms())
+        .set_terminal_sequenced(
+            task,
+            &operation_id,
+            status,
+            result,
+            error,
+            crate::workflow_sink::now_ms(),
+        )
         .await;
     if let (Ok(seq), Some(hub)) = (&write, hub) {
         // Publish the Terminal frame ONLY on a committed seq (durable-first): on a
@@ -8540,30 +8568,440 @@ mod tests {
         result
     }
 
+    /// Parse an SSE body into the full ordered wire tuple the `task watch` client
+    /// observes: `(id-line value, data.seq, data.kind, data.phase)`.
+    async fn collect_sse_wire_tuples(resp: Response) -> Vec<(String, i64, String, String)> {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut result = Vec::new();
+        for block in body.split("\n\n") {
+            let mut id: Option<String> = None;
+            let mut seq: Option<i64> = None;
+            let mut kind: Option<String> = None;
+            let mut phase: Option<String> = None;
+            for line in block.lines() {
+                if let Some(id_str) = line.strip_prefix("id:") {
+                    id = Some(id_str.trim().to_string());
+                } else if let Some(data_str) = line.strip_prefix("data:") {
+                    let trimmed = data_str.trim();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        seq = v.get("seq").and_then(|seq| seq.as_i64());
+                        kind = v
+                            .get("kind")
+                            .and_then(|kind| kind.as_str())
+                            .map(ToString::to_string);
+                        phase = v
+                            .get("phase")
+                            .and_then(|phase| phase.as_str())
+                            .map(ToString::to_string);
+                    }
+                }
+            }
+            if let (Some(id), Some(seq), Some(kind), Some(phase)) = (id, seq, kind, phase) {
+                assert_eq!(id, seq.to_string(), "SSE id line must equal data.seq");
+                result.push((id, seq, kind, phase));
+            }
+        }
+        result
+    }
+
+    fn working_record(id: &str) -> bridge_core::task_store::TaskRecord {
+        let now = crate::workflow_sink::now_ms();
+        bridge_core::task_store::TaskRecord {
+            id: bridge_core::ids::TaskId::parse(id).unwrap(),
+            workflow: "code-review".to_string(),
+            status: bridge_core::task_store::TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: now,
+            updated_ms: now,
+            input: "test input".to_string(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        }
+    }
+
     /// Seed a `MemoryTaskStore` task record in the Working state.
     async fn seed_task_record(
         store: &std::sync::Arc<bridge_core::task_store::MemoryTaskStore>,
         task_id: &str,
     ) -> bridge_core::ids::TaskId {
         let id = bridge_core::ids::TaskId::parse(task_id).unwrap();
-        let now = crate::workflow_sink::now_ms();
+        store.create(&working_record(task_id)).await.unwrap();
+        id
+    }
+
+    fn operation_id_for_task(task: &bridge_core::ids::TaskId) -> bridge_core::ids::OperationId {
+        bridge_core::ids::OperationId::parse(format!("op-{}", task.as_str())).unwrap()
+    }
+
+    fn serialize_frames(frames: &[crate::reattach::WorkflowProgressFrame]) -> Vec<String> {
+        frames
+            .iter()
+            .map(|frame| serde_json::to_string(frame).unwrap())
+            .collect()
+    }
+
+    struct LegacyFallbackStore {
+        inner: std::sync::Arc<bridge_core::task_store::MemoryTaskStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::task_store::TaskStore for LegacyFallbackStore {
+        async fn create(
+            &self,
+            rec: &bridge_core::task_store::TaskRecord,
+        ) -> Result<(), BridgeError> {
+            self.inner.create(rec).await
+        }
+
+        async fn set_terminal(
+            &self,
+            id: &bridge_core::ids::TaskId,
+            status: bridge_core::task_store::TaskRecordStatus,
+            result: Option<&str>,
+            error: Option<&str>,
+            updated_ms: i64,
+        ) -> Result<(), BridgeError> {
+            self.inner
+                .set_terminal(id, status, result, error, updated_ms)
+                .await
+        }
+
+        async fn get(
+            &self,
+            id: &bridge_core::ids::TaskId,
+        ) -> Result<Option<bridge_core::task_store::TaskRecord>, BridgeError> {
+            self.inner.get(id).await
+        }
+
+        async fn list(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+            self.inner.list(limit).await
+        }
+
+        async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError> {
+            self.inner.sweep_interrupted(updated_ms).await
+        }
+
+        async fn cancel_if_working(
+            &self,
+            id: &bridge_core::ids::TaskId,
+            updated_ms: i64,
+        ) -> Result<bool, BridgeError> {
+            self.inner.cancel_if_working(id, updated_ms).await
+        }
+
+        async fn put_node_checkpoint(
+            &self,
+            task: &bridge_core::ids::TaskId,
+            node: &bridge_core::ids::NodeId,
+            output: &str,
+            ok: bool,
+            ts: i64,
+        ) -> Result<(), BridgeError> {
+            self.inner
+                .put_node_checkpoint(task, node, output, ok, ts)
+                .await
+        }
+
+        async fn node_checkpoints(
+            &self,
+            task: &bridge_core::ids::TaskId,
+        ) -> Result<Vec<(bridge_core::ids::NodeId, String, bool)>, BridgeError> {
+            self.inner.node_checkpoints(task).await
+        }
+
+        async fn claim_resume_attempt(
+            &self,
+            task: &bridge_core::ids::TaskId,
+            cap: u32,
+            now_ms: i64,
+        ) -> Result<bridge_core::task_store::ResumeClaim, BridgeError> {
+            self.inner.claim_resume_attempt(task, cap, now_ms).await
+        }
+
+        async fn working_tasks(
+            &self,
+        ) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+            self.inner.working_tasks().await
+        }
+
+        async fn record_node_started(
+            &self,
+            task: &bridge_core::ids::TaskId,
+            node: &bridge_core::ids::NodeId,
+            operation_id: &bridge_core::ids::OperationId,
+            ts: i64,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .record_node_started(task, node, operation_id, ts)
+                .await
+        }
+
+        async fn put_node_checkpoint_sequenced(
+            &self,
+            task: &bridge_core::ids::TaskId,
+            node: &bridge_core::ids::NodeId,
+            operation_id: &bridge_core::ids::OperationId,
+            output: &str,
+            ok: bool,
+            ts: i64,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .put_node_checkpoint_sequenced(task, node, operation_id, output, ok, ts)
+                .await
+        }
+
+        async fn set_terminal_sequenced(
+            &self,
+            task: &bridge_core::ids::TaskId,
+            operation_id: &bridge_core::ids::OperationId,
+            status: bridge_core::task_store::TaskRecordStatus,
+            result: Option<&str>,
+            error: Option<&str>,
+            ts: i64,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .set_terminal_sequenced(task, operation_id, status, result, error, ts)
+                .await
+        }
+
+        async fn journal_from(
+            &self,
+            task: &bridge_core::ids::TaskId,
+            after_seq: i64,
+        ) -> Result<Vec<bridge_core::orch::OrchEvent>, BridgeError> {
+            self.inner.journal_from(task, after_seq).await
+        }
+
+        async fn progress_snapshot(
+            &self,
+            task: &bridge_core::ids::TaskId,
+        ) -> Result<bridge_core::task_store::TaskProgressSnapshot, BridgeError> {
+            self.inner.progress_snapshot(task).await
+        }
+    }
+
+    #[tokio::test]
+    async fn eligible_task_folds_journal_byte_identical() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = bridge_core::ids::TaskId::parse("task-fold-eligible").unwrap();
         store
-            .create(&bridge_core::task_store::TaskRecord {
-                id: id.clone(),
-                workflow: "code-review".to_string(),
-                status: bridge_core::task_store::TaskRecordStatus::Working,
-                result: None,
-                error: None,
-                created_ms: now,
-                updated_ms: now,
-                input: "test input".to_string(),
-                workflow_spec_json: None,
-                resume_attempts: 0,
-                session_cwd: None,
-            })
+            .create(&working_record("task-fold-eligible"))
             .await
             .unwrap();
-        id
+        let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let op = operation_id_for_task(&task_id);
+        let now = crate::workflow_sink::now_ms();
+
+        store
+            .record_node_started(&task_id, &node_a, &op, now)
+            .await
+            .unwrap();
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .await
+            .unwrap();
+        store
+            .record_node_started(&task_id, &node_b, &op, now)
+            .await
+            .unwrap();
+        store
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
+            .await
+            .unwrap();
+        store
+            .set_terminal_sequenced(
+                &task_id,
+                &op,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+
+        let fi = store.journal_fold_inputs(&task_id).await.unwrap();
+        assert!(fi.complete_from_birth);
+        assert!(fi.scalars.terminal_seq.is_some());
+
+        let typed = store.progress_snapshot(&task_id).await.unwrap();
+        let typed_frames = snapshot_frames(&typed, None);
+        let store_dyn: std::sync::Arc<dyn bridge_core::task_store::TaskStore> = store.clone();
+        let folded = fold_or_typed_snapshot(&store_dyn, &task_id).await.unwrap();
+        let folded_frames = snapshot_frames(&folded, None);
+        assert_eq!(
+            serialize_frames(&typed_frames),
+            serialize_frames(&folded_frames)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_if_working_task_uses_typed_fallback() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = bridge_core::ids::TaskId::parse("task-fold-cancel").unwrap();
+        store
+            .create(&working_record("task-fold-cancel"))
+            .await
+            .unwrap();
+        let node = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let op = operation_id_for_task(&task_id);
+        let now = crate::workflow_sink::now_ms();
+        store
+            .record_node_started(&task_id, &node, &op, now)
+            .await
+            .unwrap();
+        assert!(store.cancel_if_working(&task_id, now).await.unwrap());
+
+        let fi = store.journal_fold_inputs(&task_id).await.unwrap();
+        assert!(fi.complete_from_birth);
+        assert_eq!(
+            fi.scalars.status,
+            bridge_core::task_store::TaskRecordStatus::Canceled
+        );
+        assert_eq!(fi.scalars.terminal_seq, None);
+
+        let typed = store.progress_snapshot(&task_id).await.unwrap();
+        let typed_frames = snapshot_frames(&typed, None);
+        let store_dyn: std::sync::Arc<dyn bridge_core::task_store::TaskStore> = store.clone();
+        let folded = fold_or_typed_snapshot(&store_dyn, &task_id).await.unwrap();
+        let folded_frames = snapshot_frames(&folded, None);
+        assert_eq!(
+            serialize_frames(&typed_frames),
+            serialize_frames(&folded_frames)
+        );
+    }
+
+    // Exercises the trait-DEFAULT `journal_fold_inputs` (complete_from_birth=false) via a wrapper
+    // store that does NOT override it — i.e. the ineligibility a real pre-S6/legacy store hits — NOT
+    // a stored birth flag of 0 (the inner MemoryTaskStore's create still sets birth=true).
+    #[tokio::test]
+    async fn legacy_task_uses_typed_fallback() {
+        let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let store = std::sync::Arc::new(LegacyFallbackStore { inner });
+        let task_id = bridge_core::ids::TaskId::parse("task-fold-legacy").unwrap();
+        store
+            .create(&working_record("task-fold-legacy"))
+            .await
+            .unwrap();
+        let node = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        store
+            .put_node_checkpoint(
+                &task_id,
+                &node,
+                "legacy-out",
+                true,
+                crate::workflow_sink::now_ms(),
+            )
+            .await
+            .unwrap();
+
+        let fi = store.journal_fold_inputs(&task_id).await.unwrap();
+        assert!(!fi.complete_from_birth);
+        assert_eq!(fi.scalars.terminal_seq, None);
+        assert!(fi.events.is_empty());
+
+        let typed = store.progress_snapshot(&task_id).await.unwrap();
+        let typed_frames = snapshot_frames(&typed, None);
+        assert_eq!(typed_frames.len(), 1, "legacy typed checkpoint is required");
+        let store_dyn: std::sync::Arc<dyn bridge_core::task_store::TaskStore> = store;
+        let folded = fold_or_typed_snapshot(&store_dyn, &task_id).await.unwrap();
+        let folded_frames = snapshot_frames(&folded, None);
+        assert_eq!(
+            serialize_frames(&typed_frames),
+            serialize_frames(&folded_frames)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_two_node_run_wire_tuples() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task_id = bridge_core::ids::TaskId::parse("task-golden").unwrap();
+        store.create(&working_record("task-golden")).await.unwrap();
+        let node_a = bridge_core::ids::NodeId::parse("a").unwrap();
+        let node_b = bridge_core::ids::NodeId::parse("b").unwrap();
+        let op = bridge_core::ids::OperationId::parse("op-task-golden").unwrap();
+        let now = crate::workflow_sink::now_ms();
+
+        let s1 = store
+            .record_node_started(&task_id, &node_a, &op, now)
+            .await
+            .unwrap();
+        let s2 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .await
+            .unwrap();
+        let s3 = store
+            .record_node_started(&task_id, &node_b, &op, now)
+            .await
+            .unwrap();
+        let s4 = store
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
+            .await
+            .unwrap();
+        let s5 = store
+            .set_terminal_sequenced(
+                &task_id,
+                &op,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!((s1, s2, s3, s4, s5), (1, 2, 3, 4, 5));
+
+        let srv = build_with_task_store(store);
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": "task-golden" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let frames = collect_sse_wire_tuples(resp).await;
+        assert_eq!(
+            frames,
+            vec![
+                (
+                    "2".to_string(),
+                    2,
+                    "node_finished".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    "4".to_string(),
+                    4,
+                    "node_finished".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    "4".to_string(),
+                    4,
+                    "snapshot_complete".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    "5".to_string(),
+                    5,
+                    "terminal".to_string(),
+                    "live".to_string(),
+                ),
+            ],
+            "task watch wire tuples must stay byte-identical: {frames:?}"
+        );
     }
 
     /// (8a) Terminal task with 2 checkpoints (seqs 1, 2) + terminal_seq 3, no cursor.
@@ -8574,19 +9012,21 @@ mod tests {
         let task_id = seed_task_record(&store, "t8a").await;
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
         let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         // seq 1: node-a finished; seq 2: node-b finished; seq 3: terminal.
         let s1 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
             .await
             .unwrap();
         let s2 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
             .await
             .unwrap();
         let s3 = store
             .set_terminal_sequenced(
                 &task_id,
+                &op,
                 bridge_core::task_store::TaskRecordStatus::Completed,
                 Some("done"),
                 None,
@@ -8629,18 +9069,20 @@ mod tests {
         let task_id = seed_task_record(&store, "t8b").await;
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
         let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
             .await
             .unwrap(); // seq=1
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
             .await
             .unwrap(); // seq=2
         store
             .set_terminal_sequenced(
                 &task_id,
+                &op,
                 bridge_core::task_store::TaskRecordStatus::Completed,
                 Some("done"),
                 None,
@@ -8821,14 +9263,15 @@ mod tests {
         let task_id = seed_task_record(&store, "t9a").await;
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
         let node_b = bridge_core::ids::NodeId::parse("node-b").unwrap();
+        let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         // Durable snapshot: seqs 1,2 are finished checkpoints (task stays Working).
         let s1 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
             .await
             .unwrap();
         let s2 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_b, "out-b", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
             .await
             .unwrap();
         assert_eq!((s1, s2), (1, 2));
@@ -8868,14 +9311,15 @@ mod tests {
         let task_id = seed_task_record(&store, "t9a2").await;
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
         let node_x = bridge_core::ids::NodeId::parse("node-x").unwrap();
+        let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         // node-a finished (seq 1); node-x started but NOT finished (seq 2, stays in starts).
         let s1 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
             .await
             .unwrap();
         let s2 = store
-            .record_node_started(&task_id, &node_x, now)
+            .record_node_started(&task_id, &node_x, &op, now)
             .await
             .unwrap();
         assert_eq!((s1, s2), (1, 2));
@@ -8907,9 +9351,10 @@ mod tests {
         let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
         let task_id = seed_task_record(&store, "t9b").await;
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
             .await
             .unwrap(); // seq 1
 
@@ -8974,14 +9419,16 @@ mod tests {
         let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
         let task_id = seed_task_record(&store, "t9d").await;
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
             .await
             .unwrap(); // seq 1
         let ts = store
             .set_terminal_sequenced(
                 &task_id,
+                &op,
                 bridge_core::task_store::TaskRecordStatus::Completed,
                 Some("done"),
                 None,
@@ -9016,18 +9463,20 @@ mod tests {
         let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
         let task_id = seed_task_record(&store, "t9e").await;
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         let srv = build_with_task_store(store.clone());
         // Insert the hub (as a live runner would), write snapshot checkpoints...
         let _hub = insert_hub(&srv, &task_id).await;
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
             .await
             .unwrap(); // seq 1
                        // ...then the task finishes (terminal written) BEFORE the handler is called.
         let ts = store
             .set_terminal_sequenced(
                 &task_id,
+                &op,
                 bridge_core::task_store::TaskRecordStatus::Completed,
                 Some("done"),
                 None,
@@ -9057,9 +9506,10 @@ mod tests {
         let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
         let task_id = seed_task_record(&store, "t9f").await;
         let node_a = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
             .await
             .unwrap(); // seq 1
 

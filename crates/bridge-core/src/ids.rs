@@ -30,8 +30,10 @@ id_newtype!(AgentId);
 
 // Slice 0 (orchestration) ids.
 id_newtype!(SessionHandleId);
+id_newtype!(SessionHandleRef);
 id_newtype!(OperationId);
 id_newtype!(ContextId);
+id_newtype!(SourceId);
 
 /// A warm session's context generation. Hand-written (the `id_newtype!` macros are
 /// String-only); generations are compared/incremented so we add `Copy`/`Ord`.
@@ -87,6 +89,16 @@ mod slice0_id_tests {
         assert_eq!(ContextId::parse("ctx-1").unwrap().as_str(), "ctx-1");
         assert!(ContextId::parse("").is_err());
     }
+
+    #[test]
+    fn session_and_source_newtypes_roundtrip() {
+        let s = SessionHandleRef::parse("h-1").unwrap();
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j, serde_json::json!("h-1"));
+        assert_eq!(serde_json::from_value::<SessionHandleRef>(j).unwrap(), s);
+        assert!(SourceId::parse("src-1").is_ok());
+    }
+
     #[test]
     fn session_generation_orders_and_increments() {
         let g0 = SessionGeneration::new(0);

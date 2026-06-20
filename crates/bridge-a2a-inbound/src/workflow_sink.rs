@@ -66,7 +66,7 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-use bridge_core::ids::TaskId;
+use bridge_core::ids::{OperationId, TaskId};
 use bridge_core::task_store::{TaskRecordStatus, TaskStore};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -86,6 +86,10 @@ impl DetachedProgressSink {
     pub(crate) fn new(store: Arc<dyn TaskStore>, task: TaskId, hub: Arc<TaskProgressHub>) -> Self {
         Self { store, task, hub }
     }
+
+    fn operation_id(&self) -> Result<OperationId, BridgeError> {
+        OperationId::parse(format!("op-{}", self.task.as_str()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -96,9 +100,10 @@ impl WorkflowSink for DetachedProgressSink {
     // terminal `Failed` — so the parse error's disposition is moot on this path.
     async fn node_started(&mut self, node: &str) -> Result<(), BridgeError> {
         let node_id = bridge_core::ids::NodeId::parse(node)?;
+        let operation_id = self.operation_id()?;
         let seq = self
             .store
-            .record_node_started(&self.task, &node_id, now_ms())
+            .record_node_started(&self.task, &node_id, &operation_id, now_ms())
             .await?;
         self.hub.publish(WorkflowProgressFrame {
             v: 1,
@@ -118,9 +123,17 @@ impl WorkflowSink for DetachedProgressSink {
         output: &str,
     ) -> Result<(), BridgeError> {
         let node_id = bridge_core::ids::NodeId::parse(node)?;
+        let operation_id = self.operation_id()?;
         let seq = self
             .store
-            .put_node_checkpoint_sequenced(&self.task, &node_id, output, ok, now_ms())
+            .put_node_checkpoint_sequenced(
+                &self.task,
+                &node_id,
+                &operation_id,
+                output,
+                ok,
+                now_ms(),
+            )
             .await?;
         self.hub.publish(WorkflowProgressFrame {
             v: 1,
@@ -157,9 +170,10 @@ impl WorkflowSink for DetachedProgressSink {
                 None,
             ),
         };
+        let operation_id = self.operation_id()?;
         let seq = self
             .store
-            .set_terminal_sequenced(&self.task, status, result, error, now_ms())
+            .set_terminal_sequenced(&self.task, &operation_id, status, result, error, now_ms())
             .await?;
         self.hub.publish(WorkflowProgressFrame {
             v: 1,
@@ -522,15 +536,19 @@ mod sink_tests {
                 &self,
                 task: &TaskId,
                 node: &bridge_core::ids::NodeId,
+                operation_id: &bridge_core::ids::OperationId,
                 ts: i64,
             ) -> Result<i64, BridgeError> {
-                self.inner.record_node_started(task, node, ts).await
+                self.inner
+                    .record_node_started(task, node, operation_id, ts)
+                    .await
             }
             /// Always fails — used to test the W3b abort-on-write-failure contract.
             async fn put_node_checkpoint_sequenced(
                 &self,
                 _task: &TaskId,
                 _node: &bridge_core::ids::NodeId,
+                _operation_id: &bridge_core::ids::OperationId,
                 _output: &str,
                 _ok: bool,
                 _ts: i64,
@@ -540,14 +558,22 @@ mod sink_tests {
             async fn set_terminal_sequenced(
                 &self,
                 task: &TaskId,
+                operation_id: &bridge_core::ids::OperationId,
                 status: TaskRecordStatus,
                 result: Option<&str>,
                 error: Option<&str>,
                 ts: i64,
             ) -> Result<i64, BridgeError> {
                 self.inner
-                    .set_terminal_sequenced(task, status, result, error, ts)
+                    .set_terminal_sequenced(task, operation_id, status, result, error, ts)
                     .await
+            }
+            async fn journal_from(
+                &self,
+                task: &TaskId,
+                after_seq: i64,
+            ) -> Result<Vec<bridge_core::orch::OrchEvent>, BridgeError> {
+                self.inner.journal_from(task, after_seq).await
             }
             async fn progress_snapshot(
                 &self,
