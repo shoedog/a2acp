@@ -75,23 +75,25 @@
   the only thing that catches cross-task concurrency bugs; a "centralize" fix can have a wide deadlock blast radius
   — the systematic fix is a no-prune inner variant for every lock-holding caller.**
 
-- **Slice 6 — Event-journal dual-store (S2 journal seam): ARCHITECTING + PLANNING COMPLETE → READY TO IMPLEMENT**
-  (2026-06-19, NOT yet started impl). Docs: `specs/2026-06-19-slice-6-journal{,-ANALYSIS}.md` + `plans/2026-06-19-
-  slice-6-journal.md`. **Dual-lens architecture analysis CONVERGED** (controller + codex-xhigh, both
-  `sound-with-changes`); **spec v3** survived dual spec-review (codex `needs-rework`→ via v2 → focused re-review
-  `fix-then-plan`) + a controller-verified re-review — **FIX-1..16 binding**; **plan v2** dual plan-reviewed
-  (codex-xhigh + Opus, both `fix-then-implement`) — **PFIX-A..L binding** (read the plan's PFIX section FIRST).
-  **Settled design:** serialized `OrchEvent` journal row written in the SAME sequenced `unchecked_transaction` as
-  the typed columns (one shared `last_event_seq`); reattach replay = a FOLD of the journal into `TaskProgressSnapshot`
-  fed to the UNCHANGED `snapshot_frames` builder → byte-identical (FRAME-level invariant, NOT struct equality);
-  W3b resume stays 100% typed-column (journal is replay-ONLY). **KEY rulings:** wire FROZEN (`task watch` is a dumb
-  pass-through — project `OrchEvent`→old frame, defer the wire change to S7); CUT the un-exercised DTOs
-  (`OrchResult`/`OrchCommand`/rich variants/S6.5 → S7/S9 — only the 3 journaled `OrchEvent` kinds in S6); journal-fold
-  eligibility = `journal_complete_from_birth` flag AND (non-terminal OR `terminal_seq` set) [excludes unjournaled
-  `cancel_if_working`]; `journal_fold_inputs` = ONE trait method for a consistent read (PFIX-A); `operation_id` =
-  stable `op-<task>`. **NEXT = implement T1–T11** (codex-HIGH per the model-role matrix; controller verifies+commits)
-  → per-increment reviews → full gate → whole-branch codex-xhigh review (the cross-task-bug net) → live-gate vs real
-  codex+claude (detached run replayed via `task watch` after disconnect; W3b crash-resume intact) → merge.
+- **Slice 6 — Event-journal dual-store (S2 journal seam): SHIPPED + MERGED to `main`** (merge `9df6be4`, NOT yet
+  pushed) (2026-06-19). Docs: `specs/2026-06-19-slice-6-journal{,-ANALYSIS}.md` + `plans/2026-06-19-slice-6-journal.md`.
+  Dual-lens architecture analysis CONVERGED; spec v3 (FIX-1..16, dual spec-review + focused re-review) + plan v2
+  (PFIX-A..L, dual plan-review); **8 TDD impl commits** (codex-HIGH, controller-verified+committed) — Task 4
+  (`frame_from_orch`) + Task 9 (op-<task>) FOLDED-OUT (the fold IS the projection; op already wired in Task 7).
+  **Settled design (SHIPPED):** serialized `OrchEvent` journal row written in the SAME sequenced
+  `unchecked_transaction` as the typed columns (one shared `last_event_seq`); reattach replay = a FOLD of the journal
+  into `TaskProgressSnapshot` fed to the UNCHANGED `snapshot_frames` builder → byte-identical (FRAME-level invariant);
+  W3b resume stays 100% typed-column (journal replay-ONLY). Wire FROZEN; un-exercised DTOs (`OrchResult`/`OrchCommand`/
+  rich variants/S6.5) CUT to S7/S9. journal-fold eligibility = `journal_complete_from_birth` flag AND (non-terminal OR
+  `terminal_seq` set) [excludes unjournaled `cancel_if_working`/`mark_working_interrupted`]; `journal_fold_inputs` =
+  ONE consistent-read trait method (PFIX-A); `operation_id` = stable `op-<task>`. Full gate green (fmt/clippy/262
+  workspace tests). **Whole-branch review: BOTH lenses approve** (codex `approve` no findings + Opus
+  `approve-with-nits` — 3 doc nits, 0 BLOCKER/MAJOR/MINOR across 8 attack vectors). **LIVE-GATE (real codex) PASS:**
+  detached run → `task watch` replays from the journal-fold (n1 started+finished COLLAPSED to one `node_finished` in
+  the snapshot, proven live); durable journal survives serve restart (replayed from persisted SQLite, in-memory hub
+  gone); W3b mid-run crash-resume (killed mid-run → resumed → completed). **NEXT = Slice 7** (rich ACP mapping —
+  Plan/ToolCall/config/watchdog OrchEventKinds emitted; the deferred wire change to raw `OrchEvent`) per the slicing
+  roadmap; OR push `9df6be4`.
   Settled design: `run-workflow --serve --context C <wf>` = a STREAMING serve client (POST
   `SendStreamingMessage` skill=wf + contextId; `--context` requires `--serve`; `--config` serve-side); a
   **dependency-inversion `WorkflowNodeDispatcher`** (cold INLINE in bridge-workflow byte-identical = back-compat;
