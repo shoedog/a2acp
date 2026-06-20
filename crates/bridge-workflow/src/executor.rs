@@ -121,7 +121,7 @@ impl WorkflowExecutor {
                 }
             };
             if cancel.is_cancelled() {
-                turn.cleanup.on_exit(NodeTurnExit::Canceled).await;
+                turn.cleanup.on_exit(NodeTurnExit::Normal).await;
                 return (format!("[node {} canceled]", node.id.as_str()), false);
             }
 
@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_cancel_after_checkout_cancels_child() {
+    async fn warm_cancel_after_checkout_finishes_no_prompt_no_cancel() {
         struct CancelAfterCheckoutDispatcher {
             token: CancellationToken,
             rec: Arc<Rec>,
@@ -1072,7 +1072,8 @@ mod tests {
             }
         ));
         assert!(rec.prompt_parts.lock().unwrap().is_empty(), "no prompt");
-        assert_eq!(exits.lock().unwrap().as_slice(), ["canceled"]);
+        assert_eq!(*rec.cancels.lock().unwrap(), 0);
+        assert_eq!(exits.lock().unwrap().as_slice(), ["normal"]);
     }
 
     #[tokio::test]

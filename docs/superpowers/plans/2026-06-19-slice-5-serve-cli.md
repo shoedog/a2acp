@@ -196,6 +196,22 @@ Round-11 confirmed ordering sound; 2 MAJOR + 1 MINOR:
 - T8 (MINOR): branch on `--serve` immediately after parse; the serve branch reads its OWN input (don't hoist the
   read — local keeps config@`:2242`→input@`:2360`); update `RUN_WORKFLOW_USAGE`.
 
+### v14 — POST-IMPLEMENTATION whole-branch review folds (codex xhigh, iterate-to-clean r1→r2→r3 + adjudication)
+After T1–T8 shipped + the full gate passed, the WHOLE-BRANCH review (the entire `main...HEAD` diff) caught
+cross-task lifecycle bugs the per-increment reviews structurally could not:
+- r1: (BLOCKER) warm post-checkout token-cancel routed `Normal`/finish, but `CancelTask` fires ONLY the run
+  token (no `cancel_with_children` sweep) → a checked-out child's in-flight turn could strand → route through
+  `Canceled`/`sm.cancel`. (MAJOR) non-`--serve` CLI accepted+ignored `--url` → reject it.
+- r2: (MAJOR) `reap_idle` never pruned the new `children` map → stale-child leak after TTL reap → prune under
+  children→by_context.
+- r3 + adjudication: the warm pre-prompt cancel is **SITE-SPECIFIC** (this CORRECTS v13's blanket "both pre-prompt
+  → Normal"): **Site #1** (cancel AFTER checkout but BEFORE `prompt()` is called → no turn) = `Normal` — and
+  `sm.cancel` there is harmful, `AcpBackend::request_cancel` LATCHES even an unseen key (`acp_backend.rs:1464`)
+  and drains it on a later mint, poisoning warm reuse. **Site #2** (cancel while AWAITING `prompt()`, which for a
+  container-backed node has already started setup) = `Canceled` (driven through `sm.cancel`, since `CancelTask`
+  doesn't sweep children). In-drain = `Canceled`. Plus (MAJOR) close the `workflow_runs[C]` leak window between
+  the `stream_message` guard-insert and the producer-spawn (RAII guard disarmed once the producer owns cleanup).
+
 ---
 
 ## File Structure

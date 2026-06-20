@@ -872,6 +872,11 @@ async fn stream_message(
     } else {
         None
     };
+    let mut pre_producer_run_guard = workflow_token.as_ref().map(|(c, _)| PreProducerRunGuard {
+        workflow_runs: srv.workflow_runs.clone(),
+        ctx: c.clone(),
+        armed: true,
+    });
 
     // Persist task->session before driving the backend.
     let _ = srv.store.put(&routed.task, &routed.session).await;
@@ -930,7 +935,10 @@ async fn stream_message(
         // consumes it for `task`/`parts`).
         RouteTarget::Workflow(ref id) => {
             let id = id.clone();
-            spawn_workflow_producer(&srv, routed, id, tx, workflow_token)
+            spawn_workflow_producer(&srv, routed, id, tx, workflow_token);
+            if let Some(guard) = &mut pre_producer_run_guard {
+                guard.armed = false;
+            }
         }
     }
 
@@ -1792,6 +1800,25 @@ async fn release_run(srv: &Arc<InboundServer>, task: &TaskId, ctx: &Option<Conte
     srv.workflow_cancels.lock().await.remove(task);
     if let Some(c) = ctx {
         srv.workflow_runs.lock().await.remove(c);
+    }
+}
+
+struct PreProducerRunGuard {
+    workflow_runs: Arc<tokio::sync::Mutex<HashMap<ContextId, tokio_util::sync::CancellationToken>>>,
+    ctx: ContextId,
+    armed: bool,
+}
+
+impl Drop for PreProducerRunGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let workflow_runs = self.workflow_runs.clone();
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            workflow_runs.lock().await.remove(&ctx);
+        });
     }
 }
 
@@ -6534,6 +6561,48 @@ mod tests {
         assert_eq!(
             backend.forgotten(),
             vec!["ctx-parent::workflow::wf::node::n1-g0".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_producer_run_guard_drop_releases_context_unless_disarmed() {
+        let runs = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let ctx = ContextId::parse("ctx-pre-producer").unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        runs.lock().await.insert(ctx.clone(), token);
+
+        {
+            let _guard = PreProducerRunGuard {
+                workflow_runs: runs.clone(),
+                ctx: ctx.clone(),
+                armed: true,
+            };
+        }
+        for _ in 0..50 {
+            if !runs.lock().await.contains_key(&ctx) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !runs.lock().await.contains_key(&ctx),
+            "armed pre-producer guard must remove workflow_runs[context]"
+        );
+
+        let keep_ctx = ContextId::parse("ctx-pre-producer-keep").unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        runs.lock().await.insert(keep_ctx.clone(), token);
+        {
+            let _guard = PreProducerRunGuard {
+                workflow_runs: runs.clone(),
+                ctx: keep_ctx.clone(),
+                armed: false,
+            };
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            runs.lock().await.contains_key(&keep_ctx),
+            "disarmed pre-producer guard transfers cleanup to RunGuard"
         );
     }
 
