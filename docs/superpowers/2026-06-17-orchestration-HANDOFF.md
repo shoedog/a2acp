@@ -91,9 +91,31 @@
   `approve-with-nits` — 3 doc nits, 0 BLOCKER/MAJOR/MINOR across 8 attack vectors). **LIVE-GATE (real codex) PASS:**
   detached run → `task watch` replays from the journal-fold (n1 started+finished COLLAPSED to one `node_finished` in
   the snapshot, proven live); durable journal survives serve restart (replayed from persisted SQLite, in-memory hub
-  gone); W3b mid-run crash-resume (killed mid-run → resumed → completed). **NEXT = Slice 7** (rich ACP mapping —
-  Plan/ToolCall/config/watchdog OrchEventKinds emitted; the deferred wire change to raw `OrchEvent`) per the slicing
-  roadmap; OR push `9df6be4`.
+  gone); W3b mid-run crash-resume (killed mid-run → resumed → completed).
+
+- **Slice 7a — Rich ACP event journaling + transcript: SHIPPED + MERGED to `main`** (merge `8e1e5c6`, NOT yet
+  pushed) (2026-06-20). Docs: `specs/2026-06-20-slice-7-rich-acp-ANALYSIS.md` + `specs/2026-06-20-slice-7a-rich-acp.md`
+  (spec v2, FIX-1..13) + `plans/2026-06-20-slice-7a-rich-acp.md` (plan v2, PFIX-A..K). **Slice 7 SPLIT into S7a
+  (rich journaling, THIS) → S7b (the E9 watchdog).** Captures the dropped `plan`/`tool_call`/`tool_call_update`
+  `session/update`s → bridge-owned `OrchEventKind` DTOs → journaled on the S6 substrate for a DETACHED run →
+  visible in `task watch`. **Settled design (SHIPPED):** rich `session/update` → a pure SIBLING mapper
+  (`map_session_update_rich`, borrow) → an internal `TurnEvent::Rich` (NOT an `Update` variant — UPDATE-MINIMAL) →
+  the off-loop unfold SKIP-RICH LOOP (`sink.record` + continue, never yields an `Update`) → a dependency-inverted
+  `RichEventSink` built PER-NODE from a `RichEventSinkFactory` carried in `WorkflowRunContext` (the detached path
+  does NOT use the dispatcher seam → `prompt_observed` defaulted port + the factory closes over `op-<task>`) →
+  `record_event_sequenced` (journal-ONLY, shared `last_event_seq`, inert to W3b resume). **FLUSH BARRIER:** a node's
+  rich rows flush (durable+publish) BEFORE its `NodeFinished` (`run_node` non-dispatcher branch, all exit paths).
+  Reattach: rich `FrameKind`s + a NEW merged seq-ordered projection (`rich_snapshot_frames`: node frames +
+  Plan-latest + ToolCall folded by `tool_call_id`); the S6 no-rich golden stays byte-identical. **GOTCHAS:** the
+  tool-kind field serializes as `tool_kind` (an internally-tagged enum `tag="kind"` can't also have a `kind`
+  variant field); caps at MAP time incl. `tool_call_id`; config/mode/commands DEFERRED (SDK DTOs differ, not
+  gate-critical). **Whole-branch review: dual-lens** (codex `changes-required`; Opus DOWNGRADED the flush BLOCKER to
+  MINOR — committed-rows-precede-NodeFinished holds — confirmed 2 MAJORs [torn-read on the ineligible reattach path;
+  uncapped `tool_call_id`] + a NIT; fixed `ea74992`; focused re-review `clean`). **LIVE-GATE (real codex) PASS:** a
+  detached run where codex READS a file → `task watch` shows a folded `tool_call` frame (`tool_kind=read`,
+  `status=completed`) alongside the node/terminal frames; W3b mid-run crash-resume completes with the rich event
+  intact. **NEXT = Slice 7b** (the E9 watchdog: per-active-node-turn liveness on the journal, idle + hard
+  wall-clock, reuse `backend.cancel`+`turn_kill`) per `slice-7-rich-acp-ANALYSIS` D-E; OR push `8e1e5c6`.
   Settled design: `run-workflow --serve --context C <wf>` = a STREAMING serve client (POST
   `SendStreamingMessage` skill=wf + contextId; `--context` requires `--serve`; `--config` serve-side); a
   **dependency-inversion `WorkflowNodeDispatcher`** (cold INLINE in bridge-workflow byte-identical = back-compat;
