@@ -201,6 +201,14 @@ impl SessionManager {
         }
     }
 
+    async fn prune_child_registration(&self, ctx: &ContextId) {
+        let mut children = self.children.lock().await;
+        for set in children.values_mut() {
+            set.retain(|c| c != ctx);
+        }
+        children.retain(|_, set| !set.is_empty());
+    }
+
     /// Start a warm turn: mint (fresh ctx) or resume (known ctx). Resume requires a matching
     /// fingerprint (else ConfigMismatch), a non-retired lease (else SessionExpired), and an Idle
     /// handle (else HandleBusy). Transitions to Running. Resolves the agent exactly once.
@@ -328,14 +336,7 @@ impl SessionManager {
                     drop(h.lease);
                 }
             }
-            // Prune the children map in a separate lock after by_context is dropped.
-            {
-                let mut children = self.children.lock().await;
-                for set in children.values_mut() {
-                    set.retain(|c| c != ctx);
-                }
-                children.retain(|_, set| !set.is_empty());
-            }
+            self.prune_child_registration(ctx).await;
             return if cancelled_or_released {
                 Err(BridgeError::SessionExpired)
             } else {
@@ -413,13 +414,6 @@ impl SessionManager {
     }
 
     pub async fn expire_turn(&self, ctx: &ContextId) {
-        {
-            let mut children = self.children.lock().await;
-            for set in children.values_mut() {
-                set.retain(|c| c != ctx);
-            }
-            children.retain(|_, set| !set.is_empty());
-        }
         self.release(ctx).await;
     }
 
@@ -478,6 +472,11 @@ impl SessionManager {
     }
 
     pub async fn release(&self, ctx: &ContextId) {
+        self.release_inner(ctx).await;
+        self.prune_child_registration(ctx).await;
+    }
+
+    async fn release_inner(&self, ctx: &ContextId) {
         let h = {
             let mut tab = self.by_context.lock().await;
             if let Some(h) = tab.get_mut(ctx) {
@@ -500,9 +499,9 @@ impl SessionManager {
         let mut children = self.children.lock().await;
         let snapshot = children.get(ctx).cloned().unwrap_or_default();
 
-        self.release(ctx).await;
+        self.release_inner(ctx).await;
         for child in &snapshot {
-            self.release(child).await;
+            self.release_inner(child).await;
         }
         children.remove(ctx);
     }
@@ -655,14 +654,7 @@ impl SessionManager {
                     drop(h.lease);
                 }
             }
-            // Prune the children map in a separate lock after by_context is dropped.
-            {
-                let mut children = self.children.lock().await;
-                for set in children.values_mut() {
-                    set.retain(|c| c != ctx);
-                }
-                children.retain(|_, set| !set.is_empty());
-            }
+            self.prune_child_registration(ctx).await;
             return match cfg {
                 Err(e) => Err(e),
                 Ok(()) => Err(BridgeError::SessionExpired),
@@ -785,6 +777,8 @@ impl SessionManager {
             if let Some(h) = tab.remove(ctx) {
                 drop(h.lease);
             }
+            drop(tab);
+            self.prune_child_registration(ctx).await;
             return match cfg {
                 Err(e) => Err(e), // FIX-3: configure error, NOT SessionExpired
                 Ok(()) => Err(BridgeError::SessionExpired),
@@ -830,16 +824,7 @@ impl SessionManager {
                 drop(h.lease);
             }
         }
-        // compact-expire is another `by_context` removal site -> prune `children` too, so a
-        // compacted-then-expired child can't leak a stale parent->child registration (children
-        // leak class). Separate lock AFTER `by_context` is dropped -> children->by_context order.
-        {
-            let mut children = self.children.lock().await;
-            for set in children.values_mut() {
-                set.retain(|c| c != ctx);
-            }
-            children.retain(|_, set| !set.is_empty());
-        }
+        self.prune_child_registration(ctx).await;
     }
 
     /// Reap only idle warm sessions past the TTL (never an active turn).
@@ -1469,6 +1454,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_configure_failure_prunes_child_registration() {
+        let (m, fake, _r) = manager();
+        let parent = ctx("compact-configure-parent");
+        let child = ctx("compact-configure-child");
+        let turn = m
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("t1"))
+            .await
+            .unwrap();
+        m.finish_turn(&child, turn.generation, &turn.op).await;
+        assert!(m.child_registered(&parent, &child).await);
+
+        fake.set_configure_result(Err(BridgeError::ConfigInvalid {
+            reason: "test".into(),
+        }));
+        let err = m
+            .compact_session(&child, |_b, _s| async { Ok("good summary".to_string()) })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BridgeError::ConfigInvalid { .. }));
+        assert!(m.status(&child).await.is_none());
+        assert!(!m.child_registered(&parent, &child).await);
+        assert!(!m.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
     async fn checkout_consumes_seed_once() {
         let (m, _f, _r) = manager();
         let c = ctx("c");
@@ -1908,6 +1919,25 @@ mod tests {
             manager.cancel_with_children(&parent).await.err(),
             Some(BridgeError::SessionNotFound)
         );
+    }
+
+    #[tokio::test]
+    async fn release_standalone_prunes_child_registration() {
+        let (manager, _backend, _registry) = manager();
+        let parent = ctx("release-parent");
+        let child = ctx("release-child");
+
+        manager
+            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .await
+            .unwrap();
+        assert!(manager.child_registered(&parent, &child).await);
+
+        manager.release(&child).await;
+
+        assert!(manager.status(&child).await.is_none());
+        assert!(!manager.child_registered(&parent, &child).await);
+        assert!(!manager.child_parent_registered(&parent).await);
     }
 
     #[tokio::test]

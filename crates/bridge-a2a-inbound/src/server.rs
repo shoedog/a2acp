@@ -857,33 +857,34 @@ async fn stream_message(
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
 
-    let workflow_token = if matches!(&routed.target, RouteTarget::Workflow(_))
-        && routed.context_id.is_some()
-        && srv.session_manager.is_some()
-    {
-        let c = routed.context_id.clone().unwrap();
-        let mut runs = srv.workflow_runs.lock().await;
-        if runs.contains_key(&c) {
-            return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
-        }
-        let t = tokio_util::sync::CancellationToken::new();
-        runs.insert(c.clone(), t.clone());
-        drop(runs);
-        srv.workflow_cancels
-            .lock()
-            .await
-            .insert(routed.task.clone(), t.clone());
-        Some((c, t))
-    } else {
-        None
-    };
-    let mut pre_producer_run_guard = workflow_token.as_ref().map(|(c, _)| PreProducerRunGuard {
-        workflow_runs: srv.workflow_runs.clone(),
-        workflow_cancels: srv.workflow_cancels.clone(),
-        ctx: c.clone(),
-        task: routed.task.clone(),
-        armed: true,
-    });
+    let (workflow_token, mut pre_producer_run_guard) =
+        if matches!(&routed.target, RouteTarget::Workflow(_))
+            && routed.context_id.is_some()
+            && srv.session_manager.is_some()
+        {
+            let c = routed.context_id.clone().unwrap();
+            let mut runs = srv.workflow_runs.lock().await;
+            if runs.contains_key(&c) {
+                return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
+            }
+            let t = tokio_util::sync::CancellationToken::new();
+            runs.insert(c.clone(), t.clone());
+            let guard = PreProducerRunGuard {
+                workflow_runs: srv.workflow_runs.clone(),
+                workflow_cancels: srv.workflow_cancels.clone(),
+                ctx: c.clone(),
+                task: routed.task.clone(),
+                armed: true,
+            };
+            drop(runs);
+            srv.workflow_cancels
+                .lock()
+                .await
+                .insert(routed.task.clone(), t.clone());
+            (Some((c, t)), Some(guard))
+        } else {
+            (None, None)
+        };
 
     // Persist task->session before driving the backend.
     let _ = srv.store.put(&routed.task, &routed.session).await;
@@ -1904,6 +1905,9 @@ fn spawn_workflow_producer(
                     token
                 }
             };
+            if srv.store.cancel_requested(&task).await.unwrap_or(false) {
+                token.cancel();
+            }
             let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
                 session_cwd: routed.session_cwd.clone(),
             };

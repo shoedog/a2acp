@@ -6,7 +6,7 @@
 // and asserts the SSE frames: at least one node Status, a final synth Artifact, and
 // a terminal Completed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use a2a::{methods, SVC_PARAM_VERSION};
@@ -119,6 +119,7 @@ impl AgentRegistry for FakeRegistry {
 #[derive(Default)]
 struct FakeStore {
     map: std::sync::Mutex<HashMap<String, String>>,
+    cancels: std::sync::Mutex<HashSet<String>>,
 }
 #[async_trait]
 impl SessionStore for FakeStore {
@@ -149,11 +150,12 @@ impl SessionStore for FakeStore {
     async fn peer_task_for(&self, _t: &TaskId) -> Result<Option<PeerTaskId>, BridgeError> {
         Ok(None)
     }
-    async fn request_cancel(&self, _t: &TaskId) -> Result<(), BridgeError> {
+    async fn request_cancel(&self, t: &TaskId) -> Result<(), BridgeError> {
+        self.cancels.lock().unwrap().insert(t.as_str().into());
         Ok(())
     }
-    async fn cancel_requested(&self, _t: &TaskId) -> Result<bool, BridgeError> {
-        Ok(false)
+    async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
+        Ok(self.cancels.lock().unwrap().contains(t.as_str()))
     }
     async fn set_fanout(&self, _t: &TaskId) -> Result<(), BridgeError> {
         Ok(())
@@ -1129,6 +1131,54 @@ async fn cancel_task_immediately_after_warm_stream_send_cancels_workflow() {
     )
     .await
     .expect("warm workflow SSE must terminate after immediate CancelTask")
+    .unwrap();
+    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+}
+
+#[tokio::test]
+async fn cancel_task_before_warm_workflow_token_registration_cancels_run() {
+    let pending: Arc<dyn AgentBackend> = Arc::new(PendingBackend);
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [
+        ("codex".to_string(), pending.clone()),
+        ("claude".to_string(), pending.clone()),
+        ("synth".to_string(), pending.clone()),
+    ]
+    .into();
+    let srv = build_server_per_agent_with_session_manager(Arc::new(FakeStore::default()), backends);
+
+    let cancel_resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": "warm-early-cancel-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), axum::http::StatusCode::OK);
+    let cancel = json_response(cancel_resp).await;
+    assert_eq!(
+        cancel["result"]["task"]["state"], "TASK_STATE_CANCELED",
+        "{cancel}"
+    );
+
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            workflow_stream_params("warm-early-cancel-1", "ctx-warm-early-cancel"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    let raw = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        axum::body::to_bytes(resp.into_body(), usize::MAX),
+    )
+    .await
+    .expect("warm workflow SSE must terminate from the pre-registered CancelTask latch")
     .unwrap();
     assert_terminal_state(&raw, a2a::TaskState::Canceled);
 }
