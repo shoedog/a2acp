@@ -17,13 +17,14 @@ use agent_client_protocol::schema::{
     AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification,
     ContentBlock, CreateTerminalRequest, CreateTerminalResponse, EnvVariable, InitializeRequest,
     InitializeResponse, KillTerminalRequest, KillTerminalResponse, McpServer, McpServerStdio,
-    NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
-    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
-    SessionId as AgentSessionId, SessionModelState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, StopReason,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
+    NewSessionRequest, PermissionOptionKind, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
+    ReleaseTerminalResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+    SessionConfigValueId, SessionId as AgentSessionId, SessionModelState, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
+    StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolKind, WaitForTerminalExitRequest,
     WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo, ErrorCode};
@@ -41,7 +42,9 @@ use bridge_core::domain::{
 };
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
+use bridge_core::orch::{
+    AgentSessionCaps, ContentSummary, OrchEventKind, PlanEntry as BridgePlanEntry, ReconcileOutcome,
+};
 use bridge_core::ports::{
     AgentBackend, BackendStream, PolicyEngine, Update, STOP_REASON_CANCELLED,
 };
@@ -63,6 +66,9 @@ const DEFAULT_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// Grace handed to `Supervised::terminate` between SIGTERM and the SIGKILL
 /// escalation when we nuke the agent process on a cancel/drop timeout.
 const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+const RICH_CONTENT_CAP: usize = 2048;
+const RICH_VEC_CAP: usize = 64;
 
 /// Static configuration for an ACP agent connection.
 ///
@@ -1628,6 +1634,171 @@ impl AcpBackend {
     /// variant (thought chunks, plans, tool-call updates, ...) and non-text content
     /// is a tolerant-reader DROP (`None`).
     #[must_use]
+    pub fn map_session_update_rich(notif: &SessionNotification) -> Option<OrchEventKind> {
+        match &notif.update {
+            SessionUpdate::Plan(plan) => Some(OrchEventKind::Plan {
+                entries: plan
+                    .entries
+                    .iter()
+                    .take(RICH_VEC_CAP)
+                    .map(|entry| BridgePlanEntry {
+                        content: Self::cap(&entry.content),
+                        priority: Self::plan_entry_priority_str(&entry.priority).to_string(),
+                        status: Self::plan_entry_status_str(&entry.status).to_string(),
+                    })
+                    .collect(),
+            }),
+            SessionUpdate::ToolCall(tool_call) => Some(OrchEventKind::ToolCall {
+                tool_call_id: tool_call.tool_call_id.to_string(),
+                title: Self::cap(&tool_call.title),
+                kind: Self::tool_kind_str(&tool_call.kind).to_string(),
+                status: Self::tool_call_status_str(&tool_call.status).to_string(),
+                locations: Self::map_tool_call_locations(&tool_call.locations),
+                content: Self::map_tool_call_content(&tool_call.content),
+            }),
+            SessionUpdate::ToolCallUpdate(update) => Some(OrchEventKind::ToolCallUpdate {
+                tool_call_id: update.tool_call_id.to_string(),
+                title: update.fields.title.as_deref().map(Self::cap),
+                kind: update
+                    .fields
+                    .kind
+                    .as_ref()
+                    .map(|kind| Self::tool_kind_str(kind).to_string()),
+                status: update
+                    .fields
+                    .status
+                    .as_ref()
+                    .map(|status| Self::tool_call_status_str(status).to_string()),
+                locations: update
+                    .fields
+                    .locations
+                    .as_ref()
+                    .map(|locations| Self::map_tool_call_locations(locations)),
+                content: update
+                    .fields
+                    .content
+                    .as_ref()
+                    .map(|content| Self::summarize_tool_call_content(content)),
+            }),
+            _ => None,
+        }
+    }
+
+    fn cap(s: &str) -> String {
+        if s.len() <= RICH_CONTENT_CAP {
+            return s.to_string();
+        }
+
+        let mut end = 0;
+        for (idx, ch) in s.char_indices() {
+            let next = idx + ch.len_utf8();
+            if next > RICH_CONTENT_CAP {
+                break;
+            }
+            end = next;
+        }
+        s[..end].to_string()
+    }
+
+    fn map_tool_call_locations(locations: &[ToolCallLocation]) -> Vec<String> {
+        locations
+            .iter()
+            .take(RICH_VEC_CAP)
+            .map(|loc| Self::cap(loc.path.to_string_lossy().as_ref()))
+            .collect()
+    }
+
+    fn map_tool_call_content(content: &[ToolCallContent]) -> Option<ContentSummary> {
+        if content.is_empty() {
+            None
+        } else {
+            Some(Self::summarize_tool_call_content(content))
+        }
+    }
+
+    fn summarize_tool_call_content(content: &[ToolCallContent]) -> ContentSummary {
+        let preview = content
+            .iter()
+            .take(RICH_VEC_CAP)
+            .map(Self::tool_call_content_preview)
+            .collect::<Vec<_>>()
+            .join("\n");
+        ContentSummary {
+            item_count: content.len(),
+            preview: Self::cap(&preview),
+        }
+    }
+
+    fn tool_call_content_preview(content: &ToolCallContent) -> String {
+        match content {
+            ToolCallContent::Content(content) => match &content.content {
+                ContentBlock::Text(t) => Self::cap(&t.text),
+                _ => "[non-text]".to_string(),
+            },
+            ToolCallContent::Diff(diff) => {
+                let added = diff.new_text.lines().count();
+                let removed = diff
+                    .old_text
+                    .as_deref()
+                    .map(|old| old.lines().count())
+                    .unwrap_or(0);
+                Self::cap(&format!(
+                    "{} (+{}/-{})",
+                    diff.path.to_string_lossy(),
+                    added,
+                    removed
+                ))
+            }
+            ToolCallContent::Terminal(_) => "[terminal]".to_string(),
+            _ => "other".to_string(),
+        }
+    }
+
+    fn plan_entry_priority_str(priority: &PlanEntryPriority) -> &'static str {
+        match priority {
+            PlanEntryPriority::High => "high",
+            PlanEntryPriority::Medium => "medium",
+            PlanEntryPriority::Low => "low",
+            _ => "other",
+        }
+    }
+
+    fn plan_entry_status_str(status: &PlanEntryStatus) -> &'static str {
+        match status {
+            PlanEntryStatus::Pending => "pending",
+            PlanEntryStatus::InProgress => "in_progress",
+            PlanEntryStatus::Completed => "completed",
+            _ => "other",
+        }
+    }
+
+    fn tool_kind_str(kind: &ToolKind) -> &'static str {
+        match kind {
+            ToolKind::Read => "read",
+            ToolKind::Edit => "edit",
+            ToolKind::Delete => "delete",
+            ToolKind::Move => "move",
+            ToolKind::Search => "search",
+            ToolKind::Execute => "execute",
+            ToolKind::Think => "think",
+            ToolKind::Fetch => "fetch",
+            ToolKind::SwitchMode => "switch_mode",
+            ToolKind::Other => "other",
+            _ => "other",
+        }
+    }
+
+    fn tool_call_status_str(status: &ToolCallStatus) -> &'static str {
+        match status {
+            ToolCallStatus::Pending => "pending",
+            ToolCallStatus::InProgress => "in_progress",
+            ToolCallStatus::Completed => "completed",
+            ToolCallStatus::Failed => "failed",
+            _ => "other",
+        }
+    }
+
+    #[must_use]
     pub fn map_session_update(notif: SessionNotification) -> Option<Update> {
         match notif.update {
             SessionUpdate::AgentMessageChunk(chunk) => {
@@ -2204,6 +2375,98 @@ mod tests {
             }
             other => panic!("expected Update::Usage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_rich_plan_toolcall_update() {
+        use agent_client_protocol::schema::{
+            ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ToolCall,
+            ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+            ToolCallUpdateFields, ToolKind,
+        };
+
+        let plan = SessionNotification::new(
+            AgentSessionId::from("s"),
+            SessionUpdate::Plan(Plan::new(vec![PlanEntry::new(
+                "inspect repo",
+                PlanEntryPriority::High,
+                PlanEntryStatus::InProgress,
+            )])),
+        );
+        assert!(matches!(
+            AcpBackend::map_session_update_rich(&plan),
+            Some(bridge_core::orch::OrchEventKind::Plan { .. })
+        ));
+
+        let tc = SessionNotification::new(
+            AgentSessionId::from("s"),
+            SessionUpdate::ToolCall(ToolCall::new("t1", "read").kind(ToolKind::Read)),
+        );
+        let Some(bridge_core::orch::OrchEventKind::ToolCall { tool_call_id, .. }) =
+            AcpBackend::map_session_update_rich(&tc)
+        else {
+            panic!("expected rich tool call");
+        };
+        assert_eq!(tool_call_id, "t1");
+
+        let update = SessionNotification::new(
+            AgentSessionId::from("s"),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "t1",
+                ToolCallUpdateFields::new()
+                    .title("read file".to_string())
+                    .kind(ToolKind::Read)
+                    .status(ToolCallStatus::Completed)
+                    .content(Vec::<ToolCallContent>::new())
+                    .locations(vec![ToolCallLocation::new("src/lib.rs")]),
+            )),
+        );
+        let Some(bridge_core::orch::OrchEventKind::ToolCallUpdate {
+            title,
+            kind,
+            status,
+            locations,
+            content,
+            ..
+        }) = AcpBackend::map_session_update_rich(&update)
+        else {
+            panic!("expected rich tool call update");
+        };
+        assert_eq!(title.as_deref(), Some("read file"));
+        assert_eq!(kind.as_deref(), Some("read"));
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(locations.as_deref(), Some(&["src/lib.rs".to_string()][..]));
+        let content = content.expect("empty content patch remains present");
+        assert_eq!(content.item_count, 0);
+        assert_eq!(content.preview, "");
+
+        let txt = SessionNotification::new(
+            AgentSessionId::from("s"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("hi"),
+            ))),
+        );
+        assert!(AcpBackend::map_session_update_rich(&txt).is_none());
+    }
+
+    #[test]
+    fn map_rich_caps_content() {
+        use agent_client_protocol::schema::{ToolCall, ToolCallContent};
+
+        let big = "x".repeat(10_000);
+        let tc = SessionNotification::new(
+            AgentSessionId::from("s"),
+            SessionUpdate::ToolCall(ToolCall::new("t", "t").content(vec![ToolCallContent::from(
+                ContentBlock::Text(TextContent::new(big)),
+            )])),
+        );
+        let Some(bridge_core::orch::OrchEventKind::ToolCall {
+            content: Some(cs), ..
+        }) = AcpBackend::map_session_update_rich(&tc)
+        else {
+            panic!("expected rich tool call content");
+        };
+        assert!(cs.preview.len() <= RICH_CONTENT_CAP);
     }
 
     #[tokio::test]
