@@ -3235,10 +3235,12 @@ async fn session_release(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    if srv.workflow_runs.lock().await.contains_key(&ctx) {
+    let runs = srv.workflow_runs.lock().await;
+    if runs.contains_key(&ctx) {
         return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
     }
     sm.release_with_children(&ctx).await;
+    drop(runs);
     jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "released": true }))
 }
 
@@ -3258,14 +3260,17 @@ async fn session_clear(
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    if srv.workflow_runs.lock().await.contains_key(&ctx) {
+    let runs = srv.workflow_runs.lock().await;
+    if runs.contains_key(&ctx) {
         return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
     }
     let force = params
         .get("force")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    match sm.clear_with_children(&ctx, force).await {
+    let result = sm.clear_with_children(&ctx, force).await;
+    drop(runs);
+    match result {
         Ok(crate::session_manager::ResetOutcome::Cleared { generation }) => jsonrpc_ok(
             id,
             json!({ "contextId": ctx.as_str(), "cleared": true, "generation": generation }),
@@ -3736,8 +3741,9 @@ mod tests {
     use bridge_core::ports::*;
     use bridge_core::ports::{Delegation, DelegationPort, DelegationStream};
     use bridge_core::translator::Event;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::oneshot;
     use tower::ServiceExt;
 
     // ---- inline fakes ----
@@ -6351,6 +6357,9 @@ mod tests {
         cancels: Arc<Mutex<Vec<String>>>,
         configured: ConfiguredSessions,
         prompted_parts: Arc<Mutex<Vec<Vec<String>>>>,
+        release_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        release_started: Arc<tokio::sync::Notify>,
+        release_started_count: AtomicUsize,
     }
 
     impl WarmRecordingBackend {
@@ -6361,6 +6370,9 @@ mod tests {
                 cancels: Arc::new(Mutex::new(Vec::new())),
                 configured: Arc::new(Mutex::new(Vec::new())),
                 prompted_parts: Arc::new(Mutex::new(Vec::new())),
+                release_gate: Arc::new(Mutex::new(None)),
+                release_started: Arc::new(tokio::sync::Notify::new()),
+                release_started_count: AtomicUsize::new(0),
             })
         }
 
@@ -6382,6 +6394,26 @@ mod tests {
 
         fn forgotten(&self) -> Vec<String> {
             self.forgotten.lock().unwrap().clone()
+        }
+
+        fn gate_release_session(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.release_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        async fn wait_release_started(&self) {
+            for _ in 0..50 {
+                if self.release_started_count.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                let notified = self.release_started.notified();
+                if self.release_started_count.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(10), notified).await;
+            }
+            panic!("release_session did not start");
         }
     }
 
@@ -6430,6 +6462,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(session.as_str().to_owned());
+        }
+
+        async fn release_session(&self, session: &SessionId) {
+            self.forgotten
+                .lock()
+                .unwrap()
+                .push(session.as_str().to_owned());
+            let gate = self.release_gate.lock().unwrap().take();
+            self.release_started_count.fetch_add(1, Ordering::SeqCst);
+            self.release_started.notify_waiters();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
         }
     }
 
@@ -7553,8 +7598,19 @@ mod tests {
 
     #[tokio::test]
     async fn session_release_rejects_during_active_workflow_run() {
-        let (srv, _, _) = seed_test_server();
+        let (srv, sm, _) = seed_test_server();
         let ctx = ContextId::parse("c-active-release").unwrap();
+        let child = ContextId::parse("c-active-release::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &ctx,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-active-release").unwrap(),
+        )
+        .await
+        .expect("child checkout");
         srv.workflow_runs
             .lock()
             .await
@@ -7573,12 +7629,76 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
         assert_eq!(v["error"]["message"], "session busy");
+        assert!(
+            sm.status(&child).await.is_some(),
+            "busy release must not sweep an active workflow child"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_release_during_run_start_is_atomic() {
+        let (srv, sm, backend) = seed_test_server();
+        let parent = ContextId::parse("c-release-atomic").unwrap();
+        let child = ContextId::parse("c-release-atomic::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &parent,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-release-atomic").unwrap(),
+        )
+        .await
+        .expect("child checkout");
+        let release_gate = backend.gate_release_session();
+
+        let release = tokio::spawn({
+            let srv = srv.clone();
+            async move {
+                router(srv)
+                    .oneshot(post_request(
+                        "SessionRelease",
+                        json!({ "contextId": "c-release-atomic" }),
+                        "1.0",
+                    ))
+                    .await
+                    .unwrap()
+            }
+        });
+
+        backend.wait_release_started().await;
+        let workflow_runs_locked = srv.workflow_runs.try_lock().is_err();
+
+        release_gate.send(()).unwrap();
+        let resp = release.await.unwrap();
+        assert!(
+            workflow_runs_locked,
+            "SessionRelease must hold workflow_runs while sweeping children"
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"],
+            json!({ "contextId": "c-release-atomic", "released": true })
+        );
     }
 
     #[tokio::test]
     async fn session_clear_rejects_during_active_workflow_run() {
-        let (srv, _, _) = seed_test_server();
+        let (srv, sm, _) = seed_test_server();
         let ctx = ContextId::parse("c-active-clear").unwrap();
+        let child = ContextId::parse("c-active-clear::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &ctx,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-active-clear").unwrap(),
+        )
+        .await
+        .expect("child checkout");
         srv.workflow_runs
             .lock()
             .await
@@ -7597,6 +7717,59 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
         assert_eq!(v["error"]["message"], "session busy");
+        assert!(
+            sm.status(&child).await.is_some(),
+            "busy clear must not sweep an active workflow child"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_clear_during_run_start_is_atomic() {
+        let (srv, sm, backend) = seed_test_server();
+        let parent = ContextId::parse("c-clear-atomic").unwrap();
+        let child = ContextId::parse("c-clear-atomic::workflow::wf::node::n1").unwrap();
+        sm.checkout_child_turn(
+            &parent,
+            &child,
+            AgentId::parse("a").unwrap(),
+            None,
+            None,
+            OperationId::parse("op-clear-atomic").unwrap(),
+        )
+        .await
+        .expect("child checkout");
+        let release_gate = backend.gate_release_session();
+
+        let clear = tokio::spawn({
+            let srv = srv.clone();
+            async move {
+                router(srv)
+                    .oneshot(post_request(
+                        "SessionClear",
+                        json!({ "contextId": "c-clear-atomic", "force": true }),
+                        "1.0",
+                    ))
+                    .await
+                    .unwrap()
+            }
+        });
+
+        backend.wait_release_started().await;
+        let workflow_runs_locked = srv.workflow_runs.try_lock().is_err();
+
+        release_gate.send(()).unwrap();
+        let resp = clear.await.unwrap();
+        assert!(
+            workflow_runs_locked,
+            "SessionClear must hold workflow_runs while sweeping children"
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"],
+            json!({ "contextId": "c-clear-atomic", "cleared": true, "generation": 0 })
+        );
     }
 
     #[tokio::test]
