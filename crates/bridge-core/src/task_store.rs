@@ -191,6 +191,22 @@ pub trait TaskStore: Send + Sync {
         after_seq: i64,
     ) -> Result<Vec<crate::orch::OrchEvent>, BridgeError>;
 
+    async fn journal_fold_inputs(&self, task: &TaskId) -> Result<JournalFoldInputs, BridgeError> {
+        let snap = self.progress_snapshot(task).await?;
+        let events = self.journal_from(task, -1).await?;
+        Ok(JournalFoldInputs {
+            complete_from_birth: false,
+            scalars: JournalScalars {
+                status: snap.status,
+                result: snap.result,
+                error: snap.error,
+                terminal_seq: snap.terminal_seq,
+                cut_seq: snap.cut_seq,
+            },
+            events,
+        })
+    }
+
     /// Reconstruct the current progress state for streaming reattach.
     /// `checkpoints` is ordered by seq (ascending).
     ///
@@ -200,7 +216,7 @@ pub trait TaskStore: Send + Sync {
     async fn progress_snapshot(&self, task: &TaskId) -> Result<TaskProgressSnapshot, BridgeError>;
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// Snapshot of a task's current progress for streaming reattach.
@@ -228,6 +244,13 @@ pub struct JournalScalars {
     pub error: Option<String>,
     pub terminal_seq: Option<i64>,
     pub cut_seq: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct JournalFoldInputs {
+    pub complete_from_birth: bool,
+    pub scalars: JournalScalars,
+    pub events: Vec<crate::orch::OrchEvent>,
 }
 
 pub fn fold_journal_to_snapshot(
@@ -276,7 +299,11 @@ type CheckpointValue = (String, bool, i64, i64);
 /// can default to it WITHOUT depending on `bridge-store`.
 #[derive(Default)]
 pub struct MemoryTaskStore {
+    /// Coarse guard for Memory fold-input consistency across the split maps.
+    journal_fold_guard: Mutex<()>,
     inner: Mutex<HashMap<String, TaskRecord>>,
+    /// Tasks created under S6 code have complete journal coverage from birth.
+    birth: Mutex<HashSet<String>>,
     /// Key: (task_id, node_id) → (output, ok, ts, seq)
     checkpoints: Mutex<HashMap<(String, String), CheckpointValue>>,
     /// Per-task monotonic seq counter. Key: task_id.
@@ -292,7 +319,9 @@ pub struct MemoryTaskStore {
 impl MemoryTaskStore {
     pub fn new() -> Self {
         Self {
+            journal_fold_guard: Mutex::new(()),
             inner: Mutex::new(HashMap::new()),
+            birth: Mutex::new(HashSet::new()),
             checkpoints: Mutex::new(HashMap::new()),
             seq_counters: Mutex::new(HashMap::new()),
             terminal_seqs: Mutex::new(HashMap::new()),
@@ -314,11 +343,16 @@ impl MemoryTaskStore {
 #[async_trait::async_trait]
 impl TaskStore for MemoryTaskStore {
     async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         let mut g = self.inner.lock().unwrap();
         if g.contains_key(rec.id.as_str()) {
             return Err(BridgeError::StoreFailure);
         }
         g.insert(rec.id.as_str().to_string(), rec.clone());
+        self.birth
+            .lock()
+            .unwrap()
+            .insert(rec.id.as_str().to_string());
         Ok(())
     }
     async fn set_terminal(
@@ -329,6 +363,7 @@ impl TaskStore for MemoryTaskStore {
         error: Option<&str>,
         updated_ms: i64,
     ) -> Result<(), BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         let mut g = self.inner.lock().unwrap();
         let row = g.get_mut(id.as_str()).ok_or(BridgeError::StoreFailure)?;
         row.status = status;
@@ -348,6 +383,7 @@ impl TaskStore for MemoryTaskStore {
         Ok(v)
     }
     async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         let mut g = self.inner.lock().unwrap();
         let mut n = 0;
         for row in g.values_mut() {
@@ -361,6 +397,7 @@ impl TaskStore for MemoryTaskStore {
         Ok(n)
     }
     async fn cancel_if_working(&self, id: &TaskId, updated_ms: i64) -> Result<bool, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         let mut g = self.inner.lock().unwrap();
         match g.get_mut(id.as_str()) {
             Some(row) if row.status == TaskRecordStatus::Working => {
@@ -440,6 +477,7 @@ impl TaskStore for MemoryTaskStore {
         operation_id: &OperationId,
         ts: i64,
     ) -> Result<i64, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         // Task must exist.
         {
             let inner = self.inner.lock().unwrap();
@@ -481,6 +519,7 @@ impl TaskStore for MemoryTaskStore {
         ok: bool,
         ts: i64,
     ) -> Result<i64, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         // Task must exist.
         {
             let inner = self.inner.lock().unwrap();
@@ -534,6 +573,7 @@ impl TaskStore for MemoryTaskStore {
         error: Option<&str>,
         ts: i64,
     ) -> Result<i64, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
         // Task must exist — check BEFORE allocating a seq (mirrors record_node_started /
         // put_node_checkpoint_sequenced order to avoid leaking a counter increment on
         // a non-existent task).
@@ -602,6 +642,49 @@ impl TaskStore for MemoryTaskStore {
             .collect();
         out.sort_by_key(|event| event.seq);
         Ok(out)
+    }
+
+    async fn journal_fold_inputs(&self, task: &TaskId) -> Result<JournalFoldInputs, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let row = {
+            let g = self.inner.lock().unwrap();
+            g.get(task.as_str())
+                .cloned()
+                .ok_or(BridgeError::StoreFailure)?
+        };
+        let cut_seq = {
+            let g = self.seq_counters.lock().unwrap();
+            *g.get(task.as_str()).unwrap_or(&0)
+        };
+        let terminal_seq = {
+            let g = self.terminal_seqs.lock().unwrap();
+            g.get(task.as_str()).copied()
+        };
+        let complete_from_birth = self.birth.lock().unwrap().contains(task.as_str());
+        let mut events: Vec<crate::orch::OrchEvent> = {
+            let g = self.journals.lock().unwrap();
+            g.get(task.as_str())
+                .into_iter()
+                .flat_map(|rows| rows.iter())
+                .map(|(seq, event)| {
+                    let mut event = event.clone();
+                    event.seq = *seq;
+                    event
+                })
+                .collect()
+        };
+        events.sort_by_key(|event| event.seq);
+        Ok(JournalFoldInputs {
+            complete_from_birth,
+            scalars: JournalScalars {
+                status: row.status,
+                result: row.result,
+                error: row.error,
+                terminal_seq,
+                cut_seq,
+            },
+            events,
+        })
     }
 
     async fn progress_snapshot(&self, task: &TaskId) -> Result<TaskProgressSnapshot, BridgeError> {
@@ -1043,6 +1126,24 @@ mod tests {
                 && evs[1].seq == s2
         );
         assert_eq!(evs[0].operation_id.as_str(), "op-task-j");
+    }
+
+    #[tokio::test]
+    async fn create_sets_birth_flag_and_fold_inputs_consistent() {
+        let s = MemoryTaskStore::new();
+        let t = TaskId::parse("task-b").unwrap();
+        s.create(&rec("task-b", 1)).await.unwrap();
+        let a = NodeId::parse("a").unwrap();
+        let op = OperationId::parse("op-task-b").unwrap();
+        s.record_node_started(&t, &a, &op, 1).await.unwrap();
+        s.put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+            .await
+            .unwrap();
+
+        let fi = s.journal_fold_inputs(&t).await.unwrap();
+        assert!(fi.complete_from_birth);
+        assert_eq!(fi.events.len(), 2);
+        assert_eq!(fi.scalars.cut_seq, 2);
     }
 
     #[tokio::test]

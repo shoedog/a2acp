@@ -379,8 +379,9 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms,
-                               input, workflow_spec_json, resume_attempts, session_cwd)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                               input, workflow_spec_json, resume_attempts, session_cwd,
+                               journal_complete_from_birth)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
             rusqlite::params![
                 rec.id.as_str(),
                 rec.workflow,
@@ -775,6 +776,76 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             out.push(event);
         }
         Ok(out)
+    }
+
+    async fn journal_fold_inputs(
+        &self,
+        task: &TaskId,
+    ) -> Result<bridge_core::task_store::JournalFoldInputs, BridgeError> {
+        use bridge_core::task_store::{JournalFoldInputs, JournalScalars, TaskRecordStatus};
+        let conn = self.conn.lock().unwrap();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let (status_s, result, error, terminal_seq, cut_seq, complete_from_birth): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            i64,
+            i64,
+        ) = tx
+            .query_row(
+                "SELECT status, result, error, terminal_seq, last_event_seq,
+                        journal_complete_from_birth
+                 FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let scalars = JournalScalars {
+            status: TaskRecordStatus::parse(&status_s).ok_or(BridgeError::StoreFailure)?,
+            result,
+            error,
+            terminal_seq,
+            cut_seq,
+        };
+        let events = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT seq, event_json FROM task_journal
+                     WHERE task_id=?1 ORDER BY seq",
+                )
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut rows = stmt
+                .query(rusqlite::params![task.as_str()])
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
+                let seq: i64 = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+                let event_json: String = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
+                let mut event: bridge_core::orch::OrchEvent =
+                    serde_json::from_str(&event_json).map_err(|_| BridgeError::StoreFailure)?;
+                event.seq = seq;
+                out.push(event);
+            }
+            out
+        };
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+        Ok(JournalFoldInputs {
+            complete_from_birth: complete_from_birth != 0,
+            scalars,
+            events,
+        })
     }
 
     async fn progress_snapshot(
@@ -1374,6 +1445,25 @@ mod tests {
     #[tokio::test]
     async fn memory_journal_write() {
         journal_write_matches_typed(bridge_core::task_store::MemoryTaskStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn create_sets_birth_flag_and_fold_inputs_consistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let t = TaskId::parse("task-b").unwrap();
+        store.create(&trec("task-b", 1)).await.unwrap();
+        let a = bridge_core::ids::NodeId::parse("a").unwrap();
+        let op = OperationId::parse("op-task-b").unwrap();
+        store.record_node_started(&t, &a, &op, 1).await.unwrap();
+        store
+            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+            .await
+            .unwrap();
+
+        let fi = store.journal_fold_inputs(&t).await.unwrap();
+        assert!(fi.complete_from_birth);
+        assert_eq!(fi.events.len(), 2);
+        assert_eq!(fi.scalars.cut_seq, 2);
     }
 
     async fn duplicate_sequenced_checkpoint_is_write_once<S: bridge_core::task_store::TaskStore>(
