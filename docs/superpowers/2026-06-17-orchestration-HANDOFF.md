@@ -73,8 +73,25 @@
   + `catch_unwind` cleanup + early-`CancelTask` latch; release/clear reject + ATOMIC check+sweep vs active run;
   `--url` requires `--serve`. **KEY LESSON: the whole-branch review (whole `main...HEAD` diff, iterate-to-clean) is
   the only thing that catches cross-task concurrency bugs; a "centralize" fix can have a wide deadlock blast radius
-  — the systematic fix is a no-prune inner variant for every lock-holding caller.** **NEXT = Slice 6 (S6 journal)
-  per the slicing roadmap.**
+  — the systematic fix is a no-prune inner variant for every lock-holding caller.**
+
+- **Slice 6 — Event-journal dual-store (S2 journal seam): ARCHITECTING + PLANNING COMPLETE → READY TO IMPLEMENT**
+  (2026-06-19, NOT yet started impl). Docs: `specs/2026-06-19-slice-6-journal{,-ANALYSIS}.md` + `plans/2026-06-19-
+  slice-6-journal.md`. **Dual-lens architecture analysis CONVERGED** (controller + codex-xhigh, both
+  `sound-with-changes`); **spec v3** survived dual spec-review (codex `needs-rework`→ via v2 → focused re-review
+  `fix-then-plan`) + a controller-verified re-review — **FIX-1..16 binding**; **plan v2** dual plan-reviewed
+  (codex-xhigh + Opus, both `fix-then-implement`) — **PFIX-A..L binding** (read the plan's PFIX section FIRST).
+  **Settled design:** serialized `OrchEvent` journal row written in the SAME sequenced `unchecked_transaction` as
+  the typed columns (one shared `last_event_seq`); reattach replay = a FOLD of the journal into `TaskProgressSnapshot`
+  fed to the UNCHANGED `snapshot_frames` builder → byte-identical (FRAME-level invariant, NOT struct equality);
+  W3b resume stays 100% typed-column (journal is replay-ONLY). **KEY rulings:** wire FROZEN (`task watch` is a dumb
+  pass-through — project `OrchEvent`→old frame, defer the wire change to S7); CUT the un-exercised DTOs
+  (`OrchResult`/`OrchCommand`/rich variants/S6.5 → S7/S9 — only the 3 journaled `OrchEvent` kinds in S6); journal-fold
+  eligibility = `journal_complete_from_birth` flag AND (non-terminal OR `terminal_seq` set) [excludes unjournaled
+  `cancel_if_working`]; `journal_fold_inputs` = ONE trait method for a consistent read (PFIX-A); `operation_id` =
+  stable `op-<task>`. **NEXT = implement T1–T11** (codex-HIGH per the model-role matrix; controller verifies+commits)
+  → per-increment reviews → full gate → whole-branch codex-xhigh review (the cross-task-bug net) → live-gate vs real
+  codex+claude (detached run replayed via `task watch` after disconnect; W3b crash-resume intact) → merge.
   Settled design: `run-workflow --serve --context C <wf>` = a STREAMING serve client (POST
   `SendStreamingMessage` skill=wf + contextId; `--context` requires `--serve`; `--config` serve-side); a
   **dependency-inversion `WorkflowNodeDispatcher`** (cold INLINE in bridge-workflow byte-identical = back-compat;
