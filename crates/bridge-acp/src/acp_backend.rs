@@ -217,14 +217,19 @@ type UpdateRegistry = Arc<StdMutex<HashMap<AgentSessionId, TurnRoute>>>;
 
 struct TurnRoute {
     tx: UpdateSender,
-    #[allow(dead_code)]
     watch: Option<Arc<TurnWatch>>,
 }
 
-#[allow(dead_code)]
 struct TurnWatch {
     turn_start: Instant,
     last_activity_ms: AtomicU64,
+}
+
+fn bump_activity(w: &TurnWatch) {
+    w.last_activity_ms.store(
+        w.turn_start.elapsed().as_millis() as u64 + 1,
+        Ordering::Relaxed,
+    );
 }
 
 /// What the notification handler forwards to a turn's driver/stream. Kept
@@ -977,6 +982,7 @@ impl AcpBackend {
             Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
         ));
         let policy_handler = Arc::clone(&policy);
+        let updates_perm_handler = Arc::clone(&updates);
 
         // The event loop owns a long-lived task. `main_fn` publishes a clone of
         // `cx` and then parks on `shutdown_rx` so the connection stays open for
@@ -994,11 +1000,19 @@ impl AcpBackend {
                     move |notif: SessionNotification, _cx| {
                         let updates = Arc::clone(&updates_handler);
                         async move {
+                            let session_id = notif.session_id.clone();
+                            if let Ok(map) = updates.lock() {
+                                if let Some(route) = map.get(&session_id) {
+                                    if let Some(w) = &route.watch {
+                                        bump_activity(w);
+                                    }
+                                }
+                            }
+
                             // Map rich updates first by borrow, then fall back to the
                             // value-consuming text/usage mapper. This handler stays
                             // try-send only: rich sink writes happen in the off-loop
                             // stream driver.
-                            let session_id = notif.session_id.clone();
                             let te = if let Some(kind) = Self::map_session_update_rich(&notif) {
                                 Some(TurnEvent::Rich(kind))
                             } else {
@@ -1041,7 +1055,16 @@ impl AcpBackend {
                     >,
                           cx: ConnectionTo<Agent>| {
                         let policy = Arc::clone(&policy_handler);
+                        let updates = Arc::clone(&updates_perm_handler);
                         async move {
+                            if let Ok(map) = updates.lock() {
+                                if let Some(route) = map.get(&req.session_id) {
+                                    if let Some(w) = &route.watch {
+                                        bump_activity(w);
+                                    }
+                                }
+                            }
+
                             // Offload so the dispatch loop is NOT blocked. The
                             // spawned task owns the `Responder` and answers from there.
                             cx.spawn(async move {
@@ -1943,11 +1966,30 @@ impl AcpBackend {
         let (tx, rx) = mpsc::unbounded_channel::<TurnEvent>();
         let done_sender = tx.clone();
         let registry = Arc::clone(self.updates()?);
+        let watch = if self
+            .config
+            .as_ref()
+            .and_then(|c| c.watchdog.as_ref())
+            .is_some()
+        {
+            Some(Arc::new(TurnWatch {
+                turn_start: Instant::now(),
+                last_activity_ms: AtomicU64::new(0),
+            }))
+        } else {
+            None
+        };
         {
             let mut map = registry
                 .lock()
                 .map_err(|_| BridgeError::agent_crashed("update routing registry lock poisoned"))?;
-            map.insert(agent_id.clone(), TurnRoute { tx, watch: None });
+            map.insert(
+                agent_id.clone(),
+                TurnRoute {
+                    tx,
+                    watch: watch.clone(),
+                },
+            );
         }
 
         let cx = self.cx()?.clone();
@@ -2338,6 +2380,21 @@ mod tests {
         SessionListCapabilities, SessionResumeCapabilities,
     };
     use agent_client_protocol::{Agent, Channel};
+
+    #[test]
+    fn bump_activity_advances_last_activity() {
+        let w = TurnWatch {
+            turn_start: std::time::Instant::now(),
+            last_activity_ms: std::sync::atomic::AtomicU64::new(0),
+        };
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        bump_activity(&w);
+        assert!(
+            w.last_activity_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
+    }
 
     /// Spawn an in-process fake ACP agent on `channel` that answers `initialize`
     /// with the given response. Returns immediately; the agent loop runs in a task.
