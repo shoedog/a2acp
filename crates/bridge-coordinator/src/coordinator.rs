@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::clock::Clock;
 use crate::detached::{
     new_detached_task_id, resume_working_tasks, spawn_detached_workflow, DetachedDeps,
-    TaskProgressHub, SUPPORTED_SNAPSHOT_VERSION,
+    TaskProgressHub,
 };
 use crate::dispatch::TaskBinding;
 use crate::params::OpParams;
@@ -275,9 +275,7 @@ impl Coordinator {
         let task = new_detached_task_id();
         let now = self.clock.now_ms();
         let input = p.input;
-        let workflow_spec_json = Some(
-            serde_json::json!({ "v": SUPPORTED_SNAPSHOT_VERSION, "graph": &*graph }).to_string(),
-        );
+        let workflow_spec_json = Some(crate::detached::encode_workflow_spec(&graph));
         let rec = TaskRecord {
             id: task.clone(),
             workflow: wf_id.as_str().to_string(),

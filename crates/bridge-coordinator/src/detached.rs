@@ -1312,6 +1312,18 @@ pub struct WorkflowSpecEnvelope {
     graph: bridge_workflow::graph::WorkflowGraph,
 }
 
+/// Serialize the persisted workflow-spec snapshot envelope (`{"v":SUPPORTED_SNAPSHOT_VERSION,"graph":…}`).
+///
+/// This is the SINGLE construction site for that snapshot: BOTH detached-submit surfaces
+/// — [`crate::Coordinator::run_workflow`] and the A2A `unary_message` `RouteTarget::Workflow` arm —
+/// call this, so the persisted shape can never drift between the two adapters (it round-trips through
+/// [`WorkflowSpecEnvelope`] in [`resume_working_tasks`]). The previous A2A path hardcoded `"v": 1`,
+/// which would have silently diverged from the Coordinator on a version bump; routing both through
+/// this helper closes that gap.
+pub fn encode_workflow_spec(graph: &bridge_workflow::graph::WorkflowGraph) -> String {
+    serde_json::json!({ "v": SUPPORTED_SNAPSHOT_VERSION, "graph": graph }).to_string()
+}
+
 /// Boot-time crash-resume scan (W3b Task 10a). Replaces the W3a behavior of sweeping
 /// every `Working` row to `Interrupted`: instead, for each `Working` task this either
 /// (a) **short-circuits** it to terminal if its terminal node already has a checkpoint
@@ -1578,6 +1590,30 @@ mod frame_tests {
     // wire contract (the top-level `kind` discriminator + `tool_kind`/`content_preview` rename).
     use super::*;
     use bridge_core::orch::{ContentSummary, OrchEventKind};
+
+    // s8 T9 (non-divergence): the workflow-spec snapshot has ONE construction site
+    // (`encode_workflow_spec`) shared by `Coordinator::run_workflow` and the A2A unary Workflow
+    // arm, and it round-trips through the resume-path `WorkflowSpecEnvelope` at the supported
+    // version. If these ever drift, a detached task submitted on one surface can't be resumed.
+    #[test]
+    fn workflow_spec_envelope_round_trips_at_supported_version() {
+        use bridge_core::ids::{AgentId, NodeId, WorkflowId};
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+        let graph = WorkflowGraph {
+            id: WorkflowId::parse("code-review").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: Vec::new(),
+            }],
+        };
+        let json = encode_workflow_spec(&graph);
+        let env: WorkflowSpecEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(env.v, SUPPORTED_SNAPSHOT_VERSION);
+        assert_eq!(env.graph.id.as_str(), "code-review");
+        assert_eq!(env.graph.nodes.len(), 1);
+    }
 
     #[tokio::test]
     async fn hub_delivers_published_frame_to_active_subscriber() {

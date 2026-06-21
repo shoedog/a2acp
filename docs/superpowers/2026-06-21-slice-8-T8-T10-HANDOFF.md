@@ -106,7 +106,35 @@ inline SpawnFn onto `make_spawn_fn`). **Add a SPAWNED-binary integration test (P
 **Gate:** `cargo test -p a2a-bridge` (+ the new spawned-binary test) + `cargo test --workspace --no-run`
 + fmt + clippy. Commit.
 
-## T9 — thin the A2A handlers + CLI onto the Coordinator (FIX-8/PFIX-K)
+## T9 — RESCOPED (2026-06-21): single-source the detached envelope; DEFER full handler-thinning
+**What shipped (Option A — minimal-safe):** the workflow-spec snapshot envelope now has ONE construction
+site — `bridge_coordinator::detached::encode_workflow_spec(graph)` — called by BOTH
+`Coordinator::run_workflow` AND the A2A `unary_message` `RouteTarget::Workflow` arm (which previously
+**hardcoded `"v": 1`**, a latent drift vs the Coordinator's `SUPPORTED_SNAPSHOT_VERSION`). A round-trip
+test in `detached.rs` (`workflow_spec_envelope_round_trips_at_supported_version`) locks encode↔decode.
+Byte-identical today (`v==1`); the 133 lib + 47 integration A2A suite is unchanged.
+
+**Why the full plan-T9 (route the live A2A handlers through the Coordinator) was DEFERRED — do NOT
+"naively fix" this:** the Coordinator (T6) was built as a NEW warm-only, validation-heavy **MCP surface**,
+NOT as a literal extraction of the A2A handlers. Routing the live handlers through it is NOT byte-identical:
+- **unary Local** uses the request's `routed.task` id (Coordinator.prompt mints its OWN `prompt-N` id) and
+  has a **cold-bind fallback** (`resolve_configure_bind` when `warm_local_dispatch` returns `None`, for
+  context-less messages) that the warm-only Coordinator deferred. Routing changes the wire task id + the
+  context-less dispatch model.
+- **session_status** renders A2A wire JSON (camelCase, `windowFraction`, nested `cost`); `Coordinator.status`
+  returns a different `StatusDto` shape.
+- **session_clear** has a `force` param the locked `Coordinator.clear` (force=false) doesn't model.
+- even **unary Workflow** isn't perfectly identical via `Coordinator.run_workflow` (which REJECTS overrides
+  and errors-before-create on an unknown graph, where the A2A arm ignores overrides + creates-then-finalizes).
+
+The LOAD-BEARING substrate is ALREADY shared (T2 moved SessionManager; T3 moved the whole detached-workflow
+cluster), so divergence risk is bounded to thin glue. The full unification ("deep" option) means growing the
+Coordinator to ABSORB the A2A handlers' quirks (cold-bind + request-task-id passthrough + force + relax
+overrides) — HIGH lock-in (freezes the dispatch-core API around legacy behavior before the MCP surface has
+been exercised) and HIGH risk on the live server. Defer until a concrete driver (a drift bug, or a 3rd
+consumer) tells you which semantics are load-bearing vs accidental. Tracked as a follow-up.
+
+### ORIGINAL plan-T9 (the deferred "deep unification" — for when a driver appears)
 **Goal:** the migrated A2A handlers + CLI paths call the SAME Coordinator methods (non-divergence on these
 paths). Byte-identical behavior — the existing suite is the gate. **Plan:** Task 9. **Files:**
 `bridge-a2a-inbound/src/server.rs`, `bin/a2a-bridge/src/main.rs`.

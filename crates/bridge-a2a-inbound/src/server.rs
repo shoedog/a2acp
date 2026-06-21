@@ -2386,12 +2386,14 @@ async fn unary_message(
             // fail when it also can't find the graph — but since the wf_id was
             // validated by the route decision, this is always Some in practice).
             let graph = srv.workflows.get(wf_id).cloned();
-            // Snapshot the resolved graph at submit time.
-            // The `{"v":1,"graph":...}` envelope lets the boot resume
-            // routine detect an unknown schema version (treat as unparseable).
+            // Snapshot the resolved graph at submit time via the SINGLE shared envelope
+            // constructor (s8 T9 non-divergence): `Coordinator::run_workflow` and this A2A arm
+            // both call `encode_workflow_spec`, so the persisted `{"v":N,"graph":...}` shape can
+            // never drift between the two detached-submit surfaces (it round-trips through
+            // `WorkflowSpecEnvelope` in the boot resume routine).
             let workflow_spec_json = graph
                 .as_ref()
-                .map(|g| serde_json::json!({ "v": 1, "graph": &**g }).to_string());
+                .map(|g| bridge_coordinator::detached::encode_workflow_spec(g));
             let rec = bridge_core::task_store::TaskRecord {
                 id: task.clone(),
                 workflow: wf_id.as_str().to_string(),
