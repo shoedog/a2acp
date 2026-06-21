@@ -1,0 +1,37 @@
+# Slice 7b E9 watchdog — LIVE GATE config (host-side codex; no containers needed).
+# Two agents share ONE long-emitting prompt; only the TIGHT bound differs, so the
+# pair proves both watchdog limbs against a REAL codex process:
+#
+#   wd-trip : hard_wall_clock = 3s (idle huge) -> a steadily-EMITTING turn is STILL
+#             killed at the wall-clock bound -> AgentTimedOut -> A2A `Failed`.
+#   wd-ok   : idle_timeout = 5s (wall huge)    -> the SAME steadily-emitting turn
+#             resets idle on every chunk -> never idles 5s -> COMPLETES (FN-1).
+#
+# Drive:  a2a-bridge serve --config examples/a2a-bridge.slice-7b-livegate.toml
+#         a2a-bridge submit --agent wd-trip --input /tmp/wd-prompt.txt   # -> submit failed (Failed)
+#         a2a-bridge submit --agent wd-ok   --input /tmp/wd-prompt.txt   # -> essay text (Completed)
+
+default = "wd-ok"
+
+[[agents]]
+id = "wd-trip"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "high"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[agents.watchdog]
+idle_timeout_secs = 600   # effectively disabled: isolate the hard wall-clock limb
+hard_wall_clock_secs = 3  # any turn > 3s wall is killed even while actively emitting
+
+[[agents]]
+id = "wd-ok"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "high"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[agents.watchdog]
+idle_timeout_secs = 5      # idle limb armed; steady streaming keeps resetting it
+hard_wall_clock_secs = 600 # effectively disabled: prove idle-reset, not the wall
+
+[server]
+addr = "127.0.0.1:8111"
