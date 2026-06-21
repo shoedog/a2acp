@@ -516,11 +516,17 @@ dependencies = [
 name = "bridge-coordinator"
 version = "0.1.0"
 dependencies = [
+ "a2a-lf",
  "async-trait",
  "bridge-core",
+ "bridge-workflow",
  "futures",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

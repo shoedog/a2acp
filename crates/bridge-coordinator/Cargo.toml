@@ -9,9 +9,15 @@ test-clock = []
 
 [dependencies]
 bridge-core = { path = "../bridge-core" }
-tokio = { workspace = true }
-
-[dev-dependencies]
+bridge-workflow = { path = "../bridge-workflow" }
 async-trait.workspace = true
 futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing.workspace = true
+a2a.workspace = true
+
+[dev-dependencies]
 tokio-stream.workspace = true
