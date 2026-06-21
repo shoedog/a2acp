@@ -1,14 +1,18 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use bridge_core::domain::Part;
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{ContextId, TaskId, WorkflowId};
+use bridge_core::ids::{ContextId, OperationId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
 use bridge_core::ports::{AgentRegistry, PolicyEngine, SessionStore};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{TaskRecord, TaskRecordStatus, TaskStore};
+use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
 use bridge_workflow::graph::WorkflowGraph;
+use futures::StreamExt;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +23,8 @@ use crate::detached::{
 };
 use crate::dispatch::TaskBinding;
 use crate::params::OpParams;
+
+static PROMPT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -46,6 +52,12 @@ pub struct TaskStatusDto {
     pub result: Option<String>,
     pub error: Option<String>,
     pub updated_ms: i64,
+}
+
+pub struct TurnOutput {
+    pub text: String,
+    pub stop_reason: String,
+    pub context: ContextId,
 }
 
 impl From<&crate::session_manager::SessionStatusInfo> for SessionStatusDto {
@@ -82,13 +94,9 @@ pub struct Coordinator {
     executor: Option<Arc<WorkflowExecutor>>,
     workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>,
     task_store: Arc<dyn TaskStore>,
-    #[allow(dead_code)] // prompt/continue move consumes this in T6b-2.
     session_store: Arc<dyn SessionStore>,
-    #[allow(dead_code)] // prompt/continue move consumes this in T6b-2.
     policy: Arc<dyn PolicyEngine>,
-    #[allow(dead_code)] // prompt/continue move consumes this in T6b-2.
     registry: Arc<dyn AgentRegistry>,
-    #[allow(dead_code)] // prompt/continue move consumes this in T6b-2.
     bindings: Arc<Mutex<HashMap<TaskId, TaskBinding>>>,
     progress_hubs: Arc<Mutex<HashMap<TaskId, Arc<TaskProgressHub>>>>,
     workflow_cancels: Arc<Mutex<HashMap<TaskId, CancellationToken>>>,
@@ -140,6 +148,109 @@ impl Coordinator {
             progress_hubs: self.progress_hubs.clone(),
             clock: self.clock.clone(),
         }
+    }
+
+    fn mint_context_id(&self) -> ContextId {
+        let seq = PROMPT_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+        ContextId::parse(format!("ctx-{}-{seq}", self.clock.now_ms()))
+            .expect("minted context id is non-empty")
+    }
+
+    fn mint_operation_id(&self) -> OperationId {
+        let seq = PROMPT_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+        OperationId::parse(format!("op-{}-{seq}", self.clock.now_ms()))
+            .expect("minted operation id is non-empty")
+    }
+
+    fn mint_prompt_task_id(&self) -> TaskId {
+        let seq = PROMPT_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+        TaskId::parse(format!("prompt-{}-{seq}", self.clock.now_ms()))
+            .expect("minted task id is non-empty")
+    }
+
+    /// FIX-3/PFIX-M: a warm single-turn against a context (minted if absent), collected to one TurnOutput.
+    /// Context-less local dispatch is a follow-up; this method always uses the warm checkout path.
+    pub async fn prompt(&self, p: OpParams) -> Result<TurnOutput, BridgeError> {
+        let _deferred_cold_bindings = &self.bindings;
+        let cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
+        let agent = p
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.registry.default_id());
+        let ctx = p.context.clone().unwrap_or_else(|| self.mint_context_id());
+        let op = self.mint_operation_id();
+        let turn = self
+            .session_manager
+            .checkout_turn(&ctx, agent, Some(p.agent_override()), cwd, op)
+            .await?;
+
+        let mut parts = Vec::new();
+        if let Some(seed) = &turn.seed {
+            parts.push(Part {
+                text: format!("[Summary of earlier context in this session]\n{seed}"),
+            });
+        }
+        parts.push(Part { text: p.input });
+
+        let task = self.mint_prompt_task_id();
+        let translator = Translator::new();
+        let mut events = translator.run(
+            turn.backend.as_ref(),
+            self.session_store.as_ref(),
+            self.policy.as_ref(),
+            &task,
+            &turn.session,
+            parts,
+        );
+        let mut collected = Vec::new();
+        while let Some(ev) = events.next().await {
+            match &ev {
+                Ok(e) if e.kind() == &EventKind::Usage => {
+                    if let Some(snap) = e.usage_snapshot() {
+                        self.session_manager
+                            .record_usage(&ctx, turn.generation, &turn.op, snap.clone())
+                            .await;
+                    }
+                    continue;
+                }
+                _ => collected.push(ev),
+            }
+        }
+        drop(events);
+
+        self.session_manager
+            .finish_turn(&ctx, turn.generation, &turn.op)
+            .await;
+
+        if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
+            return Err(e.clone());
+        }
+        let events: Vec<Event> = collected.into_iter().filter_map(Result::ok).collect();
+        let out_text = events
+            .iter()
+            .rev()
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .map(|e| e.text().to_string())
+            .unwrap_or_default();
+        let stop_reason = match events.iter().rev().find_map(|e| e.outcome()) {
+            Some(TaskOutcome::Canceled) => "cancelled",
+            Some(TaskOutcome::Failed) => "failed",
+            Some(TaskOutcome::Completed) | None => "completed",
+        }
+        .to_string();
+
+        Ok(TurnOutput {
+            text: out_text,
+            stop_reason,
+            context: ctx,
+        })
+    }
+
+    pub async fn continue_turn(&self, p: OpParams) -> Result<TurnOutput, BridgeError> {
+        if p.context.is_none() {
+            return Err(BridgeError::InvalidRequest { field: "context" });
+        }
+        self.prompt(p).await
     }
 
     /// Submit a detached workflow run and return its durable task id.
@@ -302,6 +413,7 @@ mod tests {
     };
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, ContextId, NodeId, OperationId, SessionId};
+    use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::{AgentBackend, BackendStream, Lease, Resolved, Update};
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus};
     use bridge_workflow::graph::WorkflowNode;
@@ -339,12 +451,14 @@ mod tests {
 
     struct FakeRegistry {
         entry: AgentEntry,
-        backend: Arc<FakeBackend>,
+        backend: Arc<dyn AgentBackend>,
+        resolved: Arc<StdMutex<Vec<AgentId>>>,
     }
 
     #[async_trait]
     impl AgentRegistry for FakeRegistry {
         async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            self.resolved.lock().unwrap().push(id.clone());
             if *id != self.entry.id {
                 return Err(BridgeError::UnknownAgent {
                     id: id.as_str().into(),
@@ -367,6 +481,62 @@ mod tests {
 
         fn list(&self) -> Vec<AgentId> {
             vec![self.entry.id.clone()]
+        }
+    }
+
+    struct ScriptedBackend {
+        text: String,
+        usage: Option<UsageSnapshot>,
+        prompts: StdMutex<Vec<(SessionId, Vec<Part>)>>,
+    }
+
+    impl ScriptedBackend {
+        fn new(text: &str) -> Self {
+            Self {
+                text: text.into(),
+                usage: None,
+                prompts: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn with_usage(text: &str, usage: UsageSnapshot) -> Self {
+            Self {
+                text: text.into(),
+                usage: Some(usage),
+                prompts: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn prompt_sessions(&self) -> Vec<SessionId> {
+            self.prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(session, _)| session.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl AgentBackend for ScriptedBackend {
+        async fn prompt(
+            &self,
+            session: &SessionId,
+            parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.prompts.lock().unwrap().push((session.clone(), parts));
+            let mut updates = vec![Ok(Update::Text(self.text.clone()))];
+            if let Some(usage) = &self.usage {
+                updates.push(Ok(Update::Usage(usage.clone())));
+            }
+            updates.push(Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }));
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
         }
     }
 
@@ -484,6 +654,7 @@ mod tests {
         let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
             entry: entry(),
             backend: Arc::new(FakeBackend { prompt_gate: None }),
+            resolved: Arc::new(StdMutex::new(Vec::new())),
         });
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
         let session_manager = Arc::new(SessionManager::new_with_clock(
@@ -567,6 +738,7 @@ mod tests {
         let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
             entry: entry(),
             backend,
+            resolved: Arc::new(StdMutex::new(Vec::new())),
         });
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
         let session_manager = Arc::new(SessionManager::new_with_clock(
@@ -609,6 +781,138 @@ mod tests {
             mode: None,
             cwd: Some("/tmp/repo".into()),
         }
+    }
+
+    fn prompt_params(input: &str) -> OpParams {
+        OpParams {
+            workflow: None,
+            skill: None,
+            input: input.into(),
+            context: None,
+            agent: Some(AgentId::parse("codex").unwrap()),
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: Some("/tmp/repo".into()),
+        }
+    }
+
+    fn coordinator_fixture_with_registry(
+        registry: Arc<dyn AgentRegistry>,
+        clock: Arc<dyn Clock>,
+    ) -> Coordinator {
+        let session_manager = Arc::new(SessionManager::new_with_clock(
+            registry.clone(),
+            Duration::from_secs(60),
+            clock.clone(),
+        ));
+        let task_store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let session_store: Arc<dyn SessionStore> = Arc::new(FakeSessionStore::default());
+        let policy: Arc<dyn PolicyEngine> = Arc::new(AllowPolicy);
+        Coordinator::new(
+            session_manager,
+            None,
+            Arc::new(HashMap::new()),
+            task_store,
+            session_store,
+            policy,
+            registry,
+            clock,
+            Some(SessionCwd::parse("/tmp").unwrap()),
+            3,
+        )
+    }
+
+    #[tokio::test]
+    async fn prompt_warm_returns_text_and_context() {
+        let backend = Arc::new(ScriptedBackend::with_usage(
+            "backend text",
+            UsageSnapshot {
+                used: Some(7),
+                size: Some(10),
+                cost: None,
+                at_ms: 0,
+            },
+        ));
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend: backend.clone(),
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let coordinator = coordinator_fixture_with_registry(registry, clock);
+
+        let out = coordinator.prompt(prompt_params("hello")).await.unwrap();
+
+        assert_eq!(out.text, "backend text");
+        assert_eq!(out.stop_reason, "completed");
+        assert!(!out.context.as_str().is_empty());
+        let status = coordinator
+            .session_manager
+            .status(&out.context)
+            .await
+            .unwrap();
+        assert_eq!(status.usage.used, Some(7));
+        assert_eq!(status.usage.at_ms, 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn prompt_default_agent_when_unset() {
+        let backend = Arc::new(ScriptedBackend::new("default text"));
+        let resolved = Arc::new(StdMutex::new(Vec::new()));
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend,
+            resolved: resolved.clone(),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let coordinator = coordinator_fixture_with_registry(registry, clock);
+        let mut p = prompt_params("hello");
+        p.agent = None;
+
+        let out = coordinator.prompt(p).await.unwrap();
+
+        assert_eq!(out.text, "default text");
+        assert_eq!(
+            resolved.lock().unwrap().as_slice(),
+            &[AgentId::parse("codex").unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_reuses_the_same_warm_context() {
+        let backend = Arc::new(ScriptedBackend::new("remembered codeword"));
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend: backend.clone(),
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let coordinator = coordinator_fixture_with_registry(registry, clock);
+
+        let first = coordinator.prompt(prompt_params("first")).await.unwrap();
+        let mut next = prompt_params("second");
+        next.context = Some(first.context.clone());
+        let second = coordinator.continue_turn(next).await.unwrap();
+
+        assert_eq!(second.context, first.context);
+        assert_eq!(second.text, "remembered codeword");
+        let sessions = backend.prompt_sessions();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0], sessions[1]);
+    }
+
+    #[tokio::test]
+    async fn continue_without_context_is_invalid() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+
+        assert!(matches!(
+            fixture
+                .coordinator
+                .continue_turn(prompt_params("hello"))
+                .await,
+            Err(BridgeError::InvalidRequest { field: "context" })
+        ));
     }
 
     #[tokio::test]
