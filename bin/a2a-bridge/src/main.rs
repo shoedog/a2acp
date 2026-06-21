@@ -45,7 +45,6 @@ use std::time::Duration;
 
 use bridge_a2a_inbound::server::InboundServer;
 use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
-use bridge_acp::acp_backend::AcpBackend;
 use bridge_core::domain::AgentEntry;
 use bridge_core::error::BridgeError;
 use bridge_core::ports::{AgentBackend, AgentRegistry, ConfigSource, DelegationPort, PolicyEngine};
@@ -98,12 +97,22 @@ SUBCOMMANDS:
                       (Mode A: fast-forward --onto). [--config <f>] [--onto <branch>] [--force]
   init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
   serve               Run the A2A server.  [--config <path>]
+  mcp                 Serve the MCP protocol over stdio (one stable Coordinator; A2A/CLI/MCP are thin adapters).
+                      [--config <path>] [--store <path>]
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
   session             Warm session control.  status | release | cancel | clear | compact <contextId>
 
 Run `a2a-bridge <subcommand> --help` for details. Quickstart + cwd/creds/concurrency notes: AGENTS.md.";
+
+const MCP_USAGE: &str = "\
+usage: a2a-bridge mcp [--config <path>] [--store <path>]
+
+Serve the MCP protocol over stdio. STDOUT is reserved for NDJSON MCP replies; tracing is written to STDERR.
+
+  --config <path>  registry config (default: ./a2a-bridge.toml)
+  --store <path>   override the [store] path for this MCP process";
 
 /// Resolve the static (config-time) ACP session cwd for an agent entry.
 /// Resolution chain: `session_cwd` → `cwd` → `"."`.
@@ -3629,6 +3638,183 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
     }
 }
 
+async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
+    bridge_observ::init_stderr();
+
+    let mut explicit_config: Option<PathBuf> = None;
+    let mut store_override: Option<PathBuf> = None;
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--help" | "-h" => {
+                println!("{MCP_USAGE}");
+                return Ok(());
+            }
+            "--config" => {
+                explicit_config = Some(PathBuf::from(
+                    iter.next().ok_or("mcp: --config requires a <path>")?,
+                ));
+            }
+            "--store" => {
+                store_override = Some(PathBuf::from(
+                    iter.next().ok_or("mcp: --store requires a <path>")?,
+                ));
+            }
+            other => {
+                return Err(format!("mcp: unknown flag {other:?}\n{MCP_USAGE}").into());
+            }
+        }
+    }
+
+    let config_path = match explicit_config {
+        Some(p) => {
+            if !p.exists() {
+                return Err(format!(
+                    "a2a-bridge: config not found at {}; run `a2a-bridge init` to create one",
+                    p.display()
+                )
+                .into());
+            }
+            p
+        }
+        None => {
+            let p = PathBuf::from(CONFIG_PATH);
+            if !p.exists() {
+                std::fs::write(&p, DEFAULT_CONFIG)?;
+            }
+            p
+        }
+    };
+    let config_path = std::fs::canonicalize(&config_path).map_err(|e| {
+        format!(
+            "a2a-bridge: cannot resolve config path {}: {e}",
+            config_path.display()
+        )
+    })?;
+
+    let host = bridge_core::liveness::host_id();
+    let instance_id = format!("{}-{}", std::process::id(), implement::nonce(8));
+    let lease = bridge_core::liveness::acquire_lease(&instance_id)
+        .map_err(|e| format!("mcp: acquire run lease: {e}"))?;
+    let run = bridge_core::run_identity::RunHandle {
+        instance_id,
+        host: host.clone(),
+        lease: lease.path().to_string_lossy().to_string(),
+        start: epoch_secs(),
+    };
+
+    let policy = Arc::new(AutoPolicy);
+    let spawn: SpawnFn = make_spawn_fn(
+        Arc::clone(&policy) as Arc<dyn PolicyEngine>,
+        config_path.clone(),
+        run.clone(),
+    );
+
+    let source = FileConfigSource::new(config_path.clone());
+    let snapshot = source.load().await?;
+    recover_orphans(&snapshot, &config_path, &host);
+    let registry = Arc::new(Registry::new(snapshot, spawn)?);
+
+    let raw = std::fs::read_to_string(&config_path)?;
+    let cfg = RegistryConfig::parse(&raw)?;
+
+    let base = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let wf_map = cfg.load_workflows(base)?;
+    let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+        Arc::clone(&registry) as _,
+    ));
+
+    let clock: Arc<dyn bridge_coordinator::clock::Clock> =
+        Arc::new(bridge_coordinator::clock::SystemClock);
+    let warm_ttl = cfg.server.warm_idle_ttl_secs;
+    let registry_for_sessions: Arc<dyn AgentRegistry> = registry.clone();
+    let session_manager = Arc::new(
+        bridge_coordinator::session_manager::SessionManager::new_with_clock(
+            registry_for_sessions,
+            Duration::from_secs(warm_ttl),
+            clock.clone(),
+        )
+        .with_warn_fraction(cfg.server.warm_usage_warn_fraction)
+        .with_compact_summarize_timeout(Duration::from_secs(
+            cfg.server.compact_summarize_timeout_secs.unwrap_or(120),
+        )),
+    );
+    {
+        let sm = session_manager.clone();
+        let period = Duration::from_secs(warm_ttl.clamp(1, 30));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            loop {
+                ticker.tick().await;
+                sm.reap_idle().await;
+            }
+        });
+    }
+
+    let resume_cap = cfg
+        .store
+        .as_ref()
+        .and_then(|s| s.resume_attempt_cap)
+        .unwrap_or(3);
+    let resolve_rel = |p: &std::path::Path| {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base.join(p)
+        }
+    };
+    let store_path: Option<PathBuf> = match (&store_override, cfg.store.as_ref()) {
+        (Some(p), _) => Some(resolve_rel(p)),
+        (None, Some(s)) => Some(resolve_rel(std::path::Path::new(&s.path))),
+        (None, None) => None,
+    };
+    let (session_store, task_store): (
+        Arc<dyn bridge_core::ports::SessionStore>,
+        Arc<dyn bridge_core::task_store::TaskStore>,
+    ) = match store_path {
+        Some(path) => {
+            let sqlite = Arc::new(SqliteStore::open(&path).map_err(|e| {
+                format!(
+                    "a2a-bridge mcp: cannot open task store {path:?} ({e:?}); \
+                     is another a2a-bridge serve/mcp already running on this store?"
+                )
+            })?);
+            (sqlite.clone() as _, sqlite as _)
+        }
+        None => {
+            let sqlite = Arc::new(SqliteStore::open_in_memory()?);
+            (sqlite.clone() as _, sqlite as _)
+        }
+    };
+
+    let allowed_cwd_root = cfg
+        .allowed_cwd_root
+        .as_deref()
+        .map(bridge_core::session_cwd::SessionCwd::parse)
+        .transpose()
+        .map_err(|e| format!("a2a-bridge mcp: invalid allowed_cwd_root: {e:?}"))?;
+
+    let coordinator = Arc::new(bridge_coordinator::Coordinator::new(
+        session_manager,
+        Some(executor),
+        Arc::new(wf_map),
+        task_store,
+        session_store,
+        Arc::clone(&policy) as Arc<dyn PolicyEngine>,
+        Arc::clone(&registry) as Arc<dyn AgentRegistry>,
+        clock,
+        allowed_cwd_root,
+        resume_cap,
+    ));
+
+    coordinator.resume().await;
+    bridge_mcp::serve(tokio::io::stdin(), tokio::io::stdout(), coordinator).await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     // Dispatch subcommands BEFORE the server path touches the filesystem.
@@ -3643,6 +3829,7 @@ async fn main() -> Result<(), BoxError> {
         Some("task") => return task_cmd(&raw_args[2..]).await,
         Some("session") => return session_cmd(&raw_args[2..]).await,
         Some("init") => return init_cmd(&raw_args[2..]),
+        Some("mcp") => return mcp_cmd(&raw_args[2..]).await,
         Some("help") | Some("--help") | Some("-h") => {
             println!("{TOP_USAGE}");
             return Ok(());
@@ -3653,7 +3840,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         Some(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | run-workflow | models | implement | merge | containers | submit | task | session | init | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | models | implement | merge | containers | submit | task | session | init | help)"
             )
             .into());
         }
@@ -3726,76 +3913,11 @@ async fn main() -> Result<(), BoxError> {
     //    for the backend's lifetime, and applies the configured mode/model after
     //    each `session/new`. `model`/`mode` here are the per-MINT FALLBACK; the
     //    per-session `configure_session` overrides them at dispatch (Task 6).
-    let policy_for_spawn = Arc::clone(&policy) as Arc<dyn PolicyEngine>;
-    let owner_config_path = config_path.clone();
-    let run_for_spawn = run.clone();
-    let spawn: SpawnFn = Arc::new(move |entry: Arc<AgentEntry>| {
-        let policy = Arc::clone(&policy_for_spawn);
-        let owner_config_path = owner_config_path.clone();
-        let run = run_for_spawn.clone();
-        Box::pin(async move {
-            // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
-            // Resolution chain: session_cwd → cwd → ".". A relative resolved value is joined
-            // onto current_dir() to become absolute; an absolute one is used as-is (ACP §11A).
-            let resolved =
-                resolve_static_session_cwd(entry.session_cwd.as_deref(), entry.cwd.as_deref());
-            let cwd = {
-                let p = PathBuf::from(&resolved);
-                if p.is_absolute() {
-                    p
-                } else {
-                    std::env::current_dir()
-                        .map_err(|e| BridgeError::ConfigInvalid {
-                            reason: format!("cwd: {e}"),
-                        })?
-                        .join(p)
-                }
-            };
-            use bridge_core::domain::AgentKind;
-            match entry.kind {
-                AgentKind::Acp => {
-                    // Compose-or-raw + the `:ro` reaper via the shared helper (same as run-workflow).
-                    let (program, argv, acp) =
-                        acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)?;
-                    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    let be = AcpBackend::spawn(&program, &argv_ref, acp)
-                        .await?
-                        // Thread the system policy into the backend so its reverse-permission
-                        // decisions match the inbound server's policy (Task 5/6).
-                        .with_policy(policy);
-                    Ok(Arc::new(be) as Arc<dyn AgentBackend>)
-                }
-                AgentKind::Api => {
-                    let base_url = entry.base_url.clone().ok_or(BridgeError::ConfigInvalid {
-                        reason: format!("api agent {} missing base_url", entry.id.as_str()),
-                    })?;
-                    let mut cfg = bridge_api::ApiConfig::new(base_url);
-                    cfg.model = entry.model.clone();
-                    cfg.api_key_env = entry.api_key_env.clone();
-                    let be = bridge_api::ApiBackend::new(cfg).with_policy(policy);
-                    Ok(Arc::new(be) as Arc<dyn AgentBackend>)
-                }
-                AgentKind::ContainerRw => {
-                    let owner = {
-                        let sb = entry.sandbox.as_ref().ok_or(BridgeError::ConfigInvalid {
-                            reason: format!(
-                                "container_rw agent {} requires sandbox",
-                                entry.id.as_str()
-                            ),
-                        })?;
-                        container_owner(&owner_config_path, &sb.mount, entry.id.as_str())
-                    };
-                    let ccfg = container_rw_cfg_from_entry(&entry, &run)?;
-                    let cspawn: Arc<dyn bridge_container::ContainerSpawn> =
-                        Arc::new(AcpContainerSpawn {
-                            policy: Arc::clone(&policy),
-                        });
-                    let be = bridge_container::ContainerRwBackend::new(ccfg, cspawn, owner).await?;
-                    Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
-                }
-            }
-        })
-    });
+    let spawn: SpawnFn = make_spawn_fn(
+        Arc::clone(&policy) as Arc<dyn PolicyEngine>,
+        config_path.clone(),
+        run.clone(),
+    );
 
     // 5. Config source + registry. `load()` is the initial desired state; the
     //    delegation `[delegation]` env-expansion + `[server] addr` ride along on

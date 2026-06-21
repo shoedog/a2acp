@@ -10,6 +10,17 @@ pub fn init() {
         .try_init();
 }
 
+/// Like [`init`] but writes the JSON trace stream to STDERR, leaving STDOUT clean for protocols that
+/// own it (the MCP stdio transport). Idempotent-safe.
+pub fn init_stderr() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let _ = fmt()
+        .json()
+        .with_writer(std::io::stderr)
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+}
+
 /// Build an `info`-level span carrying the four A2A correlation ids.
 pub fn task_span(
     task_id: &str,
@@ -88,5 +99,12 @@ mod tests {
         // Calling init() twice must not panic.
         init();
         init();
+    }
+
+    #[test]
+    fn init_stderr_is_idempotent() {
+        // Calling init_stderr() twice must not panic.
+        init_stderr();
+        init_stderr();
     }
 }
