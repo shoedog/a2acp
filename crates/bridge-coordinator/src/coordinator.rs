@@ -269,12 +269,27 @@ impl Coordinator {
             return Err(e.clone());
         }
         let events: Vec<Event> = collected.into_iter().filter_map(Result::ok).collect();
-        let out_text = events
+        // The full reply is the coalesced Status chunks: the translator OVERWRITES `last_text` per
+        // `Update::Text`, so the terminal Artifact event carries only the LAST delta — a truncation on
+        // delta-streaming agents (codex-acp streams "OAK","LE","AF" → Artifact="AF"). Joining the Status
+        // chunks reconstructs the complete text; fall back to the Artifact for a turn with no streamed
+        // text (e.g. a stop_reason-only Done). This is the MCP surface only — the A2A unary path keeps
+        // its own (artifact + status_chunks) wire shape unchanged.
+        let status_text: String = events
             .iter()
-            .rev()
-            .find(|e| e.kind() == &EventKind::Artifact)
-            .map(|e| e.text().to_string())
-            .unwrap_or_default();
+            .filter(|e| e.kind() == &EventKind::Status)
+            .map(|e| e.text())
+            .collect();
+        let out_text = if status_text.is_empty() {
+            events
+                .iter()
+                .rev()
+                .find(|e| e.kind() == &EventKind::Artifact)
+                .map(|e| e.text().to_string())
+                .unwrap_or_default()
+        } else {
+            status_text
+        };
         let stop_reason = match events.iter().rev().find_map(|e| e.outcome()) {
             Some(TaskOutcome::Canceled) => "cancelled",
             Some(TaskOutcome::Failed) => "failed",
@@ -597,6 +612,35 @@ mod tests {
             if let Some(usage) = &self.usage {
                 updates.push(Ok(Update::Usage(usage.clone())));
             }
+            updates.push(Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }));
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    /// Emits each string as a SEPARATE `Update::Text` delta (then Done) — models a streaming agent
+    /// like codex-acp, where the translator's Artifact carries only the last delta.
+    struct DeltaBackend {
+        deltas: Vec<String>,
+    }
+
+    #[async_trait]
+    impl AgentBackend for DeltaBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let mut updates: Vec<Result<Update, BridgeError>> = self
+                .deltas
+                .iter()
+                .map(|d| Ok(Update::Text(d.clone())))
+                .collect();
             updates.push(Ok(Update::Done {
                 stop_reason: "end_turn".into(),
             }));
@@ -945,6 +989,26 @@ mod tests {
             resolved.lock().unwrap().as_slice(),
             &[AgentId::parse("codex").unwrap()]
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_reconstructs_full_text_from_streamed_chunks() {
+        // s8 T10 live-gate: a delta-streaming agent (Text "OAK","LE","AF") must yield the FULL reply,
+        // NOT the last delta. The translator's terminal Artifact = last_text = "AF"; the full text lives
+        // in the coalesced Status chunks, which `collect_turn` joins.
+        let backend = Arc::new(DeltaBackend {
+            deltas: vec!["OAK".into(), "LE".into(), "AF".into()],
+        });
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend,
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let coordinator = coordinator_fixture_with_registry(registry, clock);
+
+        let out = coordinator.prompt(prompt_params("hi")).await.unwrap();
+        assert_eq!(out.text, "OAKLEAF");
     }
 
     #[tokio::test]
