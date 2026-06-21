@@ -49,6 +49,8 @@ pub enum BridgeError {
     ModelNotAvailable,
     #[error("cancel timeout")]
     CancelTimeout,
+    #[error("agent timed out")]
+    AgentTimedOut,
     #[error("frame error")]
     FrameError,
     #[error("message too large")]
@@ -243,6 +245,18 @@ mod tests {
     fn cancel_timeout_sets_canceled() {
         assert_eq!(
             BridgeError::CancelTimeout.disposition(),
+            A2aDisposition::SetState(A2aState::Canceled)
+        );
+    }
+
+    #[test]
+    fn agent_timed_out_disposition_is_failed_not_canceled() {
+        assert_eq!(
+            BridgeError::AgentTimedOut.disposition(),
+            A2aDisposition::SetState(A2aState::Failed)
+        );
+        assert_ne!(
+            BridgeError::AgentTimedOut.disposition(),
             A2aDisposition::SetState(A2aState::Canceled)
         );
     }

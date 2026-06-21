@@ -162,6 +162,7 @@ mod tests {
             BridgeError::AgentNotAuthenticated => "AgentNotAuthenticated",
             BridgeError::ModelNotAvailable => "ModelNotAvailable",
             BridgeError::CancelTimeout => "CancelTimeout",
+            BridgeError::AgentTimedOut => "AgentTimedOut",
             BridgeError::FrameError => "FrameError",
             BridgeError::MessageTooLarge => "MessageTooLarge",
             BridgeError::AgentCrashed { .. } => "AgentCrashed",
@@ -201,6 +202,7 @@ mod tests {
             (BridgeError::AgentNotAuthenticated, Death::Fatal),
             (BridgeError::ModelNotAvailable, Death::Fatal),
             (BridgeError::CancelTimeout, Death::Transient),
+            (BridgeError::AgentTimedOut, Death::Fatal),
             (BridgeError::FrameError, Death::Transient),
             (BridgeError::MessageTooLarge, Death::Fatal),
             (BridgeError::agent_crashed("x"), Death::Transient),
@@ -225,6 +227,14 @@ mod tests {
             let _ = table_key(&err);
             assert_eq!(classify_death(&err), want, "{err:?}");
         }
+    }
+
+    #[test]
+    fn agent_timed_out_is_fatal() {
+        assert!(matches!(
+            classify_death(&BridgeError::AgentTimedOut),
+            Death::Fatal
+        ));
     }
 
     struct FakeBackend {
