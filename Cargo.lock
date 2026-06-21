@@ -549,6 +549,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bridge-coordinator",
+ "bridge-core",
+ "bridge-workflow",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+]
+
+[[package]]
 name = "bridge-observ"
 version = "0.1.0"
 dependencies = [

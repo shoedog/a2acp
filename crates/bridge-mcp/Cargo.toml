@@ -1,0 +1,18 @@
+[package]
+name = "bridge-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bridge-coordinator = { path = "../bridge-coordinator" }
+bridge-core = { path = "../bridge-core" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+bridge-coordinator = { path = "../bridge-coordinator", features = ["test-clock"] }
+bridge-workflow = { path = "../bridge-workflow" }
+tokio-stream.workspace = true
+tokio-test = "0.4"
