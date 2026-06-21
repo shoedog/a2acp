@@ -4481,7 +4481,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_watchdog_config_is_byte_identical() {
+    async fn no_watchdog_config_behaves_identically() {
+        // With no `[agents.watchdog]`: no watchdog task is spawned, the driver's
+        // watchdog select arm is a never-resolving `pending()`, and the handler's
+        // activity bump is a no-op (`watch=None`). NB the outer select gained
+        // `biased;` (a whole-branch review fix), so arm *arbitration* changed even
+        // on the disabled path — but only benignly: a ready `prompt_fut` is now
+        // preferred deterministically over the (here-`pending`) watchdog arm, which
+        // is strictly-no-worse than the prior random choice. Behaviour is therefore
+        // identical, not literally byte-identical scheduling.
         let rec = Recorder::new("agent-sess-NO-WD");
         rec.gate_prompt.store(true, Ordering::SeqCst);
         let be = connect_recording(rec.clone()).await;
@@ -4513,6 +4521,63 @@ mod tests {
             other => panic!("expected natural Done after releasing the fake agent, got {other:?}"),
         }
         assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watchdog_timeout_overrides_an_honored_cancel_within_grace() {
+        // PFIX-F sharp edge: when the watchdog fires, it sends `session/cancel`,
+        // then awaits the prompt within `cancel_grace`. If the agent HONORS that
+        // cancel and returns a clean `StopReason::Cancelled` result WITHIN grace,
+        // the driver must STILL surface `AgentTimedOut` — the watchdog arm DISCARDS
+        // the inner prompt outcome (`timed_out_local` already set). A regression
+        // that forwarded the agent's `Done{cancelled}` would mis-report the turn as
+        // a clean user cancel rather than a forced timeout. Grace is generous (2s)
+        // so the agent's response arrives well inside the inner select → the
+        // `&mut prompt_fut` arm wins (not the grace-sleep escalation), exercising
+        // exactly the honored-within-grace path.
+        let rec = Recorder::new("agent-sess-WD-HONOR");
+        // Agent waits for the cancel, then responds with a real Cancelled result.
+        rec.wait_cancel_before_respond.store(true, Ordering::SeqCst);
+        rec.set_stop_reason(StopReason::Cancelled).await;
+        let cfg = AcpConfig {
+            watchdog: Some(bridge_core::domain::WatchdogConfig {
+                idle_timeout: Duration::from_secs(10),
+                hard_wall_clock: Duration::from_millis(50),
+            }),
+            cancel_grace: Duration::from_secs(2),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-WD-HONOR");
+
+        let mut s = be.prompt(&key, vec![]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("prompt must reach the fake agent");
+
+        // The watchdog fires (wall-clock 50ms), sends session/cancel; the agent
+        // honors it and returns Cancelled within grace — yet the terminal is
+        // AgentTimedOut, NOT a Done{cancelled}.
+        match tokio::time::timeout(Duration::from_secs(2), s.next())
+            .await
+            .expect("watchdog must terminate the turn even when the agent honors cancel")
+        {
+            Some(Err(BridgeError::AgentTimedOut)) => {}
+            other => {
+                panic!("an honored-within-grace cancel must STILL be AgentTimedOut, got {other:?}")
+            }
+        }
+        assert!(s.next().await.is_none(), "stream terminates after timeout");
+
+        // The agent did observe the watchdog's session/cancel (proves the honored
+        // path, not a process kill).
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("watchdog must have sent session/cancel for the agent to honor");
+        assert_eq!(
+            rec.cancels.lock().await.as_slice(),
+            &["agent-sess-WD-HONOR"]
+        );
     }
 
     // ── Task 5: reverse session/request_permission handler ─────────────────────
