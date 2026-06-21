@@ -1,6 +1,7 @@
 pub mod clock;
 pub mod compact;
 pub mod detached;
+pub mod params;
 pub mod session_manager;
 
 pub use detached::{
