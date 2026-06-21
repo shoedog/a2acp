@@ -10,8 +10,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification,
@@ -212,7 +213,19 @@ macro_rules! reject_unsupported {
 // handler only does a `get` + non-blocking `send` under it, never awaits while
 // holding it, so a non-async lock is correct and avoids `.await` in the handler.
 type UpdateSender = mpsc::UnboundedSender<TurnEvent>;
-type UpdateRegistry = Arc<StdMutex<HashMap<AgentSessionId, UpdateSender>>>;
+type UpdateRegistry = Arc<StdMutex<HashMap<AgentSessionId, TurnRoute>>>;
+
+struct TurnRoute {
+    tx: UpdateSender,
+    #[allow(dead_code)]
+    watch: Option<Arc<TurnWatch>>,
+}
+
+#[allow(dead_code)]
+struct TurnWatch {
+    turn_start: Instant,
+    last_activity_ms: AtomicU64,
+}
 
 /// What the notification handler forwards to a turn's driver/stream. Kept
 /// minimal: only the variants the bridge models today. Unmodeled
@@ -999,8 +1012,8 @@ impl AcpBackend {
                                 // Plain get + non-blocking send under a
                                 // std::Mutex: no await is held across the lock.
                                 if let Ok(map) = updates.lock() {
-                                    if let Some(tx) = map.get(&session_id) {
-                                        let _ = tx.send(te);
+                                    if let Some(route) = map.get(&session_id) {
+                                        let _ = route.tx.send(te);
                                     }
                                 }
                             }
@@ -1934,7 +1947,7 @@ impl AcpBackend {
             let mut map = registry
                 .lock()
                 .map_err(|_| BridgeError::agent_crashed("update routing registry lock poisoned"))?;
-            map.insert(agent_id.clone(), tx);
+            map.insert(agent_id.clone(), TurnRoute { tx, watch: None });
         }
 
         let cx = self.cx()?.clone();
