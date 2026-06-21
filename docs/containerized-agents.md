@@ -241,3 +241,19 @@ gate is the `allowed_cmds`/S3 allowlist + the verify-runtime gate).
 docker too). `podman rm` is **synchronous**, so expect **0** containers immediately after a run (unlike
 Docker Desktop's ~2 s async removal). A disallowed `[verify].runtime` (not in `allowed_cmds`) makes verify
 fail with `ConfigError` rather than running on the wrong engine.
+
+## E9 watchdog (`[agents.watchdog]`) — blast radius on shared backends
+
+The per-agent E9 watchdog (`[agents.watchdog] idle_timeout_secs = N, hard_wall_clock_secs = M`,
+both `> 0`, capped at 30 days) cancels a turn that goes silent past `idle_timeout` (after first
+output) or exceeds `hard_wall_clock`, surfacing a distinct `AgentTimedOut` (→ A2A `Failed`, not a
+user `Canceled`, and **not** retried). It does a graceful `session/cancel` first.
+
+**Blast radius:** a process-backed ACP agent **multiplexes all bridge sessions over one process**,
+and the cancel last-resort (`escalate_terminate`) **SIGKILLs the whole process** if the agent
+ignores `session/cancel` past `cancel_grace`. So a watchdog timeout on ONE hung turn can fail
+**sibling turns** sharing that backend (and the killed process is not auto-replaced until the
+registry slot retires). **Enable the watchdog primarily on container/per-turn-isolated agents**
+(`ContainerRwBackend` builds a fresh `AcpConfig` per turn and inherits `[agents.watchdog]` by
+composition); on a shared local-process agent, accept that a cancel-ignoring hang takes its
+siblings with it.

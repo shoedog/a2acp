@@ -2074,6 +2074,10 @@ impl AcpBackend {
             tokio::pin!(prompt_fut);
             let mut timed_out_local = false;
             let outcome: Result<_, ()> = tokio::select! {
+                // BIASED: poll the arms in order so a `prompt_fut` that became ready in the SAME
+                // poll as a fired watchdog ALWAYS wins (the natural completion is never relabeled
+                // AgentTimedOut). Without `biased`, tokio picks a ready arm at random.
+                biased;
                 outcome = &mut prompt_fut => outcome.map_err(|_| ()),
                 _ = kill.notified() => Err(()),
                 _ = async {
