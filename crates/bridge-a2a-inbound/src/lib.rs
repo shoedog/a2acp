@@ -7,4 +7,5 @@ pub mod server;
 pub mod sse;
 pub(crate) mod workflow_sink;
 
+pub use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
 pub use bridge_coordinator::session_manager;

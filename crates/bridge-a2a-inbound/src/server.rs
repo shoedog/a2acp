@@ -35,8 +35,8 @@ use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
 use bridge_core::domain::{
-    effective_config, AgentOverride, AuthContext, EffectiveConfig, InboundRequest, Part,
-    PeerTaskId, RouteTarget, SessionSpec, TaskMeta,
+    effective_config, AgentOverride, AuthContext, InboundRequest, Part, PeerTaskId, RouteTarget,
+    SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
 use bridge_core::ids::{AgentId, ContextId, OperationId, SessionGeneration, SessionId, TaskId};
@@ -51,6 +51,8 @@ use bridge_workflow::executor::{
 };
 use bridge_workflow::graph::WorkflowNode;
 
+use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
+
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
 use crate::fanout::{self, Source};
 use crate::sse::event_to_sse;
@@ -63,61 +65,6 @@ const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
 const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error.
 const JSONRPC_INTERNAL: i32 = -32603;
-
-/// A task's binding to its resolved registry instance, created on the FIRST local
-/// message. Holds the backend driving the task, the effective config applied to its
-/// session, and the registry [`Lease`] keeping the slot alive for the task's
-/// lifetime. The lease drops when the binding is removed from the map ([`BindingGuard`]
-/// eviction on producer exit), decrementing the slot's active-task count.
-struct TaskBinding {
-    backend: Arc<dyn AgentBackend>,
-    /// The effective config applied to the task's session — reused by binding-driven
-    /// follow-ups (they prompt the bound backend without recomputing config). Kept on
-    /// the binding so the resolved config is available for the task's whole lifetime.
-    eff: EffectiveConfig,
-    /// The registry lease keeping the slot alive for the task. Dropped (releasing the
-    /// slot's active-task count) when the binding is removed on producer exit.
-    lease: Box<dyn Lease>,
-}
-
-/// RAII eviction guard owned by a task's producer. While alive it represents the
-/// task's binding; on `Drop` — whether the producer returns cleanly (Done/Failed/
-/// Canceled) OR early (client disconnect / error) — it removes the [`TaskBinding`]
-/// from the map (dropping the [`Lease`] → the slot's active-task count decrements)
-/// and forgets the backend's per-session stash. This is the spec-critical
-/// "eviction on EVERY producer exit": a leaked lease keeps a slot un-retirable
-/// forever, so the guard must fire on the non-clean paths a manual cleanup might miss.
-///
-/// `Drop` is synchronous but the eviction is async (mutex lock + `forget_session`),
-/// so it is performed on a spawned task. A follow-up that REUSES an existing binding
-/// does NOT own a guard — only the FIRST message's producer evicts.
-struct BindingGuard {
-    bindings: Arc<tokio::sync::Mutex<HashMap<TaskId, TaskBinding>>>,
-    task: TaskId,
-    backend: Arc<dyn AgentBackend>,
-    session: SessionId,
-}
-
-impl Drop for BindingGuard {
-    fn drop(&mut self) {
-        let bindings = self.bindings.clone();
-        let task = self.task.clone();
-        let session = self.session.clone();
-        let backend = self.backend.clone();
-        // Note: the spawn-in-Drop pattern means an eviction enqueued during runtime
-        // shutdown may not run (the Tokio runtime may be torn down before the task
-        // executes), leaving the binding and lease un-evicted. This is acceptable for
-        // a single-process bridge that is exiting anyway.
-        tokio::spawn(async move {
-            // Take the binding out of the map and drop its Lease explicitly → the
-            // slot's active-task count decrements. Then forget the per-session stash.
-            if let Some(binding) = bindings.lock().await.remove(&task) {
-                drop(binding.lease);
-            }
-            backend.forget_session(&session).await;
-        });
-    }
-}
 
 /// The inbound A2A server. Holds the six pipeline ports plus the advertised
 /// base URL (used to build the Agent Card). Cheap to clone via `Arc`.
@@ -447,42 +394,6 @@ fn local_agent_id(srv: &InboundServer, target: &RouteTarget) -> AgentId {
     match target {
         RouteTarget::Local(id) => id.clone(),
         _ => srv.registry.default_id(),
-    }
-}
-
-/// The local backend ready to drive a task, plus its RAII eviction guard. A
-/// FIRST-message dispatch returns `Some(guard)` (the producer owns it → evicts the
-/// binding/lease/stash on exit); a FOLLOW-UP that reused an existing binding returns
-/// `None` (the original producer owns eviction — a follow-up must not evict a still-
-/// live binding when its own short-lived call ends).
-struct LocalDispatch {
-    backend: Arc<dyn AgentBackend>,
-    /// The session to prompt against — warm `ctx-…` session, or legacy `session-{task}`.
-    session: SessionId,
-    /// Warm-session summary seed to prepend to the prompt parts, when present.
-    seed: Option<String>,
-    guard: Option<BindingGuard>,
-    /// Warm path only: finishes the warm turn (→ Idle) on drop. Mutually exclusive with `guard`.
-    warm_guard: Option<WarmTurnGuard>,
-}
-
-/// Drops the warm turn back to Idle on producer exit (mirrors BindingGuard::Drop's spawn pattern).
-struct WarmTurnGuard {
-    sm: std::sync::Arc<crate::session_manager::SessionManager>,
-    ctx: bridge_core::ids::ContextId,
-    generation: bridge_core::ids::SessionGeneration,
-    op: bridge_core::ids::OperationId,
-}
-
-impl Drop for WarmTurnGuard {
-    fn drop(&mut self) {
-        let sm = self.sm.clone();
-        let ctx = self.ctx.clone();
-        let generation = self.generation;
-        let op = self.op.clone();
-        tokio::spawn(async move {
-            sm.finish_turn(&ctx, generation, &op).await;
-        });
     }
 }
 
