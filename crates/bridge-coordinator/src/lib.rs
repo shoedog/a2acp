@@ -1,4 +1,5 @@
 pub mod clock;
+pub mod compact;
 pub mod detached;
 pub mod session_manager;
 
