@@ -50,6 +50,7 @@ pub struct ContainerRwConfig {
     pub model: Option<String>,
     pub mode: Option<String>,
     pub auth_method: Option<String>,
+    pub watchdog: Option<bridge_core::domain::WatchdogConfig>,
     pub handshake_timeout: Duration,
     pub cancel_grace: Duration,
     /// Increment A: the per-process run identity — stamps the `a2a.run`/`a2a.host`/`a2a.lease` labels +
@@ -252,6 +253,7 @@ impl ContainerRwBackend {
             model: self.cfg.model.clone(),
             mode: self.cfg.mode.clone(),
             auth_method: self.cfg.auth_method.clone(),
+            watchdog: self.cfg.watchdog.clone(),
             handshake_timeout: self.cfg.handshake_timeout,
             cancel_grace: self.cfg.cancel_grace,
             // :rw has its own reaper (this crate); the inner AcpBackend's :ro reaper stays off.
@@ -824,6 +826,7 @@ mod tests {
             model: None,
             mode: None,
             auth_method: None,
+            watchdog: None,
             handshake_timeout: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(5),
             run: RunHandle {

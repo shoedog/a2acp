@@ -256,6 +256,7 @@ fn acp_spawn_inputs(
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
         container,
+        watchdog: entry.watchdog.clone(),
         // ACP-param MCP delivery (claude): the entry's MCP servers ride `session/new`. Codex/kiro
         // native delivery leaves this empty (they get MCP via their native channel, not the param).
         mcp: if matches!(entry.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
@@ -447,6 +448,7 @@ fn container_rw_cfg_from_entry(
         model: entry.model.clone(),
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
+        watchdog: entry.watchdog.clone(),
         handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
         cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
         run: run.clone(),
@@ -4255,6 +4257,33 @@ mod cli_tests {
         );
     }
 
+    #[test]
+    fn acp_spawn_inputs_forwards_watchdog() {
+        let mut entry = acp_entry("reader");
+        entry.watchdog = Some(bridge_core::domain::WatchdogConfig {
+            idle_timeout: std::time::Duration::from_secs(30),
+            hard_wall_clock: std::time::Duration::from_secs(600),
+        });
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run0".into(),
+            host: "h".into(),
+            lease: "/l/run0.lock".into(),
+            start: "0".into(),
+        };
+
+        let (_, _, acp) = acp_spawn_inputs(
+            &entry,
+            std::path::PathBuf::from("/tmp"),
+            std::path::Path::new("/cfg/a2a.toml"),
+            &run,
+        )
+        .unwrap();
+
+        let wd = acp.watchdog.as_ref().expect("watchdog is forwarded");
+        assert_eq!(wd.idle_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(wd.hard_wall_clock, std::time::Duration::from_secs(600));
+    }
+
     fn acp_entry(id: &str) -> AgentEntry {
         use bridge_core::ids::AgentId;
         use std::collections::BTreeMap;
@@ -4272,6 +4301,7 @@ mod cli_tests {
             cwd: None,
             session_cwd: None,
             sandbox: None,
+            watchdog: None,
             mcp: vec![],
             mcp_delivery: Default::default(),
             auth_method: None,

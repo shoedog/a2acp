@@ -107,6 +107,8 @@ pub struct AcpConfig {
     /// `McpDelivery::Acp` agents (claude); `{cwd}` in args/env is substituted per session at mint.
     /// Codex/kiro native delivery leaves this empty (they ignore the param).
     pub mcp: Vec<bridge_core::mcp::McpServerSpec>,
+    /// Optional per-turn watchdog. `None` disables watchdog behavior.
+    pub watchdog: Option<bridge_core::domain::WatchdogConfig>,
 }
 
 /// Reaper handle for a containerized (`:ro` sandbox) agent: the named `docker run` container is removed
@@ -141,6 +143,7 @@ impl Default for AcpConfig {
             cancel_grace: DEFAULT_CANCEL_GRACE,
             container: None,
             mcp: Vec::new(),
+            watchdog: None,
         }
     }
 }
