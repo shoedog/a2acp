@@ -183,6 +183,45 @@ impl Coordinator {
             .session_manager
             .checkout_turn(&ctx, agent, Some(p.agent_override()), cwd, op)
             .await?;
+        self.collect_turn(ctx, turn, p.input).await
+    }
+
+    /// Continue an EXISTING warm context. Unlike `prompt`, this REUSES the context's stored fingerprint
+    /// (agent/config/cwd) instead of re-deriving it from params: the `continue` surface advertises only
+    /// `{input, context}`, so omitted agent/cwd/overrides must NOT be read as a config change (which
+    /// `checkout_turn` rejects as `ConfigMismatch`). A context that was never minted → `SessionNotFound`.
+    pub async fn continue_turn(&self, p: OpParams) -> Result<TurnOutput, BridgeError> {
+        let ctx = p
+            .context
+            .clone()
+            .ok_or(BridgeError::InvalidRequest { field: "context" })?;
+        let op = self.mint_operation_id();
+        let turn = self
+            .session_manager
+            .checkout_existing_turn(&ctx, op)
+            .await?;
+        self.collect_turn(ctx, turn, p.input).await
+    }
+
+    /// Drive ONE warm turn to completion and collect it into a `TurnOutput`. Records usage as a side
+    /// effect (excluded from output) and returns the handle to Idle on EVERY exit — synchronously on the
+    /// normal/error path (so a sequential `continue` observes Idle deterministically), and via the drop
+    /// guard if the turn future is cancelled mid-drain (the MCP loop is sequential and never drops
+    /// mid-turn, but the Coordinator is a general service API — a cancelled caller must not strand the
+    /// handle `Running`; this mirrors the A2A unary path's `WarmTurnGuard`).
+    async fn collect_turn(
+        &self,
+        ctx: ContextId,
+        turn: crate::session_manager::WarmTurn,
+        input: String,
+    ) -> Result<TurnOutput, BridgeError> {
+        let mut finish_guard = TurnFinishGuard {
+            sm: self.session_manager.clone(),
+            ctx: ctx.clone(),
+            generation: turn.generation,
+            op: turn.op.clone(),
+            armed: true,
+        };
 
         let mut parts = Vec::new();
         if let Some(seed) = &turn.seed {
@@ -190,7 +229,7 @@ impl Coordinator {
                 text: format!("[Summary of earlier context in this session]\n{seed}"),
             });
         }
-        parts.push(Part { text: p.input });
+        parts.push(Part { text: input });
 
         let task = self.mint_prompt_task_id();
         let translator = Translator::new();
@@ -218,9 +257,13 @@ impl Coordinator {
         }
         drop(events);
 
+        // Finish synchronously on the normal/error path, then disarm so the guard's drop is a no-op
+        // (no double finish_turn). If the future was cancelled before reaching here, the still-armed
+        // guard fires `finish_turn` on drop.
         self.session_manager
             .finish_turn(&ctx, turn.generation, &turn.op)
             .await;
+        finish_guard.disarm();
 
         if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
             return Err(e.clone());
@@ -244,13 +287,6 @@ impl Coordinator {
             stop_reason,
             context: ctx,
         })
-    }
-
-    pub async fn continue_turn(&self, p: OpParams) -> Result<TurnOutput, BridgeError> {
-        if p.context.is_none() {
-            return Err(BridgeError::InvalidRequest { field: "context" });
-        }
-        self.prompt(p).await
     }
 
     /// Submit a detached workflow run and return its durable task id.
@@ -396,6 +432,40 @@ impl Coordinator {
     /// Boot-time detached task resume.
     pub async fn resume(&self) {
         resume_working_tasks(&self.detached_deps(), self.resume_attempt_cap).await;
+    }
+}
+
+/// Returns a warm handle to Idle (via `finish_turn`) if a turn future is dropped before it finishes
+/// synchronously. `collect_turn` finishes the turn synchronously on the normal/error path and then
+/// `disarm`s this guard, so on those paths the guard's `Drop` is a no-op; it only fires when the turn
+/// future is cancelled mid-drain. Mirrors the A2A unary path's `WarmTurnGuard` (the spawn-in-Drop
+/// pattern), kept local to the Coordinator because here it's disarmed after a synchronous finish.
+struct TurnFinishGuard {
+    sm: Arc<crate::session_manager::SessionManager>,
+    ctx: ContextId,
+    generation: bridge_core::ids::SessionGeneration,
+    op: OperationId,
+    armed: bool,
+}
+
+impl TurnFinishGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TurnFinishGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let sm = self.sm.clone();
+        let ctx = self.ctx.clone();
+        let generation = self.generation;
+        let op = self.op.clone();
+        tokio::spawn(async move {
+            sm.finish_turn(&ctx, generation, &op).await;
+        });
     }
 }
 
@@ -911,6 +981,118 @@ mod tests {
                 .await,
             Err(BridgeError::InvalidRequest { field: "context" })
         ));
+    }
+
+    #[tokio::test]
+    async fn continue_inherits_stored_cwd_fingerprint() {
+        // s8 T10 review BLOCKER: a context minted by `run` WITH a cwd must be continuable with the
+        // advertised `{input, context}` shape. `continue` omits cwd/agent/overrides, so it must reuse
+        // the context's STORED fingerprint — NOT re-derive (cwd=None) and trip `ConfigMismatch{cwd}`.
+        let backend = Arc::new(ScriptedBackend::new("continued"));
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend: backend.clone(),
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let coordinator = coordinator_fixture_with_registry(registry, clock);
+
+        // `run` with a cwd (prompt_params sets cwd = /tmp/repo, agent = codex).
+        let first = coordinator.prompt(prompt_params("first")).await.unwrap();
+
+        // `continue` with ONLY context + input — no cwd, no agent, no overrides.
+        let cont = OpParams {
+            workflow: None,
+            skill: None,
+            input: "second".into(),
+            context: Some(first.context.clone()),
+            agent: None,
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: None,
+        };
+        let second = coordinator.continue_turn(cont).await.unwrap();
+        assert_eq!(second.context, first.context);
+        assert_eq!(second.text, "continued");
+    }
+
+    #[tokio::test]
+    async fn continue_unknown_context_is_session_not_found() {
+        // `continue` must NOT mint a fresh session for an unknown context (that is `run`'s job).
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let cont = OpParams {
+            workflow: None,
+            skill: None,
+            input: "x".into(),
+            context: Some(ctx("ctx-nope")),
+            agent: None,
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: None,
+        };
+        assert!(matches!(
+            fixture.coordinator.continue_turn(cont).await,
+            Err(BridgeError::SessionNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_turn_returns_handle_to_idle() {
+        // s8 T10 review MAJOR: a turn future dropped mid-drain must return the warm handle to Idle via
+        // the drop guard — else the next turn on that context is permanently HandleBusy.
+        let gate = Arc::new(Notify::new());
+        let fixture = coordinator_fixture_with_backend(
+            Arc::new(HashMap::new()),
+            Arc::new(FakeBackend {
+                prompt_gate: Some(gate.clone()),
+            }),
+        );
+        let coord = Arc::new(fixture.coordinator);
+
+        let known = ctx("ctx-drop");
+        let mut p = prompt_params("first");
+        p.context = Some(known.clone());
+
+        let c2 = coord.clone();
+        let handle = tokio::spawn(async move {
+            let _ = c2.prompt(p).await;
+        });
+
+        // Wait until the turn has checked out (handle exists) and is blocked in the gated backend.
+        for _ in 0..1000 {
+            if coord.session_manager.status(&known).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // Drop the prompt future mid-drain (the gate is never released).
+        handle.abort();
+
+        // The guard's spawned finish_turn returns the handle to Idle: poll until a re-checkout succeeds
+        // (a stranded Running handle would stay HandleBusy forever and exhaust the loop).
+        let mut released = false;
+        for _ in 0..1000 {
+            match coord
+                .session_manager
+                .checkout_existing_turn(&known, op("op-recheck"))
+                .await
+            {
+                Ok(_) => {
+                    released = true;
+                    break;
+                }
+                Err(BridgeError::HandleBusy) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                Err(other) => panic!("unexpected checkout error: {other:?}"),
+            }
+        }
+        assert!(
+            released,
+            "warm handle never returned to Idle after the turn future was dropped"
+        );
     }
 
     #[tokio::test]

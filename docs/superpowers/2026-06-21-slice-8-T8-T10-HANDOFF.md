@@ -177,6 +177,28 @@ paths). Byte-identical behavior — the existing suite is the gate. **Plan:** Ta
    handoff + the orchestration HANDOFF + memory (write `slice-8-mcp-shipped.md`; update the MEMORY.md
    RESUME line). **Push** (per the user's "push it then …" cadence).
 
+### T10 whole-branch review OUTCOME (2026-06-21) — codex-xhigh + Opus lens
+`changes-required` → fixes folded (commit after T9). The cross-task net caught 2 real bugs the per-task
+tests missed:
+- **BLOCKER (FIXED)** — MCP `continue` fingerprint mismatch (`coordinator.rs`): `continue_turn` delegated
+  to `prompt`, which defaulted omitted `agent`→`default_id()` + `cwd`→`None`, so `checkout_turn` rejected
+  any context minted with a cwd / non-default agent as `ConfigMismatch`. FIX: new
+  `SessionManager::checkout_existing_turn(ctx, op)` REUSES the stored fingerprint; `continue_turn` routes
+  through it (unknown ctx → `SessionNotFound`). Tests: `continue_inherits_stored_cwd_fingerprint`,
+  `continue_unknown_context_is_session_not_found`.
+- **MAJOR (FIXED)** — `Coordinator::prompt` drop-safety (`coordinator.rs`): a turn future cancelled
+  mid-drain stranded the warm handle `Running`. FIX: extracted `collect_turn` + a disarmable
+  `TurnFinishGuard` (finish synchronously on the normal path → disarm; fire on drop if cancelled),
+  mirroring the A2A `WarmTurnGuard`. Test: `dropped_turn_returns_handle_to_idle`.
+- **MINOR (FIXED)** — CI floors added: `bridge-coordinator ≥85` (measured 88.06), `bridge-mcp ≥70`
+  (measured 75.69).
+- **MAJOR→DEFERRED (Finding 3, clock seam)** — the MOVED detached substrate (`detached.rs` sinks /
+  `finalize_detached`) still timestamps task rows via the free `now_ms()` (SystemTime), not
+  `DetachedDeps.clock`. This is NOT a regression and is prod-identical (the binary's injected clock IS
+  `SystemClock`); it only matters for test determinism of detached timestamps (no current test needs it).
+  Threading `Arc<dyn Clock>` through `DetachedProgressSink`/`DetachedRichSinkFactory`/`finalize_detached`
+  is a clean follow-up; do it when a test needs to control detached wall-clock. Tracked here.
+
 ## Key anchors (verify against the tree)
 - `bin/a2a-bridge/src/main.rs`: subcommand dispatch `~:3636`; `make_spawn_fn` `:462-531`; serve inline
   SpawnFn `:3732-3798`; serve store-open `:3892-3923` + resume `:4006-4009`.

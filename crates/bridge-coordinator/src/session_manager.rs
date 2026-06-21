@@ -245,6 +245,42 @@ impl SessionManager {
         res
     }
 
+    /// Continue an EXISTING warm context, REUSING its stored fingerprint (agent/config/cwd) rather than
+    /// re-deriving it from caller params. This is the `continue` semantic: the caller supplies only the
+    /// context (+ input), so there is nothing to reconcile — an Idle handle transitions straight to
+    /// Running. Mirrors the no-diff reuse branch of [`Self::checkout_turn`], but a context that was
+    /// never minted returns `SessionNotFound` (you cannot continue what does not exist) instead of
+    /// minting a fresh session. A retired lease → `SessionExpired`; a busy handle → `HandleBusy`.
+    pub async fn checkout_existing_turn(
+        &self,
+        ctx: &ContextId,
+        op: OperationId,
+    ) -> Result<WarmTurn, BridgeError> {
+        let mut tab = self.by_context.lock().await;
+        let Some(h) = tab.get_mut(ctx) else {
+            return Err(BridgeError::SessionNotFound);
+        };
+        if h.lease.is_retired() {
+            return Err(BridgeError::SessionExpired);
+        }
+        if h.state != SessionState::Idle {
+            return Err(BridgeError::HandleBusy);
+        }
+        let usage_warning = self.eval_warn(&h.usage);
+        h.state = SessionState::Running;
+        h.op = Some(op.clone());
+        h.last_used = self.clock.now_instant();
+        let seed = h.pending_seed.take();
+        Ok(WarmTurn {
+            backend: h.backend.clone(),
+            session: h.backend_session.clone(),
+            usage_warning,
+            generation: h.generation,
+            op,
+            seed,
+        })
+    }
+
     async fn checkout_turn_inner(
         &self,
         ctx: &ContextId,
