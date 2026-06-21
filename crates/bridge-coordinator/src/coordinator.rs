@@ -1,30 +1,94 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bridge_core::error::BridgeError;
 use bridge_core::ids::{ContextId, TaskId, WorkflowId};
+use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
 use bridge_core::ports::{AgentRegistry, PolicyEngine, SessionStore};
 use bridge_core::session_cwd::SessionCwd;
-use bridge_core::task_store::TaskStore;
-use bridge_workflow::executor::WorkflowExecutor;
+use bridge_core::task_store::{TaskRecord, TaskRecordStatus, TaskStore};
+use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
 use bridge_workflow::graph::WorkflowGraph;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::clock::Clock;
-use crate::detached::TaskProgressHub;
+use crate::detached::{
+    new_detached_task_id, resume_working_tasks, spawn_detached_workflow, DetachedDeps,
+    TaskProgressHub, SUPPORTED_SNAPSHOT_VERSION,
+};
 use crate::dispatch::TaskBinding;
+use crate::params::OpParams;
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StatusDto {
+    Session(SessionStatusDto),
+    Task(TaskStatusDto),
+}
+
+#[derive(serde::Serialize)]
+pub struct SessionStatusDto {
+    pub state: &'static str,
+    pub agent: String,
+    pub generation: u64,
+    pub idle_age_ms: u128,
+    pub capabilities: AgentSessionCaps,
+    pub usage: UsageSnapshot,
+    pub over_threshold: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+pub struct TaskStatusDto {
+    pub id: TaskId,
+    pub workflow: String,
+    pub status: &'static str,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub updated_ms: i64,
+}
+
+impl From<&crate::session_manager::SessionStatusInfo> for SessionStatusDto {
+    fn from(info: &crate::session_manager::SessionStatusInfo) -> Self {
+        Self {
+            state: info.state,
+            agent: info.agent.clone(),
+            generation: info.generation,
+            idle_age_ms: info.idle_age_ms,
+            capabilities: info.capabilities.clone(),
+            usage: info.usage.clone(),
+            over_threshold: info.over_threshold,
+        }
+    }
+}
+
+impl From<&TaskRecord> for TaskStatusDto {
+    fn from(rec: &TaskRecord) -> Self {
+        Self {
+            id: rec.id.clone(),
+            workflow: rec.workflow.clone(),
+            status: rec.status.as_str(),
+            result: rec.result.clone(),
+            error: rec.error.clone(),
+            updated_ms: rec.updated_ms,
+        }
+    }
+}
 
 /// The stable Rust service API. ONE owner of the orchestration state; A2A/CLI/MCP are thin adapters
 /// over it. Concrete struct (one impl, no trait).
-#[allow(dead_code)]
 pub struct Coordinator {
     pub session_manager: Arc<crate::session_manager::SessionManager>,
     executor: Option<Arc<WorkflowExecutor>>,
     workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>,
     task_store: Arc<dyn TaskStore>,
+    #[allow(dead_code)] // prompt/continue move consumes this in T6b-2.
     session_store: Arc<dyn SessionStore>,
+    #[allow(dead_code)] // prompt/continue move consumes this in T6b-2.
     policy: Arc<dyn PolicyEngine>,
+    #[allow(dead_code)] // prompt/continue move consumes this in T6b-2.
     registry: Arc<dyn AgentRegistry>,
+    #[allow(dead_code)] // prompt/continue move consumes this in T6b-2.
     bindings: Arc<Mutex<HashMap<TaskId, TaskBinding>>>,
     progress_hubs: Arc<Mutex<HashMap<TaskId, Arc<TaskProgressHub>>>>,
     workflow_cancels: Arc<Mutex<HashMap<TaskId, CancellationToken>>>,
@@ -65,6 +129,165 @@ impl Coordinator {
             resume_attempt_cap,
         }
     }
+
+    /// Build the detached-workflow dependency view over the Coordinator's owned fields.
+    fn detached_deps(&self) -> DetachedDeps {
+        DetachedDeps {
+            task_store: self.task_store.clone(),
+            executor: self.executor.clone(),
+            workflows: self.workflows.clone(),
+            workflow_cancels: self.workflow_cancels.clone(),
+            progress_hubs: self.progress_hubs.clone(),
+            clock: self.clock.clone(),
+        }
+    }
+
+    /// Submit a detached workflow run and return its durable task id.
+    pub async fn run_workflow(&self, p: OpParams) -> Result<TaskId, BridgeError> {
+        if p.agent.is_some() || p.model.is_some() || p.effort.is_some() || p.mode.is_some() {
+            return Err(BridgeError::InvalidRequest {
+                field: "agent/model/effort/mode (run_workflow ignores overrides)",
+            });
+        }
+        let wf = p
+            .workflow
+            .as_deref()
+            .ok_or(BridgeError::InvalidRequest { field: "workflow" })?;
+        let wf_id = WorkflowId::parse(wf)?;
+        let graph = self
+            .workflows
+            .get(&wf_id)
+            .cloned()
+            .ok_or(BridgeError::InvalidRequest { field: "workflow" })?;
+        let session_cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
+
+        let task = new_detached_task_id();
+        let now = self.clock.now_ms();
+        let input = p.input;
+        let workflow_spec_json = Some(
+            serde_json::json!({ "v": SUPPORTED_SNAPSHOT_VERSION, "graph": &*graph }).to_string(),
+        );
+        let rec = TaskRecord {
+            id: task.clone(),
+            workflow: wf_id.as_str().to_string(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: now,
+            updated_ms: now,
+            input: input.clone(),
+            workflow_spec_json,
+            resume_attempts: 0,
+            session_cwd: session_cwd.as_ref().map(|c| c.as_str().to_string()),
+        };
+        self.task_store.create(&rec).await?;
+
+        let hub = Arc::new(TaskProgressHub::new());
+        self.progress_hubs
+            .lock()
+            .await
+            .insert(task.clone(), hub.clone());
+        let token = CancellationToken::new();
+        self.workflow_cancels
+            .lock()
+            .await
+            .insert(task.clone(), token.clone());
+        drop(spawn_detached_workflow(
+            &self.detached_deps(),
+            task.clone(),
+            input,
+            graph,
+            task.as_str().to_string(),
+            token,
+            HashMap::new(),
+            WorkflowRunContext {
+                session_cwd,
+                make_rich_sink: None,
+            },
+            hub,
+        ));
+        Ok(task)
+    }
+
+    /// Return status for exactly one warm context or detached task.
+    pub async fn status(
+        &self,
+        ctx: Option<ContextId>,
+        task: Option<TaskId>,
+    ) -> Result<StatusDto, BridgeError> {
+        match (ctx, task) {
+            (Some(_), Some(_)) => Err(BridgeError::InvalidRequest {
+                field: "context|task_id (exactly one)",
+            }),
+            (None, None) => Err(BridgeError::InvalidRequest {
+                field: "context|task_id (one required)",
+            }),
+            (Some(c), None) => {
+                let info = self
+                    .session_manager
+                    .status(&c)
+                    .await
+                    .ok_or(BridgeError::SessionNotFound)?;
+                Ok(StatusDto::Session(SessionStatusDto::from(&info)))
+            }
+            (None, Some(t)) => {
+                let rec = self
+                    .task_store
+                    .get(&t)
+                    .await?
+                    .ok_or(BridgeError::TaskNotFound)?;
+                Ok(StatusDto::Task(TaskStatusDto::from(&rec)))
+            }
+        }
+    }
+
+    /// Clear a warm context and its children, rejecting while a workflow run owns the context.
+    pub async fn clear(
+        &self,
+        ctx: ContextId,
+    ) -> Result<crate::session_manager::ResetOutcome, BridgeError> {
+        let runs = self.workflow_runs.lock().await;
+        if runs.contains_key(&ctx) {
+            return Err(BridgeError::HandleBusy);
+        }
+        let result = self.session_manager.clear_with_children(&ctx, false).await;
+        drop(runs);
+        result
+    }
+
+    /// Cancel a detached task live when possible, then durably flip Working -> Canceled.
+    pub async fn cancel_task(&self, id: TaskId) -> Result<bool, BridgeError> {
+        if let Some(tok) = self.workflow_cancels.lock().await.get(&id) {
+            tok.cancel();
+        }
+        self.task_store
+            .cancel_if_working(&id, self.clock.now_ms())
+            .await
+    }
+
+    /// Shutdown hook for stdin EOF: cancel live detached work and release all warm sessions.
+    pub async fn shutdown(&self) {
+        let toks: Vec<(TaskId, CancellationToken)> = self
+            .workflow_cancels
+            .lock()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (id, tok) in toks {
+            tok.cancel();
+            let _ = self
+                .task_store
+                .cancel_if_working(&id, self.clock.now_ms())
+                .await;
+        }
+        self.session_manager.release_all().await;
+    }
+
+    /// Boot-time detached task resume.
+    pub async fn resume(&self) {
+        resume_working_tasks(&self.detached_deps(), self.resume_attempt_cap).await;
+    }
 }
 
 #[cfg(test)]
@@ -78,16 +301,20 @@ mod tests {
         PermissionRequest, RegistrySnapshot, SessionContext,
     };
     use bridge_core::error::BridgeError;
-    use bridge_core::ids::{AgentId, SessionId};
+    use bridge_core::ids::{AgentId, ContextId, NodeId, OperationId, SessionId};
     use bridge_core::ports::{AgentBackend, BackendStream, Lease, Resolved, Update};
-    use bridge_core::task_store::MemoryTaskStore;
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus};
+    use bridge_workflow::graph::WorkflowNode;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     struct NoopLease;
     impl Lease for NoopLease {}
 
-    struct FakeBackend;
+    struct FakeBackend {
+        prompt_gate: Option<Arc<Notify>>,
+    }
 
     #[async_trait]
     impl AgentBackend for FakeBackend {
@@ -96,6 +323,9 @@ mod tests {
             _session: &SessionId,
             _parts: Vec<Part>,
         ) -> Result<BackendStream, BridgeError> {
+            if let Some(gate) = &self.prompt_gate {
+                gate.notified().await;
+            }
             let updates = vec![Ok(Update::Done {
                 stop_reason: "end_turn".into(),
             })];
@@ -253,7 +483,7 @@ mod tests {
     fn coordinator_constructs_with_full_state() {
         let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
             entry: entry(),
-            backend: Arc::new(FakeBackend),
+            backend: Arc::new(FakeBackend { prompt_gate: None }),
         });
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
         let session_manager = Arc::new(SessionManager::new_with_clock(
@@ -279,5 +509,257 @@ mod tests {
         );
 
         assert!(Arc::ptr_eq(&coordinator.session_manager, &session_manager));
+    }
+
+    fn workflow(id: &str) -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse(id).unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: Vec::new(),
+            }],
+        })
+    }
+
+    fn op(id: &str) -> OperationId {
+        OperationId::parse(id).unwrap()
+    }
+
+    fn ctx(id: &str) -> ContextId {
+        ContextId::parse(id).unwrap()
+    }
+
+    fn task(id: &str) -> TaskId {
+        TaskId::parse(id).unwrap()
+    }
+
+    fn working_record(id: TaskId) -> TaskRecord {
+        TaskRecord {
+            id,
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 10,
+            updated_ms: 10,
+            input: "input".into(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+        }
+    }
+
+    struct Fixture {
+        coordinator: Coordinator,
+        task_store: Arc<MemoryTaskStore>,
+    }
+
+    fn coordinator_fixture(workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>) -> Fixture {
+        coordinator_fixture_with_backend(workflows, Arc::new(FakeBackend { prompt_gate: None }))
+    }
+
+    fn coordinator_fixture_with_backend(
+        workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>,
+        backend: Arc<FakeBackend>,
+    ) -> Fixture {
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend,
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let session_manager = Arc::new(SessionManager::new_with_clock(
+            registry.clone(),
+            Duration::from_secs(60),
+            clock.clone(),
+        ));
+        let task_store = Arc::new(MemoryTaskStore::new());
+        let task_store_dyn: Arc<dyn TaskStore> = task_store.clone();
+        let session_store: Arc<dyn SessionStore> = Arc::new(FakeSessionStore::default());
+        let policy: Arc<dyn PolicyEngine> = Arc::new(AllowPolicy);
+        let executor = Arc::new(WorkflowExecutor::new(registry.clone()));
+        let coordinator = Coordinator::new(
+            session_manager,
+            Some(executor),
+            workflows,
+            task_store_dyn,
+            session_store,
+            policy,
+            registry,
+            clock,
+            Some(SessionCwd::parse("/tmp").unwrap()),
+            3,
+        );
+        Fixture {
+            coordinator,
+            task_store,
+        }
+    }
+
+    fn workflow_params() -> OpParams {
+        OpParams {
+            workflow: Some("code-review".into()),
+            skill: None,
+            input: "hello".into(),
+            context: None,
+            agent: None,
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: Some("/tmp/repo".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_workflow_creates_durable_task_and_returns_id() {
+        let gate = Arc::new(Notify::new());
+        let mut workflows = HashMap::new();
+        workflows.insert(
+            WorkflowId::parse("code-review").unwrap(),
+            workflow("code-review"),
+        );
+        let fixture = coordinator_fixture_with_backend(
+            Arc::new(workflows),
+            Arc::new(FakeBackend {
+                prompt_gate: Some(gate),
+            }),
+        );
+
+        let id = fixture
+            .coordinator
+            .run_workflow(workflow_params())
+            .await
+            .unwrap();
+        let rec = fixture.task_store.get(&id).await.unwrap().unwrap();
+
+        assert_eq!(rec.id, id);
+        assert_eq!(rec.workflow, "code-review");
+        assert_eq!(rec.status, TaskRecordStatus::Working);
+        assert_eq!(rec.input, "hello");
+        assert_eq!(rec.session_cwd.as_deref(), Some("/tmp/repo"));
+        assert!(rec.workflow_spec_json.is_some());
+        assert!(
+            fixture.task_store.create(&rec).await.is_err(),
+            "task creates must be non-clobbering"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_context_xor_task_id() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let id = task("task-status");
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            fixture
+                .coordinator
+                .status(Some(ctx("ctx-status")), Some(id.clone()))
+                .await,
+            Err(BridgeError::InvalidRequest { .. })
+        ));
+        assert!(matches!(
+            fixture.coordinator.status(None, None).await,
+            Err(BridgeError::InvalidRequest { .. })
+        ));
+
+        let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
+        let value = serde_json::to_value(dto).unwrap();
+        assert_eq!(value["kind"], "task");
+        assert_eq!(value["status"], "working");
+    }
+
+    #[tokio::test]
+    async fn cancel_task_flips_durable_when_working() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let id = task("task-cancel");
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+
+        assert!(fixture.coordinator.cancel_task(id.clone()).await.unwrap());
+        assert!(!fixture.coordinator.cancel_task(id.clone()).await.unwrap());
+        let rec = fixture.task_store.get(&id).await.unwrap().unwrap();
+        assert_eq!(rec.status, TaskRecordStatus::Canceled);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_tokens_and_releases_sessions() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let id = task("task-shutdown");
+        let token = CancellationToken::new();
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+        fixture
+            .coordinator
+            .workflow_cancels
+            .lock()
+            .await
+            .insert(id.clone(), token.clone());
+
+        let c = ctx("ctx-shutdown");
+        let turn = fixture
+            .coordinator
+            .session_manager
+            .checkout_turn(
+                &c,
+                AgentId::parse("codex").unwrap(),
+                None,
+                None,
+                op("op-shutdown"),
+            )
+            .await
+            .unwrap();
+        fixture
+            .coordinator
+            .session_manager
+            .finish_turn(&c, turn.generation, &turn.op)
+            .await;
+        assert!(fixture
+            .coordinator
+            .session_manager
+            .status(&c)
+            .await
+            .is_some());
+
+        fixture.coordinator.shutdown().await;
+
+        assert!(token.is_cancelled());
+        assert_eq!(
+            fixture.task_store.get(&id).await.unwrap().unwrap().status,
+            TaskRecordStatus::Canceled
+        );
+        assert!(fixture
+            .coordinator
+            .session_manager
+            .status(&c)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_rejects_when_a_run_is_active() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let c = ctx("ctx-clear");
+        fixture
+            .coordinator
+            .workflow_runs
+            .lock()
+            .await
+            .insert(c.clone(), CancellationToken::new());
+
+        assert!(matches!(
+            fixture.coordinator.clear(c).await,
+            Err(BridgeError::HandleBusy)
+        ));
     }
 }
