@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bridge-core = { path = "../bridge-core" }
+bridge-coordinator = { path = "../bridge-coordinator" }
 bridge-workflow = { path = "../bridge-workflow" }
 thiserror.workspace = true
 async-trait.workspace = true

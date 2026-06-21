@@ -430,6 +430,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "bridge-coordinator",
  "bridge-core",
  "bridge-workflow",
  "futures",
@@ -515,8 +516,11 @@ dependencies = [
 name = "bridge-coordinator"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bridge-core",
+ "futures",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
