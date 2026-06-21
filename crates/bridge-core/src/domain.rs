@@ -78,6 +78,12 @@ pub struct SandboxConfig {
     pub volumes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchdogConfig {
+    pub idle_timeout: std::time::Duration,
+    pub hard_wall_clock: std::time::Duration,
+}
+
 /// The container runtime used when none is configured. The SINGLE source of this literal — the sandbox
 /// runtime resolver, the default-`allowed_cmds` union, and the `[verify]` runtime gate all read it, so the
 /// "validate vs spawn" pair can never drift on the default.
@@ -134,6 +140,8 @@ pub struct AgentEntry {
     pub session_cwd: Option<String>,
     /// The enforced `[sandbox]` block (B1): how to containerize this agent. `None` = raw `cmd`/`args`.
     pub sandbox: Option<SandboxConfig>,
+    /// Optional per-agent E9 watchdog. `None` preserves the pre-watchdog turn behavior.
+    pub watchdog: Option<WatchdogConfig>,
     /// MCP servers to offer this agent (ADR-0028). Empty = none. Delivered via [`Self::mcp_delivery`].
     pub mcp: Vec<crate::mcp::McpServerSpec>,
     /// Which channel delivers `mcp` to this agent (resolved at config build from `cmd`). Irrelevant
@@ -360,6 +368,7 @@ mod tests {
             cwd: None,
             session_cwd: None,
             sandbox: None,
+            watchdog: None,
             auth_method: None,
             name: None,
             description: None,
@@ -390,6 +399,7 @@ mod tests {
             cwd: None,
             session_cwd: None,
             sandbox: None,
+            watchdog: None,
             auth_method: None,
             name: None,
             description: None,
@@ -418,6 +428,7 @@ mod tests {
             cwd: None,
             session_cwd: None,
             sandbox: None,
+            watchdog: None,
             auth_method: None,
             name: None,
             description: None,

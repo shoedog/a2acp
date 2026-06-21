@@ -180,6 +180,7 @@ mod tests {
             cwd: None,
             session_cwd: None,
             sandbox: None,
+            watchdog: None,
             auth_method: None,
             name: None,
             description: None,

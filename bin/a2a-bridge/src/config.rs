@@ -125,6 +125,11 @@ pub struct RegistryConfig {
     pub workflows: Vec<WorkflowToml>,
     #[serde(default)]
     pub languages: Vec<LanguageToml>,
+    /// Sentinel for a top-level `[watchdog]` table: the watchdog is PER-AGENT only
+    /// (`[agents.watchdog]`), so a top-level table would be silently ignored. Present →
+    /// rejected in `into_snapshot` with a clear "use [agents.watchdog]" error.
+    #[serde(default)]
+    pub watchdog: Option<toml::Value>,
     /// Global root path that gates which per-request cwds are allowed (later tasks).
     /// Absent → no global root restriction.
     #[serde(default)]
@@ -203,6 +208,9 @@ pub struct AgentEntryToml {
     /// The enforced `[sandbox]` block (B1). Converted to `SandboxConfig` + S0/S2-checked in `into_snapshot`.
     #[serde(default)]
     pub sandbox: Option<SandboxToml>,
+    /// Optional per-agent E9 watchdog. Absent means disabled.
+    #[serde(default)]
+    pub watchdog: Option<WatchdogToml>,
     #[serde(default)]
     pub auth_method: Option<String>,
     #[serde(default)]
@@ -370,6 +378,14 @@ pub struct SandboxToml {
     pub no_proxy: Option<String>,
     #[serde(default)]
     pub volumes: Vec<String>,
+}
+
+/// `[agents.watchdog]` TOML mirror. Durations are positive seconds and are converted to
+/// [`bridge_core::domain::WatchdogConfig`] in `into_snapshot`.
+#[derive(Debug, serde::Deserialize)]
+pub struct WatchdogToml {
+    pub idle_timeout_secs: u64,
+    pub hard_wall_clock_secs: u64,
 }
 
 fn default_gate() -> bool {
@@ -880,6 +896,14 @@ impl RegistryConfig {
 
     /// Convert this parsed config into a `RegistrySnapshot` with typed domain values.
     pub fn into_snapshot(self) -> Result<RegistrySnapshot, ConfigError> {
+        // The watchdog is PER-AGENT only; a top-level `[watchdog]` table would be a silent no-op
+        // (every `AcpConfig.watchdog` stays `None`). Reject it so an operator isn't misled.
+        if self.watchdog.is_some() {
+            return Err(ConfigError::Registry(
+                "top-level [watchdog] is not supported; configure it per agent as [agents.watchdog]"
+                    .to_string(),
+            ));
+        }
         // The global cwd-gate root; captured before `self.agents` is moved by the loop below.
         let allowed_cwd_root = self.allowed_cwd_root.clone();
         // `allowed_cmds`: use the explicit list if provided; otherwise default to the union of all
@@ -994,6 +1018,39 @@ impl RegistryConfig {
                     id.as_str()
                 )));
             }
+            let watchdog = match &a.watchdog {
+                None => None,
+                Some(wd) => {
+                    if wd.idle_timeout_secs == 0 {
+                        return Err(ConfigError::Registry(format!(
+                            "agent {:?}: watchdog idle_timeout_secs must be > 0",
+                            id.as_str()
+                        )));
+                    }
+                    if wd.hard_wall_clock_secs == 0 {
+                        return Err(ConfigError::Registry(format!(
+                            "agent {:?}: watchdog hard_wall_clock_secs must be > 0",
+                            id.as_str()
+                        )));
+                    }
+                    // Cap at 30 days: a turn timeout above this is a config typo, and an
+                    // unbounded value would overflow `Instant + Duration` and panic the watchdog
+                    // task (the deadline math in acp_backend).
+                    const WATCHDOG_MAX_SECS: u64 = 30 * 24 * 3600;
+                    if wd.idle_timeout_secs > WATCHDOG_MAX_SECS
+                        || wd.hard_wall_clock_secs > WATCHDOG_MAX_SECS
+                    {
+                        return Err(ConfigError::Registry(format!(
+                            "agent {:?}: watchdog timeouts must be <= {WATCHDOG_MAX_SECS}s (30 days)",
+                            id.as_str()
+                        )));
+                    }
+                    Some(bridge_core::domain::WatchdogConfig {
+                        idle_timeout: std::time::Duration::from_secs(wd.idle_timeout_secs),
+                        hard_wall_clock: std::time::Duration::from_secs(wd.hard_wall_clock_secs),
+                    })
+                }
+            };
             entries.push(AgentEntry {
                 id,
                 cmd: a.cmd,
@@ -1008,6 +1065,7 @@ impl RegistryConfig {
                 cwd: a.cwd,
                 session_cwd: a.session_cwd,
                 sandbox,
+                watchdog,
                 mcp,
                 mcp_delivery,
                 auth_method: a.auth_method,
@@ -1636,6 +1694,99 @@ addr="127.0.0.1:8080"
             .unwrap()
             .into_snapshot()
             .is_err());
+    }
+
+    #[test]
+    fn watchdog_toml_parses_per_agent() {
+        let toml = r#"
+            default = "c"
+            [server]
+            addr = "127.0.0.1:8080"
+            [[agents]]
+            id = "c"
+            cmd = "codex-acp"
+            [agents.watchdog]
+            idle_timeout_secs = 30
+            hard_wall_clock_secs = 600
+            [[agents]]
+            id = "plain"
+            cmd = "codex-acp"
+        "#;
+        let snap = RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+        let wd = snap
+            .entries
+            .iter()
+            .find(|e| e.id.as_str() == "c")
+            .unwrap()
+            .watchdog
+            .as_ref()
+            .unwrap();
+        assert_eq!(wd.idle_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(wd.hard_wall_clock, std::time::Duration::from_secs(600));
+        assert!(
+            snap.entries
+                .iter()
+                .find(|e| e.id.as_str() == "plain")
+                .unwrap()
+                .watchdog
+                .is_none(),
+            "agents without [agents.watchdog] must leave watchdog disabled"
+        );
+
+        let bad = toml.replace("idle_timeout_secs = 30", "idle_timeout_secs = 0");
+        assert!(
+            RegistryConfig::parse(&bad)
+                .unwrap()
+                .into_snapshot()
+                .is_err(),
+            "idle_timeout_secs = 0 must be rejected"
+        );
+        let bad = toml.replace("hard_wall_clock_secs = 600", "hard_wall_clock_secs = 0");
+        assert!(
+            RegistryConfig::parse(&bad)
+                .unwrap()
+                .into_snapshot()
+                .is_err(),
+            "hard_wall_clock_secs = 0 must be rejected"
+        );
+        // > 30 days is rejected (an unbounded value would overflow Instant+Duration).
+        let bad = toml.replace(
+            "hard_wall_clock_secs = 600",
+            "hard_wall_clock_secs = 9999999999",
+        );
+        assert!(
+            RegistryConfig::parse(&bad)
+                .unwrap()
+                .into_snapshot()
+                .is_err(),
+            "an absurd hard_wall_clock_secs must be rejected (overflow guard)"
+        );
+    }
+
+    #[test]
+    fn top_level_watchdog_table_is_rejected() {
+        // The watchdog is PER-AGENT; a top-level [watchdog] would be a silent no-op -> reject it.
+        let toml = r#"
+            default = "c"
+            [server]
+            addr = "127.0.0.1:8080"
+            [watchdog]
+            idle_timeout_secs = 30
+            hard_wall_clock_secs = 600
+            [[agents]]
+            id = "c"
+            cmd = "codex-acp"
+        "#;
+        assert!(
+            RegistryConfig::parse(toml)
+                .unwrap()
+                .into_snapshot()
+                .is_err(),
+            "a top-level [watchdog] table must be rejected (use [agents.watchdog])"
+        );
     }
 
     #[test]

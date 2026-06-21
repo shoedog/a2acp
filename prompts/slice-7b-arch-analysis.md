@@ -1,0 +1,24 @@
+You are doing an ARCHITECTURE ANALYSIS pass (not a line-review) on the Slice-7b "E9 watchdog" design, grounded against the ACTUAL a2a-bridge code (session-cwd = the bridge repo). READ-ONLY: read files, grep, `git log`; do NOT edit/build/test. Rigorous, structural, decisive — high-effort (xhigh) work, the second lens of a dual-lens pass (a controller analysis exists; you are the independent second opinion). Do NOT re-litigate the CONVERGED rulings (the Slice-7 analysis D-E: per-active-node-turn, idle + hard wall-clock, liveness = activity events, reuse the existing cancel/turn_kill) — pressure-test the IMPLEMENTATION ARCHITECTURE and resolve the open decisions.
+
+The controller's analysis is below:
+
+{{input}}
+
+CONTEXT YOU MUST READ (ground every claim in real code with file:line):
+- The controller analysis: `docs/superpowers/specs/2026-06-20-slice-7b-watchdog-ANALYSIS.md`. The converged D-E: `docs/superpowers/specs/2026-06-20-slice-7-rich-acp-ANALYSIS.md`. The invariants: `docs/superpowers/specs/2026-06-17-orchestration-architecture.md` (WATCHDOG / UPDATE-MINIMAL).
+- The turn lifecycle: `crates/bridge-acp/src/acp_backend.rs` — `prompt_inner` (~:1907, the turn_lock + mpsc + driver + the S7a unfold skip-rich loop); the per-turn `turn_kill` (~:305/315, installed fresh per turn) + the driver `select!` on it; `cancel(session)` + the grace escalation (~:1885-1935); `cancel_grace`/`AcpConfig` (~:95-145, :1585); `SessionEntry` (~:288-326, no activity timestamp today); the non-blocking handler (~:963).
+- The executor (per-node turns): `crates/bridge-workflow/src/executor.rs` (FuturesUnordered ~:412/455; run_node calls backend.prompt/prompt_observed). The detached runner: `crates/bridge-a2a-inbound/src/server.rs`. The Slice-7a rich path (just merged, `8e1e5c6`): the rich events flow through the unfold.
+- How `AcpConfig` is built from the bridge config (the registry/config wiring) — to see where `[watchdog]` lands.
+
+ANALYZE — give the controller a rigorous independent second opinion:
+1. **Decomposition / placement (D-A — pivotal):** is a per-turn watchdog in `prompt_inner` (applying to ALL ACP turns: detached + warm + unary) right, or should it be detached-workflow-only? Trace whether a warm interactive turn should have the same idle/wall-clock; whether cancelling a warm turn corrupts the warm session lifecycle (the turn_lock, the session staying warm). Is `prompt_inner` the right home, or should the watchdog live above the backend (in the executor / a per-node supervisor)?
+2. **Resolve D-A..D-F** with code-grounded positions:
+   - **D-B (activity tap):** bump `last_activity` in the unfold (`rx.recv`, off-loop) vs the handler (`tx.send`, on the SDK event loop — NONBLOCKING-ACP-HANDLERS). Does the unfold see EVERY event (text/usage/rich/terminal)? Any event that bypasses the unfold (so liveness would miss it)?
+   - **D-C (cancel mechanism + outcome):** reuse `cancel(session)` (graceful) vs fire `turn_kill` directly. What terminal does a watchdog-cancel produce, and how does the workflow/transcript DISTINGUISH a timeout from a generic failure/cancel (a new stop_reason / `AgentTimedOut`)? Does the existing `StopReason::Cancelled` path conflate it?
+   - **D-D (config):** `[watchdog]` global vs per-agent; defaults disabled vs sensible; the `AcpConfig` wiring.
+   - **D-E (idle-only-after-first-event):** is "no idle clock until the first event; wall-clock governs a silent turn" correct + sufficient to not false-trip a thinking model? Edge: a turn that emits once then thinks long.
+   - **D-F (watchdog task lifecycle):** how to TEAR DOWN the per-turn task cleanly (no leak across thousands of turns); cancellation-safety vs the cancel it fires (no double-fire / no fire-after-end); does the turn_kill/grace machinery already give a clean hook?
+3. **Hazards the controller missed.** e.g. the watchdog firing while the driver is mid-`block_task`; a race between the watchdog cancel and a naturally-completing turn; the watchdog holding/contending the `turn_kill` StdMutex; clock source (the bridge forbids `Date::now` in core but the server uses it — where does the watchdog get time?); the check_interval granularity; thousands of concurrent per-turn watchdog tasks (cost); interaction with the existing external `cancel()` (both firing turn_kill). Be concrete with file:line.
+4. **What to CUT or DEFER** to keep S7b minimal but non-redesign-forcing. Is the distinct timeout stop_reason worth it now or defer? Is warm/unary scope worth it or detached-only? Is per-agent config over-built?
+
+OUTPUT: a structured critique — (a) placement/decomposition verdict + a better one if warranted, (b) D-A..D-F rulings each with a one-line code-grounded reason, (c) hazards-the-controller-missed (file:line), (d) cut/defer list. End with one line: `ARCH VERDICT: sound | sound-with-changes | needs-rework`. Be a co-architect. Do NOT edit any files.
