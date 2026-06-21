@@ -1,0 +1,12 @@
+[package]
+name = "bridge-coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-clock = []
+
+[dependencies]
+bridge-core = { path = "../bridge-core" }
+tokio = { workspace = true }
