@@ -126,6 +126,37 @@
   scheduler token then sweeps children, drain-on-cancel preserved); one `on_exit(NodeTurnExit)` cleanup
   (finish/`sm.cancel`/expire-on-`AgentCrashed`); gate lift STREAMING-ONLY; `async-trait`→`[dependencies]`; warm
   nodes don't record usage (deferred). Then S6 journal → S7 observability+E9 → S8 MCP → S9 Turn Channel → tail.
+- **Slice 7b — E9 per-turn watchdog: SHIPPED + MERGED to `main`** (merge `67bb186`, NOT yet pushed) (2026-06-20).
+  Docs: `specs/2026-06-20-slice-7b-watchdog-ANALYSIS.md` + `specs/2026-06-20-slice-7b-watchdog.md` (spec v2,
+  FIX-1..12) + `plans/2026-06-20-slice-7b-watchdog.md` (plan v2, PFIX-A..M). Opt-in per-agent
+  `[agents.watchdog] {idle_timeout_secs, hard_wall_clock_secs}` arms a per-turn watchdog in
+  `AcpBackend::prompt_inner`. **Settled design (SHIPPED):** the SDK handler bumps a per-turn
+  `TurnWatch.last_activity` atomic (NON-BLOCKING short StdMutex, UNCONDITIONAL — unmodeled events count, the
+  `RequestPermissionRequest` handler bumps too; routing value became `TurnRoute{tx, watch}`); a `'static`
+  watchdog task observes it + wall-clock, `deadline=min(wall, idle-if-seen)`, `sleep_until` + re-derive, and
+  notifies `watchdog_fired` (idle armed ONLY after the first event; hard wall-clock always); the driver's outer
+  `tokio::select!` gains a **`biased;`** `watchdog_fired` arm that runs the EXISTING bounded cancel
+  (`CancelNotification` -> `cancel_grace` -> `escalate_terminate`), **DISCARDS the inner outcome**, sets
+  `timed_out_local`, and the terminal emits a distinct `BridgeError::AgentTimedOut` -> A2A **`Failed`** (disposition
+  `_` default, NOT `Canceled`) + `classify_death` Fatal (NOT retried). Disabled path (`watchdog=None`) is
+  behaviourally identical (no task, `pending()` arm, no-op bump). `WatchdogConfig` lives in `bridge-core::domain`
+  (AgentEntry carries it; +~31 struct-literal sites); config validates `>0` and a **30-day cap** (overflow guard);
+  a **top-level `[watchdog]` is REJECTED** (per-agent only). **GOTCHAS:** `tokio::select!` is UNBIASED by default ->
+  a completed `prompt_fut` racing a fired watchdog could relabel a NATURAL completion as `AgentTimedOut` (the
+  whole-branch BLOCKER) -> `biased;` fixes it; the handler bump must be at the HANDLER (`tx.send`), not the
+  backpressure-gated unfold; `escalate_terminate` SIGKILLs the WHOLE shared agent process (blast-radius doc note
+  in `docs/containerized-agents.md`); the error->state method is `disposition()` (NOT `to_state`); `Instant +
+  Duration` can panic on a huge config (capped). **Whole-branch review: dual-lens** (codex `changes-required` ->
+  Opus `approve-with-nits`): codex caught the BLOCKER (unbiased select) + 2 MAJORs (overflow cap, top-level
+  reject) + a doc NIT -> fixed `d131920`; Opus confirmed the 4 fixes + 2 nits (a missing PFIX-F regression test; the
+  disabled-path test name overstated) -> folded `d97a208`
+  (`watchdog_timeout_overrides_an_honored_cancel_within_grace` — an agent that HONORS cancel within grace is STILL
+  `AgentTimedOut`). **LIVE-GATE (real codex, `examples/a2a-bridge.slice-7b-livegate.toml`) PASS:** wd-trip
+  (`hard_wall_clock=3s`) killed a steadily-EMITTING turn at 3s -> `agent timed out` (A2A `Failed`); wd-ok
+  (`idle_timeout=5s`) ran the SAME 66s turn to NATURAL completion (steady streaming reset idle, FN-1); a re-submit
+  tripped AGAIN at 3s (the timed-out turn RELEASED its lock — no deadlock); no codex turn leak. Gate: fmt + clippy
+  `--all-targets` clean; full workspace 822 pass / 0 fail. **NEXT = Slice 8** (MCP) per the roadmap (`S7
+  observability+E9` now COMPLETE: S7a rich journaling + S7b watchdog); OR push `67bb186`.
 - **NEW FOLLOW-UP (from the Slice-4 whole-branch review):** the caller-future-drop + reap-vs-claim TOCTOU
   patterns also exist (smaller window) in the SHIPPED `reset_session`/clear path. Slice 4 fixed compact's
   (wider) version + made `reap_idle` claim-safe for ALL claims; consider the same spawn-detach for
