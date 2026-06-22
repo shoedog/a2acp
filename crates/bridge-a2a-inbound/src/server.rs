@@ -3800,6 +3800,78 @@ mod tests {
         }
     }
 
+    struct ForceClearOnWarmPutStore {
+        inner: FakeStore,
+        sm: Arc<crate::session_manager::SessionManager>,
+        ctx: ContextId,
+        fired: AtomicBool,
+    }
+
+    impl ForceClearOnWarmPutStore {
+        fn new(sm: Arc<crate::session_manager::SessionManager>, ctx: ContextId) -> Self {
+            Self {
+                inner: FakeStore::default(),
+                sm,
+                ctx,
+                fired: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore for ForceClearOnWarmPutStore {
+        async fn put(&self, t: &TaskId, s: &SessionId) -> Result<(), BridgeError> {
+            self.inner.put(t, s).await?;
+            if s.as_str().starts_with("ctx-")
+                && self
+                    .fired
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.sm
+                    .reset_session(&self.ctx, crate::session_manager::ResetOpts { force: true })
+                    .await?;
+            }
+            Ok(())
+        }
+
+        async fn session_for(&self, t: &TaskId) -> Result<Option<SessionId>, BridgeError> {
+            self.inner.session_for(t).await
+        }
+
+        async fn put_pending(&self, t: &TaskId, r: &PendingRequest) -> Result<(), BridgeError> {
+            self.inner.put_pending(t, r).await
+        }
+
+        async fn take_pending(&self, t: &TaskId) -> Result<Option<PendingRequest>, BridgeError> {
+            self.inner.take_pending(t).await
+        }
+
+        async fn set_peer_task(&self, t: &TaskId, peer: &PeerTaskId) -> Result<(), BridgeError> {
+            self.inner.set_peer_task(t, peer).await
+        }
+
+        async fn peer_task_for(&self, t: &TaskId) -> Result<Option<PeerTaskId>, BridgeError> {
+            self.inner.peer_task_for(t).await
+        }
+
+        async fn request_cancel(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.inner.request_cancel(t).await
+        }
+
+        async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            self.inner.cancel_requested(t).await
+        }
+
+        async fn set_fanout(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.inner.set_fanout(t).await
+        }
+
+        async fn is_fanout(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            self.inner.is_fanout(t).await
+        }
+    }
+
     struct AutoApprove;
     impl PolicyEngine for AutoApprove {
         fn decide(
@@ -6297,6 +6369,84 @@ mod tests {
             cancels.lock().await.contains_key(&keep_task),
             "disarmed pre-producer guard transfers cancel cleanup to RunGuard"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_producer_pre_cancelled_abort_never_prompts() {
+        let (srv, _sm, _backend) = seed_test_server();
+        let abort = tokio_util::sync::CancellationToken::new();
+        abort.cancel();
+        let dispatch = LocalDispatch {
+            backend: Arc::new(PanicBackend),
+            session: SessionId::parse("ctx-streaming-pre-cancel-g0").unwrap(),
+            seed: None,
+            guard: None,
+            warm_guard: None,
+            abort,
+        };
+        let routed = RoutedCall {
+            task: TaskId::parse("task-streaming-pre-cancel").unwrap(),
+            session: SessionId::parse("session-task-streaming-pre-cancel").unwrap(),
+            parts: vec![Part { text: "hi".into() }],
+            target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            context_id: Some(ContextId::parse("streaming-pre-cancel").unwrap()),
+            session_cwd: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+        spawn_local_producer(&srv, routed, dispatch, tx);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("producer should emit a terminal promptly")
+            .expect("producer channel should remain open until terminal")
+            .expect("terminal event should not be an error");
+        assert_eq!(ev.outcome(), Some(TaskOutcome::Canceled));
+        assert!(
+            rx.recv().await.is_none(),
+            "producer should close after the canceled terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_producer_pre_cancelled_abort_never_prompts() {
+        let ctx = ContextId::parse("unary-pre-cancel").unwrap();
+        let backend = Arc::new(PanicBackend) as Arc<dyn AgentBackend>;
+        let registry = FakeRegistry::with_entries("a", vec![(bare_entry("a"), backend)]);
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry.clone() as Arc<dyn AgentRegistry>,
+            std::time::Duration::from_secs(60),
+        ));
+        let store = Arc::new(ForceClearOnWarmPutStore::new(sm.clone(), ctx.clone()));
+        let srv = Arc::new(
+            InboundServer::new(
+                registry as Arc<dyn AgentRegistry>,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm),
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "contextId": ctx.as_str(), "text": "hi", "metadata": { "a2a-bridge.agent": "a" } } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_CANCELED");
     }
 
     fn warm_msg(text: &str) -> serde_json::Value {
