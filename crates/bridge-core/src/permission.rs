@@ -1,6 +1,7 @@
 use crate::domain::PermitDecision;
 use crate::ids::{ContextId, OperationId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -55,6 +56,7 @@ pub struct PendingPermissionView {
 struct PendingEntry {
     sender: oneshot::Sender<PermissionResolution>,
     view: PendingPermissionView,
+    token: u64,
 }
 
 /// Gen+op-keyed rendezvous for interactive permissions. Exact-once: a key resolves at most once
@@ -62,6 +64,7 @@ struct PendingEntry {
 #[derive(Default)]
 pub struct PermissionRegistry {
     inner: Mutex<HashMap<PermKey, PendingEntry>>,
+    next_token: AtomicU64,
 }
 
 /// Reaps its key on Drop (no-op if already resolved). The interactive handler holds it across the await so
@@ -69,11 +72,12 @@ pub struct PermissionRegistry {
 pub struct PermitGuard {
     reg: Arc<PermissionRegistry>,
     key: PermKey,
+    token: u64,
 }
 
 impl Drop for PermitGuard {
     fn drop(&mut self) {
-        self.reg.reap(&self.key);
+        self.reg.reap_if_current(&self.key, self.token);
     }
 }
 
@@ -89,15 +93,21 @@ impl PermissionRegistry {
         view: PendingPermissionView,
     ) -> (oneshot::Receiver<PermissionResolution>, PermitGuard) {
         let (sender, receiver) = oneshot::channel();
-        self.inner
-            .lock()
-            .expect("permission registry lock")
-            .insert(key.clone(), PendingEntry { sender, view });
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        self.inner.lock().expect("permission registry lock").insert(
+            key.clone(),
+            PendingEntry {
+                sender,
+                view,
+                token,
+            },
+        );
         (
             receiver,
             PermitGuard {
                 reg: Arc::clone(self),
                 key,
+                token,
             },
         )
     }
@@ -141,6 +151,13 @@ impl PermissionRegistry {
             .lock()
             .expect("permission registry lock")
             .remove(key);
+    }
+
+    fn reap_if_current(&self, key: &PermKey, token: u64) {
+        let mut guard = self.inner.lock().expect("permission registry lock");
+        if guard.get(key).is_some_and(|entry| entry.token == token) {
+            guard.remove(key);
+        }
     }
 
     /// Snapshot the pending permission views for a context (session/status reads this - Task 8).
@@ -281,5 +298,25 @@ mod tests {
         let p = reg.pending(&ContextId::parse("c").unwrap());
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].request_id, "r");
+    }
+
+    #[tokio::test]
+    async fn duplicate_register_old_guard_does_not_reap_new() {
+        let reg = PermissionRegistry::new();
+        let k = key("c", 1, "turn-1", "r");
+        let (_rx1, g1) = reg.register(k.clone(), view("old"));
+        let (rx2, _g2) = reg.register(k.clone(), view("new"));
+
+        drop(g1);
+
+        assert_eq!(
+            reg.pending(&ContextId::parse("c").unwrap())[0].request_id,
+            "new"
+        );
+        assert!(reg.resolve(&k, PermissionResolution::Decided(approve())));
+        assert!(matches!(
+            rx2.await.unwrap(),
+            PermissionResolution::Decided(_)
+        ));
     }
 }

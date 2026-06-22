@@ -1260,6 +1260,9 @@ impl SessionManager {
                             && now.duration_since(h.last_used) >= self.idle_ttl
                 );
                 if should_reap {
+                    if let Some(reg) = &self.perm_registry {
+                        reg.resolve_context_cancelled(&c);
+                    }
                     if let Some(h) = tab.remove(&c) {
                         reaped.insert(c);
                         handles.push(h);
@@ -4072,6 +4075,34 @@ mod tests {
 
         assert!(manager.status(&idle).await.is_none());
         assert_eq!(manager.status(&running).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn reap_idle_resolves_pending_permission() {
+        let reg = PermissionRegistry::new();
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let clock = Arc::new(ManualClock::new(0));
+        let manager =
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone())
+                .with_permission_registry(reg.clone());
+        let c = ctx("reap-idle-perm");
+
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+        clock.advance(Duration::from_secs(6));
+
+        manager.reap_idle().await;
+
+        assert_permission_cancelled(rx).await;
+        assert!(manager.status(&c).await.is_none());
     }
 
     #[tokio::test]

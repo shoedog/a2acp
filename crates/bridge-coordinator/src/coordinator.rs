@@ -6,7 +6,7 @@ use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{ContextId, OperationId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
-use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution};
+use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{AgentRegistry, PolicyEngine, SessionStore};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{TaskRecord, TaskRecordStatus, TaskStore};
@@ -252,6 +252,17 @@ impl Coordinator {
             &turn.injects,
             vec![Part { text: input }],
         );
+
+        turn.backend
+            .configure_turn(
+                &turn.session,
+                TurnMeta {
+                    context_id: ctx.clone(),
+                    generation: turn.generation.get(),
+                    op: turn.op.clone(),
+                },
+            )
+            .await;
 
         let task = self.mint_prompt_task_id();
         let translator = Translator::new();
@@ -549,6 +560,16 @@ mod tests {
 
     struct FakeBackend {
         prompt_gate: Option<Arc<Notify>>,
+        configured_turns: Arc<StdMutex<Vec<(SessionId, TurnMeta)>>>,
+    }
+
+    impl FakeBackend {
+        fn new(prompt_gate: Option<Arc<Notify>>) -> Self {
+            Self {
+                prompt_gate,
+                configured_turns: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
     }
 
     #[async_trait]
@@ -569,6 +590,13 @@ mod tests {
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             Ok(())
+        }
+
+        async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
+            self.configured_turns
+                .lock()
+                .unwrap()
+                .push((session.clone(), meta));
         }
     }
 
@@ -823,7 +851,7 @@ mod tests {
     fn coordinator_constructs_with_full_state() {
         let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
             entry: entry(),
-            backend: Arc::new(FakeBackend { prompt_gate: None }),
+            backend: Arc::new(FakeBackend::new(None)),
             resolved: Arc::new(StdMutex::new(Vec::new())),
         });
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
@@ -894,7 +922,7 @@ mod tests {
     }
 
     fn coordinator_fixture(workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>) -> Fixture {
-        coordinator_fixture_with_backend(workflows, Arc::new(FakeBackend { prompt_gate: None }))
+        coordinator_fixture_with_backend(workflows, Arc::new(FakeBackend::new(None)))
     }
 
     fn coordinator_fixture_with_backend(
@@ -1283,15 +1311,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_turn_configures_turn_meta() {
+        let coordinator = coordinator_fixture(Arc::new(HashMap::new())).coordinator;
+        let backend = Arc::new(FakeBackend::new(None));
+        let session = SessionId::parse("ctx-config-meta-g3").unwrap();
+        let op = OperationId::parse("turn-config-meta").unwrap();
+        let turn = crate::session_manager::WarmTurn {
+            backend: backend.clone() as Arc<dyn AgentBackend>,
+            session: session.clone(),
+            usage_warning: None,
+            generation: bridge_core::ids::SessionGeneration::new(3),
+            op: op.clone(),
+            seed: None,
+            injects: Vec::new(),
+            abort: CancellationToken::new(),
+        };
+
+        let out = coordinator
+            .collect_turn(ctx("ctx-config-meta"), turn, "hi".into())
+            .await
+            .unwrap();
+
+        assert_eq!(out.stop_reason, "completed"); // collect_turn maps the backend's end_turn -> completed
+        let configured = backend.configured_turns.lock().unwrap();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].0, session);
+        assert_eq!(configured[0].1.context_id.as_str(), "ctx-config-meta");
+        assert_eq!(configured[0].1.generation, 3);
+        assert_eq!(configured[0].1.op, op);
+    }
+
+    #[tokio::test]
     async fn dropped_turn_returns_handle_to_idle() {
         // s8 T10 review MAJOR: a turn future dropped mid-drain must return the warm handle to Idle via
         // the drop guard — else the next turn on that context is permanently HandleBusy.
         let gate = Arc::new(Notify::new());
         let fixture = coordinator_fixture_with_backend(
             Arc::new(HashMap::new()),
-            Arc::new(FakeBackend {
-                prompt_gate: Some(gate.clone()),
-            }),
+            Arc::new(FakeBackend::new(Some(gate.clone()))),
         );
         let coord = Arc::new(fixture.coordinator);
 
@@ -1345,9 +1402,7 @@ mod tests {
         );
         let fixture = coordinator_fixture_with_backend(
             Arc::new(workflows),
-            Arc::new(FakeBackend {
-                prompt_gate: Some(gate),
-            }),
+            Arc::new(FakeBackend::new(Some(gate))),
         );
 
         let id = fixture

@@ -308,6 +308,7 @@ impl ContainerRwBackend {
         session: &SessionId,
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
+        let meta = { self.pending_turn_meta.lock().await.remove(session) };
         let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
             BridgeError::ConfigInvalid {
                 reason: "missing session cwd".into(),
@@ -376,7 +377,6 @@ impl ContainerRwBackend {
                 "warm session retired during prompt"
             )),
         };
-        let meta = { self.pending_turn_meta.lock().await.remove(session) };
         if let Some(meta) = meta {
             inner.configure_turn(session, meta).await;
         }
@@ -456,6 +456,8 @@ impl AgentBackend for ContainerRwBackend {
             return self.prompt_warm(session, parts).await;
         }
 
+        let meta = { self.pending_turn_meta.lock().await.remove(session) };
+
         // Strict-reject: a writer MUST name its :rw target (no fallback to the broad root). The early
         // presence check keeps reject-before-reserve; `open_inner` re-resolves the same cwd.
         let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
@@ -499,7 +501,6 @@ impl AgentBackend for ContainerRwBackend {
             }),
         );
 
-        let meta = { self.pending_turn_meta.lock().await.remove(session) };
         if let Some(meta) = meta {
             wi.inner.configure_turn(session, meta).await;
         }
@@ -1127,10 +1128,16 @@ mod tests {
         let be = backend(root, CountingSpawn::new(true), reap).await;
         let s = SessionId::parse("s1").unwrap();
         be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        be.configure_turn(&s, turn_meta("ctx-spawn-fail", 1, "turn-spawn-fail"))
+            .await;
         let err = prompt_err(&be, &s).await;
         assert!(format!("{err:?}").contains("boom"), "got {err:?}");
         assert_eq!(reaps.load(Ordering::SeqCst), 1, "spawn failure MUST reap");
         assert!(be.inflight.lock().await.is_empty(), "reservation removed");
+        assert!(
+            !be.pending_turn_meta.lock().await.contains_key(&s),
+            "open_inner failure consumed pending turn metadata"
+        );
     }
 
     #[tokio::test]
@@ -1450,6 +1457,11 @@ mod tests {
         let be = warm_backend(root, CountingSpawn::new(true), reap).await; // spawn fails (cache-miss open)
         let s = SessionId::parse("implement-x").unwrap();
         be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        be.configure_turn(
+            &s,
+            turn_meta("ctx-warm-open-fail", 1, "turn-warm-open-fail"),
+        )
+        .await;
         let err = prompt_err(&be, &s).await;
         assert!(format!("{err:?}").contains("boom"), "got {err:?}");
         assert_eq!(
@@ -1464,6 +1476,10 @@ mod tests {
         assert!(
             !be.turn_active.lock().await.contains_key(&s),
             "turn_active cleared on open failure"
+        );
+        assert!(
+            !be.pending_turn_meta.lock().await.contains_key(&s),
+            "open_inner failure consumed pending turn metadata"
         );
     }
 

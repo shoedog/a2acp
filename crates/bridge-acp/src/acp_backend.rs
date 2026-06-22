@@ -228,6 +228,7 @@ struct TurnRoute {
     // threads it onto the live route.
     #[allow(dead_code)]
     turn_meta: Option<TurnMeta>,
+    cancelled: Arc<AtomicBool>,
 }
 
 struct TurnWatch {
@@ -1085,12 +1086,14 @@ impl AcpBackend {
                         let timeout_handler = Arc::clone(&perm_timeout_handler);
                         async move {
                             let mut turn_meta = None;
+                            let mut cancelled = None;
                             if let Ok(map) = updates.lock() {
                                 if let Some(route) = map.get(&req.session_id) {
                                     if let Some(w) = &route.watch {
                                         bump_activity(w);
                                     }
                                     turn_meta = route.turn_meta.clone();
+                                    cancelled = Some(route.cancelled.clone());
                                 }
                             }
                             let registry = registry_handler.lock().ok().and_then(|r| r.clone());
@@ -1103,6 +1106,7 @@ impl AcpBackend {
                                     &policy,
                                     registry.as_ref(),
                                     turn_meta,
+                                    cancelled,
                                     timeout_ms,
                                     &req,
                                 )
@@ -1322,6 +1326,7 @@ impl AcpBackend {
         policy: &PolicyHandle,
         registry: Option<&Arc<PermissionRegistry>>,
         turn_meta: Option<TurnMeta>,
+        cancelled: Option<Arc<AtomicBool>>,
         timeout_ms: u64,
         req: &RequestPermissionRequest,
     ) -> RequestPermissionOutcome {
@@ -1340,6 +1345,9 @@ impl AcpBackend {
                 let (Some(reg), Some(meta)) = (registry, turn_meta) else {
                     return Self::deny_outcome(&req.options);
                 };
+                if cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    return RequestPermissionOutcome::Cancelled;
+                }
                 let request_id = req.tool_call.tool_call_id.0.to_string();
                 let key = PermKey {
                     context_id: meta.context_id,
@@ -1348,7 +1356,11 @@ impl AcpBackend {
                     request_id,
                 };
                 let view = Self::pending_view(req, &key, timeout_ms);
+                let key_for_cancel = key.clone();
                 let (rx, _guard) = reg.register(key, view);
+                if cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    reg.resolve(&key_for_cancel, PermissionResolution::Cancelled);
+                }
                 let res = tokio::select! {
                     biased;
                     r = rx => r.unwrap_or(PermissionResolution::Cancelled),
@@ -1393,7 +1405,16 @@ impl AcpBackend {
     ) -> RequestPermissionOutcome {
         match decision {
             PermitDecision::Approve { option_id } => option_id
-                .and_then(|id| Self::select_permission_option_id(options, &id))
+                .and_then(|id| {
+                    Self::select_permission_option_id_kind(
+                        options,
+                        &id,
+                        &[
+                            PermissionOptionKind::AllowOnce,
+                            PermissionOptionKind::AllowAlways,
+                        ],
+                    )
+                })
                 .unwrap_or_else(|| {
                     Self::select_permission_option(
                         options,
@@ -1405,7 +1426,16 @@ impl AcpBackend {
                     .unwrap_or(RequestPermissionOutcome::Cancelled)
                 }),
             PermitDecision::Deny { option_id, .. } => option_id
-                .and_then(|id| Self::select_permission_option_id(options, &id))
+                .and_then(|id| {
+                    Self::select_permission_option_id_kind(
+                        options,
+                        &id,
+                        &[
+                            PermissionOptionKind::RejectOnce,
+                            PermissionOptionKind::RejectAlways,
+                        ],
+                    )
+                })
                 .unwrap_or_else(|| Self::deny_outcome(options)),
             PermitDecision::Modify { option_id, .. } => {
                 Self::select_permission_option_id(options, &option_id)
@@ -1449,6 +1479,21 @@ impl AcpBackend {
         options
             .iter()
             .find(|o| o.option_id.0.as_ref() == option_id)
+            .map(|opt| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    opt.option_id.clone(),
+                ))
+            })
+    }
+
+    fn select_permission_option_id_kind(
+        options: &[agent_client_protocol::schema::PermissionOption],
+        option_id: &str,
+        kinds: &[PermissionOptionKind],
+    ) -> Option<RequestPermissionOutcome> {
+        options
+            .iter()
+            .find(|o| o.option_id.0.as_ref() == option_id && kinds.contains(&o.kind))
             .map(|opt| {
                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                     opt.option_id.clone(),
@@ -2223,6 +2268,7 @@ impl AcpBackend {
                     tx,
                     watch: watch.clone(),
                     turn_meta,
+                    cancelled: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -2498,6 +2544,22 @@ impl AgentBackend for AcpBackend {
         self.request_cancel(session).await?;
 
         let entry = self.session_entry(session).await;
+        if let Some(agent_id) = entry.agent_id.get() {
+            let turn_meta = self.updates().ok().and_then(|updates| {
+                updates.lock().ok().and_then(|map| {
+                    map.get(agent_id).map(|route| {
+                        route.cancelled.store(true, Ordering::SeqCst);
+                        route.turn_meta.clone()
+                    })
+                })
+            });
+            if let (Some(reg), Some(meta)) = (
+                self.permission_registry.lock().ok().and_then(|r| r.clone()),
+                turn_meta.flatten(),
+            ) {
+                reg.resolve_context_cancelled(&meta.context_id);
+            }
+        }
         // No in-flight turn → the lock is free → nothing to bound. (A turn that
         // starts AFTER this check is a fresh turn, not the one this cancel
         // targeted, so it is correct not to arm a watcher for it.)
@@ -2560,6 +2622,10 @@ impl AgentBackend for AcpBackend {
         if let Ok(mut m) = self.session_cfg.lock() {
             m.remove(session);
         }
+        self.pending_turn_meta
+            .lock()
+            .expect("pending_turn_meta lock")
+            .remove(session);
     }
 
     /// Re-apply warm-session model/effort against the cached ACP config surface.
@@ -2646,6 +2712,10 @@ impl AgentBackend for AcpBackend {
         if let Ok(mut m) = self.session_cfg.lock() {
             m.remove(session);
         }
+        self.pending_turn_meta
+            .lock()
+            .expect("pending_turn_meta lock")
+            .remove(session);
     }
 
     /// Graceful async teardown of the agent process (Increment 3b §5.4). IDEMPOTENT
@@ -3664,6 +3734,7 @@ mod tests {
                 &policy,
                 Some(&reg_for_task),
                 Some(meta),
+                None,
                 1_000,
                 &req,
             )
@@ -3702,6 +3773,7 @@ mod tests {
             &policy,
             Some(&reg),
             Some(turn_meta("ctx-auto", 1, "op-auto")),
+            None,
             1_000,
             &req,
         )
@@ -3717,6 +3789,16 @@ mod tests {
         let outcome =
             defer_and_resolve(bridge_core::domain::PermitDecision::Approve { option_id: None })
                 .await;
+
+        assert_eq!(selected_option_id(&outcome), Some("approved"));
+    }
+
+    #[tokio::test]
+    async fn approve_with_reject_option_id_does_not_invert() {
+        let outcome = defer_and_resolve(bridge_core::domain::PermitDecision::Approve {
+            option_id: Some("abort".into()),
+        })
+        .await;
 
         assert_eq!(selected_option_id(&outcome), Some("approved"));
     }
@@ -3749,6 +3831,7 @@ mod tests {
             &denied_policy,
             None,
             Some(turn_meta("ctx-deny", 1, "op-deny")),
+            None,
             1_000,
             &req,
         )
@@ -3756,6 +3839,44 @@ mod tests {
 
         assert_eq!(defer_outcome, denied_outcome);
         assert_eq!(selected_option_id(&defer_outcome), Some("abort"));
+    }
+
+    #[tokio::test]
+    async fn deny_with_allow_option_id_does_not_invert() {
+        let outcome = defer_and_resolve(bridge_core::domain::PermitDecision::Deny {
+            option_id: Some("approved".into()),
+            reason: None,
+        })
+        .await;
+
+        assert_eq!(selected_option_id(&outcome), Some("abort"));
+    }
+
+    #[tokio::test]
+    async fn cancel_then_late_permission_does_not_park() {
+        let req = spike_permission_request();
+        let meta = turn_meta("ctx-cancel-late", 5, "op-cancel-late");
+        let ctx = meta.context_id.clone();
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let policy = policy_handle(Arc::new(DeferPolicy));
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            AcpBackend::resolve_permission_outcome(
+                &policy,
+                Some(&reg),
+                Some(meta),
+                Some(cancelled),
+                120_000,
+                &req,
+            ),
+        )
+        .await
+        .expect("cancelled route must not wait for permission timeout");
+
+        assert_eq!(outcome, RequestPermissionOutcome::Cancelled);
+        assert!(reg.pending(&ctx).is_empty());
     }
 
     #[tokio::test]
@@ -3767,7 +3888,8 @@ mod tests {
         let policy = policy_handle(Arc::new(DeferPolicy));
 
         let outcome =
-            AcpBackend::resolve_permission_outcome(&policy, Some(&reg), Some(meta), 30, &req).await;
+            AcpBackend::resolve_permission_outcome(&policy, Some(&reg), Some(meta), None, 30, &req)
+                .await;
 
         assert_eq!(selected_option_id(&outcome), Some("abort"));
         assert!(reg.pending(&ctx).is_empty());
@@ -3781,7 +3903,8 @@ mod tests {
         let policy = policy_handle(Arc::new(DeferPolicy));
 
         let outcome =
-            AcpBackend::resolve_permission_outcome(&policy, Some(&reg), None, 1_000, &req).await;
+            AcpBackend::resolve_permission_outcome(&policy, Some(&reg), None, None, 1_000, &req)
+                .await;
 
         assert_eq!(selected_option_id(&outcome), Some("abort"));
         assert!(reg.pending(&ctx).is_empty());
@@ -6448,6 +6571,22 @@ mod tests {
         assert!(
             be.sessions.lock().await.get(&s).is_none(),
             "agent session removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_session_clears_pending_turn_meta() {
+        let rec = Recorder::new("agent-sess-RELEASE-META");
+        let be = connect_recording(rec).await;
+        let s = SessionId::parse("ctx-release-meta-g0").unwrap();
+        be.configure_turn(&s, turn_meta("ctx-release-meta", 1, "op-release-meta"))
+            .await;
+
+        be.release_session(&s).await;
+
+        assert!(
+            be.take_pending_turn_meta(&s).is_none(),
+            "release_session removes pending turn metadata"
         );
     }
 
