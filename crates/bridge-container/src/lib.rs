@@ -15,6 +15,7 @@ use bridge_acp::acp_backend::AcpConfig;
 use bridge_core::domain::{Part, SandboxConfig, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
+use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{AgentBackend, BackendStream};
 use bridge_core::reaper::{production_reap_fn, reap_once, spawn_detached, ReapFn};
 use bridge_core::run_identity::RunHandle;
@@ -101,6 +102,7 @@ pub struct ContainerRwBackend {
     /// STABLE per-instance owner token (hash of config-path + mount + agent id), set by the caller.
     owner: String,
     session_cfg: Mutex<HashMap<SessionId, SessionSpec>>,
+    pending_turn_meta: Mutex<HashMap<SessionId, TurnMeta>>,
     inflight: Inflight,
     turn_seq: AtomicU64,
     lifecycle: Lifecycle,
@@ -132,6 +134,7 @@ impl ContainerRwBackend {
             reap_fn,
             owner,
             session_cfg: Mutex::new(HashMap::new()),
+            pending_turn_meta: Mutex::new(HashMap::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             turn_seq: AtomicU64::new(0),
             lifecycle: Lifecycle::PerTurn,
@@ -305,6 +308,7 @@ impl ContainerRwBackend {
         session: &SessionId,
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
+        let meta = { self.pending_turn_meta.lock().await.remove(session) };
         let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
             BridgeError::ConfigInvalid {
                 reason: "missing session cwd".into(),
@@ -373,6 +377,9 @@ impl ContainerRwBackend {
                 "warm session retired during prompt"
             )),
         };
+        if let Some(meta) = meta {
+            inner.configure_turn(session, meta).await;
+        }
         let inner_stream = match inner.prompt(session, parts).await {
             Ok(s) => s,
             Err(e) => {
@@ -449,6 +456,8 @@ impl AgentBackend for ContainerRwBackend {
             return self.prompt_warm(session, parts).await;
         }
 
+        let meta = { self.pending_turn_meta.lock().await.remove(session) };
+
         // Strict-reject: a writer MUST name its :rw target (no fallback to the broad root). The early
         // presence check keeps reject-before-reserve; `open_inner` re-resolves the same cwd.
         let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
@@ -492,6 +501,9 @@ impl AgentBackend for ContainerRwBackend {
             }),
         );
 
+        if let Some(meta) = meta {
+            wi.inner.configure_turn(session, meta).await;
+        }
         let inner_stream = match wi.inner.prompt(session, parts).await {
             Ok(s) => s,
             Err(e) => {
@@ -547,9 +559,17 @@ impl AgentBackend for ContainerRwBackend {
         Ok(())
     }
 
+    async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
+        self.pending_turn_meta
+            .lock()
+            .await
+            .insert(session.clone(), meta);
+    }
+
     /// Stash-only (uniform with the ACP/API backends). Does NOT reap — the stream owns the reaper.
     async fn forget_session(&self, session: &SessionId) {
         self.session_cfg.lock().await.remove(session);
+        self.pending_turn_meta.lock().await.remove(session);
     }
 
     async fn release_session(&self, session: &SessionId) {
@@ -557,6 +577,7 @@ impl AgentBackend for ContainerRwBackend {
             self.release_warm(session).await;
         }
         self.session_cfg.lock().await.remove(session);
+        self.pending_turn_meta.lock().await.remove(session);
     }
 
     async fn retire(&self) -> Result<(), BridgeError> {
@@ -722,6 +743,8 @@ fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
 mod tests {
     use super::*;
     use bridge_core::domain::{EffectiveConfig, EgressPolicy, MountAccess};
+    use bridge_core::ids::{ContextId, OperationId};
+    use bridge_core::permission::TurnMeta;
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
 
@@ -735,12 +758,15 @@ mod tests {
         prompts: AtomicUsize,
         sessions: Mutex<HashSet<String>>,
         fail_prompt: AtomicBool,
+        configured_turns: Mutex<Vec<(SessionId, TurnMeta)>>,
+        call_order: Mutex<Vec<&'static str>>,
     }
     #[async_trait]
     impl AgentBackend for StubInner {
         async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
             self.prompts.fetch_add(1, Ordering::SeqCst);
             self.sessions.lock().await.insert(s.as_str().to_string());
+            self.call_order.lock().await.push("prompt");
             if self.fail_prompt.load(Ordering::SeqCst) {
                 return Err(BridgeError::agent_crashed("prompt boom"));
             }
@@ -753,6 +779,13 @@ mod tests {
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
             self.canceled.store(true, Ordering::SeqCst);
             Ok(())
+        }
+        async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
+            self.configured_turns
+                .lock()
+                .await
+                .push((session.clone(), meta));
+            self.call_order.lock().await.push("configure_turn");
         }
     }
 
@@ -795,6 +828,8 @@ mod tests {
                 prompts: AtomicUsize::new(0),
                 sessions: Mutex::new(HashSet::new()),
                 fail_prompt: AtomicBool::new(self.fail_prompt),
+                configured_turns: Mutex::new(Vec::new()),
+                call_order: Mutex::new(Vec::new()),
             });
             *self.last_inner.lock().await = Some(inner.clone());
             Ok(inner)
@@ -863,6 +898,13 @@ mod tests {
             cwd: Some(SessionCwd::parse(p).unwrap()),
         }
     }
+    fn turn_meta(ctx: &str, generation: u64, op: &str) -> TurnMeta {
+        TurnMeta {
+            context_id: ContextId::parse(ctx).unwrap(),
+            generation,
+            op: OperationId::parse(op).unwrap(),
+        }
+    }
     /// `prompt` returns `Result<BackendStream, _>`; BackendStream isn't `Debug`, so we can't
     /// `.unwrap_err()` — match instead.
     async fn prompt_err(be: &ContainerRwBackend, s: &SessionId) -> BridgeError {
@@ -880,9 +922,71 @@ mod tests {
         let be = backend("/root", CountingSpawn::new(false), reap).await;
         let s = SessionId::parse("s1").unwrap();
         be.configure_session(&s, &spec_cwd("/root")).await.unwrap();
+        be.configure_turn(&s, turn_meta("ctx-forget", 1, "turn-forget"))
+            .await;
         assert!(be.session_cfg.lock().await.contains_key(&s));
+        assert!(be.pending_turn_meta.lock().await.contains_key(&s));
         be.forget_session(&s).await;
         assert!(!be.session_cfg.lock().await.contains_key(&s));
+        assert!(!be.pending_turn_meta.lock().await.contains_key(&s));
+    }
+
+    #[tokio::test]
+    async fn configure_turn_is_forwarded_to_inner_before_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let (reap, _) = counting_reap();
+        let be = backend(root, spawn.clone(), reap).await;
+        let s = SessionId::parse("s1").unwrap();
+        let meta = turn_meta("ctx-forward", 7, "turn-forward");
+
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        be.configure_turn(&s, meta.clone()).await;
+        let mut stream = be.prompt(&s, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let inner = spawn.last_inner.lock().await.clone().unwrap();
+        let turns = inner.configured_turns.lock().await;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].0, s);
+        assert_eq!(turns[0].1.context_id, meta.context_id);
+        assert_eq!(turns[0].1.generation, meta.generation);
+        assert_eq!(turns[0].1.op, meta.op);
+        drop(turns);
+        assert_eq!(
+            inner.call_order.lock().await.as_slice(),
+            ["configure_turn", "prompt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_configure_turn_is_forwarded_to_inner_before_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let (reap, _) = counting_reap();
+        let be = warm_backend(root, spawn.clone(), reap).await;
+        let s = SessionId::parse("implement-x").unwrap();
+        let meta = turn_meta("ctx-warm-forward", 9, "turn-warm-forward");
+
+        be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        be.configure_turn(&s, meta.clone()).await;
+        let mut stream = be.prompt(&s, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let inner = spawn.last_inner.lock().await.clone().unwrap();
+        let turns = inner.configured_turns.lock().await;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].0, s);
+        assert_eq!(turns[0].1.context_id, meta.context_id);
+        assert_eq!(turns[0].1.generation, meta.generation);
+        assert_eq!(turns[0].1.op, meta.op);
+        drop(turns);
+        assert_eq!(
+            inner.call_order.lock().await.as_slice(),
+            ["configure_turn", "prompt"]
+        );
     }
 
     #[tokio::test]
@@ -1024,10 +1128,16 @@ mod tests {
         let be = backend(root, CountingSpawn::new(true), reap).await;
         let s = SessionId::parse("s1").unwrap();
         be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        be.configure_turn(&s, turn_meta("ctx-spawn-fail", 1, "turn-spawn-fail"))
+            .await;
         let err = prompt_err(&be, &s).await;
         assert!(format!("{err:?}").contains("boom"), "got {err:?}");
         assert_eq!(reaps.load(Ordering::SeqCst), 1, "spawn failure MUST reap");
         assert!(be.inflight.lock().await.is_empty(), "reservation removed");
+        assert!(
+            !be.pending_turn_meta.lock().await.contains_key(&s),
+            "open_inner failure consumed pending turn metadata"
+        );
     }
 
     #[tokio::test]
@@ -1347,6 +1457,11 @@ mod tests {
         let be = warm_backend(root, CountingSpawn::new(true), reap).await; // spawn fails (cache-miss open)
         let s = SessionId::parse("implement-x").unwrap();
         be.configure_session(&s, &spec_cwd(root)).await.unwrap();
+        be.configure_turn(
+            &s,
+            turn_meta("ctx-warm-open-fail", 1, "turn-warm-open-fail"),
+        )
+        .await;
         let err = prompt_err(&be, &s).await;
         assert!(format!("{err:?}").contains("boom"), "got {err:?}");
         assert_eq!(
@@ -1361,6 +1476,10 @@ mod tests {
         assert!(
             !be.turn_active.lock().await.contains_key(&s),
             "turn_active cleared on open failure"
+        );
+        assert!(
+            !be.pending_turn_meta.lock().await.contains_key(&s),
+            "open_inner failure consumed pending turn metadata"
         );
     }
 

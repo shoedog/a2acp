@@ -39,15 +39,20 @@ use crate::model_effort::{
     EFFORT_ORDER,
 };
 use bridge_core::domain::{
-    Effort, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
+    Effort, PermissionDecision, PermissionRequest, PermitDecision, SessionContext, SessionSpec,
 };
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::orch::{
     AgentSessionCaps, ContentSummary, OrchEventKind, PlanEntry as BridgePlanEntry, ReconcileOutcome,
 };
+use bridge_core::permission::{
+    PendingPermissionView, PermKey, PermissionOptionView, PermissionRegistry, PermissionResolution,
+    TurnMeta,
+};
 use bridge_core::ports::{
-    AgentBackend, BackendStream, PolicyEngine, RichEventSink, Update, STOP_REASON_CANCELLED,
+    AgentBackend, BackendStream, PolicyEngine, PolicyOutcome, RichEventSink, Update,
+    STOP_REASON_CANCELLED,
 };
 
 use bridge_core::process::Supervised;
@@ -70,6 +75,7 @@ const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(50
 
 const RICH_CONTENT_CAP: usize = 2048;
 const RICH_VEC_CAP: usize = 64;
+const PERMISSION_VIEW_CAP: usize = 4096;
 
 /// Static configuration for an ACP agent connection.
 ///
@@ -218,6 +224,11 @@ type UpdateRegistry = Arc<StdMutex<HashMap<AgentSessionId, TurnRoute>>>;
 struct TurnRoute {
     tx: UpdateSender,
     watch: Option<Arc<TurnWatch>>,
+    // Task 6 consumes this from the reverse permission handler; Task 5 only
+    // threads it onto the live route.
+    #[allow(dead_code)]
+    turn_meta: Option<TurnMeta>,
+    cancelled: Arc<AtomicBool>,
 }
 
 struct TurnWatch {
@@ -410,6 +421,10 @@ pub struct AcpBackend {
     /// don't go through `configure_session`) falls back to [`AcpConfig`]'s static
     /// `model`/`mode`, preserving the pre-3b behavior.
     session_cfg: Arc<StdMutex<HashMap<SessionId, SessionSpec>>>,
+    /// Per-turn metadata stashed by the A2A producer immediately before the next
+    /// prompt. `prompt_inner` takes it at entry, before lazy session minting, so
+    /// early setup errors cannot leave stale metadata for a later turn.
+    pending_turn_meta: StdMutex<HashMap<SessionId, TurnMeta>>,
     /// Policy engine that decides reverse `session/request_permission` requests.
     /// Defaults to an internal auto-approve impl (the deployed 3a policy); a
     /// caller (Task 6's `main`) threads a concrete engine via [`Self::with_policy`].
@@ -421,10 +436,17 @@ pub struct AcpBackend {
     /// clones the inner `Arc` out under the lock (no await held), so swapping never
     /// races a decision.
     policy: PolicyHandle,
+    /// Shared registry used by deferred interactive permission requests. This is
+    /// a swappable handle for the same reason as `policy`: `connect` registers the
+    /// ACP handler before builder-style injection can run.
+    permission_registry: PermissionRegistryHandle,
+    /// Bounded operator-decision wait for deferred permissions.
+    perm_timeout_ms: Arc<AtomicU64>,
 }
 
 /// Shared, swappable handle to the active [`PolicyEngine`]. See [`AcpBackend::policy`].
 type PolicyHandle = Arc<StdMutex<Arc<dyn PolicyEngine>>>;
+type PermissionRegistryHandle = Arc<StdMutex<Option<Arc<PermissionRegistry>>>>;
 
 impl AcpBackend {
     /// Build the `initialize` request this backend sends to the agent.
@@ -983,6 +1005,10 @@ impl AcpBackend {
         ));
         let policy_handler = Arc::clone(&policy);
         let updates_perm_handler = Arc::clone(&updates);
+        let permission_registry: PermissionRegistryHandle = Arc::new(StdMutex::new(None));
+        let registry_perm_handler = Arc::clone(&permission_registry);
+        let perm_timeout_ms = Arc::new(AtomicU64::new(120_000));
+        let perm_timeout_handler = Arc::clone(&perm_timeout_ms);
 
         // The event loop owns a long-lived task. `main_fn` publishes a clone of
         // `cx` and then parks on `shutdown_rx` so the connection stays open for
@@ -1056,19 +1082,35 @@ impl AcpBackend {
                           cx: ConnectionTo<Agent>| {
                         let policy = Arc::clone(&policy_handler);
                         let updates = Arc::clone(&updates_perm_handler);
+                        let registry_handler = Arc::clone(&registry_perm_handler);
+                        let timeout_handler = Arc::clone(&perm_timeout_handler);
                         async move {
+                            let mut turn_meta = None;
+                            let mut cancelled = None;
                             if let Ok(map) = updates.lock() {
                                 if let Some(route) = map.get(&req.session_id) {
                                     if let Some(w) = &route.watch {
                                         bump_activity(w);
                                     }
+                                    turn_meta = route.turn_meta.clone();
+                                    cancelled = Some(route.cancelled.clone());
                                 }
                             }
+                            let registry = registry_handler.lock().ok().and_then(|r| r.clone());
+                            let timeout_ms = timeout_handler.load(Ordering::Relaxed);
 
                             // Offload so the dispatch loop is NOT blocked. The
                             // spawned task owns the `Responder` and answers from there.
                             cx.spawn(async move {
-                                let outcome = Self::decide_permission(&policy, &req);
+                                let outcome = Self::resolve_permission_outcome(
+                                    &policy,
+                                    registry.as_ref(),
+                                    turn_meta,
+                                    cancelled,
+                                    timeout_ms,
+                                    &req,
+                                )
+                                .await;
                                 // Ignore a `respond` error (peer gone / turn ended):
                                 // returning `Err` from a `cx.spawn` task would shut the
                                 // whole connection down, which a lost reply must not do.
@@ -1207,7 +1249,10 @@ impl AcpBackend {
             reaped: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
+            pending_turn_meta: StdMutex::new(HashMap::new()),
             policy,
+            permission_registry,
+            perm_timeout_ms,
         })
     }
 
@@ -1221,6 +1266,24 @@ impl AcpBackend {
         if let Ok(mut p) = self.policy.lock() {
             *p = policy;
         }
+        self
+    }
+
+    /// Inject the bridge-owned deferred-permission registry used by the reverse
+    /// `session/request_permission` handler.
+    #[must_use]
+    pub fn with_permission_registry(self, reg: Arc<PermissionRegistry>) -> Self {
+        if let Ok(mut r) = self.permission_registry.lock() {
+            *r = Some(reg);
+        }
+        self
+    }
+
+    /// Override the deferred-permission timeout. Primarily used by tests; live
+    /// config wiring is in the follow-up task.
+    #[must_use]
+    pub fn with_permission_timeout_ms(self, ms: u64) -> Self {
+        self.perm_timeout_ms.store(ms, Ordering::Relaxed);
         self
     }
 
@@ -1249,40 +1312,247 @@ impl AcpBackend {
             .ok()
             .map(|p| p.decide(&perm_req, &SessionContext));
 
-        // Pick the first option whose kind matches any in `kinds`, in priority order.
-        let select = |kinds: &[PermissionOptionKind]| -> Option<RequestPermissionOutcome> {
-            for k in kinds {
-                if let Some(opt) = req.options.iter().find(|o| o.kind == *k) {
-                    return Some(RequestPermissionOutcome::Selected(
-                        SelectedPermissionOutcome::new(opt.option_id.clone()),
-                    ));
+        match decision {
+            Some(verdict) => Self::map_verdict_to_outcome(verdict, &req.options),
+            None => RequestPermissionOutcome::Cancelled,
+        }
+    }
+
+    /// Resolve one reverse `session/request_permission` to an ACP outcome.
+    ///
+    /// DEAD-SAFE: when the policy returns `Decide`, this preserves the pre-slice
+    /// `decide_permission` mapping, including `with_id(..., false)`.
+    async fn resolve_permission_outcome(
+        policy: &PolicyHandle,
+        registry: Option<&Arc<PermissionRegistry>>,
+        turn_meta: Option<TurnMeta>,
+        cancelled: Option<Arc<AtomicBool>>,
+        timeout_ms: u64,
+        req: &RequestPermissionRequest,
+    ) -> RequestPermissionOutcome {
+        let perm_req = PermissionRequest::with_id(req.tool_call.tool_call_id.0.to_string(), false);
+        let outcome = policy
+            .lock()
+            .ok()
+            .map(|p| p.interactive_decide(&perm_req, &SessionContext));
+
+        match outcome {
+            None => RequestPermissionOutcome::Cancelled,
+            Some(PolicyOutcome::Decide(verdict)) => {
+                Self::map_verdict_to_outcome(verdict, &req.options)
+            }
+            Some(PolicyOutcome::Defer) => {
+                let (Some(reg), Some(meta)) = (registry, turn_meta) else {
+                    return Self::deny_outcome(&req.options);
+                };
+                if cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    return RequestPermissionOutcome::Cancelled;
+                }
+                let request_id = req.tool_call.tool_call_id.0.to_string();
+                let key = PermKey {
+                    context_id: meta.context_id,
+                    generation: meta.generation,
+                    op: meta.op,
+                    request_id,
+                };
+                let view = Self::pending_view(req, &key, timeout_ms);
+                let key_for_cancel = key.clone();
+                let (rx, _guard) = reg.register(key, view);
+                if cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    reg.resolve(&key_for_cancel, PermissionResolution::Cancelled);
+                }
+                let res = tokio::select! {
+                    biased;
+                    r = rx => r.unwrap_or(PermissionResolution::Cancelled),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => {
+                        PermissionResolution::Decided(PermitDecision::Deny {
+                            option_id: None,
+                            reason: Some("timeout".into()),
+                        })
+                    }
+                };
+                match res {
+                    PermissionResolution::Decided(d) => {
+                        Self::map_permit_to_outcome(d, &req.options)
+                    }
+                    PermissionResolution::Cancelled => RequestPermissionOutcome::Cancelled,
                 }
             }
-            None
-        };
+        }
+    }
 
-        match decision {
-            // Approve: prefer the least-committal grant.
-            Some(Ok(PermissionDecision::Approve)) => select(&[
-                PermissionOptionKind::AllowOnce,
-                PermissionOptionKind::AllowAlways,
-            ])
-            // No allow option offered (e.g. agent only has reject options) →
-            // Cancelled. We must NOT fall back to an arbitrary first option: if
-            // the agent offered ONLY reject options, selecting one would
-            // permanently blacklist a tool call under an *approve* policy —
-            // a correctness inversion. Cancelled doesn't grant but also doesn't
-            // permanently deny; it is strictly safer than selecting a reject.
+    fn map_verdict_to_outcome(
+        verdict: Result<PermissionDecision, BridgeError>,
+        options: &[agent_client_protocol::schema::PermissionOption],
+    ) -> RequestPermissionOutcome {
+        match verdict {
+            Ok(PermissionDecision::Approve) => Self::select_permission_option(
+                options,
+                &[
+                    PermissionOptionKind::AllowOnce,
+                    PermissionOptionKind::AllowAlways,
+                ],
+            )
             .unwrap_or(RequestPermissionOutcome::Cancelled),
-            // Deny: pick a reject option; if none exists, Cancelled.
-            Some(Err(BridgeError::PermissionDenied)) => select(&[
-                PermissionOptionKind::RejectOnce,
-                PermissionOptionKind::RejectAlways,
-            ])
-            .unwrap_or(RequestPermissionOutcome::Cancelled),
-            // Abstain / any other policy error / poisoned lock → Cancelled.
+            Err(BridgeError::PermissionDenied) => Self::deny_outcome(options),
             _ => RequestPermissionOutcome::Cancelled,
         }
+    }
+
+    fn map_permit_to_outcome(
+        decision: PermitDecision,
+        options: &[agent_client_protocol::schema::PermissionOption],
+    ) -> RequestPermissionOutcome {
+        match decision {
+            PermitDecision::Approve { option_id } => option_id
+                .and_then(|id| {
+                    Self::select_permission_option_id_kind(
+                        options,
+                        &id,
+                        &[
+                            PermissionOptionKind::AllowOnce,
+                            PermissionOptionKind::AllowAlways,
+                        ],
+                    )
+                })
+                .unwrap_or_else(|| {
+                    Self::select_permission_option(
+                        options,
+                        &[
+                            PermissionOptionKind::AllowOnce,
+                            PermissionOptionKind::AllowAlways,
+                        ],
+                    )
+                    .unwrap_or(RequestPermissionOutcome::Cancelled)
+                }),
+            PermitDecision::Deny { option_id, .. } => option_id
+                .and_then(|id| {
+                    Self::select_permission_option_id_kind(
+                        options,
+                        &id,
+                        &[
+                            PermissionOptionKind::RejectOnce,
+                            PermissionOptionKind::RejectAlways,
+                        ],
+                    )
+                })
+                .unwrap_or_else(|| Self::deny_outcome(options)),
+            PermitDecision::Modify { option_id, .. } => {
+                Self::select_permission_option_id(options, &option_id)
+                    .unwrap_or(RequestPermissionOutcome::Cancelled)
+            }
+            PermitDecision::Escalate { .. } => Self::deny_outcome(options),
+        }
+    }
+
+    fn deny_outcome(
+        options: &[agent_client_protocol::schema::PermissionOption],
+    ) -> RequestPermissionOutcome {
+        Self::select_permission_option(
+            options,
+            &[
+                PermissionOptionKind::RejectOnce,
+                PermissionOptionKind::RejectAlways,
+            ],
+        )
+        .unwrap_or(RequestPermissionOutcome::Cancelled)
+    }
+
+    fn select_permission_option(
+        options: &[agent_client_protocol::schema::PermissionOption],
+        kinds: &[PermissionOptionKind],
+    ) -> Option<RequestPermissionOutcome> {
+        for k in kinds {
+            if let Some(opt) = options.iter().find(|o| o.kind == *k) {
+                return Some(RequestPermissionOutcome::Selected(
+                    SelectedPermissionOutcome::new(opt.option_id.clone()),
+                ));
+            }
+        }
+        None
+    }
+
+    fn select_permission_option_id(
+        options: &[agent_client_protocol::schema::PermissionOption],
+        option_id: &str,
+    ) -> Option<RequestPermissionOutcome> {
+        options
+            .iter()
+            .find(|o| o.option_id.0.as_ref() == option_id)
+            .map(|opt| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    opt.option_id.clone(),
+                ))
+            })
+    }
+
+    fn select_permission_option_id_kind(
+        options: &[agent_client_protocol::schema::PermissionOption],
+        option_id: &str,
+        kinds: &[PermissionOptionKind],
+    ) -> Option<RequestPermissionOutcome> {
+        options
+            .iter()
+            .find(|o| o.option_id.0.as_ref() == option_id && kinds.contains(&o.kind))
+            .map(|opt| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    opt.option_id.clone(),
+                ))
+            })
+    }
+
+    fn pending_view(
+        req: &RequestPermissionRequest,
+        key: &PermKey,
+        timeout_ms: u64,
+    ) -> PendingPermissionView {
+        PendingPermissionView {
+            request_id: key.request_id.clone(),
+            tool_call_id: req.tool_call.tool_call_id.0.to_string(),
+            generation: key.generation,
+            op: key.op.clone(),
+            title: Self::cap_permission_text(
+                req.tool_call.fields.title.as_deref().unwrap_or_default(),
+            ),
+            options: req
+                .options
+                .iter()
+                .map(|opt| PermissionOptionView {
+                    option_id: opt.option_id.0.to_string(),
+                    name: opt.name.clone(),
+                    kind: Self::permission_kind_string(opt.kind),
+                })
+                .collect(),
+            raw_input: req
+                .tool_call
+                .fields
+                .raw_input
+                .as_ref()
+                .and_then(|raw| serde_json::to_string(raw).ok())
+                .map(|raw| Self::cap_permission_text(&raw)),
+            timeout_ms,
+        }
+    }
+
+    fn permission_kind_string(kind: PermissionOptionKind) -> String {
+        serde_json::to_value(kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{kind:?}"))
+    }
+
+    fn cap_permission_text(s: &str) -> String {
+        if s.len() <= PERMISSION_VIEW_CAP {
+            return s.to_string();
+        }
+        let mut end = 0;
+        for (idx, _) in s.char_indices() {
+            if idx > PERMISSION_VIEW_CAP {
+                break;
+            }
+            end = idx;
+        }
+        s[..end].to_string()
     }
 
     /// Negotiated agent capabilities from the most recent `initialize`.
@@ -1313,6 +1583,13 @@ impl AcpBackend {
                 "update routing registry unavailable (backend not connected)",
             )
         })
+    }
+
+    fn take_pending_turn_meta(&self, session: &SessionId) -> Option<TurnMeta> {
+        self.pending_turn_meta
+            .lock()
+            .expect("pending_turn_meta lock")
+            .remove(session)
     }
 
     /// Look up (or create) the per-bridge-session state for `key`, cloning the
@@ -1949,6 +2226,8 @@ impl AcpBackend {
         parts: Vec<bridge_core::domain::Part>,
         rich_sink: Option<Arc<dyn RichEventSink>>,
     ) -> Result<BackendStream, BridgeError> {
+        let turn_meta = self.take_pending_turn_meta(session);
+
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
         let entry = self.session_entry(session).await;
@@ -1988,6 +2267,8 @@ impl AcpBackend {
                 TurnRoute {
                     tx,
                     watch: watch.clone(),
+                    turn_meta,
+                    cancelled: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -2225,6 +2506,13 @@ impl AgentBackend for AcpBackend {
         self.prompt_inner(session, parts, Some(sink)).await
     }
 
+    async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
+        self.pending_turn_meta
+            .lock()
+            .expect("pending_turn_meta lock")
+            .insert(session.clone(), meta);
+    }
+
     /// Cancel the in-flight turn for the bridge session.
     ///
     /// Spec §5.3 / Codex finding 2: cancellation COMPLETION is the prompt RESULT
@@ -2256,6 +2544,22 @@ impl AgentBackend for AcpBackend {
         self.request_cancel(session).await?;
 
         let entry = self.session_entry(session).await;
+        if let Some(agent_id) = entry.agent_id.get() {
+            let turn_meta = self.updates().ok().and_then(|updates| {
+                updates.lock().ok().and_then(|map| {
+                    map.get(agent_id).map(|route| {
+                        route.cancelled.store(true, Ordering::SeqCst);
+                        route.turn_meta.clone()
+                    })
+                })
+            });
+            if let (Some(reg), Some(meta)) = (
+                self.permission_registry.lock().ok().and_then(|r| r.clone()),
+                turn_meta.flatten(),
+            ) {
+                reg.resolve_context_cancelled(&meta.context_id);
+            }
+        }
         // No in-flight turn → the lock is free → nothing to bound. (A turn that
         // starts AFTER this check is a fresh turn, not the one this cancel
         // targeted, so it is correct not to arm a watcher for it.)
@@ -2318,6 +2622,10 @@ impl AgentBackend for AcpBackend {
         if let Ok(mut m) = self.session_cfg.lock() {
             m.remove(session);
         }
+        self.pending_turn_meta
+            .lock()
+            .expect("pending_turn_meta lock")
+            .remove(session);
     }
 
     /// Re-apply warm-session model/effort against the cached ACP config surface.
@@ -2404,6 +2712,10 @@ impl AgentBackend for AcpBackend {
         if let Ok(mut m) = self.session_cfg.lock() {
             m.remove(session);
         }
+        self.pending_turn_meta
+            .lock()
+            .expect("pending_turn_meta lock")
+            .remove(session);
     }
 
     /// Graceful async teardown of the agent process (Increment 3b §5.4). IDEMPOTENT
@@ -2869,9 +3181,12 @@ mod tests {
             reaped: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
+            pending_turn_meta: StdMutex::new(HashMap::new()),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
+            permission_registry: Arc::new(StdMutex::new(None)),
+            perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
         };
 
         assert!(
@@ -3318,6 +3633,283 @@ mod tests {
         }
     }
 
+    struct DeferPolicy;
+    impl PolicyEngine for DeferPolicy {
+        fn decide(
+            &self,
+            _req: &PermissionRequest,
+            _ctx: &SessionContext,
+        ) -> Result<PermissionDecision, BridgeError> {
+            Ok(PermissionDecision::Approve)
+        }
+
+        fn interactive_decide(
+            &self,
+            _req: &PermissionRequest,
+            _ctx: &SessionContext,
+        ) -> bridge_core::ports::PolicyOutcome {
+            bridge_core::ports::PolicyOutcome::Defer
+        }
+    }
+
+    fn spike_permission_request() -> RequestPermissionRequest {
+        RequestPermissionRequest::new(
+            AgentSessionId::new("agent-sess-perm"),
+            ToolCallUpdate::new(
+                ToolCallId::new("tool-1"),
+                ToolCallUpdateFields::new()
+                    .kind(ToolKind::Execute)
+                    .status(ToolCallStatus::Pending)
+                    .title("create /tmp/x.txt")
+                    .raw_input(serde_json::json!({
+                        "command": ["/bin/zsh", "-lc", "create /tmp/x.txt"],
+                        "cwd": "/tmp",
+                    })),
+            ),
+            vec![
+                PermissionOption::new(
+                    PermissionOptionId::new("approved"),
+                    "Yes, proceed",
+                    PermissionOptionKind::AllowOnce,
+                ),
+                PermissionOption::new(
+                    PermissionOptionId::new("approved-execpolicy-amendment"),
+                    "Yes, and remember this command pattern",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                PermissionOption::new(
+                    PermissionOptionId::new("abort"),
+                    "No",
+                    PermissionOptionKind::RejectOnce,
+                ),
+            ],
+        )
+    }
+
+    fn selected_option_id(outcome: &RequestPermissionOutcome) -> Option<&str> {
+        match outcome {
+            RequestPermissionOutcome::Selected(sel) => Some(sel.option_id.0.as_ref()),
+            RequestPermissionOutcome::Cancelled => None,
+            _ => None,
+        }
+    }
+
+    fn policy_handle(policy: Arc<dyn PolicyEngine>) -> PolicyHandle {
+        Arc::new(StdMutex::new(policy))
+    }
+
+    async fn wait_pending(
+        reg: &Arc<bridge_core::permission::PermissionRegistry>,
+        ctx: &bridge_core::ids::ContextId,
+    ) -> bridge_core::permission::PendingPermissionView {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pending = reg.pending(ctx);
+                if let Some(view) = pending.into_iter().next() {
+                    return view;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("permission should be registered")
+    }
+
+    async fn defer_and_resolve(
+        decision: bridge_core::domain::PermitDecision,
+    ) -> RequestPermissionOutcome {
+        let req = spike_permission_request();
+        let meta = turn_meta("ctx-permit", 7, "op-permit");
+        let key = bridge_core::permission::PermKey {
+            context_id: meta.context_id.clone(),
+            generation: meta.generation,
+            op: meta.op.clone(),
+            request_id: "tool-1".to_string(),
+        };
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let policy = policy_handle(Arc::new(DeferPolicy));
+        let reg_for_task = Arc::clone(&reg);
+        let task = tokio::spawn(async move {
+            AcpBackend::resolve_permission_outcome(
+                &policy,
+                Some(&reg_for_task),
+                Some(meta),
+                None,
+                1_000,
+                &req,
+            )
+            .await
+        });
+
+        let view = wait_pending(&reg, &key.context_id).await;
+        assert_eq!(view.request_id, "tool-1");
+        assert_eq!(view.tool_call_id, "tool-1");
+        assert_eq!(view.generation, 7);
+        assert_eq!(view.op, key.op);
+        assert_eq!(view.title, "create /tmp/x.txt");
+        assert_eq!(view.options.len(), 3);
+        assert_eq!(view.options[0].option_id, "approved");
+        assert_eq!(view.options[0].kind, "allow_once");
+        assert!(view
+            .raw_input
+            .as_deref()
+            .is_some_and(|raw| raw.contains("create /tmp/x.txt")));
+        assert!(reg.resolve(
+            &key,
+            bridge_core::permission::PermissionResolution::Decided(decision)
+        ));
+        task.await.expect("resolver task should finish")
+    }
+
+    #[tokio::test]
+    async fn auto_decide_is_byte_identical_and_no_registry_entry() {
+        let req = spike_permission_request();
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let ctx = bridge_core::ids::ContextId::parse("ctx-auto").unwrap();
+        let policy = policy_handle(Arc::new(AutoApprovePolicy));
+
+        let old = AcpBackend::decide_permission(&policy, &req);
+        let resolved = AcpBackend::resolve_permission_outcome(
+            &policy,
+            Some(&reg),
+            Some(turn_meta("ctx-auto", 1, "op-auto")),
+            None,
+            1_000,
+            &req,
+        )
+        .await;
+
+        assert_eq!(resolved, old);
+        assert_eq!(selected_option_id(&resolved), Some("approved"));
+        assert!(reg.pending(&ctx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn defer_registers_then_approve_selects_allow() {
+        let outcome =
+            defer_and_resolve(bridge_core::domain::PermitDecision::Approve { option_id: None })
+                .await;
+
+        assert_eq!(selected_option_id(&outcome), Some("approved"));
+    }
+
+    #[tokio::test]
+    async fn approve_with_reject_option_id_does_not_invert() {
+        let outcome = defer_and_resolve(bridge_core::domain::PermitDecision::Approve {
+            option_id: Some("abort".into()),
+        })
+        .await;
+
+        assert_eq!(selected_option_id(&outcome), Some("approved"));
+    }
+
+    #[tokio::test]
+    async fn defer_modify_selects_named_option() {
+        let outcome = defer_and_resolve(bridge_core::domain::PermitDecision::Modify {
+            option_id: "approved-execpolicy-amendment".to_string(),
+            note: None,
+        })
+        .await;
+
+        assert_eq!(
+            selected_option_id(&outcome),
+            Some("approved-execpolicy-amendment")
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_deny_and_policy_denied_select_same_reject() {
+        let defer_outcome = defer_and_resolve(bridge_core::domain::PermitDecision::Deny {
+            option_id: None,
+            reason: None,
+        })
+        .await;
+
+        let req = spike_permission_request();
+        let denied_policy = policy_handle(Arc::new(DenyPolicy));
+        let denied_outcome = AcpBackend::resolve_permission_outcome(
+            &denied_policy,
+            None,
+            Some(turn_meta("ctx-deny", 1, "op-deny")),
+            None,
+            1_000,
+            &req,
+        )
+        .await;
+
+        assert_eq!(defer_outcome, denied_outcome);
+        assert_eq!(selected_option_id(&defer_outcome), Some("abort"));
+    }
+
+    #[tokio::test]
+    async fn deny_with_allow_option_id_does_not_invert() {
+        let outcome = defer_and_resolve(bridge_core::domain::PermitDecision::Deny {
+            option_id: Some("approved".into()),
+            reason: None,
+        })
+        .await;
+
+        assert_eq!(selected_option_id(&outcome), Some("abort"));
+    }
+
+    #[tokio::test]
+    async fn cancel_then_late_permission_does_not_park() {
+        let req = spike_permission_request();
+        let meta = turn_meta("ctx-cancel-late", 5, "op-cancel-late");
+        let ctx = meta.context_id.clone();
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let policy = policy_handle(Arc::new(DeferPolicy));
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            AcpBackend::resolve_permission_outcome(
+                &policy,
+                Some(&reg),
+                Some(meta),
+                Some(cancelled),
+                120_000,
+                &req,
+            ),
+        )
+        .await
+        .expect("cancelled route must not wait for permission timeout");
+
+        assert_eq!(outcome, RequestPermissionOutcome::Cancelled);
+        assert!(reg.pending(&ctx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn defer_timeout_defaults_deny() {
+        let req = spike_permission_request();
+        let meta = turn_meta("ctx-timeout", 3, "op-timeout");
+        let ctx = meta.context_id.clone();
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let policy = policy_handle(Arc::new(DeferPolicy));
+
+        let outcome =
+            AcpBackend::resolve_permission_outcome(&policy, Some(&reg), Some(meta), None, 30, &req)
+                .await;
+
+        assert_eq!(selected_option_id(&outcome), Some("abort"));
+        assert!(reg.pending(&ctx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn defer_without_turn_meta_default_denies() {
+        let req = spike_permission_request();
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let ctx = bridge_core::ids::ContextId::parse("ctx-no-meta").unwrap();
+        let policy = policy_handle(Arc::new(DeferPolicy));
+
+        let outcome =
+            AcpBackend::resolve_permission_outcome(&policy, Some(&reg), None, None, 1_000, &req)
+                .await;
+
+        assert_eq!(selected_option_id(&outcome), Some("abort"));
+        assert!(reg.pending(&ctx).is_empty());
+    }
+
     /// Spawn the recording fake agent on `channel`, wired to `rec`'s shared state.
     fn spawn_recording_agent(channel: Channel, rec: Recorder) {
         tokio::spawn(async move {
@@ -3651,6 +4243,82 @@ mod tests {
 
     fn bkey(s: &str) -> SessionId {
         SessionId::parse(s).unwrap()
+    }
+
+    fn turn_meta(ctx: &str, generation: u64, op: &str) -> bridge_core::permission::TurnMeta {
+        bridge_core::permission::TurnMeta {
+            context_id: bridge_core::ids::ContextId::parse(ctx).unwrap(),
+            generation,
+            op: bridge_core::ids::OperationId::parse(op).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_turn_stash_is_taken_into_route() {
+        let rec = Recorder::new("agent-sess-META");
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-META");
+        let meta = turn_meta("ctx-meta", 7, "op-meta");
+
+        be.configure_turn(&key, meta.clone()).await;
+        let mut stream = be.prompt(&key, vec![]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("prompt should start and keep route registered");
+
+        {
+            let updates = be.updates().expect("backend has update registry");
+            let map = updates.lock().expect("update registry lock");
+            let route = map
+                .get(&AgentSessionId::new("agent-sess-META"))
+                .expect("live prompt route registered");
+            let routed = route
+                .turn_meta
+                .as_ref()
+                .expect("turn meta moved into route");
+            assert_eq!(routed.context_id.as_str(), "ctx-meta");
+            assert_eq!(routed.generation, 7);
+            assert_eq!(routed.op.as_str(), "op-meta");
+        }
+
+        rec.prompt_gate.notify_one();
+        assert!(
+            matches!(stream.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_turn_take_at_entry_clears_on_missing_session() {
+        let rec = Recorder::new("agent-sess-TAKE");
+        let be = connect_recording(rec).await;
+        let key = bkey("bridge-TAKE");
+        let meta = turn_meta("ctx-take", 11, "op-take");
+
+        be.configure_turn(&key, meta.clone()).await;
+        {
+            let stashed = be
+                .pending_turn_meta
+                .lock()
+                .expect("pending_turn_meta lock")
+                .get(&key)
+                .cloned()
+                .expect("configure_turn stashes meta");
+            assert_eq!(stashed.context_id.as_str(), "ctx-take");
+            assert_eq!(stashed.generation, 11);
+            assert_eq!(stashed.op.as_str(), "op-take");
+        }
+
+        let taken = be
+            .take_pending_turn_meta(&key)
+            .expect("take at prompt entry returns stashed meta");
+        assert_eq!(taken.context_id.as_str(), "ctx-take");
+        assert_eq!(taken.generation, 11);
+        assert_eq!(taken.op.as_str(), "op-take");
+        assert!(
+            be.take_pending_turn_meta(&key).is_none(),
+            "take-at-entry clears stale meta even if the prompt later fails"
+        );
     }
 
     fn select_current(opts: &[SessionConfigOption], id: &str) -> Option<String> {
@@ -4618,6 +5286,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dead_safe_auto_policy_full_turn_no_deferral() {
+        // DoD regression: even when a PermissionRegistry is attached and warm
+        // turn metadata is available, the DEFAULT auto policy must stay on the
+        // pre-slice immediate-decide path: no pending entry, no parking, and the
+        // agent receives the same AllowOnce selection as before.
+        let rec = Recorder::new("agent-sess-DSAFE");
+        rec.arm_permission(allow_reject_options()).await;
+        rec.gate_turn_on_permission.store(true, Ordering::SeqCst);
+        rec.set_updates(vec![ScriptedUpdate::Text("after-perm")])
+            .await;
+
+        let registry = PermissionRegistry::new();
+        let be = connect_recording(rec.clone())
+            .await
+            .with_permission_registry(Arc::clone(&registry));
+        let key = bkey("bridge-DSAFE");
+        let meta = turn_meta("ctx-dead-safe", 42, "op-dead-safe");
+        let ctx = meta.context_id.clone();
+        be.configure_turn(&key, meta).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut s = be.prompt(&key, vec![]).await.unwrap();
+            assert!(
+                matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "after-perm"),
+                "the gated post-permission chunk must arrive"
+            );
+            let done = loop {
+                match s.next().await {
+                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(_) => continue,
+                    None => panic!("stream ended without Done"),
+                }
+            };
+            assert_eq!(done, "end_turn");
+        })
+        .await
+        .expect("default auto policy turn must complete without permission parking");
+
+        tokio::time::timeout(Duration::from_secs(2), rec.permission_replied.notified())
+            .await
+            .expect("client must have replied to the permission request");
+        assert_eq!(
+            *rec.permission_reply.lock().await,
+            Some(Some("a".to_string())),
+            "auto policy must select the same AllowOnce option as the pre-slice path"
+        );
+        assert!(
+            registry.pending(&ctx).is_empty(),
+            "auto policy must not create a pending permission entry"
+        );
+    }
+
+    #[tokio::test]
     async fn permission_deny_selects_reject_or_cancelled() {
         // With a DENY policy injected via `with_policy`, the backend must reply
         // Selected{optionId:"r"} (the reject_once option) — not the allow.
@@ -5411,9 +6132,12 @@ mod tests {
             reaped: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
+            pending_turn_meta: StdMutex::new(HashMap::new()),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
+            permission_registry: Arc::new(StdMutex::new(None)),
+            perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
         };
 
         assert!(
@@ -5847,6 +6571,22 @@ mod tests {
         assert!(
             be.sessions.lock().await.get(&s).is_none(),
             "agent session removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_session_clears_pending_turn_meta() {
+        let rec = Recorder::new("agent-sess-RELEASE-META");
+        let be = connect_recording(rec).await;
+        let s = SessionId::parse("ctx-release-meta-g0").unwrap();
+        be.configure_turn(&s, turn_meta("ctx-release-meta", 1, "op-release-meta"))
+            .await;
+
+        be.release_session(&s).await;
+
+        assert!(
+            be.take_pending_turn_meta(&s).is_none(),
+            "release_session removes pending turn metadata"
         );
     }
 

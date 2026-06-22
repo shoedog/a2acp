@@ -40,6 +40,7 @@ use bridge_core::domain::{
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
 use bridge_core::ids::{AgentId, ContextId, OperationId, SessionGeneration, SessionId, TaskId};
+use bridge_core::permission::{PermissionRegistry, TurnMeta};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
     RouteDecision, SessionStore,
@@ -51,7 +52,10 @@ use bridge_workflow::executor::{
 };
 use bridge_workflow::graph::WorkflowNode;
 
+use bridge_coordinator::coordinator::apply_permit;
 use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
+use bridge_coordinator::params::{InjectParams, PermitParams};
+use bridge_coordinator::turn_parts::assemble_turn_parts;
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
 use crate::fanout::{self, Source};
@@ -134,6 +138,7 @@ pub struct InboundServer {
     /// replace with a persistent backend via [`InboundServer::with_task_store`].
     task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
     session_manager: Option<std::sync::Arc<crate::session_manager::SessionManager>>,
+    permission_registry: Option<std::sync::Arc<PermissionRegistry>>,
     /// Global root path that gates which per-request session cwds are permitted
     /// (session_cwd increment). `None` → no global root restriction.
     /// Wired from `allowed_cwd_root` in the top-level config via
@@ -185,6 +190,7 @@ impl InboundServer {
             workflow_runs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             task_store: std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
             session_manager: None,
+            permission_registry: None,
             allowed_cwd_root: None,
             progress_hubs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             model_catalog: Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -228,6 +234,12 @@ impl InboundServer {
         sm: std::sync::Arc<crate::session_manager::SessionManager>,
     ) -> Self {
         self.session_manager = Some(sm);
+        self
+    }
+
+    #[must_use]
+    pub fn with_permission_registry(mut self, reg: std::sync::Arc<PermissionRegistry>) -> Self {
+        self.permission_registry = Some(reg);
         self
     }
 
@@ -441,6 +453,8 @@ async fn resolve_configure_bind(
                 backend,
                 session: session.clone(),
                 seed: None,
+                injects: Vec::new(),
+                turn_meta: None,
                 guard: None,
                 warm_guard: None,
                 // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
@@ -480,6 +494,8 @@ async fn resolve_configure_bind(
         backend,
         session: session.clone(),
         seed: None,
+        injects: Vec::new(),
+        turn_meta: None,
         guard: Some(guard),
         warm_guard: None,
         // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
@@ -515,6 +531,12 @@ async fn warm_local_dispatch(
                 backend: turn.backend,
                 session: turn.session,
                 seed: turn.seed,
+                injects: turn.injects,
+                turn_meta: Some(TurnMeta {
+                    context_id: ctx.clone(),
+                    generation: turn.generation.get(),
+                    op: turn.op.clone(),
+                }),
                 guard: None,
                 warm_guard: Some(WarmTurnGuard {
                     sm,
@@ -696,6 +718,8 @@ async fn jsonrpc(
         m if m == methods::GET_TASK => get_task(srv, headers, id, params).await,
         m if m == methods::LIST_TASKS => list_tasks(srv, headers, id, params).await,
         "SessionStatus" => session_status(srv, headers, id, params).await,
+        "SessionInject" => session_inject(srv, headers, id, params).await,
+        "SessionPermit" => session_permit(srv, headers, id, params).await,
         "SessionRelease" => session_release(srv, headers, id, params).await,
         "SessionCancel" => session_cancel(srv, headers, id, params).await,
         "SessionClear" => session_clear(srv, headers, id, params).await,
@@ -1373,17 +1397,9 @@ fn spawn_local_producer(
     let policy = srv.policy.clone();
     let task = routed.task;
     let session = dispatch.session.clone();
-    let parts = routed.parts;
-    let mut parts = parts;
-    if let Some(seed) = dispatch.seed {
-        parts.insert(
-            0,
-            Part {
-                text: format!("[Summary of earlier context in this session]\n{seed}"),
-            },
-        );
-    }
+    let parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
     let backend = dispatch.backend;
+    let turn_meta = dispatch.turn_meta;
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
     let warm = dispatch.warm_guard;
@@ -1395,6 +1411,9 @@ fn spawn_local_producer(
         let _guard = guard;
         let warm = warm;
 
+        if let Some(meta) = turn_meta {
+            backend.configure_turn(&session, meta).await;
+        }
         let translator = Translator::new();
         let mut events = translator.run(
             backend.as_ref(),
@@ -2306,17 +2325,16 @@ async fn unary_message(
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
             let warm = dispatch.warm_guard;
+            if let Some(meta) = dispatch.turn_meta.clone() {
+                dispatch
+                    .backend
+                    .configure_turn(&dispatch.session, meta)
+                    .await;
+            }
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
             let abort = dispatch.abort;
-            let mut parts = routed.parts;
-            if let Some(seed) = dispatch.seed {
-                parts.insert(
-                    0,
-                    Part {
-                        text: format!("[Summary of earlier context in this session]\n{seed}"),
-                    },
-                );
-            }
+            let parts =
+                assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
             let translator = Translator::new();
             let mut events = translator.run(
                 dispatch.backend.as_ref(),
@@ -2894,10 +2912,59 @@ async fn session_status(
                     })),
                     "atMs": s.usage.at_ms,
                 },
+                "pendingPermissions": srv.permission_registry
+                    .as_ref()
+                    .map(|r| r.pending(&ctx))
+                    .unwrap_or_default(),
             }),
         ),
         None => bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound),
     }
+}
+
+async fn session_inject(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(sm) = srv.session_manager.clone() else {
+        return jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "no session manager");
+    };
+    let params = match InjectParams::from_a2a(&params) {
+        Ok(p) => p,
+        Err(e) => return bridge_err_to_jsonrpc(id, &e),
+    };
+    let ctx = params.context.clone();
+    match sm.inject(params.into_request()).await {
+        Ok(queued) => jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "queued": queued })),
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    }
+}
+
+async fn session_permit(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let params = match PermitParams::from_a2a(&params) {
+        Ok(p) => p,
+        Err(e) => return bridge_err_to_jsonrpc(id, &e),
+    };
+    // A server without the interactive-permission registry has no pending rendezvous to resolve.
+    let resolved = srv
+        .permission_registry
+        .as_ref()
+        .map(|reg| apply_permit(reg, &params))
+        .unwrap_or(false);
+    jsonrpc_ok(id, json!({ "resolved": resolved }))
 }
 
 async fn session_release(
@@ -6380,6 +6447,8 @@ mod tests {
             backend: Arc::new(PanicBackend),
             session: SessionId::parse("ctx-streaming-pre-cancel-g0").unwrap(),
             seed: None,
+            injects: Vec::new(),
+            turn_meta: None,
             guard: None,
             warm_guard: None,
             abort,
@@ -7238,6 +7307,334 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["code"], JSONRPC_INVALID_REQUEST);
         assert_eq!(v["error"]["message"], "session not found");
+    }
+
+    #[tokio::test]
+    async fn session_status_lists_pending_permissions() {
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry_for_sm: Arc<dyn AgentRegistry> = registry.clone();
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_for_sm,
+            std::time::Duration::from_secs(60),
+        ));
+        let perm_registry = bridge_core::permission::PermissionRegistry::new();
+        let registry_for_srv: Arc<dyn AgentRegistry> = registry;
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_for_srv,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm.clone())
+            .with_permission_registry(Arc::clone(&perm_registry)),
+        );
+
+        let ctx = ContextId::parse("c-perm").unwrap();
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "message": {
+                        "contextId": "c-perm",
+                        "text": "go",
+                        "metadata": { "a2a-bridge.agent": "a" }
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+        assert!(
+            sm.status(&ctx).await.is_some(),
+            "pending permission visibility requires a live warm handle"
+        );
+
+        let op = OperationId::parse("turn-1").unwrap();
+        let key = bridge_core::permission::PermKey {
+            context_id: ctx.clone(),
+            generation: 0,
+            op: op.clone(),
+            request_id: "r1".into(),
+        };
+        let (_rx, _guard) = perm_registry.register(
+            key,
+            bridge_core::permission::PendingPermissionView {
+                request_id: "r1".into(),
+                tool_call_id: "tool-1".into(),
+                generation: 0,
+                op,
+                title: "write /tmp/x".into(),
+                options: vec![bridge_core::permission::PermissionOptionView {
+                    option_id: "approved".into(),
+                    name: "Yes, proceed".into(),
+                    kind: "allow_once".into(),
+                }],
+                raw_input: Some(r#"{"command":["touch","/tmp/x"]}"#.into()),
+                timeout_ms: 120_000,
+            },
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionStatus",
+                json!({ "contextId": "c-perm" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let pending = v["result"]["pendingPermissions"].as_array().unwrap();
+        assert_eq!(pending.len(), 1, "body: {body}");
+        assert_eq!(pending[0]["requestId"], "r1");
+        assert_eq!(pending[0]["toolCallId"], "tool-1");
+        assert_eq!(pending[0]["title"], "write /tmp/x");
+        assert_eq!(pending[0]["options"][0]["optionId"], "approved");
+        assert_eq!(pending[0]["options"][0]["name"], "Yes, proceed");
+        assert_eq!(pending[0]["rawInput"], r#"{"command":["touch","/tmp/x"]}"#);
+        assert_eq!(pending[0]["timeoutMs"], 120_000);
+    }
+
+    #[tokio::test]
+    async fn session_status_pending_permissions_empty_without_registry() {
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry_for_sm: Arc<dyn AgentRegistry> = registry.clone();
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_for_sm,
+            std::time::Duration::from_secs(60),
+        ));
+        let registry_for_srv: Arc<dyn AgentRegistry> = registry;
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_for_srv,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm),
+        );
+
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "message": {
+                        "contextId": "c-no-reg",
+                        "text": "go",
+                        "metadata": { "a2a-bridge.agent": "a" }
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionStatus",
+                json!({ "contextId": "c-no-reg" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["pendingPermissions"], json!([]));
+    }
+
+    fn warm_server_with_permission_registry() -> (
+        Arc<InboundServer>,
+        Arc<crate::session_manager::SessionManager>,
+        Arc<bridge_core::permission::PermissionRegistry>,
+    ) {
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry_for_sm: Arc<dyn AgentRegistry> = registry.clone();
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_for_sm,
+            std::time::Duration::from_secs(60),
+        ));
+        let perm_registry = bridge_core::permission::PermissionRegistry::new();
+        let registry_for_srv: Arc<dyn AgentRegistry> = registry;
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_for_srv,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm.clone())
+            .with_permission_registry(Arc::clone(&perm_registry)),
+        );
+        (srv, sm, perm_registry)
+    }
+
+    fn register_pending_permission(
+        reg: &Arc<bridge_core::permission::PermissionRegistry>,
+        ctx: &str,
+        request_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<bridge_core::permission::PermissionResolution>,
+        bridge_core::permission::PermitGuard,
+    ) {
+        let op = OperationId::parse("turn-1").unwrap();
+        reg.register(
+            bridge_core::permission::PermKey {
+                context_id: ContextId::parse(ctx).unwrap(),
+                generation: 1,
+                op: op.clone(),
+                request_id: request_id.into(),
+            },
+            bridge_core::permission::PendingPermissionView {
+                request_id: request_id.into(),
+                tool_call_id: "tool-1".into(),
+                generation: 1,
+                op,
+                title: "write file".into(),
+                options: Vec::new(),
+                raw_input: None,
+                timeout_ms: 120_000,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn session_inject_queues() {
+        let (srv, sm, _perm_registry) = warm_server_with_permission_registry();
+        let ctx = ContextId::parse("c-inject").unwrap();
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "message": {
+                        "contextId": "c-inject",
+                        "text": "go",
+                        "metadata": { "a2a-bridge.agent": "a" }
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionInject",
+                json!({ "contextId": "c-inject", "text": "queued" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["contextId"], "c-inject");
+        assert_eq!(v["result"]["queued"], 1);
+        assert_eq!(sm.pending_inject_count(&ctx).await, 1);
+    }
+
+    #[tokio::test]
+    async fn session_permit_resolves() {
+        let (srv, _sm, perm_registry) = warm_server_with_permission_registry();
+        let (rx, _guard) = register_pending_permission(&perm_registry, "c-permit-ok", "req-ok");
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionPermit",
+                json!({
+                    "contextId": "c-permit-ok",
+                    "generation": 1,
+                    "op": "turn-1",
+                    "requestId": "req-ok",
+                    "decision": { "decision": "approve", "optionId": "approved" }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["resolved"], true);
+        match rx.await.unwrap() {
+            bridge_core::permission::PermissionResolution::Decided(
+                bridge_core::domain::PermitDecision::Approve { option_id },
+            ) => assert_eq!(option_id.as_deref(), Some("approved")),
+            other => panic!("unexpected permission resolution: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_permit_escalate_no_resolve() {
+        let (srv, _sm, perm_registry) = warm_server_with_permission_registry();
+        let ctx = ContextId::parse("c-permit-escalate").unwrap();
+        let (mut rx, _guard) =
+            register_pending_permission(&perm_registry, "c-permit-escalate", "req-escalate");
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionPermit",
+                json!({
+                    "contextId": "c-permit-escalate",
+                    "generation": 1,
+                    "op": "turn-1",
+                    "requestId": "req-escalate",
+                    "decision": { "decision": "escalate", "reason": "ask human" }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["resolved"], false);
+        assert_eq!(perm_registry.pending(&ctx).len(), 1);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

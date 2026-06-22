@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bridge_core::domain::EffectiveConfig;
+use bridge_core::domain::{EffectiveConfig, QueuedInject};
 use bridge_core::ids::{ContextId, OperationId, SessionGeneration, SessionId, TaskId};
+use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{AgentBackend, Lease};
 use tokio::sync::Mutex;
 
@@ -74,6 +75,10 @@ pub struct LocalDispatch {
     pub session: SessionId,
     /// Warm-session summary seed to prepend to the prompt parts, when present.
     pub seed: Option<String>,
+    /// Warm-session context injects to apply to the next prompt parts.
+    pub injects: Vec<QueuedInject>,
+    /// Warm path only: bridge turn identity stashed into ACP before the next prompt.
+    pub turn_meta: Option<TurnMeta>,
     pub guard: Option<BindingGuard>,
     /// Warm path only: finishes the warm turn (→ Idle) on drop. Mutually exclusive with `guard`.
     pub warm_guard: Option<WarmTurnGuard>,

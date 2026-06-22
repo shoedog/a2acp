@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bridge_coordinator::params::OpParams;
+use bridge_coordinator::params::{InjectParams, OpParams, PermitParams};
 use bridge_coordinator::session_manager::ResetOutcome;
 use bridge_coordinator::Coordinator;
 use bridge_core::error::BridgeError;
@@ -86,6 +86,20 @@ async fn dispatch(id: &Value, params: &Value, coord: &Coordinator) -> Value {
                     "context": o.context.as_str()
                 })
             }),
+            Err(e) => Err(e),
+        },
+        "inject" => match InjectParams::from_mcp_args(&args) {
+            Ok(p) => coord
+                .inject(p.into_request())
+                .await
+                .map(|queued| json!({ "queued": queued })),
+            Err(e) => Err(e),
+        },
+        "permit" => match PermitParams::from_mcp_args(&args) {
+            Ok(p) => coord
+                .permit(p)
+                .await
+                .map(|resolved| json!({ "resolved": resolved })),
             Err(e) => Err(e),
         },
         "run_workflow" => match OpParams::from_mcp_args_for_workflow(&args) {

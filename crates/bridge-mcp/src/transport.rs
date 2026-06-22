@@ -97,6 +97,51 @@ pub fn tool_schemas() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "inject",
+            "description": "Queue text for the next turn of an existing warm context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "context": { "type": "string" },
+                    "text": { "type": "string" },
+                    "append": { "type": "boolean" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["prepend_next_turn", "append_next_turn"]
+                    },
+                    "dedupeKey": { "type": "string" }
+                },
+                "required": ["context", "text"]
+            }
+        }),
+        json!({
+            "name": "permit",
+            "description": "Resolve a pending interactive permission request.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "context": { "type": "string" },
+                    "generation": { "type": "integer", "minimum": 0 },
+                    "op": { "type": "string" },
+                    "requestId": { "type": "string" },
+                    "decision": {
+                        "type": "object",
+                        "properties": {
+                            "decision": {
+                                "type": "string",
+                                "enum": ["approve", "deny", "modify", "escalate"]
+                            },
+                            "optionId": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "note": { "type": "string" }
+                        },
+                        "required": ["decision"]
+                    }
+                },
+                "required": ["context", "generation", "op", "requestId", "decision"]
+            }
+        }),
+        json!({
             "name": "run_workflow",
             "description": "Start a detached workflow run.",
             "inputSchema": {

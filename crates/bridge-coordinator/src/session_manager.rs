@@ -2,12 +2,15 @@
 //! contextId->handle table + the registry lease that pins the warm backend. Keyed by A2A contextId.
 
 use crate::clock::{Clock, SystemClock};
-use bridge_core::domain::{effective_config, AgentOverride, SessionSpec};
+use bridge_core::domain::{
+    effective_config, AgentOverride, InjectRequest, QueuedInject, SessionSpec,
+};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{
     AgentId, ContextId, OperationId, SessionGeneration, SessionHandleId, SessionId,
 };
 use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome, UsageSnapshot};
+use bridge_core::permission::PermissionRegistry;
 use bridge_core::ports::{AgentBackend, AgentRegistry, Lease};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::session_fingerprint::SessionSpecFingerprint;
@@ -88,6 +91,7 @@ struct WarmHandle {
     /// both belong to Slice 9's cancel-under-concurrency work.
     turn_abort: Option<CancellationToken>,
     pending_seed: Option<String>,
+    pending_injects: Vec<QueuedInject>,
     last_used: Instant,
 }
 
@@ -100,6 +104,7 @@ pub struct WarmTurn {
     pub op: OperationId,
     pub abort: CancellationToken,
     pub seed: Option<String>,
+    pub injects: Vec<QueuedInject>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,6 +149,7 @@ impl SessionStatusInfo {
 
 pub struct SessionManager {
     registry: Arc<dyn AgentRegistry>,
+    perm_registry: Option<Arc<PermissionRegistry>>,
     by_context: Mutex<HashMap<ContextId, WarmHandle>>,
     children: Mutex<HashMap<ContextId, HashSet<ContextId>>>,
     idle_ttl: Duration,
@@ -166,6 +172,7 @@ impl SessionManager {
     ) -> Self {
         Self {
             registry,
+            perm_registry: None,
             by_context: Mutex::new(HashMap::new()),
             children: Mutex::new(HashMap::new()),
             idle_ttl,
@@ -185,6 +192,58 @@ impl SessionManager {
     pub fn with_compact_summarize_timeout(mut self, d: Duration) -> Self {
         self.compact_summarize_timeout = d;
         self
+    }
+
+    pub fn with_permission_registry(mut self, reg: Arc<PermissionRegistry>) -> Self {
+        self.perm_registry = Some(reg);
+        self
+    }
+
+    pub async fn inject(&self, req: InjectRequest) -> Result<usize, BridgeError> {
+        const MAX_INJECTS: usize = 32;
+        const MAX_INJECT_BYTES: usize = 64 * 1024;
+
+        let mut tab = self.by_context.lock().await;
+        let Some(h) = tab.get_mut(&req.context) else {
+            return Err(BridgeError::SessionNotFound);
+        };
+        if !matches!(h.state, SessionState::Idle | SessionState::Running) {
+            return Err(BridgeError::HandleBusy);
+        }
+
+        let mut candidate = h.pending_injects.clone();
+        let replacement = req.dedupe_key.as_ref().and_then(|key| {
+            candidate
+                .iter()
+                .position(|entry| entry.dedupe_key.as_ref() == Some(key))
+        });
+        let queued = QueuedInject {
+            text: req.text,
+            mode: req.mode,
+            dedupe_key: req.dedupe_key,
+        };
+        if let Some(idx) = replacement {
+            candidate[idx] = queued;
+        } else {
+            candidate.push(queued);
+        }
+
+        let total_bytes: usize = candidate.iter().map(|entry| entry.text.len()).sum();
+        if candidate.len() > MAX_INJECTS || total_bytes > MAX_INJECT_BYTES {
+            return Err(BridgeError::HandleBusy);
+        }
+
+        h.pending_injects = candidate;
+        Ok(h.pending_injects.len())
+    }
+
+    pub async fn pending_inject_count(&self, ctx: &ContextId) -> usize {
+        self.by_context
+            .lock()
+            .await
+            .get(ctx)
+            .map(|h| h.pending_injects.len())
+            .unwrap_or(0)
     }
 
     /// Test-only: observe the stashed next-turn seed (delivery is wired in checkout_turn at Slice-4 T5).
@@ -304,6 +363,7 @@ impl SessionManager {
         h.turn_abort = Some(abort.clone());
         h.last_used = self.clock.now_instant();
         let seed = h.pending_seed.take();
+        let injects = std::mem::take(&mut h.pending_injects);
         Ok(WarmTurn {
             backend: h.backend.clone(),
             session: h.backend_session.clone(),
@@ -312,6 +372,7 @@ impl SessionManager {
             op,
             abort,
             seed,
+            injects,
         })
     }
 
@@ -351,6 +412,7 @@ impl SessionManager {
                 h.turn_abort = Some(abort.clone());
                 h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
+                let injects = std::mem::take(&mut h.pending_injects);
                 return (
                     Ok(WarmTurn {
                         backend: h.backend.clone(),
@@ -360,6 +422,7 @@ impl SessionManager {
                         op,
                         abort,
                         seed,
+                        injects,
                     }),
                     Vec::new(),
                 );
@@ -445,6 +508,7 @@ impl SessionManager {
                 h.turn_abort = Some(abort.clone());
                 h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
+                let injects = std::mem::take(&mut h.pending_injects);
                 return (
                     Ok(WarmTurn {
                         backend: h.backend.clone(),
@@ -454,6 +518,7 @@ impl SessionManager {
                         op,
                         abort,
                         seed,
+                        injects,
                     }),
                     Vec::new(),
                 );
@@ -524,6 +589,7 @@ impl SessionManager {
             op: op.clone(),
             abort: abort.clone(),
             seed: None,
+            injects: Vec::new(),
         };
         tab.insert(
             ctx.clone(),
@@ -542,6 +608,7 @@ impl SessionManager {
                 op: Some(op),
                 turn_abort: Some(abort),
                 pending_seed: None,
+                pending_injects: Vec::new(),
                 last_used: self.clock.now_instant(),
             },
         );
@@ -650,6 +717,9 @@ impl SessionManager {
                     h.expire_after_reconcile = true;
                     return;
                 }
+                if let Some(reg) = &self.perm_registry {
+                    reg.resolve_context_cancelled(ctx);
+                }
                 // cancel-tokens F2: SessionRelease releases the session out from under any in-flight turn —
                 // fire the lingering token under the lock before release_session below.
                 fire_lingering_turn_abort(h);
@@ -704,6 +774,9 @@ impl SessionManager {
             if is_claimed(h.state) {
                 h.expire_after_reconcile = true;
                 return (Ok(()), false);
+            }
+            if let Some(reg) = &self.perm_registry {
+                reg.resolve_context_cancelled(ctx);
             }
             let was_running = h.state == SessionState::Running;
             h.op = None;
@@ -915,6 +988,9 @@ impl SessionManager {
                 config: h.fingerprint.config.clone(),
                 cwd,
             };
+            if let Some(reg) = &self.perm_registry {
+                reg.resolve_context_cancelled(ctx);
+            }
             // F2 (cancel-tokens): all fallible validation passed — committed to Resetting. Fire the lingering
             // token UNDER the lock (only here, after the fallible new_id/cwd parses, so an early-return error
             // path can't strand it) so the cancel strictly precedes the lock release + backend teardown below.
@@ -976,6 +1052,7 @@ impl SessionManager {
         h.op = None;
         h.turn_abort = None;
         h.pending_seed = None;
+        h.pending_injects.clear();
         h.state = SessionState::Idle;
         h.last_used = self.clock.now_instant();
         (
@@ -1013,6 +1090,9 @@ impl SessionManager {
             // seed is consumed by a real turn. (Whole-branch review; the spawn-detached handler makes a
             // lost-response retry reachable.)
             if h.pending_seed.is_some() {
+                return Err(BridgeError::HandleBusy);
+            }
+            if !h.pending_injects.is_empty() {
                 return Err(BridgeError::HandleBusy);
             }
             let backend = h.backend.clone();
@@ -1180,6 +1260,9 @@ impl SessionManager {
                             && now.duration_since(h.last_used) >= self.idle_ttl
                 );
                 if should_reap {
+                    if let Some(reg) = &self.perm_registry {
+                        reg.resolve_context_cancelled(&c);
+                    }
                     if let Some(h) = tab.remove(&c) {
                         reaped.insert(c);
                         handles.push(h);
@@ -1208,7 +1291,11 @@ mod tests {
     use super::*;
     use crate::clock::ManualClock;
     use async_trait::async_trait;
-    use bridge_core::domain::{AgentEntry, AgentKind, Effort, Part, RegistrySnapshot};
+    use bridge_core::domain::{AgentEntry, AgentKind, Effort, InjectMode, Part, RegistrySnapshot};
+    use bridge_core::permission::{
+        PendingPermissionView, PermKey, PermissionOptionView, PermissionRegistry,
+        PermissionResolution,
+    };
     use bridge_core::ports::{BackendStream, Resolved, Update};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
@@ -1232,6 +1319,9 @@ mod tests {
     struct FakeBackend {
         reply: String,
         releases: StdMutex<Vec<String>>,
+        release_gate: StdMutex<Option<oneshot::Receiver<()>>>,
+        release_started: Notify,
+        release_started_count: AtomicUsize,
         cancels: StdMutex<Vec<String>>,
         configured: StdMutex<Vec<String>>,
         reconciled: StdMutex<Vec<(String, SessionSpec)>>,
@@ -1255,6 +1345,9 @@ mod tests {
             Self {
                 reply: reply.into(),
                 releases: StdMutex::new(Vec::new()),
+                release_gate: StdMutex::new(None),
+                release_started: Notify::new(),
+                release_started_count: AtomicUsize::new(0),
                 cancels: StdMutex::new(Vec::new()),
                 configured: StdMutex::new(Vec::new()),
                 reconciled: StdMutex::new(Vec::new()),
@@ -1283,6 +1376,18 @@ mod tests {
 
         fn releases(&self) -> Vec<String> {
             self.releases.lock().unwrap().clone()
+        }
+
+        fn block_next_release(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.release_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        async fn wait_for_release(&self) {
+            while self.release_started_count.load(Ordering::SeqCst) == 0 {
+                self.release_started.notified().await;
+            }
         }
 
         fn cancels(&self) -> Vec<String> {
@@ -1415,6 +1520,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(session.as_str().to_string());
+            let gate = self.release_gate.lock().unwrap().take();
+            self.release_started_count.fetch_add(1, Ordering::SeqCst);
+            self.release_started.notify_waiters();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
         }
 
         fn capabilities(&self) -> AgentSessionCaps {
@@ -1539,6 +1650,49 @@ mod tests {
 
     fn op(id: &str) -> OperationId {
         OperationId::parse(id).unwrap()
+    }
+
+    fn pkey(
+        context_id: &ContextId,
+        generation: SessionGeneration,
+        op: &OperationId,
+        request_id: &str,
+    ) -> PermKey {
+        PermKey {
+            context_id: context_id.clone(),
+            generation: generation.get(),
+            op: op.clone(),
+            request_id: request_id.into(),
+        }
+    }
+
+    fn permission_view(
+        request_id: &str,
+        generation: SessionGeneration,
+        op: &OperationId,
+    ) -> PendingPermissionView {
+        PendingPermissionView {
+            request_id: request_id.into(),
+            tool_call_id: format!("tool-{request_id}"),
+            generation: generation.get(),
+            op: op.clone(),
+            title: "permission".into(),
+            options: vec![PermissionOptionView {
+                option_id: "approved".into(),
+                name: "Allow".into(),
+                kind: "allow_once".into(),
+            }],
+            raw_input: None,
+            timeout_ms: 120_000,
+        }
+    }
+
+    async fn assert_permission_cancelled(rx: oneshot::Receiver<PermissionResolution>) {
+        let resolved = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("pending permission should resolve promptly")
+            .expect("permission sender should still be live");
+        assert!(matches!(resolved, PermissionResolution::Cancelled));
     }
 
     fn model_override(model: &str) -> AgentOverride {
@@ -1856,6 +2010,185 @@ mod tests {
             .unwrap(); // plain clear after compact
         let t1 = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         assert_eq!(t1.seed, None, "clear drops the pending seed");
+    }
+
+    #[tokio::test]
+    async fn inject_queues_and_drains_once_fifo() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-once");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+
+        assert_eq!(
+            m.inject(InjectRequest {
+                context: c.clone(),
+                text: "A".into(),
+                mode: InjectMode::PrependNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            m.inject(InjectRequest {
+                context: c.clone(),
+                text: "B".into(),
+                mode: InjectMode::AppendNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap(),
+            2
+        );
+
+        let turn = m.checkout_existing_turn(&c).await.unwrap();
+        assert_eq!(
+            turn.injects
+                .iter()
+                .map(|i| (i.text.as_str(), i.mode))
+                .collect::<Vec<_>>(),
+            vec![
+                ("A", InjectMode::PrependNextTurn),
+                ("B", InjectMode::AppendNextTurn)
+            ]
+        );
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+
+        let turn = m.checkout_existing_turn(&c).await.unwrap();
+        assert!(turn.injects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_dedupe_replaces_in_place() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-dedupe");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+
+        m.inject(InjectRequest {
+            context: c.clone(),
+            text: "first".into(),
+            mode: InjectMode::PrependNextTurn,
+            dedupe_key: Some("same".into()),
+        })
+        .await
+        .unwrap();
+        m.inject(InjectRequest {
+            context: c.clone(),
+            text: "second".into(),
+            mode: InjectMode::AppendNextTurn,
+            dedupe_key: Some("same".into()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(m.pending_inject_count(&c).await, 1);
+        let turn = m.checkout_existing_turn(&c).await.unwrap();
+        assert_eq!(turn.injects[0].text, "second");
+        assert_eq!(turn.injects[0].mode, InjectMode::AppendNextTurn);
+    }
+
+    #[tokio::test]
+    async fn inject_absent_ctx_is_session_not_found() {
+        let (m, _b, _r) = manager();
+        let err = m
+            .inject(InjectRequest {
+                context: ctx("missing"),
+                text: "x".into(),
+                mode: InjectMode::PrependNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::SessionNotFound);
+    }
+
+    #[tokio::test]
+    async fn inject_cap_rejects_beyond_limit() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-cap");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+
+        for n in 0..32 {
+            m.inject(InjectRequest {
+                context: c.clone(),
+                text: format!("x{n}"),
+                mode: InjectMode::PrependNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap();
+        }
+        let err = m
+            .inject(InjectRequest {
+                context: c.clone(),
+                text: "too many".into(),
+                mode: InjectMode::PrependNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::HandleBusy);
+
+        let c = ctx("inject-byte-cap");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        let err = m
+            .inject(InjectRequest {
+                context: c,
+                text: "x".repeat(64 * 1024 + 1),
+                mode: InjectMode::AppendNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::HandleBusy);
+    }
+
+    #[tokio::test]
+    async fn clear_drops_injects() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-clear");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        m.inject(InjectRequest {
+            context: c.clone(),
+            text: "drop me".into(),
+            mode: InjectMode::PrependNextTurn,
+            dedupe_key: None,
+        })
+        .await
+        .unwrap();
+
+        m.reset_session(&c, ResetOpts { force: false })
+            .await
+            .unwrap();
+        let turn = m.checkout_existing_turn(&c).await.unwrap();
+        assert!(turn.injects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compact_rejects_while_injects_pending() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-compact");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        m.inject(InjectRequest {
+            context: c.clone(),
+            text: "pending".into(),
+            mode: InjectMode::PrependNextTurn,
+            dedupe_key: None,
+        })
+        .await
+        .unwrap();
+
+        let err = m
+            .compact_session(&c, |_b, _s| async { Ok("summary".into()) })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::HandleBusy);
     }
 
     #[tokio::test]
@@ -2819,6 +3152,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_resolves_pending_permission() {
+        let reg = PermissionRegistry::new();
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager.with_permission_registry(reg.clone()));
+        let c = ctx("cancel-perm");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+        let unblock = backend.block_next_cancel();
+
+        let cancel = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move { manager.cancel_with_children(&c).await })
+        };
+        backend.wait_for_cancel().await;
+        assert_permission_cancelled(rx).await;
+
+        unblock.send(()).unwrap();
+        cancel.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_resolves_pending_permission() {
+        let reg = PermissionRegistry::new();
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager.with_permission_registry(reg.clone()));
+        let c = ctx("clear-perm");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+        let unblock = backend.block_next_cancel();
+
+        let clear = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move { manager.clear_with_children(&c, true).await })
+        };
+        backend.wait_for_cancel().await;
+        assert_permission_cancelled(rx).await;
+
+        unblock.send(()).unwrap();
+        clear.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_resolves_pending_permission() {
+        let reg = PermissionRegistry::new();
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager.with_permission_registry(reg.clone()));
+        let c = ctx("release-perm");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+        let unblock = backend.block_next_release();
+
+        let release = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move { manager.release_with_children(&c).await })
+        };
+        backend.wait_for_release().await;
+
+        assert_permission_cancelled(rx).await;
+
+        unblock.send(()).unwrap();
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keepwarm_cancel_resolves_pending_perm_without_stranding_next_turn() {
+        let reg = PermissionRegistry::new();
+        let (manager, _backend, _registry) = manager();
+        let manager = manager.with_permission_registry(reg.clone());
+        let c = ctx("cancel-perm-next-turn");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+
+        manager.cancel(&c).await.unwrap();
+        assert_permission_cancelled(rx).await;
+
+        // Unlike the single abort-token slot, the permission registry is gen+op keyed and exact-once:
+        // resolving the cancelled turn's permission does not poison a later warm checkout.
+        let next = manager.checkout_existing_turn(&c).await.unwrap();
+        assert_ne!(next.op, turn.op);
+        assert_eq!(next.generation, turn.generation);
+    }
+
+    #[tokio::test]
+    async fn claimed_compacting_cancel_does_not_resolve_pending() {
+        let reg = PermissionRegistry::new();
+        let (manager, _backend, _registry) = manager();
+        let manager = Arc::new(manager.with_permission_registry(reg.clone()));
+        let c = ctx("claimed-compact-perm");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let compact = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move {
+                manager
+                    .compact_session(&c, |_b, _s| async move {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok("summary".to_string())
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+        assert_eq!(manager.status(&c).await.unwrap().state, "compacting");
+
+        let (mut rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+
+        manager.cancel(&c).await.unwrap();
+        let err = manager.clear_with_children(&c, false).await.err().unwrap();
+        assert_eq!(err, BridgeError::HandleBusy);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut rx)
+                .await
+                .is_err(),
+            "claimed compacting permissions must not be cancelled by non-force cancel/clear"
+        );
+
+        release_tx.send(()).unwrap();
+        let out = compact.await.unwrap();
+        assert_eq!(out, Err(BridgeError::SessionExpired));
+    }
+
+    #[tokio::test]
     async fn cancel_idle_handle_skips_backend_cancel() {
         let (manager, backend, _registry) = manager();
         let c = ctx("cancel-idle");
@@ -3582,6 +4075,34 @@ mod tests {
 
         assert!(manager.status(&idle).await.is_none());
         assert_eq!(manager.status(&running).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn reap_idle_resolves_pending_permission() {
+        let reg = PermissionRegistry::new();
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let clock = Arc::new(ManualClock::new(0));
+        let manager =
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone())
+                .with_permission_registry(reg.clone());
+        let c = ctx("reap-idle-perm");
+
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+        clock.advance(Duration::from_secs(6));
+
+        manager.reap_idle().await;
+
+        assert_permission_cancelled(rx).await;
+        assert!(manager.status(&c).await.is_none());
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ pub mod detached;
 pub mod dispatch;
 pub mod params;
 pub mod session_manager;
+pub mod turn_parts;
 
 pub use coordinator::Coordinator;
 pub use detached::{

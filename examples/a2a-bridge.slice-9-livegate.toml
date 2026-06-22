@@ -1,0 +1,17 @@
+# Slice 9 live-gate: E2 interactive permission + queued-inject, vs REAL codex.
+# [server] permission_policy="defer" → the bridge DEFERS every agent permission to the operator.
+# codex approval_policy="untrusted" + sandbox_mode="read-only" → a write attempt is blocked → codex asks
+# `session/request_permission` (SPIKE-1 confirmed). permission_timeout_ms is long so the operator action
+# (deny/approve/cancel), NOT the timeout, is what ends the turn.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "low"
+args = ["-c", "approval_policy=\"untrusted\"", "-c", "sandbox_mode=\"read-only\""]
+[server]
+addr = "127.0.0.1:8125"
+warm_idle_ttl_secs = 600
+permission_policy = "defer"
+permission_timeout_ms = 120000

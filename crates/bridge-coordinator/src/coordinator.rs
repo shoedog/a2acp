@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bridge_core::domain::Part;
+use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{ContextId, OperationId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
+use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{AgentRegistry, PolicyEngine, SessionStore};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{TaskRecord, TaskRecordStatus, TaskStore};
@@ -22,7 +23,8 @@ use crate::detached::{
     TaskProgressHub,
 };
 use crate::dispatch::TaskBinding;
-use crate::params::OpParams;
+use crate::params::{OpParams, PermitParams};
+use crate::turn_parts::assemble_turn_parts;
 
 static PROMPT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -101,9 +103,23 @@ pub struct Coordinator {
     progress_hubs: Arc<Mutex<HashMap<TaskId, Arc<TaskProgressHub>>>>,
     workflow_cancels: Arc<Mutex<HashMap<TaskId, CancellationToken>>>,
     workflow_runs: Arc<Mutex<HashMap<ContextId, CancellationToken>>>,
+    permission_registry: Option<Arc<PermissionRegistry>>,
     clock: Arc<dyn Clock>,
     allowed_cwd_root: Option<SessionCwd>,
     resume_attempt_cap: u32,
+}
+
+pub fn apply_permit(reg: &PermissionRegistry, p: &PermitParams) -> bool {
+    if matches!(p.decision, PermitDecision::Escalate { .. }) {
+        return false;
+    }
+    let key = PermKey {
+        context_id: p.context.clone(),
+        generation: p.generation,
+        op: p.op.clone(),
+        request_id: p.request_id.clone(),
+    };
+    reg.resolve(&key, PermissionResolution::Decided(p.decision.clone()))
 }
 
 impl Coordinator {
@@ -132,10 +148,17 @@ impl Coordinator {
             progress_hubs: Arc::new(Mutex::new(HashMap::new())),
             workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
+            permission_registry: None,
             clock,
             allowed_cwd_root,
             resume_attempt_cap,
         }
+    }
+
+    #[must_use]
+    pub fn with_permission_registry(mut self, reg: Arc<PermissionRegistry>) -> Self {
+        self.permission_registry = Some(reg);
+        self
     }
 
     /// Build the detached-workflow dependency view over the Coordinator's owned fields.
@@ -192,6 +215,18 @@ impl Coordinator {
         self.collect_turn(ctx, turn, p.input).await
     }
 
+    pub async fn inject(&self, req: InjectRequest) -> Result<usize, BridgeError> {
+        self.session_manager.inject(req).await
+    }
+
+    pub async fn permit(&self, p: PermitParams) -> Result<bool, BridgeError> {
+        Ok(self
+            .permission_registry
+            .as_ref()
+            .map(|reg| apply_permit(reg, &p))
+            .unwrap_or(false))
+    }
+
     /// Drive ONE warm turn to completion and collect it into a `TurnOutput`. Records usage as a side
     /// effect (excluded from output) and returns the handle to Idle on EVERY exit — synchronously on the
     /// normal/error path (so a sequential `continue` observes Idle deterministically), and via the drop
@@ -212,13 +247,22 @@ impl Coordinator {
             armed: true,
         };
 
-        let mut parts = Vec::new();
-        if let Some(seed) = &turn.seed {
-            parts.push(Part {
-                text: format!("[Summary of earlier context in this session]\n{seed}"),
-            });
-        }
-        parts.push(Part { text: input });
+        let parts = assemble_turn_parts(
+            turn.seed.as_deref(),
+            &turn.injects,
+            vec![Part { text: input }],
+        );
+
+        turn.backend
+            .configure_turn(
+                &turn.session,
+                TurnMeta {
+                    context_id: ctx.clone(),
+                    generation: turn.generation.get(),
+                    op: turn.op.clone(),
+                },
+            )
+            .await;
 
         let task = self.mint_prompt_task_id();
         let translator = Translator::new();
@@ -516,6 +560,16 @@ mod tests {
 
     struct FakeBackend {
         prompt_gate: Option<Arc<Notify>>,
+        configured_turns: Arc<StdMutex<Vec<(SessionId, TurnMeta)>>>,
+    }
+
+    impl FakeBackend {
+        fn new(prompt_gate: Option<Arc<Notify>>) -> Self {
+            Self {
+                prompt_gate,
+                configured_turns: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
     }
 
     #[async_trait]
@@ -536,6 +590,13 @@ mod tests {
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             Ok(())
+        }
+
+        async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
+            self.configured_turns
+                .lock()
+                .unwrap()
+                .push((session.clone(), meta));
         }
     }
 
@@ -790,7 +851,7 @@ mod tests {
     fn coordinator_constructs_with_full_state() {
         let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
             entry: entry(),
-            backend: Arc::new(FakeBackend { prompt_gate: None }),
+            backend: Arc::new(FakeBackend::new(None)),
             resolved: Arc::new(StdMutex::new(Vec::new())),
         });
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
@@ -861,7 +922,7 @@ mod tests {
     }
 
     fn coordinator_fixture(workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>) -> Fixture {
-        coordinator_fixture_with_backend(workflows, Arc::new(FakeBackend { prompt_gate: None }))
+        coordinator_fixture_with_backend(workflows, Arc::new(FakeBackend::new(None)))
     }
 
     fn coordinator_fixture_with_backend(
@@ -987,6 +1048,106 @@ mod tests {
             .unwrap();
         assert_eq!(status.usage.used, Some(7));
         assert_eq!(status.usage.at_ms, 1_700_000_000_000);
+    }
+
+    fn perm_key(ctx: &str, request_id: &str) -> bridge_core::permission::PermKey {
+        bridge_core::permission::PermKey {
+            context_id: ContextId::parse(ctx).unwrap(),
+            generation: 3,
+            op: OperationId::parse("turn-3").unwrap(),
+            request_id: request_id.into(),
+        }
+    }
+
+    fn pending_view(request_id: &str) -> bridge_core::permission::PendingPermissionView {
+        bridge_core::permission::PendingPermissionView {
+            request_id: request_id.into(),
+            tool_call_id: "tool-1".into(),
+            generation: 3,
+            op: OperationId::parse("turn-3").unwrap(),
+            title: "write file".into(),
+            options: Vec::new(),
+            raw_input: None,
+            timeout_ms: 120_000,
+        }
+    }
+
+    fn permit_params(
+        ctx: &str,
+        request_id: &str,
+        decision: bridge_core::domain::PermitDecision,
+    ) -> crate::params::PermitParams {
+        crate::params::PermitParams {
+            context: ContextId::parse(ctx).unwrap(),
+            generation: 3,
+            op: OperationId::parse("turn-3").unwrap(),
+            request_id: request_id.into(),
+            decision,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_permit_escalate_does_not_resolve() {
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let ctx = ContextId::parse("ctx-escalate").unwrap();
+        let key = perm_key("ctx-escalate", "req-escalate");
+        let (mut rx, _guard) = reg.register(key, pending_view("req-escalate"));
+
+        let resolved = apply_permit(
+            &reg,
+            &permit_params(
+                "ctx-escalate",
+                "req-escalate",
+                bridge_core::domain::PermitDecision::Escalate {
+                    reason: Some("human".into()),
+                },
+            ),
+        );
+
+        assert!(!resolved);
+        assert_eq!(reg.pending(&ctx).len(), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_permit_approve_resolves() {
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let key = perm_key("ctx-approve", "req-approve");
+        let (rx, _guard) = reg.register(key, pending_view("req-approve"));
+
+        let resolved = apply_permit(
+            &reg,
+            &permit_params(
+                "ctx-approve",
+                "req-approve",
+                bridge_core::domain::PermitDecision::Approve {
+                    option_id: Some("approved".into()),
+                },
+            ),
+        );
+
+        assert!(resolved);
+        match rx.await.unwrap() {
+            bridge_core::permission::PermissionResolution::Decided(
+                bridge_core::domain::PermitDecision::Approve { option_id },
+            ) => assert_eq!(option_id.as_deref(), Some("approved")),
+            other => panic!("unexpected permission resolution: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_permit_unknown_request_false() {
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let resolved = apply_permit(
+            &reg,
+            &permit_params(
+                "ctx-missing",
+                "missing",
+                bridge_core::domain::PermitDecision::Approve { option_id: None },
+            ),
+        );
+
+        assert!(!resolved);
     }
 
     #[tokio::test]
@@ -1139,6 +1300,7 @@ mod tests {
             generation: bridge_core::ids::SessionGeneration::new(1),
             op: OperationId::parse("turn-1").unwrap(),
             seed: None,
+            injects: Vec::new(),
             abort,
         };
         let out = coordinator
@@ -1149,15 +1311,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_turn_configures_turn_meta() {
+        let coordinator = coordinator_fixture(Arc::new(HashMap::new())).coordinator;
+        let backend = Arc::new(FakeBackend::new(None));
+        let session = SessionId::parse("ctx-config-meta-g3").unwrap();
+        let op = OperationId::parse("turn-config-meta").unwrap();
+        let turn = crate::session_manager::WarmTurn {
+            backend: backend.clone() as Arc<dyn AgentBackend>,
+            session: session.clone(),
+            usage_warning: None,
+            generation: bridge_core::ids::SessionGeneration::new(3),
+            op: op.clone(),
+            seed: None,
+            injects: Vec::new(),
+            abort: CancellationToken::new(),
+        };
+
+        let out = coordinator
+            .collect_turn(ctx("ctx-config-meta"), turn, "hi".into())
+            .await
+            .unwrap();
+
+        assert_eq!(out.stop_reason, "completed"); // collect_turn maps the backend's end_turn -> completed
+        let configured = backend.configured_turns.lock().unwrap();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].0, session);
+        assert_eq!(configured[0].1.context_id.as_str(), "ctx-config-meta");
+        assert_eq!(configured[0].1.generation, 3);
+        assert_eq!(configured[0].1.op, op);
+    }
+
+    #[tokio::test]
     async fn dropped_turn_returns_handle_to_idle() {
         // s8 T10 review MAJOR: a turn future dropped mid-drain must return the warm handle to Idle via
         // the drop guard — else the next turn on that context is permanently HandleBusy.
         let gate = Arc::new(Notify::new());
         let fixture = coordinator_fixture_with_backend(
             Arc::new(HashMap::new()),
-            Arc::new(FakeBackend {
-                prompt_gate: Some(gate.clone()),
-            }),
+            Arc::new(FakeBackend::new(Some(gate.clone()))),
         );
         let coord = Arc::new(fixture.coordinator);
 
@@ -1211,9 +1402,7 @@ mod tests {
         );
         let fixture = coordinator_fixture_with_backend(
             Arc::new(workflows),
-            Arc::new(FakeBackend {
-                prompt_gate: Some(gate),
-            }),
+            Arc::new(FakeBackend::new(Some(gate))),
         );
 
         let id = fixture

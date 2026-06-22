@@ -1,6 +1,6 @@
-use bridge_core::domain::{AgentOverride, Effort};
+use bridge_core::domain::{AgentOverride, Effort, InjectMode, InjectRequest, PermitDecision};
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{AgentId, ContextId};
+use bridge_core::ids::{AgentId, ContextId, OperationId};
 use bridge_core::session_cwd::SessionCwd;
 
 /// D1 typed operation params.
@@ -20,6 +20,114 @@ pub struct OpParams {
     pub effort: Option<Effort>,
     pub mode: Option<String>,
     pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InjectParams {
+    pub context: ContextId,
+    pub text: String,
+    pub mode: InjectMode,
+    pub dedupe_key: Option<String>,
+}
+
+impl InjectParams {
+    pub fn from_mcp_args(v: &serde_json::Value) -> Result<Self, BridgeError> {
+        Self::from_value(v, "context")
+    }
+
+    pub fn from_a2a(v: &serde_json::Value) -> Result<Self, BridgeError> {
+        Self::from_value(v, "contextId")
+    }
+
+    fn from_value(v: &serde_json::Value, context_field: &'static str) -> Result<Self, BridgeError> {
+        let context = string_field(v, context_field)
+            .ok_or(BridgeError::InvalidRequest {
+                field: context_field,
+            })
+            .and_then(|raw| {
+                ContextId::parse(raw).map_err(|_| BridgeError::InvalidRequest {
+                    field: context_field,
+                })
+            })?;
+        let text = string_field(v, "text")
+            .ok_or(BridgeError::InvalidRequest { field: "text" })?
+            .to_string();
+        let mode = parse_inject_mode(v)?;
+        let dedupe_key = string_field(v, "dedupeKey").map(str::to_string);
+        Ok(Self {
+            context,
+            text,
+            mode,
+            dedupe_key,
+        })
+    }
+
+    pub fn into_request(self) -> InjectRequest {
+        InjectRequest {
+            context: self.context,
+            text: self.text,
+            mode: self.mode,
+            dedupe_key: self.dedupe_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PermitParams {
+    pub context: ContextId,
+    pub generation: u64,
+    pub op: OperationId,
+    pub request_id: String,
+    pub decision: PermitDecision,
+}
+
+impl PermitParams {
+    pub fn from_mcp_args(v: &serde_json::Value) -> Result<Self, BridgeError> {
+        Self::from_value(v, "context")
+    }
+
+    pub fn from_a2a(v: &serde_json::Value) -> Result<Self, BridgeError> {
+        Self::from_value(v, "contextId")
+    }
+
+    fn from_value(v: &serde_json::Value, context_field: &'static str) -> Result<Self, BridgeError> {
+        let context = string_field(v, context_field)
+            .ok_or(BridgeError::InvalidRequest {
+                field: context_field,
+            })
+            .and_then(|raw| {
+                ContextId::parse(raw).map_err(|_| BridgeError::InvalidRequest {
+                    field: context_field,
+                })
+            })?;
+        let generation =
+            v.get("generation")
+                .and_then(|x| x.as_u64())
+                .ok_or(BridgeError::InvalidRequest {
+                    field: "generation",
+                })?;
+        let op = string_field(v, "op")
+            .ok_or(BridgeError::InvalidRequest { field: "op" })
+            .and_then(|raw| {
+                OperationId::parse(raw).map_err(|_| BridgeError::InvalidRequest { field: "op" })
+            })?;
+        let request_id = string_field(v, "requestId")
+            .ok_or(BridgeError::InvalidRequest { field: "requestId" })?
+            .to_string();
+        let decision_value = v
+            .get("decision")
+            .cloned()
+            .ok_or(BridgeError::InvalidRequest { field: "decision" })?;
+        let decision = serde_json::from_value::<PermitDecision>(decision_value)
+            .map_err(|_| BridgeError::InvalidRequest { field: "decision" })?;
+        Ok(Self {
+            context,
+            generation,
+            op,
+            request_id,
+            decision,
+        })
+    }
 }
 
 impl OpParams {
@@ -174,6 +282,17 @@ fn string_field<'a>(v: &'a serde_json::Value, field: &str) -> Option<&'a str> {
     v.get(field).and_then(|x| x.as_str())
 }
 
+fn parse_inject_mode(v: &serde_json::Value) -> Result<InjectMode, BridgeError> {
+    if v.get("append").and_then(|x| x.as_bool()).unwrap_or(false) {
+        return Ok(InjectMode::AppendNextTurn);
+    }
+    let Some(mode) = v.get("mode") else {
+        return Ok(InjectMode::PrependNextTurn);
+    };
+    serde_json::from_value::<InjectMode>(mode.clone())
+        .map_err(|_| BridgeError::InvalidRequest { field: "mode" })
+}
+
 fn metadata_string<'a>(
     md: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -325,5 +444,68 @@ mod tests {
         assert_eq!(p.agent.as_ref().map(|a| a.as_str()), Some("kiro"));
         assert!(matches!(p.effort, Some(Effort::Medium)));
         assert_eq!(p.cwd.as_deref(), Some("/work/repo"));
+    }
+
+    #[test]
+    fn inject_params_defaults_prepend() {
+        let p = InjectParams::from_mcp_args(&serde_json::json!({
+            "context": "ctx-inject",
+            "text": "remember this"
+        }))
+        .unwrap();
+        assert_eq!(p.context.as_str(), "ctx-inject");
+        assert_eq!(p.text, "remember this");
+        assert_eq!(p.mode, bridge_core::domain::InjectMode::PrependNextTurn);
+        assert_eq!(p.dedupe_key, None);
+    }
+
+    #[test]
+    fn inject_params_append_flag() {
+        let p = InjectParams::from_mcp_args(&serde_json::json!({
+            "context": "ctx-inject",
+            "text": "later",
+            "append": true,
+            "dedupeKey": "k1"
+        }))
+        .unwrap();
+        assert_eq!(p.mode, bridge_core::domain::InjectMode::AppendNextTurn);
+        assert_eq!(p.dedupe_key.as_deref(), Some("k1"));
+    }
+
+    #[test]
+    fn permit_params_parses_each_decision() {
+        let base = |decision: serde_json::Value| {
+            PermitParams::from_mcp_args(&serde_json::json!({
+                "context": "ctx-permit",
+                "generation": 7,
+                "op": "turn-7",
+                "requestId": "req-7",
+                "decision": decision
+            }))
+            .unwrap()
+        };
+
+        assert!(matches!(
+            base(serde_json::json!({"decision":"approve","optionId":"approved"})).decision,
+            bridge_core::domain::PermitDecision::Approve { option_id: Some(ref id) }
+                if id == "approved"
+        ));
+        assert!(matches!(
+            base(serde_json::json!({"decision":"deny","optionId":"abort","reason":"no"})).decision,
+            bridge_core::domain::PermitDecision::Deny {
+                option_id: Some(ref id),
+                reason: Some(ref reason)
+            } if id == "abort" && reason == "no"
+        ));
+        assert!(matches!(
+            base(serde_json::json!({"decision":"modify","optionId":"approved-execpolicy-amendment"})).decision,
+            bridge_core::domain::PermitDecision::Modify { ref option_id, note: None }
+                if option_id == "approved-execpolicy-amendment"
+        ));
+        assert!(matches!(
+            base(serde_json::json!({"decision":"escalate","reason":"ask operator"})).decision,
+            bridge_core::domain::PermitDecision::Escalate { reason: Some(ref reason) }
+                if reason == "ask operator"
+        ));
     }
 }

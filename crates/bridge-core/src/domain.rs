@@ -1,6 +1,6 @@
 // domain.rs — minimal shared domain value types (spec §5.2/§5.3).
 
-use crate::ids::{AgentId, CallerId};
+use crate::ids::{AgentId, CallerId, ContextId};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -284,6 +284,56 @@ pub enum PermissionDecision {
     Approve,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "decision",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum PermitDecision {
+    Approve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option_id: Option<String>,
+    },
+    Deny {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    Modify {
+        option_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    Escalate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectMode {
+    PrependNextTurn,
+    AppendNextTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedInject {
+    pub text: String,
+    pub mode: InjectMode,
+    pub dedupe_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectRequest {
+    pub context: ContextId,
+    pub text: String,
+    pub mode: InjectMode,
+    pub dedupe_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionContext;
 
@@ -450,6 +500,39 @@ mod tests {
         let base = effective_config(&entry, None);
         assert_eq!(base.model.as_deref(), Some("gpt-5.5")); // base when no override
         assert_eq!(base.effort, Some(Effort::High));
+    }
+
+    #[test]
+    fn permit_decision_variants_round_trip() {
+        for d in [
+            PermitDecision::Approve { option_id: None },
+            PermitDecision::Approve {
+                option_id: Some("approved".into()),
+            },
+            PermitDecision::Deny {
+                option_id: None,
+                reason: Some("nope".into()),
+            },
+            PermitDecision::Modify {
+                option_id: "approved-execpolicy-amendment".into(),
+                note: None,
+            },
+            PermitDecision::Escalate { reason: None },
+        ] {
+            let s = serde_json::to_string(&d).unwrap();
+            assert_eq!(serde_json::from_str::<PermitDecision>(&s).unwrap(), d);
+        }
+    }
+
+    #[test]
+    fn inject_request_holds_mode() {
+        let r = InjectRequest {
+            context: ContextId::parse("c").unwrap(),
+            text: "hi".into(),
+            mode: InjectMode::PrependNextTurn,
+            dedupe_key: None,
+        };
+        assert_eq!(r.mode, InjectMode::PrependNextTurn);
     }
 }
 
