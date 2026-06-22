@@ -52,6 +52,7 @@ use bridge_workflow::executor::{
 use bridge_workflow::graph::WorkflowNode;
 
 use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
+use bridge_coordinator::turn_parts::assemble_turn_parts;
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
 use crate::fanout::{self, Source};
@@ -441,6 +442,7 @@ async fn resolve_configure_bind(
                 backend,
                 session: session.clone(),
                 seed: None,
+                injects: Vec::new(),
                 guard: None,
                 warm_guard: None,
                 // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
@@ -480,6 +482,7 @@ async fn resolve_configure_bind(
         backend,
         session: session.clone(),
         seed: None,
+        injects: Vec::new(),
         guard: Some(guard),
         warm_guard: None,
         // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
@@ -515,6 +518,7 @@ async fn warm_local_dispatch(
                 backend: turn.backend,
                 session: turn.session,
                 seed: turn.seed,
+                injects: turn.injects,
                 guard: None,
                 warm_guard: Some(WarmTurnGuard {
                     sm,
@@ -1373,16 +1377,7 @@ fn spawn_local_producer(
     let policy = srv.policy.clone();
     let task = routed.task;
     let session = dispatch.session.clone();
-    let parts = routed.parts;
-    let mut parts = parts;
-    if let Some(seed) = dispatch.seed {
-        parts.insert(
-            0,
-            Part {
-                text: format!("[Summary of earlier context in this session]\n{seed}"),
-            },
-        );
-    }
+    let parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
     let backend = dispatch.backend;
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
@@ -2308,15 +2303,8 @@ async fn unary_message(
             let warm = dispatch.warm_guard;
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
             let abort = dispatch.abort;
-            let mut parts = routed.parts;
-            if let Some(seed) = dispatch.seed {
-                parts.insert(
-                    0,
-                    Part {
-                        text: format!("[Summary of earlier context in this session]\n{seed}"),
-                    },
-                );
-            }
+            let parts =
+                assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
             let translator = Translator::new();
             let mut events = translator.run(
                 dispatch.backend.as_ref(),
@@ -6380,6 +6368,7 @@ mod tests {
             backend: Arc::new(PanicBackend),
             session: SessionId::parse("ctx-streaming-pre-cancel-g0").unwrap(),
             seed: None,
+            injects: Vec::new(),
             guard: None,
             warm_guard: None,
             abort,

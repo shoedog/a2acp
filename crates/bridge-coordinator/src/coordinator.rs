@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bridge_core::domain::Part;
+use bridge_core::domain::{InjectRequest, Part};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{ContextId, OperationId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
@@ -23,6 +23,7 @@ use crate::detached::{
 };
 use crate::dispatch::TaskBinding;
 use crate::params::OpParams;
+use crate::turn_parts::assemble_turn_parts;
 
 static PROMPT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -192,6 +193,10 @@ impl Coordinator {
         self.collect_turn(ctx, turn, p.input).await
     }
 
+    pub async fn inject(&self, req: InjectRequest) -> Result<usize, BridgeError> {
+        self.session_manager.inject(req).await
+    }
+
     /// Drive ONE warm turn to completion and collect it into a `TurnOutput`. Records usage as a side
     /// effect (excluded from output) and returns the handle to Idle on EVERY exit — synchronously on the
     /// normal/error path (so a sequential `continue` observes Idle deterministically), and via the drop
@@ -212,13 +217,11 @@ impl Coordinator {
             armed: true,
         };
 
-        let mut parts = Vec::new();
-        if let Some(seed) = &turn.seed {
-            parts.push(Part {
-                text: format!("[Summary of earlier context in this session]\n{seed}"),
-            });
-        }
-        parts.push(Part { text: input });
+        let parts = assemble_turn_parts(
+            turn.seed.as_deref(),
+            &turn.injects,
+            vec![Part { text: input }],
+        );
 
         let task = self.mint_prompt_task_id();
         let translator = Translator::new();
@@ -1139,6 +1142,7 @@ mod tests {
             generation: bridge_core::ids::SessionGeneration::new(1),
             op: OperationId::parse("turn-1").unwrap(),
             seed: None,
+            injects: Vec::new(),
             abort,
         };
         let out = coordinator

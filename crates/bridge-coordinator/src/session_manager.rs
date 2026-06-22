@@ -2,7 +2,9 @@
 //! contextId->handle table + the registry lease that pins the warm backend. Keyed by A2A contextId.
 
 use crate::clock::{Clock, SystemClock};
-use bridge_core::domain::{effective_config, AgentOverride, SessionSpec};
+use bridge_core::domain::{
+    effective_config, AgentOverride, InjectRequest, QueuedInject, SessionSpec,
+};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{
     AgentId, ContextId, OperationId, SessionGeneration, SessionHandleId, SessionId,
@@ -88,6 +90,7 @@ struct WarmHandle {
     /// both belong to Slice 9's cancel-under-concurrency work.
     turn_abort: Option<CancellationToken>,
     pending_seed: Option<String>,
+    pending_injects: Vec<QueuedInject>,
     last_used: Instant,
 }
 
@@ -100,6 +103,7 @@ pub struct WarmTurn {
     pub op: OperationId,
     pub abort: CancellationToken,
     pub seed: Option<String>,
+    pub injects: Vec<QueuedInject>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -185,6 +189,53 @@ impl SessionManager {
     pub fn with_compact_summarize_timeout(mut self, d: Duration) -> Self {
         self.compact_summarize_timeout = d;
         self
+    }
+
+    pub async fn inject(&self, req: InjectRequest) -> Result<usize, BridgeError> {
+        const MAX_INJECTS: usize = 32;
+        const MAX_INJECT_BYTES: usize = 64 * 1024;
+
+        let mut tab = self.by_context.lock().await;
+        let Some(h) = tab.get_mut(&req.context) else {
+            return Err(BridgeError::SessionNotFound);
+        };
+        if !matches!(h.state, SessionState::Idle | SessionState::Running) {
+            return Err(BridgeError::HandleBusy);
+        }
+
+        let mut candidate = h.pending_injects.clone();
+        let replacement = req.dedupe_key.as_ref().and_then(|key| {
+            candidate
+                .iter()
+                .position(|entry| entry.dedupe_key.as_ref() == Some(key))
+        });
+        let queued = QueuedInject {
+            text: req.text,
+            mode: req.mode,
+            dedupe_key: req.dedupe_key,
+        };
+        if let Some(idx) = replacement {
+            candidate[idx] = queued;
+        } else {
+            candidate.push(queued);
+        }
+
+        let total_bytes: usize = candidate.iter().map(|entry| entry.text.len()).sum();
+        if candidate.len() > MAX_INJECTS || total_bytes > MAX_INJECT_BYTES {
+            return Err(BridgeError::HandleBusy);
+        }
+
+        h.pending_injects = candidate;
+        Ok(h.pending_injects.len())
+    }
+
+    pub async fn pending_inject_count(&self, ctx: &ContextId) -> usize {
+        self.by_context
+            .lock()
+            .await
+            .get(ctx)
+            .map(|h| h.pending_injects.len())
+            .unwrap_or(0)
     }
 
     /// Test-only: observe the stashed next-turn seed (delivery is wired in checkout_turn at Slice-4 T5).
@@ -304,6 +355,7 @@ impl SessionManager {
         h.turn_abort = Some(abort.clone());
         h.last_used = self.clock.now_instant();
         let seed = h.pending_seed.take();
+        let injects = std::mem::take(&mut h.pending_injects);
         Ok(WarmTurn {
             backend: h.backend.clone(),
             session: h.backend_session.clone(),
@@ -312,6 +364,7 @@ impl SessionManager {
             op,
             abort,
             seed,
+            injects,
         })
     }
 
@@ -351,6 +404,7 @@ impl SessionManager {
                 h.turn_abort = Some(abort.clone());
                 h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
+                let injects = std::mem::take(&mut h.pending_injects);
                 return (
                     Ok(WarmTurn {
                         backend: h.backend.clone(),
@@ -360,6 +414,7 @@ impl SessionManager {
                         op,
                         abort,
                         seed,
+                        injects,
                     }),
                     Vec::new(),
                 );
@@ -445,6 +500,7 @@ impl SessionManager {
                 h.turn_abort = Some(abort.clone());
                 h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
+                let injects = std::mem::take(&mut h.pending_injects);
                 return (
                     Ok(WarmTurn {
                         backend: h.backend.clone(),
@@ -454,6 +510,7 @@ impl SessionManager {
                         op,
                         abort,
                         seed,
+                        injects,
                     }),
                     Vec::new(),
                 );
@@ -524,6 +581,7 @@ impl SessionManager {
             op: op.clone(),
             abort: abort.clone(),
             seed: None,
+            injects: Vec::new(),
         };
         tab.insert(
             ctx.clone(),
@@ -542,6 +600,7 @@ impl SessionManager {
                 op: Some(op),
                 turn_abort: Some(abort),
                 pending_seed: None,
+                pending_injects: Vec::new(),
                 last_used: self.clock.now_instant(),
             },
         );
@@ -976,6 +1035,7 @@ impl SessionManager {
         h.op = None;
         h.turn_abort = None;
         h.pending_seed = None;
+        h.pending_injects.clear();
         h.state = SessionState::Idle;
         h.last_used = self.clock.now_instant();
         (
@@ -1013,6 +1073,9 @@ impl SessionManager {
             // seed is consumed by a real turn. (Whole-branch review; the spawn-detached handler makes a
             // lost-response retry reachable.)
             if h.pending_seed.is_some() {
+                return Err(BridgeError::HandleBusy);
+            }
+            if !h.pending_injects.is_empty() {
                 return Err(BridgeError::HandleBusy);
             }
             let backend = h.backend.clone();
@@ -1208,7 +1271,7 @@ mod tests {
     use super::*;
     use crate::clock::ManualClock;
     use async_trait::async_trait;
-    use bridge_core::domain::{AgentEntry, AgentKind, Effort, Part, RegistrySnapshot};
+    use bridge_core::domain::{AgentEntry, AgentKind, Effort, InjectMode, Part, RegistrySnapshot};
     use bridge_core::ports::{BackendStream, Resolved, Update};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
@@ -1856,6 +1919,185 @@ mod tests {
             .unwrap(); // plain clear after compact
         let t1 = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         assert_eq!(t1.seed, None, "clear drops the pending seed");
+    }
+
+    #[tokio::test]
+    async fn inject_queues_and_drains_once_fifo() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-once");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+
+        assert_eq!(
+            m.inject(InjectRequest {
+                context: c.clone(),
+                text: "A".into(),
+                mode: InjectMode::PrependNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            m.inject(InjectRequest {
+                context: c.clone(),
+                text: "B".into(),
+                mode: InjectMode::AppendNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap(),
+            2
+        );
+
+        let turn = m.checkout_existing_turn(&c).await.unwrap();
+        assert_eq!(
+            turn.injects
+                .iter()
+                .map(|i| (i.text.as_str(), i.mode))
+                .collect::<Vec<_>>(),
+            vec![
+                ("A", InjectMode::PrependNextTurn),
+                ("B", InjectMode::AppendNextTurn)
+            ]
+        );
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+
+        let turn = m.checkout_existing_turn(&c).await.unwrap();
+        assert!(turn.injects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_dedupe_replaces_in_place() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-dedupe");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+
+        m.inject(InjectRequest {
+            context: c.clone(),
+            text: "first".into(),
+            mode: InjectMode::PrependNextTurn,
+            dedupe_key: Some("same".into()),
+        })
+        .await
+        .unwrap();
+        m.inject(InjectRequest {
+            context: c.clone(),
+            text: "second".into(),
+            mode: InjectMode::AppendNextTurn,
+            dedupe_key: Some("same".into()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(m.pending_inject_count(&c).await, 1);
+        let turn = m.checkout_existing_turn(&c).await.unwrap();
+        assert_eq!(turn.injects[0].text, "second");
+        assert_eq!(turn.injects[0].mode, InjectMode::AppendNextTurn);
+    }
+
+    #[tokio::test]
+    async fn inject_absent_ctx_is_session_not_found() {
+        let (m, _b, _r) = manager();
+        let err = m
+            .inject(InjectRequest {
+                context: ctx("missing"),
+                text: "x".into(),
+                mode: InjectMode::PrependNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::SessionNotFound);
+    }
+
+    #[tokio::test]
+    async fn inject_cap_rejects_beyond_limit() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-cap");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+
+        for n in 0..32 {
+            m.inject(InjectRequest {
+                context: c.clone(),
+                text: format!("x{n}"),
+                mode: InjectMode::PrependNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap();
+        }
+        let err = m
+            .inject(InjectRequest {
+                context: c.clone(),
+                text: "too many".into(),
+                mode: InjectMode::PrependNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::HandleBusy);
+
+        let c = ctx("inject-byte-cap");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        let err = m
+            .inject(InjectRequest {
+                context: c,
+                text: "x".repeat(64 * 1024 + 1),
+                mode: InjectMode::AppendNextTurn,
+                dedupe_key: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::HandleBusy);
+    }
+
+    #[tokio::test]
+    async fn clear_drops_injects() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-clear");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        m.inject(InjectRequest {
+            context: c.clone(),
+            text: "drop me".into(),
+            mode: InjectMode::PrependNextTurn,
+            dedupe_key: None,
+        })
+        .await
+        .unwrap();
+
+        m.reset_session(&c, ResetOpts { force: false })
+            .await
+            .unwrap();
+        let turn = m.checkout_existing_turn(&c).await.unwrap();
+        assert!(turn.injects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compact_rejects_while_injects_pending() {
+        let (m, _b, _r) = manager();
+        let c = ctx("inject-compact");
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
+        m.finish_turn(&c, turn.generation, &turn.op).await;
+        m.inject(InjectRequest {
+            context: c.clone(),
+            text: "pending".into(),
+            mode: InjectMode::PrependNextTurn,
+            dedupe_key: None,
+        })
+        .await
+        .unwrap();
+
+        let err = m
+            .compact_session(&c, |_b, _s| async { Ok("summary".into()) })
+            .await
+            .unwrap_err();
+        assert_eq!(err, BridgeError::HandleBusy);
     }
 
     #[tokio::test]
