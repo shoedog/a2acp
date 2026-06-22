@@ -1,0 +1,16 @@
+# cancel-tokens live-gate: host codex-acp + warm sessions with a long idle TTL so a context survives across
+# turns. Drives the NAMED DoD on the A2A surface (MCP has no force-clear):
+#   Race 1 (F1 op nonce): SessionCancel + immediate same-context resend → the cancelled turn's late
+#     completion does NOT clobber the new turn (the new turn replies correctly).
+#   Race 2 (F2 abort token): SessionClear{force:true} during/after an in-flight turn → the context is a NEW
+#     empty generation (a follow-up recalls nothing); an in-flight turn ends Canceled.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "low"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[server]
+addr = "127.0.0.1:8122"
+warm_idle_ttl_secs = 600

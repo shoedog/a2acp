@@ -443,6 +443,8 @@ async fn resolve_configure_bind(
                 seed: None,
                 guard: None,
                 warm_guard: None,
+                // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
+                abort: tokio_util::sync::CancellationToken::new(),
             });
         }
     }
@@ -480,6 +482,8 @@ async fn resolve_configure_bind(
         seed: None,
         guard: Some(guard),
         warm_guard: None,
+        // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
+        abort: tokio_util::sync::CancellationToken::new(),
     })
 }
 
@@ -489,7 +493,6 @@ async fn warm_local_dispatch(
     srv: &Arc<InboundServer>,
     agent_id: &AgentId,
     routed: &RoutedCall,
-    op: OperationId,
 ) -> Option<Result<LocalDispatch, BridgeError>> {
     let ctx = routed.context_id.clone()?;
     let sm = srv.session_manager.clone()?;
@@ -499,7 +502,6 @@ async fn warm_local_dispatch(
             agent_id.clone(),
             routed.overrides.clone(),
             routed.session_cwd.clone(),
-            op,
         )
         .await
     {
@@ -520,6 +522,8 @@ async fn warm_local_dispatch(
                     generation: turn.generation,
                     op: turn.op.clone(),
                 }),
+                // Warm: the handle's per-turn abort token — a force-reset cancels it (cancel-tokens F2).
+                abort: turn.abort,
             }))
         }
         Err(e) => Some(Err(e)),
@@ -539,7 +543,7 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
         &self,
         wf_id: &str,
         node: &WorkflowNode,
-        run_id: &str,
+        _run_id: &str,
         _ctx: &WorkflowRunContext,
     ) -> Result<NodeTurn, BridgeError> {
         let child = ContextId::parse(format!(
@@ -548,7 +552,6 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
             wf_id,
             node.id.as_str()
         ))?;
-        let op = OperationId::parse(format!("workflow-{run_id}-node-{}", node.id.as_str()))?;
         let turn = self
             .sm
             .checkout_child_turn(
@@ -557,7 +560,6 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
                 node.agent.clone(),
                 None,
                 self.cwd.clone(),
-                op,
             )
             .await?;
         Ok(NodeTurn {
@@ -767,8 +769,7 @@ async fn stream_message(
             // SSE frame rather than a JSON-RPC error (streaming has already committed
             // to an SSE response).
             let agent_id = local_agent_id(&srv, &routed.target);
-            let op = OperationId::parse(format!("op-{}", routed.task.as_str())).unwrap();
-            let dispatch = match warm_local_dispatch(&srv, &agent_id, &routed, op).await {
+            let dispatch = match warm_local_dispatch(&srv, &agent_id, &routed).await {
                 Some(r) => r,
                 None => {
                     resolve_configure_bind(
@@ -1386,6 +1387,8 @@ fn spawn_local_producer(
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
     let warm = dispatch.warm_guard;
+    // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
+    let abort = dispatch.abort;
 
     tokio::spawn(async move {
         // Hold the guard for the whole producer; dropped on every return path below.
@@ -1414,15 +1417,25 @@ fn spawn_local_producer(
             // observe the dropped receiver, and its `_guard` Drop (lease/stash
             // eviction) would never fire. On disconnect we return early → guard drops.
             let ev = tokio::select! {
-                maybe = events.next() => match maybe {
-                    Some(ev) => ev,
-                    None => break,
-                },
+                biased;
+                // cancel-tokens F2 (L1 — abort arm FIRST, biased): a force-reset cancelled this turn.
+                // Emit a terminal Canceled and STOP without polling events — a pre-first-poll abort means
+                // `backend.prompt` never runs, so the released (cleared) session is never re-minted.
+                _ = abort.cancelled() => {
+                    if !translator_terminal {
+                        let _ = tx.send(Ok(Event::terminal(TaskOutcome::Canceled))).await;
+                    }
+                    return;
+                }
                 _ = tx.closed() => {
                     // Receiver gone (client disconnected) — stop driving; the `_guard`
                     // Drop evicts the binding/lease/stash on this early return.
                     return;
                 }
+                maybe = events.next() => match maybe {
+                    Some(ev) => ev,
+                    None => break,
+                },
             };
             // Slice 2: usage is telemetry — record it on the warm handle, never forward to SSE.
             if let Ok(e) = &ev {
@@ -2270,8 +2283,7 @@ async fn unary_message(
             // for the call's DURATION (so an interleaved cancel finds the binding) and
             // is dropped at the end of this scope → eviction after `collect().await`.
             // A follow-up reuses the binding and carries no guard (no premature evict).
-            let op = OperationId::parse(format!("op-{}", routed.task.as_str())).unwrap();
-            let dispatch = match warm_local_dispatch(&srv, agent_id, &routed, op).await {
+            let dispatch = match warm_local_dispatch(&srv, agent_id, &routed).await {
                 Some(r) => r,
                 None => {
                     resolve_configure_bind(
@@ -2294,6 +2306,8 @@ async fn unary_message(
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
             let warm = dispatch.warm_guard;
+            // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
+            let abort = dispatch.abort;
             let mut parts = routed.parts;
             if let Some(seed) = dispatch.seed {
                 parts.insert(
@@ -2313,7 +2327,20 @@ async fn unary_message(
                 parts,
             );
             let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
-            while let Some(ev) = events.next().await {
+            loop {
+                let ev = tokio::select! {
+                    biased;
+                    // cancel-tokens F2 (L1 — abort arm FIRST, biased): a force-reset cancelled this turn.
+                    // Record a Canceled terminal and stop without polling events (pre-first-poll → no re-mint).
+                    _ = abort.cancelled() => {
+                        collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
+                        break;
+                    }
+                    maybe = events.next() => match maybe {
+                        Some(ev) => ev,
+                        None => break,
+                    },
+                };
                 if let Ok(e) = &ev {
                     if e.kind() == &EventKind::Usage {
                         if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
@@ -3770,6 +3797,78 @@ mod tests {
         }
         async fn is_fanout(&self, t: &TaskId) -> Result<bool, BridgeError> {
             Ok(self.fanouts.lock().unwrap().contains(t.as_str()))
+        }
+    }
+
+    struct ForceClearOnWarmPutStore {
+        inner: FakeStore,
+        sm: Arc<crate::session_manager::SessionManager>,
+        ctx: ContextId,
+        fired: AtomicBool,
+    }
+
+    impl ForceClearOnWarmPutStore {
+        fn new(sm: Arc<crate::session_manager::SessionManager>, ctx: ContextId) -> Self {
+            Self {
+                inner: FakeStore::default(),
+                sm,
+                ctx,
+                fired: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore for ForceClearOnWarmPutStore {
+        async fn put(&self, t: &TaskId, s: &SessionId) -> Result<(), BridgeError> {
+            self.inner.put(t, s).await?;
+            if s.as_str().starts_with("ctx-")
+                && self
+                    .fired
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.sm
+                    .reset_session(&self.ctx, crate::session_manager::ResetOpts { force: true })
+                    .await?;
+            }
+            Ok(())
+        }
+
+        async fn session_for(&self, t: &TaskId) -> Result<Option<SessionId>, BridgeError> {
+            self.inner.session_for(t).await
+        }
+
+        async fn put_pending(&self, t: &TaskId, r: &PendingRequest) -> Result<(), BridgeError> {
+            self.inner.put_pending(t, r).await
+        }
+
+        async fn take_pending(&self, t: &TaskId) -> Result<Option<PendingRequest>, BridgeError> {
+            self.inner.take_pending(t).await
+        }
+
+        async fn set_peer_task(&self, t: &TaskId, peer: &PeerTaskId) -> Result<(), BridgeError> {
+            self.inner.set_peer_task(t, peer).await
+        }
+
+        async fn peer_task_for(&self, t: &TaskId) -> Result<Option<PeerTaskId>, BridgeError> {
+            self.inner.peer_task_for(t).await
+        }
+
+        async fn request_cancel(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.inner.request_cancel(t).await
+        }
+
+        async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            self.inner.cancel_requested(t).await
+        }
+
+        async fn set_fanout(&self, t: &TaskId) -> Result<(), BridgeError> {
+            self.inner.set_fanout(t).await
+        }
+
+        async fn is_fanout(&self, t: &TaskId) -> Result<bool, BridgeError> {
+            self.inner.is_fanout(t).await
         }
     }
 
@@ -6272,6 +6371,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn streaming_producer_pre_cancelled_abort_never_prompts() {
+        let (srv, _sm, _backend) = seed_test_server();
+        let abort = tokio_util::sync::CancellationToken::new();
+        abort.cancel();
+        let dispatch = LocalDispatch {
+            backend: Arc::new(PanicBackend),
+            session: SessionId::parse("ctx-streaming-pre-cancel-g0").unwrap(),
+            seed: None,
+            guard: None,
+            warm_guard: None,
+            abort,
+        };
+        let routed = RoutedCall {
+            task: TaskId::parse("task-streaming-pre-cancel").unwrap(),
+            session: SessionId::parse("session-task-streaming-pre-cancel").unwrap(),
+            parts: vec![Part { text: "hi".into() }],
+            target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            context_id: Some(ContextId::parse("streaming-pre-cancel").unwrap()),
+            session_cwd: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+        spawn_local_producer(&srv, routed, dispatch, tx);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("producer should emit a terminal promptly")
+            .expect("producer channel should remain open until terminal")
+            .expect("terminal event should not be an error");
+        assert_eq!(ev.outcome(), Some(TaskOutcome::Canceled));
+        assert!(
+            rx.recv().await.is_none(),
+            "producer should close after the canceled terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_producer_pre_cancelled_abort_never_prompts() {
+        let ctx = ContextId::parse("unary-pre-cancel").unwrap();
+        let backend = Arc::new(PanicBackend) as Arc<dyn AgentBackend>;
+        let registry = FakeRegistry::with_entries("a", vec![(bare_entry("a"), backend)]);
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry.clone() as Arc<dyn AgentRegistry>,
+            std::time::Duration::from_secs(60),
+        ));
+        let store = Arc::new(ForceClearOnWarmPutStore::new(sm.clone(), ctx.clone()));
+        let srv = Arc::new(
+            InboundServer::new(
+                registry as Arc<dyn AgentRegistry>,
+                store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_session_manager(sm),
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "contextId": ctx.as_str(), "text": "hi", "metadata": { "a2a-bridge.agent": "a" } } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_CANCELED");
+    }
+
     fn warm_msg(text: &str) -> serde_json::Value {
         json!({ "message": { "contextId": "c1", "text": text, "metadata": { "a2a-bridge.agent": "a" } } })
     }
@@ -7139,16 +7316,9 @@ mod tests {
         let (srv, sm, _) = seed_test_server();
         let parent = ContextId::parse("c-workflow").unwrap();
         let child = ContextId::parse("c-workflow::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &parent,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-child").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&parent, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         assert!(
             sm.status(&child).await.is_some(),
             "child handle should exist before release"
@@ -7180,16 +7350,9 @@ mod tests {
         let (srv, sm, _) = seed_test_server();
         let ctx = ContextId::parse("c-active-release").unwrap();
         let child = ContextId::parse("c-active-release::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &ctx,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-active-release").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&ctx, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         srv.workflow_runs
             .lock()
             .await
@@ -7219,16 +7382,9 @@ mod tests {
         let (srv, sm, backend) = seed_test_server();
         let parent = ContextId::parse("c-release-atomic").unwrap();
         let child = ContextId::parse("c-release-atomic::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &parent,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-release-atomic").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&parent, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         let release_gate = backend.gate_release_session();
 
         let release = tokio::spawn({
@@ -7268,16 +7424,9 @@ mod tests {
         let (srv, sm, _) = seed_test_server();
         let ctx = ContextId::parse("c-active-clear").unwrap();
         let child = ContextId::parse("c-active-clear::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &ctx,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-active-clear").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&ctx, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         srv.workflow_runs
             .lock()
             .await
@@ -7307,16 +7456,9 @@ mod tests {
         let (srv, sm, backend) = seed_test_server();
         let parent = ContextId::parse("c-clear-atomic").unwrap();
         let child = ContextId::parse("c-clear-atomic::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &parent,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-clear-atomic").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&parent, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         let release_gate = backend.gate_release_session();
 
         let clear = tokio::spawn({

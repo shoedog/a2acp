@@ -77,6 +77,10 @@ pub struct LocalDispatch {
     pub guard: Option<BindingGuard>,
     /// Warm path only: finishes the warm turn (→ Idle) on drop. Mutually exclusive with `guard`.
     pub warm_guard: Option<WarmTurnGuard>,
+    /// Per-turn abort token (cancel-tokens F2). For a WARM turn it is the handle's `turn_abort`
+    /// (a force-reset cancels it → the producer's biased select aborts before re-minting the released
+    /// session). For a cold-bind dispatch it is a fresh, never-cancelled token (no warm handle to race).
+    pub abort: tokio_util::sync::CancellationToken,
 }
 
 /// Drops the warm turn back to Idle on producer exit (mirrors BindingGuard::Drop's spawn pattern).

@@ -156,12 +156,6 @@ impl Coordinator {
             .expect("minted context id is non-empty")
     }
 
-    fn mint_operation_id(&self) -> OperationId {
-        let seq = PROMPT_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-        OperationId::parse(format!("op-{}-{seq}", self.clock.now_ms()))
-            .expect("minted operation id is non-empty")
-    }
-
     fn mint_prompt_task_id(&self) -> TaskId {
         let seq = PROMPT_ID_SEQ.fetch_add(1, Ordering::Relaxed);
         TaskId::parse(format!("prompt-{}-{seq}", self.clock.now_ms()))
@@ -178,10 +172,9 @@ impl Coordinator {
             .clone()
             .unwrap_or_else(|| self.registry.default_id());
         let ctx = p.context.clone().unwrap_or_else(|| self.mint_context_id());
-        let op = self.mint_operation_id();
         let turn = self
             .session_manager
-            .checkout_turn(&ctx, agent, Some(p.agent_override()), cwd, op)
+            .checkout_turn(&ctx, agent, Some(p.agent_override()), cwd)
             .await?;
         self.collect_turn(ctx, turn, p.input).await
     }
@@ -195,11 +188,7 @@ impl Coordinator {
             .context
             .clone()
             .ok_or(BridgeError::InvalidRequest { field: "context" })?;
-        let op = self.mint_operation_id();
-        let turn = self
-            .session_manager
-            .checkout_existing_turn(&ctx, op)
-            .await?;
+        let turn = self.session_manager.checkout_existing_turn(&ctx).await?;
         self.collect_turn(ctx, turn, p.input).await
     }
 
@@ -242,7 +231,21 @@ impl Coordinator {
             parts,
         );
         let mut collected = Vec::new();
-        while let Some(ev) = events.next().await {
+        let mut aborted = false;
+        loop {
+            let ev = tokio::select! {
+                biased;
+                // cancel-tokens F2 (L1 — abort arm FIRST): a force-reset cancelled this turn → stop without
+                // polling events (a pre-first-poll abort means `backend.prompt` never runs → no re-mint).
+                _ = turn.abort.cancelled() => {
+                    aborted = true;
+                    break;
+                }
+                maybe = events.next() => match maybe {
+                    Some(ev) => ev,
+                    None => break,
+                },
+            };
             match &ev {
                 Ok(e) if e.kind() == &EventKind::Usage => {
                     if let Some(snap) = e.usage_snapshot() {
@@ -255,7 +258,11 @@ impl Coordinator {
                 _ => collected.push(ev),
             }
         }
+        // Drop the translator stream BEFORE finishing (cancels the in-flight backend future on abort).
         drop(events);
+        if aborted {
+            collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
+        }
 
         // Finish synchronously on the normal/error path, then disarm so the guard's drop is a no-op
         // (no double finish_turn). If the future was cancelled before reaching here, the still-armed
@@ -495,7 +502,7 @@ mod tests {
         PermissionRequest, RegistrySnapshot, SessionContext,
     };
     use bridge_core::error::BridgeError;
-    use bridge_core::ids::{AgentId, ContextId, NodeId, OperationId, SessionId};
+    use bridge_core::ids::{AgentId, ContextId, NodeId, SessionId};
     use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::{AgentBackend, BackendStream, Lease, Resolved, Update};
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus};
@@ -645,6 +652,24 @@ mod tests {
                 stop_reason: "end_turn".into(),
             }));
             Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    /// Panics if `prompt` is ever called — proves the pre-first-poll abort never reaches `backend.prompt`.
+    struct PanicOnPromptBackend;
+
+    #[async_trait]
+    impl AgentBackend for PanicOnPromptBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("backend.prompt must not be called when the turn was aborted pre-first-poll");
         }
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
@@ -804,10 +829,6 @@ mod tests {
                 inputs: Vec::new(),
             }],
         })
-    }
-
-    fn op(id: &str) -> OperationId {
-        OperationId::parse(id).unwrap()
     }
 
     fn ctx(id: &str) -> ContextId {
@@ -1103,6 +1124,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_turn_pre_cancelled_abort_never_prompts() {
+        // cancel-tokens F2 / L1: when the abort token is ALREADY cancelled at collect_turn's first poll,
+        // the biased select takes the abort arm → events.next() is never polled → backend.prompt never
+        // runs (the no-re-mint proof). PanicOnPromptBackend panics if prompt is called; reaching the
+        // assertion proves it was not. The turn surfaces as "cancelled".
+        let coordinator = coordinator_fixture(Arc::new(HashMap::new())).coordinator;
+        let abort = CancellationToken::new();
+        abort.cancel();
+        let turn = crate::session_manager::WarmTurn {
+            backend: Arc::new(PanicOnPromptBackend) as Arc<dyn AgentBackend>,
+            session: SessionId::parse("ctx-abort-g1").unwrap(),
+            usage_warning: None,
+            generation: bridge_core::ids::SessionGeneration::new(1),
+            op: OperationId::parse("turn-1").unwrap(),
+            seed: None,
+            abort,
+        };
+        let out = coordinator
+            .collect_turn(ctx("ctx-abort"), turn, "hi".into())
+            .await
+            .unwrap();
+        assert_eq!(out.stop_reason, "cancelled");
+    }
+
+    #[tokio::test]
     async fn dropped_turn_returns_handle_to_idle() {
         // s8 T10 review MAJOR: a turn future dropped mid-drain must return the warm handle to Idle via
         // the drop guard — else the next turn on that context is permanently HandleBusy.
@@ -1138,11 +1184,7 @@ mod tests {
         // (a stranded Running handle would stay HandleBusy forever and exhaust the loop).
         let mut released = false;
         for _ in 0..1000 {
-            match coord
-                .session_manager
-                .checkout_existing_turn(&known, op("op-recheck"))
-                .await
-            {
+            match coord.session_manager.checkout_existing_turn(&known).await {
                 Ok(_) => {
                     released = true;
                     break;
@@ -1258,13 +1300,7 @@ mod tests {
         let turn = fixture
             .coordinator
             .session_manager
-            .checkout_turn(
-                &c,
-                AgentId::parse("codex").unwrap(),
-                None,
-                None,
-                op("op-shutdown"),
-            )
+            .checkout_turn(&c, AgentId::parse("codex").unwrap(), None, None)
             .await
             .unwrap();
         fixture

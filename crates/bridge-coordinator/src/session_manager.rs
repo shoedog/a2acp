@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
@@ -43,6 +44,20 @@ fn is_claimed(s: SessionState) -> bool {
     )
 }
 
+/// cancel-tokens F2 (whole-branch review): fire any abort token still lingering on a handle whose backend
+/// session is about to be RELEASED. A keep-warm `SessionCancel` deliberately leaves the in-flight turn's
+/// token on the (Idle) handle — see `cancel_inner` — so a pre-first-poll producer stays cancellable rather
+/// than stranding the ACP cancel latch. The invariant that makes that safe: EVERY path that then releases
+/// that backend session must fire the lingering token FIRST, or the producer could re-mint the released
+/// session. Call this under the `by_context` lock immediately before `backend.release_session(&old_id)`
+/// (or before pushing a removed handle to a deferred release). `cancel()` is synchronous → lock-safe.
+/// Latch-safe: `release_session` removes the ACP entry, so the cancel latch dies with it.
+fn fire_lingering_turn_abort(h: &mut WarmHandle) {
+    if let Some(tok) = h.turn_abort.take() {
+        tok.cancel();
+    }
+}
+
 struct WarmHandle {
     #[allow(dead_code)] // surfaced by handle ops in later slices
     id: SessionHandleId,
@@ -60,6 +75,18 @@ struct WarmHandle {
     expire_after_reconcile: bool,
     #[allow(dead_code)]
     op: Option<OperationId>,
+    /// The in-flight turn's abort token (cancel-tokens F2). Fired by every backend-session-release path via
+    /// `fire_lingering_turn_abort` so a pre-first-poll producer aborts instead of re-minting the released
+    /// session. A keep-warm `SessionCancel` deliberately LEAVES the token here (rather than firing it — that
+    /// would strand the ACP cancel latch) so a later reset/release can still fire it.
+    ///
+    /// KNOWN LIMITATION — DEFERRED TO SLICE 9 (owner decision 2026-06-21): this is a SINGLE slot. If a
+    /// keep-warm cancel leaves a token here and the NEXT checkout installs a new turn's token, the lingering
+    /// one is overwritten/orphaned — so a `cancel A → checkout B → release/reset` sequence can let producer A
+    /// re-mint the released session. Closing it needs producer-join (hold the handle claimed until the
+    /// cancelled producer confirms exit) or a `Vec` lingering-token collection drained at every release site;
+    /// both belong to Slice 9's cancel-under-concurrency work.
+    turn_abort: Option<CancellationToken>,
     pending_seed: Option<String>,
     last_used: Instant,
 }
@@ -71,6 +98,7 @@ pub struct WarmTurn {
     pub usage_warning: Option<UsageWarning>,
     pub generation: SessionGeneration,
     pub op: OperationId,
+    pub abort: CancellationToken,
     pub seed: Option<String>,
 }
 
@@ -123,6 +151,7 @@ pub struct SessionManager {
     compact_summarize_timeout: Duration,
     clock: Arc<dyn Clock>,
     seq: std::sync::atomic::AtomicU64,
+    turn_op_seq: std::sync::atomic::AtomicU64,
 }
 
 impl SessionManager {
@@ -144,6 +173,7 @@ impl SessionManager {
             compact_summarize_timeout: Duration::from_secs(120),
             clock,
             seq: std::sync::atomic::AtomicU64::new(0),
+            turn_op_seq: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -204,6 +234,13 @@ impl SessionManager {
         }
     }
 
+    fn mint_turn_op(&self) -> OperationId {
+        let n = self
+            .turn_op_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OperationId::parse(format!("turn-{n}")).expect("minted turn op is non-empty")
+    }
+
     async fn prune_child_registration(&self, ctx: &ContextId) {
         let mut children = self.children.lock().await;
         for set in children.values_mut() {
@@ -234,11 +271,8 @@ impl SessionManager {
         agent: AgentId,
         overrides: Option<AgentOverride>,
         cwd: Option<SessionCwd>,
-        op: OperationId,
     ) -> Result<WarmTurn, BridgeError> {
-        let (res, removed) = self
-            .checkout_turn_inner(ctx, agent, overrides, cwd, op)
-            .await;
+        let (res, removed) = self.checkout_turn_inner(ctx, agent, overrides, cwd).await;
         for ctx in &removed {
             self.prune_child_registration(ctx).await;
         }
@@ -251,11 +285,7 @@ impl SessionManager {
     /// Running. Mirrors the no-diff reuse branch of [`Self::checkout_turn`], but a context that was
     /// never minted returns `SessionNotFound` (you cannot continue what does not exist) instead of
     /// minting a fresh session. A retired lease → `SessionExpired`; a busy handle → `HandleBusy`.
-    pub async fn checkout_existing_turn(
-        &self,
-        ctx: &ContextId,
-        op: OperationId,
-    ) -> Result<WarmTurn, BridgeError> {
+    pub async fn checkout_existing_turn(&self, ctx: &ContextId) -> Result<WarmTurn, BridgeError> {
         let mut tab = self.by_context.lock().await;
         let Some(h) = tab.get_mut(ctx) else {
             return Err(BridgeError::SessionNotFound);
@@ -267,8 +297,11 @@ impl SessionManager {
             return Err(BridgeError::HandleBusy);
         }
         let usage_warning = self.eval_warn(&h.usage);
+        let op = self.mint_turn_op();
+        let abort = CancellationToken::new();
         h.state = SessionState::Running;
         h.op = Some(op.clone());
+        h.turn_abort = Some(abort.clone());
         h.last_used = self.clock.now_instant();
         let seed = h.pending_seed.take();
         Ok(WarmTurn {
@@ -277,6 +310,7 @@ impl SessionManager {
             usage_warning,
             generation: h.generation,
             op,
+            abort,
             seed,
         })
     }
@@ -287,7 +321,6 @@ impl SessionManager {
         agent: AgentId,
         overrides: Option<AgentOverride>,
         cwd: Option<SessionCwd>,
-        op: OperationId,
     ) -> (Result<WarmTurn, BridgeError>, Vec<ContextId>) {
         let mut tab = self.by_context.lock().await;
         if let Some(h) = tab.get_mut(ctx) {
@@ -311,8 +344,11 @@ impl SessionManager {
             let d = h.fingerprint.diff(&fp);
             if d.is_empty() {
                 let usage_warning = self.eval_warn(&h.usage);
+                let op = self.mint_turn_op();
+                let abort = CancellationToken::new();
                 h.state = SessionState::Running;
                 h.op = Some(op.clone());
+                h.turn_abort = Some(abort.clone());
                 h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
                 return (
@@ -322,6 +358,7 @@ impl SessionManager {
                         usage_warning,
                         generation: h.generation,
                         op,
+                        abort,
                         seed,
                     }),
                     Vec::new(),
@@ -400,9 +437,12 @@ impl SessionManager {
             if clean {
                 let h = tab.get_mut(ctx).expect("still_ours");
                 let usage_warning = self.eval_warn(&h.usage);
+                let op = self.mint_turn_op();
+                let abort = CancellationToken::new();
                 h.fingerprint = fp;
                 h.state = SessionState::Running;
                 h.op = Some(op.clone());
+                h.turn_abort = Some(abort.clone());
                 h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
                 return (
@@ -412,6 +452,7 @@ impl SessionManager {
                         usage_warning,
                         generation: h.generation,
                         op,
+                        abort,
                         seed,
                     }),
                     Vec::new(),
@@ -420,7 +461,11 @@ impl SessionManager {
             // Non-clean (failed reconcile OR cancel/release arrived mid-window): EXPIRE via an `Expiring`
             // tombstone held across release_session().await so a concurrent checkout (HandleBusy on Expiring)
             // can't re-mint the same backend_session id before release completes.
-            tab.get_mut(ctx).expect("still_ours").state = SessionState::Expiring;
+            // cancel-tokens F2 (whole-branch review round 4): a non-clean reconcile EXPIRES (releases) this
+            // session; a keep-warm cancel may have left a lingering token on it → fire before release.
+            let h = tab.get_mut(ctx).expect("still_ours");
+            fire_lingering_turn_abort(h);
+            h.state = SessionState::Expiring;
             drop(tab);
             backend.release_session(&backend_session).await;
             {
@@ -469,12 +514,15 @@ impl SessionManager {
             return (Err(e), Vec::new());
         }
         let caps = resolved.backend.capabilities();
+        let op = self.mint_turn_op();
+        let abort = CancellationToken::new();
         let turn = WarmTurn {
             backend: resolved.backend.clone(),
             session: backend_session.clone(),
             usage_warning: None,
             generation: SessionGeneration::new(0),
             op: op.clone(),
+            abort: abort.clone(),
             seed: None,
         };
         tab.insert(
@@ -492,6 +540,7 @@ impl SessionManager {
                 usage: UsageSnapshot::default(),
                 expire_after_reconcile: false,
                 op: Some(op),
+                turn_abort: Some(abort),
                 pending_seed: None,
                 last_used: self.clock.now_instant(),
             },
@@ -506,16 +555,13 @@ impl SessionManager {
         agent: AgentId,
         overrides: Option<AgentOverride>,
         cwd: Option<SessionCwd>,
-        op: OperationId,
     ) -> Result<WarmTurn, BridgeError> {
         // PFIX-4 (FIX-2 atomicity): hold `children` ACROSS checkout_turn + insert. A concurrent
         // `*_with_children` sweep (Task 4) takes `children` FIRST, so it WAITS for an in-progress child
         // checkout instead of missing it — closes the register-after-release leak window. Lock order is
         // children -> by_context (checkout_turn locks by_context internally); the sweeps use the same order.
         let mut children = self.children.lock().await;
-        let (turn, removed) = self
-            .checkout_turn_inner(child, agent, overrides, cwd, op)
-            .await;
+        let (turn, removed) = self.checkout_turn_inner(child, agent, overrides, cwd).await;
         Self::prune_child_registration_locked(&mut children, &removed);
         let turn = turn?;
         children
@@ -538,6 +584,7 @@ impl SessionManager {
             {
                 h.state = SessionState::Idle;
                 h.op = None;
+                h.turn_abort = None;
                 h.last_used = self.clock.now_instant();
             }
         }
@@ -603,6 +650,9 @@ impl SessionManager {
                     h.expire_after_reconcile = true;
                     return;
                 }
+                // cancel-tokens F2: SessionRelease releases the session out from under any in-flight turn —
+                // fire the lingering token under the lock before release_session below.
+                fire_lingering_turn_abort(h);
             }
             tab.remove(ctx)
         };
@@ -657,6 +707,17 @@ impl SessionManager {
             }
             let was_running = h.state == SessionState::Running;
             h.op = None;
+            // cancel-tokens (whole-branch review): a keep-warm SessionCancel must NEITHER fire NOR clear
+            // the in-flight turn's abort token here.
+            //   - Don't FIRE it: the session stays warm, so the producer must reach its prompt to drain the
+            //     ACP cancel latch backend.cancel (below) sets; aborting it pre-first-poll would strand that
+            //     latch → a spurious cancel of the next turn that mints this session (round-2 Finding 1).
+            //   - Don't CLEAR (orphan) it: a still-pre-first-poll producer holds a live token, so the token
+            //     must stay reachable on the handle — else a later reset/release sees None, releases the
+            //     session, and the orphaned producer re-mints the cleared context (round-3 BLOCKER).
+            // So leave it on the handle: the keep-warm success path below leaves Some(token) on the Idle
+            // handle (a later reset/release can fire it; the next checkout overwrites it), and the EXPIRE
+            // branch below — which DOES release the session — fires it first.
             if !was_running {
                 h.state = SessionState::Idle;
                 return (Ok(()), false);
@@ -683,8 +744,13 @@ impl SessionManager {
                     .map(|h| h.expire_after_reconcile)
                     .unwrap_or(true);
                 if res.is_ok() && !deferred {
+                    // Keep-warm: leave the abort token on the Idle handle (reachable for a later
+                    // reset/release; overwritten by the next checkout). The producer drains the ACP latch.
                     tab.get_mut(ctx).expect("still_ours").state = SessionState::Idle;
-                } else if let Some(h) = tab.remove(ctx) {
+                } else if let Some(mut h) = tab.remove(ctx) {
+                    // EXPIRE: this cancel releases the session (backend.cancel failed, or a deferred release
+                    // landed on us) → fire the lingering token before release_session below.
+                    fire_lingering_turn_abort(&mut h);
                     expired = Some(h);
                 }
             } else {
@@ -849,6 +915,10 @@ impl SessionManager {
                 config: h.fingerprint.config.clone(),
                 cwd,
             };
+            // F2 (cancel-tokens): all fallible validation passed — committed to Resetting. Fire the lingering
+            // token UNDER the lock (only here, after the fallible new_id/cwd parses, so an early-return error
+            // path can't strand it) so the cancel strictly precedes the lock release + backend teardown below.
+            fire_lingering_turn_abort(h);
             h.state = SessionState::Resetting;
             h.expire_after_reconcile = false;
             (backend, old_id, claimed_id, new_gen, new_id, spec)
@@ -904,6 +974,7 @@ impl SessionManager {
         h.generation = new_gen;
         h.usage = UsageSnapshot::default();
         h.op = None;
+        h.turn_abort = None;
         h.pending_seed = None;
         h.state = SessionState::Idle;
         h.last_used = self.clock.now_instant();
@@ -962,6 +1033,13 @@ impl SessionManager {
                 config: h.fingerprint.config.clone(),
                 cwd,
             };
+            // cancel-tokens (whole-branch review round 6): compact does NOT fire a lingering keep-warm-cancel
+            // token here. Unlike reset/release (which release the ACP entry immediately, so its cancel latch
+            // dies with it), compact PROMPTS old_id to SUMMARIZE before releasing it — so firing the lingering
+            // token (which makes its pre-mint producer abort WITHOUT draining the ACP cancel latch the earlier
+            // cancel set) would let compact's own summarize prompt drain that stale latch and return cancelled,
+            // failing the compact. A lingering pre-mint producer racing compact is part of the Slice-9 deferral
+            // (see the WarmHandle.turn_abort note); compact summarizes the warm gen-N session as-is.
             h.state = SessionState::Compacting;
             h.expire_after_reconcile = false;
             (backend, old_id, claimed_id, new_gen, new_id, spec)
@@ -1031,6 +1109,7 @@ impl SessionManager {
         h.generation = new_gen;
         h.usage = UsageSnapshot::default();
         h.op = None;
+        h.turn_abort = None;
         h.pending_seed = Some(summary);
         h.state = SessionState::Idle;
         h.last_used = self.clock.now_instant();
@@ -1114,7 +1193,10 @@ impl SessionManager {
                 children.retain(|_, set| !set.is_empty());
             }
         }
-        for h in handles {
+        for mut h in handles {
+            // cancel-tokens F2 (whole-branch review round 4): a reaped Idle handle may carry a lingering
+            // keep-warm-cancel token — fire it before releasing so a pre-first-poll producer can't re-mint.
+            fire_lingering_turn_abort(&mut h);
             h.backend.release_session(&h.backend_session).await;
             drop(h.lease);
         }
@@ -1491,18 +1573,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkout_mints_unique_op_nonce_per_turn() {
+        let (mgr, _backend, _registry) = manager();
+        let c = ctx("ctx-nonce");
+        let t1 = mgr.checkout_turn(&c, agent(), None, None).await.unwrap();
+        let old_op = t1.op.clone();
+        mgr.finish_turn(&c, t1.generation, &old_op).await;
+        let t2 = mgr.checkout_turn(&c, agent(), None, None).await.unwrap();
+        assert_ne!(old_op, t2.op, "each checkout mints a distinct op nonce");
+        mgr.finish_turn(&c, t2.generation, &old_op).await;
+        assert_eq!(mgr.status(&c).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
     async fn reset_on_idle_bumps_generation_releases_old_configures_new_zeroes_usage() {
         let (manager, backend, _r) = manager();
         let c = ctx("reset");
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager
             .record_usage(
                 &c,
                 turn.generation,
-                &op("op-1"),
+                &turn.op,
                 UsageSnapshot {
                     used: Some(7),
                     size: Some(9),
@@ -1511,7 +1606,7 @@ mod tests {
                 },
             )
             .await;
-        manager.finish_turn(&c, turn.generation, &op("op-1")).await;
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
         let out = manager
             .reset_session(&c, ResetOpts { force: false })
             .await
@@ -1530,7 +1625,7 @@ mod tests {
         let (manager, _b, _r) = manager();
         let c = ctx("reset-busy");
         manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         let err = manager
@@ -1556,10 +1651,7 @@ mod tests {
         let (m, fake, _r) = manager();
         let c = ctx("c1");
         // Warm + idle a session at gen 0.
-        let turn = m
-            .checkout_turn(&c, agent(), None, None, op("t1"))
-            .await
-            .unwrap();
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         m.finish_turn(&c, turn.generation, &turn.op).await;
         let out = m
             .compact_session(&c, |_b, _s| async { Ok("THE SUMMARY".to_string()) })
@@ -1580,10 +1672,7 @@ mod tests {
     async fn compact_on_running_is_handle_busy() {
         let (m, _f, _r) = manager();
         let c = ctx("c2");
-        let _turn = m
-            .checkout_turn(&c, agent(), None, None, op("t1"))
-            .await
-            .unwrap(); // Running
+        let _turn = m.checkout_turn(&c, agent(), None, None).await.unwrap(); // Running
         let err = m
             .compact_session(&c, |_b, _s| async { Ok("x".to_string()) })
             .await
@@ -1606,10 +1695,7 @@ mod tests {
         for bad in ["__ERR__", "   "] {
             let (m, fake, _r) = manager();
             let c = ctx("c");
-            let turn = m
-                .checkout_turn(&c, agent(), None, None, op("t1"))
-                .await
-                .unwrap();
+            let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
             m.finish_turn(&c, turn.generation, &turn.op).await;
             let b = bad.to_string();
             let err = m
@@ -1643,10 +1729,7 @@ mod tests {
     async fn compact_summary_timeout_expires() {
         let (m, _f, _r) = manager_with_timeout(std::time::Duration::from_millis(10));
         let c = ctx("c");
-        let turn = m
-            .checkout_turn(&c, agent(), None, None, op("t1"))
-            .await
-            .unwrap();
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         m.finish_turn(&c, turn.generation, &turn.op).await;
         let err = m
             .compact_session(&c, |_b, _s| async {
@@ -1664,10 +1747,7 @@ mod tests {
         // PFIX-10: a MessageTooLarge from the closure EXPIRES the handle (FIX-1/7) — explicit manager-level test.
         let (m, fake, _r) = manager();
         let c = ctx("c");
-        let turn = m
-            .checkout_turn(&c, agent(), None, None, op("t1"))
-            .await
-            .unwrap();
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         m.finish_turn(&c, turn.generation, &turn.op).await;
         let err = m
             .compact_session(&c, |_b, _s| async { Err(BridgeError::MessageTooLarge) })
@@ -1683,10 +1763,7 @@ mod tests {
         // PFIX-3: set the configure failure AFTER the warm-up (the fake fails EVERY configure incl. g0).
         let (m, fake, _r) = manager();
         let c = ctx("c");
-        let turn = m
-            .checkout_turn(&c, agent(), None, None, op("t1"))
-            .await
-            .unwrap(); // configures g0 OK
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap(); // configures g0 OK
         m.finish_turn(&c, turn.generation, &turn.op).await;
         fake.set_configure_result(Err(BridgeError::ConfigInvalid {
             reason: "test".into(),
@@ -1705,7 +1782,7 @@ mod tests {
         let parent = ctx("compact-configure-parent");
         let child = ctx("compact-configure-child");
         let turn = m
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("t1"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         m.finish_turn(&child, turn.generation, &turn.op).await;
@@ -1729,25 +1806,16 @@ mod tests {
     async fn checkout_consumes_seed_once() {
         let (m, _f, _r) = manager();
         let c = ctx("c");
-        let t = m
-            .checkout_turn(&c, agent(), None, None, op("t0"))
-            .await
-            .unwrap();
+        let t = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         m.finish_turn(&c, t.generation, &t.op).await;
         m.compact_session(&c, |_b, _s| async { Ok("SUMMARY".into()) })
             .await
             .unwrap();
         // First checkout after compact carries the seed; clear it; second sees None.
-        let t1 = m
-            .checkout_turn(&c, agent(), None, None, op("t1"))
-            .await
-            .unwrap();
+        let t1 = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         assert_eq!(t1.seed.as_deref(), Some("SUMMARY"));
         m.finish_turn(&c, t1.generation, &t1.op).await;
-        let t2 = m
-            .checkout_turn(&c, agent(), None, None, op("t2"))
-            .await
-            .unwrap();
+        let t2 = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         assert_eq!(t2.seed, None);
     }
 
@@ -1757,17 +1825,14 @@ mod tests {
         // Mirror the clean-reconcile setup in `model_override_change_reconciles_and_advances_fingerprint` (:1277).
         let (m, fake, _r) = manager();
         let c = ctx("c");
-        let t = m
-            .checkout_turn(&c, agent(), None, None, op("t0"))
-            .await
-            .unwrap();
+        let t = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         m.finish_turn(&c, t.generation, &t.op).await;
         m.compact_session(&c, |_b, _s| async { Ok("SUMMARY".into()) })
             .await
             .unwrap();
         // A model-override checkout takes the reconcile path; the seed must still be delivered.
         let t1 = m
-            .checkout_turn(&c, agent(), Some(model_override("m1")), None, op("t1"))
+            .checkout_turn(&c, agent(), Some(model_override("m1")), None)
             .await
             .unwrap();
         assert_eq!(t1.seed.as_deref(), Some("SUMMARY"));
@@ -1781,10 +1846,7 @@ mod tests {
     async fn clear_drops_pending_seed() {
         let (m, _f, _r) = manager();
         let c = ctx("c");
-        let t = m
-            .checkout_turn(&c, agent(), None, None, op("t0"))
-            .await
-            .unwrap();
+        let t = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         m.finish_turn(&c, t.generation, &t.op).await;
         m.compact_session(&c, |_b, _s| async { Ok("SUMMARY".into()) })
             .await
@@ -1792,10 +1854,7 @@ mod tests {
         m.reset_session(&c, ResetOpts { force: false })
             .await
             .unwrap(); // plain clear after compact
-        let t1 = m
-            .checkout_turn(&c, agent(), None, None, op("t1"))
-            .await
-            .unwrap();
+        let t1 = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         assert_eq!(t1.seed, None, "clear drops the pending seed");
     }
 
@@ -1805,15 +1864,15 @@ mod tests {
         let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
         let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
         let c = ctx("reset-window");
-        manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager
             .record_usage(
                 &c,
-                SessionGeneration::new(0),
-                &op("op-1"),
+                turn.generation,
+                &turn.op,
                 UsageSnapshot {
                     used: Some(7),
                     size: Some(9),
@@ -1833,14 +1892,12 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        manager
-            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
         manager
             .record_usage(
                 &c,
-                SessionGeneration::new(0),
-                &op("op-1"),
+                turn.generation,
+                &turn.op,
                 UsageSnapshot {
                     used: Some(99),
                     size: Some(100),
@@ -1864,16 +1921,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_reset_cancels_the_inflight_turn_abort() {
+        // cancel-tokens F2: a force-reset of a Running handle must cancel the in-flight turn's abort token
+        // (the producer's biased select then aborts before/instead of prompting the released session).
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-abort");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        assert!(!turn.abort.is_cancelled());
+        let out = manager
+            .reset_session(&c, ResetOpts { force: true })
+            .await
+            .unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+        assert!(
+            turn.abort.is_cancelled(),
+            "force reset must cancel the in-flight turn's abort token"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_reset_cancels_token_before_backend_teardown() {
+        // cancel-tokens F2 ordering invariant (whole-branch review): the in-flight turn's abort token must
+        // be cancelled BEFORE the backend session is torn down, so a producer can never poll a released
+        // session with an un-cancelled token (the ACP lazy-re-mint / resurrection window). On a force reset
+        // `backend.cancel(old)` is the first teardown step; gate it, and when it is entered the token must
+        // ALREADY be cancelled. Guards against any future regression that moves the cancel past the lock.
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let c = ctx("ctx-reset-order");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        assert!(!turn.abort.is_cancelled());
+        let release = backend.block_next_cancel();
+        let reset = tokio::spawn({
+            let manager = manager.clone();
+            let c = c.clone();
+            async move { manager.reset_session(&c, ResetOpts { force: true }).await }
+        });
+        // The reset has reached backend.cancel — which runs AFTER the under-lock token cancel.
+        backend.wait_for_cancel().await;
+        assert!(
+            turn.abort.is_cancelled(),
+            "the abort token must be cancelled before the backend session is torn down"
+        );
+        let _ = release.send(());
+        let out = reset.await.unwrap().unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+    }
+
+    #[tokio::test]
+    async fn release_cancels_the_inflight_turn_abort() {
+        // cancel-tokens F2 (whole-branch review, Finding 2): SessionRelease releases the backend session,
+        // so — like a force-reset — it must cancel the in-flight turn's abort token (the producer aborts
+        // instead of re-minting the just-released session). A release is one of the two paths that fire it.
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-release-abort");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        assert!(!turn.abort.is_cancelled());
+        manager.release(&c).await;
+        assert!(
+            turn.abort.is_cancelled(),
+            "releasing a running handle must cancel the in-flight turn's abort token"
+        );
+        assert!(
+            manager.status(&c).await.is_none(),
+            "release removes the handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_does_not_fire_the_turn_abort_token() {
+        // cancel-tokens (whole-branch review, round-2 Finding 1): a keep-warm SessionCancel must NOT fire
+        // the abort token — the producer must reach its prompt to drain the ACP cancel latch backend.cancel
+        // sets; firing it pre-first-poll would strand that latch and spuriously cancel the NEXT turn.
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-cancel-nofire");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        assert!(
+            !turn.abort.is_cancelled(),
+            "a keep-warm cancel must NOT fire the abort token (it would strand the ACP cancel latch)"
+        );
+        // The handle stays warm at Idle and a fresh checkout mints a new turn (new op nonce + token).
+        let next = manager.checkout_existing_turn(&c).await.unwrap();
+        assert_ne!(next.op, turn.op);
+    }
+
+    #[tokio::test]
+    async fn cancel_keep_warm_leaves_token_reachable_for_release() {
+        // cancel-tokens (whole-branch review, round-3 BLOCKER): a keep-warm cancel does not fire the token,
+        // but it must NOT orphan it either — a still-pre-first-poll producer keeps a live token, so the
+        // token stays on the Idle handle and a SUBSEQUENT reset/release can still fire it. Otherwise the
+        // cancel→release sequence would release the session out from under an un-cancellable producer that
+        // then re-mints the cleared context.
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-cancel-then-release");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        assert!(!turn.abort.is_cancelled(), "keep-warm cancel does not fire");
+        // The token lingers on the Idle handle → a following release fires it (no orphan, no re-mint).
+        manager.release(&c).await;
+        assert!(
+            turn.abort.is_cancelled(),
+            "a release after a keep-warm cancel must fire the lingering abort token"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_expire_fires_the_turn_abort_token() {
+        // cancel-tokens (whole-branch review, round-3): when backend.cancel FAILS, cancel_inner EXPIRES —
+        // it releases the session. That release path must fire the in-flight turn's abort token (like a
+        // force-reset) so a pre-first-poll producer aborts instead of re-minting the released session.
+        let (manager, backend, _registry) = manager();
+        let c = ctx("ctx-cancel-expire");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_cancel_result(Err(BridgeError::AgentCrashed {
+            reason: "cancel failed".into(),
+        }));
+        let _ = manager.cancel(&c).await;
+        assert!(
+            turn.abort.is_cancelled(),
+            "an expiring (releasing) cancel must fire the in-flight turn's abort token"
+        );
+        assert!(
+            manager.status(&c).await.is_none(),
+            "an expiring cancel removes the handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_after_keep_warm_cancel_does_not_fire_lingering_token() {
+        // cancel-tokens (whole-branch review round 6): compact must NOT fire a lingering keep-warm-cancel
+        // token — it prompts old_id (summarize) before releasing it, so firing would make the pre-mint
+        // producer abort without draining the ACP cancel latch, and compact's own summarize would then drain
+        // that stale latch and come back cancelled. (A lingering pre-mint producer racing compact is the
+        // Slice-9 deferral.) Here the FakeBackend has no latch, so compact still succeeds; we pin that compact
+        // leaves the lingering token untouched (does NOT fire it).
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-compact-nofire");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        assert!(!turn.abort.is_cancelled(), "keep-warm cancel does not fire");
+        let out = manager
+            .compact_session(&c, |_b, _s| async { Ok("THE SUMMARY".to_string()) })
+            .await
+            .unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+        assert!(
+            !turn.abort.is_cancelled(),
+            "compact must NOT fire a lingering token (it would latch-poison its own summarize prompt)"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_after_keep_warm_cancel_fires_lingering_token() {
+        // cancel-tokens F2 (whole-branch review round 4): a reaped Idle handle that carries a lingering
+        // keep-warm-cancel token must have it fired before the reaper releases the backend session.
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let clock = Arc::new(ManualClock::new(0));
+        let manager =
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone());
+        let c = ctx("ctx-reap-fires");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        assert!(!turn.abort.is_cancelled());
+        clock.advance(Duration::from_secs(6));
+        manager.reap_idle().await;
+        assert!(manager.status(&c).await.is_none(), "reaped past TTL");
+        assert!(
+            turn.abort.is_cancelled(),
+            "reap must fire the lingering keep-warm-cancel token before releasing"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_after_force_clear_uses_new_empty_generation() {
+        // cancel-tokens DoD / SPEC-FIX-7: a force-clear of a Running turn leaves the context at a NEW empty
+        // generation (Idle) — a subsequent continue (checkout_existing_turn) SUCCEEDS at the new generation,
+        // it does NOT return SessionNotFound (which is only for a truly unknown context).
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-reclear");
+        let first = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(first.generation.get(), 0);
+        let out = manager
+            .reset_session(&c, ResetOpts { force: true })
+            .await
+            .unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+        let next = manager.checkout_existing_turn(&c).await.unwrap();
+        assert_eq!(next.generation.get(), 1, "continue uses the new generation");
+        assert_ne!(next.op, first.op, "the new turn mints a fresh op nonce");
+    }
+
+    #[tokio::test]
     async fn reset_configure_failure_expires_handle_and_returns_error() {
         let (manager, backend, _r) = manager();
         let c = ctx("reset-cfg-fail");
-        manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
         backend.set_configure_result(Err(BridgeError::ConfigInvalid {
             reason: "boom".into(),
         }));
@@ -1893,13 +2169,11 @@ mod tests {
         let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
         let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
         let c = ctx("reset-defer");
-        manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
         let unblock = backend.block_next_configure();
         let in_flight = {
             let (m, c2) = (manager.clone(), c.clone());
@@ -1912,7 +2186,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let busy = manager
-            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .err()
             .unwrap();
@@ -1932,13 +2206,11 @@ mod tests {
         let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
         let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
         let c = ctx("reset-cancel-defer");
-        manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
         let unblock = backend.block_next_configure();
         let in_flight = {
             let (m, c2) = (manager.clone(), c.clone());
@@ -1964,7 +2236,7 @@ mod tests {
         let (manager, backend, _r) = manager();
         let c = ctx("reset-force");
         manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         let out = manager
@@ -1986,10 +2258,10 @@ mod tests {
         let (manager, _b, _r) = manager();
         let c = ctx("ft");
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
-        manager.finish_turn(&c, turn.generation, &op("op-1")).await;
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
         assert_eq!(manager.status(&c).await.unwrap().state, "idle");
     }
 
@@ -1997,12 +2269,12 @@ mod tests {
     async fn finish_turn_noops_on_stale_generation() {
         let (manager, _b, _r) = manager();
         let c = ctx("ft-stale");
-        manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager
-            .finish_turn(&c, SessionGeneration::new(99), &op("op-1"))
+            .finish_turn(&c, SessionGeneration::new(99), &turn.op)
             .await;
         assert_eq!(manager.status(&c).await.unwrap().state, "running");
     }
@@ -2011,15 +2283,15 @@ mod tests {
     async fn record_usage_noops_on_stale_generation() {
         let (manager, _b, _r) = manager();
         let c = ctx("ru-stale");
-        manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager
             .record_usage(
                 &c,
                 SessionGeneration::new(99),
-                &op("op-1"),
+                &turn.op,
                 UsageSnapshot {
                     used: Some(5),
                     size: Some(9),
@@ -2040,12 +2312,12 @@ mod tests {
             SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone());
         let c = ctx("cancel-ttl");
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         clock.advance(Duration::from_secs(6));
         manager.cancel(&c).await.unwrap();
-        manager.finish_turn(&c, turn.generation, &op("op-1")).await;
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
         manager.reap_idle().await;
         assert!(
             manager.status(&c).await.is_some(),
@@ -2061,12 +2333,12 @@ mod tests {
         let (manager, _b, _r) = manager();
         let c = ctx("cancel-race");
         let t1 = manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager.cancel(&c).await.unwrap();
         let t2 = manager
-            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
 
@@ -2098,14 +2370,12 @@ mod tests {
         let ctx = ctx("abc");
 
         let first = manager
-            .checkout_turn(&ctx, agent(), None, None, op("op-1"))
+            .checkout_turn(&ctx, agent(), None, None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, first.generation, &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, first.generation, &first.op).await;
         let second = manager
-            .checkout_turn(&ctx, agent(), None, None, op("op-2"))
+            .checkout_turn(&ctx, agent(), None, None)
             .await
             .unwrap();
 
@@ -2118,29 +2388,26 @@ mod tests {
         let (manager, _backend, _registry) = manager();
         let parent = ctx("parent");
         let child = ctx("child");
-        let first_op = op("op-1");
 
         let first = manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, first_op.clone())
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         assert_eq!(first.session.as_str(), "ctx-child-g0");
         assert_eq!(first.generation, SessionGeneration::new(0));
-        assert_eq!(first.op, first_op);
         assert!(manager.child_registered(&parent, &child).await);
 
         manager
             .finish_turn(&child, first.generation, &first.op)
             .await;
-        let second_op = op("op-2");
         let second = manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, second_op.clone())
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
 
         assert_eq!(second.session, first.session);
         assert_eq!(second.generation, SessionGeneration::new(0));
-        assert_eq!(second.op, second_op);
+        assert_ne!(first.op, second.op);
         assert!(manager.child_registered(&parent, &child).await);
     }
 
@@ -2151,7 +2418,7 @@ mod tests {
         let child = ctx("expire-child");
 
         manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         assert!(manager.child_registered(&parent, &child).await);
@@ -2174,7 +2441,7 @@ mod tests {
         let child = ctx("release-child");
 
         manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         assert!(manager.child_registered(&parent, &child).await);
@@ -2199,7 +2466,6 @@ mod tests {
                 agent(),
                 Some(model_override("gpt-5.5")),
                 None,
-                op("op-child-1"),
             )
             .await
             .unwrap();
@@ -2208,13 +2474,7 @@ mod tests {
 
         backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
         let err = manager
-            .checkout_turn(
-                &child,
-                agent(),
-                Some(model_override("gpt-5.4")),
-                None,
-                op("op-child-2"),
-            )
+            .checkout_turn(&child, agent(), Some(model_override("gpt-5.4")), None)
             .await
             .err()
             .unwrap();
@@ -2238,7 +2498,6 @@ mod tests {
                 agent(),
                 Some(model_override("gpt-5.5")),
                 None,
-                op("op-child-1"),
             )
             .await
             .unwrap();
@@ -2254,7 +2513,6 @@ mod tests {
                 agent(),
                 Some(model_override("gpt-5.4")),
                 None,
-                op("op-child-2"),
             ),
         )
         .await
@@ -2275,7 +2533,7 @@ mod tests {
         let child = ctx("reset-expire-child");
 
         let turn = manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         manager.finish_turn(&child, turn.generation, &turn.op).await;
@@ -2309,7 +2567,6 @@ mod tests {
                 AgentId::parse("missing").unwrap(),
                 None,
                 None,
-                op("op-1"),
             )
             .await
             .err()
@@ -2322,7 +2579,7 @@ mod tests {
         }));
         let configure_child = ctx("configure-child");
         let err = manager
-            .checkout_child_turn(&parent, &configure_child, agent(), None, None, op("op-2"))
+            .checkout_child_turn(&parent, &configure_child, agent(), None, None)
             .await
             .err()
             .unwrap();
@@ -2338,15 +2595,15 @@ mod tests {
         let child_b = ctx("sweep-child-b");
 
         manager
-            .checkout_turn(&parent, agent(), None, None, op("op-parent"))
+            .checkout_turn(&parent, agent(), None, None)
             .await
             .unwrap();
         manager
-            .checkout_child_turn(&parent, &child_a, agent(), None, None, op("op-child-a"))
+            .checkout_child_turn(&parent, &child_a, agent(), None, None)
             .await
             .unwrap();
         manager
-            .checkout_child_turn(&parent, &child_b, agent(), None, None, op("op-child-b"))
+            .checkout_child_turn(&parent, &child_b, agent(), None, None)
             .await
             .unwrap();
 
@@ -2379,15 +2636,15 @@ mod tests {
         let child_b = ctx("cancel-release-child-b");
 
         manager
-            .checkout_turn(&parent, agent(), None, None, op("op-parent"))
+            .checkout_turn(&parent, agent(), None, None)
             .await
             .unwrap();
         manager
-            .checkout_child_turn(&parent, &child_a, agent(), None, None, op("op-child-a"))
+            .checkout_child_turn(&parent, &child_a, agent(), None, None)
             .await
             .unwrap();
         manager
-            .checkout_child_turn(&parent, &child_b, agent(), None, None, op("op-child-b"))
+            .checkout_child_turn(&parent, &child_b, agent(), None, None)
             .await
             .unwrap();
 
@@ -2424,15 +2681,15 @@ mod tests {
         let child_b = ctx("clear-release-child-b");
 
         manager
-            .checkout_turn(&parent, agent(), None, None, op("op-parent"))
+            .checkout_turn(&parent, agent(), None, None)
             .await
             .unwrap();
         manager
-            .checkout_child_turn(&parent, &child_a, agent(), None, None, op("op-child-a"))
+            .checkout_child_turn(&parent, &child_a, agent(), None, None)
             .await
             .unwrap();
         manager
-            .checkout_child_turn(&parent, &child_b, agent(), None, None, op("op-child-b"))
+            .checkout_child_turn(&parent, &child_b, agent(), None, None)
             .await
             .unwrap();
 
@@ -2495,7 +2752,7 @@ mod tests {
         let child = ctx("clear-force-child");
 
         manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
 
@@ -2518,7 +2775,7 @@ mod tests {
         let child = ctx("clear-busy-child");
 
         manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
 
@@ -2539,7 +2796,7 @@ mod tests {
         let child = ctx("clear-fail-child");
 
         let turn = manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         manager.finish_turn(&child, turn.generation, &turn.op).await;
@@ -2567,7 +2824,7 @@ mod tests {
         let c = ctx("cancel-idle");
 
         manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager.cancel(&c).await.unwrap();
@@ -2586,7 +2843,7 @@ mod tests {
         let child = ctx("cancel-race-child");
 
         manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         assert!(manager.child_registered(&parent, &child).await);
@@ -2612,7 +2869,7 @@ mod tests {
         assert!(manager.child_registered(&parent, &child).await);
 
         manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child-2"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         assert_eq!(backend.configured(), vec!["ctx-cancel-race-child-g0"]);
@@ -2626,7 +2883,7 @@ mod tests {
         let child = ctx("cancel-error-expire-child");
 
         manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         assert!(manager.child_registered(&parent, &child).await);
@@ -2655,7 +2912,7 @@ mod tests {
         let c = ctx("cancel-success-warm");
 
         manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
 
@@ -2665,7 +2922,7 @@ mod tests {
         assert!(backend.releases().is_empty());
         assert_eq!(manager.status(&c).await.unwrap().state, "idle");
         manager
-            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         assert_eq!(manager.status(&c).await.unwrap().state, "running");
@@ -2679,26 +2936,12 @@ mod tests {
         let error_child = ctx("cancel-error-child");
 
         manager
-            .checkout_child_turn(
-                &parent,
-                &stale_child,
-                agent(),
-                None,
-                None,
-                op("op-stale-child"),
-            )
+            .checkout_child_turn(&parent, &stale_child, agent(), None, None)
             .await
             .unwrap();
         manager.release(&stale_child).await;
         manager
-            .checkout_child_turn(
-                &parent,
-                &error_child,
-                agent(),
-                None,
-                None,
-                op("op-error-child"),
-            )
+            .checkout_child_turn(&parent, &error_child, agent(), None, None)
             .await
             .unwrap();
         backend.set_cancel_result(Err(BridgeError::AgentCrashed {
@@ -2721,13 +2964,10 @@ mod tests {
         let ctx = ctx("busy");
 
         manager
-            .checkout_turn(&ctx, agent(), None, None, op("op-1"))
+            .checkout_turn(&ctx, agent(), None, None)
             .await
             .unwrap();
-        let err = manager
-            .checkout_turn(&ctx, agent(), None, None, op("op-2"))
-            .await
-            .err();
+        let err = manager.checkout_turn(&ctx, agent(), None, None).await.err();
 
         assert_eq!(err, Some(BridgeError::HandleBusy));
     }
@@ -2739,30 +2979,16 @@ mod tests {
         let manager = SessionManager::new(registry, Duration::from_secs(30));
         let ctx = ctx("model");
 
-        manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.5")),
-                None,
-                op("op-1"),
-            )
+        let first = manager
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.5")), None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
-            .await;
-        let err = manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.4")),
-                None,
-                op("op-2"),
-            )
+        manager.finish_turn(&ctx, first.generation, &first.op).await;
+        let second = manager
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.4")), None)
             .await;
 
-        assert!(err.is_ok());
+        let second = second.unwrap();
         assert_eq!(backend.reconciled().len(), 1);
         assert_eq!(
             backend.reconciled()[0].1.config.model.as_deref(),
@@ -2770,17 +2996,11 @@ mod tests {
         );
 
         manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-2"))
+            .finish_turn(&ctx, second.generation, &second.op)
             .await;
         backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
         manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.4")),
-                None,
-                op("op-3"),
-            )
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.4")), None)
             .await
             .unwrap();
         assert_eq!(backend.reconciled().len(), 1);
@@ -2791,28 +3011,14 @@ mod tests {
         let (manager, backend, _registry) = manager();
         let ctx = ctx("effort");
 
-        manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(effort_override(Effort::Low)),
-                None,
-                op("op-1"),
-            )
+        let turn = manager
+            .checkout_turn(&ctx, agent(), Some(effort_override(Effort::Low)), None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
 
-        manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(effort_override(Effort::High)),
-                None,
-                op("op-2"),
-            )
+        let _turn = manager
+            .checkout_turn(&ctx, agent(), Some(effort_override(Effort::High)), None)
             .await
             .unwrap();
 
@@ -2825,29 +3031,15 @@ mod tests {
         let (manager, backend, _registry) = manager();
         let ctx = ctx("not-advertised");
 
-        manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.5")),
-                None,
-                op("op-1"),
-            )
+        let turn = manager
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.5")), None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
         backend.set_reconcile_result(Ok(ReconcileOutcome::NotAdvertised));
 
         let err = manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.4")),
-                None,
-                op("op-2"),
-            )
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.4")), None)
             .await
             .err()
             .unwrap();
@@ -2857,13 +3049,7 @@ mod tests {
         assert_eq!(backend.releases(), vec!["ctx-not-advertised-g0"]);
 
         manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.4")),
-                None,
-                op("op-3"),
-            )
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.4")), None)
             .await
             .unwrap();
         assert_eq!(
@@ -2877,29 +3063,15 @@ mod tests {
         let (manager, backend, _registry) = manager();
         let ctx = ctx("rejected");
 
-        manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.5")),
-                None,
-                op("op-1"),
-            )
+        let turn = manager
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.5")), None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
         backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
 
         let err = manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.4")),
-                None,
-                op("op-2"),
-            )
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.4")), None)
             .await
             .err()
             .unwrap();
@@ -2914,16 +3086,14 @@ mod tests {
         let (manager, backend, _registry) = manager();
         let ctx = ctx("mode");
 
-        manager
-            .checkout_turn(&ctx, agent(), Some(mode_override("fast")), None, op("op-1"))
+        let turn = manager
+            .checkout_turn(&ctx, agent(), Some(mode_override("fast")), None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
 
         let err = manager
-            .checkout_turn(&ctx, agent(), Some(mode_override("slow")), None, op("op-2"))
+            .checkout_turn(&ctx, agent(), Some(mode_override("slow")), None)
             .await
             .err()
             .unwrap();
@@ -2938,19 +3108,16 @@ mod tests {
         let (manager, backend, _registry) = manager();
         let ctx = ctx("cwd");
 
-        manager
+        let turn = manager
             .checkout_turn(
                 &ctx,
                 agent(),
                 Some(model_override("gpt-5.5")),
                 cwd("/work/a"),
-                op("op-1"),
             )
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
 
         let err = manager
             .checkout_turn(
@@ -2958,7 +3125,6 @@ mod tests {
                 agent(),
                 Some(model_override("gpt-5.4")),
                 cwd("/work/b"),
-                op("op-2"),
             )
             .await
             .err()
@@ -2978,22 +3144,14 @@ mod tests {
         let manager = SessionManager::new(registry, Duration::from_secs(30));
         let ctx = ctx("agent");
 
-        manager
-            .checkout_turn(&ctx, agent(), None, None, op("op-1"))
+        let turn = manager
+            .checkout_turn(&ctx, agent(), None, None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
 
         let err = manager
-            .checkout_turn(
-                &ctx,
-                AgentId::parse("claude").unwrap(),
-                None,
-                None,
-                op("op-2"),
-            )
+            .checkout_turn(&ctx, AgentId::parse("claude").unwrap(), None, None)
             .await
             .err()
             .unwrap();
@@ -3007,42 +3165,35 @@ mod tests {
         let (manager, backend, _registry) = manager();
         let model_ctx = ctx("clear-model");
 
-        manager
-            .checkout_turn(
-                &model_ctx,
-                agent(),
-                Some(model_override("gpt-5.5")),
-                None,
-                op("op-1"),
-            )
+        let model_turn = manager
+            .checkout_turn(&model_ctx, agent(), Some(model_override("gpt-5.5")), None)
             .await
             .unwrap();
         manager
-            .finish_turn(&model_ctx, SessionGeneration::new(0), &op("op-1"))
+            .finish_turn(&model_ctx, model_turn.generation, &model_turn.op)
             .await;
         let err = manager
-            .checkout_turn(&model_ctx, agent(), None, None, op("op-2"))
+            .checkout_turn(&model_ctx, agent(), None, None)
             .await
             .err()
             .unwrap();
         assert_eq!(err, BridgeError::ConfigReseedRequired { field: "model" });
 
         let effort_ctx = ctx("clear-effort");
-        manager
+        let effort_turn = manager
             .checkout_turn(
                 &effort_ctx,
                 agent(),
                 Some(effort_override(Effort::High)),
                 None,
-                op("op-3"),
             )
             .await
             .unwrap();
         manager
-            .finish_turn(&effort_ctx, SessionGeneration::new(0), &op("op-3"))
+            .finish_turn(&effort_ctx, effort_turn.generation, &effort_turn.op)
             .await;
         let err = manager
-            .checkout_turn(&effort_ctx, agent(), None, None, op("op-4"))
+            .checkout_turn(&effort_ctx, agent(), None, None)
             .await
             .err()
             .unwrap();
@@ -3057,19 +3208,11 @@ mod tests {
         let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
         let ctx = ctx("release-race");
 
-        manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.5")),
-                None,
-                op("op-1"),
-            )
+        let turn = manager
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.5")), None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
         let unblock = backend.block_next_reconcile();
 
         let in_flight = {
@@ -3077,13 +3220,7 @@ mod tests {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 manager
-                    .checkout_turn(
-                        &ctx,
-                        agent(),
-                        Some(model_override("gpt-5.4")),
-                        None,
-                        op("op-2"),
-                    )
+                    .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.4")), None)
                     .await
             })
         };
@@ -3093,13 +3230,7 @@ mod tests {
         // During the reconcile/release window the handle is OWNED (Reconciling): a concurrent checkout must
         // be HandleBusy — no fresh re-mint of the same backend_session id mid-reconcile (closes the reuse race).
         let busy = manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.3")),
-                None,
-                op("op-3"),
-            )
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.3")), None)
             .await
             .err()
             .unwrap();
@@ -3114,13 +3245,7 @@ mod tests {
         // Handle is gone -> a subsequent checkout mints fresh (cold).
         assert!(manager.status(&ctx).await.is_none());
         manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.3")),
-                None,
-                op("op-4"),
-            )
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.3")), None)
             .await
             .unwrap();
     }
@@ -3132,19 +3257,11 @@ mod tests {
         let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
         let ctx = ctx("cancel-race");
 
-        manager
-            .checkout_turn(
-                &ctx,
-                agent(),
-                Some(model_override("gpt-5.5")),
-                None,
-                op("op-1"),
-            )
+        let turn = manager
+            .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.5")), None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
         let unblock = backend.block_next_reconcile();
 
         let in_flight = {
@@ -3152,13 +3269,7 @@ mod tests {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 manager
-                    .checkout_turn(
-                        &ctx,
-                        agent(),
-                        Some(model_override("gpt-5.4")),
-                        None,
-                        op("op-2"),
-                    )
+                    .checkout_turn(&ctx, agent(), Some(model_override("gpt-5.4")), None)
                     .await
             })
         };
@@ -3190,7 +3301,7 @@ mod tests {
         let ctx = ctx("caps");
 
         manager
-            .checkout_turn(&ctx, agent(), None, None, op("op-1"))
+            .checkout_turn(&ctx, agent(), None, None)
             .await
             .unwrap();
 
@@ -3202,14 +3313,14 @@ mod tests {
         let (manager, _b, _r) = manager();
         let c = ctx("u");
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager
             .record_usage(
                 &c,
                 turn.generation,
-                &op("op-1"),
+                &turn.op,
                 UsageSnapshot {
                     used: Some(10),
                     size: Some(100),
@@ -3222,7 +3333,7 @@ mod tests {
             .record_usage(
                 &c,
                 turn.generation,
-                &op("op-1"),
+                &turn.op,
                 UsageSnapshot {
                     used: Some(42),
                     size: Some(100),
@@ -3241,7 +3352,7 @@ mod tests {
         let (manager, _b, _r) = manager();
         let c = ctx("missing-usage-window");
         manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
 
@@ -3256,15 +3367,15 @@ mod tests {
         let manager =
             SessionManager::new(registry, Duration::from_secs(30)).with_warn_fraction(Some(0.8));
         let c = ctx("warn");
-        manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+        let first = manager
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager
             .record_usage(
                 &c,
-                SessionGeneration::new(0),
-                &op("op-1"),
+                first.generation,
+                &first.op,
                 UsageSnapshot {
                     used: Some(90),
                     size: Some(100),
@@ -3273,11 +3384,9 @@ mod tests {
                 },
             )
             .await;
-        manager
-            .finish_turn(&c, SessionGeneration::new(0), &op("op-1"))
-            .await;
+        manager.finish_turn(&c, first.generation, &first.op).await;
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         let w = turn.usage_warning.expect("0.90 >= 0.80 warns");
@@ -3293,7 +3402,7 @@ mod tests {
             SessionManager::new(registry, Duration::from_secs(30)).with_warn_fraction(Some(0.8));
         let c = ctx("below");
         let mint = manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         assert!(mint.usage_warning.is_none(), "mint has no carried usage");
@@ -3301,7 +3410,7 @@ mod tests {
             .record_usage(
                 &c,
                 mint.generation,
-                &op("op-1"),
+                &mint.op,
                 UsageSnapshot {
                     used: Some(10),
                     size: Some(100),
@@ -3310,9 +3419,9 @@ mod tests {
                 },
             )
             .await;
-        manager.finish_turn(&c, mint.generation, &op("op-1")).await;
+        manager.finish_turn(&c, mint.generation, &mint.op).await;
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         assert!(turn.usage_warning.is_none(), "0.10 < 0.80");
@@ -3327,14 +3436,14 @@ mod tests {
         let (manager, _b, _r) = manager();
         let c = ctx("disabled");
         let first = manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager
             .record_usage(
                 &c,
                 first.generation,
-                &op("op-1"),
+                &first.op,
                 UsageSnapshot {
                     used: Some(99),
                     size: Some(100),
@@ -3343,9 +3452,9 @@ mod tests {
                 },
             )
             .await;
-        manager.finish_turn(&c, first.generation, &op("op-1")).await;
+        manager.finish_turn(&c, first.generation, &first.op).await;
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         assert!(turn.usage_warning.is_none());
@@ -3357,14 +3466,14 @@ mod tests {
             SessionManager::new(registry, Duration::from_secs(30)).with_warn_fraction(Some(0.8));
         let c = ctx("degraded");
         let first = manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager
             .record_usage(
                 &c,
                 first.generation,
-                &op("op-1"),
+                &first.op,
                 UsageSnapshot {
                     used: Some(99),
                     size: None,
@@ -3373,9 +3482,9 @@ mod tests {
                 },
             )
             .await;
-        manager.finish_turn(&c, first.generation, &op("op-1")).await;
+        manager.finish_turn(&c, first.generation, &first.op).await;
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("op-2"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         assert!(turn.usage_warning.is_none());
@@ -3405,16 +3514,16 @@ mod tests {
             SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone());
         let c = ctx("idle-usage");
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("op-1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
-        manager.finish_turn(&c, turn.generation, &op("op-1")).await;
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
         clock.advance(Duration::from_secs(6));
         manager
             .record_usage(
                 &c,
                 turn.generation,
-                &op("op-1"),
+                &turn.op,
                 UsageSnapshot {
                     used: Some(1),
                     size: Some(2),
@@ -3436,12 +3545,10 @@ mod tests {
         let ctx = ctx("release");
 
         let turn = manager
-            .checkout_turn(&ctx, agent(), None, None, op("op-1"))
+            .checkout_turn(&ctx, agent(), None, None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, turn.generation, &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
         manager.release(&ctx).await;
 
         assert!(manager.status(&ctx).await.is_none());
@@ -3459,14 +3566,14 @@ mod tests {
         let running = ctx("running");
 
         let idle_turn = manager
-            .checkout_turn(&idle, agent(), None, None, op("op-1"))
+            .checkout_turn(&idle, agent(), None, None)
             .await
             .unwrap();
         manager
-            .finish_turn(&idle, idle_turn.generation, &op("op-1"))
+            .finish_turn(&idle, idle_turn.generation, &idle_turn.op)
             .await;
         manager
-            .checkout_turn(&running, agent(), None, None, op("op-2"))
+            .checkout_turn(&running, agent(), None, None)
             .await
             .unwrap();
         clock.advance(Duration::from_secs(6));
@@ -3488,7 +3595,7 @@ mod tests {
         let child = ctx("reap-child");
 
         let turn = manager
-            .checkout_child_turn(&parent, &child, agent(), None, None, op("op-child"))
+            .checkout_child_turn(&parent, &child, agent(), None, None)
             .await
             .unwrap();
         manager.finish_turn(&child, turn.generation, &turn.op).await;
@@ -3513,10 +3620,7 @@ mod tests {
         // gen N+1 session and overwrite the good summary. Reject it; the original seed must survive.
         let (m, _f, _r) = manager();
         let c = ctx("c");
-        let turn = m
-            .checkout_turn(&c, agent(), None, None, op("t1"))
-            .await
-            .unwrap();
+        let turn = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         m.finish_turn(&c, turn.generation, &turn.op).await;
         m.compact_session(&c, |_b, _s| async { Ok("GOOD SUMMARY".to_string()) })
             .await
@@ -3529,10 +3633,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, BridgeError::HandleBusy);
         // The good summary is preserved (delivered on the next checkout).
-        let t2 = m
-            .checkout_turn(&c, agent(), None, None, op("t2"))
-            .await
-            .unwrap();
+        let t2 = m.checkout_turn(&c, agent(), None, None).await.unwrap();
         assert_eq!(t2.seed.as_deref(), Some("GOOD SUMMARY"));
     }
 
@@ -3550,7 +3651,7 @@ mod tests {
         ));
         let c = ctx("c");
         let turn = manager
-            .checkout_turn(&c, agent(), None, None, op("t1"))
+            .checkout_turn(&c, agent(), None, None)
             .await
             .unwrap();
         manager.finish_turn(&c, turn.generation, &turn.op).await;
@@ -3594,17 +3695,12 @@ mod tests {
         let ctx = ctx("retired");
 
         let turn = manager
-            .checkout_turn(&ctx, agent(), None, None, op("op-1"))
+            .checkout_turn(&ctx, agent(), None, None)
             .await
             .unwrap();
-        manager
-            .finish_turn(&ctx, turn.generation, &op("op-1"))
-            .await;
+        manager.finish_turn(&ctx, turn.generation, &turn.op).await;
         registry.retire();
-        let err = manager
-            .checkout_turn(&ctx, agent(), None, None, op("op-2"))
-            .await
-            .err();
+        let err = manager.checkout_turn(&ctx, agent(), None, None).await.err();
 
         assert_eq!(err, Some(BridgeError::SessionExpired));
     }
