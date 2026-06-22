@@ -232,3 +232,111 @@ PermissionRequest {
 - D3: clear/compact DROP pending injects (default) vs preserve. (Lean: drop.)
 - D4: does `Escalate` need any in-slice behavior beyond "route + fall to timeout Deny"? (Lean: no — OUT.)
 - D5: inject allowed while Running (queues) vs reject if Running. (Lean: allow + queue.)
+
+---
+
+## v2 — SPIKE-1 RESOLVED + spec-review folded (BINDING; supersedes contradictions above)
+
+> Dual spec-review (codex-xhigh `1b0ecd9` + Opus lens) verdict was **needs-respike**. SPIKE-1 was then run
+> empirically and CONFIRMED; the 4 BLOCKERs + 5 MAJORs + decisions are folded here. This section is binding.
+
+### SPIKE-1 — RESOLVED ✅ (a real ACP permission DOES arrive; shape pinned to real traffic)
+- **Reachable.** With **codex-acp `-c approval_policy="untrusted"` `-c sandbox_mode="read-only"`** + a turn that
+  attempts a **write/exec the sandbox blocks** (e.g. "create /tmp/x.txt"), codex-acp issues a real reverse
+  `session/request_permission` mid-turn. (`approval_policy="never"` auto-runs → NO ask; that is why dogfood
+  configs never saw it. The live-gate config is now pinned.) Captured shape in `/tmp/ct-lg/spike1_shape.txt`.
+- **Real shape** (REVERTED probe `eprintln` in `acp_backend.rs` permission handler):
+  `RequestPermissionRequest { session_id, tool_call: ToolCallUpdate { tool_call_id, fields: { kind: Execute,
+  status: Pending, title: <the proposed command>, content: [text], raw_input: Object{command:[/bin/zsh,-lc,
+  <cmd>], cwd, parsed_cmd, available_decisions, turn_id, …} } }, options: Vec<PermissionOption{ option_id,
+  name, kind }> }`.
+- **The options use STANDARD ACP `PermissionOptionKind`** — codex offered exactly three:
+  `{option_id:"approved", name:"Yes, proceed", kind:AllowOnce}`,
+  `{option_id:"approved-execpolicy-amendment", name:"Yes, and remember this command pattern", kind:AllowAlways}`,
+  `{option_id:"abort", name:"No, …", kind:RejectOnce}`. → **the existing `decide_permission` option-selection
+  (`select(&[AllowOnce,AllowAlways])` / `select(&[RejectOnce,RejectAlways])`, `acp_backend.rs:1264`) maps
+  cleanly, UNCHANGED.** **`Modify`=select-an-offered-option is VALIDATED + meaningful** (proceed vs
+  remember-pattern vs abort are 3 distinct real options). The `PermissionRequestEvent` must surface
+  `options[] {option_id, name, kind}` + `tool_call_id` + `title` + a capped `raw_input` (the command+cwd give
+  the orchestrator the real action to decide on).
+- **SPIKE-1 verdict: FEASIBLE — E2 is buildable + live-gateable.** Live-gate config: the untrusted+read-only
+  codex above + an opt-in `Defer` bridge policy + a write-prompt.
+
+### SPEC-FIX (folded review findings — binding)
+- **SF-1 (B2) — cancel resolves the pending permission IMMEDIATELY, not via `turn_kill`.** `turn_kill` only
+  fires after the grace timeout (`acp_backend.rs:2240`) and keep-warm `cancel_inner` does not fire the warm
+  abort (`session_manager.rs:709`). So `SessionCancel` / `release` / `clear` / `reset_session` MUST call
+  `PermissionRegistry::resolve_context(ctx, Cancelled)` DIRECTLY (synchronously, where they already hold the
+  handle). `turn_kill` stays a backstop only. The handler `select!` includes the registry oneshot (not
+  turn_kill) as the cancel path.
+- **SF-2 (B3) — generation-safe keying.** Key the pending entry by **`{context_id, generation, op,
+  request_id}`** (mirror the `finish_turn` gen+op+state guard, `session_manager.rs:581`). The
+  `PermissionRequest` event carries `generation`+`op`; `SessionPermit` ECHOES them and the registry REJECTS a
+  permit whose gen/op no longer matches the live turn (a stale permission from a cleared/compacted generation
+  must not resolve a new turn). A late agent permission for a dead generation reaps its own entry.
+- **SF-3 (B4) — thread bridge context into the route AT CHECKOUT.** The reverse handler only has
+  `req.session_id` and routes carry only `tx`+`watch` (`acp_backend.rs:1060/1986`). The route registration MUST
+  additionally carry `{context_id, generation, op}` (set when the turn is checked out / the producer registers
+  its route), so the handler can build the gen-stamped `PermissionRequest` event + registry key WITHOUT parsing
+  it back out of a formatted `SessionId`. (Plumbing task: extend the route entry + its registration sites.)
+- **SF-4 (B1/M5) — `PermissionRegistry` exact-once + drop-guard.** Internal resolution type
+  **`PermissionResolution { Decided(PermissionDecision), Cancelled }`** — the oneshot carries THIS (do NOT
+  overload `Deny` for cancel, M9). `register(key) -> Receiver`; `resolve(key, res)` and `resolve_context(ctx,
+  res)` **take the sender out of the map under ONE lock and send at most once** (resolve-exactly-once). The
+  spawned handler task reaps its entry on EVERY exit (decision, timeout, cancel, responder-fail, task-drop) via
+  a drop-guard; the registry is also swept on handle release/finish. No leak, no double-send.
+- **SF-5 (M6) — queued-inject threads through the A2A producers too.** The streaming `spawn_local_producer`
+  (`server.rs:1376`) and the unary Local path (`server.rs:2311`) assemble their OWN parts from
+  `LocalDispatch.seed`; `LocalDispatch` (`dispatch.rs:71`) has `seed` but no injects. Add `injects:
+  Vec<QueuedInject>` to BOTH `WarmTurn` and `LocalDispatch`, and a SINGLE shared helper
+  `assemble_turn_parts(seed, injects, input) -> Vec<Part>` (`seed → prepend-injects → input → append-injects`,
+  FIFO) used in `Coordinator::collect_turn` AND both A2A producers. (Same producer-multiplicity discipline as
+  the cancel-tokens biased selects.)
+- **SF-6 (M7) — the `PermissionRequest` event must not panic the detached sink.** `frame_from_orch`
+  (`detached.rs:398`) PANICS on any `OrchEventKind` outside plan/tool-call/update. The new variant is
+  **journal-only**: `DetachedRichSink::flush` SKIPS it (an explicit no-frame arm), and `task watch` renders it
+  from the journal. (Do NOT add it to the SSE frame path this slice; live permission UX rides the streaming
+  turn's event, not the detached frame.) Add the skip arm + a test that a `PermissionRequest` event does not
+  panic the detached flush.
+- **SF-7 (M8 / Opus D1) — dead-safe by construction.** Do NOT change `PolicyEngine::decide`'s signature (14
+  impls). Add a **defaulted** method: `fn interactive_decide(&self, req, ctx) -> PolicyOutcome { PolicyOutcome::
+  Decide(self.decide(req, ctx)) }` where `PolicyOutcome ∈ { Decide(Result<PermissionDecision, BridgeError>),
+  Defer }`. The 14 existing impls inherit the default (never `Defer`) → byte-identical. Only an opt-in
+  interactive policy overrides to return `Defer`. The handler: call `interactive_decide`; on `Decide(d)` respond
+  immediately (NO event, NO register — today's auto path, the API-backend silence preserved); on `Defer` take
+  the event+register+await path. The auto branch responds BEFORE any event/register.
+- **SF-8 (M10) — producer-join residual tracked, not claimed-away.** The single-`turn_abort`-slot overwrite +
+  compact-vs-lingering re-mint vectors ([[cancel-tokens-shipped]], documented on `WarmHandle.turn_abort`) remain
+  a Slice-9+ follow-up. This slice does NOT close them. cancel-resolves-PENDING-PERMISSION is INDEPENDENT (it
+  resolves the permission ONESHOT registry, not the producer lifecycle) — so E2 does not need producer-join.
+  Keep the residual explicitly documented; do not assert it away.
+- **SF-9 (M11/M12) — inject bounds + D3.** Cap queued inject at **N=32 entries / 64 KB total** per context
+  (reject beyond → `HandleBusy`-style error); dedupe by `dedupe_key` = **replace-in-place** (preserve FIFO
+  position). **clear DROPS** pending injects (fresh context); **compact PRESERVES** them (compact is not a fresh
+  context — it keeps the conversation; injects queued for the next turn survive the summarize) OR, mirroring
+  compact's existing pending-seed rejection (`session_manager.rs:1010`), **REJECTS compact while injects are
+  pending** (lean: reject-while-pending, simplest + consistent with the seed rule).
+
+### Decisions (RESOLVED)
+- **D1 = `PolicyOutcome::Defer`** (separate enum + defaulted trait method, SF-7) — NOT a `PermissionDecision`
+  arm. **D2 = dedicated `InjectParams` / `PermitParams`** (OpParams is prompt-shaped + requires `input`).
+  **D3 = clear drops, compact rejects-while-pending** (SF-9). **D4 = `Escalate` non-functional in-slice** — it
+  is modeled + routed, but in-slice it MUST NOT consume the pending sender; it falls through to the timeout
+  default (Deny). **D5 = inject-while-Running ALLOWED** (queues for the next checkout).
+
+### Revised task order (for the plan)
+1. **Domain (bridge-core):** `PermissionDecision{Approve,Deny,Modify,Escalate}` + `PolicyOutcome{Decide,Defer}`
+   + the defaulted `PolicyEngine::interactive_decide` + `InjectRequest`/`InjectMode`/`QueuedInject` +
+   `OrchEventKind::PermissionRequest{request_id,tool_call_id,generation,op,title,options,raw_input?,timeout_ms}`.
+2. **Queued-inject (coordinator):** `WarmHandle.pending_injects` + `inject()` + drain at the 3 checkout sites +
+   `WarmTurn.injects` + `LocalDispatch.injects` + the shared `assemble_turn_parts` helper (Coordinator + both
+   A2A producers, SF-5) + clear-drops/compact-rejects (SF-9).
+3. **PermissionRegistry (coordinator):** gen-keyed (SF-2) + `PermissionResolution` + exact-once + drop-guard
+   (SF-4); `resolve_context` wired into cancel/release/clear/reset (SF-1).
+4. **Route-context plumbing (acp):** carry `{ctx,gen,op}` on the route (SF-3).
+5. **Interactive permission path (acp):** `interactive_decide`→`Defer`→publish event + register(key) + await
+   `select!{ rx, sleep(timeout=Deny) }` + `map_decision_to_outcome` (reuse `acp_backend.rs:1264`); auto path
+   byte-identical (SF-7).
+6. **Detached sink skip (coordinator):** SF-6 (no panic).
+7. **Wire/CLI/MCP:** `SessionInject` + `SessionPermit` + the event in `task watch`.
+8. **DoD + dead-safe byte-identity test + live-gate** (untrusted+read-only codex + Defer policy).
