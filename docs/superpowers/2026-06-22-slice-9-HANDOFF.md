@@ -12,15 +12,16 @@
 - **Dual spec-review DONE** (codex-xhigh `1b0ecd9` + Opus lens). **Verdict: needs-respike.** Findings in
   `/tmp/slice-9-spec-review.out` (transient — re-run the workflow to regenerate).
 
-## The keystone: SPIKE-1 (do this FIRST — it gates the E2 half)
-**E2 is NOT reachable under current configs.** Today the ACP handler auto-answers every `session/request_
-permission` (`acp_backend.rs:1051`/`decide_permission:1227`); the default policy approves
-(`bridge-policy/src/permission.rs:15`); dogfood codex runs `approval_policy="never"`. So a real interactive
-permission NEVER fires live. **SPIKE-1 = empirically confirm a real permission arrives** with: codex `-c
-approval_policy="on-request"` (or `"untrusted"`) + a tool prompt that requires approval (a write/exec the
-sandbox would gate), OR claude-agent-acp permission mode `default`; + a bridge policy that returns `Defer`.
-Log the raw `RequestPermissionRequest` (options/tool_call/raw_input) and PIN the event shape to real traffic.
-If no config makes it fire, the E2 design/DoD must change — hence "respike before plan".
+## The keystone: SPIKE-1 — ✅ DONE (E2 FEASIBLE; shape pinned)
+**Confirmed empirically** (temporary `eprintln` probe in the `acp_backend.rs` permission handler, REVERTED):
+codex-acp with **`-c approval_policy="untrusted"` `-c sandbox_mode="read-only"`** + a turn attempting a
+sandbox-blocked **write** ("create /tmp/x.txt") emits a real `session/request_permission`. (`="never"`
+auto-runs → no ask; that is why dogfood never saw it.) Shape captured (`/tmp/ct-lg/spike1_shape.txt`):
+`tool_call: ToolCallUpdate{tool_call_id, kind:Execute, title:<cmd>, raw_input:{command,cwd,…}}` + `options[]`
+using STANDARD ACP kinds (`approved`/AllowOnce, `approved-execpolicy-amendment`/AllowAlways, `abort`/RejectOnce)
+→ the existing `decide_permission` mapping works UNCHANGED; `Modify`=select-offered-option validated. Folded
+into **spec v2** (`## v2` section, BINDING, `98c85f5`). Live-gate config pinned (untrusted+read-only + a Defer
+policy + a write-prompt).
 
 ## Spec-review findings to FOLD into spec v2 (after the spike)
 BLOCKERS:
@@ -58,12 +59,15 @@ compact PRESERVES-after-seed OR rejects-while-pending (compact already rejects a
 `InjectParams`/`PermitParams` (OpParams is prompt-shaped, requires input); D4=`Escalate` non-functional in-slice
 (must not consume the pending sender); D5=allow inject-while-Running (queue for next checkout).
 
-## NEXT (resume HERE)
-1. **Run SPIKE-1** (empirical, the keystone). Author a `Defer` policy + an interactive-approval codex config;
-   drive a permission-triggering turn; log the raw request; pin the shape. (De-risks the whole E2 half.)
-2. **Fold the spike + the 13 findings into spec v2** (a `## v2` section, like cancel-tokens). Re-review.
-3. **Then** plan → dual plan-review → 7 TDD tasks → whole-branch review → live-gate → merge.
-   (Consider SPLITTING: ship Part A queued-inject first — low-risk, no spike — and gate Part B on SPIKE-1.)
+## NEXT (resume HERE) — architect phase DONE (SPIKE-1 ✅ + spec v2 ✅)
+1. **(optional) Spec re-review** of v2 to confirm the needs-respike findings are resolved → ready-to-plan
+   (the SF-1..9 are folded; a quick codex-xhigh pass + Opus lens, or skip straight to the plan).
+2. **Plan** the v2 8-step task order (writing-plans skill) → dual plan-review (codex-xhigh + Opus) →
+   iterate-to-ready. Scaffolding ports 8124+ (8123 = spec-review).
+3. **TDD-implement** per task (codex-HIGH writes / Opus verifies+commits) → whole-branch dual-lens review →
+   live-gate (untrusted+read-only codex + a `Defer` policy: inject lands next turn; a real permission surfaces +
+   routed Deny blocks / Approve allows; cancel mid-permission ends promptly) → merge.
+   (User chose the FULL slice — inject + permission together — not the split.)
 
 ## Proven loop + scaffolding (reuse)
 - codex-HIGH implements (no commit) / Opus verifies+commits / codex-xhigh reviews / live-gate vs real codex.
