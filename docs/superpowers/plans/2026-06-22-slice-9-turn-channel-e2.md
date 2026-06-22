@@ -544,3 +544,101 @@ impl PermissionRegistry {
   live warm session? (Handler holds the turn; the warm handle exists during the turn. Confirm.)
 - R4: is scoping interactive permission to WARM sessions (detached-node deferred) acceptable for the slice DoD,
   or must a detached workflow node also support interactive permit in-slice?
+
+---
+
+## v3 — Dual-review reconciliation (Opus architecture lens + codex-xhigh 2nd pass) — BINDING
+
+> Both reviews returned **needs-revision** but agreed the v2 five-decision architecture is SOUND — the fixes
+> are precise edits, NOT re-architecture. This section supersedes v2 where it conflicts. Every corrected
+> `file:line` below was re-verified against the working tree. The two lenses were complementary (Opus =
+> lifecycle/placement/coherence; codex = wiring gaps + a wrong anchor that v2 AND the Opus lens both shared).
+
+### Corrected facts (verified — these change v2's anchors)
+| Fact | v2 said | TRUTH (verified) |
+|------|---------|------------------|
+| Serve policy construction | `main.rs:1913/2210/2627` | those are `implement_cmd`/resume/`run-workflow`. **Serve = `main.rs:3909` (inside `main`), MCP = `main.rs:3706` (`mcp_cmd`).** The live-gate uses SERVE → wire Defer at `:3909`+`:3706`. |
+| `RegistrySnapshot` carries policy | implied | NO — it has only `default`/`entries`/`allowed_cmds` (`domain.rs:217`). Policy selection goes on **`ServerConfig` (`config.rs:44`)** via a `make_policy(&cfg.server)` helper. |
+| `InboundServer` has a Coordinator | v2.T8/T9 call `coordinator.*` | NO coordinator field — only `registry`/`store`/`policy`/`task_store`/`session_manager` (`server.rs:71`). Wire `Arc<PermissionRegistry>` + `sm.inject` DIRECTLY into `InboundServer`; `SessionStatus` (`server.rs:2871`) reads `registry.pending`. |
+| `ContainerRwBackend` forwards turn config | unaddressed | It forwards `configure_session` (`bridge-container/src/lib.rs:97`) but NOT `configure_turn`; `AcpContainerSpawn` only `.with_policy` (`main.rs:296`). Must add a `configure_turn` forward + thread the registry into the inner `AcpBackend`. |
+| `LocalDispatch` carries gen/op | "confirm/add if absent" | ABSENT — only backend/session/seed/guard/warm_guard/abort (`dispatch.rs:71`). `WarmTurn` HAS gen+op (`session_manager.rs:95`); `WarmTurnGuard` carries ctx/gen/op. Add `turn_meta: Option<TurnMeta>` to `LocalDispatch`. |
+| `prompt_inner` turn-lock protects the stash | v2.T5 assumed | `ensure_session().await` runs at `:1955` BEFORE `turn_lock` at `:1959` — a failed `ensure_session` leaves stale stashed meta. `prompt_inner` must `take` pending `TurnMeta` at entry + clear on every early error + move into `TurnRoute` at `:1986`. |
+
+### v3 task amendments (apply ON TOP of v2)
+- **v2.T4 (resolve in SessionManager) — CRITICAL placement fix (Opus).** Call `resolve_context_cancelled(ctx)`
+  **AFTER** the `is_claimed`/`Cancelling` early-return guards, before any `backend.cancel().await`:
+  `cancel_inner` after `:701-707`; `release_inner` after its claimed guard; `reset_session_inner` after the
+  non-force claimed guard `:885-889`. **NOT at the very top** — a ctx whose handle is `Compacting`/`Resetting`
+  must NOT have its in-flight claim's pending summarize-permission cancelled (that poisons the summarize →
+  EXPIRE → data loss, the cancel-tokens latch lesson). Keep-warm `SessionCancel` DOES resolve a NORMAL turn's
+  pending permission — and unlike the abort-token, this is SAFE (the registry is exact-once + gen+op-keyed, not
+  a single slot) → add a test `keepwarm_cancel_resolves_pending_perm_without_stranding_next_turn` + a comment on
+  the disanalogy. **Drop the "swept on finish" claim** (spec `:211`): a pending permission cannot coexist with a
+  returned `PromptResponse` (the agent blocks on it), so finish-with-pending only happens on the abandon path,
+  reaped by handler-timeout + the drop-guard. Registry liveness is bounded by `min(operator-resolve,
+  permission_timeout_ms)` + drop-guard on EVERY handler exit; `resolve_context` is a prompt-cancel OPTIMIZATION,
+  not the authoritative reaper. Use `resolve_context_cancelled(&ctx)` (constructs `Cancelled` per send → no
+  `Clone` bound on `PermissionResolution`/`PermitDecision`).
+- **v2.T5 (TurnMeta route) — site + race fixes (both lenses).** The producer never calls `prompt` directly —
+  `Translator::run` does (`translator.rs:133`). Call `backend.configure_turn(session, meta)` in the THREE
+  PRODUCER functions before they drive the turn: `spawn_local_producer` (`server.rs:1376`, before `Translator::
+  run`), the unary Local arm (`server.rs:2311`), and the detached workflow `prompt_observed` caller
+  (`executor.rs:237`). Source `TurnMeta{context_id, generation, op}` from `dispatch.turn_meta` (NEW field —
+  add `turn_meta: Option<TurnMeta>` to `LocalDispatch`; fill `Some(TurnMeta{ctx, turn.generation,
+  turn.op.clone()})` in `warm_local_dispatch`, `None` for cold binds). `prompt_inner` takes the stash at entry,
+  clears it on every early error, moves it into `TurnRoute{tx, watch, turn_meta}`. `configure_turn` is a
+  DEFAULTED no-op trait method (other backends unaffected). `ContainerRwBackend` MUST forward it (see v2.T5b).
+  Note (Opus F2): ctx+gen are also derivable from the warm `SessionId` (`ctx-{ctx}-g{gen}`); `op` is the
+  load-bearing field — documented escape hatch, but `configure_turn` is the chosen seam. `TurnMeta` is cheap-clone.
+- **v2.T5b (NEW) — ContainerRwBackend propagation (codex BLOCKER C-F1).** Add a `configure_turn` forward to
+  `ContainerRwBackend`'s `AgentBackend` impl (mirror `configure_session` at `lib.rs:97`) → `inner.configure_turn`
+  before `inner.prompt`. Thread the shared `Arc<PermissionRegistry>` through `AcpContainerSpawn` (`main.rs:282-300`)
+  into the inner `AcpBackend.with_permission_registry(...)`. (The slice live-gate uses DIRECT codex, so this is
+  completeness — but the STANDING implementor config is containerized codex, so wire it.)
+- **v2.T6 (interactive handler) — Escalate + byte-identity fixes (codex).** `Escalate` is a TRUE no-op: a
+  `SessionPermit` carrying `PermitDecision::Escalate` does NOT `resolve` AND does NOT `reap` — the entry stays
+  visible until `permission_timeout_ms` → handler default-denies → the drop-guard reaps. (Fixes the v2
+  "reap-and-leave-pending" self-contradiction: `reap` removes-without-send, so it cannot leave-pending.) On the
+  `Decide` branch, preserve the EXACT current mapping including `PermissionRequest::with_id(tool_call_id, false)`
+  (`acp_backend.rs:1246`) so SF-7 byte-identity holds (`AutoPolicy` denies `interactive=true`, `permission.rs:15`).
+  Map `PermitDecision::Deny` and a policy `Err(PermissionDenied)` through the SAME `select(&[RejectOnce,
+  RejectAlways])` helper (`:1253`) → identical option; add a test they don't drift. Cold/detached prompt with NO
+  `TurnMeta` → immediate default-deny (or Cancelled), NO registry entry (codex R4).
+- **v2.T7 (Defer config) — correct sites (codex BLOCKER C-F2).** Add `permission_policy: Option<String>` +
+  `permission_timeout_ms: Option<u64>` (default `120_000`) to `[server]` `ServerConfig` (`config.rs:44`). A
+  `make_policy(&cfg.server) -> Arc<dyn PolicyEngine>` helper maps `"defer"`→`DeferPolicy` else `AutoPolicy`; call
+  it at SERVE (`main.rs:3909`) and MCP (`main.rs:3706`). `DeferPolicy` (bridge-policy): `decide`→`Ok(Approve)`
+  fallback, `interactive_decide`→`Defer`. NOTE the policy `Arc` is GLOBAL (one per serve, threaded via
+  `.with_policy`) → Defer is all-agents-or-none in-slice; per-agent Defer is a tracked follow-up (no per-agent
+  policy seam exists today). Thread `permission_timeout_ms` to `AcpBackend` + the container spawn.
+- **v2.T8 (session/status visibility) — direct server wiring (codex BLOCKER C-F3).** `InboundServer` gains a
+  `permission_registry: Option<Arc<PermissionRegistry>>` field (no Coordinator exists). The `SessionStatus`
+  handler (`server.rs:2871`) appends a `pendingPermissions` block from `registry.pending(&ctx)`. Each entry is a
+  `PendingPermissionView{request_id, tool_call_id, generation, op, title, options, raw_input(capped), timeout_ms}`
+  (codex C-F9 adds `tool_call_id`+capped `raw_input` per the SPIKE-1 shape, spec `:248-261`). The operator reads
+  gen+op+request_id from the CHOSEN pending entry (NOT the status root `generation`, which is the handle's CURRENT
+  gen — Opus F3).
+- **v2.T9 (wire/CLI/MCP) — direct handlers.** `SessionInject`/`SessionPermit` arms in `server.rs` dispatch
+  (`:691`) call `sm.inject(...)` and `registry.resolve(&key, Decided(decision))` DIRECTLY (no Coordinator). CLI
+  parser split + MCP `transport.rs:68`/`server.rs:70` as in v2.T9. `PermitParams.decision: PermitDecision`.
+- **v2.T10 (DoD/live-gate).** Live-gate = SERVE with `[server] permission_policy="defer"` + direct codex
+  `approval_policy="untrusted" sandbox_mode="read-only"` (port 8125). Visibility = `session status <ctx>` shows
+  `pendingPermissions` (request_id/op/options); `session permit <reqid> --context <c> --generation <n> --op <o>
+  --deny|--approve`; `session cancel <ctx>` mid-permission ends promptly. Poll-contract: `permission_timeout_ms`
+  default `120_000` ≫ any sane operator poll interval (Opus F4).
+
+### Deferred — TRACKED (not silently dropped)
+- **Push/SSE permission visibility** — in-slice is PULL (`session/status`). A future slice adds a push reader of
+  the SAME registry (insertion point: a `registry.subscribe`/journal reader; the registry already holds the
+  views — no seam move). Tracked here alongside SF-8.
+- **Detached-node INTERACTIVE permit** — detached workflow nodes run unattended; in-slice a Defer policy on a
+  detached node TIMES OUT to default-deny (no operator). Interactive detached permit (human-in-the-loop queue)
+  is a future slice. v2.T5's `executor.rs:237` `configure_turn` site is still wired so detached-Defer times-out
+  cleanly rather than hanging.
+- **Per-agent Defer policy** — needs a per-agent policy seam (none today); in-slice Defer is global `[server]`.
+- **Producer-join residual single-slot re-mint** (SF-8, inherited from cancel-tokens) — unchanged.
+
+### v3 verdict
+Both lenses: needs-revision → **all findings folded above**. No re-architecture; the five v2 decisions stand.
+ONE scope question surfaced by both R4 answers (warm-only interactive permit, detached deferred) — both
+reviewers call it the correct slice boundary. Plan is now **ready-to-implement** pending that scope confirm.
