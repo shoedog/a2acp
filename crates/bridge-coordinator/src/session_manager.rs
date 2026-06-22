@@ -75,6 +75,17 @@ struct WarmHandle {
     expire_after_reconcile: bool,
     #[allow(dead_code)]
     op: Option<OperationId>,
+    /// The in-flight turn's abort token (cancel-tokens F2). Fired by every backend-session-release path via
+    /// `fire_lingering_turn_abort` so a pre-first-poll producer aborts instead of re-minting the released
+    /// session. A keep-warm `SessionCancel` deliberately LEAVES the token here (rather than firing it — that
+    /// would strand the ACP cancel latch) so a later reset/release can still fire it.
+    ///
+    /// KNOWN LIMITATION — DEFERRED TO SLICE 9 (owner decision 2026-06-21): this is a SINGLE slot. If a
+    /// keep-warm cancel leaves a token here and the NEXT checkout installs a new turn's token, the lingering
+    /// one is overwritten/orphaned — so a `cancel A → checkout B → release/reset` sequence can let producer A
+    /// re-mint the released session. Closing it needs producer-join (hold the handle claimed until the
+    /// cancelled producer confirms exit) or a `Vec` lingering-token collection drained at every release site;
+    /// both belong to Slice 9's cancel-under-concurrency work.
     turn_abort: Option<CancellationToken>,
     pending_seed: Option<String>,
     last_used: Instant,
