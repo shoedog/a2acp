@@ -126,7 +126,20 @@
   scheduler token then sweeps children, drain-on-cancel preserved); one `on_exit(NodeTurnExit)` cleanup
   (finish/`sm.cancel`/expire-on-`AgentCrashed`); gate lift STREAMING-ONLY; `async-trait`→`[dependencies]`; warm
   nodes don't record usage (deferred). Then S6 journal → S7 observability+E9 → S8 MCP → S9 Turn Channel → tail.
-- **Slice 7b — E9 per-turn watchdog: SHIPPED + MERGED to `main`** (merge `67bb186`, NOT yet pushed) (2026-06-20).
+- **Slice 8 — MCP/D1 surface (roadmap item K): SHIPPED + MERGED + PUSHED** (merge `52b4f9a`) (2026-06-21).
+  A2A/CLI/MCP are now thin adapters over ONE `Coordinator` service API. New `crates/bridge-coordinator`
+  (the `Coordinator` façade + moved SessionManager/detached/Clock/compact/OpParams/dispatch) + new
+  `crates/bridge-mcp` (async stdio adapter, OWN NDJSON framing — no bridge-acp→rmcp dyld trap) + the
+  `a2a-bridge mcp` subcommand (one SqliteStore→both stores, single-owner lock, sterile stdout, boot resume).
+  T9 RESCOPED: single-sourced the detached envelope; full A2A-handler-thinning DEFERRED (the Coordinator is
+  a warm-only MCP surface, not an extraction → not byte-identical). Whole-branch dual-lens review
+  (codex-xhigh `changes-required` → fixes: `continue` fingerprint-inheritance `checkout_existing_turn`,
+  `prompt` drop-safety `TurnFinishGuard`) + live-gate 8/8 vs real codex (warm run→continue codeword recall,
+  durable detached workflow, split-state durability + single-owner lock; caught+fixed the last-delta
+  truncation). Deferred follow-ups: T9 deep-unification + Finding-3 detached clock seam. Docs:
+  `2026-06-21-slice-8-T8-T10-HANDOFF.md` + `specs/2026-06-20-slice-8-mcp*.md` + `plans/2026-06-20-slice-8-mcp.md`.
+  **NEXT = next roadmap slice OR a deferred follow-up.**
+- **Slice 7b — E9 per-turn watchdog: SHIPPED + MERGED + PUSHED to `main`** (merge `67bb186`, on `origin/main` via `21fd1ac`) (2026-06-20).
   Docs: `specs/2026-06-20-slice-7b-watchdog-ANALYSIS.md` + `specs/2026-06-20-slice-7b-watchdog.md` (spec v2,
   FIX-1..12) + `plans/2026-06-20-slice-7b-watchdog.md` (plan v2, PFIX-A..M). Opt-in per-agent
   `[agents.watchdog] {idle_timeout_secs, hard_wall_clock_secs}` arms a per-turn watchdog in
@@ -155,8 +168,8 @@
   (`hard_wall_clock=3s`) killed a steadily-EMITTING turn at 3s -> `agent timed out` (A2A `Failed`); wd-ok
   (`idle_timeout=5s`) ran the SAME 66s turn to NATURAL completion (steady streaming reset idle, FN-1); a re-submit
   tripped AGAIN at 3s (the timed-out turn RELEASED its lock — no deadlock); no codex turn leak. Gate: fmt + clippy
-  `--all-targets` clean; full workspace 822 pass / 0 fail. **NEXT = Slice 8** (MCP) per the roadmap (`S7
-  observability+E9` now COMPLETE: S7a rich journaling + S7b watchdog); OR push `67bb186`.
+  `--all-targets` clean; full workspace 822 pass / 0 fail. (`S7 observability+E9` COMPLETE: S7a rich
+  journaling + S7b watchdog. **Slice 8 (MCP) now ALSO SHIPPED+MERGED+PUSHED — see the entry above.**)
 - **NEW FOLLOW-UP (from the Slice-4 whole-branch review):** the caller-future-drop + reap-vs-claim TOCTOU
   patterns also exist (smaller window) in the SHIPPED `reset_session`/clear path. Slice 4 fixed compact's
   (wider) version + made `reap_idle` claim-safe for ALL claims; consider the same spawn-detach for
