@@ -1897,6 +1897,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continue_after_force_clear_uses_new_empty_generation() {
+        // cancel-tokens DoD / SPEC-FIX-7: a force-clear of a Running turn leaves the context at a NEW empty
+        // generation (Idle) — a subsequent continue (checkout_existing_turn) SUCCEEDS at the new generation,
+        // it does NOT return SessionNotFound (which is only for a truly unknown context).
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-reclear");
+        let first = manager.checkout_turn(&c, agent(), None, None).await.unwrap();
+        assert_eq!(first.generation.get(), 0);
+        let out = manager
+            .reset_session(&c, ResetOpts { force: true })
+            .await
+            .unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+        let next = manager.checkout_existing_turn(&c).await.unwrap();
+        assert_eq!(next.generation.get(), 1, "continue uses the new generation");
+        assert_ne!(next.op, first.op, "the new turn mints a fresh op nonce");
+    }
+
+    #[tokio::test]
     async fn reset_configure_failure_expires_handle_and_returns_error() {
         let (manager, backend, _r) = manager();
         let c = ctx("reset-cfg-fail");
