@@ -138,7 +138,21 @@
   durable detached workflow, split-state durability + single-owner lock; caught+fixed the last-delta
   truncation). Deferred follow-ups: T9 deep-unification + Finding-3 detached clock seam. Docs:
   `2026-06-21-slice-8-T8-T10-HANDOFF.md` + `specs/2026-06-20-slice-8-mcp*.md` + `plans/2026-06-20-slice-8-mcp.md`.
-  **NEXT = next roadmap slice OR a deferred follow-up.**
+- **Warm-turn cancellation tokens (Slice-9 PREREQUISITE): SHIPPED + MERGED to `main`** (merge `12e3816`)
+  (2026-06-22). Closes the two PRE-EXISTING races `SessionClear --force` surfaced (deferred from Slice 3):
+  **F1** = `SessionManager` mints a UNIQUE per-checkout op nonce (`turn-{n}`, AtomicU64) replacing the caller
+  `op` param (A2A `op-{task}` + workflow-node derivations deleted); `finish_turn`/`record_usage` guard on
+  `gen+op+Running`. **F2** = a per-turn `CancellationToken` on the warm handle → `WarmTurn` → `LocalDispatch`;
+  all 3 warm producers race it in a **`biased;` select, abort arm FIRST**, entered before the first translator
+  poll (the re-mint window); every backend-release path fires it first via `fire_lingering_turn_abort`
+  (force-reset/SessionRelease/cancel-expire/reap/reconcile-expire). **KEY: keep-warm `SessionCancel` does NOT
+  fire the token (would strand the ACP cancel latch → spurious next-turn cancel); compact does NOT fire it
+  (latch-poisons its summarize).** 7-round whole-branch dual review drove the ACP-latch fix cascade (round 7 =
+  approve); live-gate 5/5 vs real codex (Race-1 cancel-no-clobber + Race-2 force-clear→new-empty-gen). Two
+  narrow lingering-producer re-mint vectors (single `turn_abort` slot overwrite; compact-vs-lingering-producer)
+  DEFERRED to Slice 9 (producer-join), documented in code. Spec/plan: `specs|plans/2026-06-21-warm-turn-
+  cancellation-tokens.md`; resume doc `2026-06-21-cancel-tokens-HANDOFF.md`. See [[cancel-tokens-shipped]].
+  **NEXT = Slice 9 (Turn Channel + E2 permission / cancel-under-concurrency) — now UNBLOCKED.**
 - **Slice 7b — E9 per-turn watchdog: SHIPPED + MERGED + PUSHED to `main`** (merge `67bb186`, on `origin/main` via `21fd1ac`) (2026-06-20).
   Docs: `specs/2026-06-20-slice-7b-watchdog-ANALYSIS.md` + `specs/2026-06-20-slice-7b-watchdog.md` (spec v2,
   FIX-1..12) + `plans/2026-06-20-slice-7b-watchdog.md` (plan v2, PFIX-A..M). Opt-in per-agent
