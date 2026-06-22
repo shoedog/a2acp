@@ -43,7 +43,14 @@
   before/while polling the translator (pre-first-poll abort prevents the `backend.prompt` re-mint — the real
   Race-2 window is the `store.put` gap); `reset_session(force)` cancels it under the `Resetting` claim.
 
-## The 7 tasks (with the PLAN-FIX corrections folded — READ plan v2)
+## The 7 tasks — ALL DONE (record of what was built; tests in parentheses)
+- **T1** `9a2df3e` — manager mint + ~100-site sweep (`checkout_mints_unique_op_nonce_per_turn`).
+- **T2/T3** `bdc1cf3` — force-reset cancel + LocalDispatch.abort (`force_reset_cancels_the_inflight_turn_abort`).
+- **T4/T5/T6** `c0aaa71` — biased abort-select in the 3 producers (`collect_turn_pre_cancelled_abort_never_prompts`
+  = the no-re-mint proof: a PanicOnPromptBackend + pre-cancelled token asserts prompt is NEVER called).
+- **T7** `91adbaa` — DoD (`continue_after_force_clear_uses_new_empty_generation`, SPEC-FIX-7).
+
+### Original task breakdown (the design detail — with the PLAN-FIX corrections folded; READ plan v2)
 1. **Manager mint (IN FLIGHT):** `turn_op_seq` counter + `mint_turn_op()`; `WarmHandle.turn_abort:
    Option<CancellationToken>` (init None everywhere); `WarmTurn.abort: CancellationToken`; mint at ALL 4
    `WarmTurn` sites (`checkout_turn_inner` no-diff-reuse `:274` + clean-reconcile `:409` + fresh-mint `:472`,
@@ -87,17 +94,31 @@
   (the worktree has MANY unrelated untracked `examples/*.toml`/`prompts/*.md` — do NOT fold them; also the
   pre-existing `M examples/a2a-bridge.slicing-analysis.toml` is NOT ours). Commit.
 
-## After all 7 tasks
-- Whole-branch dual-lens review (codex-xhigh via the bridge — mirror the slice-8 whole-branch scaffolding + a
-  new prompt; ports used so far: spec-review 8118, plan-review 8119, impl 8120) + an Opus lens on `git diff
-  main...HEAD`. Pressure-test: the re-mint guarantee (biased select), the token-clearing on EVERY turn-end path,
-  no stranded tokens, the gen+nonce guard, byte-identity elsewhere.
-- **Live-gate vs real codex:** Race 1 (cancel-then-immediate-resend doesn't clobber the new turn) + Race 2
-  (force-clear during a turn leaves the context at a new empty generation, not resurrected) on the A2A surface
-  (MCP has no `force` — SPEC-FIX-3). Build the binary; a scripted client (the slice-8 NDJSON driver pattern or
-  the A2A wire).
-- Merge `--no-ff` to `main` once clean; update memory (`slice-3-clear-reset-shipped` deferred-hardening block
-  is now CLOSED for F1/F2; write a `cancel-tokens-shipped` note) + the orchestration HANDOFF; push.
+## NEXT (resume HERE — implementation is done) → review → live-gate → merge
+1. **Whole-branch dual-lens review** (the cross-task net). Create `prompts/cancel-tokens-whole-branch-review.md`
+   + `examples/a2a-bridge.cancel-tokens-whole-branch-review-codex.toml` (codex `effort="xhigh"`, `sandbox_mode
+   ="read-only"`, NEW port e.g. 8121 — ports used: spec 8118, plan 8119, impl 8120), mirror the slice-8
+   whole-branch scaffolding. Run via `run-workflow` on `git diff main...HEAD` + an Opus lens. **Pressure-test:**
+   (a) the re-mint guarantee — is the abort select `biased;` with the abort arm FIRST in ALL THREE producers
+   (streaming `spawn_local_producer`, unary Local, Coordinator `collect_turn`)? (b) is `turn_abort` cleared on
+   EVERY turn-end path (`finish_turn`, `cancel_inner`, the reset/compact new-gen handles) — no stranded token on
+   an Idle handle? (c) the nonce guard (gen+op) — can a stale producer still match? (d) the `reset_session_inner`
+   cancel ordering (cancel BEFORE `release_session`, under the `Resetting` claim); (e) byte-identity elsewhere
+   (133+47 unchanged); (f) any abort-arm `tx.send` on a closed channel (ignored?); (g) the cold-bind fresh token.
+   Iterate to clean (fold fixes; re-verify the gate).
+2. **Live-gate vs real codex (A2A surface — MCP has no `force`, SPEC-FIX-3).** Build the binary; author
+   `examples/a2a-bridge.cancel-tokens-livegate.toml` (real codex + `[store]`). Drive the A2A wire (the slice-8
+   live-gate used `a2a-bridge mcp` + an NDJSON driver; here use the A2A `message/send` + `session/clear
+   {force:true}` JSON-RPC, e.g. a small python driver against `a2a-bridge serve`). Prove: **Race 1** — a
+   `SessionCancel` then an immediate same-context resend; the cancelled turn's late completion does NOT clobber
+   the new turn (the new turn's reply is correct). **Race 2** — a `session/clear {force:true}` fired DURING a
+   gated/long turn leaves the context at a new EMPTY generation (a follow-up `continue` recalls nothing), never
+   resurrected; the in-flight turn ends Canceled. (Note: hitting the checkout→prompt window live is timing-y —
+   a long-running codex turn + a concurrent force-clear is the practical shape.)
+3. **Merge `--no-ff` to `main`** once the review is clean + live-gate passes. Update memory: the
+   `slice-3-clear-reset-shipped` DEFERRED-HARDENING block is now CLOSED for F1/F2 (F3 still open); write a
+   `cancel-tokens-shipped` memory note; update the MEMORY.md RESUME line + the orchestration HANDOFF (this
+   prereq DONE → **Slice 9 now UNBLOCKED**). **Push.**
 
 ## OUT OF SCOPE (documented; separate follow-ups)
 - **F3** `session_clear` strand-window hardening (`workflow_runs`-lock migration + the clear wire-contract
