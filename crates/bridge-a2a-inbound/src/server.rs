@@ -489,7 +489,6 @@ async fn warm_local_dispatch(
     srv: &Arc<InboundServer>,
     agent_id: &AgentId,
     routed: &RoutedCall,
-    op: OperationId,
 ) -> Option<Result<LocalDispatch, BridgeError>> {
     let ctx = routed.context_id.clone()?;
     let sm = srv.session_manager.clone()?;
@@ -499,7 +498,6 @@ async fn warm_local_dispatch(
             agent_id.clone(),
             routed.overrides.clone(),
             routed.session_cwd.clone(),
-            op,
         )
         .await
     {
@@ -539,7 +537,7 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
         &self,
         wf_id: &str,
         node: &WorkflowNode,
-        run_id: &str,
+        _run_id: &str,
         _ctx: &WorkflowRunContext,
     ) -> Result<NodeTurn, BridgeError> {
         let child = ContextId::parse(format!(
@@ -548,7 +546,6 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
             wf_id,
             node.id.as_str()
         ))?;
-        let op = OperationId::parse(format!("workflow-{run_id}-node-{}", node.id.as_str()))?;
         let turn = self
             .sm
             .checkout_child_turn(
@@ -557,7 +554,6 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
                 node.agent.clone(),
                 None,
                 self.cwd.clone(),
-                op,
             )
             .await?;
         Ok(NodeTurn {
@@ -767,8 +763,7 @@ async fn stream_message(
             // SSE frame rather than a JSON-RPC error (streaming has already committed
             // to an SSE response).
             let agent_id = local_agent_id(&srv, &routed.target);
-            let op = OperationId::parse(format!("op-{}", routed.task.as_str())).unwrap();
-            let dispatch = match warm_local_dispatch(&srv, &agent_id, &routed, op).await {
+            let dispatch = match warm_local_dispatch(&srv, &agent_id, &routed).await {
                 Some(r) => r,
                 None => {
                     resolve_configure_bind(
@@ -2270,8 +2265,7 @@ async fn unary_message(
             // for the call's DURATION (so an interleaved cancel finds the binding) and
             // is dropped at the end of this scope → eviction after `collect().await`.
             // A follow-up reuses the binding and carries no guard (no premature evict).
-            let op = OperationId::parse(format!("op-{}", routed.task.as_str())).unwrap();
-            let dispatch = match warm_local_dispatch(&srv, agent_id, &routed, op).await {
+            let dispatch = match warm_local_dispatch(&srv, agent_id, &routed).await {
                 Some(r) => r,
                 None => {
                     resolve_configure_bind(
@@ -7139,16 +7133,9 @@ mod tests {
         let (srv, sm, _) = seed_test_server();
         let parent = ContextId::parse("c-workflow").unwrap();
         let child = ContextId::parse("c-workflow::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &parent,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-child").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&parent, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         assert!(
             sm.status(&child).await.is_some(),
             "child handle should exist before release"
@@ -7180,16 +7167,9 @@ mod tests {
         let (srv, sm, _) = seed_test_server();
         let ctx = ContextId::parse("c-active-release").unwrap();
         let child = ContextId::parse("c-active-release::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &ctx,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-active-release").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&ctx, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         srv.workflow_runs
             .lock()
             .await
@@ -7219,16 +7199,9 @@ mod tests {
         let (srv, sm, backend) = seed_test_server();
         let parent = ContextId::parse("c-release-atomic").unwrap();
         let child = ContextId::parse("c-release-atomic::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &parent,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-release-atomic").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&parent, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         let release_gate = backend.gate_release_session();
 
         let release = tokio::spawn({
@@ -7268,16 +7241,9 @@ mod tests {
         let (srv, sm, _) = seed_test_server();
         let ctx = ContextId::parse("c-active-clear").unwrap();
         let child = ContextId::parse("c-active-clear::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &ctx,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-active-clear").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&ctx, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         srv.workflow_runs
             .lock()
             .await
@@ -7307,16 +7273,9 @@ mod tests {
         let (srv, sm, backend) = seed_test_server();
         let parent = ContextId::parse("c-clear-atomic").unwrap();
         let child = ContextId::parse("c-clear-atomic::workflow::wf::node::n1").unwrap();
-        sm.checkout_child_turn(
-            &parent,
-            &child,
-            AgentId::parse("a").unwrap(),
-            None,
-            None,
-            OperationId::parse("op-clear-atomic").unwrap(),
-        )
-        .await
-        .expect("child checkout");
+        sm.checkout_child_turn(&parent, &child, AgentId::parse("a").unwrap(), None, None)
+            .await
+            .expect("child checkout");
         let release_gate = backend.gate_release_session();
 
         let clear = tokio::spawn({

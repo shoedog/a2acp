@@ -156,12 +156,6 @@ impl Coordinator {
             .expect("minted context id is non-empty")
     }
 
-    fn mint_operation_id(&self) -> OperationId {
-        let seq = PROMPT_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-        OperationId::parse(format!("op-{}-{seq}", self.clock.now_ms()))
-            .expect("minted operation id is non-empty")
-    }
-
     fn mint_prompt_task_id(&self) -> TaskId {
         let seq = PROMPT_ID_SEQ.fetch_add(1, Ordering::Relaxed);
         TaskId::parse(format!("prompt-{}-{seq}", self.clock.now_ms()))
@@ -178,10 +172,9 @@ impl Coordinator {
             .clone()
             .unwrap_or_else(|| self.registry.default_id());
         let ctx = p.context.clone().unwrap_or_else(|| self.mint_context_id());
-        let op = self.mint_operation_id();
         let turn = self
             .session_manager
-            .checkout_turn(&ctx, agent, Some(p.agent_override()), cwd, op)
+            .checkout_turn(&ctx, agent, Some(p.agent_override()), cwd)
             .await?;
         self.collect_turn(ctx, turn, p.input).await
     }
@@ -195,11 +188,7 @@ impl Coordinator {
             .context
             .clone()
             .ok_or(BridgeError::InvalidRequest { field: "context" })?;
-        let op = self.mint_operation_id();
-        let turn = self
-            .session_manager
-            .checkout_existing_turn(&ctx, op)
-            .await?;
+        let turn = self.session_manager.checkout_existing_turn(&ctx).await?;
         self.collect_turn(ctx, turn, p.input).await
     }
 
@@ -495,7 +484,7 @@ mod tests {
         PermissionRequest, RegistrySnapshot, SessionContext,
     };
     use bridge_core::error::BridgeError;
-    use bridge_core::ids::{AgentId, ContextId, NodeId, OperationId, SessionId};
+    use bridge_core::ids::{AgentId, ContextId, NodeId, SessionId};
     use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::{AgentBackend, BackendStream, Lease, Resolved, Update};
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus};
@@ -804,10 +793,6 @@ mod tests {
                 inputs: Vec::new(),
             }],
         })
-    }
-
-    fn op(id: &str) -> OperationId {
-        OperationId::parse(id).unwrap()
     }
 
     fn ctx(id: &str) -> ContextId {
@@ -1138,11 +1123,7 @@ mod tests {
         // (a stranded Running handle would stay HandleBusy forever and exhaust the loop).
         let mut released = false;
         for _ in 0..1000 {
-            match coord
-                .session_manager
-                .checkout_existing_turn(&known, op("op-recheck"))
-                .await
-            {
+            match coord.session_manager.checkout_existing_turn(&known).await {
                 Ok(_) => {
                     released = true;
                     break;
@@ -1258,13 +1239,7 @@ mod tests {
         let turn = fixture
             .coordinator
             .session_manager
-            .checkout_turn(
-                &c,
-                AgentId::parse("codex").unwrap(),
-                None,
-                None,
-                op("op-shutdown"),
-            )
+            .checkout_turn(&c, AgentId::parse("codex").unwrap(), None, None)
             .await
             .unwrap();
         fixture
