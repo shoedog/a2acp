@@ -17,10 +17,15 @@
 
 ## State (2026-06-21) — branch `feat/warm-turn-cancellation-tokens` (NOT pushed, NOT merged)
 - Base = `main` = `origin/main` `52b4f9a`.
-- **Commits so far (docs only):** `b4b40cf` spec v2 · `a48d0b2` plan · `8b4cf84` plan v2. NO code committed yet.
-- **IN FLIGHT:** codex-HIGH implementing **Task 1** via `run-workflow` (background; out → `/tmp/cancel-tokens-task-1.out`).
-  On resume: check if it finished (read that file + `git status`), then VERIFY in the clean host env + commit
-  (see the loop below). If it didn't finish / the tree is dirty-but-uncommitted, re-verify the post-state.
+- **ALL 7 TASKS IMPLEMENTED + COMMITTED + clean-host-verified.** Code commits: `9a2df3e` T1 (manager mint +
+  ~100-site sweep) · `bdc1cf3` T2/T3 (force-reset cancel + LocalDispatch.abort) · `c0aaa71` T4/T5/T6 (biased
+  abort-select in all 3 producers + the pre-first-poll no-re-mint proof) · `91adbaa` T7 (SPEC-FIX-7 DoD). Docs:
+  `b4b40cf` spec v2 · `a48d0b2` plan · `8b4cf84` plan v2 · `c4fc334` this handoff.
+- **Gate GREEN:** bridge-coordinator 111 ; bridge-a2a-inbound 133 lib + 47 integration (byte-identical) ;
+  `cargo test --workspace --no-run` + `clippy --workspace --all-targets` + `fmt --all --check` all clean.
+- **NEXT = whole-branch dual-lens review → live-gate → merge** (see "After all 7 tasks" below). Implementation
+  done by the controller directly (not codex) for T2-T7 — the small surgical concurrency edits; T1's ~100-site
+  sweep went through codex-HIGH.
 
 ## Binding docs (the rulings are SETTLED — do NOT re-litigate)
 - **Spec:** `docs/superpowers/specs/2026-06-21-warm-turn-cancellation-tokens.md` — the **`## v2 (SPEC-FIX-1..8 +
