@@ -44,6 +44,20 @@ fn is_claimed(s: SessionState) -> bool {
     )
 }
 
+/// cancel-tokens F2 (whole-branch review): fire any abort token still lingering on a handle whose backend
+/// session is about to be RELEASED. A keep-warm `SessionCancel` deliberately leaves the in-flight turn's
+/// token on the (Idle) handle — see `cancel_inner` — so a pre-first-poll producer stays cancellable rather
+/// than stranding the ACP cancel latch. The invariant that makes that safe: EVERY path that then releases
+/// that backend session must fire the lingering token FIRST, or the producer could re-mint the released
+/// session. Call this under the `by_context` lock immediately before `backend.release_session(&old_id)`
+/// (or before pushing a removed handle to a deferred release). `cancel()` is synchronous → lock-safe.
+/// Latch-safe: `release_session` removes the ACP entry, so the cancel latch dies with it.
+fn fire_lingering_turn_abort(h: &mut WarmHandle) {
+    if let Some(tok) = h.turn_abort.take() {
+        tok.cancel();
+    }
+}
+
 struct WarmHandle {
     #[allow(dead_code)] // surfaced by handle ops in later slices
     id: SessionHandleId,
@@ -436,7 +450,11 @@ impl SessionManager {
             // Non-clean (failed reconcile OR cancel/release arrived mid-window): EXPIRE via an `Expiring`
             // tombstone held across release_session().await so a concurrent checkout (HandleBusy on Expiring)
             // can't re-mint the same backend_session id before release completes.
-            tab.get_mut(ctx).expect("still_ours").state = SessionState::Expiring;
+            // cancel-tokens F2 (whole-branch review round 4): a non-clean reconcile EXPIRES (releases) this
+            // session; a keep-warm cancel may have left a lingering token on it → fire before release.
+            let h = tab.get_mut(ctx).expect("still_ours");
+            fire_lingering_turn_abort(h);
+            h.state = SessionState::Expiring;
             drop(tab);
             backend.release_session(&backend_session).await;
             {
@@ -621,15 +639,9 @@ impl SessionManager {
                     h.expire_after_reconcile = true;
                     return;
                 }
-                // cancel-tokens F2 (whole-branch review, Finding 2): a SessionRelease of a handle with an
-                // in-flight turn releases the backend session out from under the producer. Cancel its abort
-                // token UNDER the lock, BEFORE release_session below, so a producer in the checkout→first-
-                // poll gap aborts instead of prompting (and ACP lazy-re-minting) the just-released session.
-                // Latch-safe: release_session removes the ACP session entry, so its cancel latch dies with
-                // it (unlike the keep-warm cancel path). An Idle handle has no live turn (None).
-                if let Some(tok) = h.turn_abort.take() {
-                    tok.cancel();
-                }
+                // cancel-tokens F2: SessionRelease releases the session out from under any in-flight turn —
+                // fire the lingering token under the lock before release_session below.
+                fire_lingering_turn_abort(h);
             }
             tab.remove(ctx)
         };
@@ -725,13 +737,9 @@ impl SessionManager {
                     // reset/release; overwritten by the next checkout). The producer drains the ACP latch.
                     tab.get_mut(ctx).expect("still_ours").state = SessionState::Idle;
                 } else if let Some(mut h) = tab.remove(ctx) {
-                    // EXPIRE: this cancel is releasing the session (backend.cancel failed, or a release was
-                    // deferred onto us). Fire the in-flight turn's abort token UNDER the lock, before
-                    // release_session below, so a producer in the checkout→first-poll gap aborts instead of
-                    // re-minting the released session. Latch-safe: release_session removes the entry.
-                    if let Some(tok) = h.turn_abort.take() {
-                        tok.cancel();
-                    }
+                    // EXPIRE: this cancel releases the session (backend.cancel failed, or a deferred release
+                    // landed on us) → fire the lingering token before release_session below.
+                    fire_lingering_turn_abort(&mut h);
                     expired = Some(h);
                 }
             } else {
@@ -896,16 +904,10 @@ impl SessionManager {
                 config: h.fingerprint.config.clone(),
                 cwd,
             };
-            // F2 (cancel-tokens): all fallible validation has passed — we are committed to Resetting, so
-            // take the in-flight turn's abort token and cancel it UNDER the lock. The cancel then strictly
-            // precedes BOTH the lock release and the backend teardown (cancel/release_session) below — a
-            // force-clear can never let a producer poll a released session with an un-cancelled token (and
-            // ACP lazy-re-mint the cleared context). Taking it only here (not before the fallible new_id/cwd
-            // validation) avoids stranding the token on an early-return error path. An Idle reset has no
-            // live turn (None). cancel() is synchronous, so holding the lock across it cannot deadlock.
-            if let Some(tok) = h.turn_abort.take() {
-                tok.cancel();
-            }
+            // F2 (cancel-tokens): all fallible validation passed — committed to Resetting. Fire the lingering
+            // token UNDER the lock (only here, after the fallible new_id/cwd parses, so an early-return error
+            // path can't strand it) so the cancel strictly precedes the lock release + backend teardown below.
+            fire_lingering_turn_abort(h);
             h.state = SessionState::Resetting;
             h.expire_after_reconcile = false;
             (backend, old_id, claimed_id, new_gen, new_id, spec)
@@ -1020,6 +1022,10 @@ impl SessionManager {
                 config: h.fingerprint.config.clone(),
                 cwd,
             };
+            // cancel-tokens F2 (whole-branch review round 4): compact RELEASES old_id (the success path AND
+            // expire_after_summarize) — fire any lingering keep-warm-cancel token now, under the claim and
+            // after the fallible parses, so a pre-first-poll producer can't re-mint the released session.
+            fire_lingering_turn_abort(h);
             h.state = SessionState::Compacting;
             h.expire_after_reconcile = false;
             (backend, old_id, claimed_id, new_gen, new_id, spec)
@@ -1173,7 +1179,10 @@ impl SessionManager {
                 children.retain(|_, set| !set.is_empty());
             }
         }
-        for h in handles {
+        for mut h in handles {
+            // cancel-tokens F2 (whole-branch review round 4): a reaped Idle handle may carry a lingering
+            // keep-warm-cancel token — fire it before releasing so a pre-first-poll producer can't re-mint.
+            fire_lingering_turn_abort(&mut h);
             h.backend.release_session(&h.backend_session).await;
             drop(h.lease);
         }
@@ -2041,6 +2050,55 @@ mod tests {
         assert!(
             manager.status(&c).await.is_none(),
             "an expiring cancel removes the handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_after_keep_warm_cancel_fires_lingering_token() {
+        // cancel-tokens F2 (whole-branch review round 4): a keep-warm cancel leaves the token on the Idle
+        // handle; a following compact RELEASES old_id, so it must fire that lingering token first (else a
+        // pre-first-poll producer could re-mint the released session).
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-compact-fires");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        assert!(!turn.abort.is_cancelled(), "keep-warm cancel does not fire");
+        let out = manager
+            .compact_session(&c, |_b, _s| async { Ok("THE SUMMARY".to_string()) })
+            .await
+            .unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+        assert!(
+            turn.abort.is_cancelled(),
+            "compact must fire the lingering keep-warm-cancel token before releasing old_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_after_keep_warm_cancel_fires_lingering_token() {
+        // cancel-tokens F2 (whole-branch review round 4): a reaped Idle handle that carries a lingering
+        // keep-warm-cancel token must have it fired before the reaper releases the backend session.
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let clock = Arc::new(ManualClock::new(0));
+        let manager =
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone());
+        let c = ctx("ctx-reap-fires");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        assert!(!turn.abort.is_cancelled());
+        clock.advance(Duration::from_secs(6));
+        manager.reap_idle().await;
+        assert!(manager.status(&c).await.is_none(), "reaped past TTL");
+        assert!(
+            turn.abort.is_cancelled(),
+            "reap must fire the lingering keep-warm-cancel token before releasing"
         );
     }
 
