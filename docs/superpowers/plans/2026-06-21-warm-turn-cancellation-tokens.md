@@ -19,6 +19,43 @@ claim so a force-clear aborts the in-flight producer before it re-mints the rele
 **Binding spec:** `docs/superpowers/specs/2026-06-21-warm-turn-cancellation-tokens.md` — the **v2 section
 (SPEC-FIX-1..8 + L1..L3) SUPERSEDES** the draft. **F3 is SPLIT OUT (not in this plan).** Scope = F1 + F2.
 
+## v2 — dual plan-review folded (BINDING; codex-xhigh fix-then-implement + Opus lens)
+These corrections SUPERSEDE contradicting task-body text. (`tokio-util`/`CancellationToken` are ALREADY deps of
+both crates — no Cargo change. `Event::terminal(TaskOutcome::Canceled)` CONFIRMED at `translator.rs:91`.)
+- **PLAN-FIX-1 (BLOCKER — clear the token on turn end).** `finish_turn` (`session_manager.rs:535`) clears
+  `h.op` but NOT the new token → a completed turn would strand a stale `turn_abort` on the Idle handle
+  (breaking the "Idle ⇒ None" invariant). In the finish branch ALSO set `h.turn_abort = None;`. AND in
+  `cancel_inner` (`:659`): when it clears `h.op`, `take()` the token; for a Running cancel, `.cancel()` it
+  before/with `backend.cancel()`. (So an in-flight turn aborts on plain `SessionCancel` too, not just
+  force-reset.)
+- **PLAN-FIX-2 (BLOCKER — real test helper).** Tests use `let (mgr, _backend, _registry) = manager();` (NOT a
+  `test_manager()`). All Task-1/2/etc. test snippets use `manager()` + `ctx()`/`agent()` helpers; capture
+  `let old_op = t1.op.clone();` and finish via `turn.op`.
+- **PLAN-FIX-3 (MAJOR — TWO cold-bind constructors).** `resolve_configure_bind` builds `LocalDispatch` in TWO
+  branches (`server.rs:440` follow-up reuse + `:477` first-message bind). Add `abort: CancellationToken::new()`
+  to BOTH (a cold-bind has no warm handle → a fresh never-cancelled token is correct).
+- **PLAN-FIX-4 (MAJOR — the op-param ripple is ~100 sites, mostly tests).** Task 1's compile-green requires
+  updating EVERY `rg "\.checkout_turn\(|\.checkout_existing_turn\(|\.checkout_child_turn\("` hit (the bulk are
+  `session_manager.rs` tests passing `op("…")`, plus coordinator/server tests). Switch post-checkout
+  `finish_turn`/`record_usage` guards to `&turn.op` — EXCEPT tests that intentionally assert stale-op no-op
+  (keep a literal there and rename to reflect the nonce). Do this mechanical sweep as Task 1 Step 3b (its own
+  pass) so the tree compiles at Task 1 end. Keep the `OperationId` import + `op()` test helper (still used by
+  `finish_turn`/`record_usage` + `WarmTurnGuard`/`WarmNodeCleanup`).
+- **PLAN-FIX-5 (MAJOR — prove the pre-first-poll guarantee, L1).** Task 4's gated-backend test proves
+  abort-DURING-prompt, not the load-bearing abort-BEFORE-prompt. ADD a streaming-producer test: a backend that
+  increments a counter (or panics) if `prompt` is EVER called + a `dispatch.abort` that is ALREADY cancelled
+  before the producer spawns; assert a Canceled terminal AND `prompt_called == false` (no re-mint). This is the
+  Race-2 correctness proof.
+- **PLAN-FIX-6 (MAJOR — keep `drop(events)` before finish in `collect_turn`).** On abort, DROP the translator
+  stream (cancels the in-flight backend future) BEFORE `finish_turn`. Shape: `let aborted = loop { <biased
+  select> }; drop(events); if aborted { collected.push(Ok(Event::terminal(TaskOutcome::Canceled))); }
+  self.session_manager.finish_turn(&ctx, turn.generation, &turn.op).await; finish_guard.disarm();` — then the
+  existing `rev().find_map(outcome())` yields `cancelled`.
+- **PLAN-FIX-7 (MINOR — enumerate ALL WarmTurn mint sites).** `checkout_turn_inner` has THREE `WarmTurn`
+  construction paths — no-diff reuse (`:274`), clean reconcile (`:409`), fresh-mint (`:472`) — PLUS
+  `checkout_existing_turn`. Mint the nonce + token in ALL FOUR; init `turn_abort: None` at every `WarmHandle {
+  … }` construction.
+
 ---
 
 ## File Structure
