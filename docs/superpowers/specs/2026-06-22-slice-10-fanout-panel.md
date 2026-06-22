@@ -105,3 +105,91 @@ synthesizes from the survivor + notes the missing lens + its cost shows "n/a".
   it re-capture usage, and is the re-run's cost the one that counts)?
 - Q4: Scope check — is the markdown-first + reuse-substrate cut correct, or does "generalized fan-out" demand the
   native `fan_out` op in-slice?
+
+---
+
+## v2 — dual spec-review folded (codex needs-revision + Opus needs-spike) — BINDING
+
+> Supersedes the draft where it conflicts. Folds both lenses (strongly aligned) + an empirical probe. The probe
+> RESOLVED the spike: a real codex turn in THIS env emits `used=15071, size=258400, windowFraction=0.058,
+> cost=null` — so per-source USAGE/context-footprint is REAL for codex, but MONEY is claude-only. That reframes
+> the marquee dimension (below). `Update::Usage` reaches the executor unconditionally (`acp_backend.rs:2473`,
+> ignored at `executor.rs:275`), so per-node capture is feasible; a T1 one-node smoke test is the final proof
+> (no further spike). SPEC NOW: **ready-to-plan.**
+
+### SF-FIX-1 (Opus #1, codex #6, probe-confirmed) — the dimension is USAGE/context-size, NOT "cost"
+Rename "cost" → **usage/context-footprint** everywhere. `UsageSnapshot.used/size` is CONTEXT-WINDOW OCCUPANCY
+(`window_fraction = used/size`), not spend. The panel's per-source usage block = `{used, size, windowFraction}`
+(REAL for both ACP agents) + a money `cost{amount,currency}` ONLY when the agent sent one (claude yes, codex
+`null`). Per-field rendering: `used`/`size`/`windowFraction` when present else `n/a`; money only when present;
+whole-`None` usage → all cells `n/a`. Do NOT sell "real cost" or assert money is non-zero in the gate. The five
+panel dimensions become **pros / cons / usage(real) / benefit / risk** (the agents' qualitative analysis on
+pros/benefit/risk; usage is the one REAL-DATA column).
+
+### SF-FIX-2 (Opus #4 — the keystone) — WEIGHTS are operator config, not LLM-invented
+The "weighted recommendation" weights come from the workflow TOML, NOT the synth's imagination (which would make
+B2 "a prompt asking for a table" — the existing review/design synths already do that). Add a `[panel]` section to
+the panel workflow config: `weights = { usage = 0.2, benefit = 0.4, risk = 0.3, ... }` (operator-assigned,
+reproducible). Parse it, inject as a reserved `{{workflow.weights}}` synth var. The synth states the weights it
+applied (markdown prose — stays ADR-0012-side: prose weights, NOT machine-emitted routing scores). THIS is what
+makes B2 a real panel + more than a prompt tweak.
+
+### SF-FIX-3 (codex #3) — reserved synth vars use an INVALID-NodeId namespace (no collision)
+`{{costs}}`/`{{weights}}` would collide with an upstream node literally named `costs`/`weights` (node IDs become
+template vars directly, `executor.rs:484`; `costs` is a valid `NodeId`). Use the `workflow.` namespace —
+`{{workflow.costs}}`, `{{workflow.weights}}` — which is NOT a valid `NodeId` (verify the `NodeId` charset at
+`ids.rs:58`; the `.` makes it un-collidable). Reserve the `workflow.` prefix for built-in synth context vars.
+
+### SF-FIX-4 (codex #1+#2, Opus #3 — the BLOCKER) — per-node usage must survive crash-resume
+Adding usage is additive at the wire/journal layer but is DROPPED through the fold→seed→`run_from` chain. The
+FULL carrier (decide in plan, but the spec mandates one of these — NOT silent loss):
+- Executor: a `NodeResult { output, ok, usage: Option<UsageSnapshot> }` (replaces the `(String,bool)` node output
+  + the `HashMap<String,(String,bool)>` outputs map + the `run_from` seed type `(String,bool)` →
+  `(String,bool,Option<UsageSnapshot>)`). `run_node` accumulates the FINAL pre-`Done` `Update::Usage` (the node's
+  end-state; `executor.rs:169/275` stop ignoring it).
+- `WorkflowEvent::NodeFinished{node,ok,output}` → `+ usage: Option<UsageSnapshot>` → the `WorkflowSink::
+  node_finished` TRAIT signature gains a 4th param (BREAKING — update `DetachedProgressSink`, the streaming sink,
+  test fakes).
+- Durable: `OrchEventKind::NodeFinished{node,ok,output}` `+ usage` (versioned journal → old rows fold as `None`);
+  `task_node_checkpoints` gains a nullable `usage_json` column (the established `ALTER TABLE ADD COLUMN` +
+  PRAGMA-guard migration, `sqlite.rs:148-179`; old rows read `None`); `TaskProgressSnapshot.checkpoints` 4-tuple →
+  carries `Option<UsageSnapshot>`; `fold_journal_to_snapshot` + the `resume_working_tasks` seed
+  (`detached.rs:1423`) carry it.
+- **RECOMMENDED minimum (cheaper, honest):** if the full seed-chain thread is too heavy, accept **wire+journal+
+  checkpoint-COLUMN only** and have the RESUME SEED carry usage from the checkpoint (so a resumed-already-done
+  node's usage is restored from its `usage_json` checkpoint, NOT re-run). A pre-B2 task / crashed-before-usage
+  node seeds `None` → `{{workflow.costs}}` shows `n/a` for it. Plan picks the exact boundary set; either way old
+  data folds as `None` with a test.
+
+### SF-FIX-5 (codex #4, Opus #6) — SF-4 surfacing scope = detached task watch, gated on RAW fields
+Per-source usage surfaces on the **detached `task watch`** structured `FrameKind::NodeFinished` (additive
+`usage` field, `#[serde(skip_serializing_if="Option::is_none")]` → non-panel runs emit the identical frame, no
+`v` bump). The LIVE A2A workflow SSE path emits only plain `node X ok` status text (`server.rs:1841`) — extending
+THAT is a bigger change, **DEFERRED** (noted). The live-gate asserts the RAW `NodeFinished.usage` /
+checkpoint `usage_json` (`used>0` when supported), NOT the synth markdown (which could echo/hallucinate). The
+synth markdown must REPRODUCE the generated `{{workflow.costs}}` table verbatim (assert string-equality of the
+injected table vs what appears in the synth output).
+
+### SF-FIX-6 (codex #7) — D4 reword: the substrate is the WORKFLOW DAG, not fanout.rs
+B2 reuses the **workflow DAG fan-out/fan-in + executor scheduling** (`executor.rs`), NOT the
+`bridge-a2a-inbound/fanout.rs` coordinator (which serves the A2A direct-fan-out surface, a different path).
+`fanout.rs` is adjacent precedent (source-identity/cancel already solved there), NOT B2's implementation
+substrate. No native `fan_out` op in B2.
+
+### Updated decisions
+- D1 → SF-FIX-1 (per-field usage rendering; money only when present).
+- D3 unchanged (markdown-first; JSON panel deferred — the deferred structuring node will consume the synth
+  markdown + the SF-FIX-4 captured `usage` → `Part::data`; that's the tracked insertion point).
+- D4 → SF-FIX-6 (workflow DAG, not fanout.rs).
+- D6 (NEW): weights are operator config (SF-FIX-2), not LLM-emitted scores — keeps B2 ADR-0012-consistent.
+
+### Updated live-gate
+Run the new `panel` workflow with TWO intentionally-different members (codex@low + codex@high, or codex + claude)
++ a `[panel] weights` table → assert: (a) each non-synth node's RAW `usage.used > 0` (distinct per member,
+proving real per-node capture — NOT from markdown); (b) the synth artifact reproduces the generated
+`{{workflow.costs}}` usage table verbatim + states the configured weights + a weighted recommendation; (c) a
+crash-resume (kill serve mid-run after the members finish, restart) still shows the members' usage in the resumed
+synth's `{{workflow.costs}}` (proving SF-FIX-4); (d) degrade: one member fails → survivor synthesizes + its usage
+shows `n/a`. T1 ships a one-node usage-capture smoke test as the foundation proof.
+
+### Spike status: RESOLVED (probe + corpus + code). Ready-to-plan.
