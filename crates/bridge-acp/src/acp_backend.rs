@@ -5163,6 +5163,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dead_safe_auto_policy_full_turn_no_deferral() {
+        // DoD regression: even when a PermissionRegistry is attached and warm
+        // turn metadata is available, the DEFAULT auto policy must stay on the
+        // pre-slice immediate-decide path: no pending entry, no parking, and the
+        // agent receives the same AllowOnce selection as before.
+        let rec = Recorder::new("agent-sess-DSAFE");
+        rec.arm_permission(allow_reject_options()).await;
+        rec.gate_turn_on_permission.store(true, Ordering::SeqCst);
+        rec.set_updates(vec![ScriptedUpdate::Text("after-perm")])
+            .await;
+
+        let registry = PermissionRegistry::new();
+        let be = connect_recording(rec.clone())
+            .await
+            .with_permission_registry(Arc::clone(&registry));
+        let key = bkey("bridge-DSAFE");
+        let meta = turn_meta("ctx-dead-safe", 42, "op-dead-safe");
+        let ctx = meta.context_id.clone();
+        be.configure_turn(&key, meta).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut s = be.prompt(&key, vec![]).await.unwrap();
+            assert!(
+                matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "after-perm"),
+                "the gated post-permission chunk must arrive"
+            );
+            let done = loop {
+                match s.next().await {
+                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(_) => continue,
+                    None => panic!("stream ended without Done"),
+                }
+            };
+            assert_eq!(done, "end_turn");
+        })
+        .await
+        .expect("default auto policy turn must complete without permission parking");
+
+        tokio::time::timeout(Duration::from_secs(2), rec.permission_replied.notified())
+            .await
+            .expect("client must have replied to the permission request");
+        assert_eq!(
+            *rec.permission_reply.lock().await,
+            Some(Some("a".to_string())),
+            "auto policy must select the same AllowOnce option as the pre-slice path"
+        );
+        assert!(
+            registry.pending(&ctx).is_empty(),
+            "auto policy must not create a pending permission entry"
+        );
+    }
+
+    #[tokio::test]
     async fn permission_deny_selects_reject_or_cancelled() {
         // With a DENY policy injected via `with_policy`, the backend must reply
         // Selected{optionId:"r"} (the reject_once option) — not the allow.
