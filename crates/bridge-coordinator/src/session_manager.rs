@@ -1033,10 +1033,13 @@ impl SessionManager {
                 config: h.fingerprint.config.clone(),
                 cwd,
             };
-            // cancel-tokens F2 (whole-branch review round 4): compact RELEASES old_id (the success path AND
-            // expire_after_summarize) — fire any lingering keep-warm-cancel token now, under the claim and
-            // after the fallible parses, so a pre-first-poll producer can't re-mint the released session.
-            fire_lingering_turn_abort(h);
+            // cancel-tokens (whole-branch review round 6): compact does NOT fire a lingering keep-warm-cancel
+            // token here. Unlike reset/release (which release the ACP entry immediately, so its cancel latch
+            // dies with it), compact PROMPTS old_id to SUMMARIZE before releasing it — so firing the lingering
+            // token (which makes its pre-mint producer abort WITHOUT draining the ACP cancel latch the earlier
+            // cancel set) would let compact's own summarize prompt drain that stale latch and return cancelled,
+            // failing the compact. A lingering pre-mint producer racing compact is part of the Slice-9 deferral
+            // (see the WarmHandle.turn_abort note); compact summarizes the warm gen-N session as-is.
             h.state = SessionState::Compacting;
             h.expire_after_reconcile = false;
             (backend, old_id, claimed_id, new_gen, new_id, spec)
@@ -2065,12 +2068,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_after_keep_warm_cancel_fires_lingering_token() {
-        // cancel-tokens F2 (whole-branch review round 4): a keep-warm cancel leaves the token on the Idle
-        // handle; a following compact RELEASES old_id, so it must fire that lingering token first (else a
-        // pre-first-poll producer could re-mint the released session).
+    async fn compact_after_keep_warm_cancel_does_not_fire_lingering_token() {
+        // cancel-tokens (whole-branch review round 6): compact must NOT fire a lingering keep-warm-cancel
+        // token — it prompts old_id (summarize) before releasing it, so firing would make the pre-mint
+        // producer abort without draining the ACP cancel latch, and compact's own summarize would then drain
+        // that stale latch and come back cancelled. (A lingering pre-mint producer racing compact is the
+        // Slice-9 deferral.) Here the FakeBackend has no latch, so compact still succeeds; we pin that compact
+        // leaves the lingering token untouched (does NOT fire it).
         let (manager, _backend, _registry) = manager();
-        let c = ctx("ctx-compact-fires");
+        let c = ctx("ctx-compact-nofire");
         let turn = manager
             .checkout_turn(&c, agent(), None, None)
             .await
@@ -2083,8 +2089,8 @@ mod tests {
             .unwrap();
         assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
         assert!(
-            turn.abort.is_cancelled(),
-            "compact must fire the lingering keep-warm-cancel token before releasing old_id"
+            !turn.abort.is_cancelled(),
+            "compact must NOT fire a lingering token (it would latch-poison its own summarize prompt)"
         );
     }
 
