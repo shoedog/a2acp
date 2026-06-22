@@ -621,6 +621,15 @@ impl SessionManager {
                     h.expire_after_reconcile = true;
                     return;
                 }
+                // cancel-tokens F2 (whole-branch review, Finding 2): a SessionRelease of a handle with an
+                // in-flight turn releases the backend session out from under the producer. Cancel its abort
+                // token UNDER the lock, BEFORE release_session below, so a producer in the checkout→first-
+                // poll gap aborts instead of prompting (and ACP lazy-re-minting) the just-released session.
+                // Latch-safe: release_session removes the ACP session entry, so its cancel latch dies with
+                // it (unlike the keep-warm cancel path). An Idle handle has no live turn (None).
+                if let Some(tok) = h.turn_abort.take() {
+                    tok.cancel();
+                }
             }
             tab.remove(ctx)
         };
@@ -675,13 +684,17 @@ impl SessionManager {
             }
             let was_running = h.state == SessionState::Running;
             h.op = None;
-            let tok = h.turn_abort.take();
+            // cancel-tokens (whole-branch review, Finding 1): CLEAR the in-flight turn's abort token but
+            // do NOT fire it here. SessionCancel keeps the session WARM (→ Idle), so the producer must
+            // reach its prompt to drain the ACP cancel latch that backend.cancel (below) sets; firing the
+            // token would abort the producer pre-first-poll, leaving an undrained latch that would
+            // spuriously cancel the NEXT turn that mints this still-warm session. The release paths
+            // (force-reset, release_inner) DO fire the token — they discard the session id, so its latch
+            // dies with it — but the keep-warm cancel path must not.
+            h.turn_abort = None;
             if !was_running {
                 h.state = SessionState::Idle;
                 return (Ok(()), false);
-            }
-            if let Some(tok) = tok {
-                tok.cancel();
             }
             // was_running is necessarily true here (the !was_running case returned above). Claim the
             // handle across backend.cancel so a failed teardown cannot leave it reusable.
@@ -1925,6 +1938,51 @@ mod tests {
         let _ = release.send(());
         let out = reset.await.unwrap().unwrap();
         assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+    }
+
+    #[tokio::test]
+    async fn release_cancels_the_inflight_turn_abort() {
+        // cancel-tokens F2 (whole-branch review, Finding 2): SessionRelease releases the backend session,
+        // so — like a force-reset — it must cancel the in-flight turn's abort token (the producer aborts
+        // instead of re-minting the just-released session). A release is one of the two paths that fire it.
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-release-abort");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        assert!(!turn.abort.is_cancelled());
+        manager.release(&c).await;
+        assert!(
+            turn.abort.is_cancelled(),
+            "releasing a running handle must cancel the in-flight turn's abort token"
+        );
+        assert!(
+            manager.status(&c).await.is_none(),
+            "release removes the handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_does_not_fire_the_turn_abort_token() {
+        // cancel-tokens (whole-branch review, Finding 1): SessionCancel keeps the session WARM, so it must
+        // NOT fire the abort token — the producer must reach its prompt to drain the ACP cancel latch that
+        // backend.cancel sets. Firing it pre-first-poll would strand the latch and spuriously cancel the
+        // NEXT turn. This pins the keep-warm path to clear-but-not-fire (the inverse of release/reset).
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-cancel-nofire");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        assert!(
+            !turn.abort.is_cancelled(),
+            "a keep-warm cancel must NOT fire the abort token (it would strand the ACP cancel latch)"
+        );
+        // The handle stays warm at Idle and a fresh checkout mints a new turn (new op nonce + token).
+        let next = manager.checkout_existing_turn(&c).await.unwrap();
+        assert_ne!(next.op, turn.op);
     }
 
     #[tokio::test]
