@@ -62,7 +62,8 @@ async fn mcp_subcommand_handshake_and_tool_call_over_real_pipes() {
     assert_eq!(frames[0]["id"], 1);
     assert_eq!(frames[0]["result"]["protocolVersion"], "2024-11-05");
     assert_eq!(frames[1]["id"], 2);
-    assert_eq!(frames[1]["result"]["tools"].as_array().unwrap().len(), 6);
+    // Slice 9 added the `inject` + `permit` tools (6 -> 8).
+    assert_eq!(frames[1]["result"]["tools"].as_array().unwrap().len(), 8);
     assert_eq!(frames[2]["id"], 3);
     assert_eq!(frames[2]["result"]["isError"], true);
 
