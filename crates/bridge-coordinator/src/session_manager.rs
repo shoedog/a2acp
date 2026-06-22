@@ -10,6 +10,7 @@ use bridge_core::ids::{
     AgentId, ContextId, OperationId, SessionGeneration, SessionHandleId, SessionId,
 };
 use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome, UsageSnapshot};
+use bridge_core::permission::PermissionRegistry;
 use bridge_core::ports::{AgentBackend, AgentRegistry, Lease};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::session_fingerprint::SessionSpecFingerprint;
@@ -148,6 +149,7 @@ impl SessionStatusInfo {
 
 pub struct SessionManager {
     registry: Arc<dyn AgentRegistry>,
+    perm_registry: Option<Arc<PermissionRegistry>>,
     by_context: Mutex<HashMap<ContextId, WarmHandle>>,
     children: Mutex<HashMap<ContextId, HashSet<ContextId>>>,
     idle_ttl: Duration,
@@ -170,6 +172,7 @@ impl SessionManager {
     ) -> Self {
         Self {
             registry,
+            perm_registry: None,
             by_context: Mutex::new(HashMap::new()),
             children: Mutex::new(HashMap::new()),
             idle_ttl,
@@ -188,6 +191,11 @@ impl SessionManager {
 
     pub fn with_compact_summarize_timeout(mut self, d: Duration) -> Self {
         self.compact_summarize_timeout = d;
+        self
+    }
+
+    pub fn with_permission_registry(mut self, reg: Arc<PermissionRegistry>) -> Self {
+        self.perm_registry = Some(reg);
         self
     }
 
@@ -709,6 +717,9 @@ impl SessionManager {
                     h.expire_after_reconcile = true;
                     return;
                 }
+                if let Some(reg) = &self.perm_registry {
+                    reg.resolve_context_cancelled(ctx);
+                }
                 // cancel-tokens F2: SessionRelease releases the session out from under any in-flight turn —
                 // fire the lingering token under the lock before release_session below.
                 fire_lingering_turn_abort(h);
@@ -763,6 +774,9 @@ impl SessionManager {
             if is_claimed(h.state) {
                 h.expire_after_reconcile = true;
                 return (Ok(()), false);
+            }
+            if let Some(reg) = &self.perm_registry {
+                reg.resolve_context_cancelled(ctx);
             }
             let was_running = h.state == SessionState::Running;
             h.op = None;
@@ -974,6 +988,9 @@ impl SessionManager {
                 config: h.fingerprint.config.clone(),
                 cwd,
             };
+            if let Some(reg) = &self.perm_registry {
+                reg.resolve_context_cancelled(ctx);
+            }
             // F2 (cancel-tokens): all fallible validation passed — committed to Resetting. Fire the lingering
             // token UNDER the lock (only here, after the fallible new_id/cwd parses, so an early-return error
             // path can't strand it) so the cancel strictly precedes the lock release + backend teardown below.
@@ -1272,6 +1289,10 @@ mod tests {
     use crate::clock::ManualClock;
     use async_trait::async_trait;
     use bridge_core::domain::{AgentEntry, AgentKind, Effort, InjectMode, Part, RegistrySnapshot};
+    use bridge_core::permission::{
+        PendingPermissionView, PermKey, PermissionOptionView, PermissionRegistry,
+        PermissionResolution,
+    };
     use bridge_core::ports::{BackendStream, Resolved, Update};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
@@ -1295,6 +1316,9 @@ mod tests {
     struct FakeBackend {
         reply: String,
         releases: StdMutex<Vec<String>>,
+        release_gate: StdMutex<Option<oneshot::Receiver<()>>>,
+        release_started: Notify,
+        release_started_count: AtomicUsize,
         cancels: StdMutex<Vec<String>>,
         configured: StdMutex<Vec<String>>,
         reconciled: StdMutex<Vec<(String, SessionSpec)>>,
@@ -1318,6 +1342,9 @@ mod tests {
             Self {
                 reply: reply.into(),
                 releases: StdMutex::new(Vec::new()),
+                release_gate: StdMutex::new(None),
+                release_started: Notify::new(),
+                release_started_count: AtomicUsize::new(0),
                 cancels: StdMutex::new(Vec::new()),
                 configured: StdMutex::new(Vec::new()),
                 reconciled: StdMutex::new(Vec::new()),
@@ -1346,6 +1373,18 @@ mod tests {
 
         fn releases(&self) -> Vec<String> {
             self.releases.lock().unwrap().clone()
+        }
+
+        fn block_next_release(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.release_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        async fn wait_for_release(&self) {
+            while self.release_started_count.load(Ordering::SeqCst) == 0 {
+                self.release_started.notified().await;
+            }
         }
 
         fn cancels(&self) -> Vec<String> {
@@ -1478,6 +1517,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(session.as_str().to_string());
+            let gate = self.release_gate.lock().unwrap().take();
+            self.release_started_count.fetch_add(1, Ordering::SeqCst);
+            self.release_started.notify_waiters();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
         }
 
         fn capabilities(&self) -> AgentSessionCaps {
@@ -1602,6 +1647,49 @@ mod tests {
 
     fn op(id: &str) -> OperationId {
         OperationId::parse(id).unwrap()
+    }
+
+    fn pkey(
+        context_id: &ContextId,
+        generation: SessionGeneration,
+        op: &OperationId,
+        request_id: &str,
+    ) -> PermKey {
+        PermKey {
+            context_id: context_id.clone(),
+            generation: generation.get(),
+            op: op.clone(),
+            request_id: request_id.into(),
+        }
+    }
+
+    fn permission_view(
+        request_id: &str,
+        generation: SessionGeneration,
+        op: &OperationId,
+    ) -> PendingPermissionView {
+        PendingPermissionView {
+            request_id: request_id.into(),
+            tool_call_id: format!("tool-{request_id}"),
+            generation: generation.get(),
+            op: op.clone(),
+            title: "permission".into(),
+            options: vec![PermissionOptionView {
+                option_id: "approved".into(),
+                name: "Allow".into(),
+                kind: "allow_once".into(),
+            }],
+            raw_input: None,
+            timeout_ms: 120_000,
+        }
+    }
+
+    async fn assert_permission_cancelled(rx: oneshot::Receiver<PermissionResolution>) {
+        let resolved = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("pending permission should resolve promptly")
+            .expect("permission sender should still be live");
+        assert!(matches!(resolved, PermissionResolution::Cancelled));
     }
 
     fn model_override(model: &str) -> AgentOverride {
@@ -3058,6 +3146,166 @@ mod tests {
         assert!(manager.status(&child).await.is_none());
         assert!(!manager.child_registered(&parent, &child).await);
         assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_resolves_pending_permission() {
+        let reg = PermissionRegistry::new();
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager.with_permission_registry(reg.clone()));
+        let c = ctx("cancel-perm");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+        let unblock = backend.block_next_cancel();
+
+        let cancel = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move { manager.cancel_with_children(&c).await })
+        };
+        backend.wait_for_cancel().await;
+        assert_permission_cancelled(rx).await;
+
+        unblock.send(()).unwrap();
+        cancel.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_resolves_pending_permission() {
+        let reg = PermissionRegistry::new();
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager.with_permission_registry(reg.clone()));
+        let c = ctx("clear-perm");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+        let unblock = backend.block_next_cancel();
+
+        let clear = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move { manager.clear_with_children(&c, true).await })
+        };
+        backend.wait_for_cancel().await;
+        assert_permission_cancelled(rx).await;
+
+        unblock.send(()).unwrap();
+        clear.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_resolves_pending_permission() {
+        let reg = PermissionRegistry::new();
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager.with_permission_registry(reg.clone()));
+        let c = ctx("release-perm");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+        let unblock = backend.block_next_release();
+
+        let release = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move { manager.release_with_children(&c).await })
+        };
+        backend.wait_for_release().await;
+
+        assert_permission_cancelled(rx).await;
+
+        unblock.send(()).unwrap();
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keepwarm_cancel_resolves_pending_perm_without_stranding_next_turn() {
+        let reg = PermissionRegistry::new();
+        let (manager, _backend, _registry) = manager();
+        let manager = manager.with_permission_registry(reg.clone());
+        let c = ctx("cancel-perm-next-turn");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let (rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+
+        manager.cancel(&c).await.unwrap();
+        assert_permission_cancelled(rx).await;
+
+        // Unlike the single abort-token slot, the permission registry is gen+op keyed and exact-once:
+        // resolving the cancelled turn's permission does not poison a later warm checkout.
+        let next = manager.checkout_existing_turn(&c).await.unwrap();
+        assert_ne!(next.op, turn.op);
+        assert_eq!(next.generation, turn.generation);
+    }
+
+    #[tokio::test]
+    async fn claimed_compacting_cancel_does_not_resolve_pending() {
+        let reg = PermissionRegistry::new();
+        let (manager, _backend, _registry) = manager();
+        let manager = Arc::new(manager.with_permission_registry(reg.clone()));
+        let c = ctx("claimed-compact-perm");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let compact = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move {
+                manager
+                    .compact_session(&c, |_b, _s| async move {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Ok("summary".to_string())
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+        assert_eq!(manager.status(&c).await.unwrap().state, "compacting");
+
+        let (mut rx, _guard) = reg.register(
+            pkey(&c, turn.generation, &turn.op, "r"),
+            permission_view("r", turn.generation, &turn.op),
+        );
+
+        manager.cancel(&c).await.unwrap();
+        let err = manager.clear_with_children(&c, false).await.err().unwrap();
+        assert_eq!(err, BridgeError::HandleBusy);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut rx)
+                .await
+                .is_err(),
+            "claimed compacting permissions must not be cancelled by non-force cancel/clear"
+        );
+
+        release_tx.send(()).unwrap();
+        let out = compact.await.unwrap();
+        assert_eq!(out, Err(BridgeError::SessionExpired));
     }
 
     #[tokio::test]
