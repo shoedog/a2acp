@@ -833,7 +833,7 @@ impl SessionManager {
         opts: ResetOpts,
     ) -> (Result<ResetOutcome, BridgeError>, Vec<ContextId>) {
         // (1)+(2)+(3) claim under ONE lock hold (FIX-2: never bounce through Idle, never call self.cancel).
-        let (backend, old_id, claimed_id, new_gen, new_id, spec, turn_abort) = {
+        let (backend, old_id, claimed_id, new_gen, new_id, spec) = {
             let mut tab = self.by_context.lock().await;
             let Some(h) = tab.get_mut(ctx) else {
                 return (Ok(ResetOutcome::NotFound), Vec::new());
@@ -843,9 +843,6 @@ impl SessionManager {
                 SessionState::Running if opts.force => {}
                 _ => return (Err(BridgeError::HandleBusy), Vec::new()),
             }
-            // F2 (cancel-tokens): take the in-flight turn's abort token under the claim so a force-reset
-            // can cancel it (below) BEFORE releasing the session. An Idle reset has no live turn (None).
-            let turn_abort = h.turn_abort.take();
             let backend = h.backend.clone();
             let old_id = h.backend_session.clone();
             let claimed_id = h.id.clone();
@@ -874,19 +871,20 @@ impl SessionManager {
                 config: h.fingerprint.config.clone(),
                 cwd,
             };
+            // F2 (cancel-tokens): all fallible validation has passed — we are committed to Resetting, so
+            // take the in-flight turn's abort token and cancel it UNDER the lock. The cancel then strictly
+            // precedes BOTH the lock release and the backend teardown (cancel/release_session) below — a
+            // force-clear can never let a producer poll a released session with an un-cancelled token (and
+            // ACP lazy-re-mint the cleared context). Taking it only here (not before the fallible new_id/cwd
+            // validation) avoids stranding the token on an early-return error path. An Idle reset has no
+            // live turn (None). cancel() is synchronous, so holding the lock across it cannot deadlock.
+            if let Some(tok) = h.turn_abort.take() {
+                tok.cancel();
+            }
             h.state = SessionState::Resetting;
             h.expire_after_reconcile = false;
-            (
-                backend, old_id, claimed_id, new_gen, new_id, spec, turn_abort,
-            )
+            (backend, old_id, claimed_id, new_gen, new_id, spec)
         };
-
-        // F2 (cancel-tokens): abort an in-flight producer BEFORE releasing its session, so a force-clear
-        // cannot let the producer prompt (and ACP lazy-re-mint) the released — cleared — context. The
-        // producer's biased abort-select observes this on its next poll (pre-first-poll → never prompts).
-        if let Some(tok) = &turn_abort {
-            tok.cancel();
-        }
 
         // (4)+(5) PF-13: force pre-cancel (trait-default release_session does NOT cancel, e.g. ApiBackend);
         // release(old) is the drain; FIX-4: CAPTURE configure, no `?`.
@@ -1897,13 +1895,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_reset_cancels_token_before_backend_teardown() {
+        // cancel-tokens F2 ordering invariant (whole-branch review): the in-flight turn's abort token must
+        // be cancelled BEFORE the backend session is torn down, so a producer can never poll a released
+        // session with an un-cancelled token (the ACP lazy-re-mint / resurrection window). On a force reset
+        // `backend.cancel(old)` is the first teardown step; gate it, and when it is entered the token must
+        // ALREADY be cancelled. Guards against any future regression that moves the cancel past the lock.
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let c = ctx("ctx-reset-order");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        assert!(!turn.abort.is_cancelled());
+        let release = backend.block_next_cancel();
+        let reset = tokio::spawn({
+            let manager = manager.clone();
+            let c = c.clone();
+            async move { manager.reset_session(&c, ResetOpts { force: true }).await }
+        });
+        // The reset has reached backend.cancel — which runs AFTER the under-lock token cancel.
+        backend.wait_for_cancel().await;
+        assert!(
+            turn.abort.is_cancelled(),
+            "the abort token must be cancelled before the backend session is torn down"
+        );
+        let _ = release.send(());
+        let out = reset.await.unwrap().unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+    }
+
+    #[tokio::test]
     async fn continue_after_force_clear_uses_new_empty_generation() {
         // cancel-tokens DoD / SPEC-FIX-7: a force-clear of a Running turn leaves the context at a NEW empty
         // generation (Idle) — a subsequent continue (checkout_existing_turn) SUCCEEDS at the new generation,
         // it does NOT return SessionNotFound (which is only for a truly unknown context).
         let (manager, _backend, _registry) = manager();
         let c = ctx("ctx-reclear");
-        let first = manager.checkout_turn(&c, agent(), None, None).await.unwrap();
+        let first = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
         assert_eq!(first.generation.get(), 0);
         let out = manager
             .reset_session(&c, ResetOpts { force: true })
