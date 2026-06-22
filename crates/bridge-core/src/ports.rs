@@ -149,12 +149,21 @@ pub trait RouteDecision: Send + Sync {
 }
 
 /// Sync policy engine — evaluates a permission request against session context.
+pub enum PolicyOutcome {
+    Decide(Result<PermissionDecision, BridgeError>),
+    Defer,
+}
+
 pub trait PolicyEngine: Send + Sync {
     fn decide(
         &self,
         req: &PermissionRequest,
         ctx: &SessionContext,
     ) -> Result<PermissionDecision, BridgeError>;
+
+    fn interactive_decide(&self, req: &PermissionRequest, ctx: &SessionContext) -> PolicyOutcome {
+        PolicyOutcome::Decide(self.decide(req, ctx))
+    }
 }
 
 /// Sync auth middleware — validates an inbound request.
@@ -230,6 +239,26 @@ mod tests {
     use super::*;
     use crate::error::BridgeError;
     use futures::StreamExt;
+
+    #[test]
+    fn default_policy_engine_never_defers() {
+        struct OldStyle;
+        impl PolicyEngine for OldStyle {
+            fn decide(
+                &self,
+                _: &PermissionRequest,
+                _: &SessionContext,
+            ) -> Result<PermissionDecision, BridgeError> {
+                Ok(PermissionDecision::Approve)
+            }
+        }
+        let out =
+            OldStyle.interactive_decide(&PermissionRequest::with_id("r", false), &SessionContext);
+        assert!(matches!(
+            out,
+            PolicyOutcome::Decide(Ok(PermissionDecision::Approve))
+        ));
+    }
 
     struct FakeStore {
         inner: std::sync::Mutex<std::collections::HashMap<String, String>>,

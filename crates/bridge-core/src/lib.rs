@@ -7,6 +7,7 @@ pub mod ids;
 pub mod liveness;
 pub mod mcp;
 pub mod orch;
+pub mod permission;
 pub mod ports;
 pub mod process;
 pub mod profile;
