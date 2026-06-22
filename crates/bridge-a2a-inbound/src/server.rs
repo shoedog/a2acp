@@ -40,6 +40,7 @@ use bridge_core::domain::{
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
 use bridge_core::ids::{AgentId, ContextId, OperationId, SessionGeneration, SessionId, TaskId};
+use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
     RouteDecision, SessionStore,
@@ -443,6 +444,7 @@ async fn resolve_configure_bind(
                 session: session.clone(),
                 seed: None,
                 injects: Vec::new(),
+                turn_meta: None,
                 guard: None,
                 warm_guard: None,
                 // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
@@ -483,6 +485,7 @@ async fn resolve_configure_bind(
         session: session.clone(),
         seed: None,
         injects: Vec::new(),
+        turn_meta: None,
         guard: Some(guard),
         warm_guard: None,
         // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
@@ -519,6 +522,11 @@ async fn warm_local_dispatch(
                 session: turn.session,
                 seed: turn.seed,
                 injects: turn.injects,
+                turn_meta: Some(TurnMeta {
+                    context_id: ctx.clone(),
+                    generation: turn.generation.get(),
+                    op: turn.op.clone(),
+                }),
                 guard: None,
                 warm_guard: Some(WarmTurnGuard {
                     sm,
@@ -1379,6 +1387,7 @@ fn spawn_local_producer(
     let session = dispatch.session.clone();
     let parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
     let backend = dispatch.backend;
+    let turn_meta = dispatch.turn_meta;
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
     let warm = dispatch.warm_guard;
@@ -1390,6 +1399,9 @@ fn spawn_local_producer(
         let _guard = guard;
         let warm = warm;
 
+        if let Some(meta) = turn_meta {
+            backend.configure_turn(&session, meta).await;
+        }
         let translator = Translator::new();
         let mut events = translator.run(
             backend.as_ref(),
@@ -2301,6 +2313,12 @@ async fn unary_message(
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
             let warm = dispatch.warm_guard;
+            if let Some(meta) = dispatch.turn_meta.clone() {
+                dispatch
+                    .backend
+                    .configure_turn(&dispatch.session, meta)
+                    .await;
+            }
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
             let abort = dispatch.abort;
             let parts =
@@ -6369,6 +6387,7 @@ mod tests {
             session: SessionId::parse("ctx-streaming-pre-cancel-g0").unwrap(),
             seed: None,
             injects: Vec::new(),
+            turn_meta: None,
             guard: None,
             warm_guard: None,
             abort,

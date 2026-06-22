@@ -46,6 +46,7 @@ use bridge_core::ids::SessionId;
 use bridge_core::orch::{
     AgentSessionCaps, ContentSummary, OrchEventKind, PlanEntry as BridgePlanEntry, ReconcileOutcome,
 };
+use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
     AgentBackend, BackendStream, PolicyEngine, RichEventSink, Update, STOP_REASON_CANCELLED,
 };
@@ -218,6 +219,10 @@ type UpdateRegistry = Arc<StdMutex<HashMap<AgentSessionId, TurnRoute>>>;
 struct TurnRoute {
     tx: UpdateSender,
     watch: Option<Arc<TurnWatch>>,
+    // Task 6 consumes this from the reverse permission handler; Task 5 only
+    // threads it onto the live route.
+    #[allow(dead_code)]
+    turn_meta: Option<TurnMeta>,
 }
 
 struct TurnWatch {
@@ -410,6 +415,10 @@ pub struct AcpBackend {
     /// don't go through `configure_session`) falls back to [`AcpConfig`]'s static
     /// `model`/`mode`, preserving the pre-3b behavior.
     session_cfg: Arc<StdMutex<HashMap<SessionId, SessionSpec>>>,
+    /// Per-turn metadata stashed by the A2A producer immediately before the next
+    /// prompt. `prompt_inner` takes it at entry, before lazy session minting, so
+    /// early setup errors cannot leave stale metadata for a later turn.
+    pending_turn_meta: StdMutex<HashMap<SessionId, TurnMeta>>,
     /// Policy engine that decides reverse `session/request_permission` requests.
     /// Defaults to an internal auto-approve impl (the deployed 3a policy); a
     /// caller (Task 6's `main`) threads a concrete engine via [`Self::with_policy`].
@@ -1207,6 +1216,7 @@ impl AcpBackend {
             reaped: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
+            pending_turn_meta: StdMutex::new(HashMap::new()),
             policy,
         })
     }
@@ -1313,6 +1323,13 @@ impl AcpBackend {
                 "update routing registry unavailable (backend not connected)",
             )
         })
+    }
+
+    fn take_pending_turn_meta(&self, session: &SessionId) -> Option<TurnMeta> {
+        self.pending_turn_meta
+            .lock()
+            .expect("pending_turn_meta lock")
+            .remove(session)
     }
 
     /// Look up (or create) the per-bridge-session state for `key`, cloning the
@@ -1949,6 +1966,8 @@ impl AcpBackend {
         parts: Vec<bridge_core::domain::Part>,
         rich_sink: Option<Arc<dyn RichEventSink>>,
     ) -> Result<BackendStream, BridgeError> {
+        let turn_meta = self.take_pending_turn_meta(session);
+
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
         let entry = self.session_entry(session).await;
@@ -1988,6 +2007,7 @@ impl AcpBackend {
                 TurnRoute {
                     tx,
                     watch: watch.clone(),
+                    turn_meta,
                 },
             );
         }
@@ -2223,6 +2243,13 @@ impl AgentBackend for AcpBackend {
         sink: Arc<dyn RichEventSink>,
     ) -> Result<BackendStream, BridgeError> {
         self.prompt_inner(session, parts, Some(sink)).await
+    }
+
+    async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
+        self.pending_turn_meta
+            .lock()
+            .expect("pending_turn_meta lock")
+            .insert(session.clone(), meta);
     }
 
     /// Cancel the in-flight turn for the bridge session.
@@ -2869,6 +2896,7 @@ mod tests {
             reaped: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
+            pending_turn_meta: StdMutex::new(HashMap::new()),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -3651,6 +3679,82 @@ mod tests {
 
     fn bkey(s: &str) -> SessionId {
         SessionId::parse(s).unwrap()
+    }
+
+    fn turn_meta(ctx: &str, generation: u64, op: &str) -> bridge_core::permission::TurnMeta {
+        bridge_core::permission::TurnMeta {
+            context_id: bridge_core::ids::ContextId::parse(ctx).unwrap(),
+            generation,
+            op: bridge_core::ids::OperationId::parse(op).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_turn_stash_is_taken_into_route() {
+        let rec = Recorder::new("agent-sess-META");
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-META");
+        let meta = turn_meta("ctx-meta", 7, "op-meta");
+
+        be.configure_turn(&key, meta.clone()).await;
+        let mut stream = be.prompt(&key, vec![]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("prompt should start and keep route registered");
+
+        {
+            let updates = be.updates().expect("backend has update registry");
+            let map = updates.lock().expect("update registry lock");
+            let route = map
+                .get(&AgentSessionId::new("agent-sess-META"))
+                .expect("live prompt route registered");
+            let routed = route
+                .turn_meta
+                .as_ref()
+                .expect("turn meta moved into route");
+            assert_eq!(routed.context_id.as_str(), "ctx-meta");
+            assert_eq!(routed.generation, 7);
+            assert_eq!(routed.op.as_str(), "op-meta");
+        }
+
+        rec.prompt_gate.notify_one();
+        assert!(
+            matches!(stream.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_turn_take_at_entry_clears_on_missing_session() {
+        let rec = Recorder::new("agent-sess-TAKE");
+        let be = connect_recording(rec).await;
+        let key = bkey("bridge-TAKE");
+        let meta = turn_meta("ctx-take", 11, "op-take");
+
+        be.configure_turn(&key, meta.clone()).await;
+        {
+            let stashed = be
+                .pending_turn_meta
+                .lock()
+                .expect("pending_turn_meta lock")
+                .get(&key)
+                .cloned()
+                .expect("configure_turn stashes meta");
+            assert_eq!(stashed.context_id.as_str(), "ctx-take");
+            assert_eq!(stashed.generation, 11);
+            assert_eq!(stashed.op.as_str(), "op-take");
+        }
+
+        let taken = be
+            .take_pending_turn_meta(&key)
+            .expect("take at prompt entry returns stashed meta");
+        assert_eq!(taken.context_id.as_str(), "ctx-take");
+        assert_eq!(taken.generation, 11);
+        assert_eq!(taken.op.as_str(), "op-take");
+        assert!(
+            be.take_pending_turn_meta(&key).is_none(),
+            "take-at-entry clears stale meta even if the prompt later fails"
+        );
     }
 
     fn select_current(opts: &[SessionConfigOption], id: &str) -> Option<String> {
@@ -5411,6 +5515,7 @@ mod tests {
             reaped: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
+            pending_turn_meta: StdMutex::new(HashMap::new()),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
