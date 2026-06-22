@@ -1,0 +1,16 @@
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "slice-8-arch-analysis"
+[[workflows.nodes]]
+id = "analysis"
+agent = "codex"
+prompt_file = "../prompts/slice-8-arch-analysis.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8112"

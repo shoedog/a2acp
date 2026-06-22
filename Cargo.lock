@@ -15,7 +15,9 @@ dependencies = [
  "bridge-acp",
  "bridge-api",
  "bridge-container",
+ "bridge-coordinator",
  "bridge-core",
+ "bridge-mcp",
  "bridge-observ",
  "bridge-policy",
  "bridge-registry",
@@ -430,6 +432,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "bridge-coordinator",
  "bridge-core",
  "bridge-workflow",
  "futures",
@@ -512,6 +515,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-coordinator"
+version = "0.1.0"
+dependencies = [
+ "a2a-lf",
+ "async-trait",
+ "bridge-core",
+ "bridge-workflow",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "bridge-core"
 version = "0.1.0"
 dependencies = [
@@ -528,6 +548,20 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "trybuild",
+]
+
+[[package]]
+name = "bridge-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bridge-coordinator",
+ "bridge-core",
+ "bridge-workflow",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
 ]
 
 [[package]]

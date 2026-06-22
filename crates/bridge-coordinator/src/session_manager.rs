@@ -1,6 +1,7 @@
 //! Serve-side warm-session manager (Slice 0). Sibling to the registry + TaskStore. Owns the
 //! contextId->handle table + the registry lease that pins the warm backend. Keyed by A2A contextId.
 
+use crate::clock::{Clock, SystemClock};
 use bridge_core::domain::{effective_config, AgentOverride, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{
@@ -120,19 +121,19 @@ pub struct SessionManager {
     idle_ttl: Duration,
     warn_fraction: Option<f64>,
     compact_summarize_timeout: Duration,
-    now: Box<dyn Fn() -> Instant + Send + Sync>,
+    clock: Arc<dyn Clock>,
     seq: std::sync::atomic::AtomicU64,
 }
 
 impl SessionManager {
     pub fn new(registry: Arc<dyn AgentRegistry>, idle_ttl: Duration) -> Self {
-        Self::new_with_clock(registry, idle_ttl, Box::new(Instant::now))
+        Self::new_with_clock(registry, idle_ttl, Arc::new(SystemClock))
     }
 
     pub fn new_with_clock(
         registry: Arc<dyn AgentRegistry>,
         idle_ttl: Duration,
-        now: Box<dyn Fn() -> Instant + Send + Sync>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             registry,
@@ -141,7 +142,7 @@ impl SessionManager {
             idle_ttl,
             warn_fraction: None,
             compact_summarize_timeout: Duration::from_secs(120),
-            now,
+            clock,
             seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -244,6 +245,42 @@ impl SessionManager {
         res
     }
 
+    /// Continue an EXISTING warm context, REUSING its stored fingerprint (agent/config/cwd) rather than
+    /// re-deriving it from caller params. This is the `continue` semantic: the caller supplies only the
+    /// context (+ input), so there is nothing to reconcile — an Idle handle transitions straight to
+    /// Running. Mirrors the no-diff reuse branch of [`Self::checkout_turn`], but a context that was
+    /// never minted returns `SessionNotFound` (you cannot continue what does not exist) instead of
+    /// minting a fresh session. A retired lease → `SessionExpired`; a busy handle → `HandleBusy`.
+    pub async fn checkout_existing_turn(
+        &self,
+        ctx: &ContextId,
+        op: OperationId,
+    ) -> Result<WarmTurn, BridgeError> {
+        let mut tab = self.by_context.lock().await;
+        let Some(h) = tab.get_mut(ctx) else {
+            return Err(BridgeError::SessionNotFound);
+        };
+        if h.lease.is_retired() {
+            return Err(BridgeError::SessionExpired);
+        }
+        if h.state != SessionState::Idle {
+            return Err(BridgeError::HandleBusy);
+        }
+        let usage_warning = self.eval_warn(&h.usage);
+        h.state = SessionState::Running;
+        h.op = Some(op.clone());
+        h.last_used = self.clock.now_instant();
+        let seed = h.pending_seed.take();
+        Ok(WarmTurn {
+            backend: h.backend.clone(),
+            session: h.backend_session.clone(),
+            usage_warning,
+            generation: h.generation,
+            op,
+            seed,
+        })
+    }
+
     async fn checkout_turn_inner(
         &self,
         ctx: &ContextId,
@@ -276,7 +313,7 @@ impl SessionManager {
                 let usage_warning = self.eval_warn(&h.usage);
                 h.state = SessionState::Running;
                 h.op = Some(op.clone());
-                h.last_used = (self.now)();
+                h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
                 return (
                     Ok(WarmTurn {
@@ -332,7 +369,7 @@ impl SessionManager {
             // cancel/release defer (set expire_after_reconcile) rather than mutate/remove it.
             h.state = SessionState::Reconciling;
             h.expire_after_reconcile = false;
-            h.last_used = (self.now)();
+            h.last_used = self.clock.now_instant();
             drop(tab);
 
             let outcome = backend
@@ -366,7 +403,7 @@ impl SessionManager {
                 h.fingerprint = fp;
                 h.state = SessionState::Running;
                 h.op = Some(op.clone());
-                h.last_used = (self.now)();
+                h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
                 return (
                     Ok(WarmTurn {
@@ -456,7 +493,7 @@ impl SessionManager {
                 expire_after_reconcile: false,
                 op: Some(op),
                 pending_seed: None,
-                last_used: (self.now)(),
+                last_used: self.clock.now_instant(),
             },
         );
         (Ok(turn), Vec::new())
@@ -501,7 +538,7 @@ impl SessionManager {
             {
                 h.state = SessionState::Idle;
                 h.op = None;
-                h.last_used = (self.now)();
+                h.last_used = self.clock.now_instant();
             }
         }
     }
@@ -520,15 +557,19 @@ impl SessionManager {
             },
             agent: h.agent.as_str().to_string(),
             generation: h.generation.get(),
-            idle_age_ms: (self.now)().duration_since(h.last_used).as_millis(),
+            idle_age_ms: self
+                .clock
+                .now_instant()
+                .duration_since(h.last_used)
+                .as_millis(),
             capabilities: h.caps.clone(),
             usage: h.usage.clone(),
             over_threshold: self.over_threshold(&h.usage),
         })
     }
 
-    /// Record the latest usage snapshot for a warm handle (latest-wins). Stamps `at_ms` here
-    /// (the inbound layer has a wall clock; SessionManager.now is monotonic). FIX-7: does NOT
+    /// Record the latest usage snapshot for a warm handle (latest-wins). Stamps `at_ms` from
+    /// the injected wall clock. FIX-7: does NOT
     /// touch `last_used` (usage during a turn is already covered by Running + finish_turn's
     /// refresh; bumping it here only races reap_idle). No-ops a missing/removed handle. [Slice 2]
     pub async fn record_usage(
@@ -538,7 +579,7 @@ impl SessionManager {
         op: &OperationId,
         mut snap: UsageSnapshot,
     ) {
-        snap.at_ms = crate::workflow_sink::now_ms();
+        snap.at_ms = self.clock.now_ms();
         if let Some(h) = self.by_context.lock().await.get_mut(ctx) {
             if h.generation == gen && h.op.as_ref() == Some(op) && h.state == SessionState::Running
             {
@@ -582,6 +623,14 @@ impl SessionManager {
         children.remove(ctx);
     }
 
+    /// Release EVERY warm context (with children). Called on mcp stdin-EOF (FIX-5).
+    pub async fn release_all(&self) {
+        let ctxs: Vec<ContextId> = self.by_context.lock().await.keys().cloned().collect();
+        for c in ctxs {
+            self.release_with_children(&c).await;
+        }
+    }
+
     /// Cancel an in-flight turn but keep the session warm (-> Idle).
     pub async fn cancel(&self, ctx: &ContextId) -> Result<(), BridgeError> {
         let (res, expired) = self.cancel_inner(ctx).await;
@@ -615,7 +664,7 @@ impl SessionManager {
             // was_running is necessarily true here (the !was_running case returned above). Claim the
             // handle across backend.cancel so a failed teardown cannot leave it reusable.
             h.state = SessionState::Cancelling;
-            h.last_used = (self.now)();
+            h.last_used = self.clock.now_instant();
             (h.backend.clone(), h.backend_session.clone(), h.id.clone())
         };
         let res = backend.cancel(&session).await;
@@ -857,7 +906,7 @@ impl SessionManager {
         h.op = None;
         h.pending_seed = None;
         h.state = SessionState::Idle;
-        h.last_used = (self.now)();
+        h.last_used = self.clock.now_instant();
         (
             Ok(ResetOutcome::Cleared {
                 generation: new_gen.get(),
@@ -984,7 +1033,7 @@ impl SessionManager {
         h.op = None;
         h.pending_seed = Some(summary);
         h.state = SessionState::Idle;
-        h.last_used = (self.now)();
+        h.last_used = self.clock.now_instant();
         Ok(ResetOutcome::Cleared {
             generation: new_gen.get(),
         })
@@ -1022,7 +1071,7 @@ impl SessionManager {
 
     /// Reap only idle warm sessions past the TTL (never an active turn).
     pub async fn reap_idle(&self) {
-        let now = (self.now)();
+        let now = self.clock.now_instant();
         let expired: Vec<ContextId> = {
             let tab = self.by_context.lock().await;
             tab.iter()
@@ -1075,6 +1124,7 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ManualClock;
     use async_trait::async_trait;
     use bridge_core::domain::{AgentEntry, AgentKind, Effort, Part, RegistrySnapshot};
     use bridge_core::ports::{BackendStream, Resolved, Update};
@@ -1438,29 +1488,6 @@ mod tests {
     fn is_claimed_includes_compacting() {
         assert!(super::is_claimed(super::SessionState::Compacting));
         assert!(super::is_claimed(super::SessionState::Cancelling));
-    }
-
-    #[derive(Clone)]
-    struct ManualClock {
-        now: Arc<StdMutex<Instant>>,
-    }
-
-    impl ManualClock {
-        fn new() -> Self {
-            Self {
-                now: Arc::new(StdMutex::new(Instant::now())),
-            }
-        }
-
-        fn reader(&self) -> Box<dyn Fn() -> Instant + Send + Sync> {
-            let now = self.now.clone();
-            Box::new(move || *now.lock().unwrap())
-        }
-
-        fn advance(&self, by: Duration) {
-            let mut now = self.now.lock().unwrap();
-            *now += by;
-        }
     }
 
     #[tokio::test]
@@ -2008,9 +2035,9 @@ mod tests {
     async fn cancel_refreshes_idle_ttl() {
         let backend = Arc::new(FakeBackend::new("ok"));
         let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
-        let clock = ManualClock::new();
+        let clock = Arc::new(ManualClock::new(0));
         let manager =
-            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.reader());
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone());
         let c = ctx("cancel-ttl");
         let turn = manager
             .checkout_turn(&c, agent(), None, None, op("op-1"))
@@ -3373,9 +3400,9 @@ mod tests {
     async fn record_usage_does_not_refresh_idle_ttl() {
         let backend = Arc::new(FakeBackend::new("ok"));
         let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
-        let clock = ManualClock::new();
+        let clock = Arc::new(ManualClock::new(0));
         let manager =
-            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.reader());
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone());
         let c = ctx("idle-usage");
         let turn = manager
             .checkout_turn(&c, agent(), None, None, op("op-1"))
@@ -3425,9 +3452,9 @@ mod tests {
     async fn reap_idle_removes_only_idle_sessions_past_ttl() {
         let backend = Arc::new(FakeBackend::new("ok"));
         let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
-        let clock = ManualClock::new();
+        let clock = Arc::new(ManualClock::new(0));
         let manager =
-            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.reader());
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone());
         let idle = ctx("idle");
         let running = ctx("running");
 
@@ -3454,9 +3481,9 @@ mod tests {
     async fn reap_idle_prunes_child_registration() {
         let backend = Arc::new(FakeBackend::new("ok"));
         let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
-        let clock = ManualClock::new();
+        let clock = Arc::new(ManualClock::new(0));
         let manager =
-            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.reader());
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone());
         let parent = ctx("reap-child-parent");
         let child = ctx("reap-child");
 
@@ -3515,11 +3542,11 @@ mod tests {
         // claim owns the lifecycle; the reaper must not defer-expire it).
         let backend = Arc::new(FakeBackend::new("ok"));
         let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
-        let clock = ManualClock::new();
+        let clock = Arc::new(ManualClock::new(0));
         let manager = Arc::new(SessionManager::new_with_clock(
             registry,
             Duration::from_secs(5),
-            clock.reader(),
+            clock.clone(),
         ));
         let c = ctx("c");
         let turn = manager
