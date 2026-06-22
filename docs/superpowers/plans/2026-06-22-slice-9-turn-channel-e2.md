@@ -640,5 +640,8 @@ impl PermissionRegistry {
 
 ### v3 verdict
 Both lenses: needs-revision → **all findings folded above**. No re-architecture; the five v2 decisions stand.
-ONE scope question surfaced by both R4 answers (warm-only interactive permit, detached deferred) — both
-reviewers call it the correct slice boundary. Plan is now **ready-to-implement** pending that scope confirm.
+**SCOPE CONFIRMED (operator, 2026-06-22): WARM-ONLY** interactive permit — detached-node interactive permit +
+push/SSE visibility + per-agent Defer are TRACKED deferrals (above). Plan is **READY-TO-IMPLEMENT**. Implement
+order: v2.T1 → T2 → T3 → T4 → T5 → T5b → T6 → T7 → T8 → T9 → T10 (deps: types→inject→registry→SM-resolve→
+route-meta→container-forward→handler→config→status→wire→DoD). Proven loop: codex-HIGH writes (no commit) /
+Opus verifies in the clean host env + commits / codex-xhigh whole-branch review / live-gate vs direct codex.

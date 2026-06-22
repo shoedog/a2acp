@@ -1,25 +1,29 @@
 # Slice 9 — Turn Channel + E2 permission — HANDOFF / Resume Doc
 
-> Resume the LAST core orchestration slice. **STATUS: architect DONE (spec v2 ready-to-plan, SPIKE-1 ✅) +
-> PLAN WRITTEN; the codex PLAN-REVIEW is the in-flight gate.** Branch `feat/slice-9-turn-channel-e2`
+> Resume the LAST core orchestration slice. **STATUS: architect DONE (spec v2, SPIKE-1 ✅) + PLAN v3 DONE
+> (dual-review folded, scope confirmed) → READY-TO-IMPLEMENT.** Branch `feat/slice-9-turn-channel-e2`
 > (base = `main` `e4e12f0`). Read top-to-bottom. Docs-only so far — NO production code written yet.
 
-## ⏯️ RESUME POINT (paused here): read the plan-review, fold, then implement
-- **Plan written + committed** (`5a04b6f`): `docs/superpowers/plans/2026-06-22-slice-9-turn-channel-e2.md`
-  — 8 TDD tasks realizing SF-1..9, + open items P1-P4.
-- **codex-xhigh PLAN-REVIEW was DISPATCHED and is/was running** (port 8124) — output to
-  `/tmp/slice-9-plan-review.out` (transient). Scaffolding committed (`prompts/slice-9-plan-review.md` +
-  `examples/a2a-bridge.slice-9-plan-review-codex.toml`). **FIRST on resume: read `/tmp/slice-9-plan-review.out`**
-  (if gone, re-run: `./target/debug/a2a-bridge run-workflow slice-9-plan-review --input
-  /tmp/slice-9-plan-review-input.md --session-cwd $PWD --config
-  examples/a2a-bridge.slice-9-plan-review-codex.toml --out /tmp/slice-9-plan-review.out`).
-- **Then:** add an Opus lens; fold both into a plan `## v2` section (resolve P1-P4); then run the loop —
-  TDD-implement task-by-task (codex-HIGH writes via `run-workflow` on the `cancel-tokens-impl`-style config / Opus
-  verifies in the clean host env + commits) → whole-branch dual-lens review → live-gate → merge.
-- **Watch (the plan flagged these for review):** P1 — does the A2A `SessionCancel`/`SessionClear` path
-  (`server.rs:2952`) reach the `PermissionRegistry` to `resolve_context`, or call `SessionManager` directly (then
-  the registry must be threaded there)? P2 — is the bridge `ContextId` available at ACP route-registration
-  (Task 4, the least-pinned)? P3 — timeout default + Escalate must not consume the sender. P4 — MCP tool seam.
+## ⏯️ RESUME POINT: the plan is locked — START IMPLEMENTING (v2.T1)
+- **Plan = `docs/superpowers/plans/2026-06-22-slice-9-turn-channel-e2.md`**: read the **`## v2`** (BINDING) +
+  **`## v3`** (BINDING, supersedes v2 where it conflicts) sections — they are the implementation spec.
+  History: draft (`5a04b6f`) → v2 fold of codex-1 plan-review + verification (`1e5e5a6`) → v3 reconciliation of
+  the Opus architecture lens + codex-2 2nd pass (`ac96379`) → scope confirm (warm-only).
+- **Both reviews (Opus lens + codex-xhigh 2nd pass) = needs-revision → ALL findings folded into v3.** The five
+  v2 decisions stand; no re-architecture. Transient review outputs: `/tmp/slice-9-plan-review-v2.out` (codex-2);
+  the Opus lens is captured in the conversation + v3.
+- **SCOPE CONFIRMED: WARM-ONLY interactive permit.** Detached-node interactive permit + push/SSE visibility +
+  per-agent Defer = TRACKED deferrals (see v3 "Deferred — TRACKED"). Detached nodes still get `configure_turn`
+  so a Defer there TIMES-OUT to default-deny (no hang).
+- **NEXT: implement task-by-task** v2.T1 → T2 → T3 → T4 → T5 → T5b → T6 → T7 → T8 → T9 → T10. Proven loop:
+  codex-HIGH writes (no commit) / Opus verifies in the clean host env + commits / codex-xhigh whole-branch
+  review / live-gate vs DIRECT codex (`approval_policy="untrusted" sandbox_mode="read-only"` + `[server]
+  permission_policy="defer"`, port 8125). Reuse a `cancel-tokens-impl`-style codex-HIGH config (danger-full-
+  access, NO commit). Stage ONLY each task's files (worktree has many unrelated untracked `examples/*.toml` /
+  `prompts/*.md` + `M examples/a2a-bridge.slicing-analysis.toml` — never fold them).
+- **The single most critical impl detail** (Opus, verified): `resolve_context_cancelled` fires AFTER the
+  `is_claimed`/`Cancelling` guards in `cancel_inner`/`release_inner`/`reset_session_inner` (NOT at the top) —
+  else cancelling a `Compacting`/`Resetting` ctx poisons its own summarize permission → EXPIRE → data loss.
 
 ## Where this sits
 - The prerequisite ([[cancel-tokens-shipped]]) is SHIPPED+MERGED+PUSHED (`main` merge `12e3816`). Slice 9 is
