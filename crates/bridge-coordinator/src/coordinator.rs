@@ -231,7 +231,21 @@ impl Coordinator {
             parts,
         );
         let mut collected = Vec::new();
-        while let Some(ev) = events.next().await {
+        let mut aborted = false;
+        loop {
+            let ev = tokio::select! {
+                biased;
+                // cancel-tokens F2 (L1 — abort arm FIRST): a force-reset cancelled this turn → stop without
+                // polling events (a pre-first-poll abort means `backend.prompt` never runs → no re-mint).
+                _ = turn.abort.cancelled() => {
+                    aborted = true;
+                    break;
+                }
+                maybe = events.next() => match maybe {
+                    Some(ev) => ev,
+                    None => break,
+                },
+            };
             match &ev {
                 Ok(e) if e.kind() == &EventKind::Usage => {
                     if let Some(snap) = e.usage_snapshot() {
@@ -244,7 +258,11 @@ impl Coordinator {
                 _ => collected.push(ev),
             }
         }
+        // Drop the translator stream BEFORE finishing (cancels the in-flight backend future on abort).
         drop(events);
+        if aborted {
+            collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
+        }
 
         // Finish synchronously on the normal/error path, then disarm so the guard's drop is a no-op
         // (no double finish_turn). If the future was cancelled before reaching here, the still-armed
@@ -634,6 +652,24 @@ mod tests {
                 stop_reason: "end_turn".into(),
             }));
             Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    /// Panics if `prompt` is ever called — proves the pre-first-poll abort never reaches `backend.prompt`.
+    struct PanicOnPromptBackend;
+
+    #[async_trait]
+    impl AgentBackend for PanicOnPromptBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("backend.prompt must not be called when the turn was aborted pre-first-poll");
         }
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
@@ -1085,6 +1121,31 @@ mod tests {
             fixture.coordinator.continue_turn(cont).await,
             Err(BridgeError::SessionNotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn collect_turn_pre_cancelled_abort_never_prompts() {
+        // cancel-tokens F2 / L1: when the abort token is ALREADY cancelled at collect_turn's first poll,
+        // the biased select takes the abort arm → events.next() is never polled → backend.prompt never
+        // runs (the no-re-mint proof). PanicOnPromptBackend panics if prompt is called; reaching the
+        // assertion proves it was not. The turn surfaces as "cancelled".
+        let coordinator = coordinator_fixture(Arc::new(HashMap::new())).coordinator;
+        let abort = CancellationToken::new();
+        abort.cancel();
+        let turn = crate::session_manager::WarmTurn {
+            backend: Arc::new(PanicOnPromptBackend) as Arc<dyn AgentBackend>,
+            session: SessionId::parse("ctx-abort-g1").unwrap(),
+            usage_warning: None,
+            generation: bridge_core::ids::SessionGeneration::new(1),
+            op: OperationId::parse("turn-1").unwrap(),
+            seed: None,
+            abort,
+        };
+        let out = coordinator
+            .collect_turn(ctx("ctx-abort"), turn, "hi".into())
+            .await
+            .unwrap();
+        assert_eq!(out.stop_reason, "cancelled");
     }
 
     #[tokio::test]

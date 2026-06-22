@@ -1387,6 +1387,8 @@ fn spawn_local_producer(
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
     let warm = dispatch.warm_guard;
+    // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
+    let abort = dispatch.abort;
 
     tokio::spawn(async move {
         // Hold the guard for the whole producer; dropped on every return path below.
@@ -1415,15 +1417,25 @@ fn spawn_local_producer(
             // observe the dropped receiver, and its `_guard` Drop (lease/stash
             // eviction) would never fire. On disconnect we return early → guard drops.
             let ev = tokio::select! {
-                maybe = events.next() => match maybe {
-                    Some(ev) => ev,
-                    None => break,
-                },
+                biased;
+                // cancel-tokens F2 (L1 — abort arm FIRST, biased): a force-reset cancelled this turn.
+                // Emit a terminal Canceled and STOP without polling events — a pre-first-poll abort means
+                // `backend.prompt` never runs, so the released (cleared) session is never re-minted.
+                _ = abort.cancelled() => {
+                    if !translator_terminal {
+                        let _ = tx.send(Ok(Event::terminal(TaskOutcome::Canceled))).await;
+                    }
+                    return;
+                }
                 _ = tx.closed() => {
                     // Receiver gone (client disconnected) — stop driving; the `_guard`
                     // Drop evicts the binding/lease/stash on this early return.
                     return;
                 }
+                maybe = events.next() => match maybe {
+                    Some(ev) => ev,
+                    None => break,
+                },
             };
             // Slice 2: usage is telemetry — record it on the warm handle, never forward to SSE.
             if let Ok(e) = &ev {
@@ -2294,6 +2306,8 @@ async fn unary_message(
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
             let warm = dispatch.warm_guard;
+            // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
+            let abort = dispatch.abort;
             let mut parts = routed.parts;
             if let Some(seed) = dispatch.seed {
                 parts.insert(
@@ -2313,7 +2327,20 @@ async fn unary_message(
                 parts,
             );
             let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
-            while let Some(ev) = events.next().await {
+            loop {
+                let ev = tokio::select! {
+                    biased;
+                    // cancel-tokens F2 (L1 — abort arm FIRST, biased): a force-reset cancelled this turn.
+                    // Record a Canceled terminal and stop without polling events (pre-first-poll → no re-mint).
+                    _ = abort.cancelled() => {
+                        collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
+                        break;
+                    }
+                    maybe = events.next() => match maybe {
+                        Some(ev) => ev,
+                        None => break,
+                    },
+                };
                 if let Ok(e) = &ev {
                     if e.kind() == &EventKind::Usage {
                         if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
