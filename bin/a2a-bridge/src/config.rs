@@ -52,6 +52,10 @@ pub struct ServerConfig {
     pub warm_usage_warn_fraction: Option<f64>,
     #[serde(default)]
     pub compact_summarize_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub permission_policy: Option<String>,
+    #[serde(default)]
+    pub permission_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2429,6 +2433,28 @@ addr = "127.0.0.1:8080"
         assert_eq!(cfg2.server.warm_idle_ttl_secs, 5);
         assert_eq!(cfg2.server.warm_usage_warn_fraction, Some(0.8));
         assert_eq!(cfg2.server.compact_summarize_timeout_secs, Some(7));
+    }
+
+    #[test]
+    fn permission_policy_and_timeout_parse_with_absent_defaults() {
+        let base = r#"
+default = "a"
+[[agents]]
+id = "a"
+cmd = "echo"
+[server]
+addr = "127.0.0.1:8080"
+"#;
+        let cfg: RegistryConfig = RegistryConfig::parse(base).unwrap();
+        assert_eq!(cfg.server.permission_policy, None);
+        assert_eq!(cfg.server.permission_timeout_ms, None);
+
+        let cfg2: RegistryConfig = RegistryConfig::parse(&format!(
+            "{base}permission_policy = \"defer\"\npermission_timeout_ms = 5000\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg2.server.permission_policy.as_deref(), Some("defer"));
+        assert_eq!(cfg2.server.permission_timeout_ms, Some(5000));
     }
 
     #[test]
