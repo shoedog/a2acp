@@ -4143,6 +4143,7 @@ async fn main() -> Result<(), BoxError> {
         .with_workflows(executor, wf_map.clone())
         .with_task_store(task_store)
         .with_session_manager(session_manager)
+        .with_permission_registry(Arc::clone(&perm_registry))
         .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
         .with_model_catalog(Arc::clone(&model_catalog)),
     );

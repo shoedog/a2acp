@@ -30,6 +30,7 @@ pub enum PermissionResolution {
 
 /// One offered permission option, surfaced to the operator via session/status.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PermissionOptionView {
     pub option_id: String,
     pub name: String,
@@ -38,6 +39,7 @@ pub struct PermissionOptionView {
 
 /// What `session/status` shows for a pending permission (Task 8 reads this from the registry).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingPermissionView {
     pub request_id: String,
     pub tool_call_id: String,
@@ -200,10 +202,16 @@ mod tests {
                 name: "Allow".into(),
                 kind: "allow_once".into(),
             }],
-            raw_input: None,
+            raw_input: Some(r#"{"command":["touch","/tmp/x"]}"#.into()),
             timeout_ms: 120_000,
         };
         let s = serde_json::to_string(&v).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(json["requestId"], "r");
+        assert_eq!(json["toolCallId"], "t");
+        assert_eq!(json["timeoutMs"], 120_000);
+        assert_eq!(json["options"][0]["optionId"], "approved");
+        assert_eq!(json["rawInput"], r#"{"command":["touch","/tmp/x"]}"#);
         let _back: PendingPermissionView = serde_json::from_str(&s).unwrap();
     }
 
