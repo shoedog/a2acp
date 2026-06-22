@@ -833,7 +833,7 @@ impl SessionManager {
         opts: ResetOpts,
     ) -> (Result<ResetOutcome, BridgeError>, Vec<ContextId>) {
         // (1)+(2)+(3) claim under ONE lock hold (FIX-2: never bounce through Idle, never call self.cancel).
-        let (backend, old_id, claimed_id, new_gen, new_id, spec) = {
+        let (backend, old_id, claimed_id, new_gen, new_id, spec, turn_abort) = {
             let mut tab = self.by_context.lock().await;
             let Some(h) = tab.get_mut(ctx) else {
                 return (Ok(ResetOutcome::NotFound), Vec::new());
@@ -843,6 +843,9 @@ impl SessionManager {
                 SessionState::Running if opts.force => {}
                 _ => return (Err(BridgeError::HandleBusy), Vec::new()),
             }
+            // F2 (cancel-tokens): take the in-flight turn's abort token under the claim so a force-reset
+            // can cancel it (below) BEFORE releasing the session. An Idle reset has no live turn (None).
+            let turn_abort = h.turn_abort.take();
             let backend = h.backend.clone();
             let old_id = h.backend_session.clone();
             let claimed_id = h.id.clone();
@@ -873,8 +876,17 @@ impl SessionManager {
             };
             h.state = SessionState::Resetting;
             h.expire_after_reconcile = false;
-            (backend, old_id, claimed_id, new_gen, new_id, spec)
+            (
+                backend, old_id, claimed_id, new_gen, new_id, spec, turn_abort,
+            )
         };
+
+        // F2 (cancel-tokens): abort an in-flight producer BEFORE releasing its session, so a force-clear
+        // cannot let the producer prompt (and ACP lazy-re-mint) the released — cleared — context. The
+        // producer's biased abort-select observes this on its next poll (pre-first-poll → never prompts).
+        if let Some(tok) = &turn_abort {
+            tok.cancel();
+        }
 
         // (4)+(5) PF-13: force pre-cancel (trait-default release_session does NOT cancel, e.g. ApiBackend);
         // release(old) is the drain; FIX-4: CAPTURE configure, no `?`.
@@ -1860,6 +1872,28 @@ mod tests {
         assert_eq!(s.generation, 1);
         assert_eq!(s.state, "idle");
         assert_eq!(s.usage.used, None);
+    }
+
+    #[tokio::test]
+    async fn force_reset_cancels_the_inflight_turn_abort() {
+        // cancel-tokens F2: a force-reset of a Running handle must cancel the in-flight turn's abort token
+        // (the producer's biased select then aborts before/instead of prompting the released session).
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-abort");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        assert!(!turn.abort.is_cancelled());
+        let out = manager
+            .reset_session(&c, ResetOpts { force: true })
+            .await
+            .unwrap();
+        assert!(matches!(out, ResetOutcome::Cleared { generation: 1 }));
+        assert!(
+            turn.abort.is_cancelled(),
+            "force reset must cancel the in-flight turn's abort token"
+        );
     }
 
     #[tokio::test]

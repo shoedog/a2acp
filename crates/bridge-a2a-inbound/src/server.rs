@@ -443,6 +443,8 @@ async fn resolve_configure_bind(
                 seed: None,
                 guard: None,
                 warm_guard: None,
+                // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
+                abort: tokio_util::sync::CancellationToken::new(),
             });
         }
     }
@@ -480,6 +482,8 @@ async fn resolve_configure_bind(
         seed: None,
         guard: Some(guard),
         warm_guard: None,
+        // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
+        abort: tokio_util::sync::CancellationToken::new(),
     })
 }
 
@@ -518,6 +522,8 @@ async fn warm_local_dispatch(
                     generation: turn.generation,
                     op: turn.op.clone(),
                 }),
+                // Warm: the handle's per-turn abort token — a force-reset cancels it (cancel-tokens F2).
+                abort: turn.abort,
             }))
         }
         Err(e) => Some(Err(e)),
