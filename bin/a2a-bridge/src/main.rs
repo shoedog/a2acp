@@ -3040,29 +3040,147 @@ async fn session_cmd(args: &[String]) -> Result<(), BoxError> {
     let sub = args
         .first()
         .map(|s| s.as_str())
-        .ok_or("session: missing subcommand (status|release|cancel|clear|compact)")?;
+        .ok_or("session: missing subcommand (status|release|cancel|clear|compact|inject|permit)")?;
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
-    let ctx = args.get(1).cloned().ok_or("session: missing <contextId>")?;
-    let method = match sub {
-        "status" => "SessionStatus",
-        "release" => "SessionRelease",
-        "cancel" => "SessionCancel",
-        "clear" => "SessionClear",
-        "compact" => "SessionCompact",
-        other => return Err(format!("session: unknown subcommand {other:?}").into()),
-    };
-    let force = args.iter().any(|a| a == "--force");
-    let params = if sub == "clear" {
-        serde_json::json!({ "contextId": ctx, "force": force })
-    } else {
-        serde_json::json!({ "contextId": ctx })
-    };
+    let (method, params) = build_session_rpc(args)?;
     let v = rpc_call(url, method, params).await?;
     if let Some(err) = v.get("error") {
         return Err(format!("session {sub} failed: {err}").into());
     }
     println!("{}", serde_json::to_string_pretty(&v["result"])?);
     Ok(())
+}
+
+fn build_session_rpc(args: &[String]) -> Result<(&'static str, serde_json::Value), BoxError> {
+    let sub = args
+        .first()
+        .map(|s| s.as_str())
+        .ok_or("session: missing subcommand (status|release|cancel|clear|compact|inject|permit)")?;
+    match sub {
+        "status" | "release" | "cancel" | "clear" | "compact" => {
+            let ctx = args.get(1).cloned().ok_or("session: missing <contextId>")?;
+            let method = match sub {
+                "status" => "SessionStatus",
+                "release" => "SessionRelease",
+                "cancel" => "SessionCancel",
+                "clear" => "SessionClear",
+                "compact" => "SessionCompact",
+                _ => unreachable!(),
+            };
+            let force = args.iter().any(|a| a == "--force");
+            let params = if sub == "clear" {
+                serde_json::json!({ "contextId": ctx, "force": force })
+            } else {
+                serde_json::json!({ "contextId": ctx })
+            };
+            Ok((method, params))
+        }
+        "inject" => build_session_inject_rpc(args),
+        "permit" => build_session_permit_rpc(args),
+        other => Err(format!("session: unknown subcommand {other:?}").into()),
+    }
+}
+
+fn build_session_inject_rpc(
+    args: &[String],
+) -> Result<(&'static str, serde_json::Value), BoxError> {
+    let ctx = args
+        .get(1)
+        .cloned()
+        .ok_or("session inject: missing <contextId>")?;
+    let input_path = flag(args, "--input").ok_or("session inject: --input <file> required")?;
+    let text = std::fs::read_to_string(input_path)?;
+    let mut params = serde_json::json!({
+        "contextId": ctx,
+        "text": text,
+        "mode": if args.iter().any(|a| a == "--append") {
+            "append_next_turn"
+        } else {
+            "prepend_next_turn"
+        }
+    });
+    if let Some(dedupe) = flag(args, "--dedupe") {
+        params["dedupeKey"] = serde_json::Value::String(dedupe.to_string());
+    }
+    Ok(("SessionInject", params))
+}
+
+fn build_session_permit_rpc(
+    args: &[String],
+) -> Result<(&'static str, serde_json::Value), BoxError> {
+    let request_id = args
+        .get(1)
+        .cloned()
+        .ok_or("session permit: missing <requestId>")?;
+    let context =
+        flag(args, "--context").ok_or("session permit: --context <contextId> required")?;
+    let generation: u64 = flag(args, "--generation")
+        .ok_or("session permit: --generation <n> required")?
+        .parse()
+        .map_err(|_| "session permit: invalid --generation")?;
+    let op = flag(args, "--op").ok_or("session permit: --op <operationId> required")?;
+    let mut selected = Vec::new();
+    if args.iter().any(|a| a == "--approve") {
+        selected.push("approve");
+    }
+    if args.iter().any(|a| a == "--deny") {
+        selected.push("deny");
+    }
+    if flag(args, "--modify").is_some() {
+        selected.push("modify");
+    }
+    if args.iter().any(|a| a == "--escalate") {
+        selected.push("escalate");
+    }
+    if selected.len() != 1 {
+        return Err(
+            "session permit: choose exactly one of --approve|--deny|--modify <id>|--escalate"
+                .into(),
+        );
+    }
+
+    let decision = match selected[0] {
+        "approve" => {
+            let mut d = serde_json::json!({ "decision": "approve" });
+            if let Some(option) = flag(args, "--option") {
+                d["optionId"] = serde_json::Value::String(option.to_string());
+            }
+            d
+        }
+        "deny" => {
+            let mut d = serde_json::json!({ "decision": "deny" });
+            if let Some(option) = flag(args, "--option") {
+                d["optionId"] = serde_json::Value::String(option.to_string());
+            }
+            if let Some(reason) = flag(args, "--reason") {
+                d["reason"] = serde_json::Value::String(reason.to_string());
+            }
+            d
+        }
+        "modify" => serde_json::json!({
+            "decision": "modify",
+            "optionId": flag(args, "--modify").expect("selected modify has a value")
+        }),
+        "escalate" => {
+            let mut d = serde_json::json!({ "decision": "escalate" });
+            if let Some(reason) = flag(args, "--reason") {
+                d["reason"] = serde_json::Value::String(reason.to_string());
+            }
+            d
+        }
+        _ => unreachable!(),
+    };
+
+    Ok((
+        "SessionPermit",
+        serde_json::json!({
+            "contextId": context,
+            "generation": generation,
+            "op": op,
+            "requestId": request_id,
+            "decision": decision
+        }),
+    ))
 }
 
 /// Execute `task watch <id> [--from <seq>]`: POSTs a SubscribeToTask JSON-RPC
@@ -3838,18 +3956,21 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         .transpose()
         .map_err(|e| format!("a2a-bridge mcp: invalid allowed_cwd_root: {e:?}"))?;
 
-    let coordinator = Arc::new(bridge_coordinator::Coordinator::new(
-        session_manager,
-        Some(executor),
-        Arc::new(wf_map),
-        task_store,
-        session_store,
-        Arc::clone(&policy) as Arc<dyn PolicyEngine>,
-        Arc::clone(&registry) as Arc<dyn AgentRegistry>,
-        clock,
-        allowed_cwd_root,
-        resume_cap,
-    ));
+    let coordinator = Arc::new(
+        bridge_coordinator::Coordinator::new(
+            session_manager,
+            Some(executor),
+            Arc::new(wf_map),
+            task_store,
+            session_store,
+            Arc::clone(&policy) as Arc<dyn PolicyEngine>,
+            Arc::clone(&registry) as Arc<dyn AgentRegistry>,
+            clock,
+            allowed_cwd_root,
+            resume_cap,
+        )
+        .with_permission_registry(Arc::clone(&perm_registry)),
+    );
 
     coordinator.resume().await;
     bridge_mcp::serve(tokio::io::stdin(), tokio::io::stdout(), coordinator).await?;
@@ -4311,6 +4432,60 @@ mod cli_tests {
             ))
         ));
         assert_eq!(permission_timeout_ms(&cfg.server), 120_000);
+    }
+
+    #[test]
+    fn session_inject_parser_builds_append_payload() {
+        let path =
+            std::env::temp_dir().join(format!("a2a-bridge-inject-{}.txt", std::process::id()));
+        std::fs::write(&path, "queued text").unwrap();
+        let args = vec![
+            "inject".to_string(),
+            "ctx-cli".to_string(),
+            "--input".to_string(),
+            path.to_string_lossy().to_string(),
+            "--append".to_string(),
+            "--dedupe".to_string(),
+            "k1".to_string(),
+        ];
+
+        let (method, params) = build_session_rpc(&args).unwrap();
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(method, "SessionInject");
+        assert_eq!(params["contextId"], "ctx-cli");
+        assert_eq!(params["text"], "queued text");
+        assert_eq!(params["mode"], "append_next_turn");
+        assert_eq!(params["dedupeKey"], "k1");
+    }
+
+    #[test]
+    fn session_permit_parser_builds_approve_payload() {
+        let args = vec![
+            "permit".to_string(),
+            "req-cli".to_string(),
+            "--context".to_string(),
+            "ctx-cli".to_string(),
+            "--generation".to_string(),
+            "4".to_string(),
+            "--op".to_string(),
+            "turn-4".to_string(),
+            "--approve".to_string(),
+            "--option".to_string(),
+            "approved".to_string(),
+        ];
+
+        let (method, params) = build_session_rpc(&args).unwrap();
+
+        assert_eq!(method, "SessionPermit");
+        assert_eq!(params["contextId"], "ctx-cli");
+        assert_eq!(params["generation"], 4);
+        assert_eq!(params["op"], "turn-4");
+        assert_eq!(params["requestId"], "req-cli");
+        assert_eq!(
+            params["decision"],
+            serde_json::json!({ "decision": "approve", "optionId": "approved" })
+        );
     }
 
     struct FakeTurnRunner {

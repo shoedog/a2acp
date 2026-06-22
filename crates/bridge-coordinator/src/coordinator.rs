@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bridge_core::domain::{InjectRequest, Part};
+use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{ContextId, OperationId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
+use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution};
 use bridge_core::ports::{AgentRegistry, PolicyEngine, SessionStore};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{TaskRecord, TaskRecordStatus, TaskStore};
@@ -22,7 +23,7 @@ use crate::detached::{
     TaskProgressHub,
 };
 use crate::dispatch::TaskBinding;
-use crate::params::OpParams;
+use crate::params::{OpParams, PermitParams};
 use crate::turn_parts::assemble_turn_parts;
 
 static PROMPT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -102,9 +103,23 @@ pub struct Coordinator {
     progress_hubs: Arc<Mutex<HashMap<TaskId, Arc<TaskProgressHub>>>>,
     workflow_cancels: Arc<Mutex<HashMap<TaskId, CancellationToken>>>,
     workflow_runs: Arc<Mutex<HashMap<ContextId, CancellationToken>>>,
+    permission_registry: Option<Arc<PermissionRegistry>>,
     clock: Arc<dyn Clock>,
     allowed_cwd_root: Option<SessionCwd>,
     resume_attempt_cap: u32,
+}
+
+pub fn apply_permit(reg: &PermissionRegistry, p: &PermitParams) -> bool {
+    if matches!(p.decision, PermitDecision::Escalate { .. }) {
+        return false;
+    }
+    let key = PermKey {
+        context_id: p.context.clone(),
+        generation: p.generation,
+        op: p.op.clone(),
+        request_id: p.request_id.clone(),
+    };
+    reg.resolve(&key, PermissionResolution::Decided(p.decision.clone()))
 }
 
 impl Coordinator {
@@ -133,10 +148,17 @@ impl Coordinator {
             progress_hubs: Arc::new(Mutex::new(HashMap::new())),
             workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
+            permission_registry: None,
             clock,
             allowed_cwd_root,
             resume_attempt_cap,
         }
+    }
+
+    #[must_use]
+    pub fn with_permission_registry(mut self, reg: Arc<PermissionRegistry>) -> Self {
+        self.permission_registry = Some(reg);
+        self
     }
 
     /// Build the detached-workflow dependency view over the Coordinator's owned fields.
@@ -195,6 +217,14 @@ impl Coordinator {
 
     pub async fn inject(&self, req: InjectRequest) -> Result<usize, BridgeError> {
         self.session_manager.inject(req).await
+    }
+
+    pub async fn permit(&self, p: PermitParams) -> Result<bool, BridgeError> {
+        Ok(self
+            .permission_registry
+            .as_ref()
+            .map(|reg| apply_permit(reg, &p))
+            .unwrap_or(false))
     }
 
     /// Drive ONE warm turn to completion and collect it into a `TurnOutput`. Records usage as a side
@@ -990,6 +1020,106 @@ mod tests {
             .unwrap();
         assert_eq!(status.usage.used, Some(7));
         assert_eq!(status.usage.at_ms, 1_700_000_000_000);
+    }
+
+    fn perm_key(ctx: &str, request_id: &str) -> bridge_core::permission::PermKey {
+        bridge_core::permission::PermKey {
+            context_id: ContextId::parse(ctx).unwrap(),
+            generation: 3,
+            op: OperationId::parse("turn-3").unwrap(),
+            request_id: request_id.into(),
+        }
+    }
+
+    fn pending_view(request_id: &str) -> bridge_core::permission::PendingPermissionView {
+        bridge_core::permission::PendingPermissionView {
+            request_id: request_id.into(),
+            tool_call_id: "tool-1".into(),
+            generation: 3,
+            op: OperationId::parse("turn-3").unwrap(),
+            title: "write file".into(),
+            options: Vec::new(),
+            raw_input: None,
+            timeout_ms: 120_000,
+        }
+    }
+
+    fn permit_params(
+        ctx: &str,
+        request_id: &str,
+        decision: bridge_core::domain::PermitDecision,
+    ) -> crate::params::PermitParams {
+        crate::params::PermitParams {
+            context: ContextId::parse(ctx).unwrap(),
+            generation: 3,
+            op: OperationId::parse("turn-3").unwrap(),
+            request_id: request_id.into(),
+            decision,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_permit_escalate_does_not_resolve() {
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let ctx = ContextId::parse("ctx-escalate").unwrap();
+        let key = perm_key("ctx-escalate", "req-escalate");
+        let (mut rx, _guard) = reg.register(key, pending_view("req-escalate"));
+
+        let resolved = apply_permit(
+            &reg,
+            &permit_params(
+                "ctx-escalate",
+                "req-escalate",
+                bridge_core::domain::PermitDecision::Escalate {
+                    reason: Some("human".into()),
+                },
+            ),
+        );
+
+        assert!(!resolved);
+        assert_eq!(reg.pending(&ctx).len(), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_permit_approve_resolves() {
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let key = perm_key("ctx-approve", "req-approve");
+        let (rx, _guard) = reg.register(key, pending_view("req-approve"));
+
+        let resolved = apply_permit(
+            &reg,
+            &permit_params(
+                "ctx-approve",
+                "req-approve",
+                bridge_core::domain::PermitDecision::Approve {
+                    option_id: Some("approved".into()),
+                },
+            ),
+        );
+
+        assert!(resolved);
+        match rx.await.unwrap() {
+            bridge_core::permission::PermissionResolution::Decided(
+                bridge_core::domain::PermitDecision::Approve { option_id },
+            ) => assert_eq!(option_id.as_deref(), Some("approved")),
+            other => panic!("unexpected permission resolution: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_permit_unknown_request_false() {
+        let reg = bridge_core::permission::PermissionRegistry::new();
+        let resolved = apply_permit(
+            &reg,
+            &permit_params(
+                "ctx-missing",
+                "missing",
+                bridge_core::domain::PermitDecision::Approve { option_id: None },
+            ),
+        );
+
+        assert!(!resolved);
     }
 
     #[tokio::test]

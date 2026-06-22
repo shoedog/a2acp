@@ -285,7 +285,11 @@ pub enum PermissionDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "decision", rename_all = "snake_case")]
+#[serde(
+    tag = "decision",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum PermitDecision {
     Approve {
         #[serde(default, skip_serializing_if = "Option::is_none")]

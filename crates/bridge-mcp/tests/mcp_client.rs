@@ -12,7 +12,7 @@ use bridge_core::domain::{
     PermissionRequest, RegistrySnapshot, SessionContext,
 };
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{AgentId, ContextId, NodeId, SessionId, TaskId, WorkflowId};
+use bridge_core::ids::{AgentId, ContextId, NodeId, OperationId, SessionId, TaskId, WorkflowId};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, BackendStream, Lease, PolicyEngine, Resolved, SessionStore, Update,
 };
@@ -186,6 +186,7 @@ impl PolicyEngine for AllowPolicy {
 struct Fixture {
     coord: Arc<Coordinator>,
     backend: Arc<FakeBackend>,
+    perm_registry: Arc<bridge_core::permission::PermissionRegistry>,
 }
 
 fn agent_entry() -> AgentEntry {
@@ -234,11 +235,11 @@ fn fixture() -> Fixture {
         backend: backend.clone(),
     });
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
-    let session_manager = Arc::new(SessionManager::new_with_clock(
-        registry.clone(),
-        Duration::from_secs(60),
-        clock.clone(),
-    ));
+    let perm_registry = bridge_core::permission::PermissionRegistry::new();
+    let session_manager = Arc::new(
+        SessionManager::new_with_clock(registry.clone(), Duration::from_secs(60), clock.clone())
+            .with_permission_registry(perm_registry.clone()),
+    );
     let task_store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
     let session_store: Arc<dyn SessionStore> = Arc::new(FakeSessionStore::default());
     let policy: Arc<dyn PolicyEngine> = Arc::new(AllowPolicy);
@@ -248,19 +249,26 @@ fn fixture() -> Fixture {
         workflow("code-review"),
     );
     let executor = Arc::new(WorkflowExecutor::new(registry.clone()));
-    let coord = Arc::new(Coordinator::new(
-        session_manager,
-        Some(executor),
-        Arc::new(workflows),
-        task_store,
-        session_store,
-        policy,
-        registry,
-        clock,
-        Some(SessionCwd::parse("/tmp").unwrap()),
-        3,
-    ));
-    Fixture { coord, backend }
+    let coord = Arc::new(
+        Coordinator::new(
+            session_manager,
+            Some(executor),
+            Arc::new(workflows),
+            task_store,
+            session_store,
+            policy,
+            registry,
+            clock,
+            Some(SessionCwd::parse("/tmp").unwrap()),
+            3,
+        )
+        .with_permission_registry(perm_registry.clone()),
+    );
+    Fixture {
+        coord,
+        backend,
+        perm_registry,
+    }
 }
 
 fn text_body(reply: &Value) -> Value {
@@ -337,12 +345,105 @@ async fn initialize_echoes_version_and_lists_tools() {
         vec![
             "run",
             "continue",
+            "inject",
+            "permit",
             "run_workflow",
             "status",
             "clear",
             "cancel_task"
         ]
     );
+}
+
+#[tokio::test]
+async fn tools_call_inject_queues_for_existing_context() {
+    let fixture = fixture();
+    let out = fixture
+        .coord
+        .prompt(bridge_coordinator::params::OpParams {
+            workflow: None,
+            skill: None,
+            input: "hello".into(),
+            context: None,
+            agent: Some(AgentId::parse("codex").unwrap()),
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: Some("/tmp/repo".into()),
+        })
+        .await
+        .unwrap();
+    let mut reqs = initialize_reqs();
+    reqs.push(req(
+        2,
+        "tools/call",
+        json!({
+            "name": "inject",
+            "arguments": {
+                "context": out.context.as_str(),
+                "text": "queued",
+                "append": true
+            }
+        }),
+    ));
+
+    let replies = run_session(fixture.coord.clone(), reqs).await;
+
+    assert_eq!(replies.len(), 2);
+    let body = text_body(&replies[1]);
+    assert_eq!(body["queued"], 1);
+}
+
+#[tokio::test]
+async fn tools_call_permit_resolves_pending_permission() {
+    let fixture = fixture();
+    let ctx = ContextId::parse("ctx-mcp-permit").unwrap();
+    let op = OperationId::parse("turn-1").unwrap();
+    let (rx, _guard) = fixture.perm_registry.register(
+        bridge_core::permission::PermKey {
+            context_id: ctx.clone(),
+            generation: 1,
+            op: op.clone(),
+            request_id: "req-mcp".into(),
+        },
+        bridge_core::permission::PendingPermissionView {
+            request_id: "req-mcp".into(),
+            tool_call_id: "tool-1".into(),
+            generation: 1,
+            op,
+            title: "write file".into(),
+            options: Vec::new(),
+            raw_input: None,
+            timeout_ms: 120_000,
+        },
+    );
+    let mut reqs = initialize_reqs();
+    reqs.push(req(
+        2,
+        "tools/call",
+        json!({
+            "name": "permit",
+            "arguments": {
+                "context": ctx.as_str(),
+                "generation": 1,
+                "op": "turn-1",
+                "requestId": "req-mcp",
+                "decision": { "decision": "approve" }
+            }
+        }),
+    ));
+
+    let replies = run_session(fixture.coord.clone(), reqs).await;
+
+    assert_eq!(replies.len(), 2);
+    let body = text_body(&replies[1]);
+    assert_eq!(body["resolved"], true);
+    assert!(matches!(
+        rx.await.unwrap(),
+        bridge_core::permission::PermissionResolution::Decided(
+            bridge_core::domain::PermitDecision::Approve { .. }
+        )
+    ));
 }
 
 #[tokio::test]
