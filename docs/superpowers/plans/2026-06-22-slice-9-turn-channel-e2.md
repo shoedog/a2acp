@@ -418,3 +418,129 @@ impl PermissionRegistry {
 - P2: is the ACP `ContextId` reliably available at route registration (Task 4)? If not, what threads it?
 - P3: timeout default value + whether it's per-config; Escalate's in-slice no-op must not consume the sender.
 - P4: MCP `inject`/`permit` — confirm bridge-mcp's tool-dispatch seam matches.
+
+---
+
+## v2 — Plan revision (post codex-xhigh plan-review + Opus verification) — BINDING
+
+> This section SUPERSEDES the draft tasks where it conflicts. It folds the codex-xhigh plan-review (verdict:
+> needs-revision; 3 BLOCKERs + 8 MAJORs) AFTER each finding was re-verified against ground-truth `file:line`
+> (every anchor confirmed). Tasks below are renumbered v2.T1..v2.T9; where a v2 task only amends a draft task,
+> it says so. The draft's TDD step rhythm (failing test → FAIL → impl → PASS → commit, staging ONLY each task's
+> files) is unchanged.
+
+### Verified findings (all confirmed against real code)
+| # | Sev | Claim | Ground truth | Resolution |
+|---|-----|-------|--------------|------------|
+| B1 | BLOCKER | cancel-resolve not wired to real A2A paths; Coordinator wrapper too late | `server.rs:2923/2952/3034` call `sm.release_with_children`/`clear_with_children`/`cancel_with_children` DIRECTLY; `cancel_inner` awaits `backend.cancel` at `session_manager.rs:731` | Registry lives in **`SessionManager`** (Arc, shared-in); `resolve_context(ctx, Cancelled)` called SYNCHRONOUSLY at the top of `cancel_inner`/`reset_session_inner`/`release_inner`, BEFORE any backend await. v2.T3+T4. |
+| B2 | BLOCKER | `{ctx,gen,op}` not available at ACP route registration | `AgentBackend::prompt` gets only `SessionId`+`Vec<Part>` (`ports.rs:44`); `TurnRoute{tx,watch}` (`acp_backend.rs:218`); registered from `session`/`agent_id` (`:1986`) | New defaulted `AgentBackend::configure_turn(session, TurnMeta)` (no-op default); producers call it before `prompt`; AcpBackend stashes per-session, copies into `TurnRoute`. v2.T5. |
+| B3 | BLOCKER | permission event won't reach normal turns (rich dropped w/o sink) | `acp_backend.rs:2182` drops `TurnEvent::Rich` when `sink` is None; `prompt` passes `None` (`:2216`); A2A uses `translator.rs:133` `backend.prompt` | **Visibility via `session/status` enumerating the registry** (pull, sink-independent) — NOT RichEventSink, NOT a new stream variant. Detached-node E2 + push/journal visibility DEFERRED. v2.T6. |
+| M4 | MAJOR | registry in bridge-coordinator but bridge-acp uses it | `bridge-acp` deps = only `bridge-core` (`Cargo.toml:23`) | `PermissionRegistry`+`PermKey`+`PermissionResolution`+`PermitDecision`+`TurnMeta` all live in **`bridge-core`**. v2.T1/T3. |
+| M5 | MAJOR | event lacks `context_id` | `OrchEvent` has none; `RichEventSink::record` takes only `OrchEventKind` (`ports.rs:32`) | MOOT — no `OrchEventKind::PermissionRequest` in-slice (B3 → session/status). The registry holds full `PendingPermissionView` keyed by `PermKey` (which carries ctx). v2.T3. |
+| M6 | MAJOR | `Escalate` must not consume the sender (D4) | decision map at `acp_backend.rs:1264` | `Escalate` = registry `reap`-and-leave-pending NO-OP (never `resolve`); pending entry then times out → default-Deny. v2.T6/T8. |
+| M7 | MAJOR | `assemble_turn_parts(seed,injects,input:&str)` doesn't fit producers | both producers build from `routed.parts: Vec<Part>`+`dispatch.seed` (`server.rs:1376/2311`) | Signature → `assemble_turn_parts(seed: Option<&str>, injects: &[QueuedInject], base: Vec<Part>) -> Vec<Part>`. v2.T2. |
+| M8 | MAJOR/CRITICAL | `PermissionDecision` reshape breaks ~12 sites + contradicts dead-safe | `PermissionDecision` IS `enum { Approve }` (`domain.rs:283-285`); constructed/matched at coordinator.rs:758, acp:173/1266/3316, api:64/257/283, policy:18/36, translator:353, sse:309, server:3882, ports:157 | **Leave `PermissionDecision{Approve}` UNTOUCHED.** Introduce a DISTINCT operator-decision type **`PermitDecision`** (`Approve{option_id?}`/`Deny{option_id?,reason?}`/`Modify{option_id,note?}`/`Escalate{reason?}`). Zero construction-site churn. v2.T1. |
+| M9 | MAJOR | registry API inconsistent (`register` vs `register_guard`) | draft `:267` vs `:325` | One API: `register(key, view) -> (Receiver<PermissionResolution>, PermitGuard)`. v2.T3. |
+| M10 | MAJOR | `Defer` live-gate unreachable from config | serve builds `AutoPolicy` at `main.rs:1913/2210/2627`; `AgentEntryToml` has no policy field (`config.rs:174`) | New `v2.T7` adds `permission_policy="defer"` config + a `DeferPolicy` in `bridge-policy`; serve constructs it when set. |
+| M11 | MAJOR | detached `frame_from_orch` panics on new variant | `unreachable!` at `detached.rs:131`, called in `flush` (`:405`); `fold_journal_to_snapshot` exhaustive-no-wildcard (`task_store.rs:278`) | MOOT — no new `OrchEventKind` in-slice (B3). `detached.rs`/`task_store.rs` UNTOUCHED. Draft Task 6 DELETED. |
+| M12 | MINOR | `finish_turn_by_ctx` test helper doesn't exist | only in plan (`grep`); `manager()` real at `session_manager.rs:1511` | Tests store the `WarmTurn` and call `finish_turn(&ctx, turn.generation, &turn.op)`. v2.T2. |
+
+### v2 architecture (the 5 reconciled decisions)
+1. **Shared core registry.** `PermissionRegistry` (+ `PermKey`, `PermissionResolution`, `PermitDecision`,
+   `TurnMeta`, `PendingPermissionView`) live in **`bridge-core`**. Constructed ONCE in serve composition;
+   `Arc<PermissionRegistry>` injected into BOTH `AcpBackend` (`with_permission_registry`) AND `SessionManager`
+   (`with_permission_registry`). No dep-direction problem (both depend on `bridge-core`).
+2. **Synchronous cancel-resolve inside SessionManager** (B1). `cancel_inner`/`reset_session_inner`/`release_inner`
+   call `perm_registry.resolve_context(ctx, Cancelled)` at the TOP, before any `backend.cancel().await`. The
+   A2A handlers (`server.rs:2923/2952/3034`) need NO change — they already funnel through these SM methods.
+   `turn_kill`/abort-token stays a backstop only.
+3. **`PermitDecision` is distinct from `PermissionDecision`** (M8). The PolicyEngine `decide()` path is unchanged
+   (returns `PermissionDecision{Approve}`). `PermitDecision` is produced ONLY by the operator (`SessionPermit`)
+   and consumed ONLY by the ACP handler's outcome-mapping. `PolicyOutcome::Decide` carries the EXISTING
+   `Result<PermissionDecision, BridgeError>`; `Defer` carries nothing. Defaulted `interactive_decide` returns
+   `Decide(self.decide(req,ctx))` → 14 impls unchanged, dead-safe by construction.
+4. **Visibility via `session/status`** (B3, M5, M11). The registry stores `PendingPermissionView{request_id,
+   generation, op, title, options, timeout_ms}` alongside each sender. `session/status` enumerates pending
+   permissions for the ctx (pull, sink-independent). NO new `OrchEventKind`, NO stream/journal change in-slice.
+   Push/SSE + detached-node interactive permission are DEFERRED (tracked, not built).
+5. **TurnMeta threading** (B2). `TurnMeta{context_id, generation, op}` (bridge-core). Producers call a defaulted
+   `AgentBackend::configure_turn(session, meta)` immediately before `prompt`/`prompt_observed`; AcpBackend
+   stashes it per-session (the turn lock guarantees one-at-a-time) and copies it into `TurnRoute`; the reverse
+   permission handler reads `route.turn_meta` via `map.get(&req.session_id)` to build the gen-stamped `PermKey`.
+
+### v2 task list (renumbered)
+- **v2.T1 — Domain/ports/orch (AMENDS draft T1).** In `bridge-core/src/domain.rs`: ADD `PermitDecision`
+  (`#[serde(tag="decision", rename_all="snake_case")]`, the 4 variants from draft `:95-104` but RENAMED type)
+  + `InjectMode`/`QueuedInject`/`InjectRequest` (unchanged). **DO NOT touch `PermissionDecision{Approve}`.** In
+  `ports.rs`: `enum PolicyOutcome { Decide(Result<PermissionDecision, BridgeError>), Defer }` + defaulted
+  `interactive_decide(&self, req, ctx) -> PolicyOutcome { PolicyOutcome::Decide(self.decide(req,ctx)) }`. In
+  `orch.rs`: **NOTHING** (no new event variant). Add `TurnMeta`, `PermKey`, `PermissionResolution{Decided(PermitDecision),
+  Cancelled}`, `PendingPermissionView`, `PermissionRegistry`, `PermitGuard` to bridge-core (a new
+  `bridge-core/src/permission.rs` module, `pub mod permission;`). Tests: `permit_decision_variants_round_trip`;
+  `default_policy_engine_never_defers` (asserts `matches!(out, PolicyOutcome::Decide(Ok(PermissionDecision::Approve)))`).
+- **v2.T2 — Queued-inject + shared parts helper (AMENDS draft T2).** Helper signature →
+  `assemble_turn_parts(seed: Option<&str>, injects: &[QueuedInject], base: Vec<Part>) -> Vec<Part>` (prepend
+  seed-part + Prepend injects ONTO `base`, then the base parts, then Append injects — preserve `base` order).
+  All 3 sites pass their existing `Vec<Part>` as `base`: `collect_turn` (the assembled input parts),
+  `spawn_local_producer:1376` (`routed.parts`), unary `:2311` (`routed.parts`). Tests use the real `manager()`
+  (`session_manager.rs:1511`) and `finish_turn(&ctx, turn.generation, &turn.op)` (NOT `finish_turn_by_ctx`).
+  `turn_parts.rs` lives in bridge-coordinator (uses only `bridge_core::domain::Part`).
+- **v2.T3 — PermissionRegistry in bridge-core (AMENDS draft T3).** `register(key, view) -> (oneshot::Receiver
+  <PermissionResolution>, PermitGuard)`; `resolve(&key, PermissionResolution) -> bool` (atomic take-under-lock);
+  `resolve_context(&ctx, PermissionResolution) -> usize` (drain+send all entries with `key.context_id==ctx`;
+  only `Cancelled` is ever passed — assert); `reap(&key)` (remove w/o send — drop-guard + Escalate); `pending(&ctx)
+  -> Vec<PendingPermissionView>` (for session/status). Entry = `{sender, view}`. `PermitGuard{reg,key}` reaps on
+  Drop. Tests: exact-once, resolve_context-cancels-all, stale-generation-no-op, drop-guard-reaps, pending-lists.
+- **v2.T4 — Wire resolve into SessionManager (NEW; realizes B1/SF-1).** `SessionManager::with_permission_registry
+  (Arc<PermissionRegistry>)`; store `Option<Arc<PermissionRegistry>>`. At the TOP of `cancel_inner`,
+  `reset_session_inner`, `release_inner`: `if let Some(r)=&self.perm_registry { r.resolve_context(ctx,
+  PermissionResolution::Cancelled); }` BEFORE any backend await. Tests: a registered pending perm for ctx is
+  resolved `Cancelled` synchronously when cancel/clear/release runs (assert the rx resolves before a paused
+  fake-backend cancel returns).
+- **v2.T5 — TurnMeta onto the ACP route (NEW; realizes B2/SF-3).** `AgentBackend::configure_turn(&self, session:
+  &SessionId, meta: TurnMeta)` defaulted no-op (`ports.rs`). AcpBackend stashes `meta` in the session entry;
+  `prompt_inner` moves it into `TurnRoute{tx, watch, turn_meta: Option<TurnMeta>}`. Producers (warm dispatch +
+  Translator callers) call `configure_turn` before `prompt`. Confirm `LocalDispatch`/`WarmTurn` carry
+  `generation`+`op`+`ContextId` to populate `TurnMeta` (add fields to `LocalDispatch` if absent). Test: the
+  reverse-handler lookup `map.get(&agent_session_id)` exposes the `{ctx,gen,op}`.
+- **v2.T6 — Interactive permission path (AMENDS draft T5; DELETES draft T6).** In the `cx.spawn` handler task:
+  `match policy.interactive_decide(&perm_req, &SessionContext)`: `Decide(verdict)` → today's byte-identical
+  `decide_permission` mapping (NO registry, NO view). `Defer` → read `route.turn_meta` → build `PermKey` →
+  `let (rx, _guard) = registry.register(key, view)` → `biased; select!{ r=rx => …, _=sleep(timeout_ms) =>
+  Decided(Deny) }` → map `PermitDecision`→`RequestPermissionOutcome` (`Approve`→[AllowOnce,AllowAlways];
+  `Deny`→[RejectOnce,RejectAlways]; `Modify{option_id}`→that exact id if in `req.options` else Cancelled;
+  `Escalate`→leave pending, do NOT resolve, let it time-out) → `responder.respond`. `Cancelled`→`Cancelled`
+  outcome. `detached.rs`/`task_store.rs`/`orch.rs` UNTOUCHED (no new event). Tests: auto-byte-identical (no
+  registry entry), defer-publishes-view-to-registry + maps each PermitDecision, timeout-default-deny,
+  escalate-leaves-pending-then-times-out.
+- **v2.T7 — Config Defer policy (NEW; realizes M10).** `DeferPolicy` in `bridge-policy/src/permission.rs`
+  (`decide`→`Ok(PermissionDecision::Approve)` fallback; `interactive_decide`→`PolicyOutcome::Defer`). Config:
+  `permission_policy: Option<String>` (top-level `[server]` or registry section); `into_snapshot` maps
+  `"defer"`→DeferPolicy else AutoPolicy. Serve composition (`main.rs:1913/2210/2627`) selects the policy. Test:
+  config parse → DeferPolicy `interactive_decide` returns `Defer`.
+- **v2.T8 — session/status surfaces pending permissions (NEW; realizes B3 visibility).** `Coordinator::
+  pending_permissions(&ctx) -> Vec<PendingPermissionView>` (→ `registry.pending`); `session/status` handler
+  includes a `pendingPermissions` block. Test: a registered pending perm appears in status; resolved/cancelled
+  ones don't.
+- **v2.T9 — Wire + CLI + MCP (AMENDS draft T7).** `InjectParams`/`PermitParams{context,generation,op,request_id,
+  decision: PermitDecision}` in `params.rs`. `server.rs` `SessionInject`/`SessionPermit` arms → `coordinator.
+  inject`/`permit`. **CLI parser SPLIT** (P4): `session` at `main.rs:3009` assumes `<contextId>` positional —
+  give `permit` its own shape `session permit <requestId> --context <c> --generation <n> --op <o> (--approve
+  [--option <id>]|--deny [--reason ..]|--modify <id>|--escalate)`; `inject <ctx> --input <f> [--append] [--dedupe
+  <k>]`. **MCP** (P4): add `inject`+`permit` tools at BOTH `bridge-mcp` schema (`transport.rs:68`) AND dispatch
+  (`server.rs:70`). The operator reads `{ctx,gen,op,request_id}` from `session/status`.
+- **v2.T10 — DoD + live-gate (AMENDS draft T8).** Live-gate visibility is `session/status` (NOT `task watch`):
+  `submit` a write-prompt under untrusted+read-only+DeferPolicy → `session status <ctx>` shows the pending perm
+  + options + request_id → `session permit <reqid> --context <c> --generation <n> --op <o> --deny` rejects the
+  write; re-run `--approve` allows; `session cancel <ctx>` mid-permission ends promptly. Plus inject codeword
+  recall + the dead-safe auto-policy byte-identity gate.
+
+### v2 open items for the 2nd review pass
+- R1: `configure_turn` vs threading `TurnMeta` through a new `prompt` arg — is the per-session stash race-free
+  given the turn lock? Confirm one producer owns the session at `configure_turn`→`prompt` (no interleave).
+- R2: does `LocalDispatch` already carry `generation`+`op` (for `TurnMeta`), or must v2.T5 add them? (cancel-tokens
+  added `abort`; confirm gen/op presence.)
+- R3: `session/status` for a ctx with NO warm handle but a pending perm — can a permission be pending without a
+  live warm session? (Handler holds the turn; the warm handle exists during the turn. Confirm.)
+- R4: is scoping interactive permission to WARM sessions (detached-node deferred) acceptable for the slice DoD,
+  or must a detached workflow node also support interactive permit in-slice?
