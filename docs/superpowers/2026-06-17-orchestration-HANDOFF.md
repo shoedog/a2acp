@@ -6,6 +6,13 @@
 
 ## TL;DR state (2026-06-17)
 
+> **UPDATE 2026-06-22 — ALL CORE SLICES 0–9 + the cancel-tokens prereq SHIPPED+MERGED+PUSHED to `main`
+> (`c92804d`).** The core orchestration roadmap is COMPLETE. Slice 9 (Turn Channel + E2 interactive permission)
+> was the last core slice — see the `slice-9-shipped` memory + `docs/superpowers/2026-06-22-slice-9-HANDOFF.md`.
+> **NEXT = the Slice-10+ tail** (B2 fan-out · E1 worktree · E6 retry · push-visibility · detached-node interactive
+> permit · per-agent Defer). The proven loop holds; the whole-branch dual-lens review keeps catching what
+> per-task tests + the happy-path live-gate miss.
+
 - **Architecture: CONVERGED.** Whole roadmap architected as ONE design across 3 passes × 2 lenses
   (codex-xhigh + Opus) + a dedicated slicing analysis. Do NOT re-litigate the decomposition.
 - **Slice 0 — Live Session Core (warm continue): SHIPPED + MERGED to `main`** (`ded3e3c`, pushed). Live-gated

@@ -1,8 +1,12 @@
 # Slice 9 — Turn Channel + E2 permission — HANDOFF / Resume Doc
 
-> Resume the LAST core orchestration slice. **STATUS: architect DONE (spec v2, SPIKE-1 ✅) + PLAN v3 DONE
-> (dual-review folded, scope confirmed) → READY-TO-IMPLEMENT.** Branch `feat/slice-9-turn-channel-e2`
-> (base = `main` `e4e12f0`). Read top-to-bottom. Docs-only so far — NO production code written yet.
+> **✅ SHIPPED + MERGED + PUSHED to `main` (`c92804d`), 2026-06-22.** The LAST core orchestration slice is DONE:
+> 11 TDD tasks (T1–T10 + T5b) + 7 whole-branch dual-review fixes, live-gated vs real codex (deny/approve/
+> cancel-mid-permission + queued-inject all PASS). See the `slice-9-shipped` memory for the design + gotchas.
+> Everything below is the historical resume doc (kept as a record). **NEXT = the Slice-10+ tail.**
+>
+> _(original status was: architect DONE + PLAN v3 DONE → READY-TO-IMPLEMENT; branch `feat/slice-9-turn-channel-e2`
+> base `main` `e4e12f0`.)_
 
 ## ⏯️ RESUME POINT: the plan is locked — START IMPLEMENTING (v2.T1)
 - **Plan = `docs/superpowers/plans/2026-06-22-slice-9-turn-channel-e2.md`**: read the **`## v2`** (BINDING) +
