@@ -1,7 +1,25 @@
 # Slice 9 — Turn Channel + E2 permission — HANDOFF / Resume Doc
 
-> Resume the LAST core orchestration slice. Architect phase DONE; spec dual-reviewed → **needs-respike**.
-> Branch `feat/slice-9-turn-channel-e2` (base = `main` `e4e12f0`). Read top-to-bottom.
+> Resume the LAST core orchestration slice. **STATUS: architect DONE (spec v2 ready-to-plan, SPIKE-1 ✅) +
+> PLAN WRITTEN; the codex PLAN-REVIEW is the in-flight gate.** Branch `feat/slice-9-turn-channel-e2`
+> (base = `main` `e4e12f0`). Read top-to-bottom. Docs-only so far — NO production code written yet.
+
+## ⏯️ RESUME POINT (paused here): read the plan-review, fold, then implement
+- **Plan written + committed** (`5a04b6f`): `docs/superpowers/plans/2026-06-22-slice-9-turn-channel-e2.md`
+  — 8 TDD tasks realizing SF-1..9, + open items P1-P4.
+- **codex-xhigh PLAN-REVIEW was DISPATCHED and is/was running** (port 8124) — output to
+  `/tmp/slice-9-plan-review.out` (transient). Scaffolding committed (`prompts/slice-9-plan-review.md` +
+  `examples/a2a-bridge.slice-9-plan-review-codex.toml`). **FIRST on resume: read `/tmp/slice-9-plan-review.out`**
+  (if gone, re-run: `./target/debug/a2a-bridge run-workflow slice-9-plan-review --input
+  /tmp/slice-9-plan-review-input.md --session-cwd $PWD --config
+  examples/a2a-bridge.slice-9-plan-review-codex.toml --out /tmp/slice-9-plan-review.out`).
+- **Then:** add an Opus lens; fold both into a plan `## v2` section (resolve P1-P4); then run the loop —
+  TDD-implement task-by-task (codex-HIGH writes via `run-workflow` on the `cancel-tokens-impl`-style config / Opus
+  verifies in the clean host env + commits) → whole-branch dual-lens review → live-gate → merge.
+- **Watch (the plan flagged these for review):** P1 — does the A2A `SessionCancel`/`SessionClear` path
+  (`server.rs:2952`) reach the `PermissionRegistry` to `resolve_context`, or call `SessionManager` directly (then
+  the registry must be threaded there)? P2 — is the bridge `ContextId` available at ACP route-registration
+  (Task 4, the least-pinned)? P3 — timeout default + Escalate must not consume the sender. P4 — MCP tool seam.
 
 ## Where this sits
 - The prerequisite ([[cancel-tokens-shipped]]) is SHIPPED+MERGED+PUSHED (`main` merge `12e3816`). Slice 9 is
@@ -9,8 +27,8 @@
 - **Spec written + committed** (`907a8c6`): `docs/superpowers/specs/2026-06-22-slice-9-turn-channel-e2.md`.
   Two parts: **A) queued-inject** (mirrors `pending_seed`; low-risk, NO spike needed) + **B) E2 permission**
   (the spike-heavy half).
-- **Dual spec-review DONE** (codex-xhigh `1b0ecd9` + Opus lens). **Verdict: needs-respike.** Findings in
-  `/tmp/slice-9-spec-review.out` (transient — re-run the workflow to regenerate).
+- **Dual spec-review DONE** (codex-xhigh `1b0ecd9` + Opus lens) → was needs-respike; **SPIKE-1 ran + all
+  findings folded into spec v2** (`98c85f5`, the `## v2` section — BINDING). Spec is ready-to-plan.
 
 ## The keystone: SPIKE-1 — ✅ DONE (E2 FEASIBLE; shape pinned)
 **Confirmed empirically** (temporary `eprintln` probe in the `acp_backend.rs` permission handler, REVERTED):
@@ -59,17 +77,19 @@ compact PRESERVES-after-seed OR rejects-while-pending (compact already rejects a
 `InjectParams`/`PermitParams` (OpParams is prompt-shaped, requires input); D4=`Escalate` non-functional in-slice
 (must not consume the pending sender); D5=allow inject-while-Running (queue for next checkout).
 
-## NEXT (resume HERE) — architect phase DONE (SPIKE-1 ✅ + spec v2 ✅)
-1. **(optional) Spec re-review** of v2 to confirm the needs-respike findings are resolved → ready-to-plan
-   (the SF-1..9 are folded; a quick codex-xhigh pass + Opus lens, or skip straight to the plan).
-2. **Plan** the v2 8-step task order (writing-plans skill) → dual plan-review (codex-xhigh + Opus) →
-   iterate-to-ready. Scaffolding ports 8124+ (8123 = spec-review).
-3. **TDD-implement** per task (codex-HIGH writes / Opus verifies+commits) → whole-branch dual-lens review →
-   live-gate (untrusted+read-only codex + a `Defer` policy: inject lands next turn; a real permission surfaces +
-   routed Deny blocks / Approve allows; cancel mid-permission ends promptly) → merge.
-   (User chose the FULL slice — inject + permission together — not the split.)
+## Phase status
+- Architect: ✅ spec v2 (`98c85f5`), SPIKE-1 ✅.  · Plan: ✅ written (`5a04b6f`).  · Plan-review: ⏳ IN FLIGHT
+  (see the RESUME POINT at the top — read `/tmp/slice-9-plan-review.out`, add an Opus lens, fold → plan v2).
+- Then: TDD-implement per task → whole-branch dual-lens review → live-gate → merge. (User chose the FULL slice —
+  inject + permission together — not the split.) Live-gate shape: inject lands next turn; a real permission
+  surfaces + routed Deny blocks / Approve allows; cancel mid-permission ends promptly. Config = untrusted +
+  read-only codex + a `Defer` policy.
 
 ## Proven loop + scaffolding (reuse)
-- codex-HIGH implements (no commit) / Opus verifies+commits / codex-xhigh reviews / live-gate vs real codex.
-- Spec-review tooling committed (`1b0ecd9`): `prompts/slice-9-spec-review.md` +
-  `examples/a2a-bridge.slice-9-spec-review-codex.toml` (port 8123). Mirror for plan/whole-branch (ports 8124+).
+- codex-HIGH implements (no commit) / Opus verifies in the clean host env + commits / codex-xhigh reviews /
+  live-gate vs real codex. (codex sandbox hits the `_dyld_start` flake → controller re-verifies.)
+- Scaffolding committed: spec-review (`1b0ecd9`, port 8123) + plan-review (port 8124,
+  `prompts/slice-9-plan-review.md` + `examples/a2a-bridge.slice-9-plan-review-codex.toml`). For implementation,
+  reuse a `cancel-tokens-impl`-style codex-HIGH config (danger-full-access, NO commit); whole-branch review next
+  free port. Stage ONLY each task's files (the worktree has many unrelated untracked `examples/*.toml` /
+  `prompts/*.md` + the pre-existing `M examples/a2a-bridge.slicing-analysis.toml` — never fold them).
