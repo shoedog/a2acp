@@ -1,0 +1,18 @@
+# Codex (gpt-5.5, effort=high) as the IMPLEMENTER for E1 (worktree-per-session).
+# session-cwd = the repo, on feat/e1-worktree-per-session; codex EDITS the tree, runs cargo, does NOT commit.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "high"
+args = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "e1-impl"
+[[workflows.nodes]]
+id = "impl"
+agent = "codex"
+prompt_file = "../prompts/e1-impl.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8136"
