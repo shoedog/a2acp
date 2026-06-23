@@ -103,6 +103,19 @@ pub(crate) fn render_costs_table(rows: &[(String, Option<UsageSnapshot>)]) -> St
     table
 }
 
+pub(crate) fn render_weights(panel: &Option<crate::graph::PanelConfig>) -> String {
+    match panel {
+        Some(panel) if !panel.weights.is_empty() => {
+            let mut rendered = String::new();
+            for (key, value) in &panel.weights {
+                rendered.push_str(&format!("- {key}: {value}\n"));
+            }
+            rendered
+        }
+        _ => "(no weights configured)".to_string(),
+    }
+}
+
 pub struct WorkflowExecutor {
     registry: Arc<dyn AgentRegistry>,
 }
@@ -573,6 +586,7 @@ impl WorkflowExecutor {
                                         })
                                         .collect();
                                     owned.push(("workflow.costs".into(), render_costs_table(&cost_rows)));
+                                    owned.push(("workflow.weights".into(), render_weights(&graph.panel)));
                                 }
                                 let node = n.clone();
                                 let run_id = run_id.clone();
@@ -752,6 +766,7 @@ mod tests {
                 prompt_template: "echo {{input}}".into(),
                 inputs: vec![],
             }],
+            panel: None,
         })
     }
 
@@ -867,6 +882,18 @@ mod tests {
         assert!(table.contains("| codexer | 15071 | 258400 | 0.0583 |"));
         assert!(table.contains("| clauder | 8200 | 200000 | 0.0410 | 0.03 USD |"));
         assert!(table.contains("| dead | n/a | n/a | n/a | n/a |"));
+    }
+
+    #[test]
+    fn weights_render_sorted() {
+        let mut weights = std::collections::BTreeMap::new();
+        weights.insert("risk".to_string(), 0.3);
+        weights.insert("benefit".to_string(), 0.4);
+
+        let out = render_weights(&Some(crate::graph::PanelConfig { weights }));
+
+        assert_eq!(out, "- benefit: 0.4\n- risk: 0.3\n");
+        assert_eq!(render_weights(&None), "(no weights configured)");
     }
 
     pub(super) struct CountingCleanup {
@@ -1110,6 +1137,7 @@ mod tests {
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let shared = Arc::new(Shared {
             entered: AtomicUsize::new(0),
@@ -1403,6 +1431,7 @@ mod tests {
                     "merge {{codex}} + {{claude}} for {{input}}",
                 ),
             ],
+            panel: None,
         })
     }
 
@@ -1426,6 +1455,7 @@ mod tests {
                     inputs: vec![NodeId::parse("draftnode").unwrap()],
                 },
             ],
+            panel: None,
         });
         let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
         let reg = Arc::new(FakeRegistry {
@@ -1570,6 +1600,7 @@ mod tests {
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let reg = Arc::new(BReg {
             barrier: Arc::new(Barrier::new(2)),
@@ -1624,6 +1655,7 @@ mod tests {
                     inputs: vec![NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let ex = WorkflowExecutor::new(reg);
         let _ = ex
@@ -1847,6 +1879,7 @@ mod tests {
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let shared = Arc::new(Shared {
             cleanups: AtomicUsize::new(0),
@@ -2002,6 +2035,7 @@ mod tests {
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let reg = Arc::new(TReg {
             slow_gate: slow_gate.clone(),
@@ -2437,6 +2471,7 @@ mod tests {
                     inputs: vec![NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
 
         // Seed only `b` without its upstream `a` → closure violation.

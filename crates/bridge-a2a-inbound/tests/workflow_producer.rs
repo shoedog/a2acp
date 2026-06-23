@@ -232,6 +232,7 @@ fn review_graph() -> Arc<WorkflowGraph> {
                 "merge {{codex}} + {{claude}} for {{input}}",
             ),
         ],
+        panel: None,
     })
 }
 
@@ -537,6 +538,7 @@ async fn write_ahead_barrier() {
                 inputs: vec![NodeId::parse("a").unwrap()],
             },
         ],
+        panel: None,
     });
 
     let mut stream = executor.run(graph, "DIFF".into(), "r".into(), CancellationToken::new());

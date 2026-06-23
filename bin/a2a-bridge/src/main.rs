@@ -4572,6 +4572,7 @@ mod cli_tests {
         WorkflowGraph {
             id: WorkflowId::parse(id).unwrap(),
             nodes,
+            panel: None,
         }
     }
 

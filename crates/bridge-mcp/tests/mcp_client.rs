@@ -225,6 +225,7 @@ fn workflow(id: &str) -> Arc<WorkflowGraph> {
             prompt_template: "{{input}}".into(),
             inputs: Vec::new(),
         }],
+        panel: None,
     })
 }
 

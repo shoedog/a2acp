@@ -1083,6 +1083,7 @@ mod sink_tests {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
             }],
+            panel: None,
         });
         let executor = WorkflowExecutor::new(Arc::new(RichRegistry));
         let ctx = WorkflowRunContext {
@@ -1683,6 +1684,7 @@ mod frame_tests {
                 prompt_template: "{{input}}".into(),
                 inputs: Vec::new(),
             }],
+            panel: None,
         };
         let json = encode_workflow_spec(&graph);
         let env: WorkflowSpecEnvelope = serde_json::from_str(&json).unwrap();
