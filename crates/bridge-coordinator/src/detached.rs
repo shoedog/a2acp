@@ -70,6 +70,8 @@ pub enum FrameKind {
         node: String,
         ok: bool,
         output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<bridge_core::orch::UsageSnapshot>,
     },
     SnapshotComplete,
     Terminal {
@@ -188,6 +190,7 @@ pub trait WorkflowSink: Send {
         _node: &str,
         _ok: bool,
         _output: &str,
+        _usage: Option<&bridge_core::orch::UsageSnapshot>,
     ) -> Result<(), BridgeError> {
         Ok(())
     }
@@ -212,8 +215,14 @@ pub async fn drain_workflow<S: WorkflowSink>(
     while let Some(item) = stream.next().await {
         match item {
             Ok(WorkflowEvent::NodeStarted { node }) => sink.node_started(node.as_str()).await?,
-            Ok(WorkflowEvent::NodeFinished { node, ok, output }) => {
-                sink.node_finished(node.as_str(), ok, &output).await?
+            Ok(WorkflowEvent::NodeFinished {
+                node,
+                ok,
+                output,
+                usage,
+            }) => {
+                sink.node_finished(node.as_str(), ok, &output, usage.as_ref())
+                    .await?
             }
             Ok(WorkflowEvent::Terminal { outcome, output }) => {
                 sink.terminal(outcome, output).await?;
@@ -303,6 +312,7 @@ impl WorkflowSink for DetachedProgressSink {
         node: &str,
         ok: bool,
         output: &str,
+        usage: Option<&bridge_core::orch::UsageSnapshot>,
     ) -> Result<(), BridgeError> {
         let node_id = bridge_core::ids::NodeId::parse(node)?;
         let operation_id = self.operation_id()?;
@@ -315,7 +325,7 @@ impl WorkflowSink for DetachedProgressSink {
                 output,
                 ok,
                 now_ms(),
-                None,
+                usage,
             )
             .await?;
         self.hub.publish(WorkflowProgressFrame {
@@ -326,6 +336,7 @@ impl WorkflowSink for DetachedProgressSink {
                 node: node.to_string(),
                 ok,
                 output: output.to_string(),
+                usage: usage.cloned(),
             },
         });
         Ok(())
@@ -527,6 +538,7 @@ mod sink_tests {
             _node: &str,
             _ok: bool,
             _output: &str,
+            _usage: Option<&bridge_core::orch::UsageSnapshot>,
         ) -> Result<(), BridgeError> {
             self.log.push("node_finished");
             Ok(())
@@ -555,12 +567,14 @@ mod sink_tests {
                 node: a.clone(),
                 ok: true,
                 output: "out-a".into(),
+                usage: None,
             }),
             Ok(WorkflowEvent::NodeStarted { node: b.clone() }),
             Ok(WorkflowEvent::NodeFinished {
                 node: b.clone(),
                 ok: true,
                 output: "out-b".into(),
+                usage: None,
             }),
             Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -633,6 +647,7 @@ mod sink_tests {
                 node: a.clone(),
                 ok: true,
                 output: "out-a".into(),
+                usage: None,
             }),
             Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -698,6 +713,55 @@ mod sink_tests {
         assert!(matches!(frames[0].phase, crate::detached::Phase::Live));
         assert!(matches!(frames[1].phase, crate::detached::Phase::Live));
         assert!(matches!(frames[2].phase, crate::detached::Phase::Live));
+    }
+
+    #[tokio::test]
+    async fn detached_sink_persists_and_publishes_node_usage() {
+        use crate::detached::{FrameKind, TaskProgressHub};
+        use bridge_core::orch::UsageSnapshot;
+        use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskStore};
+
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let task = TaskId::parse("t-frame").unwrap();
+        store
+            .create(&TaskRecord {
+                id: task.clone(),
+                workflow: "code-review".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+                input: "DIFF".into(),
+                workflow_spec_json: None,
+                resume_attempts: 0,
+                session_cwd: None,
+            })
+            .await
+            .unwrap();
+
+        let hub = Arc::new(TaskProgressHub::new());
+        let mut rx = hub.subscribe();
+        let mut sink = DetachedProgressSink::new(store.clone(), task.clone(), hub);
+
+        let usage = UsageSnapshot {
+            used: Some(123),
+            size: Some(1000),
+            cost: None,
+            at_ms: 1,
+        };
+        sink.node_finished("member", true, "OUT", Some(&usage))
+            .await
+            .unwrap();
+
+        let frame = rx.try_recv().unwrap();
+        match frame.kind {
+            FrameKind::NodeFinished { usage: Some(u), .. } => assert_eq!(u.used, Some(123)),
+            other => panic!("expected NodeFinished with usage, got {other:?}"),
+        }
+
+        let cps = store.node_checkpoints(&task).await.unwrap();
+        assert_eq!(cps[0].3.as_ref().unwrap().used, Some(123));
     }
 
     /// A `DetachedProgressSink` whose store's `put_node_checkpoint_sequenced`
@@ -864,6 +928,7 @@ mod sink_tests {
                 node: a.clone(),
                 ok: true,
                 output: "out-a".into(),
+                usage: None,
             }),
             Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -1638,6 +1703,7 @@ mod frame_tests {
                 node: "a".into(),
                 ok: true,
                 output: "o".into(),
+                usage: None,
             },
         });
         let f = rx.recv().await.unwrap();
@@ -1656,6 +1722,7 @@ mod frame_tests {
                 node: "synth".into(),
                 ok: true,
                 output: "done".into(),
+                usage: None,
             },
         };
         let val: serde_json::Value = serde_json::to_value(&frame).unwrap();

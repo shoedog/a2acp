@@ -81,6 +81,7 @@ pub enum WorkflowEvent {
         node: NodeId,
         ok: bool,
         output: String,
+        usage: Option<bridge_core::orch::UsageSnapshot>,
     },
     Terminal {
         outcome: WorkflowOutcome,
@@ -520,7 +521,7 @@ impl WorkflowExecutor {
                 yield Ok(WorkflowEvent::NodeStarted { node });
             }
             while let Some((node_id, text, ok)) = inflight.next().await {
-                yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok, output: text.clone() });
+                yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok, output: text.clone(), usage: None });
                 done.insert(node_id.as_str().to_string());
                 outputs.insert(node_id.as_str().to_string(), (text, ok));
                 if cancel.is_cancelled() {

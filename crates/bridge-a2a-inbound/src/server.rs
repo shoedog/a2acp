@@ -1201,6 +1201,7 @@ fn snapshot_frames(
                     node: node.as_str().to_string(),
                     ok: *ok,
                     output: output.clone(),
+                    usage: None,
                 },
             });
         }
@@ -1852,6 +1853,7 @@ impl crate::workflow_sink::WorkflowSink for SseSink {
         node: &str,
         ok: bool,
         _output: &str,
+        _usage: Option<&bridge_core::orch::UsageSnapshot>,
     ) -> Result<(), BridgeError> {
         let _ = self
             .tx
@@ -9400,6 +9402,7 @@ mod tests {
                 node: node.to_string(),
                 ok: true,
                 output: "live".to_string(),
+                usage: None,
             },
         }
     }

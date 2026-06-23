@@ -866,16 +866,19 @@ diff --git \"a/docs/a b.md\" \"b/docs/a b.md\"
                 node: NodeId::parse("reviewer_codex").unwrap(),
                 ok: false,
                 output: String::new(),
+                usage: None,
             },
             WorkflowEvent::NodeFinished {
                 node: NodeId::parse("reviewer_claude").unwrap(),
                 ok: true,
                 output: "ok".into(),
+                usage: None,
             },
             WorkflowEvent::NodeFinished {
                 node: NodeId::parse("synth").unwrap(),
                 ok: true,
                 output: "VERDICT: APPROVE".into(),
+                usage: None,
             },
             WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -896,6 +899,7 @@ diff --git \"a/docs/a b.md\" \"b/docs/a b.md\"
             node: NodeId::parse(id).unwrap(),
             ok: false,
             output: String::new(),
+            usage: None,
         };
         let term = WorkflowEvent::Terminal {
             outcome: WorkflowOutcome::Completed,
