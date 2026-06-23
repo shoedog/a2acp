@@ -1,18 +1,21 @@
 # E1 — Worktree-per-Session — HANDOFF / Resume Doc
 
 > A Slice-10+ tail item (the user picked E1 from {E1 worktree · E6 retry · E3 batch · E7 task-spec · E8 prompt-lib}).
-> **STATUS: architect DONE — spec v2 ready-to-plan (dual spec-review folded + SPIKE RESOLVED).** Branch
-> `feat/e1-worktree-per-session` (base = `main` `165e7e2`). Docs-only so far — NO production code. Read top-to-bottom.
+> **STATUS: architect DONE + PLAN WRITTEN — dual plan-review IN FLIGHT.** Branch `feat/e1-worktree-per-session`
+> (base = `main` `165e7e2`). Docs-only so far — NO production code. Read top-to-bottom.
 
-## ⏯️ RESUME POINT: write the PLAN next
-- **Spec = `docs/superpowers/specs/2026-06-23-e1-worktree-per-session.md`** — read the **`## v2`** section
-  (BINDING; SR-FIX-1..12 + updated D1..D6 + the updated live-gate). It supersedes the draft above it.
-- **NEXT:** write `docs/superpowers/plans/2026-06-23-e1-worktree-per-session.md` per the `superpowers:writing-plans`
-  skill → bite-sized TDD tasks realizing SF-1..6 + SR-FIX-1..12. Then dual plan-review (codex xhigh + Opus lens)
-  → fold to plan v2 → TDD-implement task-by-task → whole-branch dual review → live-gate → merge. (Same loop that
-  shipped Slice 10 `165e7e2`.)
-- Commit history so far: `81223ae` (spec draft + spec-review scaffolding) → spec-review (codex port 8133 + Opus)
-  → `1b71455` (spec v2 fold).
+## ⏯️ RESUME POINT: fold the dual plan-review → plan v2, then TDD-implement T1
+- **Spec = `docs/superpowers/specs/2026-06-23-e1-worktree-per-session.md`** (`## v2`, BINDING; SR-FIX-1..12).
+- **Plan = `docs/superpowers/plans/2026-06-23-e1-worktree-per-session.md`** (8 TDD tasks T1–T8, BINDING; realizes
+  SF-1..6 + SR-FIX-1..12). Self-review flagged 4 plan-review items: (a) the exact immutability `BridgeError`
+  variant (T3 used `InvalidStateTransition` — VERIFY in `error.rs`); (b) per-agent vs global enable (D2); (c)
+  canonicalization depth in `worktree_path` (lexical vs real canonicalize); (d) the sidecar owner-threading seam.
+- **Dual plan-review IN FLIGHT:** codex xhigh (port 8134, `prompts/e1-plan-review.md` +
+  `examples/a2a-bridge.e1-plan-review-codex.toml`) + the Opus lens. **NEXT:** read `/tmp/e1-plan-review.out`, add
+  the Opus lens, fold both → a `## v2` section in the plan → then TDD-implement T1→T8 (codex-HIGH writes / Opus
+  verifies+commits in the clean host env). Then whole-branch dual review → live-gate → merge. (Same loop as Slice 10.)
+- Commit history: `81223ae` (spec + spec-review scaffolding) → `1b71455` (spec v2) → `0a0ce0e` (this handoff) →
+  `28398b0` (plan) → plan-review scaffolding (port 8134).
 
 ## What E1 is (the architect decision)
 Each warm session gets its OWN **git worktree** off a target repo, so **concurrent write-capable agents don't
