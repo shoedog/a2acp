@@ -2094,7 +2094,10 @@ fn spawn_detached_workflow(
     graph: std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
     run_id: String,
     token: tokio_util::sync::CancellationToken,
-    seed: std::collections::HashMap<String, (String, bool)>,
+    seed: std::collections::HashMap<
+        String,
+        (String, bool, Option<bridge_core::orch::UsageSnapshot>),
+    >,
     ctx: bridge_workflow::executor::WorkflowRunContext,
     hub: Arc<crate::reattach::TaskProgressHub>,
 ) -> tokio::task::JoinHandle<()> {

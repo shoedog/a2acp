@@ -433,7 +433,7 @@ impl WorkflowExecutor {
     /// Seeded nodes are treated as done; only un-seeded nodes actually run.
     /// `run()` is a thin wrapper over this with an empty seed and default context.
     ///
-    /// Each seed entry is `(output_text, ok)`, matching the `NodeFinished` payload.
+    /// Each seed entry is `(output_text, ok, usage)`, matching the `NodeFinished` payload.
     ///
     /// # Errors (streamed)
     /// - `BridgeError::ConfigInvalid` if a seed key is not in `graph.nodes`.
@@ -445,7 +445,7 @@ impl WorkflowExecutor {
         input: String,
         run_id: String,
         cancel: CancellationToken,
-        seed: HashMap<String, (String, bool)>,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
     ) -> WorkflowStream {
         self.run_from_with_context(
             graph,
@@ -466,7 +466,7 @@ impl WorkflowExecutor {
         input: String,
         run_id: String,
         cancel: CancellationToken,
-        seed: HashMap<String, (String, bool)>,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowRunContext,
     ) -> WorkflowStream {
         self.run_from_with_context_inner(graph, input, run_id, cancel, seed, ctx, None)
@@ -479,7 +479,7 @@ impl WorkflowExecutor {
         input: String,
         run_id: String,
         cancel: CancellationToken,
-        seed: HashMap<String, (String, bool)>,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowRunContext,
         dispatcher: Arc<dyn WorkflowNodeDispatcher>,
     ) -> WorkflowStream {
@@ -493,7 +493,7 @@ impl WorkflowExecutor {
         input: String,
         run_id: String,
         cancel: CancellationToken,
-        seed: HashMap<String, (String, bool)>,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowRunContext,
         dispatcher: Option<Arc<dyn WorkflowNodeDispatcher>>,
     ) -> WorkflowStream {
@@ -527,10 +527,7 @@ impl WorkflowExecutor {
                 }
             }
 
-            let mut outputs: HashMap<String, (String, bool, Option<UsageSnapshot>)> = seed
-                .into_iter()
-                .map(|(node, (text, ok))| (node, (text, ok, None)))
-                .collect();
+            let mut outputs: HashMap<String, (String, bool, Option<UsageSnapshot>)> = seed;
             let mut done: HashSet<String> = outputs.keys().cloned().collect();
             let terminal_id = graph.terminal().map(|n| n.id.as_str().to_string()).unwrap_or_default();
 
@@ -1428,7 +1425,7 @@ mod tests {
                     "synth",
                     "synth",
                     &["codex", "claude"],
-                    "merge {{codex}} + {{claude}} for {{input}}",
+                    "merge {{codex}} + {{claude}} for {{input}}\n{{workflow.costs}}",
                 ),
             ],
             panel: None,
@@ -2168,9 +2165,9 @@ mod tests {
         let claude_rec = reg.backends.get("claude").unwrap().1.clone();
         let synth_rec = reg.backends.get("synth").unwrap().1.clone();
 
-        let seed: HashMap<String, (String, bool)> = [
-            ("codex".to_string(), ("OUTA".to_string(), true)),
-            ("claude".to_string(), ("OUTB".to_string(), true)),
+        let seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> = [
+            ("codex".to_string(), ("OUTA".to_string(), true, None)),
+            ("claude".to_string(), ("OUTB".to_string(), true, None)),
         ]
         .into();
 
@@ -2238,6 +2235,53 @@ mod tests {
         assert_eq!(finished, vec!["synth"], "only synth should be finished");
     }
 
+    #[tokio::test]
+    async fn resumed_synth_sees_seeded_member_usage() {
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry {
+            backends: [("synth".to_string(), mk("FINAL"))].into(),
+        });
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+        let ex = WorkflowExecutor::new(reg);
+
+        let mut seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> = HashMap::new();
+        seed.insert(
+            "codex".into(),
+            (
+                "CODEX_REVIEW".into(),
+                true,
+                Some(UsageSnapshot {
+                    used: Some(15071),
+                    size: Some(258400),
+                    cost: None,
+                    at_ms: 0,
+                }),
+            ),
+        );
+        seed.insert("claude".into(), ("CLAUDE_REVIEW".into(), true, None));
+
+        let _ = ex
+            .run_from(
+                review_graph(),
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+                seed,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        let p = &synth_rec.prompts.lock().unwrap()[0];
+        assert!(
+            p.contains("| codex | 15071 | 258400 |"),
+            "resumed synth costs table shows seeded member usage: {p}"
+        );
+        assert!(
+            p.contains("| claude | n/a |"),
+            "member with no captured usage -> n/a: {p}"
+        );
+    }
+
     /// Seed contains a node id not present in the graph → stream yields ConfigInvalid.
     #[tokio::test]
     async fn run_from_unknown_seed_node_errors() {
@@ -2248,8 +2292,8 @@ mod tests {
             )]
             .into(),
         });
-        let seed: HashMap<String, (String, bool)> =
-            [("ghost_node".to_string(), ("OUT".to_string(), true))].into();
+        let seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> =
+            [("ghost_node".to_string(), ("OUT".to_string(), true, None))].into();
 
         let ex = WorkflowExecutor::new(reg);
         let evs: Vec<_> = ex
@@ -2475,8 +2519,8 @@ mod tests {
         });
 
         // Seed only `b` without its upstream `a` → closure violation.
-        let seed: HashMap<String, (String, bool)> =
-            [("b".to_string(), ("BOUT".to_string(), true))].into();
+        let seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> =
+            [("b".to_string(), ("BOUT".to_string(), true, None))].into();
 
         let ex = WorkflowExecutor::new(reg);
         let evs: Vec<_> = ex
