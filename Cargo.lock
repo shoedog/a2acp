@@ -23,6 +23,7 @@ dependencies = [
  "bridge-registry",
  "bridge-store",
  "bridge-workflow",
+ "bridge-worktree",
  "futures",
  "lsp-mcp",
  "notify",

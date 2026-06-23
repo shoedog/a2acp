@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot};
 use bridge_core::ids::AgentId;
@@ -150,6 +151,90 @@ pub struct RegistryConfig {
     /// `[merge]` (ADR-0027): merge hand-off target + operator identity override. Absent → defaults.
     #[serde(default)]
     pub merge: Option<MergeToml>,
+    #[serde(default)]
+    pub worktrees: Option<WorktreesToml>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct WorktreesToml {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+/// Reject a worktrees root inside a git repo (a worktree there dirties the source) OR inside
+/// allowed_cwd_root (the gate root must stay clean). Walks to the nearest existing ancestor for the
+/// git probe; canonicalizes (nearest-existing-ancestor lenient) for the allowed-root containment.
+pub fn preflight_worktrees_root(
+    root: &Path,
+    allowed_cwd_root: Option<&bridge_core::SessionCwd>,
+) -> Result<(), ConfigError> {
+    let probe = nearest_existing_ancestor(root)?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&probe)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+    if matches!(out, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+    {
+        return Err(ConfigError::Registry(format!(
+            "[worktrees] root {root:?} is inside a git repo; choose a root outside any repo"
+        )));
+    }
+
+    if let Some(allowed) = allowed_cwd_root {
+        let root_canon = canonicalize_lenient_session_cwd(root)?;
+        let allowed_canon = canonicalize_lenient_session_cwd(Path::new(allowed.as_str()))?;
+        if root_canon.is_under(&allowed_canon) {
+            return Err(ConfigError::Registry(
+                "[worktrees] root must be outside allowed_cwd_root".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, ConfigError> {
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent().ok_or_else(|| {
+            ConfigError::Registry(format!(
+                "[worktrees] root {path:?} has no existing ancestor"
+            ))
+        })?;
+    }
+    Ok(probe.to_path_buf())
+}
+
+fn canonicalize_lenient_session_cwd(path: &Path) -> Result<bridge_core::SessionCwd, ConfigError> {
+    let mut existing = path;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let canonical = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(c) => break c,
+            Err(_) => {
+                let file = existing.file_name().ok_or_else(|| {
+                    ConfigError::Registry(format!(
+                        "[worktrees] path {path:?} has no canonical root"
+                    ))
+                })?;
+                tail.push(file.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    ConfigError::Registry(format!(
+                        "[worktrees] path {path:?} has no canonical root"
+                    ))
+                })?;
+            }
+        }
+    };
+    let mut out = canonical;
+    for seg in tail.iter().rev() {
+        out.push(seg);
+    }
+    bridge_core::SessionCwd::parse(&out.to_string_lossy())
+        .map_err(|e| ConfigError::Registry(format!("[worktrees] canonical path {out:?}: {e:?}")))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2338,6 +2423,40 @@ addr="127.0.0.1:8080"
     const AGENTS_HEADER: &str =
         "default = \"codex\"\n[[agents]]\nid = \"codex\"\ncmd = \"codex-acp\"\n";
     const SERVER_FOOTER: &str = "[server]\naddr = \"127.0.0.1:8080\"\n";
+
+    #[test]
+    fn worktrees_config_parses_and_preflight() {
+        let toml = format!(
+            "{AGENTS_HEADER}\n[worktrees]\nenabled = true\nroot = \"/tmp/a2a-wt-xyz\"\n{SERVER_FOOTER}"
+        );
+        let cfg: RegistryConfig = toml::from_str(&toml).unwrap();
+        let w = cfg.worktrees.as_ref().unwrap();
+        assert!(w.enabled);
+        assert_eq!(w.root.as_deref(), Some("/tmp/a2a-wt-xyz"));
+        assert!(
+            preflight_worktrees_root(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), None)
+                .is_err(),
+            "a root inside the a2a-bridge repo must be rejected"
+        );
+        assert!(
+            preflight_worktrees_root(std::path::Path::new("/tmp/a2a-wt-xyz-clean"), None).is_ok()
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_root_under_allowed_cwd_root() {
+        let allowed = bridge_core::SessionCwd::parse("/tmp/a2a-allowed-xyz").unwrap();
+        assert!(preflight_worktrees_root(
+            std::path::Path::new("/tmp/a2a-allowed-xyz/wt"),
+            Some(&allowed)
+        )
+        .is_err());
+        assert!(preflight_worktrees_root(
+            std::path::Path::new("/tmp/a2a-other-xyz"),
+            Some(&allowed)
+        )
+        .is_ok());
+    }
 
     #[test]
     fn parses_workflows_and_loads_prompts() {
