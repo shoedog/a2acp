@@ -2755,6 +2755,20 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
         instance_id: instance_id.clone(),
     };
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
+    let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
+        wc.enabled
+            .then(|| bridge_worktree::sweep::WorktreeRunEndGuard {
+                root: wc.root.clone(),
+                instance_id: run.instance_id.clone(),
+            })
+    });
     let policy = Arc::new(bridge_policy::permission::AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
     let spawn = make_spawn_fn(
@@ -4198,7 +4212,7 @@ async fn main() -> Result<(), BoxError> {
         run.clone(),
         Some(Arc::clone(&perm_registry)),
         perm_timeout,
-        worktree_cfg,
+        worktree_cfg.clone(),
     );
 
     // 5. Config source + registry. `load()` is the initial desired state; the
@@ -4214,6 +4228,13 @@ async fn main() -> Result<(), BoxError> {
                                          // retire reaps with the runtime alive, and the next run's recovery
                                          // catches any crash leftover.
     recover_orphans(&snapshot, &config_path, &host);
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
     // Fan-out source label (wire-observable in fan-out artifacts): the default
     // entry's `name` if set, else the default agent id, so a non-Kiro default
     // (e.g. codex) isn't mislabeled "kiro".
