@@ -1,10 +1,27 @@
 # E1 — Worktree-per-Session — HANDOFF / Resume Doc
 
 > A Slice-10+ tail item (the user picked E1 from {E1 worktree · E6 retry · E3 batch · E7 task-spec · E8 prompt-lib}).
-> **STATUS: architect DONE + PLAN v2 DONE — READY-TO-IMPLEMENT.** Branch `feat/e1-worktree-per-session`
-> (base = `main` `165e7e2`). Docs-only so far — NO production code. Read top-to-bottom.
+> **STATUS: ✅ SHIPPED — all 8 TDD tasks + whole-branch review fixes implemented, full host gate green (1228),
+> live-gate AIRTIGHT, merged to `main`.** Branch `feat/e1-worktree-per-session` (base = `main` `165e7e2`).
 
-## ⏯️ RESUME POINT: TDD-implement T1 (the plan v2 is locked)
+## ✅ SHIPPED SUMMARY (read this first)
+- **8 TDD tasks** (`43ed48d` T1 → `47f951f` T8): new `crates/bridge-worktree` (provider + path/canonicalize-gate +
+  sidecar carrier + `HostGitWorktree` real-git w/ lock-retry + `WorktreeBackend` decorator + lease-aware sweep) +
+  `[worktrees]` config/preflight/all-call-site wiring in `bin/a2a-bridge` + the cold-executor configure-error fix.
+- **Whole-branch dual review** (codex xhigh = 1 BLOCKER + 5 MAJOR; Opus = 1 NIT) → ALL folded in `30c8f29`: sweep
+  path-safety (own-sibling + under-root containment), atomic+mandatory sidecar, `Notify` single-flight w/ claim-id +
+  promotion-guard (closes teardown-during-reserving leak), boot-sweep+end-guard on every `worktree_cfg` path,
+  hot-reload caveat doc.
+- **Host gate:** `cargo fmt --all --check` + `cargo clippy --workspace --all-targets -D warnings` + `cargo test
+  --workspace --all-targets` = **1228 passed / 0 failed**. (codex's sandbox stalls the `a2a_bridge` bin-test / `integration_fanout` — controller re-ran clean, as always.)
+- **Live-gate (real codex agents, 2 concurrent warm sessions on 1 repo):** ✅ isolation (2 separate worktrees), ✅
+  source `git status` CLEAN throughout, ✅ writes land in worktrees not source, ✅ `continue` reuses the worktree,
+  ✅ `release` removes it (no dangling registration), ✅ preflight rejects root-in-repo, ✅ boot-sweep reaps a
+  SIGKILL-orphaned worktree on restart (dead-owner = same host + freed lease).
+- **Tracked deferrals (unchanged):** container compose (WorktreeBackend ∘ ContainerRwBackend `:rw`), persist-edits/
+  commit-hand-off on release, named-branch-per-worktree, threading static `[agents].cwd` (SR-FIX-9).
+
+## ⏯️ (historical) RESUME POINT: TDD-implement T1 (the plan v2 is locked)
 - **Spec = `docs/superpowers/specs/2026-06-23-e1-worktree-per-session.md`** (`## v2`, BINDING; SR-FIX-1..12).
 - **Plan = `docs/superpowers/plans/2026-06-23-e1-worktree-per-session.md`** — read the **`## v2`** section
   (BINDING; PR-FIX-1..13 + the "Revised task structure"). It supersedes the draft task bodies above it.
