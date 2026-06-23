@@ -757,3 +757,103 @@ git commit -m "test(worktree): T8 — unborn-HEAD clean error + workspace gate"
 **2. Placeholders:** each step has real test + impl code + exact commands. The two soft spots flagged inline (the exact `BridgeError` immutability variant in T3; the sidecar owner-threading seam in T4) for the implementer to resolve against the real `error.rs`. ✅
 **3. Type consistency:** `WorktreeConfig { root, owner, run }`, `WorktreeProvider::{add,remove,is_git_repo}`, `worktree_path(cfg, allowed_root, repo, session_id)`, `WorktreeBackend::new(inner, provider, cfg, allowed_root)` consistent across T1/T3/T4/T5. ✅
 **4. Open items for plan-review:** (a) the exact immutability error variant (T3); (b) per-agent vs global enable (D2); (c) canonicalization depth in `worktree_path` (T4 uses lexical `is_under` like upstream — confirm a real `canonicalize` isn't required given the source may not exist); (d) the sidecar owner-threading seam (provider signature vs backend-writes). Confirm in the dual plan-review.
+
+---
+
+## v2 — dual plan-review folded (codex xhigh needs-revision: 5 BLOCKER + 7 MAJOR + 1 MINOR; Opus lens) — BINDING
+
+> Supersedes the task bodies above where it conflicts. The DECORATOR SEAM HOLDS (both lenses CONFIRM: 10-method
+> trait, `capabilities()` sync, substitute-after-fingerprint correct via `session_manager.rs:559` before `:574`).
+> The folds make the plan compile-green per task + faithful to the spec's lifecycle/safety rigor. Apply each in its
+> named task.
+
+### PR-FIX-1 (codex BLOCKER-1 + Opus-1) — T3→T4 forward reference (won't compile)
+T3 imports `crate::provider_path::worktree_path` (created in T4). **Reorder: do the path+gate task BEFORE the
+decorator.** New order: T1 crate/provider → **T2 path+gate+sidecar (was T4)** → **T3 HostGitWorktree+smoke (was T2)**
+→ **T4 WorktreeBackend decorator (was T3)** → T5 → T6 → T7 → T8. (Or keep numbering but move `worktree_path` +
+the gate into the task that precedes the decorator.) The decorator task may then `use` `worktree_path`.
+
+### PR-FIX-2 (codex BLOCKER-2) — the new crate's deps are incomplete
+T1 `Cargo.toml` omits `tokio`/`tokio-stream`/`futures` but the tests use `#[tokio::test]`, `tokio::sync::Mutex`,
+`tokio_stream`. Add (prefer workspace deps): `tokio = { workspace = true }` (or `{version="1", features=["sync","macros","rt"]}`),
+`tokio-stream = { workspace = true }`, and `futures` if a stream type is named. Verify against the root `Cargo.toml`
+`[workspace.dependencies]`.
+
+### PR-FIX-3 (codex BLOCKER-3 + Opus-3) — SR-FIX-5 requires real CANONICALIZE, not lexical `is_under`
+`SessionCwd::is_under` is lexical only (`session_cwd.rs:48`). The decorator runs at `configure_session` when the
+SOURCE repo EXISTS → it CAN and MUST lenient-canonicalize. Mirror ContainerRw's lenient canonicalizer
+(`bridge-container/src/lib.rs:713`): canonicalize source + root + worktree, then the containment check on the
+canonical paths. REQUIRE `allowed_cwd_root` to be set when `[worktrees].enabled` (else reject at preflight). Gate
+BEFORE any `git` op.
+
+### PR-FIX-4 (codex BLOCKER-4 + Opus-1) — full sidecar + LEASE-aware sweep (reuse `run_identity`)
+The sidecar must carry `{ canonical_source, common_dir, worktree_path, owner, run_id, host, lease }` (not `{source,
+owner}`). Liveness is HOST+LEASE based (`crates/bridge-core/src/run_identity.rs:91`), NOT an owner-string compare.
+The boot-sweep must classify dead-vs-live via the SAME lease semantics as the container `recover_orphans`
+(`main.rs:381`). Capture `common_dir` (`git -C <repo> rev-parse --git-common-dir`) so cleanup can
+`git worktree prune` the source even when the worktree dir is gone. (T-path/sidecar + T-sweep tasks.)
+
+### PR-FIX-5 (codex BLOCKER-5) — `retire()` must drain the worktree map (else leak)
+Registry retirement calls backend `retire()` (`registry.rs:285/327`) and requires idempotent/concurrent-safe
+retire (`registry.rs:263`). The decorator's `retire()` must NOT just delegate — it must idempotently DRAIN the map,
+delegate `inner.retire()`, then `provider.remove` every mapped worktree. Add a test: retire with N mapped sessions
+→ all worktrees removed, map empty, second retire is a no-op.
+
+### PR-FIX-6 (codex MAJOR-6) — same-source re-configure must RE-DELEGATE to inner (not early-return Ok)
+Inbound follow-ups re-call `configure_session` (`server.rs:443`); `AcpBackend::configure_session` is insert-or-
+replace (`acp_backend.rs:2605`). On the same source, the decorator must DELEGATE to inner again (with the existing
+substituted worktree cwd) — just DON'T call `provider.add` a second time. (T-decorator: replace the `return Ok(())`
+with a delegate-without-add.)
+
+### PR-FIX-7 (codex MAJOR-7) — close the check-then-add race (single-flight)
+The decorator drops the map lock before `provider.add` → two concurrent `configure_session` on one SessionId could
+both add. Use a `Reserving|Ready` entry (insert `Reserving` under the lock; the loser awaits/sees it; only one
+`add`). Add a concurrent-configure test proving exactly one `add`.
+
+### PR-FIX-8 (codex MAJOR-8) — `make_spawn_fn` wiring ripples to ALL call sites
+`make_spawn_fn` (`main.rs:482`) has no worktree param and is called at MULTIPLE sites — `:1984`, `:2665`, `:3869`,
+`:4090` (+ implement/resume). Define a concrete runtime `WorktreeRuntimeCfg { enabled, root, allowed_root }` (built
+once from `[worktrees]` + `allowed_cwd_root`) and thread it through EVERY `make_spawn_fn` call site (mirror how
+`permission_registry` is threaded). Gate the T5 step with `cargo build --workspace` so a missed call site is a
+compile error. `wc.backend_cfg(agent_id)` must be a real method producing `WorktreeConfig { root, owner, run }`.
+
+### PR-FIX-9 (codex MAJOR-9) — root preflight: outside any repo AND outside `allowed_cwd_root`
+T5's preflight only rejects "inside a git repo". v2 requires the root ALSO outside `allowed_cwd_root` (canonical).
+Preflight the resolved root against BOTH (git containment + canonical `allowed_cwd_root` containment) in every
+command path that can enable worktrees (serve + run-workflow + implement).
+
+### PR-FIX-10 (codex MAJOR-10) — add-failure cleanup + bounded retry
+On `worktree add` failure: remove any partial worktree dir + `git worktree prune` the source (no half-state, per
+spec). Classify retryable git LOCK failures (index.lock / worktrees lock in stderr) → bounded retry (mirror B2b's
+commit-with-retry). (T-HostGitWorktree.)
+
+### PR-FIX-11 (codex MAJOR-11) — T6's test must compile against the real `Rec`
+`Rec.prompts` is `Mutex<Vec<String>>` (`executor.rs:648`), not an int. The T6 test must `push` to the vec (or use
+a separate `AtomicUsize` counter) and assert no-prompt + exactly-one-forget. The impl return shape is correct
+(3-tuple `(String,bool,Option<UsageSnapshot>)`, `executor.rs:247`).
+
+### PR-FIX-12 (codex MAJOR-12 + Opus-4) — SR-FIX-9 is a DOCUMENTED BYPASS, not silent coverage
+The plan's self-review wording ("static cwd never reaches as `spec.cwd`") is misleading: `AcpBackend` falls back to
+static `AcpConfig.cwd` (`acp_backend.rs:1651`, set at `main.rs:265`) → a static-`[agents].cwd` session with NO
+per-request cwd shares the repo tree (NO worktree). This IS the intended per-request-cwd-only scope, but it's a
+BYPASS to DOCUMENT explicitly (config doc + a test asserting `spec.cwd=None` → pass-through → no worktree), not to
+imply as "covered". (T-decorator test + a doc line.)
+
+### PR-FIX-13 (codex MINOR + Opus-2) — error variant
+Use `BridgeError::ConfigMismatch { field: "cwd" }` (the SessionManager's cwd-immutability error,
+`session_manager.rs:438`) for the different-source reject, NOT `InvalidStateTransition` (both exist, `error.rs:26/66`;
+ConfigMismatch is the consistent client disposition). The gate reject uses `InvalidRequest { field: "..." }` (static str).
+
+### CONFIRM (both lenses — do NOT re-litigate)
+10-method `AgentBackend` (`ports.rs:43`); `capabilities()` SYNC (delegate without `.await`); substitute-after-
+fingerprint holds (`session_manager.rs:559` before `:574`). No leak on reset/release_all (cascade to
+`release_session`) — but RETIRE was the missed leak (PR-FIX-5).
+
+### Revised task structure (net of the folds)
+T1 crate+provider+argv → **T2 worktree_path + canonicalize/self-gate + full sidecar (PR-FIX-1/3/4/13)** →
+**T3 HostGitWorktree + add-failure-cleanup + bounded-retry + isolation smoke (PR-FIX-2/10)** → **T4 WorktreeBackend
+decorator: full-trait delegate + delegate-then-remove + idempotent-RE-DELEGATE + single-flight reserve + retire-
+drains-map + None-bypass test (PR-FIX-5/6/7/12)** → **T5 [worktrees] config + dual-preflight + ALL-call-site
+make_spawn_fn wiring (PR-FIX-8/9)** → T6 cold executor configure-error (fix the test, PR-FIX-11) → **T7 lease-aware
+boot-sweep + run-workflow end-guard (PR-FIX-4)** → T8 unborn-HEAD + workspace gate. After folding PR-FIX-1..13 the
+plan is **ready-to-implement**.
