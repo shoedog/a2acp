@@ -1,0 +1,18 @@
+# Codex (gpt-5.5, effort=xhigh) as the WHOLE-BRANCH REVIEWER for E1 (worktree-per-session).
+# Read-only sandbox; reviews the full code diff vs main + the binding spec/plan + the real code.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "e1-whole-branch-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/e1-whole-branch-review.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8135"

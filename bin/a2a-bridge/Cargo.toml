@@ -23,6 +23,7 @@ bridge-observ = { path = "../../crates/bridge-observ" }
 bridge-registry = { path = "../../crates/bridge-registry" }
 bridge-api = { path = "../../crates/bridge-api" }
 bridge-container = { path = "../../crates/bridge-container" }
+bridge-worktree = { path = "../../crates/bridge-worktree" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

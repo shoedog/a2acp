@@ -1,0 +1,16 @@
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "e1-spec-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/e1-spec-review.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8133"

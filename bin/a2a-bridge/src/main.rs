@@ -323,6 +323,16 @@ fn container_owner(config_path: &std::path::Path, mount: &str, agent_id: &str) -
     format!("{:016x}", h.finish())
 }
 
+fn worktree_owner(config_path: &std::path::Path, agent_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let canonical =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    canonical.to_string_lossy().hash(&mut h);
+    agent_id.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Epoch-seconds string for the display-only `a2a.start` label (no RFC3339 dep; `containers list` shows
 /// `age = now - start`).
 fn epoch_secs() -> String {
@@ -476,6 +486,47 @@ fn container_rw_cfg_from_entry(
     })
 }
 
+#[derive(Clone)]
+struct WorktreeRuntimeCfg {
+    enabled: bool,
+    root: String,
+    allowed_root: Option<bridge_core::SessionCwd>,
+}
+
+fn default_worktrees_root() -> String {
+    let root = std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".a2a-bridge").join("worktrees"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp").join("a2a-bridge").join("worktrees"));
+    root.to_string_lossy().into_owned()
+}
+
+/// Resolve `[worktrees]` into a runtime cfg. Worktrees are opt-in, host-only, and require
+/// `allowed_cwd_root` so the decorator can self-gate before any git operation. `[worktrees]`
+/// changes require a serve restart because the spawn factory captures this config once;
+/// hot-reload does not re-read it.
+fn resolve_worktree_runtime_cfg(
+    cfg: &RegistryConfig,
+) -> Result<Option<WorktreeRuntimeCfg>, String> {
+    let Some(w) = cfg.worktrees.as_ref().filter(|w| w.enabled) else {
+        return Ok(None);
+    };
+    let allowed = cfg
+        .allowed_cwd_root
+        .as_deref()
+        .ok_or_else(|| "[worktrees] enabled requires allowed_cwd_root".to_string())?;
+    let allowed_root = bridge_core::SessionCwd::parse(allowed)
+        .map_err(|e| format!("[worktrees]: invalid allowed_cwd_root: {e:?}"))?;
+    let root = w.root.clone().unwrap_or_else(default_worktrees_root);
+    config::preflight_worktrees_root(std::path::Path::new(&root), Some(&allowed_root))
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&root).map_err(|e| format!("[worktrees] root {root:?}: {e}"))?;
+    Ok(Some(WorktreeRuntimeCfg {
+        enabled: true,
+        root,
+        allowed_root: Some(allowed_root),
+    }))
+}
+
 /// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
 /// `implement` subcommand so their registry builds can't drift. `owner_config_path` seeds the ContainerRw
 /// owner token.
@@ -485,12 +536,14 @@ fn make_spawn_fn(
     run: bridge_core::run_identity::RunHandle,
     permission_registry: Option<Arc<PermissionRegistry>>,
     perm_timeout_ms: u64,
+    worktree_cfg: Option<WorktreeRuntimeCfg>,
 ) -> bridge_registry::registry::SpawnFn {
     Arc::new(move |entry: Arc<AgentEntry>| {
         let policy = Arc::clone(&policy_for_spawn);
         let owner_config_path = owner_config_path.clone();
         let run = run.clone();
         let permission_registry = permission_registry.clone();
+        let worktree_cfg = worktree_cfg.clone();
         Box::pin(async move {
             // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
             // Resolution chain: session_cwd → cwd → "."; then absolutize relative values.
@@ -524,7 +577,31 @@ fn make_spawn_fn(
                             .with_permission_registry(reg)
                             .with_permission_timeout_ms(perm_timeout_ms);
                     }
-                    Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+                    let inner = Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>;
+                    match &worktree_cfg {
+                        Some(wc) if wc.enabled => {
+                            let prov = Arc::new(bridge_worktree::host_git::HostGitWorktree::new());
+                            let wcfg = bridge_worktree::provider_path::WorktreeConfig {
+                                root: wc.root.clone(),
+                                owner: worktree_owner(&owner_config_path, entry.id.as_str()),
+                                run: run.instance_id.clone(),
+                            };
+                            let identity = bridge_worktree::backend::WorktreeIdentity {
+                                run_id: run.instance_id.clone(),
+                                host: run.host.clone(),
+                                lease: run.lease.clone(),
+                            };
+                            Ok(Arc::new(bridge_worktree::backend::WorktreeBackend::new(
+                                inner,
+                                prov,
+                                wcfg,
+                                wc.allowed_root.clone(),
+                                identity,
+                            ))
+                                as Arc<dyn bridge_core::ports::AgentBackend>)
+                        }
+                        _ => Ok(inner),
+                    }
                 }
                 AgentKind::Api => {
                     let base_url = entry.base_url.clone().ok_or(BridgeError::ConfigInvalid {
@@ -1798,6 +1875,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         .map_err(|e| format!("implement: read config {:?}: {e}", config_path))?;
     let cfg =
         config::RegistryConfig::parse(&raw).map_err(|e| format!("implement: config parse: {e}"))?;
+    let worktree_cfg = resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("implement: {e}"))?;
     let root = cfg
         .allowed_cwd_root
         .clone()
@@ -1940,12 +2018,26 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // Before-first-use crash recovery: reap only DEAD (same host + free lease) orphans of THIS process's
     // owners (`:rw` ∪ `:ro`); a live concurrent run's lease is held → its containers are spared.
     recover_orphans(&snapshot, &owner_config_path, &host);
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
     // Label-scoped END-sweep backstop (THIS run's `a2a.run` only). Declared BEFORE `warm` → drops AFTER it
     // (the warm `retire` reaps first; this catches anything it missed, including the `:ro` reviewers).
     let _run_guard = RunEndGuard {
         runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
         instance_id: instance_id.clone(),
     };
+    let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
+        wc.enabled
+            .then(|| bridge_worktree::sweep::WorktreeRunEndGuard {
+                root: wc.root.clone(),
+                instance_id: run.instance_id.clone(),
+            })
+    });
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
     let impl_lsp_cache_vol =
         warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &repo, &clone, false);
@@ -1981,7 +2073,14 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     ));
 
     // The registry + executor are still built — REVIEW runs through them (edit/fix are off-executor).
-    let spawn = make_spawn_fn(Arc::clone(&policy), owner_config_path, run, None, 120_000);
+    let spawn = make_spawn_fn(
+        Arc::clone(&policy),
+        owner_config_path,
+        run,
+        None,
+        120_000,
+        worktree_cfg.clone(),
+    );
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
             .map_err(|e| format!("implement: registry: {e:?}"))?,
@@ -2147,6 +2246,8 @@ async fn implement_resume_cmd(
         .map_err(|e| format!("implement --resume: read config {config_path:?}: {e}"))?;
     let cfg = config::RegistryConfig::parse(&raw)
         .map_err(|e| format!("implement --resume: config parse: {e}"))?;
+    let worktree_cfg =
+        resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("implement --resume: {e}"))?;
     let loop_cfg = cfg
         .implement
         .as_ref()
@@ -2238,10 +2339,24 @@ async fn implement_resume_cmd(
         start: epoch_secs(),
     };
     recover_orphans(&snapshot, &owner_config_path, &host);
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
     let _run_guard = RunEndGuard {
         runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
         instance_id: instance_id.clone(),
     };
+    let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
+        wc.enabled
+            .then(|| bridge_worktree::sweep::WorktreeRunEndGuard {
+                root: wc.root.clone(),
+                instance_id: run.instance_id.clone(),
+            })
+    });
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
     let impl_lsp_cache_vol = warm_lsp_deps_step(
@@ -2278,7 +2393,14 @@ async fn implement_resume_cmd(
         },
     ));
 
-    let spawn = make_spawn_fn(Arc::clone(&policy), owner_config_path, run, None, 120_000);
+    let spawn = make_spawn_fn(
+        Arc::clone(&policy),
+        owner_config_path,
+        run,
+        None,
+        120_000,
+        worktree_cfg.clone(),
+    );
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
             .map_err(|e| format!("implement --resume: registry: {e:?}"))?,
@@ -2593,6 +2715,9 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None => None,
     };
 
+    let worktree_cfg =
+        resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("run-workflow: {e}"))?;
+
     // Build the registry + executor using the same SpawnFn the server uses.
     let mut snapshot = cfg
         .into_snapshot()
@@ -2660,9 +2785,30 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
         instance_id: instance_id.clone(),
     };
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
+    let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
+        wc.enabled
+            .then(|| bridge_worktree::sweep::WorktreeRunEndGuard {
+                root: wc.root.clone(),
+                instance_id: run.instance_id.clone(),
+            })
+    });
     let policy = Arc::new(bridge_policy::permission::AutoPolicy);
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
-    let spawn = make_spawn_fn(policy_for_spawn, owner_config_path, run, None, 120_000);
+    let spawn = make_spawn_fn(
+        policy_for_spawn,
+        owner_config_path,
+        run,
+        None,
+        120_000,
+        worktree_cfg,
+    );
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
             .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
@@ -3862,6 +4008,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
 
     let raw = std::fs::read_to_string(&config_path)?;
     let cfg = RegistryConfig::parse(&raw)?;
+    let worktree_cfg = resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("mcp: {e}"))?;
 
     let policy = make_policy(&cfg.server);
     let perm_registry = PermissionRegistry::new();
@@ -3872,11 +4019,19 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         run.clone(),
         Some(Arc::clone(&perm_registry)),
         perm_timeout,
+        worktree_cfg.clone(),
     );
 
     let source = FileConfigSource::new(config_path.clone());
     let snapshot = source.load().await?;
     recover_orphans(&snapshot, &config_path, &host);
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
     let registry = Arc::new(Registry::new(snapshot, spawn)?);
 
     let base = config_path
@@ -4073,6 +4228,7 @@ async fn main() -> Result<(), BoxError> {
     // working on the RegistryConfig path.
     let raw = std::fs::read_to_string(&config_path)?;
     let cfg = RegistryConfig::parse(&raw)?;
+    let worktree_cfg = resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("serve: {e}"))?;
 
     // 3. Build the policy engine FIRST so the SAME engine drives both the inbound
     //    server's permission decisions AND each backend's REVERSE
@@ -4093,6 +4249,7 @@ async fn main() -> Result<(), BoxError> {
         run.clone(),
         Some(Arc::clone(&perm_registry)),
         perm_timeout,
+        worktree_cfg.clone(),
     );
 
     // 5. Config source + registry. `load()` is the initial desired state; the
@@ -4108,6 +4265,13 @@ async fn main() -> Result<(), BoxError> {
                                          // retire reaps with the runtime alive, and the next run's recovery
                                          // catches any crash leftover.
     recover_orphans(&snapshot, &config_path, &host);
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
     // Fan-out source label (wire-observable in fan-out artifacts): the default
     // entry's `name` if set, else the default agent id, so a non-Kiro default
     // (e.g. codex) isn't mislabeled "kiro".
@@ -5879,6 +6043,7 @@ cmd = "cargo build --locked"
             run,
             None,
             120_000,
+            None,
         );
         bridge_registry::registry::Registry::new(snap, spawn)
             .expect("containerized config (incl. the impl container_rw agent) validates");
