@@ -2373,6 +2373,22 @@ addr="127.0.0.1:8080"
     }
 
     #[test]
+    fn shipped_panel_config_loads_and_wires_reserved_vars() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let raw = std::fs::read_to_string(base.join("a2a-bridge.panel.toml")).unwrap();
+        let cfg = RegistryConfig::parse(&raw).unwrap();
+        let map = cfg.load_workflows(&base).unwrap();
+        let g = map
+            .get(&bridge_core::ids::WorkflowId::parse("panel").unwrap())
+            .expect("panel workflow present");
+        assert!(g.panel.as_ref().unwrap().weights.contains_key("usage"));
+        let synth = g.nodes.iter().find(|n| n.id.as_str() == "synth").unwrap();
+        assert!(synth.prompt_template.contains("{{workflow.costs}}"));
+        assert!(synth.prompt_template.contains("{{workflow.weights}}"));
+        g.validate().unwrap();
+    }
+
+    #[test]
     fn workflow_unknown_agent_rejected_at_boot() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("p.md"), "x").unwrap();
