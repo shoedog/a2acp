@@ -1,21 +1,33 @@
 # E1 — Worktree-per-Session — HANDOFF / Resume Doc
 
 > A Slice-10+ tail item (the user picked E1 from {E1 worktree · E6 retry · E3 batch · E7 task-spec · E8 prompt-lib}).
-> **STATUS: architect DONE + PLAN WRITTEN — dual plan-review IN FLIGHT.** Branch `feat/e1-worktree-per-session`
+> **STATUS: architect DONE + PLAN v2 DONE — READY-TO-IMPLEMENT.** Branch `feat/e1-worktree-per-session`
 > (base = `main` `165e7e2`). Docs-only so far — NO production code. Read top-to-bottom.
 
-## ⏯️ RESUME POINT: fold the dual plan-review → plan v2, then TDD-implement T1
+## ⏯️ RESUME POINT: TDD-implement T1 (the plan v2 is locked)
 - **Spec = `docs/superpowers/specs/2026-06-23-e1-worktree-per-session.md`** (`## v2`, BINDING; SR-FIX-1..12).
-- **Plan = `docs/superpowers/plans/2026-06-23-e1-worktree-per-session.md`** (8 TDD tasks T1–T8, BINDING; realizes
-  SF-1..6 + SR-FIX-1..12). Self-review flagged 4 plan-review items: (a) the exact immutability `BridgeError`
-  variant (T3 used `InvalidStateTransition` — VERIFY in `error.rs`); (b) per-agent vs global enable (D2); (c)
-  canonicalization depth in `worktree_path` (lexical vs real canonicalize); (d) the sidecar owner-threading seam.
-- **Dual plan-review IN FLIGHT:** codex xhigh (port 8134, `prompts/e1-plan-review.md` +
-  `examples/a2a-bridge.e1-plan-review-codex.toml`) + the Opus lens. **NEXT:** read `/tmp/e1-plan-review.out`, add
-  the Opus lens, fold both → a `## v2` section in the plan → then TDD-implement T1→T8 (codex-HIGH writes / Opus
-  verifies+commits in the clean host env). Then whole-branch dual review → live-gate → merge. (Same loop as Slice 10.)
-- Commit history: `81223ae` (spec + spec-review scaffolding) → `1b71455` (spec v2) → `0a0ce0e` (this handoff) →
-  `28398b0` (plan) → plan-review scaffolding (port 8134).
+- **Plan = `docs/superpowers/plans/2026-06-23-e1-worktree-per-session.md`** — read the **`## v2`** section
+  (BINDING; PR-FIX-1..13 + the "Revised task structure"). It supersedes the draft task bodies above it.
+- **Dual plan-review DONE** (codex xhigh `5 BLOCKER + 7 MAJOR + 1 MINOR` + Opus lens, both needs-revision, **no
+  re-architecture** — decorator seam holds) → ALL folded into plan v2. Transient: `/tmp/e1-plan-review.out`.
+- **Revised task order (plan v2):** T1 crate+provider+argv → **T2 worktree_path + canonicalize/self-gate + full
+  sidecar** → **T3 HostGitWorktree + add-failure-cleanup + bounded-retry + isolation smoke** → **T4 WorktreeBackend
+  decorator (full-trait delegate + delegate-then-remove + idempotent-RE-DELEGATE + single-flight reserve + retire-
+  drains-map + None-bypass test)** → **T5 [worktrees] config + dual-preflight + ALL-call-site make_spawn_fn wiring**
+  → T6 cold executor configure-error → **T7 lease-aware boot-sweep + run-workflow end-guard** → T8 unborn-HEAD +
+  workspace gate.
+- **NEXT: implement task-by-task** (codex-HIGH writes, NO commit / NO git-mutating cmd / `cargo test --workspace
+  --all-targets` gate / `_dyld_start` stall → report) → Opus verifies in the clean host env + commits (stage ONLY
+  each task's files) → codex-xhigh whole-branch review → live-gate → merge. Reuse a `slice-10-impl`-style codex-HIGH
+  config (copy `examples/a2a-bridge.slice-10-impl-codex.toml` + `prompts/slice-10-impl.md` to e1 variants, re-point
+  at the E1 plan).
+- **The single most critical impl details (plan v2):** (1) `retire()` must DRAIN the worktree map (else leak —
+  registry retirement is a real teardown path, `registry.rs:285/327`); (2) `make_spawn_fn` worktree-cfg param
+  ripples to ALL call sites (`main.rs:1984/2665/3869/4090` + implement/resume) — `cargo build --workspace` is the
+  gate; (3) the sweep is LEASE-aware via `run_identity` (`run_identity.rs:91`), NOT an owner-string compare; (4)
+  real lenient CANONICALIZE (mirror `bridge-container/src/lib.rs:713`), not lexical `is_under`.
+- Commit history: `81223ae` (spec + spec-review scaffolding) → `1b71455` (spec v2) → `0a0ce0e` (handoff) →
+  `28398b0` (plan) → `2451e2f` (handoff update) → `025327b` (plan v2) → plan-review scaffolding (port 8134).
 
 ## What E1 is (the architect decision)
 Each warm session gets its OWN **git worktree** off a target repo, so **concurrent write-capable agents don't
