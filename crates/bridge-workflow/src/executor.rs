@@ -1712,6 +1712,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panel_degrades_failed_member_usage_is_n_a() {
+        // No "member_a" backend registered → its node fails (error marker, usage None);
+        // member_b + synth still run, synth's costs table shows member_a as n/a.
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry {
+            backends: [
+                ("member_b".to_string(), mk("B_ANALYSIS")),
+                ("synth".to_string(), mk("PANEL")),
+            ]
+            .into(),
+        });
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+        let g = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("panel").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("member_a").unwrap(),
+                    agent: AgentId::parse("member_a").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("member_b").unwrap(),
+                    agent: AgentId::parse("member_b").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("synth").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "{{member_b}}\n{{workflow.costs}}".into(),
+                    inputs: vec![
+                        NodeId::parse("member_a").unwrap(),
+                        NodeId::parse("member_b").unwrap(),
+                    ],
+                },
+            ],
+            panel: None,
+        });
+        let evs: Vec<_> = WorkflowExecutor::new(reg)
+            .run(g, "DIFF".into(), "r".into(), CancellationToken::new())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                ..
+            }
+        ));
+        let p = &synth_rec.prompts.lock().unwrap()[0];
+        assert!(
+            p.contains("| member_a | n/a | n/a | n/a | n/a |"),
+            "failed member usage row must be n/a: {p}"
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_calls_backend_cancel_and_ends_canceled() {
         // A backend whose prompt() stream NEVER yields Done (pending) → only the cancel path ends it.
         struct Pending {
