@@ -628,6 +628,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-worktree"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bridge-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
