@@ -10,8 +10,9 @@ use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{AgentBackend, BackendStream, RichEventSink};
 use bridge_core::SessionCwd;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Clone)]
 pub struct WorktreeIdentity {
@@ -21,7 +22,7 @@ pub struct WorktreeIdentity {
 }
 
 enum WtState {
-    Reserving,
+    Reserving(u64),
     Ready(WtEntry),
 }
 
@@ -37,6 +38,8 @@ pub struct WorktreeBackend {
     allowed_root: Option<SessionCwd>,
     identity: WorktreeIdentity,
     map: Mutex<HashMap<String, WtState>>,
+    next_claim: AtomicU64,
+    notify: Notify,
 }
 
 impl WorktreeBackend {
@@ -54,6 +57,8 @@ impl WorktreeBackend {
             allowed_root,
             identity,
             map: Mutex::new(HashMap::new()),
+            next_claim: AtomicU64::new(1),
+            notify: Notify::new(),
         }
     }
 }
@@ -106,7 +111,7 @@ impl AgentBackend for WorktreeBackend {
             session.as_str(),
         )?;
         let key = session.as_str().to_string();
-        let mut spins = 0usize;
+        let claim;
 
         loop {
             let mut map = self.map.lock().await;
@@ -123,21 +128,14 @@ impl AgentBackend for WorktreeBackend {
                     };
                     return self.inner.configure_session(session, &sub).await;
                 }
-                Some(WtState::Reserving) => {
-                    if spins >= 1000 {
-                        return Err(BridgeError::ConfigInvalid {
-                            reason: format!(
-                                "timed out waiting for worktree reservation for session {}",
-                                session.as_str()
-                            ),
-                        });
-                    }
-                    spins += 1;
+                Some(WtState::Reserving(_)) => {
+                    let fut = self.notify.notified();
                     drop(map);
-                    tokio::task::yield_now().await;
+                    fut.await;
                 }
                 None => {
-                    map.insert(key.clone(), WtState::Reserving);
+                    claim = self.next_claim.fetch_add(1, Ordering::Relaxed);
+                    map.insert(key.clone(), WtState::Reserving(claim));
                     break;
                 }
             }
@@ -150,7 +148,11 @@ impl AgentBackend for WorktreeBackend {
         {
             Ok(common_dir) => common_dir,
             Err(e) => {
-                self.map.lock().await.remove(session.as_str());
+                let mut map = self.map.lock().await;
+                if matches!(map.get(session.as_str()), Some(WtState::Reserving(c)) if *c == claim) {
+                    map.remove(session.as_str());
+                    self.notify.notify_waiters();
+                }
                 return Err(e);
             }
         };
@@ -164,7 +166,19 @@ impl AgentBackend for WorktreeBackend {
             host: self.identity.host.clone(),
             lease: self.identity.lease.clone(),
         };
-        let _ = write_sidecar(&sidecar);
+        if let Err(e) = write_sidecar(&sidecar) {
+            let _ = self
+                .provider
+                .remove(&resolved.canonical_source, &resolved.worktree_path)
+                .await;
+            let _ = std::fs::remove_file(sidecar_path(&resolved.worktree_path));
+            let mut map = self.map.lock().await;
+            if matches!(map.get(session.as_str()), Some(WtState::Reserving(c)) if *c == claim) {
+                map.remove(session.as_str());
+                self.notify.notify_waiters();
+            }
+            return Err(e);
+        }
 
         let sub = SessionSpec {
             config: spec.config.clone(),
@@ -176,23 +190,45 @@ impl AgentBackend for WorktreeBackend {
                 .remove(&resolved.canonical_source, &resolved.worktree_path)
                 .await;
             let _ = std::fs::remove_file(sidecar_path(&resolved.worktree_path));
-            self.map.lock().await.remove(session.as_str());
+            let mut map = self.map.lock().await;
+            if matches!(map.get(session.as_str()), Some(WtState::Reserving(c)) if *c == claim) {
+                map.remove(session.as_str());
+                self.notify.notify_waiters();
+            }
             return Err(e);
         }
 
-        self.map.lock().await.insert(
-            key,
-            WtState::Ready(WtEntry {
-                canonical_source: resolved.canonical_source,
-                worktree_path: resolved.worktree_path,
-            }),
-        );
+        let mut map = self.map.lock().await;
+        let owns_claim =
+            matches!(map.get(session.as_str()), Some(WtState::Reserving(c)) if *c == claim);
+        if owns_claim {
+            map.insert(
+                key,
+                WtState::Ready(WtEntry {
+                    canonical_source: resolved.canonical_source,
+                    worktree_path: resolved.worktree_path,
+                }),
+            );
+            self.notify.notify_waiters();
+            return Ok(());
+        }
+        drop(map);
+        let _ = self
+            .provider
+            .remove(&resolved.canonical_source, &resolved.worktree_path)
+            .await;
+        let _ = std::fs::remove_file(sidecar_path(&resolved.worktree_path));
+        self.notify.notify_waiters();
         Ok(())
     }
 
     async fn forget_session(&self, session: &SessionId) {
         self.inner.forget_session(session).await;
-        if let Some(WtState::Ready(e)) = self.map.lock().await.remove(session.as_str()) {
+        let removed = self.map.lock().await.remove(session.as_str());
+        if removed.is_some() {
+            self.notify.notify_waiters();
+        }
+        if let Some(WtState::Ready(e)) = removed {
             let _ = self
                 .provider
                 .remove(&e.canonical_source, &e.worktree_path)
@@ -203,7 +239,11 @@ impl AgentBackend for WorktreeBackend {
 
     async fn release_session(&self, session: &SessionId) {
         self.inner.release_session(session).await;
-        if let Some(WtState::Ready(e)) = self.map.lock().await.remove(session.as_str()) {
+        let removed = self.map.lock().await.remove(session.as_str());
+        if removed.is_some() {
+            self.notify.notify_waiters();
+        }
+        if let Some(WtState::Ready(e)) = removed {
             let _ = self
                 .provider
                 .remove(&e.canonical_source, &e.worktree_path)
@@ -243,10 +283,11 @@ impl AgentBackend for WorktreeBackend {
             map.drain()
                 .filter_map(|(_, st)| match st {
                     WtState::Ready(e) => Some(e),
-                    WtState::Reserving => None,
+                    WtState::Reserving(_) => None,
                 })
                 .collect()
         };
+        self.notify.notify_waiters();
         let _ = self.inner.retire().await;
         for e in entries {
             let _ = self
@@ -271,6 +312,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::Notify;
 
     #[derive(Default)]
     struct Rec {
@@ -507,6 +549,79 @@ mod tests {
         a.unwrap();
         b.unwrap();
         assert_eq!(rec.add_count.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    struct BlockingProv {
+        rec: Arc<Rec>,
+        add_entered: Arc<Notify>,
+        allow_add: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::WorktreeProvider for BlockingProv {
+        async fn add(&self, _repo: &str, _worktree_path: &str) -> Result<String, BridgeError> {
+            self.rec.add_count.fetch_add(1, Ordering::SeqCst);
+            self.add_entered.notify_one();
+            self.allow_add.notified().await;
+            Ok(String::new())
+        }
+
+        async fn remove(&self, _repo: &str, _worktree_path: &str) -> Result<(), BridgeError> {
+            self.rec.remove_count.fetch_add(1, Ordering::SeqCst);
+            self.rec.order.lock().unwrap().push("wt_remove".into());
+            Ok(())
+        }
+
+        async fn is_git_repo(&self, _path: &str) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_during_reserving_does_not_leak() {
+        let tmp = unique_temp_dir("teardown-reserving");
+        let allowed_root = tmp.join("allowed");
+        let source = allowed_root.join("source");
+        let worktree_root = tmp.join("worktrees");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let canonical_allowed_root = std::fs::canonicalize(&allowed_root).unwrap();
+        let canonical_worktree_root = std::fs::canonicalize(&worktree_root).unwrap();
+        let rec = Arc::new(Rec::default());
+        let add_entered = Arc::new(Notify::new());
+        let allow_add = Arc::new(Notify::new());
+        let be = Arc::new(WorktreeBackend::new(
+            Arc::new(FakeInner { rec: rec.clone() }),
+            Arc::new(BlockingProv {
+                rec: rec.clone(),
+                add_entered: add_entered.clone(),
+                allow_add: allow_add.clone(),
+            }),
+            crate::provider_path::WorktreeConfig {
+                root: canonical_worktree_root.to_string_lossy().into_owned(),
+                owner: "ownr".into(),
+                run: "run7".into(),
+            },
+            Some(SessionCwd::parse(&canonical_allowed_root.to_string_lossy()).unwrap()),
+            identity(),
+        ));
+        let sid = SessionId::parse("ctx-c1-g0").unwrap();
+        let session_spec = spec(Some(&source.to_string_lossy()));
+        let task_be = be.clone();
+        let task_sid = sid.clone();
+        let configure =
+            tokio::spawn(async move { task_be.configure_session(&task_sid, &session_spec).await });
+
+        add_entered.notified().await;
+        be.release_session(&sid).await;
+        allow_add.notify_one();
+        configure.await.unwrap().unwrap();
+
+        assert!(be.map.lock().await.is_empty());
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.remove_count.load(Ordering::SeqCst), 1);
 
         std::fs::remove_dir_all(tmp).unwrap();
     }

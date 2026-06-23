@@ -1,19 +1,65 @@
 use crate::provider::{prune_argv, remove_argv};
-use crate::provider_path::{read_sidecar, sidecar_path};
+use crate::provider_path::{canonicalize_lenient, read_sidecar, sidecar_path};
 use bridge_core::liveness::LeaseProbe;
 use bridge_core::run_identity::{classify, Verdict};
+use bridge_core::SessionCwd;
 use std::collections::HashMap;
+use std::path::Path;
 
 fn run_git_sync(argv: &[&str]) {
     let _ = std::process::Command::new("git").args(argv).output();
 }
 
 /// Best-effort remove a worktree + its sidecar.
-fn remove_worktree(canonical_source: &str, worktree_path: &str) {
+fn remove_worktree(canonical_source: &str, common_dir: &str, worktree_path: &str) {
     run_git_sync(&remove_argv(canonical_source, worktree_path));
     run_git_sync(&prune_argv(canonical_source));
+    if !common_dir.is_empty() {
+        run_git_sync(&["--git-dir", common_dir, "worktree", "prune"]);
+    }
     let _ = std::fs::remove_dir_all(worktree_path);
     let _ = std::fs::remove_file(sidecar_path(worktree_path));
+}
+
+fn sidecar_file_matches(sidecar_file: &str, worktree_path: &str) -> bool {
+    let Ok(sidecar_file) = std::fs::canonicalize(Path::new(sidecar_file)) else {
+        return false;
+    };
+    let Ok(expected) = std::fs::canonicalize(Path::new(&sidecar_path(worktree_path))) else {
+        return false;
+    };
+    sidecar_file == expected
+}
+
+fn worktree_under_root(root: &SessionCwd, worktree_path: &str) -> bool {
+    canonicalize_lenient(worktree_path)
+        .map(|wt| wt.is_under(root))
+        .unwrap_or(false)
+}
+
+fn remove_worktree_if_safe(
+    root: &SessionCwd,
+    sidecar_file: &str,
+    s: &crate::provider_path::WorktreeSidecar,
+) {
+    if !sidecar_file_matches(sidecar_file, &s.worktree_path) {
+        tracing::warn!(
+            sidecar = sidecar_file,
+            worktree_path = s.worktree_path,
+            "skipping worktree sidecar whose file does not match its worktree sibling"
+        );
+        return;
+    }
+    if !worktree_under_root(root, &s.worktree_path) {
+        tracing::warn!(
+            sidecar = sidecar_file,
+            worktree_path = s.worktree_path,
+            root = root.as_str(),
+            "skipping worktree sidecar outside sweep root"
+        );
+        return;
+    }
+    remove_worktree(&s.canonical_source, &s.common_dir, &s.worktree_path);
 }
 
 /// Iterate readable worktree sidecars directly under `root`.
@@ -35,13 +81,17 @@ fn sidecars(root: &str) -> Vec<(String, crate::provider_path::WorktreeSidecar)> 
 
 /// Reap only same-host worktrees whose owner lease is free.
 pub fn sweep_orphans(root: &str, my_host: &str, probe: &dyn LeaseProbe) {
-    for (_path, s) in sidecars(root) {
+    let Ok(root_cwd) = canonicalize_lenient(root) else {
+        tracing::warn!(root, "skipping worktree sweep with non-canonical root");
+        return;
+    };
+    for (path, s) in sidecars(root) {
         let labels = HashMap::from([
             ("a2a.host".to_string(), s.host.clone()),
             ("a2a.lease".to_string(), s.lease.clone()),
         ]);
         if classify(&labels, my_host, probe) == Verdict::Dead {
-            remove_worktree(&s.canonical_source, &s.worktree_path);
+            remove_worktree_if_safe(&root_cwd, &path, &s);
         }
     }
 }
@@ -54,9 +104,16 @@ pub struct WorktreeRunEndGuard {
 
 impl Drop for WorktreeRunEndGuard {
     fn drop(&mut self) {
-        for (_path, s) in sidecars(&self.root) {
+        let Ok(root_cwd) = canonicalize_lenient(&self.root) else {
+            tracing::warn!(
+                root = self.root,
+                "skipping worktree end sweep with non-canonical root"
+            );
+            return;
+        };
+        for (path, s) in sidecars(&self.root) {
             if s.run_id == self.instance_id {
-                remove_worktree(&s.canonical_source, &s.worktree_path);
+                remove_worktree_if_safe(&root_cwd, &path, &s);
             }
         }
     }
@@ -159,5 +216,70 @@ mod tests {
         assert!(Path::new(&sidecar_path(&other.worktree_path)).exists());
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sweep_skips_sidecar_that_points_at_non_sibling_worktree() {
+        let root = unique_temp_dir("sidecar-mismatch");
+        let victim = unique_temp_dir("sidecar-mismatch-victim");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), "do not delete").unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: victim.to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "run-a".into(),
+            host: "my-host".into(),
+            lease: "/leases/dead.lock".into(),
+        };
+        let forged = root.join("forged.meta.json");
+        fs::write(&forged, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+        let probe = FakeProbe(HashMap::from([(
+            "/leases/dead.lock".to_string(),
+            Some(true),
+        )]));
+
+        super::sweep_orphans(&root.to_string_lossy(), "my-host", &probe);
+
+        assert!(victim.join("keep").exists());
+        assert!(forged.exists());
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&victim).unwrap();
+    }
+
+    #[test]
+    fn end_guard_skips_sidecar_that_points_at_non_sibling_worktree() {
+        let root = unique_temp_dir("end-guard-mismatch");
+        let victim = unique_temp_dir("end-guard-mismatch-victim");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), "do not delete").unwrap();
+        let sidecar = WorktreeSidecar {
+            canonical_source: root.join("source").to_string_lossy().into_owned(),
+            common_dir: root.join("source/.git").to_string_lossy().into_owned(),
+            worktree_path: victim.to_string_lossy().into_owned(),
+            owner: "owner".into(),
+            run_id: "mine".into(),
+            host: "my-host".into(),
+            lease: "/leases/mine.lock".into(),
+        };
+        let forged = root.join("forged.meta.json");
+        fs::write(&forged, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+
+        {
+            let _guard = super::WorktreeRunEndGuard {
+                root: root.to_string_lossy().into_owned(),
+                instance_id: "mine".into(),
+            };
+        }
+
+        assert!(victim.join("keep").exists());
+        assert!(forged.exists());
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&victim).unwrap();
     }
 }

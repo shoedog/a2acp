@@ -151,10 +151,14 @@ pub struct RegistryConfig {
     /// `[merge]` (ADR-0027): merge hand-off target + operator identity override. Absent → defaults.
     #[serde(default)]
     pub merge: Option<MergeToml>,
+    /// `[worktrees]` host worktree isolation. Changes require a serve restart: the spawn
+    /// factory captures this config once, and hot-reload does not re-read it.
     #[serde(default)]
     pub worktrees: Option<WorktreesToml>,
 }
 
+/// Host worktree isolation config. Changes require a serve restart because the spawn
+/// factory captures `[worktrees]` once at startup; hot-reload does not re-read it.
 #[derive(Debug, serde::Deserialize)]
 pub struct WorktreesToml {
     #[serde(default)]

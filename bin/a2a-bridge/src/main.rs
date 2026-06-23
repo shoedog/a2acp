@@ -501,7 +501,9 @@ fn default_worktrees_root() -> String {
 }
 
 /// Resolve `[worktrees]` into a runtime cfg. Worktrees are opt-in, host-only, and require
-/// `allowed_cwd_root` so the decorator can self-gate before any git operation.
+/// `allowed_cwd_root` so the decorator can self-gate before any git operation. `[worktrees]`
+/// changes require a serve restart because the spawn factory captures this config once;
+/// hot-reload does not re-read it.
 fn resolve_worktree_runtime_cfg(
     cfg: &RegistryConfig,
 ) -> Result<Option<WorktreeRuntimeCfg>, String> {
@@ -2016,12 +2018,26 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // Before-first-use crash recovery: reap only DEAD (same host + free lease) orphans of THIS process's
     // owners (`:rw` ∪ `:ro`); a live concurrent run's lease is held → its containers are spared.
     recover_orphans(&snapshot, &owner_config_path, &host);
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
     // Label-scoped END-sweep backstop (THIS run's `a2a.run` only). Declared BEFORE `warm` → drops AFTER it
     // (the warm `retire` reaps first; this catches anything it missed, including the `:ro` reviewers).
     let _run_guard = RunEndGuard {
         runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
         instance_id: instance_id.clone(),
     };
+    let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
+        wc.enabled
+            .then(|| bridge_worktree::sweep::WorktreeRunEndGuard {
+                root: wc.root.clone(),
+                instance_id: run.instance_id.clone(),
+            })
+    });
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
     let impl_lsp_cache_vol =
         warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &repo, &clone, false);
@@ -2063,7 +2079,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         run,
         None,
         120_000,
-        worktree_cfg,
+        worktree_cfg.clone(),
     );
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
@@ -2323,10 +2339,24 @@ async fn implement_resume_cmd(
         start: epoch_secs(),
     };
     recover_orphans(&snapshot, &owner_config_path, &host);
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
     let _run_guard = RunEndGuard {
         runtimes: run_guard_runtimes(&snapshot, &owner_config_path),
         instance_id: instance_id.clone(),
     };
+    let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
+        wc.enabled
+            .then(|| bridge_worktree::sweep::WorktreeRunEndGuard {
+                root: wc.root.clone(),
+                instance_id: run.instance_id.clone(),
+            })
+    });
 
     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
     let impl_lsp_cache_vol = warm_lsp_deps_step(
@@ -2369,7 +2399,7 @@ async fn implement_resume_cmd(
         run,
         None,
         120_000,
-        worktree_cfg,
+        worktree_cfg.clone(),
     );
     let registry = Arc::new(
         bridge_registry::registry::Registry::new(snapshot, spawn)
@@ -3989,12 +4019,19 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         run.clone(),
         Some(Arc::clone(&perm_registry)),
         perm_timeout,
-        worktree_cfg,
+        worktree_cfg.clone(),
     );
 
     let source = FileConfigSource::new(config_path.clone());
     let snapshot = source.load().await?;
     recover_orphans(&snapshot, &config_path, &host);
+    if let Some(wc) = &worktree_cfg {
+        bridge_worktree::sweep::sweep_orphans(
+            &wc.root,
+            &host,
+            &bridge_core::liveness::FsLeaseProbe,
+        );
+    }
     let registry = Arc::new(Registry::new(snapshot, spawn)?);
 
     let base = config_path

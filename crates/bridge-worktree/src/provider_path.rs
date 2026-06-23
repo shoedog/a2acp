@@ -66,8 +66,13 @@ pub fn sidecar_path(worktree_path: &str) -> String {
 
 pub fn write_sidecar(s: &WorktreeSidecar) -> Result<(), BridgeError> {
     let path = sidecar_path(&s.worktree_path);
+    let tmp = format!("{path}.tmp");
     let json = serde_json::to_vec(s).map_err(|_| BridgeError::StoreFailure)?;
-    std::fs::write(path, json).map_err(|_| BridgeError::StoreFailure)
+    std::fs::write(&tmp, json).map_err(|_| BridgeError::StoreFailure)?;
+    std::fs::rename(&tmp, &path).map_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+        BridgeError::StoreFailure
+    })
 }
 
 pub fn read_sidecar(path: &str) -> Option<WorktreeSidecar> {
@@ -90,7 +95,7 @@ fn canonicalize_existing(path: &str) -> Result<SessionCwd, BridgeError> {
 
 /// Canonicalize `path`, resolving symlinks. If it doesn't exist yet, canonicalize the nearest
 /// existing ancestor and re-append the missing tail.
-fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
+pub(crate) fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
     let p = Path::new(path);
     let mut existing = p;
     let mut tail: Vec<std::ffi::OsString> = vec![];
