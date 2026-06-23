@@ -889,6 +889,7 @@ mod tests {
                 prompt_template: "{{input}}".into(),
                 inputs: Vec::new(),
             }],
+            panel: None,
         })
     }
 

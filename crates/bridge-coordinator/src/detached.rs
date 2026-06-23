@@ -70,6 +70,8 @@ pub enum FrameKind {
         node: String,
         ok: bool,
         output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<bridge_core::orch::UsageSnapshot>,
     },
     SnapshotComplete,
     Terminal {
@@ -188,6 +190,7 @@ pub trait WorkflowSink: Send {
         _node: &str,
         _ok: bool,
         _output: &str,
+        _usage: Option<&bridge_core::orch::UsageSnapshot>,
     ) -> Result<(), BridgeError> {
         Ok(())
     }
@@ -212,8 +215,14 @@ pub async fn drain_workflow<S: WorkflowSink>(
     while let Some(item) = stream.next().await {
         match item {
             Ok(WorkflowEvent::NodeStarted { node }) => sink.node_started(node.as_str()).await?,
-            Ok(WorkflowEvent::NodeFinished { node, ok, output }) => {
-                sink.node_finished(node.as_str(), ok, &output).await?
+            Ok(WorkflowEvent::NodeFinished {
+                node,
+                ok,
+                output,
+                usage,
+            }) => {
+                sink.node_finished(node.as_str(), ok, &output, usage.as_ref())
+                    .await?
             }
             Ok(WorkflowEvent::Terminal { outcome, output }) => {
                 sink.terminal(outcome, output).await?;
@@ -303,6 +312,7 @@ impl WorkflowSink for DetachedProgressSink {
         node: &str,
         ok: bool,
         output: &str,
+        usage: Option<&bridge_core::orch::UsageSnapshot>,
     ) -> Result<(), BridgeError> {
         let node_id = bridge_core::ids::NodeId::parse(node)?;
         let operation_id = self.operation_id()?;
@@ -315,6 +325,7 @@ impl WorkflowSink for DetachedProgressSink {
                 output,
                 ok,
                 now_ms(),
+                usage,
             )
             .await?;
         self.hub.publish(WorkflowProgressFrame {
@@ -325,6 +336,7 @@ impl WorkflowSink for DetachedProgressSink {
                 node: node.to_string(),
                 ok,
                 output: output.to_string(),
+                usage: usage.cloned(),
             },
         });
         Ok(())
@@ -526,6 +538,7 @@ mod sink_tests {
             _node: &str,
             _ok: bool,
             _output: &str,
+            _usage: Option<&bridge_core::orch::UsageSnapshot>,
         ) -> Result<(), BridgeError> {
             self.log.push("node_finished");
             Ok(())
@@ -554,12 +567,14 @@ mod sink_tests {
                 node: a.clone(),
                 ok: true,
                 output: "out-a".into(),
+                usage: None,
             }),
             Ok(WorkflowEvent::NodeStarted { node: b.clone() }),
             Ok(WorkflowEvent::NodeFinished {
                 node: b.clone(),
                 ok: true,
                 output: "out-b".into(),
+                usage: None,
             }),
             Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -632,6 +647,7 @@ mod sink_tests {
                 node: a.clone(),
                 ok: true,
                 output: "out-a".into(),
+                usage: None,
             }),
             Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -697,6 +713,55 @@ mod sink_tests {
         assert!(matches!(frames[0].phase, crate::detached::Phase::Live));
         assert!(matches!(frames[1].phase, crate::detached::Phase::Live));
         assert!(matches!(frames[2].phase, crate::detached::Phase::Live));
+    }
+
+    #[tokio::test]
+    async fn detached_sink_persists_and_publishes_node_usage() {
+        use crate::detached::{FrameKind, TaskProgressHub};
+        use bridge_core::orch::UsageSnapshot;
+        use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskStore};
+
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let task = TaskId::parse("t-frame").unwrap();
+        store
+            .create(&TaskRecord {
+                id: task.clone(),
+                workflow: "code-review".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+                input: "DIFF".into(),
+                workflow_spec_json: None,
+                resume_attempts: 0,
+                session_cwd: None,
+            })
+            .await
+            .unwrap();
+
+        let hub = Arc::new(TaskProgressHub::new());
+        let mut rx = hub.subscribe();
+        let mut sink = DetachedProgressSink::new(store.clone(), task.clone(), hub);
+
+        let usage = UsageSnapshot {
+            used: Some(123),
+            size: Some(1000),
+            cost: None,
+            at_ms: 1,
+        };
+        sink.node_finished("member", true, "OUT", Some(&usage))
+            .await
+            .unwrap();
+
+        let frame = rx.try_recv().unwrap();
+        match frame.kind {
+            FrameKind::NodeFinished { usage: Some(u), .. } => assert_eq!(u.used, Some(123)),
+            other => panic!("expected NodeFinished with usage, got {other:?}"),
+        }
+
+        let cps = store.node_checkpoints(&task).await.unwrap();
+        assert_eq!(cps[0].3.as_ref().unwrap().used, Some(123));
     }
 
     /// A `DetachedProgressSink` whose store's `put_node_checkpoint_sequenced`
@@ -766,7 +831,15 @@ mod sink_tests {
             async fn node_checkpoints(
                 &self,
                 task: &TaskId,
-            ) -> Result<Vec<(bridge_core::ids::NodeId, String, bool)>, BridgeError> {
+            ) -> Result<
+                Vec<(
+                    bridge_core::ids::NodeId,
+                    String,
+                    bool,
+                    Option<bridge_core::orch::UsageSnapshot>,
+                )>,
+                BridgeError,
+            > {
                 self.inner.node_checkpoints(task).await
             }
             async fn claim_resume_attempt(
@@ -792,6 +865,7 @@ mod sink_tests {
                     .await
             }
             /// Always fails — used to test the W3b abort-on-write-failure contract.
+            #[allow(clippy::too_many_arguments)]
             async fn put_node_checkpoint_sequenced(
                 &self,
                 _task: &TaskId,
@@ -800,6 +874,7 @@ mod sink_tests {
                 _output: &str,
                 _ok: bool,
                 _ts: i64,
+                _usage: Option<&bridge_core::orch::UsageSnapshot>,
             ) -> Result<i64, BridgeError> {
                 Err(BridgeError::StoreFailure)
             }
@@ -853,6 +928,7 @@ mod sink_tests {
                 node: a.clone(),
                 ok: true,
                 output: "out-a".into(),
+                usage: None,
             }),
             Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -1007,6 +1083,7 @@ mod sink_tests {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
             }],
+            panel: None,
         });
         let executor = WorkflowExecutor::new(Arc::new(RichRegistry));
         let ctx = WorkflowRunContext {
@@ -1112,7 +1189,7 @@ pub fn spawn_detached_workflow(
     graph: Arc<WorkflowGraph>,
     run_id: String,
     token: CancellationToken,
-    seed: HashMap<String, (String, bool)>,
+    seed: HashMap<String, (String, bool, Option<bridge_core::orch::UsageSnapshot>)>,
     mut ctx: WorkflowRunContext,
     hub: Arc<TaskProgressHub>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1412,7 +1489,7 @@ pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
             }
         };
 
-        // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok).
+        // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok, usage).
         let cps = match deps.task_store.node_checkpoints(&task).await {
             Ok(cps) => cps,
             Err(e) => {
@@ -1420,9 +1497,17 @@ pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
                 continue;
             }
         };
-        let seed: std::collections::HashMap<String, (String, bool)> = cps
+        let seed: std::collections::HashMap<
+            String,
+            (String, bool, Option<bridge_core::orch::UsageSnapshot>),
+        > = cps
             .iter()
-            .map(|(node, output, ok)| (node.as_str().to_string(), (output.clone(), *ok)))
+            .map(|(node, output, ok, usage)| {
+                (
+                    node.as_str().to_string(),
+                    (output.clone(), *ok, usage.clone()),
+                )
+            })
             .collect();
 
         // (4) Terminal short-circuit: if the graph's terminal node already has a
@@ -1458,7 +1543,7 @@ pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
                 continue;
             }
         };
-        if let Some((output, ok)) = seed.get(&terminal_id) {
+        if let Some((output, ok, _usage)) = seed.get(&terminal_id) {
             let (status, result, error) = if *ok {
                 (TaskRecordStatus::Completed, Some(output.as_str()), None)
             } else {
@@ -1584,6 +1669,243 @@ pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
 }
 
 #[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use crate::clock::ManualClock;
+    use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
+    use bridge_core::ids::{AgentId, NodeId, OperationId, SessionId, WorkflowId};
+    use bridge_core::orch::UsageSnapshot;
+    use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
+    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use bridge_workflow::executor::WorkflowExecutor;
+    use bridge_workflow::graph::{PanelConfig, WorkflowGraph, WorkflowNode};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    struct NoopLease;
+    impl Lease for NoopLease {}
+
+    #[derive(Default)]
+    struct PromptRec {
+        prompts: StdMutex<Vec<String>>,
+    }
+
+    struct RecordingBackend {
+        rec: Arc<PromptRec>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for RecordingBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.rec
+                .prompts
+                .lock()
+                .unwrap()
+                .push(parts.iter().map(|p| p.text.clone()).collect());
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::Text("FINAL".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct RecordingRegistry {
+        synth: Arc<PromptRec>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for RecordingRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            if id.as_str() != "synth" {
+                return Err(BridgeError::UnknownAgent {
+                    id: id.as_str().into(),
+                });
+            }
+            Ok(Resolved {
+                entry: Arc::new(AgentEntry {
+                    id: id.clone(),
+                    cmd: Some("x".into()),
+                    base_url: None,
+                    api_key_env: None,
+                    args: vec![],
+                    kind: AgentKind::Acp,
+                    model_provider: None,
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    cwd: None,
+                    session_cwd: None,
+                    sandbox: None,
+                    watchdog: None,
+                    auth_method: None,
+                    name: None,
+                    description: None,
+                    tags: vec![],
+                    version: None,
+                    mcp: vec![],
+                    mcp_delivery: Default::default(),
+                    extensions: Default::default(),
+                }),
+                backend: Arc::new(RecordingBackend {
+                    rec: self.synth.clone(),
+                }),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("synth").unwrap()
+        }
+
+        async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![AgentId::parse("synth").unwrap()]
+        }
+    }
+
+    fn panel_graph() -> Arc<WorkflowGraph> {
+        let node = |id: &str, agent: &str, inputs: &[&str], prompt: &str| WorkflowNode {
+            id: NodeId::parse(id).unwrap(),
+            agent: AgentId::parse(agent).unwrap(),
+            prompt_template: prompt.into(),
+            inputs: inputs
+                .iter()
+                .map(|input| NodeId::parse(*input).unwrap())
+                .collect(),
+        };
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("panel").unwrap(),
+            nodes: vec![
+                node("codex", "codex", &[], "review {{input}}"),
+                node("claude", "claude", &[], "review {{input}}"),
+                node(
+                    "synth",
+                    "synth",
+                    &["codex", "claude"],
+                    "merge {{codex}} + {{claude}}\n{{workflow.costs}}",
+                ),
+            ],
+            panel: Some(PanelConfig {
+                weights: BTreeMap::from([("usage".into(), 0.2), ("benefit".into(), 0.8)]),
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn resume_working_task_synth_sees_checkpointed_member_usage() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let task = TaskId::parse("t-resume-usage").unwrap();
+        let graph = panel_graph();
+        store
+            .create(&TaskRecord {
+                id: task.clone(),
+                workflow: "panel".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+                input: "DIFF".into(),
+                workflow_spec_json: Some(encode_workflow_spec(&graph)),
+                resume_attempts: 0,
+                session_cwd: None,
+            })
+            .await
+            .unwrap();
+
+        let op = OperationId::parse(format!("op-{}", task.as_str())).unwrap();
+        let codex = NodeId::parse("codex").unwrap();
+        let claude = NodeId::parse("claude").unwrap();
+        let codex_usage = UsageSnapshot {
+            used: Some(15071),
+            size: Some(258400),
+            cost: None,
+            at_ms: 10,
+        };
+        let claude_usage = UsageSnapshot {
+            used: Some(42),
+            size: Some(100),
+            cost: None,
+            at_ms: 11,
+        };
+        store
+            .put_node_checkpoint_sequenced(
+                &task,
+                &codex,
+                &op,
+                "CODEX_REVIEW",
+                true,
+                2,
+                Some(&codex_usage),
+            )
+            .await
+            .unwrap();
+        store
+            .put_node_checkpoint_sequenced(
+                &task,
+                &claude,
+                &op,
+                "CLAUDE_REVIEW",
+                true,
+                3,
+                Some(&claude_usage),
+            )
+            .await
+            .unwrap();
+
+        let synth = Arc::new(PromptRec::default());
+        let executor = Arc::new(WorkflowExecutor::new(Arc::new(RecordingRegistry {
+            synth: synth.clone(),
+        })));
+        let deps = DetachedDeps {
+            task_store: store.clone(),
+            executor: Some(executor),
+            workflows: Arc::new(HashMap::new()),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+        };
+
+        resume_working_tasks(&deps, 1).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if !synth.prompts.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resumed synth prompt was recorded");
+
+        let prompts = synth.prompts.lock().unwrap();
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains("| codex | 15071 | 258400 |"),
+            "resumed synth costs table includes codex usage: {prompt}"
+        );
+        assert!(
+            prompt.contains("| claude | 42 | 100 |"),
+            "resumed synth costs table includes claude usage: {prompt}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod frame_tests {
     // Ported with the move (s8 T3 controller fix): these 3 frame/hub tests were dropped
     // when the reattach DTOs moved here from bridge-a2a-inbound; they guard the LOCKED SSE
@@ -1607,6 +1929,7 @@ mod frame_tests {
                 prompt_template: "{{input}}".into(),
                 inputs: Vec::new(),
             }],
+            panel: None,
         };
         let json = encode_workflow_spec(&graph);
         let env: WorkflowSpecEnvelope = serde_json::from_str(&json).unwrap();
@@ -1627,6 +1950,7 @@ mod frame_tests {
                 node: "a".into(),
                 ok: true,
                 output: "o".into(),
+                usage: None,
             },
         });
         let f = rx.recv().await.unwrap();
@@ -1645,6 +1969,7 @@ mod frame_tests {
                 node: "synth".into(),
                 ok: true,
                 output: "done".into(),
+                usage: None,
             },
         };
         let val: serde_json::Value = serde_json::to_value(&frame).unwrap();

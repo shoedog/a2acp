@@ -5,6 +5,7 @@ use crate::template::render;
 use bridge_core::domain::{effective_config, Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
+use bridge_core::orch::UsageSnapshot;
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, RichEventSinkFactory, Update, STOP_REASON_CANCELLED,
 };
@@ -58,8 +59,62 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
 /// Uniform future type used in the per-run `FuturesUnordered` pool.
 /// Each fan-out node is boxed to this type so `FuturesUnordered` can hold
 /// futures of different async-block monomorphisations in one collection.
-type NodeFut<'a> =
-    std::pin::Pin<Box<dyn futures::Future<Output = (NodeId, String, bool)> + Send + 'a>>;
+type NodeFut<'a> = std::pin::Pin<
+    Box<dyn futures::Future<Output = (NodeId, String, bool, Option<UsageSnapshot>)> + Send + 'a>,
+>;
+
+/// Render the reserved `{{workflow.costs}}` synth var: a markdown table of each
+/// input source's captured usage. Per-field `n/a` when absent.
+/// `windowFraction = used/size` as a raw fraction.
+pub(crate) fn render_costs_table(rows: &[(String, Option<UsageSnapshot>)]) -> String {
+    let mut table = String::from(
+        "| source | used | size | windowFraction | cost |\n| --- | --- | --- | --- | --- |\n",
+    );
+    for (source, usage) in rows {
+        let (used, size, window_fraction, cost) = match usage {
+            Some(usage) => {
+                let used = usage
+                    .used
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".into());
+                let size = usage
+                    .size
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".into());
+                let window_fraction = match (usage.used, usage.size) {
+                    (Some(used), Some(size)) if size > 0 => {
+                        format!("{:.4}", used as f64 / size as f64)
+                    }
+                    _ => "n/a".into(),
+                };
+                let cost = usage
+                    .cost
+                    .as_ref()
+                    .map(|cost| format!("{} {}", cost.amount, cost.currency))
+                    .unwrap_or_else(|| "n/a".into());
+                (used, size, window_fraction, cost)
+            }
+            None => ("n/a".into(), "n/a".into(), "n/a".into(), "n/a".into()),
+        };
+        table.push_str(&format!(
+            "| {source} | {used} | {size} | {window_fraction} | {cost} |\n"
+        ));
+    }
+    table
+}
+
+pub(crate) fn render_weights(panel: &Option<crate::graph::PanelConfig>) -> String {
+    match panel {
+        Some(panel) if !panel.weights.is_empty() => {
+            let mut rendered = String::new();
+            for (key, value) in &panel.weights {
+                rendered.push_str(&format!("- {key}: {value}\n"));
+            }
+            rendered
+        }
+        _ => "(no weights configured)".to_string(),
+    }
+}
 
 pub struct WorkflowExecutor {
     registry: Arc<dyn AgentRegistry>,
@@ -81,6 +136,7 @@ pub enum WorkflowEvent {
         node: NodeId,
         ok: bool,
         output: String,
+        usage: Option<bridge_core::orch::UsageSnapshot>,
     },
     Terminal {
         outcome: WorkflowOutcome,
@@ -97,7 +153,7 @@ impl WorkflowExecutor {
     }
 
     /// Run one node: render its prompt from `vars`, resolve+configure+prompt+drain, forget.
-    /// Returns (text, ok). On any failure returns the error marker + ok=false.
+    /// Returns (text, ok, usage). On any failure returns the error marker + ok=false.
     #[allow(clippy::too_many_arguments)]
     async fn run_node(
         &self,
@@ -108,9 +164,9 @@ impl WorkflowExecutor {
         cancel: &CancellationToken,
         ctx: &WorkflowRunContext,
         dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>,
-    ) -> (String, bool) {
+    ) -> (String, bool, Option<UsageSnapshot>) {
         if cancel.is_cancelled() {
-            return (format!("[node {} canceled]", node.id.as_str()), false);
+            return (format!("[node {} canceled]", node.id.as_str()), false, None);
         }
         if let Some(d) = dispatcher {
             let rendered = render(&node.prompt_template, vars);
@@ -120,12 +176,13 @@ impl WorkflowExecutor {
                     return (
                         format!("[node {} failed: {:?}]", node.id.as_str(), e),
                         false,
+                        None,
                     )
                 }
             };
             if cancel.is_cancelled() {
                 turn.cleanup.on_exit(NodeTurnExit::Normal).await;
-                return (format!("[node {} canceled]", node.id.as_str()), false);
+                return (format!("[node {} canceled]", node.id.as_str()), false, None);
             }
 
             let mut parts = vec![Part { text: rendered }];
@@ -142,19 +199,20 @@ impl WorkflowExecutor {
                 biased;
                 _ = cancel.cancelled() => {
                     turn.cleanup.on_exit(NodeTurnExit::Canceled).await;
-                    return (format!("[node {} canceled]", node.id.as_str()), false);
+                    return (format!("[node {} canceled]", node.id.as_str()), false, None);
                 }
                 s = turn.backend.prompt(&turn.session, parts) => match s {
                     Ok(s) => s,
                     Err(e) => {
                         let text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
                         turn.cleanup.on_exit(NodeTurnExit::Error(e)).await;
-                        return (text, false);
+                        return (text, false, None);
                     }
                 },
             };
             let mut text = String::new();
             let mut ok = true;
+            let mut last_usage: Option<UsageSnapshot> = None;
             let exit = loop {
                 tokio::select! {
                     biased;
@@ -166,7 +224,9 @@ impl WorkflowExecutor {
                     item = stream.next() => match item {
                         Some(Ok(Update::Text(t))) => text.push_str(&t),
                         Some(Ok(Update::Permission(_))) => {}
-                        Some(Ok(Update::Usage(_))) => {}
+                        Some(Ok(Update::Usage(u))) => {
+                            last_usage = Some(u);
+                        }
                         Some(Ok(Update::Done { stop_reason })) => {
                             if stop_reason == STOP_REASON_CANCELLED { ok = false; }
                             break NodeTurnExit::Normal;
@@ -180,8 +240,11 @@ impl WorkflowExecutor {
                     }
                 }
             };
+            // Keep whatever usage the agent reported, even if the turn then errored or was
+            // cancelled — the tokens were really consumed and belong in the durable footprint.
+            // `last_usage` is already `None` when no `Update::Usage` was ever observed.
             turn.cleanup.on_exit(exit).await;
-            return (text, ok);
+            return (text, ok, last_usage);
         }
         let rendered = render(&node.prompt_template, vars);
         let session = match SessionId::parse(format!(
@@ -195,16 +258,17 @@ impl WorkflowExecutor {
                 return (
                     format!("[node {} failed: bad session id]", node.id.as_str()),
                     false,
+                    None,
                 )
             }
         };
         // resolve, with cancel
         let resolved = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return (format!("[node {} canceled]", node.id.as_str()), false),
+            _ = cancel.cancelled() => return (format!("[node {} canceled]", node.id.as_str()), false, None),
             r = self.registry.resolve(&node.agent) => match r {
                 Ok(r) => r,
-                Err(e) => return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false),
+                Err(e) => return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false, None),
             },
         };
         let eff = effective_config(&resolved.entry, None);
@@ -220,7 +284,7 @@ impl WorkflowExecutor {
             .await; // best-effort (no-op default)
         if cancel.is_cancelled() {
             resolved.backend.forget_session(&session).await;
-            return (format!("[node {} canceled]", node.id.as_str()), false);
+            return (format!("[node {} canceled]", node.id.as_str()), false, None);
         }
         // prompt, with cancel
         let rich_sink;
@@ -228,7 +292,7 @@ impl WorkflowExecutor {
             biased;
             _ = cancel.cancelled() => {
                 resolved.backend.forget_session(&session).await;
-                return (format!("[node {} canceled]", node.id.as_str()), false);
+                return (format!("[node {} canceled]", node.id.as_str()), false, None);
             }
             s = async {
                 let sink = ctx.make_rich_sink.as_ref().map(|factory| factory.make(&node.id));
@@ -254,13 +318,14 @@ impl WorkflowExecutor {
                         }
                     }
                     resolved.backend.forget_session(&session).await;
-                    return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false);
+                    return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false, None);
                 }
             },
         };
         let mut text = String::new();
         let mut ok = true;
         let mut canceled_during_drain = false;
+        let mut last_usage: Option<UsageSnapshot> = None;
         loop {
             tokio::select! {
                 biased;
@@ -272,7 +337,9 @@ impl WorkflowExecutor {
                 item = stream.next() => match item {
                     Some(Ok(Update::Text(t))) => text.push_str(&t),
                     Some(Ok(Update::Permission(_))) => {} // safe: backends resolve permission internally
-                    Some(Ok(Update::Usage(_))) => { /* Slice 0: ignore */ }
+                    Some(Ok(Update::Usage(u))) => {
+                        last_usage = Some(u);
+                    }
                     Some(Ok(Update::Done { stop_reason })) => {
                         if stop_reason == STOP_REASON_CANCELLED { ok = false; }
                         break;
@@ -282,6 +349,9 @@ impl WorkflowExecutor {
                 }
             }
         }
+        // Keep whatever usage the agent reported, even on error/cancel (see the warm path):
+        // `last_usage` is `None` only when no `Update::Usage` was ever observed.
+        let usage = last_usage;
         if let Some(sink) = &rich_sink {
             if let Err(e) = sink.flush().await {
                 if !ok {
@@ -296,17 +366,18 @@ impl WorkflowExecutor {
                         e
                     );
                     resolved.backend.forget_session(&session).await;
-                    return (text, ok);
+                    return (text, ok, None);
                 }
                 resolved.backend.forget_session(&session).await;
                 return (
                     format!("[node {} rich-flush failed: {:?}]", node.id.as_str(), e),
                     false,
+                    None,
                 );
             }
         }
         resolved.backend.forget_session(&session).await;
-        (text, ok)
+        (text, ok, usage)
     }
 
     /// Run a workflow from scratch (no prior checkpoints).
@@ -358,7 +429,7 @@ impl WorkflowExecutor {
     /// Seeded nodes are treated as done; only un-seeded nodes actually run.
     /// `run()` is a thin wrapper over this with an empty seed and default context.
     ///
-    /// Each seed entry is `(output_text, ok)`, matching the `NodeFinished` payload.
+    /// Each seed entry is `(output_text, ok, usage)`, matching the `NodeFinished` payload.
     ///
     /// # Errors (streamed)
     /// - `BridgeError::ConfigInvalid` if a seed key is not in `graph.nodes`.
@@ -370,7 +441,7 @@ impl WorkflowExecutor {
         input: String,
         run_id: String,
         cancel: CancellationToken,
-        seed: HashMap<String, (String, bool)>,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
     ) -> WorkflowStream {
         self.run_from_with_context(
             graph,
@@ -391,7 +462,7 @@ impl WorkflowExecutor {
         input: String,
         run_id: String,
         cancel: CancellationToken,
-        seed: HashMap<String, (String, bool)>,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowRunContext,
     ) -> WorkflowStream {
         self.run_from_with_context_inner(graph, input, run_id, cancel, seed, ctx, None)
@@ -404,7 +475,7 @@ impl WorkflowExecutor {
         input: String,
         run_id: String,
         cancel: CancellationToken,
-        seed: HashMap<String, (String, bool)>,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowRunContext,
         dispatcher: Arc<dyn WorkflowNodeDispatcher>,
     ) -> WorkflowStream {
@@ -418,7 +489,7 @@ impl WorkflowExecutor {
         input: String,
         run_id: String,
         cancel: CancellationToken,
-        seed: HashMap<String, (String, bool)>,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowRunContext,
         dispatcher: Option<Arc<dyn WorkflowNodeDispatcher>>,
     ) -> WorkflowStream {
@@ -452,7 +523,7 @@ impl WorkflowExecutor {
                 }
             }
 
-            let mut outputs: HashMap<String, (String, bool)> = seed;
+            let mut outputs: HashMap<String, (String, bool, Option<UsageSnapshot>)> = seed;
             let mut done: HashSet<String> = outputs.keys().cloned().collect();
             let terminal_id = graph.terminal().map(|n| n.id.as_str().to_string()).unwrap_or_default();
 
@@ -483,7 +554,7 @@ impl WorkflowExecutor {
                                 started.push(n.id.clone());
                                 let mut owned: Vec<(String, String)> = vec![("input".into(), input.clone())];
                                 for inp in &n.inputs {
-                                    if let Some((t, _)) = outputs.get(inp.as_str()) {
+                                    if let Some((t, _, _)) = outputs.get(inp.as_str()) {
                                         owned.push((inp.as_str().into(), t.clone()));
                                     }
                                 }
@@ -492,9 +563,23 @@ impl WorkflowExecutor {
                                 // node id — so one refine prompt serves model-diverse legs whose draft nodes
                                 // have distinct ids (e.g. reviewer_codex_draft / reviewer_claude_draft).
                                 if let [only] = n.inputs.as_slice() {
-                                    if let Some((t, _)) = outputs.get(only.as_str()) {
+                                    if let Some((t, _, _)) = outputs.get(only.as_str()) {
                                         owned.push(("draft".into(), t.clone()));
                                     }
+                                }
+                                if !n.inputs.is_empty() {
+                                    let cost_rows: Vec<(String, Option<UsageSnapshot>)> = n.inputs.iter()
+                                        .map(|inp| {
+                                            (
+                                                inp.as_str().to_string(),
+                                                outputs
+                                                    .get(inp.as_str())
+                                                    .and_then(|(_, _, usage)| usage.clone()),
+                                            )
+                                        })
+                                        .collect();
+                                    owned.push(("workflow.costs".into(), render_costs_table(&cost_rows)));
+                                    owned.push(("workflow.weights".into(), render_weights(&graph.panel)));
                                 }
                                 let node = n.clone();
                                 let run_id = run_id.clone();
@@ -506,8 +591,8 @@ impl WorkflowExecutor {
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
                                         owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                                    let (text, ok) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel, &ctx, dispatcher.as_ref()).await;
-                                    (node.id.clone(), text, ok)
+                                    let (text, ok, usage) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel, &ctx, dispatcher.as_ref()).await;
+                                    (node.id.clone(), text, ok, usage)
                                 }) as NodeFut);
                             }
                         }
@@ -519,10 +604,10 @@ impl WorkflowExecutor {
             for node in schedule_ready!() {
                 yield Ok(WorkflowEvent::NodeStarted { node });
             }
-            while let Some((node_id, text, ok)) = inflight.next().await {
-                yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok, output: text.clone() });
+            while let Some((node_id, text, ok, usage)) = inflight.next().await {
+                yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok, output: text.clone(), usage: usage.clone() });
                 done.insert(node_id.as_str().to_string());
-                outputs.insert(node_id.as_str().to_string(), (text, ok));
+                outputs.insert(node_id.as_str().to_string(), (text, ok, usage));
                 if cancel.is_cancelled() {
                     // Stop scheduling NEW nodes, but keep draining so every already-in-flight
                     // sibling completes its run_node cancel branch (backend.cancel() +
@@ -535,7 +620,7 @@ impl WorkflowExecutor {
                     yield Ok(WorkflowEvent::NodeStarted { node });
                 }
             }
-            let (term_text, term_ok) = outputs.get(&terminal_id).cloned().unwrap_or_default();
+            let (term_text, term_ok, _usage) = outputs.get(&terminal_id).cloned().unwrap_or_default();
             let outcome = if term_ok { WorkflowOutcome::Completed }
                 else if cancel.is_cancelled() { WorkflowOutcome::Canceled }
                 else { WorkflowOutcome::Failed };
@@ -674,7 +759,269 @@ mod tests {
                 prompt_template: "echo {{input}}".into(),
                 inputs: vec![],
             }],
+            panel: None,
         })
+    }
+
+    #[tokio::test]
+    async fn captures_node_usage_smoke() {
+        struct UsageBackend;
+        #[async_trait::async_trait]
+        impl AgentBackend for UsageBackend {
+            async fn prompt(
+                &self,
+                _s: &SessionId,
+                _p: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                Ok(Box::pin(tokio_stream::iter(vec![
+                    Ok(Update::Text("HI".into())),
+                    Ok(Update::Usage(bridge_core::orch::UsageSnapshot {
+                        used: Some(15071),
+                        size: Some(258400),
+                        cost: None,
+                        at_ms: 1,
+                    })),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ])))
+            }
+
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        struct UReg;
+        #[async_trait::async_trait]
+        impl AgentRegistry for UReg {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                Ok(Resolved {
+                    entry: Arc::new(minimal_entry(id)),
+                    backend: Arc::new(UsageBackend),
+                    lease: Box::new(NoopLease),
+                })
+            }
+
+            fn default_id(&self) -> AgentId {
+                AgentId::parse("codex").unwrap()
+            }
+
+            async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+                Ok(())
+            }
+
+            fn list(&self) -> Vec<AgentId> {
+                vec![]
+            }
+        }
+
+        let ex = WorkflowExecutor::new(Arc::new(UReg));
+        let evs: Vec<_> = ex
+            .run(
+                one_node_graph(),
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let nf = evs
+            .iter()
+            .find(|e| matches!(e, WorkflowEvent::NodeFinished { .. }))
+            .unwrap();
+        match nf {
+            WorkflowEvent::NodeFinished { usage: Some(u), .. } => {
+                assert_eq!(u.used, Some(15071))
+            }
+            other => panic!("expected captured usage, got {other:?}"),
+        }
+    }
+
+    // A backend that reports Usage and THEN errors mid-stream. Shared by the warm + cold
+    // "usage kept on error" regressions (whole-branch review MAJOR-1): the real tokens were
+    // consumed, so the usage must survive into NodeFinished even though ok=false.
+    struct UsageThenErrBackend {
+        used: u64,
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for UsageThenErrBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::Usage(bridge_core::orch::UsageSnapshot {
+                    used: Some(self.used),
+                    size: Some(100_000),
+                    cost: None,
+                    at_ms: 1,
+                })),
+                Err(BridgeError::ConfigInvalid {
+                    reason: "boom".into(),
+                }),
+            ])))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_usage_kept_when_node_errors_after_usage() {
+        struct UReg;
+        #[async_trait::async_trait]
+        impl AgentRegistry for UReg {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                Ok(Resolved {
+                    entry: Arc::new(minimal_entry(id)),
+                    backend: Arc::new(UsageThenErrBackend { used: 4242 }),
+                    lease: Box::new(NoopLease),
+                })
+            }
+            fn default_id(&self) -> AgentId {
+                AgentId::parse("codex").unwrap()
+            }
+            async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+                Ok(())
+            }
+            fn list(&self) -> Vec<AgentId> {
+                vec![]
+            }
+        }
+        let ex = WorkflowExecutor::new(Arc::new(UReg));
+        let evs: Vec<_> = ex
+            .run(
+                one_node_graph(),
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let nf = evs
+            .iter()
+            .find(|e| matches!(e, WorkflowEvent::NodeFinished { .. }))
+            .unwrap();
+        match nf {
+            WorkflowEvent::NodeFinished {
+                ok, usage: Some(u), ..
+            } => {
+                assert!(!ok, "node errored → ok=false");
+                assert_eq!(u.used, Some(4242), "usage kept despite the stream error");
+            }
+            other => panic!("expected NodeFinished with kept usage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_usage_kept_when_node_errors_after_usage() {
+        struct D;
+        #[async_trait::async_trait]
+        impl WorkflowNodeDispatcher for D {
+            async fn checkout(
+                &self,
+                _wf: &str,
+                _n: &WorkflowNode,
+                _r: &str,
+                _c: &WorkflowRunContext,
+            ) -> Result<NodeTurn, BridgeError> {
+                Ok(NodeTurn {
+                    backend: Arc::new(UsageThenErrBackend { used: 777 }),
+                    session: SessionId::parse("warm-session").unwrap(),
+                    seed: None,
+                    cleanup: Box::new(CountingCleanup {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        exits: Arc::new(Mutex::new(Vec::new())),
+                    }),
+                })
+            }
+        }
+        let ex = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: std::collections::HashMap::new(),
+        }));
+        let evs: Vec<_> = ex
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                Arc::new(D),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let nf = evs
+            .iter()
+            .find(|e| matches!(e, WorkflowEvent::NodeFinished { .. }))
+            .unwrap();
+        match nf {
+            WorkflowEvent::NodeFinished {
+                ok, usage: Some(u), ..
+            } => {
+                assert!(!ok, "node errored → ok=false");
+                assert_eq!(u.used, Some(777), "warm path keeps usage despite the error");
+            }
+            other => panic!("expected NodeFinished with kept usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn costs_table_renders_per_field_with_n_a() {
+        use bridge_core::orch::{UsageCost, UsageSnapshot};
+
+        let rows = vec![
+            (
+                "codexer".to_string(),
+                Some(UsageSnapshot {
+                    used: Some(15071),
+                    size: Some(258400),
+                    cost: None,
+                    at_ms: 0,
+                }),
+            ),
+            (
+                "clauder".to_string(),
+                Some(UsageSnapshot {
+                    used: Some(8200),
+                    size: Some(200000),
+                    cost: Some(UsageCost {
+                        amount: 0.03,
+                        currency: "USD".into(),
+                    }),
+                    at_ms: 0,
+                }),
+            ),
+            ("dead".to_string(), None),
+        ];
+
+        let table = render_costs_table(&rows);
+        assert!(table.contains("| source | used | size | windowFraction | cost |"));
+        assert!(table.contains("| codexer | 15071 | 258400 | 0.0583 |"));
+        assert!(table.contains("| clauder | 8200 | 200000 | 0.0410 | 0.03 USD |"));
+        assert!(table.contains("| dead | n/a | n/a | n/a | n/a |"));
+    }
+
+    #[test]
+    fn weights_render_sorted() {
+        let mut weights = std::collections::BTreeMap::new();
+        weights.insert("risk".to_string(), 0.3);
+        weights.insert("benefit".to_string(), 0.4);
+
+        let out = render_weights(&Some(crate::graph::PanelConfig { weights }));
+
+        assert_eq!(out, "- benefit: 0.4\n- risk: 0.3\n");
+        assert_eq!(render_weights(&None), "(no weights configured)");
     }
 
     pub(super) struct CountingCleanup {
@@ -918,6 +1265,7 @@ mod tests {
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let shared = Arc::new(Shared {
             entered: AtomicUsize::new(0),
@@ -1208,9 +1556,10 @@ mod tests {
                     "synth",
                     "synth",
                     &["codex", "claude"],
-                    "merge {{codex}} + {{claude}} for {{input}}",
+                    "merge {{codex}} + {{claude}} for {{input}}\n{{workflow.costs}}",
                 ),
             ],
+            panel: None,
         })
     }
 
@@ -1234,6 +1583,7 @@ mod tests {
                     inputs: vec![NodeId::parse("draftnode").unwrap()],
                 },
             ],
+            panel: None,
         });
         let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
         let reg = Arc::new(FakeRegistry {
@@ -1378,6 +1728,7 @@ mod tests {
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let reg = Arc::new(BReg {
             barrier: Arc::new(Barrier::new(2)),
@@ -1432,6 +1783,7 @@ mod tests {
                     inputs: vec![NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let ex = WorkflowExecutor::new(reg);
         let _ = ex
@@ -1487,6 +1839,65 @@ mod tests {
         assert!(
             p.contains("[node codex failed:"),
             "marker reached synth: {p}"
+        );
+    }
+
+    #[tokio::test]
+    async fn panel_degrades_failed_member_usage_is_n_a() {
+        // No "member_a" backend registered → its node fails (error marker, usage None);
+        // member_b + synth still run, synth's costs table shows member_a as n/a.
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry {
+            backends: [
+                ("member_b".to_string(), mk("B_ANALYSIS")),
+                ("synth".to_string(), mk("PANEL")),
+            ]
+            .into(),
+        });
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+        let g = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("panel").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("member_a").unwrap(),
+                    agent: AgentId::parse("member_a").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("member_b").unwrap(),
+                    agent: AgentId::parse("member_b").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                },
+                WorkflowNode {
+                    id: NodeId::parse("synth").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "{{member_b}}\n{{workflow.costs}}".into(),
+                    inputs: vec![
+                        NodeId::parse("member_a").unwrap(),
+                        NodeId::parse("member_b").unwrap(),
+                    ],
+                },
+            ],
+            panel: None,
+        });
+        let evs: Vec<_> = WorkflowExecutor::new(reg)
+            .run(g, "DIFF".into(), "r".into(), CancellationToken::new())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                ..
+            }
+        ));
+        let p = &synth_rec.prompts.lock().unwrap()[0];
+        assert!(
+            p.contains("| member_a | n/a | n/a | n/a | n/a |"),
+            "failed member usage row must be n/a: {p}"
         );
     }
 
@@ -1655,6 +2066,7 @@ mod tests {
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let shared = Arc::new(Shared {
             cleanups: AtomicUsize::new(0),
@@ -1810,6 +2222,7 @@ mod tests {
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
         let reg = Arc::new(TReg {
             slow_gate: slow_gate.clone(),
@@ -1942,9 +2355,9 @@ mod tests {
         let claude_rec = reg.backends.get("claude").unwrap().1.clone();
         let synth_rec = reg.backends.get("synth").unwrap().1.clone();
 
-        let seed: HashMap<String, (String, bool)> = [
-            ("codex".to_string(), ("OUTA".to_string(), true)),
-            ("claude".to_string(), ("OUTB".to_string(), true)),
+        let seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> = [
+            ("codex".to_string(), ("OUTA".to_string(), true, None)),
+            ("claude".to_string(), ("OUTB".to_string(), true, None)),
         ]
         .into();
 
@@ -2012,6 +2425,53 @@ mod tests {
         assert_eq!(finished, vec!["synth"], "only synth should be finished");
     }
 
+    #[tokio::test]
+    async fn resumed_synth_sees_seeded_member_usage() {
+        let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
+        let reg = Arc::new(FakeRegistry {
+            backends: [("synth".to_string(), mk("FINAL"))].into(),
+        });
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+        let ex = WorkflowExecutor::new(reg);
+
+        let mut seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> = HashMap::new();
+        seed.insert(
+            "codex".into(),
+            (
+                "CODEX_REVIEW".into(),
+                true,
+                Some(UsageSnapshot {
+                    used: Some(15071),
+                    size: Some(258400),
+                    cost: None,
+                    at_ms: 0,
+                }),
+            ),
+        );
+        seed.insert("claude".into(), ("CLAUDE_REVIEW".into(), true, None));
+
+        let _ = ex
+            .run_from(
+                review_graph(),
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+                seed,
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        let p = &synth_rec.prompts.lock().unwrap()[0];
+        assert!(
+            p.contains("| codex | 15071 | 258400 |"),
+            "resumed synth costs table shows seeded member usage: {p}"
+        );
+        assert!(
+            p.contains("| claude | n/a |"),
+            "member with no captured usage -> n/a: {p}"
+        );
+    }
+
     /// Seed contains a node id not present in the graph → stream yields ConfigInvalid.
     #[tokio::test]
     async fn run_from_unknown_seed_node_errors() {
@@ -2022,8 +2482,8 @@ mod tests {
             )]
             .into(),
         });
-        let seed: HashMap<String, (String, bool)> =
-            [("ghost_node".to_string(), ("OUT".to_string(), true))].into();
+        let seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> =
+            [("ghost_node".to_string(), ("OUT".to_string(), true, None))].into();
 
         let ex = WorkflowExecutor::new(reg);
         let evs: Vec<_> = ex
@@ -2245,11 +2705,12 @@ mod tests {
                     inputs: vec![NodeId::parse("b").unwrap()],
                 },
             ],
+            panel: None,
         });
 
         // Seed only `b` without its upstream `a` → closure violation.
-        let seed: HashMap<String, (String, bool)> =
-            [("b".to_string(), ("BOUT".to_string(), true))].into();
+        let seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> =
+            [("b".to_string(), ("BOUT".to_string(), true, None))].into();
 
         let ex = WorkflowExecutor::new(reg);
         let evs: Vec<_> = ex

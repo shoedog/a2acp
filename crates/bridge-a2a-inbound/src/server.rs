@@ -1201,6 +1201,7 @@ fn snapshot_frames(
                     node: node.as_str().to_string(),
                     ok: *ok,
                     output: output.clone(),
+                    usage: None,
                 },
             });
         }
@@ -1852,6 +1853,7 @@ impl crate::workflow_sink::WorkflowSink for SseSink {
         node: &str,
         ok: bool,
         _output: &str,
+        _usage: Option<&bridge_core::orch::UsageSnapshot>,
     ) -> Result<(), BridgeError> {
         let _ = self
             .tx
@@ -2092,7 +2094,10 @@ fn spawn_detached_workflow(
     graph: std::sync::Arc<bridge_workflow::graph::WorkflowGraph>,
     run_id: String,
     token: tokio_util::sync::CancellationToken,
-    seed: std::collections::HashMap<String, (String, bool)>,
+    seed: std::collections::HashMap<
+        String,
+        (String, bool, Option<bridge_core::orch::UsageSnapshot>),
+    >,
     ctx: bridge_workflow::executor::WorkflowRunContext,
     hub: Arc<crate::reattach::TaskProgressHub>,
 ) -> tokio::task::JoinHandle<()> {
@@ -8820,7 +8825,15 @@ mod tests {
         async fn node_checkpoints(
             &self,
             task: &bridge_core::ids::TaskId,
-        ) -> Result<Vec<(bridge_core::ids::NodeId, String, bool)>, BridgeError> {
+        ) -> Result<
+            Vec<(
+                bridge_core::ids::NodeId,
+                String,
+                bool,
+                Option<bridge_core::orch::UsageSnapshot>,
+            )>,
+            BridgeError,
+        > {
             self.inner.node_checkpoints(task).await
         }
 
@@ -8851,6 +8864,7 @@ mod tests {
                 .await
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn put_node_checkpoint_sequenced(
             &self,
             task: &bridge_core::ids::TaskId,
@@ -8859,9 +8873,10 @@ mod tests {
             output: &str,
             ok: bool,
             ts: i64,
+            usage: Option<&bridge_core::orch::UsageSnapshot>,
         ) -> Result<i64, BridgeError> {
             self.inner
-                .put_node_checkpoint_sequenced(task, node, operation_id, output, ok, ts)
+                .put_node_checkpoint_sequenced(task, node, operation_id, output, ok, ts, usage)
                 .await
         }
 
@@ -8913,7 +8928,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap();
         store
@@ -8921,7 +8936,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now, None)
             .await
             .unwrap();
         store
@@ -9043,7 +9058,7 @@ mod tests {
             .await
             .unwrap();
         let s2 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap();
         let s3 = store
@@ -9051,7 +9066,7 @@ mod tests {
             .await
             .unwrap();
         let s4 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now, None)
             .await
             .unwrap();
         let s5 = store
@@ -9163,7 +9178,7 @@ mod tests {
             .await
             .unwrap();
         let s4 = store
-            .put_node_checkpoint_sequenced(&task_id, &node, &op, "node-out", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node, &op, "node-out", true, now, None)
             .await
             .unwrap();
         assert_eq!((s1, s2, s3, s4), (1, 2, 3, 4));
@@ -9199,11 +9214,11 @@ mod tests {
         let now = crate::workflow_sink::now_ms();
         // seq 1: node-a finished; seq 2: node-b finished; seq 3: terminal.
         let s1 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap();
         let s2 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now, None)
             .await
             .unwrap();
         let s3 = store
@@ -9255,11 +9270,11 @@ mod tests {
         let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap(); // seq=1
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now, None)
             .await
             .unwrap(); // seq=2
         store
@@ -9390,6 +9405,7 @@ mod tests {
                 node: node.to_string(),
                 ok: true,
                 output: "live".to_string(),
+                usage: None,
             },
         }
     }
@@ -9450,11 +9466,11 @@ mod tests {
         let now = crate::workflow_sink::now_ms();
         // Durable snapshot: seqs 1,2 are finished checkpoints (task stays Working).
         let s1 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap();
         let s2 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_b, &op, "out-b", true, now, None)
             .await
             .unwrap();
         assert_eq!((s1, s2), (1, 2));
@@ -9498,7 +9514,7 @@ mod tests {
         let now = crate::workflow_sink::now_ms();
         // node-a finished (seq 1); node-x started but NOT finished (seq 2, stays in starts).
         let s1 = store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap();
         let s2 = store
@@ -9537,7 +9553,7 @@ mod tests {
         let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap(); // seq 1
 
@@ -9605,7 +9621,7 @@ mod tests {
         let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap(); // seq 1
         let ts = store
@@ -9652,7 +9668,7 @@ mod tests {
         // Insert the hub (as a live runner would), write snapshot checkpoints...
         let _hub = insert_hub(&srv, &task_id).await;
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap(); // seq 1
                        // ...then the task finishes (terminal written) BEFORE the handler is called.
@@ -9692,7 +9708,7 @@ mod tests {
         let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         store
-            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now)
+            .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
             .unwrap(); // seq 1
 

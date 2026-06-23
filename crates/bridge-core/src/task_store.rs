@@ -126,11 +126,11 @@ pub trait TaskStore: Send + Sync {
         ok: bool,
         ts: i64,
     ) -> Result<(), BridgeError>;
-    /// Return all node checkpoints for a task as `(node_id, output, ok)` tuples.
+    /// Return all node checkpoints for a task as `(node_id, output, ok, usage)` tuples.
     async fn node_checkpoints(
         &self,
         task: &TaskId,
-    ) -> Result<Vec<(NodeId, String, bool)>, BridgeError>;
+    ) -> Result<Vec<(NodeId, String, bool, Option<crate::orch::UsageSnapshot>)>, BridgeError>;
     /// Atomic poison-pill guard: if `resume_attempts < cap`, increments
     /// `resume_attempts` and returns `Resumable { attempt: new_count }`.
     /// If already `>= cap`, returns `Exhausted` without modifying the row.
@@ -163,6 +163,7 @@ pub trait TaskStore: Send + Sync {
     /// WRITE-ONCE per `(task,node)`, like `put_node_checkpoint` (W3b semantics):
     /// a node finishes once; on resume, already-finished nodes are seeded and do
     /// NOT re-checkpoint, so the durable (SQLite) impl uses a plain INSERT.
+    #[allow(clippy::too_many_arguments)]
     async fn put_node_checkpoint_sequenced(
         &self,
         task: &TaskId,
@@ -171,6 +172,7 @@ pub trait TaskStore: Send + Sync {
         output: &str,
         ok: bool,
         ts: i64,
+        usage: Option<&crate::orch::UsageSnapshot>,
     ) -> Result<i64, BridgeError>;
 
     /// Set the terminal status + result/error, recording a seq for the event.
@@ -281,7 +283,12 @@ pub fn fold_journal_to_snapshot(
                 starts.retain(|(started, _seq)| started != &node);
                 starts.push((node, event.seq));
             }
-            crate::orch::OrchEventKind::NodeFinished { node, ok, output } => {
+            crate::orch::OrchEventKind::NodeFinished {
+                node,
+                ok,
+                output,
+                usage: _,
+            } => {
                 let node = NodeId::parse(node)?;
                 starts.retain(|(started, _seq)| started != &node);
                 checkpoints.push((node, output.clone(), *ok, event.seq));
@@ -313,8 +320,8 @@ pub fn fold_journal_to_snapshot(
     })
 }
 
-/// `(output, ok, ts, seq)` stored per `(task_id, node_id)` checkpoint key.
-type CheckpointValue = (String, bool, i64, i64);
+/// `(output, ok, ts, seq, usage)` stored per `(task_id, node_id)` checkpoint key.
+type CheckpointValue = (String, bool, i64, i64, Option<crate::orch::UsageSnapshot>);
 
 /// In-memory `TaskStore` (the default when no DB path is configured). Production
 /// use, not just a test fake — lives in `bridge-core` so `bridge-a2a-inbound`
@@ -326,7 +333,7 @@ pub struct MemoryTaskStore {
     inner: Mutex<HashMap<String, TaskRecord>>,
     /// Tasks created under S6 code have complete journal coverage from birth.
     birth: Mutex<HashSet<String>>,
-    /// Key: (task_id, node_id) → (output, ok, ts, seq)
+    /// Key: (task_id, node_id) → (output, ok, ts, seq, usage)
     checkpoints: Mutex<HashMap<(String, String), CheckpointValue>>,
     /// Per-task monotonic seq counter. Key: task_id.
     seq_counters: Mutex<HashMap<String, i64>>,
@@ -450,19 +457,19 @@ impl TaskStore for MemoryTaskStore {
         if g.contains_key(&key) {
             return Err(BridgeError::StoreFailure);
         }
-        g.insert(key, (output.to_string(), ok, ts, 0));
+        g.insert(key, (output.to_string(), ok, ts, 0, None));
         Ok(())
     }
     async fn node_checkpoints(
         &self,
         task: &TaskId,
-    ) -> Result<Vec<(NodeId, String, bool)>, BridgeError> {
+    ) -> Result<Vec<(NodeId, String, bool, Option<crate::orch::UsageSnapshot>)>, BridgeError> {
         let g = self.checkpoints.lock().unwrap();
         let mut out = Vec::new();
-        for ((tid, nid), (output, ok, _ts, _seq)) in g.iter() {
+        for ((tid, nid), (output, ok, _ts, _seq, usage)) in g.iter() {
             if tid == task.as_str() {
                 let node = NodeId::parse(nid).map_err(|_| BridgeError::StoreFailure)?;
-                out.push((node, output.clone(), *ok));
+                out.push((node, output.clone(), *ok, usage.clone()));
             }
         }
         Ok(out)
@@ -532,6 +539,7 @@ impl TaskStore for MemoryTaskStore {
         Ok(seq)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn put_node_checkpoint_sequenced(
         &self,
         task: &TaskId,
@@ -540,6 +548,7 @@ impl TaskStore for MemoryTaskStore {
         output: &str,
         ok: bool,
         ts: i64,
+        usage: Option<&crate::orch::UsageSnapshot>,
     ) -> Result<i64, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
         // Task must exist.
@@ -563,7 +572,7 @@ impl TaskStore for MemoryTaskStore {
             sg.remove(&key);
         }
         let mut g = self.checkpoints.lock().unwrap();
-        g.insert(key, (output.to_string(), ok, ts, seq));
+        g.insert(key, (output.to_string(), ok, ts, seq, usage.cloned()));
         let event = crate::orch::OrchEvent {
             v: crate::orch::ORCH_V,
             seq,
@@ -575,6 +584,7 @@ impl TaskStore for MemoryTaskStore {
                 node: node.as_str().to_string(),
                 ok,
                 output: output.to_string(),
+                usage: usage.cloned(),
             },
         };
         self.journals
@@ -760,7 +770,7 @@ impl TaskStore for MemoryTaskStore {
         let mut checkpoints: Vec<(NodeId, String, bool, i64)> = {
             let g = self.checkpoints.lock().unwrap();
             let mut out = Vec::new();
-            for ((tid, nid), (output, ok, _ts, seq)) in g.iter() {
+            for ((tid, nid), (output, ok, _ts, seq, _usage)) in g.iter() {
                 if tid == task.as_str() {
                     let node = NodeId::parse(nid).map_err(|_| BridgeError::StoreFailure)?;
                     out.push((node, output.clone(), *ok, *seq));
@@ -808,7 +818,7 @@ impl TaskStore for MemoryTaskStore {
 mod tests {
     use super::*;
     use crate::ids::{NodeId, OperationId};
-    use crate::orch::{OrchEvent, OrchEventKind, ORCH_V};
+    use crate::orch::{OrchEvent, OrchEventKind, UsageSnapshot, ORCH_V};
 
     fn rec(id: &str, ms: i64) -> TaskRecord {
         TaskRecord {
@@ -846,6 +856,7 @@ mod tests {
                     node: "a".into(),
                     ok: true,
                     output: "oA".into(),
+                    usage: None,
                 },
             ),
             ev(3, OrchEventKind::NodeStarted { node: "b".into() }),
@@ -1104,7 +1115,15 @@ mod tests {
             .await
             .unwrap();
         let s2 = s
-            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), &op, "OUT", true, 2)
+            .put_node_checkpoint_sequenced(
+                &t,
+                &NodeId::parse("a").unwrap(),
+                &op,
+                "OUT",
+                true,
+                2,
+                None,
+            )
             .await
             .unwrap();
         assert!(s2 > s1, "seq is monotonic");
@@ -1162,6 +1181,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_node_checkpoint_roundtrips_usage_and_journals_it() {
+        let s = MemoryTaskStore::new();
+        let t = TaskId::parse("t-usage").unwrap();
+        s.create(&rec("t-usage", 1)).await.unwrap();
+        let op = OperationId::parse("op-t-usage").unwrap();
+        let member = NodeId::parse("member").unwrap();
+        let usage = UsageSnapshot {
+            used: Some(15071),
+            size: Some(258400),
+            cost: None,
+            at_ms: 7,
+        };
+
+        s.put_node_checkpoint_sequenced(&t, &member, &op, "OUT", true, 7, Some(&usage))
+            .await
+            .unwrap();
+        s.put_node_checkpoint(&t, &NodeId::parse("legacy").unwrap(), "L", true, 8)
+            .await
+            .unwrap();
+
+        let cps = s.node_checkpoints(&t).await.unwrap();
+        let got = cps
+            .iter()
+            .find(|(node, ..)| node.as_str() == "member")
+            .unwrap();
+        assert_eq!(got.1, "OUT");
+        assert!(got.2);
+        assert_eq!(got.3.as_ref(), Some(&usage));
+        let legacy = cps
+            .iter()
+            .find(|(node, ..)| node.as_str() == "legacy")
+            .unwrap();
+        assert!(legacy.3.is_none(), "legacy checkpoint has no usage");
+
+        let evs = s.journal_from(&t, -1).await.unwrap();
+        assert!(matches!(
+            &evs[0].kind,
+            OrchEventKind::NodeFinished { usage: Some(got), .. } if got == &usage
+        ));
+    }
+
+    #[tokio::test]
     async fn memory_journal_write() {
         let s = MemoryTaskStore::new();
         let t = TaskId::parse("task-j").unwrap();
@@ -1170,7 +1231,7 @@ mod tests {
         let op = OperationId::parse("op-task-j").unwrap();
         let s1 = s.record_node_started(&t, &a, &op, 1).await.unwrap();
         let s2 = s
-            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2, None)
             .await
             .unwrap();
         let evs = s.journal_from(&t, -1).await.unwrap();
@@ -1191,7 +1252,7 @@ mod tests {
         let a = NodeId::parse("a").unwrap();
         let op = OperationId::parse("op-task-b").unwrap();
         s.record_node_started(&t, &a, &op, 1).await.unwrap();
-        s.put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+        s.put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2, None)
             .await
             .unwrap();
 

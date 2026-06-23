@@ -1,0 +1,36 @@
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[[agents]]
+id = "claude"
+cmd = "claude-agent-acp"
+
+[[workflows]]
+id = "panel"
+
+[workflows.panel]
+weights = { usage = 0.2, benefit = 0.4, risk = 0.3, pros = 0.05, cons = 0.05 }
+
+[[workflows.nodes]]
+id = "member_a"
+agent = "codex"
+prompt_file = "../prompts/panel-member.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "member_b"
+agent = "claude"
+prompt_file = "../prompts/panel-member.md"
+inputs = []
+
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/panel-synth.md"
+inputs = ["member_a", "member_b"]
+
+[server]
+addr = "127.0.0.1:8080"

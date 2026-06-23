@@ -1,11 +1,19 @@
 //! Workflow DAG types + validation. Edges are implicit from each node's `inputs`.
 use bridge_core::ids::{AgentId, NodeId, WorkflowId};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PanelConfig {
+    #[serde(default)]
+    pub weights: BTreeMap<String, f64>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowGraph {
     pub id: WorkflowId,
     pub nodes: Vec<WorkflowNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<PanelConfig>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -123,6 +131,7 @@ mod tests {
                 node("claude", "claude", &[]),
                 node("synth", "claude", &["codex", "claude"]),
             ],
+            panel: None,
         };
         g.validate().unwrap();
         assert_eq!(g.terminal().unwrap().id.as_str(), "synth");
@@ -132,6 +141,7 @@ mod tests {
         let g = WorkflowGraph {
             id: WorkflowId::parse("c").unwrap(),
             nodes: vec![node("a", "x", &["b"]), node("b", "x", &["a"])],
+            panel: None,
         };
         assert!(matches!(g.validate(), Err(WorkflowError::Cyclic)));
     }
@@ -140,6 +150,7 @@ mod tests {
         let g = WorkflowGraph {
             id: WorkflowId::parse("c").unwrap(),
             nodes: vec![node("a", "x", &[]), node("b", "x", &[])],
+            panel: None,
         };
         assert!(matches!(
             g.validate(),
@@ -151,6 +162,7 @@ mod tests {
         let g = WorkflowGraph {
             id: WorkflowId::parse("c").unwrap(),
             nodes: vec![node("a", "x", &["ghost"])],
+            panel: None,
         };
         assert!(matches!(
             g.validate(),
@@ -162,6 +174,7 @@ mod tests {
         let g = WorkflowGraph {
             id: WorkflowId::parse("c").unwrap(),
             nodes: vec![node("a", "x", &[]), node("a", "x", &[])],
+            panel: None,
         };
         assert!(matches!(g.validate(), Err(WorkflowError::DuplicateNode(_))));
     }
@@ -176,10 +189,38 @@ mod tests {
                 prompt_template: "t {{input}}".into(),
                 inputs: vec![],
             }],
+            panel: None,
         };
         let s = serde_json::to_string(&g).unwrap();
         let g2: WorkflowGraph = serde_json::from_str(&s).unwrap();
         assert_eq!(g2.nodes.len(), 1);
         assert_eq!(g2.nodes[0].id.as_str(), "a");
+    }
+
+    #[test]
+    fn graph_panel_serde_is_additive() {
+        let mut weights = std::collections::BTreeMap::new();
+        weights.insert("usage".to_string(), 0.2);
+        weights.insert("benefit".to_string(), 0.4);
+        let g = WorkflowGraph {
+            id: WorkflowId::parse("panel").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("a").unwrap(),
+                agent: AgentId::parse("x").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+            }],
+            panel: Some(PanelConfig { weights }),
+        };
+        let s = serde_json::to_string(&g).unwrap();
+        assert!(s.contains("\"benefit\":0.4"));
+        let back: WorkflowGraph = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.panel.unwrap().weights["usage"], 0.2);
+
+        let old: WorkflowGraph = serde_json::from_str(
+            r#"{"id":"w","nodes":[{"id":"a","agent":"x","prompt_template":"{{input}}","inputs":[]}]}"#,
+        )
+        .unwrap();
+        assert!(old.panel.is_none());
     }
 }

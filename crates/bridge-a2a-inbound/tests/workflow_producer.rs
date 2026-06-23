@@ -232,6 +232,7 @@ fn review_graph() -> Arc<WorkflowGraph> {
                 "merge {{codex}} + {{claude}} for {{input}}",
             ),
         ],
+        panel: None,
     })
 }
 
@@ -537,6 +538,7 @@ async fn write_ahead_barrier() {
                 inputs: vec![NodeId::parse("a").unwrap()],
             },
         ],
+        panel: None,
     });
 
     let mut stream = executor.run(graph, "DIFF".into(), "r".into(), CancellationToken::new());
@@ -2353,7 +2355,7 @@ async fn detached_runner_checkpoints_each_node() {
     ]
     .into();
 
-    for (node_id, output, ok) in &checkpoints {
+    for (node_id, output, ok, _usage) in &checkpoints {
         let (exp_output, exp_ok) = expected
             .get(node_id.as_str())
             .unwrap_or_else(|| panic!("unexpected checkpoint node: {}", node_id.as_str()));
@@ -2432,7 +2434,15 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
     async fn node_checkpoints(
         &self,
         task: &TaskId,
-    ) -> Result<Vec<(bridge_core::ids::NodeId, String, bool)>, BridgeError> {
+    ) -> Result<
+        Vec<(
+            bridge_core::ids::NodeId,
+            String,
+            bool,
+            Option<bridge_core::orch::UsageSnapshot>,
+        )>,
+        BridgeError,
+    > {
         self.inner.node_checkpoints(task).await
     }
     async fn claim_resume_attempt(
@@ -2459,6 +2469,7 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn put_node_checkpoint_sequenced(
         &self,
         _task: &TaskId,
@@ -2467,6 +2478,7 @@ impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
         _output: &str,
         _ok: bool,
         _ts: i64,
+        _usage: Option<&bridge_core::orch::UsageSnapshot>,
     ) -> Result<i64, BridgeError> {
         // Always fail — simulates a DB write error (mirrors put_node_checkpoint failure).
         Err(BridgeError::StoreFailure)

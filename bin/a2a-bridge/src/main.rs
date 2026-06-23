@@ -2717,7 +2717,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 eprintln!("[workflow] node {} started", node.as_str());
             }
             Ok(WorkflowEvent::NodeFinished {
-                node, ok: node_ok, ..
+                node,
+                ok: node_ok,
+                usage: _,
+                ..
             }) => {
                 eprintln!(
                     "[workflow] node {} {}",
@@ -4569,6 +4572,7 @@ mod cli_tests {
         WorkflowGraph {
             id: WorkflowId::parse(id).unwrap(),
             nodes,
+            panel: None,
         }
     }
 

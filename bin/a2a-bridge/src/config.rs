@@ -156,7 +156,15 @@ pub struct RegistryConfig {
 pub struct WorkflowToml {
     pub id: String,
     #[serde(default)]
+    pub panel: Option<PanelTomlSection>,
+    #[serde(default)]
     pub nodes: Vec<WorkflowNodeToml>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PanelTomlSection {
+    #[serde(default)]
+    pub weights: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -890,6 +898,12 @@ impl RegistryConfig {
             let g = WorkflowGraph {
                 id: id.clone(),
                 nodes,
+                panel: w
+                    .panel
+                    .as_ref()
+                    .map(|p| bridge_workflow::graph::PanelConfig {
+                        weights: p.weights.clone(),
+                    }),
             };
             g.validate()
                 .map_err(|e| ConfigError::Registry(format!("workflow {} invalid: {e:?}", w.id)))?;
@@ -2339,6 +2353,38 @@ addr="127.0.0.1:8080"
             .get(&bridge_core::ids::WorkflowId::parse("wf1").unwrap())
             .unwrap();
         assert_eq!(g.nodes[0].prompt_template, "review {{input}}");
+        g.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_workflow_panel_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.md"), "go {{input}} {{workflow.weights}}").unwrap();
+        let toml = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"panel\"\n[workflows.panel]\nweights = {{ usage = 0.2, benefit = 0.4 }}\n\
+            [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}"
+        );
+        let cfg = RegistryConfig::parse(&toml).unwrap();
+        let map = cfg.load_workflows(dir.path()).unwrap();
+        let g = map
+            .get(&bridge_core::ids::WorkflowId::parse("panel").unwrap())
+            .unwrap();
+        assert_eq!(g.panel.as_ref().unwrap().weights["benefit"], 0.4);
+    }
+
+    #[test]
+    fn shipped_panel_config_loads_and_wires_reserved_vars() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let raw = std::fs::read_to_string(base.join("a2a-bridge.panel.toml")).unwrap();
+        let cfg = RegistryConfig::parse(&raw).unwrap();
+        let map = cfg.load_workflows(&base).unwrap();
+        let g = map
+            .get(&bridge_core::ids::WorkflowId::parse("panel").unwrap())
+            .expect("panel workflow present");
+        assert!(g.panel.as_ref().unwrap().weights.contains_key("usage"));
+        let synth = g.nodes.iter().find(|n| n.id.as_str() == "synth").unwrap();
+        assert!(synth.prompt_template.contains("{{workflow.costs}}"));
+        assert!(synth.prompt_template.contains("{{workflow.weights}}"));
         g.validate().unwrap();
     }
 

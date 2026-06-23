@@ -146,6 +146,7 @@ fn load_workflow_map(
         let g = WorkflowGraph {
             id: id.clone(),
             nodes,
+            panel: None,
         };
         g.validate().map_err(|e| format!("{e:?}"))?;
         map.insert(id, std::sync::Arc::new(g));
