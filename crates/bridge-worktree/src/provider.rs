@@ -4,7 +4,8 @@ use bridge_core::error::BridgeError;
 #[async_trait::async_trait]
 pub trait WorktreeProvider: Send + Sync {
     /// Create a detached worktree of `repo` at `worktree_path` (base ref = repo HEAD).
-    async fn add(&self, repo: &str, worktree_path: &str) -> Result<(), BridgeError>;
+    /// Returns the source's ABSOLUTE git common-dir (for the sidecar / crash-prune).
+    async fn add(&self, repo: &str, worktree_path: &str) -> Result<String, BridgeError>;
 
     /// Remove the worktree + prune the source's dangling registration. Best-effort.
     async fn remove(&self, repo: &str, worktree_path: &str) -> Result<(), BridgeError>;
@@ -13,22 +14,18 @@ pub trait WorktreeProvider: Send + Sync {
     async fn is_git_repo(&self, path: &str) -> bool;
 }
 
-#[allow(dead_code)]
 pub(crate) fn add_argv<'a>(repo: &'a str, wt: &'a str, base: &'a str) -> Vec<&'a str> {
     vec!["-C", repo, "worktree", "add", "--detach", wt, base]
 }
 
-#[allow(dead_code)]
 pub(crate) fn remove_argv<'a>(repo: &'a str, wt: &'a str) -> Vec<&'a str> {
     vec!["-C", repo, "worktree", "remove", "--force", wt]
 }
 
-#[allow(dead_code)]
 pub(crate) fn is_repo_argv(path: &str) -> Vec<&str> {
     vec!["-C", path, "rev-parse", "--is-inside-work-tree"]
 }
 
-#[allow(dead_code)]
 pub(crate) fn prune_argv(repo: &str) -> Vec<&str> {
     vec!["-C", repo, "worktree", "prune"]
 }
