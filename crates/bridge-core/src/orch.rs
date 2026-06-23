@@ -67,6 +67,8 @@ pub enum OrchEventKind {
         node: String,
         ok: bool,
         output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<UsageSnapshot>,
     },
     Terminal {
         status: TerminalStatus,
@@ -237,6 +239,7 @@ mod tests {
                 node: "a".into(),
                 ok: true,
                 output: "o".into(),
+                usage: None,
             },
         };
         let j = serde_json::to_value(&finished).unwrap();
@@ -272,6 +275,47 @@ mod tests {
         assert!(j.get("source").is_none());
         let back: OrchEvent = serde_json::from_value(j).unwrap();
         assert_eq!(back.seq, 3);
+    }
+
+    #[test]
+    fn node_finished_carries_optional_usage() {
+        // usage present -> serializes; absent -> field omitted (skip_serializing_if).
+        let with_usage = OrchEventKind::NodeFinished {
+            node: "a".into(),
+            ok: true,
+            output: "o".into(),
+            usage: Some(UsageSnapshot {
+                used: Some(15071),
+                size: Some(258400),
+                cost: None,
+                at_ms: 5,
+            }),
+        };
+        let j = serde_json::to_value(&with_usage).unwrap();
+        assert_eq!(j["kind"], "node_finished");
+        assert_eq!(j["usage"]["used"], 15071);
+
+        let without = OrchEventKind::NodeFinished {
+            node: "a".into(),
+            ok: true,
+            output: "o".into(),
+            usage: None,
+        };
+        let j2 = serde_json::to_value(&without).unwrap();
+        assert!(j2.get("usage").is_none(), "absent usage omitted from wire");
+
+        // Old rows on the wire (no `usage` key) must still deserialize (default None).
+        let old: OrchEventKind = serde_json::from_value(serde_json::json!({
+            "kind": "node_finished",
+            "node": "a",
+            "ok": true,
+            "output": "o"
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            OrchEventKind::NodeFinished { usage: None, .. }
+        ));
     }
 
     #[test]

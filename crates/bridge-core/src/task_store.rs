@@ -281,7 +281,12 @@ pub fn fold_journal_to_snapshot(
                 starts.retain(|(started, _seq)| started != &node);
                 starts.push((node, event.seq));
             }
-            crate::orch::OrchEventKind::NodeFinished { node, ok, output } => {
+            crate::orch::OrchEventKind::NodeFinished {
+                node,
+                ok,
+                output,
+                usage: _,
+            } => {
                 let node = NodeId::parse(node)?;
                 starts.retain(|(started, _seq)| started != &node);
                 checkpoints.push((node, output.clone(), *ok, event.seq));
@@ -575,6 +580,7 @@ impl TaskStore for MemoryTaskStore {
                 node: node.as_str().to_string(),
                 ok,
                 output: output.to_string(),
+                usage: None,
             },
         };
         self.journals
@@ -846,6 +852,7 @@ mod tests {
                     node: "a".into(),
                     ok: true,
                     output: "oA".into(),
+                    usage: None,
                 },
             ),
             ev(3, OrchEventKind::NodeStarted { node: "b".into() }),

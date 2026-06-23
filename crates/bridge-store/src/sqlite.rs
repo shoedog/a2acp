@@ -685,6 +685,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 node: node.as_str().to_string(),
                 ok,
                 output: output.to_string(),
+                usage: None,
             },
         };
         insert_journal_event(&tx, task, &event)?;
