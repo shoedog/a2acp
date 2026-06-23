@@ -120,6 +120,7 @@ impl SqliteStore {
                 output    TEXT NOT NULL,
                 ok        INTEGER NOT NULL,
                 ts        INTEGER NOT NULL,
+                usage_json TEXT,
                 PRIMARY KEY (task_id, node_id),
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
             );
@@ -177,6 +178,9 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         .collect::<rusqlite::Result<_>>()?;
     if !cp_existing.contains("seq") {
         conn.execute_batch("ALTER TABLE task_node_checkpoints ADD COLUMN seq INTEGER;")?;
+    }
+    if !cp_existing.contains("usage_json") {
+        conn.execute_batch("ALTER TABLE task_node_checkpoints ADD COLUMN usage_json TEXT;")?;
     }
 
     Ok(())
@@ -506,10 +510,20 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     async fn node_checkpoints(
         &self,
         task: &TaskId,
-    ) -> Result<Vec<(NodeId, String, bool)>, BridgeError> {
+    ) -> Result<
+        Vec<(
+            NodeId,
+            String,
+            bool,
+            Option<bridge_core::orch::UsageSnapshot>,
+        )>,
+        BridgeError,
+    > {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT node_id, output, ok FROM task_node_checkpoints WHERE task_id=?1")
+            .prepare(
+                "SELECT node_id, output, ok, usage_json FROM task_node_checkpoints WHERE task_id=?1",
+            )
             .map_err(|_| BridgeError::StoreFailure)?;
         let mut rows = stmt
             .query(rusqlite::params![task.as_str()])
@@ -519,8 +533,13 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             let node_s: String = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
             let output: String = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
             let ok_i: i64 = row.get(2).map_err(|_| BridgeError::StoreFailure)?;
+            let usage_s: Option<String> = row.get(3).map_err(|_| BridgeError::StoreFailure)?;
+            let usage = usage_s
+                .map(|s| serde_json::from_str::<bridge_core::orch::UsageSnapshot>(&s))
+                .transpose()
+                .map_err(|_| BridgeError::StoreFailure)?;
             let node = NodeId::parse(node_s).map_err(|_| BridgeError::StoreFailure)?;
-            out.push((node, output, ok_i != 0));
+            out.push((node, output, ok_i != 0, usage));
         }
         Ok(out)
     }
@@ -631,6 +650,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         Ok(seq)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn put_node_checkpoint_sequenced(
         &self,
         task: &TaskId,
@@ -639,7 +659,12 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         output: &str,
         ok: bool,
         ts: i64,
+        usage: Option<&bridge_core::orch::UsageSnapshot>,
     ) -> Result<i64, BridgeError> {
+        let usage_json = usage
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| BridgeError::StoreFailure)?;
         let conn = self.conn.lock().unwrap();
         let tx = conn
             .unchecked_transaction()
@@ -663,9 +688,17 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         // Plain INSERT (write-once per W3b; PK enforces uniqueness).
         tx.execute(
-            "INSERT INTO task_node_checkpoints(task_id, node_id, output, ok, ts, seq)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![task.as_str(), node.as_str(), output, ok as i64, ts, seq],
+            "INSERT INTO task_node_checkpoints(task_id, node_id, output, ok, ts, seq, usage_json)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                task.as_str(),
+                node.as_str(),
+                output,
+                ok as i64,
+                ts,
+                seq,
+                usage_json
+            ],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
         // Remove the start row — the node is no longer in-progress.
@@ -685,7 +718,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 node: node.as_str().to_string(),
                 ok,
                 output: output.to_string(),
-                usage: None,
+                usage: usage.cloned(),
             },
         };
         insert_journal_event(&tx, task, &event)?;
@@ -1241,6 +1274,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_checkpoint_roundtrips_usage_and_old_rows_read_none() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let task = TaskId::parse("t-usage").unwrap();
+        let op = OperationId::parse("op-t-usage").unwrap();
+        store.create(&trec("t-usage", 1)).await.unwrap();
+        let node = NodeId::parse("member").unwrap();
+        let usage = bridge_core::orch::UsageSnapshot {
+            used: Some(15071),
+            size: Some(258400),
+            cost: None,
+            at_ms: 7,
+        };
+        store
+            .put_node_checkpoint_sequenced(&task, &node, &op, "OUT", true, 7, Some(&usage))
+            .await
+            .unwrap();
+
+        let cps = store.node_checkpoints(&task).await.unwrap();
+        assert_eq!(cps.len(), 1);
+        let (n, out, ok, got) = &cps[0];
+        assert_eq!(n.as_str(), "member");
+        assert_eq!(out, "OUT");
+        assert!(ok);
+        assert_eq!(got.as_ref().unwrap().used, Some(15071));
+
+        let evs = store.journal_from(&task, -1).await.unwrap();
+        assert!(matches!(
+            &evs[0].kind,
+            bridge_core::orch::OrchEventKind::NodeFinished { usage: Some(got), .. } if got == &usage
+        ));
+
+        let node2 = NodeId::parse("legacy").unwrap();
+        store
+            .put_node_checkpoint_sequenced(&task, &node2, &op, "L", true, 8, None)
+            .await
+            .unwrap();
+        let cps = store.node_checkpoints(&task).await.unwrap();
+        let legacy = cps
+            .iter()
+            .find(|(node, ..)| node.as_str() == "legacy")
+            .unwrap();
+        assert!(legacy.3.is_none(), "absent usage reads back as None");
+    }
+
+    #[tokio::test]
     async fn session_cwd_sqlite_roundtrip() {
         // A TaskRecord with session_cwd=Some("/req") must survive create→get via SQLite.
         let s = SqliteStore::open_in_memory().unwrap();
@@ -1347,6 +1425,10 @@ mod tests {
                     cp_cols.contains("seq"),
                     "task_node_checkpoints.seq must exist after migration"
                 );
+                assert!(
+                    cp_cols.contains("usage_json"),
+                    "task_node_checkpoints.usage_json must exist after migration"
+                );
                 // task_node_starts must exist.
                 let count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_node_starts'",
@@ -1363,6 +1445,9 @@ mod tests {
                 "legacy checkpoint must appear in snapshot"
             );
             assert_eq!(legacy_cp.unwrap().3, 0, "legacy NULL seq must map to 0");
+            let cps = s.node_checkpoints(&old).await.unwrap();
+            let legacy = cps.iter().find(|(node, ..)| node.as_str() == "n").unwrap();
+            assert!(legacy.3.is_none(), "legacy NULL usage_json maps to None");
             // A seq write on the freshly-migrated task works from the DEFAULT 0 baseline.
             let op = OperationId::parse("op-old").unwrap();
             let first = s
@@ -1430,7 +1515,15 @@ mod tests {
             .await
             .unwrap();
         let s2 = s
-            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), &op, "OUT", true, 2)
+            .put_node_checkpoint_sequenced(
+                &t,
+                &NodeId::parse("a").unwrap(),
+                &op,
+                "OUT",
+                true,
+                2,
+                None,
+            )
             .await
             .unwrap();
         assert!(s2 > s1);
@@ -1464,16 +1557,22 @@ mod tests {
         store.create(&trec("task-j", 1)).await.unwrap();
         let a = NodeId::parse("a").unwrap();
         let op = OperationId::parse("op-task-j").unwrap();
+        let usage = bridge_core::orch::UsageSnapshot {
+            used: Some(15071),
+            size: Some(258400),
+            cost: None,
+            at_ms: 7,
+        };
         let s1 = store.record_node_started(&t, &a, &op, 1).await.unwrap();
         let s2 = store
-            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2, Some(&usage))
             .await
             .unwrap();
         let evs = store.journal_from(&t, -1).await.unwrap();
         assert_eq!(evs.len(), 2);
         assert!(matches!(evs[0].kind, OrchEventKind::NodeStarted { .. }) && evs[0].seq == s1);
         assert!(
-            matches!(&evs[1].kind, OrchEventKind::NodeFinished { output, .. } if output == "oA")
+            matches!(&evs[1].kind, OrchEventKind::NodeFinished { output, usage: Some(got), .. } if output == "oA" && got == &usage)
                 && evs[1].seq == s2
         );
         assert_eq!(evs[0].operation_id.as_str(), "op-task-j");
@@ -1529,7 +1628,7 @@ mod tests {
         let op = OperationId::parse("op-task-b").unwrap();
         store.record_node_started(&t, &a, &op, 1).await.unwrap();
         store
-            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2)
+            .put_node_checkpoint_sequenced(&t, &a, &op, "oA", true, 2, None)
             .await
             .unwrap();
 
@@ -1548,11 +1647,11 @@ mod tests {
         let a = NodeId::parse("a").unwrap();
         let op = OperationId::parse("op-task-dup-seq").unwrap();
         let first = store
-            .put_node_checkpoint_sequenced(&t, &a, &op, "first", true, 1)
+            .put_node_checkpoint_sequenced(&t, &a, &op, "first", true, 1, None)
             .await
             .unwrap();
         let duplicate = store
-            .put_node_checkpoint_sequenced(&t, &a, &op, "second", true, 2)
+            .put_node_checkpoint_sequenced(&t, &a, &op, "second", true, 2, None)
             .await;
         assert!(duplicate.is_err());
         let snap = store.progress_snapshot(&t).await.unwrap();
@@ -1606,7 +1705,15 @@ mod tests {
         s.create(&trec("t", 1)).await.unwrap();
         let op = OperationId::parse("op-t").unwrap();
         let a = s
-            .put_node_checkpoint_sequenced(&t, &NodeId::parse("a").unwrap(), &op, "A", true, 1)
+            .put_node_checkpoint_sequenced(
+                &t,
+                &NodeId::parse("a").unwrap(),
+                &op,
+                "A",
+                true,
+                1,
+                None,
+            )
             .await
             .unwrap();
         let b = s

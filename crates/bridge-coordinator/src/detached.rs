@@ -315,6 +315,7 @@ impl WorkflowSink for DetachedProgressSink {
                 output,
                 ok,
                 now_ms(),
+                None,
             )
             .await?;
         self.hub.publish(WorkflowProgressFrame {
@@ -766,7 +767,15 @@ mod sink_tests {
             async fn node_checkpoints(
                 &self,
                 task: &TaskId,
-            ) -> Result<Vec<(bridge_core::ids::NodeId, String, bool)>, BridgeError> {
+            ) -> Result<
+                Vec<(
+                    bridge_core::ids::NodeId,
+                    String,
+                    bool,
+                    Option<bridge_core::orch::UsageSnapshot>,
+                )>,
+                BridgeError,
+            > {
                 self.inner.node_checkpoints(task).await
             }
             async fn claim_resume_attempt(
@@ -792,6 +801,7 @@ mod sink_tests {
                     .await
             }
             /// Always fails — used to test the W3b abort-on-write-failure contract.
+            #[allow(clippy::too_many_arguments)]
             async fn put_node_checkpoint_sequenced(
                 &self,
                 _task: &TaskId,
@@ -800,6 +810,7 @@ mod sink_tests {
                 _output: &str,
                 _ok: bool,
                 _ts: i64,
+                _usage: Option<&bridge_core::orch::UsageSnapshot>,
             ) -> Result<i64, BridgeError> {
                 Err(BridgeError::StoreFailure)
             }
@@ -1422,7 +1433,7 @@ pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
         };
         let seed: std::collections::HashMap<String, (String, bool)> = cps
             .iter()
-            .map(|(node, output, ok)| (node.as_str().to_string(), (output.clone(), *ok)))
+            .map(|(node, output, ok, _usage)| (node.as_str().to_string(), (output.clone(), *ok)))
             .collect();
 
         // (4) Terminal short-circuit: if the graph's terminal node already has a
