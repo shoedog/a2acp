@@ -962,4 +962,101 @@ git commit -m "test(workflow): panel degrade — failed member usage is n/a"
 
 **3. Type consistency:** `usage: Option<UsageSnapshot>` is the single carrier across `OrchEventKind::NodeFinished` (T1), `put_node_checkpoint_sequenced`/`node_checkpoints` (T2), `WorkflowEvent::NodeFinished` + `FrameKind::NodeFinished` + `WorkflowSink::node_finished` (T3), `run_node` return + `outputs` map (T4), `run_from` seed (T6). `render_costs_table(&[(String, Option<UsageSnapshot>)])` and `render_weights(&Option<PanelConfig>)` signatures match their call sites. `PanelConfig { weights: BTreeMap<String, f64> }` consistent in graph + config. ✅
 
-**4. Open decision flagged for plan-review:** weights on `WorkflowGraph.panel` (durable-for-free via the spec snapshot, 25 trivial literal edits) vs. `WorkflowRunContext` (fewer edits, but needs envelope + resume re-derivation). This plan chose the graph field — confirm in the dual plan-review.
+**4. Open decision flagged for plan-review:** weights on `WorkflowGraph.panel` (durable-for-free via the spec snapshot, ~24 trivial literal edits) vs. `WorkflowRunContext` (fewer edits, but needs envelope + resume re-derivation). This plan chose the graph field — confirm in the dual plan-review.
+
+---
+
+## v2 — dual plan-review folded (codex xhigh needs-revision + Opus needs-revision) — BINDING
+
+> Supersedes the task bodies above where it conflicts. Both lenses returned **needs-revision** with **no
+> re-architecture** — both CONFIRMED the core design: panel-on-`WorkflowGraph` is additive-safe and is serialized
+> through `encode_workflow_spec` (`detached.rs:1323`); `WorkflowSpecEnvelope` deserializes it (old snapshots →
+> `None`); `NodeId` bans `.` (`ids.rs:58`); the renderer accepts dotted tokens (`template.rs:16`); the resume seed
+> reads `node_checkpoints` directly (`detached.rs:1415`). The fixes below are tactical (compile-green ripples +
+> test strength + one contract detail). Apply each in its named task.
+
+### PR-FIX-1 (codex BLOCKER #1 + Opus M1) — T2 must update EVERY `TaskStore` impl AND direct call site
+The `node_checkpoints` 3-tuple→4-tuple + `put_node_checkpoint_sequenced` +`usage` arity changes ripple to **all
+five** `impl TaskStore` sites — not the three T2 lists. Add to T2:
+- `FailingCheckpointStore` @ `crates/bridge-coordinator/src/detached.rs:722` (and its wrapper methods ~`:766`)
+- `LegacyFallbackStore` @ `crates/bridge-a2a-inbound/src/server.rs:8760` (wrapper methods ~`:8820`)
+- plus **direct positional call sites** of `put_node_checkpoint_sequenced` in `server.rs` tests (e.g. `:8916`) —
+  add the trailing `None` argument.
+T2's gate becomes `cargo test --workspace --all-targets` (NOT per-crate) so a wrapper/test impl in another crate
+can't silently break. (The single `WorkflowSink` trait def at `detached.rs:182` is confirmed — that part of T3 is fine.)
+
+### PR-FIX-2 (codex BLOCKER #2) — T4 must fix the terminal destructure
+After `outputs` becomes `(String, bool, Option<UsageSnapshot>)`, `executor.rs:538`
+(`let (term_text, term_ok) = outputs.get(&terminal_id).cloned().unwrap_or_default();`) no longer compiles. Change
+to `let (term_text, term_ok, _usage) = outputs.get(&terminal_id).cloned().unwrap_or_default();`
+(the 3-tuple is still `Default`, so `unwrap_or_default()` stays valid). Add this as an explicit T4 step.
+
+### PR-FIX-3 (codex MAJOR #3 + the Slice-9 lesson) — every task gates with `--all-targets`
+`WorkflowEvent::NodeFinished` test literals live in `bin/a2a-bridge/src/review.rs:865/870/895` (a file the draft
+missed). `cargo build -p a2a-bridge` does NOT compile test targets, so a `--bin`/`build` gate false-greens. **Every
+task** that changes a public type/signature ends with `cargo test --workspace --all-targets` (or at minimum
+`cargo test -p <crate> --all-targets`). T3's file list adds `bin/a2a-bridge/src/review.rs`. (This is the Slice-9
+MCP 6→8 stale-count lesson, generalized.)
+
+### PR-FIX-4 (codex MAJOR #4) — the usage column is `windowFraction = used/size` (raw fraction), not a percent
+SF-FIX-1's contract is `{used, size, windowFraction}` where `windowFraction = used/size` (a raw fraction, e.g.
+`0.0583` — see `session_manager.rs:140`). T4's `render_costs_table` must emit a **`windowFraction`** column with
+the RAW fraction, not a `window` percent string. Revised helper body for the fraction cell:
+
+```rust
+let window = match (u.used, u.size) {
+    (Some(a), Some(b)) if b > 0 => format!("{:.4}", a as f64 / b as f64),
+    _ => "n/a".into(),
+};
+```
+
+and the header → `"| source | used | size | windowFraction | cost |\n| --- | --- | --- | --- | --- |\n"`. Update
+the T4 `costs_table_renders_per_field_with_n_a` test to assert the derived fraction (e.g.
+`assert!(table.contains("| codexer | 15071 | 258400 | 0.0583 |"));`) AND the `n/a` row — i.e. assert the COMPUTED
+field, not just `used`/`size`.
+
+### PR-FIX-5 (codex MAJOR #5) — T6 must prove SF-FIX-4 at the COORDINATOR resume level, not just `run_from`
+The draft's T6 test only feeds a pre-built seed to `run_from` — it doesn't exercise the store→resume-scan→spawn
+chain. Keep that unit test, but ADD a `bridge-coordinator` resume test (in `detached.rs` tests): create a Working
+task with a `panel`-shaped graph snapshot + member `usage_json` checkpoints (via `put_node_checkpoint_sequenced`
+with `Some(usage)`), call `resume_working_tasks(&deps, cap)`, and assert the resumed **synth's prompt** received
+the `{{workflow.costs}}` table with the members' usage. (Use the existing detached-test harness — the
+`spawn_detached_workflow_*_for_test` helpers + a fake dispatcher/registry that records the synth prompt.) This is
+the real SF-FIX-4 crash-resume proof; it belongs in T6, not deferred to the live-gate.
+
+### PR-FIX-6 (codex MAJOR #6) — T2 must test the DURABLE JOURNAL leg + the legacy-schema migration
+T2's draft test only checks `node_checkpoints`. Add, in T2:
+- assert `journal_from(&task, -1)` returns an `OrchEventKind::NodeFinished { usage: Some(..), .. }` for the
+  usage-bearing checkpoint — for BOTH `SqliteStore` and `MemoryTaskStore`.
+- extend the existing legacy-schema migration test (`sqlite.rs:1280`, pre-creates the old `task_node_checkpoints`)
+  to insert a row with NO `usage_json`, then assert `node_checkpoints` reads `usage = None` (proves the
+  `ALTER TABLE ADD COLUMN usage_json` migration + the NULL→None read on legacy rows).
+
+### PR-FIX-7 (codex MINOR #7) — inject `{{workflow.weights}}` only for nodes WITH inputs (match `{{workflow.costs}}`)
+In T5, move the `owned.push(("workflow.weights"...))` inside the same `if !n.inputs.is_empty() { … }` block as
+`{{workflow.costs}}` — the reserved synth vars surface only at fan-in (synth) nodes, keeping root members'
+prompts byte-identical. Update the T5 `weights_render_sorted` test target accordingly (it tests `render_weights`
+directly, so it's unaffected; just ensure an injection test, if added, uses a fan-in node).
+
+### PR-FIX-8 (Opus m1) — test-code name fixes
+The in-memory store type is **`MemoryTaskStore`** (`task_store.rs:366`), NOT `InMemoryTaskStore` — fix every test
+that constructs it (T3's `detached_sink_persists_and_publishes_node_usage`, any other). Replace the invented
+`sample_task`/`working_task`/`working_task` helpers with an inline `TaskRecord { … status: Working … }` + `create`
+(or bind to a confirmed existing helper in that test module) so the tests compile.
+
+### PR-FIX-9 (codex NIT #8) — the literal count is ~24, compiler-enumerated
+Drop the exact "25" — `rg "WorkflowGraph {"` over-counts (a fn signature at `main.rs:4556`, the struct def at
+`graph.rs:6`). T5 relies on the COMPILER to enumerate the real construction sites; the file list stays, the number
+is approximate.
+
+### PR-FIX-10 (Opus C1 — clarification, no code) — `task watch` needs NO printer change
+`task_watch_cmd` (`main.rs:3236`) prints the raw `data:` SSE payload verbatim, so T3's `FrameKind::NodeFinished.usage`
+(`skip_serializing_if=Option::is_none`) surfaces automatically → **SF-FIX-5 is satisfied by the frame field alone**;
+do NOT add a `task watch` printer task. The live-gate reads usage from `task watch` raw output. (Distinct from
+PR-FIX-3's `review.rs` literals, which ARE a real edit.)
+
+### Verdict reconciliation
+Both lenses: **needs-revision, no re-architecture.** Confirmed sound (do not reopen): panel-on-graph (durable +
+resume-safe via the snapshot, with the verified advantage that `WorkflowRunContext` would LOSE weights on resume);
+the direct-`node_checkpoints` resume seed (the fold/`TaskProgressSnapshot.checkpoints` stays a usage-less 4-tuple);
+the reserved `workflow.` var namespace. After folding PR-FIX-1..10 the plan is **ready-to-implement**.
