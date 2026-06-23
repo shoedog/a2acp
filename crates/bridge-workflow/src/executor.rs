@@ -272,7 +272,7 @@ impl WorkflowExecutor {
             },
         };
         let eff = effective_config(&resolved.entry, None);
-        let _ = resolved
+        if let Err(e) = resolved
             .backend
             .configure_session(
                 &session,
@@ -281,7 +281,15 @@ impl WorkflowExecutor {
                     cwd: ctx.session_cwd.clone(),
                 },
             )
-            .await; // best-effort (no-op default)
+            .await
+        {
+            resolved.backend.forget_session(&session).await;
+            return (
+                format!("[node {} failed: configure {:?}]", node.id.as_str(), e),
+                false,
+                None,
+            );
+        }
         if cancel.is_cancelled() {
             resolved.backend.forget_session(&session).await;
             return (format!("[node {} canceled]", node.id.as_str()), false, None);
@@ -1504,6 +1512,116 @@ mod tests {
             rec.prompts.lock().unwrap()[0],
             "echo DIFF",
             "template rendered with {{input}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_configure_error_fails_node_without_prompting() {
+        struct CfgErrBackend {
+            rec: Arc<Rec>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentBackend for CfgErrBackend {
+            async fn prompt(
+                &self,
+                _s: &SessionId,
+                parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                self.rec
+                    .prompts
+                    .lock()
+                    .unwrap()
+                    .push(parts.iter().map(|p| p.text.clone()).collect());
+                Ok(Box::pin(tokio_stream::iter(Vec::<
+                    Result<Update, BridgeError>,
+                >::new())))
+            }
+
+            async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+
+            async fn configure_session(
+                &self,
+                _s: &SessionId,
+                _spec: &SessionSpec,
+            ) -> Result<(), BridgeError> {
+                Err(BridgeError::ConfigInvalid {
+                    reason: "worktree add failed".into(),
+                })
+            }
+
+            async fn forget_session(&self, _s: &SessionId) {
+                *self.rec.forgets.lock().unwrap() += 1;
+            }
+        }
+
+        struct CfgErrReg {
+            rec: Arc<Rec>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentRegistry for CfgErrReg {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                Ok(Resolved {
+                    entry: Arc::new(minimal_entry(id)),
+                    backend: Arc::new(CfgErrBackend {
+                        rec: self.rec.clone(),
+                    }),
+                    lease: Box::new(NoopLease),
+                })
+            }
+
+            fn default_id(&self) -> AgentId {
+                AgentId::parse("codex").unwrap()
+            }
+
+            async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+                Ok(())
+            }
+
+            fn list(&self) -> Vec<AgentId> {
+                vec![]
+            }
+        }
+
+        let rec = Arc::new(Rec::default());
+        let ex = WorkflowExecutor::new(Arc::new(CfgErrReg { rec: rec.clone() }));
+        let events: Vec<WorkflowEvent> = ex
+            .run(
+                one_node_graph(),
+                "DIFF".into(),
+                "run1".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let nf = events
+            .iter()
+            .find(|e| matches!(e, WorkflowEvent::NodeFinished { .. }))
+            .unwrap();
+        match nf {
+            WorkflowEvent::NodeFinished { ok, output, .. } => {
+                assert!(!ok, "configure error must fail the node");
+                assert!(
+                    output.starts_with("[node only failed: configure "),
+                    "unexpected node output: {output}"
+                );
+            }
+            other => panic!("expected NodeFinished, got {other:?}"),
+        }
+        assert!(
+            rec.prompts.lock().unwrap().is_empty(),
+            "prompt must not run after configure_session fails"
+        );
+        assert_eq!(
+            *rec.forgets.lock().unwrap(),
+            1,
+            "configure_session error must forget the session"
         );
     }
 
