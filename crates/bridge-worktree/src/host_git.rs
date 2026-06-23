@@ -212,4 +212,20 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }
+
+    #[tokio::test]
+    async fn unborn_head_add_errors_cleanly() {
+        let tmp = unique_temp_dir("unborn");
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q"]);
+
+        let p = HostGitWorktree::new();
+        let wt = tmp.join("wt");
+        let r = p.add(src.to_str().unwrap(), wt.to_str().unwrap()).await;
+
+        assert!(r.is_err(), "unborn HEAD => typed error, not a panic");
+        assert!(!wt.exists(), "failed add should clean partial worktree");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }
