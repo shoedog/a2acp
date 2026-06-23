@@ -240,12 +240,11 @@ impl WorkflowExecutor {
                     }
                 }
             };
-            let usage = match &exit {
-                NodeTurnExit::Normal => last_usage,
-                NodeTurnExit::Canceled | NodeTurnExit::Error(_) => None,
-            };
+            // Keep whatever usage the agent reported, even if the turn then errored or was
+            // cancelled — the tokens were really consumed and belong in the durable footprint.
+            // `last_usage` is already `None` when no `Update::Usage` was ever observed.
             turn.cleanup.on_exit(exit).await;
-            return (text, ok, usage);
+            return (text, ok, last_usage);
         }
         let rendered = render(&node.prompt_template, vars);
         let session = match SessionId::parse(format!(
@@ -326,7 +325,6 @@ impl WorkflowExecutor {
         let mut text = String::new();
         let mut ok = true;
         let mut canceled_during_drain = false;
-        let mut errored_during_drain = false;
         let mut last_usage: Option<UsageSnapshot> = None;
         loop {
             tokio::select! {
@@ -346,16 +344,14 @@ impl WorkflowExecutor {
                         if stop_reason == STOP_REASON_CANCELLED { ok = false; }
                         break;
                     }
-                    Some(Err(e)) => { errored_during_drain = true; ok = false; text = format!("[node {} failed: {:?}]", node.id.as_str(), e); break; }
+                    Some(Err(e)) => { ok = false; text = format!("[node {} failed: {:?}]", node.id.as_str(), e); break; }
                     None => break,
                 }
             }
         }
-        let usage = if canceled_during_drain || errored_during_drain {
-            None
-        } else {
-            last_usage
-        };
+        // Keep whatever usage the agent reported, even on error/cancel (see the warm path):
+        // `last_usage` is `None` only when no `Update::Usage` was ever observed.
+        let usage = last_usage;
         if let Some(sink) = &rich_sink {
             if let Err(e) = sink.flush().await {
                 if !ok {
@@ -842,6 +838,141 @@ mod tests {
                 assert_eq!(u.used, Some(15071))
             }
             other => panic!("expected captured usage, got {other:?}"),
+        }
+    }
+
+    // A backend that reports Usage and THEN errors mid-stream. Shared by the warm + cold
+    // "usage kept on error" regressions (whole-branch review MAJOR-1): the real tokens were
+    // consumed, so the usage must survive into NodeFinished even though ok=false.
+    struct UsageThenErrBackend {
+        used: u64,
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for UsageThenErrBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::Usage(bridge_core::orch::UsageSnapshot {
+                    used: Some(self.used),
+                    size: Some(100_000),
+                    cost: None,
+                    at_ms: 1,
+                })),
+                Err(BridgeError::ConfigInvalid {
+                    reason: "boom".into(),
+                }),
+            ])))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_usage_kept_when_node_errors_after_usage() {
+        struct UReg;
+        #[async_trait::async_trait]
+        impl AgentRegistry for UReg {
+            async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+                Ok(Resolved {
+                    entry: Arc::new(minimal_entry(id)),
+                    backend: Arc::new(UsageThenErrBackend { used: 4242 }),
+                    lease: Box::new(NoopLease),
+                })
+            }
+            fn default_id(&self) -> AgentId {
+                AgentId::parse("codex").unwrap()
+            }
+            async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+                Ok(())
+            }
+            fn list(&self) -> Vec<AgentId> {
+                vec![]
+            }
+        }
+        let ex = WorkflowExecutor::new(Arc::new(UReg));
+        let evs: Vec<_> = ex
+            .run(
+                one_node_graph(),
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let nf = evs
+            .iter()
+            .find(|e| matches!(e, WorkflowEvent::NodeFinished { .. }))
+            .unwrap();
+        match nf {
+            WorkflowEvent::NodeFinished {
+                ok, usage: Some(u), ..
+            } => {
+                assert!(!ok, "node errored → ok=false");
+                assert_eq!(u.used, Some(4242), "usage kept despite the stream error");
+            }
+            other => panic!("expected NodeFinished with kept usage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_usage_kept_when_node_errors_after_usage() {
+        struct D;
+        #[async_trait::async_trait]
+        impl WorkflowNodeDispatcher for D {
+            async fn checkout(
+                &self,
+                _wf: &str,
+                _n: &WorkflowNode,
+                _r: &str,
+                _c: &WorkflowRunContext,
+            ) -> Result<NodeTurn, BridgeError> {
+                Ok(NodeTurn {
+                    backend: Arc::new(UsageThenErrBackend { used: 777 }),
+                    session: SessionId::parse("warm-session").unwrap(),
+                    seed: None,
+                    cleanup: Box::new(CountingCleanup {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        exits: Arc::new(Mutex::new(Vec::new())),
+                    }),
+                })
+            }
+        }
+        let ex = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: std::collections::HashMap::new(),
+        }));
+        let evs: Vec<_> = ex
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "r".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                Arc::new(D),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let nf = evs
+            .iter()
+            .find(|e| matches!(e, WorkflowEvent::NodeFinished { .. }))
+            .unwrap();
+        match nf {
+            WorkflowEvent::NodeFinished {
+                ok, usage: Some(u), ..
+            } => {
+                assert!(!ok, "node errored → ok=false");
+                assert_eq!(u.used, Some(777), "warm path keeps usage despite the error");
+            }
+            other => panic!("expected NodeFinished with kept usage, got {other:?}"),
         }
     }
 
