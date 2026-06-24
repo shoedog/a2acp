@@ -16,12 +16,46 @@ pub struct WorkflowGraph {
     pub panel: Option<PanelConfig>,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub backoff_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_cap_ms: Option<u64>,
+}
+
+impl RetryPolicy {
+    /// Total attempts (>=1). `max_attempts == 0` is treated as 1 (defensive).
+    pub fn attempts(&self) -> u32 {
+        self.max_attempts.max(1)
+    }
+
+    /// Overflow-safe backoff for `attempt` (1-based): min(backoff_ms * 2^(attempt-1), cap).
+    pub fn backoff_for(&self, attempt: u32) -> std::time::Duration {
+        let cap = self.backoff_cap_ms.unwrap_or(30_000);
+        let shift = attempt.saturating_sub(1);
+        // `checked_shl` only rejects shift >= bit-width (it WRAPS the value otherwise), so a large
+        // `attempt` would silently wrap `backoff_ms << shift` to a small value and defeat the cap.
+        // Multiply by `2^shift` with `checked_mul` (saturating to MAX) to catch VALUE overflow.
+        let base = if shift >= 64 {
+            u64::MAX
+        } else {
+            self.backoff_ms
+                .checked_mul(1u64 << shift)
+                .unwrap_or(u64::MAX)
+        };
+        std::time::Duration::from_millis(base.min(cap))
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowNode {
     pub id: NodeId,
     pub agent: AgentId,
     pub prompt_template: String,
     pub inputs: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -119,6 +153,7 @@ mod tests {
             agent: AgentId::parse(agent).unwrap(),
             prompt_template: format!("{{{{input}}}} {}", id),
             inputs: inputs.iter().map(|i| NodeId::parse(*i).unwrap()).collect(),
+            retry: None,
         }
     }
 
@@ -188,6 +223,7 @@ mod tests {
                 agent: AgentId::parse("x").unwrap(),
                 prompt_template: "t {{input}}".into(),
                 inputs: vec![],
+                retry: None,
             }],
             panel: None,
         };
@@ -209,6 +245,7 @@ mod tests {
                 agent: AgentId::parse("x").unwrap(),
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
+                retry: None,
             }],
             panel: Some(PanelConfig { weights }),
         };
@@ -222,5 +259,66 @@ mod tests {
         )
         .unwrap();
         assert!(old.panel.is_none());
+    }
+
+    #[test]
+    fn retry_policy_rides_the_spec_snapshot_round_trip() {
+        let node = WorkflowNode {
+            id: NodeId::parse("n1").unwrap(),
+            agent: AgentId::parse("codex").unwrap(),
+            prompt_template: "p".into(),
+            inputs: vec![],
+            retry: Some(RetryPolicy {
+                max_attempts: 3,
+                backoff_ms: 500,
+                backoff_cap_ms: Some(30_000),
+            }),
+        };
+
+        let json = serde_json::to_string(&node).unwrap();
+        let back: WorkflowNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.retry,
+            Some(RetryPolicy {
+                max_attempts: 3,
+                backoff_ms: 500,
+                backoff_cap_ms: Some(30_000),
+            })
+        );
+
+        let no_retry: WorkflowNode = serde_json::from_str(
+            r#"{"id":"n1","agent":"codex","prompt_template":"p","inputs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(no_retry.retry, None);
+    }
+
+    #[test]
+    fn backoff_for_is_overflow_safe() {
+        let capped = RetryPolicy {
+            max_attempts: 5,
+            backoff_ms: 500,
+            backoff_cap_ms: Some(30_000),
+        };
+
+        assert_eq!(capped.backoff_for(1), std::time::Duration::from_millis(500));
+        assert_eq!(
+            capped.backoff_for(10),
+            std::time::Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            capped.backoff_for(64),
+            std::time::Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            RetryPolicy {
+                max_attempts: 0,
+                backoff_ms: 500,
+                backoff_cap_ms: None,
+            }
+            .attempts(),
+            1
+        );
+        assert_eq!(capped.attempts(), 5);
     }
 }

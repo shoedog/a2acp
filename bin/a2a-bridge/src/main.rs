@@ -4731,6 +4731,7 @@ mod cli_tests {
                 agent: AgentId::parse(*a).unwrap(),
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
+                retry: None,
             })
             .collect();
         WorkflowGraph {

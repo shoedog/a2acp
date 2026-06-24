@@ -888,6 +888,7 @@ mod tests {
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
                 inputs: Vec::new(),
+                retry: None,
             }],
             panel: None,
         })

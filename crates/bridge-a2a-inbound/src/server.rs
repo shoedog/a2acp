@@ -6298,6 +6298,7 @@ mod tests {
             agent: AgentId::parse("a").unwrap(),
             prompt_template: "go".into(),
             inputs: vec![],
+            retry: None,
         };
         let ctx = WorkflowRunContext {
             session_cwd: Some(cwd.clone()),

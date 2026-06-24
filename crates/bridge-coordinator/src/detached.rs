@@ -1082,6 +1082,7 @@ mod sink_tests {
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
+                retry: None,
             }],
             panel: None,
         });
@@ -1785,6 +1786,7 @@ mod resume_tests {
                 .iter()
                 .map(|input| NodeId::parse(*input).unwrap())
                 .collect(),
+            retry: None,
         };
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("panel").unwrap(),
@@ -1928,6 +1930,7 @@ mod frame_tests {
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
                 inputs: Vec::new(),
+                retry: None,
             }],
             panel: None,
         };

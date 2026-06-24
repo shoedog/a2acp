@@ -982,6 +982,7 @@ impl RegistryConfig {
                         .map_err(|e| {
                             ConfigError::Registry(format!("workflow {} input id: {e:?}", w.id))
                         })?,
+                    retry: None,
                 });
             }
             let g = WorkflowGraph {
