@@ -518,3 +518,63 @@ fail-then-ok proving resolve-in-loop+invalidate counts (PR-FIX-6), exhaust, non-
 cancel-mid-backoff, retry-enabled-ConfigInvalid-fail-fast (PR-FIX-8), last-attempt-usage (PR-FIX-10)** → **T6
 resume-compat via a DROPPED runner future (PR-FIX-7) + workspace gate**. After folding PR-FIX-1..10 the plan is
 **ready-to-implement**.
+
+---
+
+## v3 — plan v2 RE-REVIEW folded (codex xhigh: 4 MAJOR + 2 MINOR; Opus re-lens) — BINDING
+
+> Supersedes v2 where it conflicts. The re-review CONFIRMED the T4 registry seam is fully sound + implementable (no
+> change) and refined T5/T6 + closed a compile gap. CONFIRMED (do NOT re-litigate): T4 write-lock is deadlock-free
+> (`apply`'s load→build→store is SYNC, no await inside; sole prod caller = the hot-reload task `main.rs:4308`);
+> `spawn_retirement(slot, grace)` ALREADY EXISTS (`registry.rs:265`/used at `:427`) → `invalidate` REUSES it
+> (`old_slot.retired.store(true, SeqCst); Self::spawn_retirement(old_slot.clone(), self.grace);` after the swap — no
+> extraction, no `Arc::ptr_eq`, single known slot); `Slot::new` returns `Arc<Slot>` (`:43`); the PR-FIX-6 executor
+> tests use a FRESH fake `impl AgentRegistry` (bridge-workflow does NOT depend on bridge-registry); the resolve-error
+> `backend: None` branch is the `self.registry.resolve` Err arm at `executor.rs:269`.
+
+### RR2-FIX-1 (MAJOR-1, T5) — the `Attempt` must carry `Option<Resolved>`, not just `Arc<dyn AgentBackend>`
+`Resolved` OWNS the retirement LEASE (`ports.rs:190`); registry retirement WAITS on slot leases before `retire()`
+(`registry.rs:265`). `run_node` keeps `resolved` ALIVE through cleanup/forget today (`executor.rs:266`). If the
+attempt returns `Transient { backend: Some(resolved.backend.clone()) }` the `Resolved` (and its lease) DROPS before
+`release_session()` — a concurrent `apply`/`invalidate` could retire the process while cleanup still uses it. **Fix:
+carry `Option<Resolved>` in `Attempt::Transient` (hold the lease through `release_session`), OR perform
+`release_session`/`forget_session` INSIDE the attempt scope BEFORE `Resolved` drops.** (The cleanest: the per-attempt
+block does its own release on the retry path while `resolved` is still in scope, and returns only `{ err, usage }`.)
+
+### RR2-FIX-2 (MAJOR-2, T5) — transient attempts must carry `usage` (exhaustion reports last-attempt usage)
+The cold path preserves `last_usage` even when the stream later errors (`executor.rs:348/360`; locked by a test at
+`:852`). `Transient { err }` alone can't return usage on an EXHAUSTED transient failure. **Fix: `Attempt::Transient {
+err, usage: Option<UsageSnapshot> }`; on exhaustion return that usage** (SR-FIX-4 last-attempt). Add a test: all
+attempts fail transiently, the FINAL failed attempt emits `Update::Usage(C)` → `NodeFinished.usage == C` (folds
+PR-FIX-10's MINOR-6 gap).
+
+### RR2-FIX-3 (MAJOR-3, T6) — split the resume-compat proof; abort ≠ crash
+Dropping mid-backoff DOES prevent a node checkpoint (`NodeFinished` only after `run_node` returns, `executor.rs:615`),
+but aborting `spawn_detached_workflow` drops the `Finalizer` which async-marks the task `Failed` (`detached.rs:468`) —
+NOT a restartable `Working` crash. **Fix: TWO tests** — (a) **no-checkpoint:** drop the executor STREAM directly (or
+the `run_from` future) mid-retry → assert NO `NodeFinished`/checkpoint for the node; (b) **resume-reruns:** seed a
+`Working` task row with the workflow snapshot + NO checkpoint, run `resume_working_tasks` → assert the node RE-RUNS
+(mirror the existing W3b resume tests' Working-seed harness).
+
+### RR2-FIX-4 (MAJOR-4, T5 prerequisite) — add the `tracing` dependency to bridge-workflow
+T5's `tracing::warn!(node, attempt, ?err, "node retry")` needs `tracing`, which `crates/bridge-workflow/Cargo.toml`
+does NOT depend on (the workspace dep exists, root `Cargo.toml:20`). **Add `tracing.workspace = true` to
+`crates/bridge-workflow/Cargo.toml` as T5 step 0** (else T5 won't compile).
+
+### RR2-FIX-5 (MINOR-5, T2) — the literal count is 42, not ~32
+`rg "WorkflowNode\s*\{" -g '*.rs'` finds 42 direct literals (no `WorkflowNode::new`/`Default`; some helpers return
+literals, e.g. `graph.rs:116`). The remedy stands (add `retry: None` to each; `cargo build --workspace` is the gate);
+the count is 42. (Optional: add `WorkflowNode::new(id, agent, prompt_template, inputs)` defaulting `retry: None` and
+migrate to cut churn.)
+
+### RR2-FIX-6 (MINOR-6) — covered by RR2-FIX-2's exhausted-usage test.
+
+### Revised task structure (net of v2 + v3)
+T1 `is_transient` → T2 `RetryPolicy` + `WorkflowNode.retry` at ALL **42** workspace literals + overflow-safe
+`backoff_for` → T3 config `retry` + `load_workflows` mapping test → T4 `invalidate` (shared write-lock with `apply` +
+REUSE `spawn_retirement` + `Slot::new`/`State` types + resolve/invalidate-counting fake-registry test) → **T5 (step 0:
+add `tracing` dep) the retry loop: `Attempt` enum carrying `Option<Resolved>` + `usage` (RR2-FIX-1/2), release INSIDE
+the attempt scope on retry, invalidate + cancel-abortable overflow-safe backoff + re-resolve; tests: resolve-in-loop+
+invalidate-counts, exhaust-with-usage, non-transient, no-policy, cancel-mid-backoff, retry-enabled-ConfigInvalid-fail-
+fast** → **T6 two resume tests: drop-stream-no-checkpoint + seed-Working-resume-reruns (RR2-FIX-3) + workspace gate**.
+After folding RR2-FIX-1..6 the plan is **ready-to-implement**.
