@@ -430,3 +430,91 @@ git commit -m "test(workflow): T6 — resume-compat (mid-retry interrupt not see
 **2. Placeholders:** each step has real test + impl code + commands. The T1 test note (enumerate the real non-transient set) + the T4 `State`-fields verify + the T5 attempt-extraction are flagged inline for the implementer to bind to the real types. ✅
 **3. Type consistency:** `RetryPolicy { max_attempts: u32, backoff_ms: u64, backoff_cap_ms: Option<u64> }` + `attempts()`/`backoff_for()` + `WorkflowNode.retry` + `RetryToml` + `AgentRegistry::invalidate(&AgentId)` consistent across T2/T3/T4/T5. ✅
 **4. Open items for plan-review:** (a) does `invalidate` retiring the old backend (T4) block (retire drains leases) — should it be best-effort/non-blocking? (b) the apply-vs-invalidate ArcSwap race (T4) — acceptable or needs compare-swap? (c) is `self.registry` actually reachable + `Arc<dyn AgentRegistry>` in `run_node` (T5)? (d) does `release_session` THEN `invalidate`+respawn double-cancel harmlessly, or is `release` redundant given respawn (drop it)? (e) the FlakyBackend + invalidate-counter harness shape (T5). Confirm in the dual plan-review.
+
+---
+
+## v2 — dual plan-review folded (codex xhigh: 4 BLOCKER + 6 MAJOR; Opus lens) — BINDING
+
+> Supersedes the task bodies above where it conflicts. The ARCHITECTURE + task list HOLD; the MECHANICS of T4 (the
+> registry seam) + T5 (the attempt model) + T6 (the resume test) needed real correction. Apply each in its named
+> task. CONFIRMED (do NOT re-litigate): `self.registry: Arc<dyn AgentRegistry>` IS reachable in `run_node`
+> (`executor.rs:119/120`); `tokio::time` IS available (workspace `tokio` = full features, `Cargo.toml:11`);
+> `release_session` STAYS in the reset (clears BRIDGE-side session/config state — `acp_backend.rs:2705`) while
+> `invalidate` handles PROCESS replacement (they are NOT redundant — plan open-item (d) resolved).
+
+### PR-FIX-1 (BLOCKER-1, T2) — `WorkflowNode.retry` ripples WORKSPACE-WIDE (~32 literals), not just the crate
+`WorkflowNode` is constructed far outside `bridge-workflow`: `bin/a2a-bridge/src/main.rs:4729`,
+`crates/bridge-a2a-inbound/src/server.rs:6296`, `crates/bridge-coordinator/src/coordinator.rs:886`,
+`detached.rs:1080`, `crates/bridge-mcp/tests/mcp_client.rs:222`, the inbound/integration tests, etc. (~32 literals).
+T2 must add `retry: None` to EVERY workspace construction site; the gate is **`cargo build --workspace`** (not
+`-p bridge-workflow`). (Optional churn-cut: add a `WorkflowNode::new(id, agent, prompt_template, inputs)` ctor that
+defaults `retry: None` and migrate literals — but the field add + `retry: None` is the minimum.)
+
+### PR-FIX-2 (BLOCKER-2, T4) — close the `apply`-vs-`invalidate` ArcSwap race (no slot resurrection)
+`apply` does a stale `load_full` → build `next` → `state.store` with NO writer lock (`registry.rs:376-414`) — fine
+as the SOLE writer. `invalidate` adding a second load→modify→store RACES it: an `invalidate` that wins after a
+concurrent `apply` would RESURRECT removed/old slots or the old `default`. **Add a shared writer `Mutex` (e.g.
+`write_lock: tokio::sync::Mutex<()>`) held across the load→modify→store in BOTH `apply` AND `invalidate`** (serialize
+the two writers). `invalidate` must NO-OP if the agent is absent from the CURRENT state (re-load under the lock; don't
+re-insert a vanished agent).
+
+### PR-FIX-3 (BLOCKER-3, T4) — do NOT await `be.retire()`; reuse the DETACHED lease-draining retirement
+Direct `backend.retire()` KILLS the process (`acp_backend.rs:2728`) out from under concurrent sessions still holding
+that `Arc` (a fan-out workflow can have node B mid-turn on the SAME agent). Mirror `apply` (`registry.rs:416-425`):
+after the slot swap, mark the OLD slot `retired = true` SYNCHRONOUSLY (closes resolve's spawn/retire race —
+`resolve` re-checks `retired` at `:322`) and hand it to the DETACHED lease-draining retirement task (awaits
+leases==0 or the grace deadline, THEN `retire()`). **`invalidate` NEVER awaits process teardown.** Extract apply's
+retirement-of-one-slot into a reusable helper (`spawn_retirement(old_slot, self.grace)` or similar) and call it from
+both. (This makes the retry path non-blocking AND concurrency-safe — the old process drains its leases before dying.)
+
+### PR-FIX-4 (MAJOR-4, T4) — `Slot::new` already returns `Arc<Slot>` (no double-Arc)
+`Slot::new(entry) -> Arc<Slot>` (`registry.rs:43`). The plan's `Arc::new(Slot::new(...))` would be `Arc<Arc<Slot>>`.
+Use `next.insert(agent.clone(), Slot::new((*entry).clone()))`. `State { slots, default }` (`:55-57`) — match it.
+
+### PR-FIX-5 (MAJOR-5, T5) — a resolve-time failure has NO `resolved` backend
+T5's reset can't call `resolved.backend.release_session(...)` on a resolve-time `AgentCrashed` (the startup flake) —
+there is no `resolved`. Model the attempt outcome as e.g. `enum Attempt { Ok(text,usage), Canceled(text),
+Transient { err: BridgeError, backend: Option<Arc<dyn AgentBackend>> }, Fatal(text,usage) }`. On `Transient`: if
+`backend.is_some()` → `release_session` it; ALWAYS `invalidate(&node.agent)` + backoff + re-resolve. A resolve
+failure → `backend: None` → skip release, still invalidate (so the uninitialized/failed `OnceCell` is replaced) +
+backoff + re-resolve.
+
+### PR-FIX-6 (MAJOR-6, T5) — the test must PROVE resolve-in-loop + invalidate (no tautology)
+`FlakyBackend::FailThenOk(n)` passes even if `resolve` stays OUTSIDE the loop (same backend re-prompted). The test
+registry MUST: (a) count `resolve` calls, (b) count `invalidate` calls, (c) make SUCCESS depend on a POST-`invalidate`
+FRESH backend instance (e.g. the spawn fn hands out a backend that fails until `invalidate` swaps in a fresh one).
+Assert `resolve_count == attempts`, `invalidate_count == attempts-1`, and success only after the fresh resolve.
+
+### PR-FIX-7 (BLOCKER-7, T6) — resume-compat: test a DROPPED runner future (crash), NOT cancellation
+Cancellation is the WRONG proxy: `run_node` emits `NodeFinished` on EVERY return incl. canceled (`executor.rs:615`),
+and detached mode checkpoints it (`detached.rs:310`) — so a canceled retry IS seeded. Resume-compat holds only for a
+CRASH = the retry future DROPPED before returning. T6 must DROP/abort the runner task while a node's retry future is
+still pending (mid-backoff) and assert NO `NodeFinished`/checkpoint was emitted for the node (so W3b re-runs it).
+(Use the detached/run harness; abort the spawned run task mid-flight, or drop the `run_from` future.)
+
+### PR-FIX-8 (MAJOR-8) — prove `ConfigInvalid` stays fatal WITH retry enabled
+The existing configure fail-fast test (`executor.rs:1519` via `one_node_graph()` `:761`) has NO retry policy, so it
+doesn't prove fail-fast when retry is ON. Add/extend a test with `retry: Some(RetryPolicy{max_attempts:3,..})` + a
+backend whose `configure_session` returns `ConfigInvalid` → assert exactly ONE configure attempt, ZERO prompts, ZERO
+invalidates (non-transient ⇒ no retry).
+
+### PR-FIX-9 (MAJOR-9, T3) — test the GRAPH MAPPING, not just TOML deser
+T3's deser-only test doesn't prove `WorkflowNodeToml.retry` reaches `WorkflowNode.retry`. The mapping is reachable via
+`RegistryConfig::load_workflows` (the `WorkflowNode {` build at `config.rs:970`). Make a mapping assertion MANDATORY:
+a temp prompt file + `load_workflows` → `WorkflowGraph.nodes[0].retry == Some(RetryPolicy{..})`.
+
+### PR-FIX-10 (MAJOR-10, T5) — test last-attempt usage (SR-FIX-4)
+Add a retry test where a FAILED attempt emits `Update::Usage(A)` and the SUCCESSFUL final attempt emits
+`Update::Usage(B)` → assert the node's reported usage `== B` (last attempt), NOT `A+B`.
+
+### Revised task structure (net of the folds)
+T1 `is_transient` (unchanged) → **T2 `RetryPolicy` + `WorkflowNode.retry` + `retry: None` at ALL ~32 workspace
+literals (PR-FIX-1) + overflow-safe `backoff_for`** → **T3 config `retry` + the load_workflows graph-mapping test
+(PR-FIX-9)** → **T4 `AgentRegistry::invalidate`: shared write-lock with `apply` (PR-FIX-2) + detached lease-drained
+retirement of the old slot (PR-FIX-3) + the `Slot::new`/`State` type fix (PR-FIX-4) + the resolve/invalidate-counting
+test (toward PR-FIX-6)** → **T5 the retry loop: `Attempt` enum with `Option<backend>` (PR-FIX-5), reset =
+release(if backend)+invalidate+backoff+re-resolve, cancel-abortable overflow-safe backoff, last-attempt usage; tests:
+fail-then-ok proving resolve-in-loop+invalidate counts (PR-FIX-6), exhaust, non-transient, no-policy,
+cancel-mid-backoff, retry-enabled-ConfigInvalid-fail-fast (PR-FIX-8), last-attempt-usage (PR-FIX-10)** → **T6
+resume-compat via a DROPPED runner future (PR-FIX-7) + workspace gate**. After folding PR-FIX-1..10 the plan is
+**ready-to-implement**.
