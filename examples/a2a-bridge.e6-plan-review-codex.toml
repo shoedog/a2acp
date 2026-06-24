@@ -1,0 +1,17 @@
+# Codex (gpt-5.5, effort=xhigh) as the PLAN REVIEWER for E6 (node retry). Read-only sandbox.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "e6-plan-review"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/e6-plan-review.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8141"
