@@ -142,3 +142,94 @@ architects/verifies-in-clean-host-env/commits/live-gates. Stage ONLY each task's
 pre-existing untracked `examples/*.toml`/`prompts/*.md` + `M examples/a2a-bridge.slicing-analysis.toml` — NEVER fold).
 The controller re-runs runtime tests in the clean host env (codex's sandbox `_dyld_start` stall). `cargo test
 --workspace --all-targets` is the gate.
+
+---
+
+## v2 — dual spec-review folded (codex xhigh: 2 BLOCKER + 3 MAJOR + 1 MINOR; Opus lens) — BINDING
+
+> Supersedes v1 where it conflicts. The ARCHITECTURE HOLDS (opt-in per-node retry in `run_node`, default off) — but
+> the RESET CONTRACT between attempts is the crux and v1 got it wrong (`forget_session` is not a reset). Apply each
+> SR-FIX. VERDICT after folding: ready-to-plan (the plan details the reset seam + decides the registry-invalidation size).
+
+### SR-FIX-1 (BLOCKER-1) — the retry loop wraps `resolve()`, not just configure→prompt
+The `_dyld_start`/startup flake is an `AgentCrashed` from `registry.resolve()`'s LAZY spawn (`registry.rs:305-312`
+`get_or_try_init`), BEFORE the prompt/drain sites (`acp_backend.rs:948/1237`). On a failed spawn the `OnceCell` stays
+UNINITIALIZED (`registry.rs:306`) → a later `resolve()` RESPAWNS. **So the retry loop must span
+`resolve() → configure_session → prompt → drain`** — then a startup-flake re-resolve respawns the agent FOR FREE. (v1's
+hook starting at configure/prompt missed the headline flake.) `run_node`'s `resolve` is at `~:269`.
+
+### SR-FIX-2 (BLOCKER-2) — the RESET CONTRACT: `release_session` + a UNIQUE per-attempt `SessionId` + re-`resolve`
+`forget_session` is NOT a clean reset for plain ACP: it clears config/turn metadata only (`acp_backend.rs:2616-2621`),
+NOT the agent session map or the process; `ensure_session` REUSES the existing session (`:1604/1635`); only
+`release_session` drops it (`:2705`); and the registry reuses one backend `Arc` per agent (`registry.rs:308`). So a
+retry that `forget`s + re-prompts the SAME `SessionId` reuses the stale (possibly dead) session. **Reset between
+attempts = (a) `release_session(prior_attempt_sid)` (drops the agent session + reaps a `:rw` container), (b) a UNIQUE
+per-attempt `SessionId` (e.g. suffix `-a{N}`) so `ensure_session` creates a FRESH session, (c) re-`resolve()`.**
+- Process-ALIVE transients (`AgentOverloaded`, `AgentTimedOut`): the fresh session re-prompts the same alive process →
+  clean retry. ✓ Works for ALL cold backends.
+- STARTUP-failure `AgentCrashed` (resolve-time, `OnceCell` uninitialized): re-`resolve()` respawns. ✓
+- MID-TURN `AgentCrashed` (spawned then died, `OnceCell` INITIALIZED): re-`resolve()` returns the cached DEAD `Arc` →
+  retry is futile WITHOUT a registry **invalidate-and-respawn** seam. **DECISION FOR THE PLAN:** either (i) add a
+  minimal registry "invalidate agent backend" seam (drop the `OnceCell` so re-resolve respawns) — preferred, delivers
+  full crash-recovery — or (ii) scope the MVP transient set to `AgentOverloaded | AgentTimedOut | resolve-time
+  AgentCrashed` and document mid-turn-crash retry as best-effort/deferred. The plan reads the registry seam to size (i).
+
+### SR-FIX-3 (MAJOR-3) — resolve the `configure_session` inconsistency (preserve the T6 fix)
+v1 was inconsistent (binding context said prompt/drain; mechanics said configure). RESOLUTION: the retry loop gates
+EVERY site (`resolve`/`configure`/`prompt`/`drain`) by `is_transient()`. The E1/T6 fail-node-on-configure-error
+behavior (`executor.rs:275-291`, regression test `:1519`) is PRESERVED because that error is `ConfigInvalid`
+(NON-transient → no retry → fail-fast). A genuinely TRANSIENT configure error (e.g. a worktree-add git lock that
+escaped the T3 bounded retry) would now retry — acceptable + strictly better. Keep/extend the T6 test (ConfigInvalid
+still fails on attempt 1, no retry).
+
+### SR-FIX-4 (MAJOR-4 + Opus-1) — usage = LAST observed attempt, do NOT sum the carrier
+`UsageSnapshot { used, size, cost, at_ms }` (`orch.rs:37`) has NO additive semantics: `size` is the context-window
+size (summing corrupts `windowFraction = used/size`, the Slice-10 panel signal, `executor.rs:69`), `cost` is
+mixed-currency, `at_ms` is a timestamp. **D5 REVISED: report the LAST observed attempt's `UsageSnapshot`** (matches
+existing downstream meaning). The failed attempts' tokens are uncounted in the report (a minor, documented cost on the
+rare retry). A true cross-attempt cost carrier is DEFERRED (needs explicit per-field aggregation).
+
+### SR-FIX-5 (MAJOR-5 + D6) — write side-effects: retry is RECOMMENDED for read-only nodes; write-node reset deferred
+`container_rw` per-turn retries reuse the same writable cwd + open a fresh container against it with NO reset
+(`container/lib.rs:463-524`), unlike the warm-respawn path which resets first (`resilient.rs:97`). So retrying a
+WRITE-capable node may re-apply edits. **D6 REVISED:** retry is opt-in per node; v1 RECOMMENDS enabling it only on
+READ-ONLY nodes (review/design — the bulk of the dogfooded loop + the stated value). A pre-retry reset hook for
+write-capable nodes (clean the worktree/clone before re-attempt) is DEFERRED + documented. The spec/plan do NOT
+auto-guard; the operator scopes retry to read-only nodes.
+
+### SR-FIX-6 (MINOR-6 + D3) — observability = `tracing` for MVP
+`OrchEventKind` has no retry variant and `frame_from_orch` `unreachable!`s on unmapped kinds
+(`detached.rs:98`). **D3 CONFIRMED:** MVP emits `tracing::warn!(node, attempt, reason)` per retry. A rich
+`OrchEventKind::NodeRetry` (journal + watch-visible) is DEFERRED (full DTO/journal/frame/watch wiring).
+
+### Q/D answers — LOCKED (both lenses)
+- **Q1/D1 backoff:** simple exponential with a CAP — `min(backoff_ms * 2^(attempt-1), backoff_cap_ms)`. `RetryPolicy`
+  gains `backoff_cap_ms: Option<u64>` (default ~30_000). The backoff sleep MUST be `tokio::select!`-able against the
+  cancel token (abort mid-backoff). Default `backoff_ms=500`.
+- **Q2/D2:** per-node policy ONLY for MVP; global default deferred. `retry: None` ⇒ 1 attempt (zero behavior change).
+- **Q3/D3:** `tracing` only (SR-FIX-6).
+- **Q4/D4 transient set:** `AgentCrashed | AgentOverloaded | AgentTimedOut`. Everything else fails fast — auth/
+  permission/config/model/request/state/not-found/message-size/store/upstream/`FrameError`/session/cancel all need
+  human/config action, indicate protocol/state/persistence bugs, or are user intent. **NOTE the `AgentCrashed` split**
+  (resolve-time respawns free; mid-turn needs the SR-FIX-2 invalidation decision). `is_transient()` is COLD-only —
+  do NOT reuse the warm-respawn classifier (`resilient.rs`, which treats `AgentTimedOut` fatal + `FrameError`/
+  `SessionNotFound` transient — deliberately different).
+- **Q5/D6:** read-only-recommended (SR-FIX-5).
+- **Q6 watchdog:** COMPOSES — ACP makes fresh per-turn watchdog state in `prompt_inner` (`acp_backend.rs:2248`) with
+  biased arbitration (`:2357`); each retry = a new prompt = a fresh watchdog. Retrying `AgentTimedOut` is sound,
+  bounded by attempts. (Opus note: with `AgentTimedOut` retryable, worst-case wall = `max_attempts × watchdog_window` —
+  document the time-budget implication; operators sizing `max_attempts` for timeout-prone nodes should account for it.)
+- **Q7/D5:** last-attempt usage (SR-FIX-4).
+- **Resume claim CONFIRMED:** mid-retry unfinished nodes are NOT checkpointed until `NodeFinished`
+  (`executor.rs:615` → `detached.rs:310`) → re-run free on resume; exhausted `ok=false` checkpoints are seeded+skipped
+  (`detached.rs:1492`, `executor.rs:534`), terminal-failure short-circuited (`detached.rs:1546`). The deferral (don't
+  re-run exhausted failures) is REAL + acceptable-if-documented. **Opus-3 gap to name:** a LONG transient outage
+  (longer than `max_attempts × backoff`) exhausts in-run retries → node fails permanently even though a restart later
+  would succeed; resume does NOT recover it (documented MVP limitation; operator re-submits).
+
+### Revised scope summary (net of the folds)
+`is_transient()` (bridge-core) → `RetryPolicy { max_attempts, backoff_ms, backoff_cap_ms }` on `WorkflowNode` (rides
+`encode_workflow_spec`) ← `WorkflowNodeToml.retry` → the retry loop in `run_node` spanning resolve→configure→prompt→
+drain with the release+fresh-SessionId+re-resolve RESET, `is_transient`-gated, cancel-abortable (incl. backoff),
+last-attempt usage, `tracing` observability. PLAN decides the registry invalidate-and-respawn seam (full mid-turn-crash
+recovery) vs the scoped-transient-set fallback. Read-only-recommended; resume-compat asserted (no new code).
