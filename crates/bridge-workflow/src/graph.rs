@@ -40,9 +40,7 @@ impl RetryPolicy {
         let base = if shift >= 64 {
             u64::MAX
         } else {
-            self.backoff_ms
-                .checked_mul(1u64 << shift)
-                .unwrap_or(u64::MAX)
+            self.backoff_ms.saturating_mul(1u64 << shift)
         };
         std::time::Duration::from_millis(base.min(cap))
     }
