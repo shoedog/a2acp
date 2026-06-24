@@ -233,3 +233,65 @@ auto-guard; the operator scopes retry to read-only nodes.
 drain with the release+fresh-SessionId+re-resolve RESET, `is_transient`-gated, cancel-abortable (incl. backoff),
 last-attempt usage, `tracing` observability. PLAN decides the registry invalidate-and-respawn seam (full mid-turn-crash
 recovery) vs the scoped-transient-set fallback. Read-only-recommended; resume-compat asserted (no new code).
+
+---
+
+## v3 — spec v2 RE-REVIEW folded (codex xhigh: 1 BLOCKER + 1 MAJOR + 1 MINOR + 1 NIT; Opus re-lens) — BINDING
+
+> Supersedes v2 where it conflicts. The re-review CONFIRMED SR-FIX-1/3/4/5/6 RESOLVED and SR-FIX-2
+> PARTIALLY-RESOLVED — the reset's BRIDGE-side piece is right, but **backend invalidation for a dead cached process**
+> was left too loose, and that gap hits `AgentTimedOut` too (the watchdog can KILL the process past grace,
+> `acp_backend.rs:2376/2435`, yet still report `AgentTimedOut`). v3 promotes the invalidation seam INTO SCOPE so the
+> headline crash+timeout recovery actually works. VERDICT after folding: ready-to-plan (the plan designs the seam).
+
+### RR-FIX-1 (BLOCKER) — adopt the registry INVALIDATE-AND-RESPAWN seam; respawn every retry
+The registry caches ONE backend `Arc` per slot in a `OnceCell` (`registry.rs:32-34`); after a mid-turn process death
+(`AgentCrashed`) OR a watchdog process-kill (`AgentTimedOut` past grace) the cached `Arc` is DEAD and `resolve()`
+returns it again → retry is futile. The `AgentRegistry` trait has no invalidate (`ports.rs:197`). **DECISION: add a
+minimal `AgentRegistry::invalidate(&self, agent: &AgentId)` seam** (default no-op for mocked registries) that
+ATOMICALLY replaces that agent's `Slot` with a fresh one (new `OnceCell`) via an `ArcSwap` state store — mirroring
+`apply`'s atomic slot swap (`registry.rs:366-412`). Concurrent resolvers keep their already-held `Arc` clones
+(unaffected); the NEXT `resolve()` respawns. The retry RESET between attempts is then:
+`release_session(node_sid)` → `registry.invalidate(node.agent)` → re-`resolve()` (respawn) → re-`configure_session`
+→ re-`prompt`. **Respawn EVERY attempt** is the simplest correct reset (a fresh process per retry — recovers
+`AgentCrashed` startup+mid-turn AND `AgentTimedOut` killed-or-not AND `AgentOverloaded`). Optimizing to
+respawn-only-on-death-signals is a documented follow-on (spawn+handshake latency per retry is acceptable for the rare
+retry). The plan designs the `invalidate` impl + the `apply`-vs-`invalidate` ArcSwap concurrency.
+
+### RR-FIX-2 (MAJOR) — `release_session` is BRIDGE-side; respawn handles the agent side (no `session/close` needed)
+`release_session` cancels + drops the bridge `sessions` map + config stash (`acp_backend.rs:2705-2715`) but does NOT
+send ACP `session/close` (capability-advertised, unimplemented). With RR-FIX-1's respawn-every-attempt, the OLD
+process (and all its agent-side sessions) DIES when invalidated → no stale agent-side session, no `session/close`
+required. Spec wording corrected: the reset "drops bridge-side session state + replaces the process," not "re-mints a
+fresh `session/new` on the same process." (Opus-R1: with respawn, the SAME node `SessionId` is reused — the FRESH
+process mints a new session for it; the v2 unique-per-attempt `-a{N}` `SessionId` is DROPPED as redundant. The
+re-review confirmed `-a{N}` would be valid (`ids.rs:10` rejects only empty) and downstream keys on `NodeId` not
+`SessionId`, so either works — same-id is simpler.)
+
+### RR-FIX-3 (MINOR) — backoff arithmetic must be overflow-safe
+`min(backoff_ms * 2^(attempt-1), backoff_cap_ms)` can overflow `u64` before the `min`. Implementation: compute with
+`checked_shl`/`saturating_mul` (saturate to `u64::MAX` on overflow) then `min(.., backoff_cap_ms)` BEFORE
+`Duration::from_millis`. `backoff_cap_ms` defaults to 30_000. (A high `attempt` thus clamps to the cap, never panics.)
+
+### RR-FIX-4 (NIT) — drop the misleading "transient configure error" example
+The v2 "worktree-add git lock" example for a retryable configure error is wrong: host worktree-add failures return
+`ConfigInvalid` (NON-transient, `host_git.rs:90/102`) → SR-FIX-3 fails them fast. There is NO transient configure
+error today; the retry loop's configure-site gating by `is_transient` is FUTURE-PROOFING (if a transient configure
+error variant is ever added). Reword — no example claimed.
+
+### Fold status (re-review, for the record)
+- SR-FIX-1 RESOLVED · SR-FIX-2 → now COMPLETED by RR-FIX-1+2 · SR-FIX-3 RESOLVED (T6 `ConfigInvalid` fail-fast,
+  test `:1549`) · SR-FIX-4 RESOLVED (last-attempt usage; `size`/`cost` non-additive) · SR-FIX-5 RESOLVED (read-only
+  recommended) · SR-FIX-6 RESOLVED (`tracing`; `frame_from_orch` can't map a new kind).
+- Downstream stable: checkpoints/watch/rich-sink key on `NodeId` (`detached.rs`/`executor.rs`), not the cold
+  `SessionId`. `backoff_cap_ms: Option<u64>` with serde default round-trips `encode_workflow_spec` cleanly.
+
+### Revised scope summary (net of v2 + v3)
+`is_transient()` (bridge-core) · `RetryPolicy { max_attempts, backoff_ms, backoff_cap_ms }` on `WorkflowNode` (rides
+`encode_workflow_spec`) ← `WorkflowNodeToml.retry` · NEW `AgentRegistry::invalidate(agent)` seam (atomic Slot
+replacement) · the retry loop in `run_node` spanning resolve→configure→prompt→drain, `is_transient`-gated,
+cancel-abortable (incl. overflow-safe backoff sleep), with the RESET = release_session + invalidate + re-resolve
+(respawn) + re-configure + re-prompt (same node `SessionId`), last-attempt usage, `tracing` observability,
+read-only-recommended. Resume-compat asserted (no new code). DEFERRED: respawn-only-on-death optimization,
+resume-re-run of exhausted failures, warm-turn retry, write-node pre-retry reset, rich `NodeRetry` event, global
+retry default.
