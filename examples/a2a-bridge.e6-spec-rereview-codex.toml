@@ -1,0 +1,17 @@
+# Codex (gpt-5.5, effort=xhigh) RE-REVIEWING E6 spec v2 (validate the SR-FIX folds + the reset contract). Read-only.
+default = "codex"
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+model = "gpt-5.5"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+[[workflows]]
+id = "e6-spec-rereview"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt_file = "../prompts/e6-spec-rereview.md"
+inputs = []
+[server]
+addr = "127.0.0.1:8140"
