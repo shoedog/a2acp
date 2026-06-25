@@ -25,6 +25,10 @@ pub type SpawnFn = Arc<
 /// Default grace before a lease-draining retirement task force-retires a backend
 /// whose leases never reach zero (e.g. a stuck in-flight prompt). [spec §7]
 pub(crate) const DEFAULT_RETIRE_GRACE: Duration = Duration::from_secs(30);
+/// Retry invalidation swaps in a fresh slot immediately, but the old slot may
+/// still be serving a sibling workflow node. Keep the normal lease-drain-first
+/// behavior and use a long force deadline only as a leaked-lease backstop.
+const INVALIDATE_RETIRE_GRACE: Duration = Duration::from_secs(3600);
 
 /// One registry slot: the (swappable) entry config, the lazily-spawned backend,
 /// a retired flag (set by reconcile in T4/T5), the active-lease counter, and a
@@ -448,7 +452,7 @@ impl AgentRegistry for Registry {
         }));
 
         old_slot.retired.store(true, SeqCst);
-        Self::spawn_retirement(old_slot, self.grace);
+        Self::spawn_retirement(old_slot, INVALIDATE_RETIRE_GRACE);
     }
 
     fn list(&self) -> Vec<AgentId> {
@@ -880,6 +884,33 @@ mod tests {
         drop((b1, b2));
         await_retired(&retired, 1).await;
         drop(b3);
+    }
+
+    #[tokio::test]
+    async fn invalidate_waits_for_held_lease_before_retiring() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::with_grace(
+            snapshot(&["a"]),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+        let a = AgentId::parse("a").unwrap();
+
+        let held = reg.resolve(&a).await.unwrap();
+        assert_eq!(count.load(SeqCst), 1);
+
+        reg.invalidate(&a).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            retired.load(SeqCst),
+            0,
+            "retry invalidation must not retire a backend while a sibling holds its lease"
+        );
+
+        drop(held);
+        await_retired(&retired, 1).await;
     }
 
     #[tokio::test]

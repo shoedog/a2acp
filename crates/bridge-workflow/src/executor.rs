@@ -270,6 +270,7 @@ impl WorkflowExecutor {
             },
             Canceled {
                 marker: String,
+                usage: Option<UsageSnapshot>,
             },
             Fatal {
                 text: String,
@@ -296,6 +297,7 @@ impl WorkflowExecutor {
                     _ = cancel.cancelled() => {
                         break 'attempt Attempt::Canceled {
                             marker: format!("[node {} canceled]", node.id.as_str()),
+                            usage: None,
                         };
                     }
                     r = self.registry.resolve(&node.agent) => match r {
@@ -344,6 +346,7 @@ impl WorkflowExecutor {
                     resolved.backend.forget_session(&session).await;
                     break 'attempt Attempt::Canceled {
                         marker: format!("[node {} canceled]", node.id.as_str()),
+                        usage: None,
                     };
                 }
                 // prompt, with cancel
@@ -354,6 +357,7 @@ impl WorkflowExecutor {
                         resolved.backend.forget_session(&session).await;
                         break 'attempt Attempt::Canceled {
                             marker: format!("[node {} canceled]", node.id.as_str()),
+                            usage: None,
                         };
                     }
                     s = async {
@@ -462,7 +466,10 @@ impl WorkflowExecutor {
                 }
                 if canceled_during_drain {
                     resolved.backend.forget_session(&session).await;
-                    break 'attempt Attempt::Canceled { marker: text };
+                    break 'attempt Attempt::Canceled {
+                        marker: text,
+                        usage,
+                    };
                 }
                 if let Some(e) = err {
                     if retry_enabled && e.is_transient() {
@@ -485,7 +492,7 @@ impl WorkflowExecutor {
             };
 
             match outcome {
-                Attempt::Canceled { marker } => return (marker, false, None),
+                Attempt::Canceled { marker, usage } => return (marker, false, usage),
                 Attempt::Ok { text, usage } => return (text, true, usage),
                 Attempt::Fatal { text, usage } => return (text, false, usage),
                 Attempt::Transient { err, usage } => {
@@ -953,6 +960,10 @@ mod tests {
         },
         NonTransientPrompt,
         ConfigInvalid,
+        UsageThenPending {
+            usage: UsageSnapshot,
+            usage_notify: Arc<tokio::sync::Notify>,
+        },
     }
 
     #[derive(Default)]
@@ -1017,6 +1028,20 @@ mod tests {
                     Result<Update, BridgeError>,
                 >::new(
                 )))),
+                RetryBehavior::UsageThenPending {
+                    usage,
+                    usage_notify,
+                } => {
+                    let usage = usage.clone();
+                    let usage_notify = usage_notify.clone();
+                    Ok(Box::pin(
+                        futures::stream::once(async move {
+                            usage_notify.notify_waiters();
+                            Ok(Update::Usage(usage))
+                        })
+                        .chain(futures::stream::pending()),
+                    ))
+                }
             }
         }
 
@@ -1245,6 +1270,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_cancel_preserves_usage_without_retry_policy() {
+        let rec = Arc::new(RetryRec::default());
+        let cancel = CancellationToken::new();
+        let usage_notify = Arc::new(tokio::sync::Notify::new());
+        let observed_usage = usage(616);
+        let run = tokio::spawn(run_retry_case(
+            RetryBehavior::UsageThenPending {
+                usage: observed_usage.clone(),
+                usage_notify: usage_notify.clone(),
+            },
+            None,
+            cancel.clone(),
+            rec.clone(),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), usage_notify.notified())
+            .await
+            .expect("backend should emit usage before hanging");
+        cancel.cancel();
+
+        let events = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .expect("cancel must end the hanging drain promptly")
+            .unwrap();
+        let (ok, output, reported_usage) = only_node_finished(&events);
+        assert!(!*ok);
+        assert_eq!(output, "[node only canceled]");
+        assert_eq!(reported_usage, &Some(observed_usage));
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn dropped_mid_retry_emits_no_checkpoint() {
         let rec = Arc::new(RetryRec::default());
         let ex = WorkflowExecutor::new(Arc::new(RetryRegistry {
@@ -1271,7 +1328,7 @@ mod tests {
             matches!(first, WorkflowEvent::NodeStarted { .. }),
             "first event should be NodeStarted, got {first:?}"
         );
-        let seen = vec![first];
+        let mut seen = vec![first];
 
         let next = stream.next();
         tokio::pin!(next);
@@ -1282,7 +1339,10 @@ mod tests {
                 }
                 tokio::select! {
                     item = &mut next => {
-                        panic!("stream yielded before entering retry backoff: {item:?}");
+                        let event = item
+                            .expect("stream should remain open before retry backoff")
+                            .expect("workflow event should be Ok before retry backoff");
+                        seen.push(event);
                     }
                     _ = rec.invalidate_notify.notified() => {}
                 }
