@@ -224,6 +224,7 @@ fn workflow(id: &str) -> Arc<WorkflowGraph> {
             agent: AgentId::parse("codex").unwrap(),
             prompt_template: "{{input}}".into(),
             inputs: Vec::new(),
+            retry: None,
         }],
         panel: None,
     })

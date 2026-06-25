@@ -219,6 +219,7 @@ fn review_graph() -> Arc<WorkflowGraph> {
         agent: AgentId::parse(ag).unwrap(),
         prompt_template: tpl.into(),
         inputs: ins.iter().map(|i| NodeId::parse(*i).unwrap()).collect(),
+        retry: None,
     };
     Arc::new(WorkflowGraph {
         id: WorkflowId::parse("code-review").unwrap(),
@@ -530,12 +531,14 @@ async fn write_ahead_barrier() {
                 agent: AgentId::parse("a").unwrap(),
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
+                retry: None,
             },
             WorkflowNode {
                 id: NodeId::parse("b").unwrap(),
                 agent: AgentId::parse("b").unwrap(),
                 prompt_template: "got {{a}}".into(),
                 inputs: vec![NodeId::parse("a").unwrap()],
+                retry: None,
             },
         ],
         panel: None,

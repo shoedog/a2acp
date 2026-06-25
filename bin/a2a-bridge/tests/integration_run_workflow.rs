@@ -141,6 +141,7 @@ fn load_workflow_map(
                     .iter()
                     .map(|i| NodeId::parse(i.clone()).map_err(|e| format!("{e:?}")))
                     .collect::<Result<_, _>>()?,
+                retry: None,
             });
         }
         let g = WorkflowGraph {

@@ -130,6 +130,19 @@ impl BridgeError {
             BridgeError::AuthRequired { .. } | BridgeError::PermissionRequired { .. }
         )
     }
+
+    /// True for failures that a workflow node MAY retry (the agent crashed, is overloaded, or hung) —
+    /// the single source of truth for E6 retry. COLD-workflow-only; do NOT reuse the warm-respawn
+    /// classifier (`resilient.rs`, deliberately different). Everything else needs human/config action,
+    /// indicates a protocol/state/persistence bug, or is user intent (cancel) → fail fast.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            BridgeError::AgentCrashed { .. }
+                | BridgeError::AgentOverloaded
+                | BridgeError::AgentTimedOut
+        )
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +277,49 @@ mod tests {
     #[test]
     fn agent_overloaded_displays() {
         assert_eq!(BridgeError::AgentOverloaded.to_string(), "agent overloaded");
+    }
+
+    #[test]
+    fn is_transient_covers_every_variant() {
+        use BridgeError::*;
+
+        for e in [
+            AgentCrashed { reason: "x".into() },
+            AgentOverloaded,
+            AgentTimedOut,
+        ] {
+            assert!(e.is_transient(), "{e:?} must be transient");
+        }
+
+        for e in [
+            A2aVersionMismatch,
+            InvalidRequest { field: "x" },
+            TaskNotFound,
+            SessionNotFound,
+            ConfigMismatch { field: "x" },
+            ConfigReseedRequired { field: "x" },
+            SessionExpired,
+            HandleBusy,
+            AuthRequired {
+                request_id: "r".into(),
+            },
+            PermissionRequired {
+                request_id: "r".into(),
+            },
+            PermissionDenied,
+            AgentNotAuthenticated,
+            ModelNotAvailable,
+            CancelTimeout,
+            FrameError,
+            MessageTooLarge,
+            UpstreamA2aError,
+            StoreFailure,
+            InvalidStateTransition,
+            UnknownAgent { id: "a".into() },
+            ConfigInvalid { reason: "x".into() },
+        ] {
+            assert!(!e.is_transient(), "{e:?} must not be transient");
+        }
     }
 
     #[test]

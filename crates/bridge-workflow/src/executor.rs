@@ -262,130 +262,275 @@ impl WorkflowExecutor {
                 )
             }
         };
-        // resolve, with cancel
-        let resolved = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return (format!("[node {} canceled]", node.id.as_str()), false, None),
-            r = self.registry.resolve(&node.agent) => match r {
-                Ok(r) => r,
-                Err(e) => return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false, None),
+
+        enum Attempt {
+            Ok {
+                text: String,
+                usage: Option<UsageSnapshot>,
             },
-        };
-        let eff = effective_config(&resolved.entry, None);
-        if let Err(e) = resolved
-            .backend
-            .configure_session(
-                &session,
-                &SessionSpec {
-                    config: eff,
-                    cwd: ctx.session_cwd.clone(),
-                },
-            )
-            .await
-        {
-            resolved.backend.forget_session(&session).await;
-            return (
-                format!("[node {} failed: configure {:?}]", node.id.as_str(), e),
-                false,
-                None,
-            );
+            Canceled {
+                marker: String,
+                usage: Option<UsageSnapshot>,
+            },
+            Fatal {
+                text: String,
+                usage: Option<UsageSnapshot>,
+            },
+            Transient {
+                err: BridgeError,
+                usage: Option<UsageSnapshot>,
+            },
         }
-        if cancel.is_cancelled() {
-            resolved.backend.forget_session(&session).await;
-            return (format!("[node {} canceled]", node.id.as_str()), false, None);
-        }
-        // prompt, with cancel
-        let rich_sink;
-        let mut stream = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                resolved.backend.forget_session(&session).await;
+
+        let attempts = node.retry.as_ref().map(|r| r.attempts()).unwrap_or(1);
+        let retry_enabled = node.retry.is_some();
+        for attempt in 1..=attempts {
+            if cancel.is_cancelled() {
                 return (format!("[node {} canceled]", node.id.as_str()), false, None);
             }
-            s = async {
-                let sink = ctx.make_rich_sink.as_ref().map(|factory| factory.make(&node.id));
-                let parts = vec![Part { text: rendered }];
-                let stream = match &sink {
-                    Some(sink) => resolved.backend.prompt_observed(&session, parts, sink.clone()).await,
-                    None => resolved.backend.prompt(&session, parts).await,
+
+            let should_retry_after_attempt = attempt < attempts;
+            let outcome = 'attempt: {
+                // resolve, with cancel
+                let resolved = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        break 'attempt Attempt::Canceled {
+                            marker: format!("[node {} canceled]", node.id.as_str()),
+                            usage: None,
+                        };
+                    }
+                    r = self.registry.resolve(&node.agent) => match r {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if retry_enabled && e.is_transient() {
+                                break 'attempt Attempt::Transient { err: e, usage: None };
+                            }
+                            break 'attempt Attempt::Fatal {
+                                text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                                usage: None,
+                            };
+                        }
+                    },
                 };
-                (sink, stream)
-            } => match s {
-                (sink, Ok(s)) => {
-                    rich_sink = sink;
-                    s
+                let eff = effective_config(&resolved.entry, None);
+                if let Err(e) = resolved
+                    .backend
+                    .configure_session(
+                        &session,
+                        &SessionSpec {
+                            config: eff,
+                            cwd: ctx.session_cwd.clone(),
+                        },
+                    )
+                    .await
+                {
+                    if retry_enabled && e.is_transient() {
+                        if should_retry_after_attempt {
+                            resolved.backend.release_session(&session).await;
+                        } else {
+                            resolved.backend.forget_session(&session).await;
+                        }
+                        break 'attempt Attempt::Transient {
+                            err: e,
+                            usage: None,
+                        };
+                    }
+                    resolved.backend.forget_session(&session).await;
+                    break 'attempt Attempt::Fatal {
+                        text: format!("[node {} failed: configure {:?}]", node.id.as_str(), e),
+                        usage: None,
+                    };
                 }
-                (sink, Err(e)) => {
-                    if let Some(sink) = &sink {
-                        if let Err(flush_err) = sink.flush().await {
-                            eprintln!(
-                                "rich sink flush failed after prompt error for node {}: {:?}",
-                                node.id.as_str(),
-                                flush_err
-                            );
+                if cancel.is_cancelled() {
+                    resolved.backend.forget_session(&session).await;
+                    break 'attempt Attempt::Canceled {
+                        marker: format!("[node {} canceled]", node.id.as_str()),
+                        usage: None,
+                    };
+                }
+                // prompt, with cancel
+                let rich_sink;
+                let mut stream = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        resolved.backend.forget_session(&session).await;
+                        break 'attempt Attempt::Canceled {
+                            marker: format!("[node {} canceled]", node.id.as_str()),
+                            usage: None,
+                        };
+                    }
+                    s = async {
+                        let sink = ctx.make_rich_sink.as_ref().map(|factory| factory.make(&node.id));
+                        let parts = vec![Part { text: rendered.clone() }];
+                        let stream = match &sink {
+                            Some(sink) => resolved.backend.prompt_observed(&session, parts, sink.clone()).await,
+                            None => resolved.backend.prompt(&session, parts).await,
+                        };
+                        (sink, stream)
+                    } => match s {
+                        (sink, Ok(s)) => {
+                            rich_sink = sink;
+                            s
+                        }
+                        (sink, Err(e)) => {
+                            if let Some(sink) = &sink {
+                                if let Err(flush_err) = sink.flush().await {
+                                    eprintln!(
+                                        "rich sink flush failed after prompt error for node {}: {:?}",
+                                        node.id.as_str(),
+                                        flush_err
+                                    );
+                                }
+                            }
+                            if retry_enabled && e.is_transient() {
+                                if should_retry_after_attempt {
+                                    resolved.backend.release_session(&session).await;
+                                } else {
+                                    resolved.backend.forget_session(&session).await;
+                                }
+                                break 'attempt Attempt::Transient { err: e, usage: None };
+                            }
+                            resolved.backend.forget_session(&session).await;
+                            break 'attempt Attempt::Fatal {
+                                text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                                usage: None,
+                            };
+                        }
+                    },
+                };
+                let mut text = String::new();
+                let mut ok = true;
+                let mut canceled_during_drain = false;
+                let mut last_usage: Option<UsageSnapshot> = None;
+                let mut err: Option<BridgeError> = None;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            let _ = resolved.backend.cancel(&session).await;
+                            canceled_during_drain = true;
+                            ok = false;
+                            text = format!("[node {} canceled]", node.id.as_str());
+                            break;
+                        }
+                        item = stream.next() => match item {
+                            Some(Ok(Update::Text(t))) => text.push_str(&t),
+                            Some(Ok(Update::Permission(_))) => {} // safe: backends resolve permission internally
+                            Some(Ok(Update::Usage(u))) => {
+                                last_usage = Some(u);
+                            }
+                            Some(Ok(Update::Done { stop_reason })) => {
+                                if stop_reason == STOP_REASON_CANCELLED { ok = false; }
+                                break;
+                            }
+                            Some(Err(e)) => {
+                                ok = false;
+                                text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
+                                err = Some(e);
+                                break;
+                            }
+                            None => break,
                         }
                     }
+                }
+                // Keep whatever usage the agent reported, even on error/cancel (see the warm path):
+                // `last_usage` is `None` only when no `Update::Usage` was ever observed.
+                let mut usage = last_usage;
+                if let Some(sink) = &rich_sink {
+                    if let Err(e) = sink.flush().await {
+                        if !ok {
+                            let exit = if canceled_during_drain {
+                                "node cancellation"
+                            } else {
+                                "node failure"
+                            };
+                            eprintln!(
+                                "rich sink flush failed after {exit} for node {}: {:?}",
+                                node.id.as_str(),
+                                e
+                            );
+                            usage = None;
+                        } else {
+                            resolved.backend.forget_session(&session).await;
+                            break 'attempt Attempt::Fatal {
+                                text: format!(
+                                    "[node {} rich-flush failed: {:?}]",
+                                    node.id.as_str(),
+                                    e
+                                ),
+                                usage: None,
+                            };
+                        }
+                    }
+                }
+                if canceled_during_drain {
                     resolved.backend.forget_session(&session).await;
-                    return (format!("[node {} failed: {:?}]", node.id.as_str(), e), false, None);
-                }
-            },
-        };
-        let mut text = String::new();
-        let mut ok = true;
-        let mut canceled_during_drain = false;
-        let mut last_usage: Option<UsageSnapshot> = None;
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    let _ = resolved.backend.cancel(&session).await;
-                    canceled_during_drain = true;
-                    ok = false; text = format!("[node {} canceled]", node.id.as_str()); break;
-                }
-                item = stream.next() => match item {
-                    Some(Ok(Update::Text(t))) => text.push_str(&t),
-                    Some(Ok(Update::Permission(_))) => {} // safe: backends resolve permission internally
-                    Some(Ok(Update::Usage(u))) => {
-                        last_usage = Some(u);
-                    }
-                    Some(Ok(Update::Done { stop_reason })) => {
-                        if stop_reason == STOP_REASON_CANCELLED { ok = false; }
-                        break;
-                    }
-                    Some(Err(e)) => { ok = false; text = format!("[node {} failed: {:?}]", node.id.as_str(), e); break; }
-                    None => break,
-                }
-            }
-        }
-        // Keep whatever usage the agent reported, even on error/cancel (see the warm path):
-        // `last_usage` is `None` only when no `Update::Usage` was ever observed.
-        let usage = last_usage;
-        if let Some(sink) = &rich_sink {
-            if let Err(e) = sink.flush().await {
-                if !ok {
-                    let exit = if canceled_during_drain {
-                        "node cancellation"
-                    } else {
-                        "node failure"
+                    break 'attempt Attempt::Canceled {
+                        marker: text,
+                        usage,
                     };
-                    eprintln!(
-                        "rich sink flush failed after {exit} for node {}: {:?}",
-                        node.id.as_str(),
-                        e
-                    );
+                }
+                if let Some(e) = err {
+                    if retry_enabled && e.is_transient() {
+                        if should_retry_after_attempt {
+                            resolved.backend.release_session(&session).await;
+                        } else {
+                            resolved.backend.forget_session(&session).await;
+                        }
+                        break 'attempt Attempt::Transient { err: e, usage };
+                    }
                     resolved.backend.forget_session(&session).await;
-                    return (text, ok, None);
+                    break 'attempt Attempt::Fatal { text, usage };
                 }
                 resolved.backend.forget_session(&session).await;
-                return (
-                    format!("[node {} rich-flush failed: {:?}]", node.id.as_str(), e),
-                    false,
-                    None,
-                );
+                if ok {
+                    Attempt::Ok { text, usage }
+                } else {
+                    Attempt::Fatal { text, usage }
+                }
+            };
+
+            match outcome {
+                Attempt::Canceled { marker, usage } => return (marker, false, usage),
+                Attempt::Ok { text, usage } => return (text, true, usage),
+                Attempt::Fatal { text, usage } => return (text, false, usage),
+                Attempt::Transient { err, usage } => {
+                    let err_for_log = err.clone();
+                    if should_retry_after_attempt {
+                        self.registry.invalidate(&node.agent).await;
+                        tracing::warn!(
+                            node = node.id.as_str(),
+                            attempt,
+                            error = ?err_for_log,
+                            "node retry"
+                        );
+                        let retry = node.retry.as_ref().expect("retry attempts require policy");
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                return (
+                                    format!("[node {} canceled]", node.id.as_str()),
+                                    false,
+                                    None,
+                                );
+                            }
+                            _ = tokio::time::sleep(retry.backoff_for(attempt)) => {}
+                        }
+                        continue;
+                    }
+                    return (
+                        format!(
+                            "[node {} failed after {attempts} attempts: {err:?}]",
+                            node.id.as_str()
+                        ),
+                        false,
+                        usage,
+                    );
+                }
             }
         }
-        resolved.backend.forget_session(&session).await;
-        (text, ok, usage)
+        unreachable!("retry attempts are always at least one")
     }
 
     /// Run a workflow from scratch (no prior checkpoints).
@@ -640,7 +785,7 @@ impl WorkflowExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{WorkflowGraph, WorkflowNode};
+    use crate::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
     use bridge_core::domain::{Part, RegistrySnapshot, SessionSpec};
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, NodeId, SessionId, WorkflowId};
@@ -766,9 +911,487 @@ mod tests {
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "echo {{input}}".into(),
                 inputs: vec![],
+                retry: None,
             }],
             panel: None,
         })
+    }
+
+    fn retry_graph(retry: Option<RetryPolicy>) -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("codex").unwrap(),
+                prompt_template: "echo {{input}}".into(),
+                inputs: vec![],
+                retry,
+            }],
+            panel: None,
+        })
+    }
+
+    fn retry_policy(max_attempts: u32, backoff_ms: u64) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            backoff_ms,
+            backoff_cap_ms: None,
+        }
+    }
+
+    fn usage(used: u64) -> UsageSnapshot {
+        UsageSnapshot {
+            used: Some(used),
+            size: Some(10_000),
+            cost: None,
+            at_ms: used as i64,
+        }
+    }
+
+    #[derive(Clone)]
+    enum RetryBehavior {
+        SucceedsAfterInvalidates {
+            required_invalidates: usize,
+        },
+        AlwaysTimedOutWithUsage {
+            final_generation: usize,
+            first_usage: UsageSnapshot,
+            final_usage: UsageSnapshot,
+        },
+        NonTransientPrompt,
+        ConfigInvalid,
+        UsageThenPending {
+            usage: UsageSnapshot,
+            usage_notify: Arc<tokio::sync::Notify>,
+        },
+    }
+
+    #[derive(Default)]
+    struct RetryRec {
+        resolve_count: AtomicUsize,
+        invalidate_count: AtomicUsize,
+        configure_count: AtomicUsize,
+        prompt_count: AtomicUsize,
+        release_count: AtomicUsize,
+        forget_count: AtomicUsize,
+        prompt_notify: tokio::sync::Notify,
+        invalidate_notify: tokio::sync::Notify,
+    }
+
+    struct RetryBackend {
+        behavior: RetryBehavior,
+        generation: usize,
+        rec: Arc<RetryRec>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for RetryBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.rec.prompt_count.fetch_add(1, Ordering::SeqCst);
+            self.rec.prompt_notify.notify_waiters();
+            match &self.behavior {
+                RetryBehavior::SucceedsAfterInvalidates {
+                    required_invalidates,
+                } => {
+                    if self.generation < *required_invalidates {
+                        Err(BridgeError::AgentOverloaded)
+                    } else {
+                        Ok(Box::pin(tokio_stream::iter(vec![
+                            Ok(Update::Text("OK".into())),
+                            Ok(Update::Done {
+                                stop_reason: "end_turn".into(),
+                            }),
+                        ])))
+                    }
+                }
+                RetryBehavior::AlwaysTimedOutWithUsage {
+                    final_generation,
+                    first_usage,
+                    final_usage,
+                } => {
+                    let usage = if self.generation == *final_generation {
+                        final_usage.clone()
+                    } else {
+                        first_usage.clone()
+                    };
+                    Ok(Box::pin(tokio_stream::iter(vec![
+                        Ok(Update::Usage(usage)),
+                        Err(BridgeError::AgentTimedOut),
+                    ])))
+                }
+                RetryBehavior::NonTransientPrompt => Err(BridgeError::PermissionDenied),
+                RetryBehavior::ConfigInvalid => Ok(Box::pin(tokio_stream::iter(Vec::<
+                    Result<Update, BridgeError>,
+                >::new(
+                )))),
+                RetryBehavior::UsageThenPending {
+                    usage,
+                    usage_notify,
+                } => {
+                    let usage = usage.clone();
+                    let usage_notify = usage_notify.clone();
+                    Ok(Box::pin(
+                        futures::stream::once(async move {
+                            usage_notify.notify_waiters();
+                            Ok(Update::Usage(usage))
+                        })
+                        .chain(futures::stream::pending()),
+                    ))
+                }
+            }
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            _s: &SessionId,
+            _spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            self.rec.configure_count.fetch_add(1, Ordering::SeqCst);
+            if matches!(&self.behavior, RetryBehavior::ConfigInvalid) {
+                Err(BridgeError::ConfigInvalid {
+                    reason: "invalid test config".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn forget_session(&self, _s: &SessionId) {
+            self.rec.forget_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn release_session(&self, _s: &SessionId) {
+            self.rec.release_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct RetryRegistry {
+        behavior: RetryBehavior,
+        rec: Arc<RetryRec>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for RetryRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            self.rec.resolve_count.fetch_add(1, Ordering::SeqCst);
+            let generation = self.rec.invalidate_count.load(Ordering::SeqCst);
+            Ok(Resolved {
+                entry: Arc::new(minimal_entry(id)),
+                backend: Arc::new(RetryBackend {
+                    behavior: self.behavior.clone(),
+                    generation,
+                    rec: self.rec.clone(),
+                }),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+
+        async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn invalidate(&self, _agent: &AgentId) {
+            self.rec.invalidate_count.fetch_add(1, Ordering::SeqCst);
+            self.rec.invalidate_notify.notify_waiters();
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    async fn run_retry_case(
+        behavior: RetryBehavior,
+        retry: Option<RetryPolicy>,
+        cancel: CancellationToken,
+        rec: Arc<RetryRec>,
+    ) -> Vec<WorkflowEvent> {
+        let ex = WorkflowExecutor::new(Arc::new(RetryRegistry { behavior, rec }));
+        ex.run(retry_graph(retry), "DIFF".into(), "run1".into(), cancel)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn only_node_finished(events: &[WorkflowEvent]) -> (&bool, &String, &Option<UsageSnapshot>) {
+        match events
+            .iter()
+            .find(|e| matches!(e, WorkflowEvent::NodeFinished { .. }))
+            .unwrap()
+        {
+            WorkflowEvent::NodeFinished {
+                ok, output, usage, ..
+            } => (ok, output, usage),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_transient_failures() {
+        let rec = Arc::new(RetryRec::default());
+        let events = run_retry_case(
+            RetryBehavior::SucceedsAfterInvalidates {
+                required_invalidates: 2,
+            },
+            Some(retry_policy(3, 0)),
+            CancellationToken::new(),
+            rec.clone(),
+        )
+        .await;
+
+        let (ok, output, usage) = only_node_finished(&events);
+        assert!(*ok, "node should recover after retry: {output}");
+        assert_eq!(output, "OK");
+        assert_eq!(usage, &None);
+        assert_eq!(rec.resolve_count.load(Ordering::SeqCst), 3);
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 2);
+        assert_eq!(rec.release_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_exhausts_then_degrades_with_last_usage() {
+        let rec = Arc::new(RetryRec::default());
+        let final_usage = usage(777);
+        let events = run_retry_case(
+            RetryBehavior::AlwaysTimedOutWithUsage {
+                final_generation: 1,
+                first_usage: usage(111),
+                final_usage: final_usage.clone(),
+            },
+            Some(retry_policy(2, 0)),
+            CancellationToken::new(),
+            rec.clone(),
+        )
+        .await;
+
+        let (ok, output, reported_usage) = only_node_finished(&events);
+        assert!(!*ok, "exhausted retry must degrade");
+        assert!(
+            output.contains("after 2 attempts"),
+            "unexpected retry marker: {output}"
+        );
+        assert_eq!(reported_usage, &Some(final_usage));
+        assert_eq!(rec.resolve_count.load(Ordering::SeqCst), 2);
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_transient_fails_without_retry() {
+        let rec = Arc::new(RetryRec::default());
+        let events = run_retry_case(
+            RetryBehavior::NonTransientPrompt,
+            Some(retry_policy(3, 0)),
+            CancellationToken::new(),
+            rec.clone(),
+        )
+        .await;
+
+        let (ok, output, _) = only_node_finished(&events);
+        assert!(!*ok);
+        assert!(
+            output.contains("PermissionDenied"),
+            "unexpected non-transient marker: {output}"
+        );
+        assert_eq!(rec.resolve_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn no_retry_policy_is_single_attempt() {
+        let rec = Arc::new(RetryRec::default());
+        let events = run_retry_case(
+            RetryBehavior::AlwaysTimedOutWithUsage {
+                final_generation: 0,
+                first_usage: usage(222),
+                final_usage: usage(333),
+            },
+            None,
+            CancellationToken::new(),
+            rec.clone(),
+        )
+        .await;
+
+        let (ok, output, _) = only_node_finished(&events);
+        assert!(!*ok);
+        assert!(
+            output.contains("AgentTimedOut"),
+            "single-attempt path should keep today's marker: {output}"
+        );
+        assert!(
+            !output.contains("after 1 attempts"),
+            "retry marker must stay disabled when retry is None: {output}"
+        );
+        assert_eq!(rec.resolve_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_backoff_aborts_retry() {
+        let rec = Arc::new(RetryRec::default());
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn(run_retry_case(
+            RetryBehavior::AlwaysTimedOutWithUsage {
+                final_generation: usize::MAX,
+                first_usage: usage(444),
+                final_usage: usage(555),
+            },
+            Some(retry_policy(5, 60_000)),
+            cancel.clone(),
+            rec.clone(),
+        ));
+
+        while rec.invalidate_count.load(Ordering::SeqCst) == 0 {
+            rec.invalidate_notify.notified().await;
+        }
+        cancel.cancel();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .expect("cancel must abort retry backoff promptly")
+            .unwrap();
+        let (ok, output, usage) = only_node_finished(&events);
+        assert!(!*ok);
+        assert_eq!(output, "[node only canceled]");
+        assert_eq!(usage, &None);
+        assert_eq!(rec.resolve_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_cancel_preserves_usage_without_retry_policy() {
+        let rec = Arc::new(RetryRec::default());
+        let cancel = CancellationToken::new();
+        let usage_notify = Arc::new(tokio::sync::Notify::new());
+        let observed_usage = usage(616);
+        let run = tokio::spawn(run_retry_case(
+            RetryBehavior::UsageThenPending {
+                usage: observed_usage.clone(),
+                usage_notify: usage_notify.clone(),
+            },
+            None,
+            cancel.clone(),
+            rec.clone(),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), usage_notify.notified())
+            .await
+            .expect("backend should emit usage before hanging");
+        cancel.cancel();
+
+        let events = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .expect("cancel must end the hanging drain promptly")
+            .unwrap();
+        let (ok, output, reported_usage) = only_node_finished(&events);
+        assert!(!*ok);
+        assert_eq!(output, "[node only canceled]");
+        assert_eq!(reported_usage, &Some(observed_usage));
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_mid_retry_emits_no_checkpoint() {
+        let rec = Arc::new(RetryRec::default());
+        let ex = WorkflowExecutor::new(Arc::new(RetryRegistry {
+            behavior: RetryBehavior::AlwaysTimedOutWithUsage {
+                final_generation: usize::MAX,
+                first_usage: usage(444),
+                final_usage: usage(555),
+            },
+            rec: rec.clone(),
+        }));
+        let mut stream = ex.run(
+            retry_graph(Some(retry_policy(5, 60_000))),
+            "DIFF".into(),
+            "run1".into(),
+            CancellationToken::new(),
+        );
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("executor should emit NodeStarted before retry backoff")
+            .expect("stream should yield NodeStarted")
+            .expect("NodeStarted should be Ok");
+        assert!(
+            matches!(first, WorkflowEvent::NodeStarted { .. }),
+            "first event should be NodeStarted, got {first:?}"
+        );
+        let mut seen = vec![first];
+
+        let next = stream.next();
+        tokio::pin!(next);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if rec.invalidate_count.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::select! {
+                    item = &mut next => {
+                        let event = item
+                            .expect("stream should remain open before retry backoff")
+                            .expect("workflow event should be Ok before retry backoff");
+                        seen.push(event);
+                    }
+                    _ = rec.invalidate_notify.notified() => {}
+                }
+            }
+        })
+        .await
+        .expect("retry path should invalidate before the long backoff");
+
+        // `next` is a `Pin<&mut Next>`; dropping it is a no-op for Drop but ends the borrow of
+        // `stream` (NLL last-use) so `stream` itself can be dropped to simulate the crash.
+        #[allow(clippy::drop_non_drop)]
+        drop(next);
+        drop(stream);
+
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, WorkflowEvent::NodeFinished { .. })),
+            "dropping the stream mid-backoff must not record NodeFinished"
+        );
+        assert_eq!(rec.resolve_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rec.prompt_count.load(Ordering::SeqCst),
+            1,
+            "dropping the stream mid-backoff must not run another prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_enabled_config_invalid_fails_fast() {
+        let rec = Arc::new(RetryRec::default());
+        let events = run_retry_case(
+            RetryBehavior::ConfigInvalid,
+            Some(retry_policy(3, 0)),
+            CancellationToken::new(),
+            rec.clone(),
+        )
+        .await;
+
+        let (ok, output, _) = only_node_finished(&events);
+        assert!(!*ok);
+        assert!(
+            output.starts_with("[node only failed: configure "),
+            "unexpected configure marker: {output}"
+        );
+        assert_eq!(rec.configure_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.prompt_count.load(Ordering::SeqCst), 0);
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1259,18 +1882,21 @@ mod tests {
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
+                    retry: None,
                 },
             ],
             panel: None,
@@ -1664,6 +2290,7 @@ mod tests {
             agent: AgentId::parse(ag).unwrap(),
             prompt_template: tpl.into(),
             inputs: ins.iter().map(|i| NodeId::parse(*i).unwrap()).collect(),
+            retry: None,
         };
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("code-review").unwrap(),
@@ -1693,12 +2320,14 @@ mod tests {
                     agent: AgentId::parse("codex").unwrap(),
                     prompt_template: "draft {{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("refinenode").unwrap(),
                     agent: AgentId::parse("claude").unwrap(),
                     prompt_template: "refine against {{draft}} for {{input}}".into(),
                     inputs: vec![NodeId::parse("draftnode").unwrap()],
+                    retry: None,
                 },
             ],
             panel: None,
@@ -1832,18 +2461,21 @@ mod tests {
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
+                    retry: None,
                 },
             ],
             panel: None,
@@ -1887,18 +2519,21 @@ mod tests {
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "got {{a}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap()],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("c").unwrap(),
                     agent: AgentId::parse("c").unwrap(),
                     prompt_template: "got {{b}}".into(),
                     inputs: vec![NodeId::parse("b").unwrap()],
+                    retry: None,
                 },
             ],
             panel: None,
@@ -1981,12 +2616,14 @@ mod tests {
                     agent: AgentId::parse("member_a").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("member_b").unwrap(),
                     agent: AgentId::parse("member_b").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("synth").unwrap(),
@@ -1996,6 +2633,7 @@ mod tests {
                         NodeId::parse("member_a").unwrap(),
                         NodeId::parse("member_b").unwrap(),
                     ],
+                    retry: None,
                 },
             ],
             panel: None,
@@ -2170,18 +2808,21 @@ mod tests {
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
+                    retry: None,
                 },
             ],
             panel: None,
@@ -2326,18 +2967,21 @@ mod tests {
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
+                    retry: None,
                 },
             ],
             panel: None,
@@ -2809,18 +3453,21 @@ mod tests {
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "got {{a}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap()],
+                    retry: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("c").unwrap(),
                     agent: AgentId::parse("c").unwrap(),
                     prompt_template: "got {{b}}".into(),
                     inputs: vec![NodeId::parse("b").unwrap()],
+                    retry: None,
                 },
             ],
             panel: None,

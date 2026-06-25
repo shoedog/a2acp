@@ -257,12 +257,22 @@ pub struct PanelTomlSection {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct RetryToml {
+    pub max_attempts: u32,
+    pub backoff_ms: u64,
+    #[serde(default)]
+    pub backoff_cap_ms: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct WorkflowNodeToml {
     pub id: String,
     pub agent: String,
     pub prompt_file: String,
     #[serde(default)]
     pub inputs: Vec<String>,
+    #[serde(default)]
+    pub retry: Option<RetryToml>,
 }
 
 /// `[registry]` section — optional; controls which cmds are allowed.
@@ -982,6 +992,14 @@ impl RegistryConfig {
                         .map_err(|e| {
                             ConfigError::Registry(format!("workflow {} input id: {e:?}", w.id))
                         })?,
+                    retry: n
+                        .retry
+                        .as_ref()
+                        .map(|r| bridge_workflow::graph::RetryPolicy {
+                            max_attempts: r.max_attempts,
+                            backoff_ms: r.backoff_ms,
+                            backoff_cap_ms: r.backoff_cap_ms,
+                        }),
                 });
             }
             let g = WorkflowGraph {
@@ -2477,6 +2495,43 @@ addr="127.0.0.1:8080"
             .unwrap();
         assert_eq!(g.nodes[0].prompt_template, "review {{input}}");
         g.validate().unwrap();
+    }
+
+    #[test]
+    fn workflow_node_retry_parses() {
+        let toml = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+            [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n\
+            retry = {{ max_attempts = 3, backoff_ms = 250 }}\n{SERVER_FOOTER}"
+        );
+        let cfg = RegistryConfig::parse(&toml).unwrap();
+        let r = cfg.workflows[0].nodes[0].retry.as_ref().unwrap();
+        assert_eq!((r.max_attempts, r.backoff_ms), (3, 250));
+        assert_eq!(r.backoff_cap_ms, None);
+    }
+
+    #[test]
+    fn workflow_node_retry_maps_into_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.md"), "review {{input}}").unwrap();
+        let toml = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+            [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n\
+            retry = {{ max_attempts = 3, backoff_ms = 250 }}\n{SERVER_FOOTER}"
+        );
+        let cfg = RegistryConfig::parse(&toml).unwrap();
+        let map = cfg.load_workflows(dir.path()).unwrap();
+        let g = map
+            .get(&bridge_core::ids::WorkflowId::parse("wf1").unwrap())
+            .unwrap();
+        assert_eq!(
+            g.nodes[0].retry,
+            Some(bridge_workflow::graph::RetryPolicy {
+                max_attempts: 3,
+                backoff_ms: 250,
+                backoff_cap_ms: None,
+            })
+        );
     }
 
     #[test]
