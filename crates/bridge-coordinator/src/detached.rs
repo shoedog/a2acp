@@ -1973,7 +1973,9 @@ mod resume_tests {
         .await
         .expect("resume should re-run and checkpoint the uncheckpointed retry node");
 
-        let prompts = synth.prompts.lock().unwrap();
+        // Clone the prompts out of the std MutexGuard in a scope so the guard is dropped before any
+        // await below (clippy await_holding_lock doesn't honor an explicit drop()).
+        let prompts: Vec<String> = { synth.prompts.lock().unwrap().clone() };
         assert_eq!(
             prompts.len(),
             1,

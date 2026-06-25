@@ -1351,6 +1351,9 @@ mod tests {
         .await
         .expect("retry path should invalidate before the long backoff");
 
+        // `next` is a `Pin<&mut Next>`; dropping it is a no-op for Drop but ends the borrow of
+        // `stream` (NLL last-use) so `stream` itself can be dropped to simulate the crash.
+        #[allow(clippy::drop_non_drop)]
         drop(next);
         drop(stream);
 
