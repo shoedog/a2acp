@@ -1679,7 +1679,7 @@ mod resume_tests {
     use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
     use bridge_workflow::executor::WorkflowExecutor;
-    use bridge_workflow::graph::{PanelConfig, WorkflowGraph, WorkflowNode};
+    use bridge_workflow::graph::{PanelConfig, RetryPolicy, WorkflowGraph, WorkflowNode};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -1806,6 +1806,24 @@ mod resume_tests {
         })
     }
 
+    fn single_retry_graph() -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("retry-resume").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("synth").unwrap(),
+                prompt_template: "resume {{input}}".into(),
+                inputs: vec![],
+                retry: Some(RetryPolicy {
+                    max_attempts: 5,
+                    backoff_ms: 60_000,
+                    backoff_cap_ms: None,
+                }),
+            }],
+            panel: None,
+        })
+    }
+
     #[tokio::test]
     async fn resume_working_task_synth_sees_checkpointed_member_usage() {
         let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
@@ -1904,6 +1922,74 @@ mod resume_tests {
             prompt.contains("| claude | 42 | 100 |"),
             "resumed synth costs table includes claude usage: {prompt}"
         );
+    }
+
+    #[tokio::test]
+    async fn working_task_without_checkpoint_reruns_on_resume() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let task = TaskId::parse("t-resume-no-checkpoint").unwrap();
+        let graph = single_retry_graph();
+        store
+            .create(&TaskRecord {
+                id: task.clone(),
+                workflow: "retry-resume".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+                input: "DIFF".into(),
+                workflow_spec_json: Some(encode_workflow_spec(&graph)),
+                resume_attempts: 0,
+                session_cwd: None,
+            })
+            .await
+            .unwrap();
+
+        let synth = Arc::new(PromptRec::default());
+        let executor = Arc::new(WorkflowExecutor::new(Arc::new(RecordingRegistry {
+            synth: synth.clone(),
+        })));
+        let deps = DetachedDeps {
+            task_store: store.clone(),
+            executor: Some(executor),
+            workflows: Arc::new(HashMap::new()),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+        };
+
+        resume_working_tasks(&deps, 1).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let cps = store.node_checkpoints(&task).await.unwrap();
+                if !cps.is_empty() {
+                    return cps;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resume should re-run and checkpoint the uncheckpointed retry node");
+
+        let prompts = synth.prompts.lock().unwrap();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "resume should invoke the node prompt once"
+        );
+        assert!(
+            prompts[0].contains("resume DIFF"),
+            "resumed prompt should use the original task input: {}",
+            prompts[0]
+        );
+
+        let checkpoints = store.node_checkpoints(&task).await.unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].0.as_str(), "only");
+        assert_eq!(checkpoints[0].1, "FINAL");
+        assert!(checkpoints[0].2);
     }
 }
 

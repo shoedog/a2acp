@@ -1245,6 +1245,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_mid_retry_emits_no_checkpoint() {
+        let rec = Arc::new(RetryRec::default());
+        let ex = WorkflowExecutor::new(Arc::new(RetryRegistry {
+            behavior: RetryBehavior::AlwaysTimedOutWithUsage {
+                final_generation: usize::MAX,
+                first_usage: usage(444),
+                final_usage: usage(555),
+            },
+            rec: rec.clone(),
+        }));
+        let mut stream = ex.run(
+            retry_graph(Some(retry_policy(5, 60_000))),
+            "DIFF".into(),
+            "run1".into(),
+            CancellationToken::new(),
+        );
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("executor should emit NodeStarted before retry backoff")
+            .expect("stream should yield NodeStarted")
+            .expect("NodeStarted should be Ok");
+        assert!(
+            matches!(first, WorkflowEvent::NodeStarted { .. }),
+            "first event should be NodeStarted, got {first:?}"
+        );
+        let seen = vec![first];
+
+        let next = stream.next();
+        tokio::pin!(next);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if rec.invalidate_count.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::select! {
+                    item = &mut next => {
+                        panic!("stream yielded before entering retry backoff: {item:?}");
+                    }
+                    _ = rec.invalidate_notify.notified() => {}
+                }
+            }
+        })
+        .await
+        .expect("retry path should invalidate before the long backoff");
+
+        drop(next);
+        drop(stream);
+
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, WorkflowEvent::NodeFinished { .. })),
+            "dropping the stream mid-backoff must not record NodeFinished"
+        );
+        assert_eq!(rec.resolve_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rec.prompt_count.load(Ordering::SeqCst),
+            1,
+            "dropping the stream mid-backoff must not run another prompt"
+        );
+    }
+
+    #[tokio::test]
     async fn retry_enabled_config_invalid_fails_fast() {
         let rec = Arc::new(RetryRec::default());
         let events = run_retry_case(
