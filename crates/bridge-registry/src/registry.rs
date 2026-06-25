@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures::future::BoxFuture;
-use tokio::sync::{Notify, OnceCell};
+use tokio::sync::{Mutex, Notify, OnceCell};
 
 use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot};
 use bridge_core::error::BridgeError;
@@ -92,6 +92,7 @@ impl Lease for LeaseGuard {
 pub struct Registry {
     state: ArcSwap<State>,
     spawn: SpawnFn,
+    write_lock: Mutex<()>,
     /// Grace deadline for the lease-draining retirement task: if a retired slot's
     /// leases don't reach zero within this window, the backend is force-retired.
     grace: Duration,
@@ -250,6 +251,7 @@ impl Registry {
                 default: snap.default,
             }),
             spawn,
+            write_lock: Mutex::new(()),
             grace,
         })
     }
@@ -364,6 +366,7 @@ impl AgentRegistry for Registry {
     }
 
     async fn apply(&self, desired: RegistrySnapshot) -> Result<(), BridgeError> {
+        let _g = self.write_lock.lock().await;
         // Atomic reconcile [spec §7]:
         //  - validate first → malformed config is rejected before any state change.
         //  - reuse the live slot for a config-only edit (same cmd/args/cwd/auth_method)
@@ -428,6 +431,24 @@ impl AgentRegistry for Registry {
             }
         }
         Ok(())
+    }
+
+    async fn invalidate(&self, agent: &AgentId) {
+        let _g = self.write_lock.lock().await;
+        let cur = self.state.load_full();
+        let Some(old_slot) = cur.slots.get(agent).cloned() else {
+            return;
+        };
+        let entry = old_slot.entry.load_full();
+        let mut next = cur.slots.clone();
+        next.insert(agent.clone(), Slot::new((*entry).clone()));
+        self.state.store(Arc::new(State {
+            slots: next,
+            default: cur.default.clone(),
+        }));
+
+        old_slot.retired.store(true, SeqCst);
+        Self::spawn_retirement(old_slot, self.grace);
     }
 
     fn list(&self) -> Vec<AgentId> {
@@ -831,6 +852,34 @@ mod tests {
             1,
             "backend spawned exactly once (OnceCell reuse)"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidate_replaces_slot_so_next_resolve_respawns() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            snapshot(&["a"]),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap();
+        let a = AgentId::parse("a").unwrap();
+
+        let b1 = reg.resolve(&a).await.unwrap();
+        assert_eq!(count.load(SeqCst), 1);
+        let b2 = reg.resolve(&a).await.unwrap();
+        assert_eq!(count.load(SeqCst), 1, "cached resolve must not spawn");
+
+        reg.invalidate(&a).await;
+        let b3 = reg.resolve(&a).await.unwrap();
+        assert_eq!(count.load(SeqCst), 2, "invalidate forces a respawn");
+
+        reg.invalidate(&AgentId::parse("ghost").unwrap()).await;
+        assert_eq!(count.load(SeqCst), 2, "unknown invalidate is a no-op");
+
+        drop((b1, b2));
+        await_retired(&retired, 1).await;
+        drop(b3);
     }
 
     #[tokio::test]

@@ -201,6 +201,9 @@ pub trait AgentRegistry: Send + Sync {
     fn default_id(&self) -> crate::ids::AgentId;
     /// Atomically reconcile the registry to the given snapshot. [§4.5]
     async fn apply(&self, snapshot: RegistrySnapshot) -> Result<(), BridgeError>;
+    /// Drop the cached backend for `agent` so the next `resolve` RESPAWNS a fresh process (E6 retry
+    /// reset). Best-effort + idempotent; unknown agent ⇒ no-op. Default: no-op (non-spawning registries).
+    async fn invalidate(&self, _agent: &crate::ids::AgentId) {}
     /// List all registered agent ids.
     fn list(&self) -> Vec<crate::ids::AgentId>;
     /// Per-agent MCP server names, for agent-card advertisement (ADR-0028) — `(agent_id, [server
