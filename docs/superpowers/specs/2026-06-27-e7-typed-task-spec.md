@@ -469,3 +469,71 @@ One plan, with a clean optional cut if it grows: **Slice A** = `bridge-core::tas
 the most likely to need its own container live-gate).
 
 **RE-REVIEW TARGET (round 2):** with RR-FIX-1..12 → ready-to-plan.
+
+---
+
+## v4 (BINDING — round-2 re-review folds; supersedes earlier text on conflict)
+
+Round-2 dual re-review: **Opus = ready-to-plan** (all 12 RR-FIXes resolved, MINOR/NIT only); **codex = needs-revision**
+with 5 sharper edge cases (1 BLOCKER-rated correctness + 4 MAJOR). All 5 are MECHANICAL sharpenings of existing
+RR-FIXes — no decisions, no spikes. Folded as RR2-FIX-1..5; with these the spec is ready-to-plan. (Opus plan-sharpening
+notes — the exact 3-edit `BridgeError` ripple, the read-hoist wording, the typed-message resolved at `main.rs:2133`,
+`parse_for_render` = one-grammar/two-policies — are PLAN guidance, recorded under "Planning guidance" below.)
+
+### RR2-FIX-1 (BLOCKER — codex; sharpens RR-FIX-5) — read the input ONCE; validate the SAME bytes that dispatch
+v3's "validate after arg-parse + stdin at both read sites" is unsafe: stdin (`-`) can only be read ONCE, and two
+reads can validate different bytes than the run dispatches. Fix: read `--input <file|->` **once**, immediately after
+arg-parse, into one owned `String`; validate THAT string; pass the SAME owned string to dispatch — the local executor
+OR the `--serve` POST. The serve-client read (main.rs:2554) and the local read (main.rs:2834) are UNIFIED into one
+pre-branch read; there is no "both read sites."
+
+### RR2-FIX-2 (MAJOR — codex; sharpens RR-FIX-2) — invariant wording
+The invariant is "**every USER-SUBMITTED workflow/batch/implement entry is pre-gated**." INTERNAL generated executor
+calls — implement's review `review::build_review_input → executor.run_with_context` (main.rs:1455/1461) — are
+EXPLICIT bypasses, made safe by the lenient render parse (RR-FIX-4 / RR2-FIX-4: machine-built freeform input → no
+fabricated `task.*` vars). The lenient parse is precisely what covers these internal bypasses; "every executor caller
+pre-gated" was too strong.
+
+### RR2-FIX-3 (MAJOR — codex; sharpens RR-FIX-3) — the wire message is BRIDGE-AUTHORED + sanitized
+The unredacted `TaskSpecInvalid.message` is safe ONLY if it can't echo user content. The wire message (and the wire
+form of `TaskSpecError::Display`) is **bridge-authored fixed text only**: the valid-types list + the
+`task-spec schema`/`template` hint + a **sanitized + length-capped** unknown `task-type` value. It NEVER echoes raw
+input lines, file paths, or body text. `TaskSpecError::Parse(String)` detail stays in the server log (tracing) — same
+philosophy as the existing `client_message()` redaction (error.rs:94). This reconciles the unredacted-discovery-text
+requirement with the wire-leak guard.
+
+### RR2-FIX-4 (MAJOR — codex; sharpens RR-FIX-4) — fail-closed render must be OBSERVABLE in detached/batch
+A present-but-invalid render parse (reachable only via a missed gate or legacy-persisted-invalid input) must emit an
+explicit **terminal `Failed` carrying the safe discovery message**, persisted/published via the detached/batch
+finalize path — it must NOT be swallowed by the default no-op sink `error` (detached.rs:202) into the generic
+"workflow ended without terminal" (detached.rs:1270). The local CLI prints the safe message + exits non-zero.
+
+### RR2-FIX-5 (MAJOR — codex; sharpens RR-FIX-12 + RR-FIX-6) — commit-message extraction strips comments + falls back to title
+The scaffold's `## Commit Message` is an HTML comment, and the existing resolver accepts any non-blank string
+(implement.rs:121) — so a comment-only section would commit `<!-- … -->` verbatim. Fix the commit resolution: **strip
+HTML comments + whitespace; a comment-only / empty `Commit Message` is treated as ABSENT**; on absence fall back to the
+parsed **`task.title`** text (NOT the raw `# Title` markdown line, NOT the old first-line-of-body). Precedence:
+sanitized typed `Commit Message` (non-empty after comment-strip) > `.git/A2A_COMMIT_MSG` > `task.title` > task-derived
+default — each trimmed + NUL-stripped + 64 KiB-bounded.
+
+### Planning guidance (Opus round-2 — fold into the PLAN, not the spec)
+- The `BridgeError::TaskSpecInvalid` ripple is exactly THREE edits: (a) `disposition()` arm `=> RejectRequest`
+  (MANDATORY — the default `_ => SetState(Failed)` is the trap), (b) `client_message()` arm (clarity; the catch-all
+  already surfaces `Display`), (c) the `is_transient_covers_every_variant` test list (error.rs:283). No
+  `bridge_err_to_jsonrpc`/`is_transient`/`is_resumable` edits (they're `matches!`-based / disposition-driven).
+- RR-FIX-5 is a read-HOIST (move+unify the input read to main.rs:2675), not "add a validate call" — word the task so.
+- The typed commit message is resolved at the `commit_message(...)` call site (main.rs:2133), one `message` threaded
+  to both `host_commit` (2166) and the checkpoint `original_message` (2189); `tweak.rs`/`merge.rs` callers pass
+  `None`/the persisted copy (unchanged).
+- `parse_for_render` calls the SAME `task_spec::parse`; it differs from the gate ONLY in post-parse policy (gate:
+  reject; render: freeform-on-absent, observable-Failed-on-present-invalid). One grammar, two policies — not two scanners.
+- Single-agent footgun (a task-spec pasted into a `RouteTarget::Local` chat turn runs as raw text, front-matter and
+  all) is acceptable (a chat turn isn't a task) but ships a one-line doc note in `task-spec` help/onboarding.
+- Re-resolve the migration anchors at plan time against `docs/onboarding.md` + `docs/containerized-agents.md` (the
+  earlier anchors drifted).
+
+### RR-FIX closure (round 2)
+RR-FIX-1/7/8/9/10/11 → RESOLVED (both lenses). RR-FIX-2/3/4/5/6/12 → completed by RR2-FIX-1..5. **Slice A/B cut
+confirmed real** (Opus): one plan with the A|B boundary marked; split only if Slice A grows past a comfortable review.
+
+**STATUS: ready-to-plan.**
