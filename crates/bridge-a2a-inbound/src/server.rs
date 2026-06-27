@@ -2185,8 +2185,9 @@ pub async fn spawn_detached_workflow_with_token_for_test(
 pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
     match batch_deps(srv) {
         Some(bdeps) => bridge_coordinator::batch::resume_all(&bdeps, cap).await,
-        None => bridge_coordinator::detached::resume_non_batch_tasks(&detached_deps(srv), cap)
-            .await,
+        None => {
+            bridge_coordinator::detached::resume_non_batch_tasks(&detached_deps(srv), cap).await
+        }
     }
 }
 
@@ -3259,7 +3260,11 @@ async fn run_batch_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> Res
         Err(_) => return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "invalid RunBatch params"),
     };
     if params.items.is_empty() {
-        return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "RunBatch items must not be empty");
+        return jsonrpc_err(
+            id,
+            JSONRPC_INVALID_REQUEST,
+            "RunBatch items must not be empty",
+        );
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -3274,20 +3279,18 @@ async fn run_batch_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> Res
             );
         }
         let session_cwd = match item.session_cwd {
-            Some(raw) => match validate_cwd_str(
-                &raw,
-                bdeps.allowed_cwd_root.as_ref(),
-                "batch.item.cwd",
-            ) {
-                Ok(cwd) => Some(cwd.as_str().to_string()),
-                Err(_) => {
-                    return jsonrpc_err(
-                        id,
-                        JSONRPC_INVALID_REQUEST,
-                        &format!("invalid batch.item.cwd for item_id: {item_id}"),
-                    );
+            Some(raw) => {
+                match validate_cwd_str(&raw, bdeps.allowed_cwd_root.as_ref(), "batch.item.cwd") {
+                    Ok(cwd) => Some(cwd.as_str().to_string()),
+                    Err(_) => {
+                        return jsonrpc_err(
+                            id,
+                            JSONRPC_INVALID_REQUEST,
+                            &format!("invalid batch.item.cwd for item_id: {item_id}"),
+                        );
+                    }
                 }
-            },
+            }
             None => None,
         };
         items.push(BatchItem {

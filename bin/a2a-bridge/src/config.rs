@@ -2938,9 +2938,7 @@ path = "/tmp/x.db"
             }
         );
 
-        assert!(
-            batch_cfg("[batch]\nmax_concurrent = 0\ndefault_concurrency = 4\n").is_err()
-        );
+        assert!(batch_cfg("[batch]\nmax_concurrent = 0\ndefault_concurrency = 4\n").is_err());
 
         let omitted = batch_cfg("[batch]\nmax_concurrent = 5\n").unwrap().unwrap();
         assert_eq!(
@@ -2962,9 +2960,7 @@ path = "/tmp/x.db"
             }
         );
 
-        assert!(
-            batch_cfg("[batch]\nmax_concurrent = 3\ndefault_concurrency = 0\n").is_err()
-        );
+        assert!(batch_cfg("[batch]\nmax_concurrent = 3\ndefault_concurrency = 0\n").is_err());
     }
 
     // ---- [review] slice + threshold fields (Task 5) ----

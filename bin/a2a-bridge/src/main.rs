@@ -3217,8 +3217,8 @@ fn parse_run_batch_args(args: &[String]) -> Result<RunBatchArgs, BoxError> {
         )
         .into());
     }
-    let manifest =
-        manifest.ok_or_else(|| format!("run-batch: --manifest <file> is required\n{RUN_BATCH_USAGE}"))?;
+    let manifest = manifest
+        .ok_or_else(|| format!("run-batch: --manifest <file> is required\n{RUN_BATCH_USAGE}"))?;
     Ok(RunBatchArgs {
         workflow: positionals.remove(0),
         manifest,
@@ -3308,7 +3308,10 @@ async fn run_batch_cmd(args: &[String]) -> Result<(), BoxError> {
     if let Some(concurrency) = parsed.concurrency {
         params["concurrency"] = serde_json::json!(concurrency);
     }
-    let result = rpc_result(rpc_call(&parsed.url, "RunBatch", params).await?, "run-batch")?;
+    let result = rpc_result(
+        rpc_call(&parsed.url, "RunBatch", params).await?,
+        "run-batch",
+    )?;
     let batch_id = result["batchId"]
         .as_str()
         .ok_or("run-batch: response missing result.batchId")?
@@ -3332,7 +3335,10 @@ async fn batch_cmd(args: &[String]) -> Result<(), BoxError> {
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
     match sub {
         "status" => {
-            let id = args.get(1).cloned().ok_or("batch status: missing <batch-id>")?;
+            let id = args
+                .get(1)
+                .cloned()
+                .ok_or("batch status: missing <batch-id>")?;
             let summary = batch_status(url, &id).await?;
             println!("{}", batch_rollup(&summary));
         }
@@ -3351,7 +3357,10 @@ async fn batch_cmd(args: &[String]) -> Result<(), BoxError> {
             }
         }
         "cancel" => {
-            let id = args.get(1).cloned().ok_or("batch cancel: missing <batch-id>")?;
+            let id = args
+                .get(1)
+                .cloned()
+                .ok_or("batch cancel: missing <batch-id>")?;
             let result = rpc_result(
                 rpc_call(url, "CancelBatch", serde_json::json!({ "id": id })).await?,
                 "batch cancel",

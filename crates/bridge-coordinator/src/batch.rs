@@ -131,10 +131,7 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
     Ok(bid)
 }
 
-pub async fn batch_status(
-    deps: &BatchDeps,
-    id: &BatchId,
-) -> Result<BatchSummary, BridgeError> {
+pub async fn batch_status(deps: &BatchDeps, id: &BatchId) -> Result<BatchSummary, BridgeError> {
     let rec = deps
         .detached
         .task_store
@@ -159,10 +156,7 @@ pub async fn batch_status(
     Ok(summary)
 }
 
-pub async fn batch_list(
-    deps: &BatchDeps,
-    limit: usize,
-) -> Result<Vec<BatchSummary>, BridgeError> {
+pub async fn batch_list(deps: &BatchDeps, limit: usize) -> Result<Vec<BatchSummary>, BridgeError> {
     let batches = deps.detached.task_store.list_batches(limit).await?;
     let mut out = Vec::with_capacity(batches.len());
     for rec in batches {
@@ -210,7 +204,11 @@ pub async fn resume_all(deps: &BatchDeps, cap: u32) {
                         {
                             tracing::warn!(task = task.id.as_str(), batch = bid.as_str(), error = ?e, "batch resume: orphan child sweep failed");
                         } else {
-                            tracing::warn!(task = task.id.as_str(), batch = bid.as_str(), "batch resume: interrupted orphan batch child");
+                            tracing::warn!(
+                                task = task.id.as_str(),
+                                batch = bid.as_str(),
+                                "batch resume: interrupted orphan batch child"
+                            );
                         }
                     }
                 }
@@ -262,7 +260,11 @@ async fn cancel_working_children(deps: &BatchDeps, children: &[TaskRecord], reas
         {
             tracing::warn!(task = child.id.as_str(), error = ?e, "batch resume: cancel child failed");
         }
-        deps.detached.workflow_cancels.lock().await.remove(&child.id);
+        deps.detached
+            .workflow_cancels
+            .lock()
+            .await
+            .remove(&child.id);
     }
 }
 
@@ -491,8 +493,7 @@ pub async fn resume_batches(deps: &BatchDeps, cap: u32) {
                 continue;
             }
         };
-        let existing: HashSet<String> =
-            children.iter().filter_map(|c| c.item_id.clone()).collect();
+        let existing: HashSet<String> = children.iter().filter_map(|c| c.item_id.clone()).collect();
 
         if batch.status == BatchStatus::Canceling {
             cancel_working_children(deps, &children, "batch canceled during resume").await;
@@ -815,7 +816,11 @@ pub fn summarize_batch(rec: &BatchRecord, children: &[TaskRecord]) -> BatchSumma
             TaskRecordStatus::Canceled => canceled += 1,
             TaskRecordStatus::Working => running += 1,
         }
-        kids.push((c.item_id.clone().unwrap_or_default(), c.id.clone(), c.status));
+        kids.push((
+            c.item_id.clone().unwrap_or_default(),
+            c.id.clone(),
+            c.status,
+        ));
     }
 
     let pending = rec.total.saturating_sub(children.len() as u32);
@@ -852,7 +857,10 @@ mod tests {
         domain::{AgentEntry, AgentKind, Part, RegistrySnapshot},
         ids::{AgentId, BatchId, NodeId, SessionId, TaskId, WorkflowId},
         ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update},
-        task_store::{BatchItem, BatchRecord, BatchStatus, MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore},
+        task_store::{
+            BatchItem, BatchRecord, BatchStatus, MemoryTaskStore, TaskRecord, TaskRecordStatus,
+            TaskStore,
+        },
     };
     use bridge_workflow::executor::WorkflowExecutor;
     use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
@@ -1155,11 +1163,21 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(&batch_child(&bid, "item-0", TaskRecordStatus::Completed, false))
+            .create(&batch_child(
+                &bid,
+                "item-0",
+                TaskRecordStatus::Completed,
+                false,
+            ))
             .await
             .unwrap();
         store
-            .create(&batch_child(&bid, "item-1", TaskRecordStatus::Failed, false))
+            .create(&batch_child(
+                &bid,
+                "item-1",
+                TaskRecordStatus::Failed,
+                false,
+            ))
             .await
             .unwrap();
 
@@ -1225,7 +1243,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(&batch_child(&bid, "item-1", TaskRecordStatus::Working, true))
+            .create(&batch_child(
+                &bid,
+                "item-1",
+                TaskRecordStatus::Working,
+                true,
+            ))
             .await
             .unwrap();
 
@@ -1252,11 +1275,21 @@ mod tests {
         let a = BatchId::parse("batch-resume-cap-a").unwrap();
         let b = BatchId::parse("batch-resume-cap-b").unwrap();
         store
-            .create_batch(&batch_record("batch-resume-cap-a", BatchStatus::Working, 5, 5))
+            .create_batch(&batch_record(
+                "batch-resume-cap-a",
+                BatchStatus::Working,
+                5,
+                5,
+            ))
             .await
             .unwrap();
         store
-            .create_batch(&batch_record("batch-resume-cap-b", BatchStatus::Working, 5, 5))
+            .create_batch(&batch_record(
+                "batch-resume-cap-b",
+                BatchStatus::Working,
+                5,
+                5,
+            ))
             .await
             .unwrap();
         store
@@ -1297,7 +1330,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(&batch_child(&bid, "item-0", TaskRecordStatus::Working, true))
+            .create(&batch_child(
+                &bid,
+                "item-0",
+                TaskRecordStatus::Working,
+                true,
+            ))
             .await
             .unwrap();
 
@@ -1326,7 +1364,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .create(&batch_child(&bid, "item-0", TaskRecordStatus::Working, true))
+            .create(&batch_child(
+                &bid,
+                "item-0",
+                TaskRecordStatus::Working,
+                true,
+            ))
             .await
             .unwrap();
 
@@ -1351,7 +1394,12 @@ mod tests {
         rec.items_json = r#"{"v":99,"items":[]}"#.into();
         store.create_batch(&rec).await.unwrap();
         store
-            .create(&batch_child(&bid, "item-0", TaskRecordStatus::Working, true))
+            .create(&batch_child(
+                &bid,
+                "item-0",
+                TaskRecordStatus::Working,
+                true,
+            ))
             .await
             .unwrap();
 
@@ -1473,7 +1521,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let held = deps.runtime.semaphore.clone().acquire_owned().await.unwrap();
+        let held = deps
+            .runtime
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
         let token = CancellationToken::new();
         let h = tokio::spawn(run_admission(
             deps,
