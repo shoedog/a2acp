@@ -44,6 +44,58 @@ impl TaskRecordStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchStatus {
+    Working,
+    Completed,
+    Canceling,
+    Canceled,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BatchItem {
+    pub item_id: String,
+    pub input: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_cwd: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchRecord {
+    pub id: crate::ids::BatchId,
+    pub workflow: String,
+    pub concurrency: u32,
+    pub total: u32,
+    pub status: BatchStatus,
+    pub items_json: String,
+    pub error: Option<String>,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchSummary {
+    pub id: crate::ids::BatchId,
+    pub workflow: String,
+    pub status: BatchStatus,
+    pub total: u32,
+    pub ok: u32,
+    pub failed: u32,
+    pub canceled: u32,
+    pub running: u32,
+    pub pending: u32,
+    pub children: Vec<(String, crate::ids::TaskId, TaskRecordStatus)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildClaim {
+    Created,
+    ExistingWorking,
+    ExistingTerminal,
+}
+
 pub fn terminal_status_from_record(s: &TaskRecordStatus) -> crate::orch::TerminalStatus {
     use crate::orch::TerminalStatus;
     match s {
@@ -77,6 +129,8 @@ pub struct TaskRecord {
     /// in its OWN `tasks` column (NOT in the `workflow_spec_json` envelope) so it
     /// is independently accessible without deserializing the snapshot.
     pub session_cwd: Option<String>,
+    pub batch_id: Option<crate::ids::BatchId>,
+    pub item_id: Option<String>,
 }
 
 /// Outcome of a `claim_resume_attempt` call.
@@ -833,7 +887,35 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         }
+    }
+
+    #[test]
+    fn batch_id_parses_nonempty() {
+        assert!(crate::ids::BatchId::parse("batch-abc").is_ok());
+        assert!(crate::ids::BatchId::parse("").is_err());
+    }
+
+    #[test]
+    fn batch_status_serde_roundtrip() {
+        for s in [
+            BatchStatus::Working,
+            BatchStatus::Completed,
+            BatchStatus::Canceling,
+            BatchStatus::Canceled,
+            BatchStatus::Failed,
+        ] {
+            let j = serde_json::to_string(&s).unwrap();
+            assert_eq!(serde_json::from_str::<BatchStatus>(&j).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn task_record_batch_fields_default_none() {
+        let rec = rec("task-1", 0);
+        assert!(rec.batch_id.is_none() && rec.item_id.is_none());
     }
 
     #[test]
@@ -1046,6 +1128,8 @@ mod tests {
             workflow_spec_json: Some("{\"v\":1}".into()),
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -1279,6 +1363,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: Some("/req".to_string()),
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();

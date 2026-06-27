@@ -616,6 +616,8 @@ mod sink_tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         }
     }
 
@@ -736,6 +738,8 @@ mod sink_tests {
                 workflow_spec_json: None,
                 resume_attempts: 0,
                 session_cwd: None,
+                batch_id: None,
+                item_id: None,
             })
             .await
             .unwrap();
@@ -1842,6 +1846,8 @@ mod resume_tests {
                 workflow_spec_json: Some(encode_workflow_spec(&graph)),
                 resume_attempts: 0,
                 session_cwd: None,
+                batch_id: None,
+                item_id: None,
             })
             .await
             .unwrap();
@@ -1942,6 +1948,8 @@ mod resume_tests {
                 workflow_spec_json: Some(encode_workflow_spec(&graph)),
                 resume_attempts: 0,
                 session_cwd: None,
+                batch_id: None,
+                item_id: None,
             })
             .await
             .unwrap();

@@ -24,6 +24,7 @@ macro_rules! id_newtype {
 }
 
 id_newtype!(TaskId);
+id_newtype!(BatchId);
 id_newtype!(SessionId);
 id_newtype!(CallerId);
 id_newtype!(AgentId);

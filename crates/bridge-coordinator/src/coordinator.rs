@@ -390,6 +390,8 @@ impl Coordinator {
             workflow_spec_json,
             resume_attempts: 0,
             session_cwd: session_cwd.as_ref().map(|c| c.as_str().to_string()),
+            batch_id: None,
+            item_id: None,
         };
         self.task_store.create(&rec).await?;
 
@@ -915,6 +917,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         }
     }
 

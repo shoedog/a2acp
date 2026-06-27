@@ -2456,6 +2456,8 @@ async fn unary_message(
                 workflow_spec_json,
                 resume_attempts: 0,
                 session_cwd: routed.session_cwd.as_ref().map(|c| c.as_str().to_string()),
+                batch_id: None,
+                item_id: None,
             };
             if srv.task_store.create(&rec).await.is_err() {
                 return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
@@ -8507,6 +8509,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         };
         store.create(&rec).await.unwrap();
 
@@ -8555,6 +8559,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         };
         store.create(&rec).await.unwrap();
 
@@ -8717,6 +8723,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         }
     }
 

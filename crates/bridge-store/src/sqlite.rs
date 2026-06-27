@@ -1036,6 +1036,8 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
         workflow_spec_json,
         resume_attempts: resume_attempts.unwrap_or(0) as u32,
         session_cwd,
+        batch_id: None,
+        item_id: None,
     })
 }
 
@@ -1060,6 +1062,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         }
     }
 
@@ -1253,6 +1257,8 @@ mod tests {
             workflow_spec_json: Some("{\"v\":1}".into()),
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -1335,6 +1341,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: Some("/req".to_string()),
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
