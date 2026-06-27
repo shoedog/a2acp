@@ -527,6 +527,14 @@ fn resolve_worktree_runtime_cfg(
     }))
 }
 
+fn batch_runtime(
+    cfg: &RegistryConfig,
+) -> Result<Option<bridge_coordinator::BatchRuntime>, config::ConfigError> {
+    Ok(cfg.batch_config()?.map(|batch| {
+        bridge_coordinator::BatchRuntime::new(batch.max_concurrent, batch.default_concurrency)
+    }))
+}
+
 /// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
 /// `implement` subcommand so their registry builds can't drift. `owner_config_path` seeds the ContainerRw
 /// owner token.
@@ -4113,6 +4121,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         .map(bridge_core::session_cwd::SessionCwd::parse)
         .transpose()
         .map_err(|e| format!("a2a-bridge mcp: invalid allowed_cwd_root: {e:?}"))?;
+    let batch = batch_runtime(&cfg).map_err(|e| format!("a2a-bridge mcp: {e}"))?;
 
     let coordinator = Arc::new(
         bridge_coordinator::Coordinator::new(
@@ -4125,6 +4134,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
             Arc::clone(&registry) as Arc<dyn AgentRegistry>,
             clock,
             allowed_cwd_root,
+            batch,
             resume_cap,
         )
         .with_permission_registry(Arc::clone(&perm_registry)),
@@ -4417,6 +4427,7 @@ async fn main() -> Result<(), BoxError> {
     // The inbound server holds the agent registry (3b): first-message LOCAL dispatch
     // resolves the routed agent id, applies its effective config, and binds the task.
     let base_url = format!("http://{}", cfg.server.addr);
+    let batch = batch_runtime(&cfg)?;
     let server = Arc::new(
         InboundServer::new(
             Arc::clone(&registry) as _,
@@ -4433,6 +4444,7 @@ async fn main() -> Result<(), BoxError> {
         .with_session_manager(session_manager)
         .with_permission_registry(Arc::clone(&perm_registry))
         .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
+        .with_batch_runtime(batch)
         .with_model_catalog(Arc::clone(&model_catalog)),
     );
 

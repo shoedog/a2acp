@@ -52,6 +52,7 @@ use bridge_workflow::executor::{
 };
 use bridge_workflow::graph::WorkflowNode;
 
+use bridge_coordinator::{BatchDeps, BatchRuntime};
 use bridge_coordinator::coordinator::apply_permit;
 use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
 use bridge_coordinator::params::{InjectParams, PermitParams};
@@ -152,6 +153,7 @@ pub struct InboundServer {
             std::collections::HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>,
         >,
     >,
+    batch: Option<BatchRuntime>,
     /// Live per-agent model catalog (advertise-models). Probed host-side at `serve` startup and on
     /// `SIGHUP`; [`serve_card`] reads it lock-free via `ArcSwap` so the card path never probes. Default
     /// empty → the card omits the `agent-models` extension (same as a fully-failed probe). Wired from
@@ -193,6 +195,7 @@ impl InboundServer {
             permission_registry: None,
             allowed_cwd_root: None,
             progress_hubs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            batch: None,
             model_catalog: Arc::new(arc_swap::ArcSwap::from_pointee(
                 bridge_core::catalog::ModelCatalog::new(),
             )),
@@ -249,6 +252,12 @@ impl InboundServer {
     #[must_use]
     pub fn with_allowed_cwd_root(mut self, root: Option<String>) -> Self {
         self.allowed_cwd_root = root;
+        self
+    }
+
+    #[must_use]
+    pub fn with_batch_runtime(mut self, rt: Option<BatchRuntime>) -> Self {
+        self.batch = rt;
         self
     }
 
@@ -2055,6 +2064,19 @@ fn detached_deps(srv: &Arc<InboundServer>) -> bridge_coordinator::detached::Deta
         progress_hubs: srv.progress_hubs.clone(),
         clock: Arc::new(bridge_coordinator::clock::SystemClock),
     }
+}
+
+pub fn batch_deps(srv: &Arc<InboundServer>) -> Option<BatchDeps> {
+    let runtime = srv.batch.clone()?;
+    let allowed_cwd_root = match srv.allowed_cwd_root.as_deref() {
+        Some(root) => Some(SessionCwd::parse(root).ok()?),
+        None => None,
+    };
+    Some(BatchDeps {
+        detached: detached_deps(srv),
+        runtime,
+        allowed_cwd_root,
+    })
 }
 
 /// Mint a fresh unique task id for a detached submit (SDK UUIDv7). NOT

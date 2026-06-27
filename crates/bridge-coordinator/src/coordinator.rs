@@ -17,6 +17,7 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::batch::{BatchDeps, BatchRuntime};
 use crate::clock::Clock;
 use crate::detached::{
     new_detached_task_id, resume_working_tasks, spawn_detached_workflow, DetachedDeps,
@@ -106,6 +107,7 @@ pub struct Coordinator {
     permission_registry: Option<Arc<PermissionRegistry>>,
     clock: Arc<dyn Clock>,
     allowed_cwd_root: Option<SessionCwd>,
+    batch: Option<BatchRuntime>,
     resume_attempt_cap: u32,
 }
 
@@ -134,6 +136,7 @@ impl Coordinator {
         registry: Arc<dyn AgentRegistry>,
         clock: Arc<dyn Clock>,
         allowed_cwd_root: Option<SessionCwd>,
+        batch: Option<BatchRuntime>,
         resume_attempt_cap: u32,
     ) -> Self {
         Self {
@@ -151,6 +154,7 @@ impl Coordinator {
             permission_registry: None,
             clock,
             allowed_cwd_root,
+            batch,
             resume_attempt_cap,
         }
     }
@@ -171,6 +175,14 @@ impl Coordinator {
             progress_hubs: self.progress_hubs.clone(),
             clock: self.clock.clone(),
         }
+    }
+
+    pub fn batch_deps(&self) -> Option<BatchDeps> {
+        Some(BatchDeps {
+            detached: self.detached_deps(),
+            runtime: self.batch.clone()?,
+            allowed_cwd_root: self.allowed_cwd_root.clone(),
+        })
     }
 
     fn mint_context_id(&self) -> ContextId {
@@ -876,6 +888,7 @@ mod tests {
             registry,
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
             3,
         );
 
@@ -961,6 +974,7 @@ mod tests {
             registry,
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
             3,
         );
         Fixture {
@@ -1019,6 +1033,7 @@ mod tests {
             registry,
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
             3,
         )
     }

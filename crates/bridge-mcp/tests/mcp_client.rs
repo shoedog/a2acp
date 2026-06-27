@@ -262,6 +262,7 @@ fn fixture() -> Fixture {
             registry,
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
             3,
         )
         .with_permission_registry(perm_registry.clone()),

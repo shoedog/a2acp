@@ -1,6 +1,39 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use bridge_core::ids::BatchId;
+use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{
     BatchRecord, BatchStatus, BatchSummary, TaskRecord, TaskRecordStatus,
 };
+use tokio::sync::{Mutex, Semaphore};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+pub struct BatchRuntime {
+    pub semaphore: Arc<Semaphore>,
+    pub default_concurrency: u32,
+    pub max_concurrent: u32,
+    pub batch_cancels: Arc<Mutex<HashMap<BatchId, CancellationToken>>>,
+}
+
+impl BatchRuntime {
+    pub fn new(max_concurrent: u32, default_concurrency: u32) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent as usize)),
+            default_concurrency,
+            max_concurrent,
+            batch_cancels: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct BatchDeps {
+    pub detached: crate::detached::DetachedDeps,
+    pub runtime: BatchRuntime,
+    pub allowed_cwd_root: Option<SessionCwd>,
+}
 
 /// Pure roll-up over the durable plan (rec.total) + the child rows. The SINGLE owner
 /// of the bucket math (RR-FIX-7) -- never re-implemented in a store impl.
