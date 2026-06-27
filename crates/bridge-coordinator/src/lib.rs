@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod clock;
 pub mod compact;
 pub mod coordinator;
@@ -7,6 +8,7 @@ pub mod params;
 pub mod session_manager;
 pub mod turn_parts;
 
+pub use batch::{is_settleable, summarize_batch};
 pub use coordinator::Coordinator;
 pub use detached::{
     drain_workflow, frame_from_orch, now_ms, DetachedProgressSink, DetachedRichSink,
