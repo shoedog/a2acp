@@ -8,7 +8,8 @@ use crate::ids::{BatchId, NodeId, OperationId, TaskId};
 /// Durable status of a detached task. `Interrupted` is distinct from `Failed`
 /// (a crash mid-run, swept on the next boot) so triage can tell them apart; the
 /// A2A wire collapses it to `failed` (see the inbound server).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskRecordStatus {
     Working,
     Completed,
@@ -75,7 +76,7 @@ pub struct BatchRecord {
     pub updated_ms: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct BatchSummary {
     pub id: crate::ids::BatchId,
     pub workflow: String,

@@ -19,6 +19,7 @@ use crate::detached::{
     encode_workflow_spec, finalize_detached, new_detached_task_id, spawn_detached_workflow,
     TaskProgressHub, SUPPORTED_SNAPSHOT_VERSION,
 };
+use crate::params::validate_cwd_str;
 
 #[derive(Clone)]
 pub struct BatchRuntime {
@@ -56,6 +57,10 @@ pub fn new_batch_id() -> BatchId {
     BatchId::parse(format!("batch-{}", a2a::new_task_id())).expect("new_task_id is non-empty")
 }
 
+fn now_ms(deps: &BatchDeps) -> i64 {
+    deps.detached.clock.now_ms()
+}
+
 pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId, BridgeError> {
     let workflow = WorkflowId::parse(params.workflow)
         .map_err(|_| BridgeError::InvalidRequest { field: "workflow" })?;
@@ -80,16 +85,7 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
             return Err(BridgeError::InvalidRequest { field: "item_id" });
         }
         if let Some(raw) = &item.session_cwd {
-            let cwd = SessionCwd::parse(raw).map_err(|_| BridgeError::InvalidRequest {
-                field: "batch.item.cwd",
-            })?;
-            if let Some(root) = &deps.allowed_cwd_root {
-                if !cwd.is_under(root) {
-                    return Err(BridgeError::InvalidRequest {
-                        field: "batch.item.cwd",
-                    });
-                }
-            }
+            let cwd = validate_cwd_str(raw, deps.allowed_cwd_root.as_ref(), "batch.item.cwd")?;
             item.session_cwd = Some(cwd.as_str().to_string());
         }
         items.push(item);
@@ -133,6 +129,59 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
         token,
     ));
     Ok(bid)
+}
+
+pub async fn batch_status(
+    deps: &BatchDeps,
+    id: &BatchId,
+) -> Result<BatchSummary, BridgeError> {
+    let rec = deps
+        .detached
+        .task_store
+        .get_batch(id)
+        .await?
+        .ok_or(BridgeError::TaskNotFound)?;
+    let kids = deps.detached.task_store.batch_children(id).await?;
+    let summary = summarize_batch(&rec, &kids);
+    if let Some(term) = is_settleable(&summary) {
+        deps.detached
+            .task_store
+            .settle_batch_if_status(id, rec.status, term, now_ms(deps))
+            .await?;
+        let rec = deps
+            .detached
+            .task_store
+            .get_batch(id)
+            .await?
+            .ok_or(BridgeError::TaskNotFound)?;
+        return Ok(summarize_batch(&rec, &kids));
+    }
+    Ok(summary)
+}
+
+pub async fn batch_list(
+    deps: &BatchDeps,
+    limit: usize,
+) -> Result<Vec<BatchSummary>, BridgeError> {
+    let batches = deps.detached.task_store.list_batches(limit).await?;
+    let mut out = Vec::with_capacity(batches.len());
+    for rec in batches {
+        let kids = deps.detached.task_store.batch_children(&rec.id).await?;
+        out.push(summarize_batch(&rec, &kids));
+    }
+    Ok(out)
+}
+
+pub async fn cancel_batch(deps: &BatchDeps, id: &BatchId) -> Result<bool, BridgeError> {
+    let flipped = deps
+        .detached
+        .task_store
+        .cancel_batch_if_working(id, now_ms(deps))
+        .await?;
+    if let Some(tok) = deps.runtime.batch_cancels.lock().await.get(id) {
+        tok.cancel();
+    }
+    Ok(flipped)
 }
 
 pub async fn resume_all(deps: &BatchDeps, cap: u32) {
@@ -1089,6 +1138,67 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn batch_status_lazy_settles_dead_loop() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(2, gate);
+        let bid = BatchId::parse("batch-lazy-settle").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-lazy-settle",
+                BatchStatus::Working,
+                2,
+                2,
+            ))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(&bid, "item-0", TaskRecordStatus::Completed, false))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(&bid, "item-1", TaskRecordStatus::Failed, false))
+            .await
+            .unwrap();
+
+        let summary = batch_status(&deps, &bid).await.unwrap();
+
+        assert_eq!(summary.status, BatchStatus::Completed);
+        assert_eq!(
+            store.get_batch(&bid).await.unwrap().unwrap().status,
+            BatchStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_batch_cas_and_fires_token() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(2, gate);
+        let bid = BatchId::parse("batch-cancel-token").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-cancel-token",
+                BatchStatus::Working,
+                1,
+                1,
+            ))
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        deps.runtime
+            .batch_cancels
+            .lock()
+            .await
+            .insert(bid.clone(), token.clone());
+
+        assert!(cancel_batch(&deps, &bid).await.unwrap());
+        assert!(token.is_cancelled());
+        assert_eq!(
+            store.get_batch(&bid).await.unwrap().unwrap().status,
+            BatchStatus::Canceling
+        );
     }
 
     #[tokio::test]

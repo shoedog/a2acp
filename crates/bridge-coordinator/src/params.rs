@@ -267,15 +267,22 @@ impl OpParams {
         let Some(raw) = &self.cwd else {
             return Ok(None);
         };
-        let cwd =
-            SessionCwd::parse(raw).map_err(|_| BridgeError::InvalidRequest { field: "cwd" })?;
-        if let Some(root) = root {
-            if !cwd.is_under(root) {
-                return Err(BridgeError::InvalidRequest { field: "cwd" });
-            }
-        }
-        Ok(Some(cwd))
+        validate_cwd_str(raw, root, "cwd").map(Some)
     }
+}
+
+pub fn validate_cwd_str(
+    s: &str,
+    root: Option<&SessionCwd>,
+    field: &'static str,
+) -> Result<SessionCwd, BridgeError> {
+    let cwd = SessionCwd::parse(s).map_err(|_| BridgeError::InvalidRequest { field })?;
+    if let Some(root) = root {
+        if !cwd.is_under(root) {
+            return Err(BridgeError::InvalidRequest { field });
+        }
+    }
+    Ok(cwd)
 }
 
 fn string_field<'a>(v: &'a serde_json::Value, field: &str) -> Option<&'a str> {
