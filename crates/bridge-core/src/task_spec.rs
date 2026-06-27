@@ -204,6 +204,71 @@ pub fn validate(spec: &TaskSpec) -> Result<(), TaskSpecError> {
     Ok(())
 }
 
+pub fn fields(spec: &TaskSpec) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    fields.push(("title".to_string(), spec.title.clone().unwrap_or_default()));
+    fields.push(("type".to_string(), spec.task_type.clone()));
+
+    for section in &spec.sections {
+        push_section_fields(&mut fields, "", section);
+    }
+
+    fields
+}
+
+pub fn body(spec: &TaskSpec) -> &str {
+    &spec.body
+}
+
+pub fn template(t: &str) -> Option<String> {
+    let schema = schema(t)?;
+    let mut out = format!("---\ntask-type: {}\n---\n# <title>\n", schema.task_type);
+
+    for section in schema.sections {
+        let requirement = if section.required { "REQUIRED" } else { "OPTIONAL" };
+        out.push_str(&format!(
+            "\n## {}\n<!-- {}: {} -->\n",
+            section.name, requirement, section.description
+        ));
+    }
+
+    out.push_str(
+        "\n## <Your Own Section>\n<!-- OPTIONAL/EXTENSION: Add task-specific context not covered by the schema. -->\n",
+    );
+    Some(out)
+}
+
+fn push_section_fields(fields: &mut Vec<(String, String)>, prefix: &str, section: &Section) {
+    let name = normalize_field_name(&section.name);
+    let key = if prefix.is_empty() {
+        name
+    } else {
+        format!("{prefix}.{name}")
+    };
+    fields.push((key.clone(), section.content.clone()));
+
+    for subsection in &section.subsections {
+        push_section_fields(fields, &key, subsection);
+    }
+}
+
+fn normalize_field_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut previous_was_separator = false;
+
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            out.push('_');
+            previous_was_separator = true;
+        }
+    }
+
+    out.trim_matches('_').to_string()
+}
+
 pub fn parse(raw: &str) -> Result<TaskSpec, TaskSpecError> {
     let normalized = raw.replace("\r\n", "\n");
     let (task_type, body) = parse_frontmatter(&normalized)?;
@@ -664,5 +729,29 @@ mod tests {
         let err = validate(&empty_title).unwrap_err();
         assert!(matches!(err, TaskSpecError::EmptyTitle { .. }));
         assert!(err.to_string().contains("task-spec schema"));
+    }
+
+    #[test]
+    fn fields_flatten_and_body() {
+        let s = parse(
+            "---\ntask-type: implement\n---\n# T\n## Description\n### Context\nc\n## Files\n- a.rs",
+        )
+        .unwrap();
+        let f: std::collections::HashMap<_, _> = fields(&s).into_iter().collect();
+
+        assert_eq!(f.get("title").map(String::as_str), Some("T"));
+        assert!(f.get("files").unwrap().contains("a.rs"));
+        assert_eq!(f.get("description.context").map(|s| s.trim()), Some("c"));
+        assert_eq!(body(&s), s.body.as_str());
+    }
+
+    #[test]
+    fn template_round_trips() {
+        let t = template("implement").unwrap();
+
+        assert!(t.contains("task-type: implement"));
+        assert!(t.contains("## Acceptance Criteria"));
+        assert!(t.contains("OPTIONAL"));
+        assert!(parse(&t).is_ok());
     }
 }
