@@ -145,10 +145,24 @@ impl SqliteStore {
     }
 }
 
-/// Idempotently add the W3b additive columns to the `tasks` table.
+/// Idempotently add additive task/batch schema.
 /// Reads existing columns via `PRAGMA table_info`, then issues `ALTER TABLE ADD COLUMN`
 /// only for columns that are missing. Safe to call on both fresh and old databases.
 fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS batch (
+            id TEXT PRIMARY KEY,
+            workflow TEXT NOT NULL,
+            concurrency INTEGER NOT NULL,
+            total INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            items_json TEXT NOT NULL,
+            error TEXT,
+            created_ms INTEGER NOT NULL,
+            updated_ms INTEGER NOT NULL
+        );",
+    )?;
+
     // Collect existing column names for `tasks`.
     let mut stmt = conn.prepare("PRAGMA table_info(tasks)")?;
     let existing: HashSet<String> = stmt
@@ -164,12 +178,18 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         ("last_event_seq", "INTEGER NOT NULL DEFAULT 0"),
         ("terminal_seq", "INTEGER"),
         ("journal_complete_from_birth", "INTEGER NOT NULL DEFAULT 0"),
+        ("batch_id", "TEXT"),
+        ("item_id", "TEXT"),
     ];
     for (col, def) in additive {
         if !existing.contains(col) {
             conn.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {col} {def};"))?;
         }
     }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_batch_item
+            ON tasks(batch_id, item_id) WHERE batch_id IS NOT NULL;",
+    )?;
 
     // Collect existing column names for `task_node_checkpoints`.
     let mut stmt2 = conn.prepare("PRAGMA table_info(task_node_checkpoints)")?;
@@ -198,6 +218,29 @@ fn insert_journal_event(
     )
     .map_err(|_| BridgeError::StoreFailure)?;
     Ok(())
+}
+
+fn batch_status_as_str(status: bridge_core::task_store::BatchStatus) -> &'static str {
+    use bridge_core::task_store::BatchStatus;
+    match status {
+        BatchStatus::Working => "working",
+        BatchStatus::Completed => "completed",
+        BatchStatus::Canceling => "canceling",
+        BatchStatus::Canceled => "canceled",
+        BatchStatus::Failed => "failed",
+    }
+}
+
+fn parse_batch_status(s: &str) -> Option<bridge_core::task_store::BatchStatus> {
+    use bridge_core::task_store::BatchStatus;
+    match s {
+        "working" => Some(BatchStatus::Working),
+        "completed" => Some(BatchStatus::Completed),
+        "canceling" => Some(BatchStatus::Canceling),
+        "canceled" => Some(BatchStatus::Canceled),
+        "failed" => Some(BatchStatus::Failed),
+        _ => None,
+    }
 }
 
 #[async_trait::async_trait]
@@ -384,8 +427,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         conn.execute(
             "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms,
                                input, workflow_spec_json, resume_attempts, session_cwd,
-                               journal_complete_from_birth)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
+                               journal_complete_from_birth, batch_id, item_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13)",
             rusqlite::params![
                 rec.id.as_str(),
                 rec.workflow,
@@ -397,7 +440,9 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 rec.input,
                 rec.workflow_spec_json,
                 rec.resume_attempts as i64,
-                rec.session_cwd
+                rec.session_cwd,
+                rec.batch_id.as_ref().map(|b| b.as_str()),
+                rec.item_id
             ],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
@@ -433,7 +478,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts, session_cwd
+                        input, workflow_spec_json, resume_attempts, session_cwd,
+                        batch_id, item_id
                  FROM tasks WHERE id=?1",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -454,7 +500,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts, session_cwd
+                        input, workflow_spec_json, resume_attempts, session_cwd,
+                        batch_id, item_id
                  FROM tasks ORDER BY updated_ms DESC LIMIT ?1",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -586,7 +633,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts, session_cwd
+                        input, workflow_spec_json, resume_attempts, session_cwd,
+                        batch_id, item_id
                  FROM tasks WHERE status='working'",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -596,6 +644,234 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             out.push(row_to_task(row)?);
         }
         Ok(out)
+    }
+
+    async fn create_batch(
+        &self,
+        rec: &bridge_core::task_store::BatchRecord,
+    ) -> Result<(), BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO batch(id, workflow, concurrency, total, status, items_json, error,
+                               created_ms, updated_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                rec.id.as_str(),
+                rec.workflow,
+                rec.concurrency as i64,
+                rec.total as i64,
+                batch_status_as_str(rec.status),
+                rec.items_json,
+                rec.error,
+                rec.created_ms,
+                rec.updated_ms
+            ],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(())
+    }
+
+    async fn get_batch(
+        &self,
+        id: &bridge_core::ids::BatchId,
+    ) -> Result<Option<bridge_core::task_store::BatchRecord>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workflow, concurrency, total, status, items_json, error,
+                        created_ms, updated_ms
+                 FROM batch WHERE id=?1",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![id.as_str()])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        match rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            None => Ok(None),
+            Some(row) => Ok(Some(row_to_batch(row)?)),
+        }
+    }
+
+    async fn list_batches(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bridge_core::task_store::BatchRecord>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workflow, concurrency, total, status, items_json, error,
+                        created_ms, updated_ms
+                 FROM batch ORDER BY updated_ms DESC LIMIT ?1",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![limit as i64])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            out.push(row_to_batch(row)?);
+        }
+        Ok(out)
+    }
+
+    async fn active_batches(
+        &self,
+    ) -> Result<Vec<bridge_core::task_store::BatchRecord>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workflow, concurrency, total, status, items_json, error,
+                        created_ms, updated_ms
+                 FROM batch WHERE status IN ('working','canceling')",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt.query([]).map_err(|_| BridgeError::StoreFailure)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            out.push(row_to_batch(row)?);
+        }
+        Ok(out)
+    }
+
+    async fn batch_children(
+        &self,
+        id: &bridge_core::ids::BatchId,
+    ) -> Result<Vec<bridge_core::task_store::TaskRecord>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workflow, status, result, error, created_ms, updated_ms,
+                        input, workflow_spec_json, resume_attempts, session_cwd,
+                        batch_id, item_id
+                 FROM tasks WHERE batch_id=?1",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut rows = stmt
+            .query(rusqlite::params![id.as_str()])
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
+            out.push(row_to_task(row)?);
+        }
+        Ok(out)
+    }
+
+    async fn claim_batch_child(
+        &self,
+        batch: &bridge_core::ids::BatchId,
+        item: &str,
+        rec: &bridge_core::task_store::TaskRecord,
+    ) -> Result<bridge_core::task_store::ChildClaim, BridgeError> {
+        use bridge_core::task_store::{ChildClaim, TaskRecordStatus};
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let result = (|| -> rusqlite::Result<ChildClaim> {
+            let existing: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT id, status FROM tasks WHERE batch_id=?1 AND item_id=?2",
+                    rusqlite::params![batch.as_str(), item],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((_id, status)) = existing {
+                conn.execute_batch("COMMIT;")?;
+                return Ok(if status == TaskRecordStatus::Working.as_str() {
+                    ChildClaim::ExistingWorking
+                } else {
+                    ChildClaim::ExistingTerminal
+                });
+            }
+
+            conn.execute(
+                "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms,
+                                   input, workflow_spec_json, resume_attempts, session_cwd,
+                                   journal_complete_from_birth, batch_id, item_id)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13)",
+                rusqlite::params![
+                    rec.id.as_str(),
+                    rec.workflow,
+                    TaskRecordStatus::Working.as_str(),
+                    rec.result,
+                    rec.error,
+                    rec.created_ms,
+                    rec.updated_ms,
+                    rec.input,
+                    rec.workflow_spec_json,
+                    rec.resume_attempts as i64,
+                    rec.session_cwd,
+                    batch.as_str(),
+                    item
+                ],
+            )?;
+            conn.execute_batch("COMMIT;")?;
+            Ok(ChildClaim::Created)
+        })();
+
+        match result {
+            Ok(claim) => Ok(claim),
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(BridgeError::StoreFailure)
+            }
+        }
+    }
+
+    async fn cancel_batch_if_working(
+        &self,
+        id: &bridge_core::ids::BatchId,
+        ts: i64,
+    ) -> Result<bool, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE batch SET status='canceling', updated_ms=?1
+                 WHERE id=?2 AND status='working'",
+                rusqlite::params![ts, id.as_str()],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(n > 0)
+    }
+
+    async fn settle_batch_if_status(
+        &self,
+        id: &bridge_core::ids::BatchId,
+        expect: bridge_core::task_store::BatchStatus,
+        new: bridge_core::task_store::BatchStatus,
+        ts: i64,
+    ) -> Result<bool, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE batch SET status=?1, updated_ms=?2 WHERE id=?3 AND status=?4",
+                rusqlite::params![
+                    batch_status_as_str(new),
+                    ts,
+                    id.as_str(),
+                    batch_status_as_str(expect)
+                ],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(n > 0)
+    }
+
+    async fn fail_batch_if_status(
+        &self,
+        id: &bridge_core::ids::BatchId,
+        expect: bridge_core::task_store::BatchStatus,
+        error: &str,
+        ts: i64,
+    ) -> Result<bool, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE batch SET status='failed', error=?1, updated_ms=?2
+                 WHERE id=?3 AND status=?4",
+                rusqlite::params![error, ts, id.as_str(), batch_status_as_str(expect)],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(n > 0)
     }
 
     async fn record_node_started(
@@ -1024,6 +1300,8 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
     let workflow_spec_json: Option<String> = row.get(8).map_err(|_| BridgeError::StoreFailure)?;
     let resume_attempts: Option<i64> = row.get(9).map_err(|_| BridgeError::StoreFailure)?;
     let session_cwd: Option<String> = row.get(10).map_err(|_| BridgeError::StoreFailure)?;
+    let batch_id: Option<String> = row.get(11).map_err(|_| BridgeError::StoreFailure)?;
+    let item_id: Option<String> = row.get(12).map_err(|_| BridgeError::StoreFailure)?;
     Ok(TaskRecord {
         id: TaskId::parse(id).map_err(|_| BridgeError::StoreFailure)?,
         workflow,
@@ -1036,8 +1314,35 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
         workflow_spec_json,
         resume_attempts: resume_attempts.unwrap_or(0) as u32,
         session_cwd,
-        batch_id: None,
-        item_id: None,
+        batch_id: batch_id
+            .map(bridge_core::ids::BatchId::parse)
+            .transpose()
+            .map_err(|_| BridgeError::StoreFailure)?,
+        item_id,
+    })
+}
+
+fn row_to_batch(row: &rusqlite::Row) -> Result<bridge_core::task_store::BatchRecord, BridgeError> {
+    use bridge_core::task_store::BatchRecord;
+    let id: String = row.get(0).map_err(|_| BridgeError::StoreFailure)?;
+    let workflow: String = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
+    let concurrency: i64 = row.get(2).map_err(|_| BridgeError::StoreFailure)?;
+    let total: i64 = row.get(3).map_err(|_| BridgeError::StoreFailure)?;
+    let status_s: String = row.get(4).map_err(|_| BridgeError::StoreFailure)?;
+    let items_json: String = row.get(5).map_err(|_| BridgeError::StoreFailure)?;
+    let error: Option<String> = row.get(6).map_err(|_| BridgeError::StoreFailure)?;
+    let created_ms: i64 = row.get(7).map_err(|_| BridgeError::StoreFailure)?;
+    let updated_ms: i64 = row.get(8).map_err(|_| BridgeError::StoreFailure)?;
+    Ok(BatchRecord {
+        id: bridge_core::ids::BatchId::parse(id).map_err(|_| BridgeError::StoreFailure)?,
+        workflow,
+        concurrency: concurrency as u32,
+        total: total as u32,
+        status: parse_batch_status(&status_s).ok_or(BridgeError::StoreFailure)?,
+        items_json,
+        error,
+        created_ms,
+        updated_ms,
     })
 }
 
@@ -1045,9 +1350,11 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
 mod tests {
     use super::*;
     use bridge_core::domain::{PeerTaskId, PendingKind, PendingRequest};
-    use bridge_core::ids::{SessionId, TaskId};
+    use bridge_core::ids::{BatchId, SessionId, TaskId};
     use bridge_core::ports::SessionStore;
-    use bridge_core::task_store::{TaskRecord, TaskRecordStatus, TaskStore};
+    use bridge_core::task_store::{
+        BatchRecord, BatchStatus, ChildClaim, TaskRecord, TaskRecordStatus, TaskStore,
+    };
 
     fn trec(id: &str, ms: i64) -> TaskRecord {
         TaskRecord {
@@ -1065,6 +1372,88 @@ mod tests {
             batch_id: None,
             item_id: None,
         }
+    }
+
+    fn sample_batch(bid: &BatchId, status: BatchStatus, total: u32, ms: i64) -> BatchRecord {
+        BatchRecord {
+            id: bid.clone(),
+            workflow: "code-review".into(),
+            concurrency: 2,
+            total,
+            status,
+            items_json: r#"{"v":1,"items":[]}"#.into(),
+            error: None,
+            created_ms: ms,
+            updated_ms: ms,
+        }
+    }
+
+    fn batch_child_record(tid: &TaskId, bid: &BatchId, item: &str) -> TaskRecord {
+        TaskRecord {
+            id: tid.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 0,
+            updated_ms: 0,
+            input: "DIFF".into(),
+            workflow_spec_json: Some(r#"{"v":1,"nodes":[]}"#.into()),
+            resume_attempts: 0,
+            session_cwd: None,
+            batch_id: Some(bid.clone()),
+            item_id: Some(item.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_migration_idempotent_and_batch_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let _s = SqliteStore::open(&path).unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let bid = BatchId::parse("b1").unwrap();
+        s.create_batch(&sample_batch(&bid, BatchStatus::Working, 2, 0))
+            .await
+            .unwrap();
+
+        let got = s.get_batch(&bid).await.unwrap().unwrap();
+        assert_eq!(got.total, 2);
+        assert_eq!(got.status, BatchStatus::Working);
+    }
+
+    #[tokio::test]
+    async fn sqlite_claim_is_atomic_single_runner() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let bid = BatchId::parse("b1").unwrap();
+        s.create_batch(&sample_batch(&bid, BatchStatus::Working, 1, 0))
+            .await
+            .unwrap();
+
+        let a = s
+            .claim_batch_child(
+                &bid,
+                "x",
+                &batch_child_record(&TaskId::parse("t1").unwrap(), &bid, "x"),
+            )
+            .await
+            .unwrap();
+        let b = s
+            .claim_batch_child(
+                &bid,
+                "x",
+                &batch_child_record(&TaskId::parse("t2").unwrap(), &bid, "x"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!((a, b), (ChildClaim::Created, ChildClaim::ExistingWorking));
+        let children = s.batch_children(&bid).await.unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].batch_id.as_ref(), Some(&bid));
+        assert_eq!(children[0].item_id.as_deref(), Some("x"));
     }
 
     #[tokio::test]
