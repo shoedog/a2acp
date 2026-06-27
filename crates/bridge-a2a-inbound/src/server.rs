@@ -2175,7 +2175,11 @@ pub async fn spawn_detached_workflow_with_token_for_test(
 /// Boot-time crash-resume scan (W3b Task 10a). Thin adapter kept in the inbound
 /// surface while the implementation lives in bridge-coordinator.
 pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
-    bridge_coordinator::detached::resume_working_tasks(&detached_deps(srv), cap).await;
+    match batch_deps(srv) {
+        Some(bdeps) => bridge_coordinator::batch::resume_all(&bdeps, cap).await,
+        None => bridge_coordinator::detached::resume_non_batch_tasks(&detached_deps(srv), cap)
+            .await,
+    }
 }
 
 /// Background claimer: as each fan-out source's stream ENDS (its `*_done` flag

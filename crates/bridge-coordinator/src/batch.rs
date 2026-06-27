@@ -133,6 +133,16 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
     Ok(bid)
 }
 
+pub async fn resume_all(deps: &BatchDeps, cap: u32) {
+    // TODO(T7): orphan sweep
+    crate::detached::resume_non_batch_tasks(&deps.detached, cap).await;
+    resume_batches(deps, cap).await;
+}
+
+pub async fn resume_batches(_deps: &BatchDeps, _cap: u32) {
+    // TODO(T7): real batch resume
+}
+
 pub async fn run_admission(
     deps: BatchDeps,
     bid: BatchId,

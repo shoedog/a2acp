@@ -511,7 +511,10 @@ impl Coordinator {
 
     /// Boot-time detached task resume.
     pub async fn resume(&self) {
-        resume_working_tasks(&self.detached_deps(), self.resume_attempt_cap).await;
+        match self.batch_deps() {
+            Some(bdeps) => crate::batch::resume_all(&bdeps, self.resume_attempt_cap).await,
+            None => resume_working_tasks(&self.detached_deps(), self.resume_attempt_cap).await,
+        }
     }
 }
 
