@@ -737,10 +737,10 @@ async fn jsonrpc(
         "SessionClear" => session_clear(srv, headers, id, params).await,
         "SessionCompact" => session_compact(srv, headers, id, params).await,
         // bridge-private batch RPCs (not A2A-spec methods)
-        "RunBatch" => run_batch_rpc(srv, id, params).await,
-        "BatchStatus" => batch_status_rpc(srv, id, params).await,
-        "BatchList" => batch_list_rpc(srv, id, params).await,
-        "CancelBatch" => cancel_batch_rpc(srv, id, params).await,
+        "RunBatch" => run_batch_rpc(srv, headers, id, params).await,
+        "BatchStatus" => batch_status_rpc(srv, headers, id, params).await,
+        "BatchList" => batch_list_rpc(srv, headers, id, params).await,
+        "CancelBatch" => cancel_batch_rpc(srv, headers, id, params).await,
         "" => jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "missing method"),
         _ => jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "method not found"),
     }
@@ -3251,7 +3251,15 @@ struct BatchListRpcParams {
     limit: Option<usize>,
 }
 
-async fn run_batch_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> Response {
+async fn run_batch_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
     let Some(bdeps) = batch_deps(&srv) else {
         return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "batch not configured");
     };
@@ -3271,6 +3279,13 @@ async fn run_batch_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> Res
     let mut items = Vec::with_capacity(params.items.len());
     for (idx, item) in params.items.into_iter().enumerate() {
         let item_id = item.item_id.unwrap_or_else(|| idx.to_string());
+        if item_id.is_empty() {
+            return jsonrpc_err(
+                id,
+                JSONRPC_INVALID_REQUEST,
+                "RunBatch item_id must not be empty",
+            );
+        }
         if !seen.insert(item_id.clone()) {
             return jsonrpc_err(
                 id,
@@ -3315,7 +3330,15 @@ async fn run_batch_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> Res
     }
 }
 
-async fn batch_status_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> Response {
+async fn batch_status_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
     let Some(bdeps) = batch_deps(&srv) else {
         return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "batch not configured");
     };
@@ -3333,7 +3356,15 @@ async fn batch_status_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> 
     }
 }
 
-async fn batch_list_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> Response {
+async fn batch_list_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
     let Some(bdeps) = batch_deps(&srv) else {
         return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "batch not configured");
     };
@@ -3347,7 +3378,15 @@ async fn batch_list_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> Re
     }
 }
 
-async fn cancel_batch_rpc(srv: Arc<InboundServer>, id: Value, params: Value) -> Response {
+async fn cancel_batch_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
     let Some(bdeps) = batch_deps(&srv) else {
         return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "batch not configured");
     };
@@ -4499,6 +4538,27 @@ mod tests {
         assert!(
             body.contains("auth required"),
             "expected auth-required message: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_batch_rpc_requires_auth() {
+        // Whole-branch review: batch RPCs must authorize like the Session* RPCs. RejectAuth
+        // must short-circuit RunBatch before it touches batch state (or the "batch not
+        // configured" path).
+        let srv = build(Arc::new(PanicBackend), Arc::new(RejectAuth));
+        let resp = router(srv)
+            .oneshot(post_request(
+                "RunBatch",
+                json!({ "workflow": "code", "items": [{ "input": "x" }] }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("auth required"),
+            "RunBatch must reject unauthenticated callers: {body}"
         );
     }
 

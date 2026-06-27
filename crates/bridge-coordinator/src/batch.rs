@@ -81,6 +81,9 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
     let mut seen = HashSet::new();
     let mut items = Vec::with_capacity(params.items.len());
     for mut item in params.items {
+        if item.item_id.is_empty() {
+            return Err(BridgeError::InvalidRequest { field: "item_id" });
+        }
         if !seen.insert(item.item_id.clone()) {
             return Err(BridgeError::InvalidRequest { field: "item_id" });
         }
@@ -123,10 +126,11 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
     tokio::spawn(run_admission(
         deps.clone(),
         bid.clone(),
+        VecDeque::new(),
         items.into(),
-        FuturesUnordered::new(),
         concurrency,
         token,
+        0,
     ));
     Ok(bid)
 }
@@ -178,6 +182,14 @@ pub async fn cancel_batch(deps: &BatchDeps, id: &BatchId) -> Result<bool, Bridge
     Ok(flipped)
 }
 
+/// Boot-resume entry point: orphan-sweep batch children whose parent is no longer active →
+/// `Interrupted`, then resume non-batch tasks (W3b) and the active batches.
+///
+/// KNOWN LIMITATION (whole-branch review): `resume_all` only runs when `[batch]` is configured
+/// (the adapters route here only when `batch_deps()` is `Some`). Booting a DB that holds live
+/// batch rows under a config that DROPPED `[batch]` leaves those children `Working` un-swept.
+/// Removing `[batch]` while batch rows are in-flight is unsupported; drain or cancel batches
+/// before dropping the block.
 pub async fn resume_all(deps: &BatchDeps, cap: u32) {
     match deps.detached.task_store.active_batches().await {
         Ok(active) => {
@@ -273,7 +285,7 @@ async fn resumed_child_future(
     child: &TaskRecord,
     cap: u32,
     permit: OwnedSemaphorePermit,
-) -> Option<BoxFuture<'static, TaskId>> {
+) -> Option<(BoxFuture<'static, TaskId>, TaskId, CancellationToken)> {
     let task = child.id.clone();
     let Some(spec_json) = child.workflow_spec_json.as_deref() else {
         let _ = finalize_detached(
@@ -434,16 +446,21 @@ async fn resumed_child_future(
         child.input.clone(),
         Arc::new(graph),
         run_id,
-        token,
+        token.clone(),
         seed,
         ctx,
         hub,
     );
-    Some(Box::pin(async move {
-        let _permit = permit;
-        let _ = h.await;
-        task
-    }))
+    let task_id = child.id.clone();
+    Some((
+        Box::pin(async move {
+            let _permit = permit;
+            let _ = h.await;
+            task
+        }),
+        task_id,
+        token,
+    ))
 }
 
 pub async fn resume_batches(deps: &BatchDeps, cap: u32) {
@@ -511,23 +528,14 @@ pub async fn resume_batches(deps: &BatchDeps, cap: u32) {
             continue;
         }
 
-        let inflight: FuturesUnordered<BoxFuture<'static, TaskId>> = FuturesUnordered::new();
-        for child in children
-            .iter()
+        // Hand the still-Working children to `run_admission` as `to_resume`; it acquires their
+        // permits inside its drain-aware loop (so the cap holds on boot WITHOUT the cross-batch
+        // deadlock of acquiring inline here) and registers their tokens in `live` (so a later
+        // CancelBatch reaches resumed children) — whole-branch review fixes.
+        let to_resume: VecDeque<TaskRecord> = children
+            .into_iter()
             .filter(|c| c.status == TaskRecordStatus::Working)
-        {
-            let permit = deps
-                .runtime
-                .semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("batch semaphore closed");
-            if let Some(fut) = resumed_child_future(deps, child, cap, permit).await {
-                inflight.push(fut);
-            }
-        }
-
+            .collect();
         let pending: VecDeque<BatchItem> = items
             .into_iter()
             .filter(|item| !existing.contains(&item.item_id))
@@ -535,22 +543,40 @@ pub async fn resume_batches(deps: &BatchDeps, cap: u32) {
         tokio::spawn(run_admission(
             deps.clone(),
             bid,
+            to_resume,
             pending,
-            inflight,
             batch.concurrency,
             token,
+            cap,
         ));
     }
+}
+
+/// CAS a still-`Working` batch to `Failed` when its workflow snapshot/graph can no longer be
+/// resolved, so a batch with a pending tail does not sit `Working` forever (whole-branch review).
+async fn fail_batch_unavailable(deps: &BatchDeps, bid: &BatchId) {
+    let _ = deps
+        .detached
+        .task_store
+        .fail_batch_if_status(
+            bid,
+            BatchStatus::Working,
+            "workflow unavailable",
+            deps.detached.clock.now_ms(),
+        )
+        .await;
 }
 
 pub async fn run_admission(
     deps: BatchDeps,
     bid: BatchId,
+    mut to_resume: VecDeque<TaskRecord>,
     mut pending: VecDeque<BatchItem>,
-    mut inflight: FuturesUnordered<BoxFuture<'static, TaskId>>,
     concurrency: u32,
     token: CancellationToken,
+    cap: u32,
 ) {
+    let mut inflight: FuturesUnordered<BoxFuture<'static, TaskId>> = FuturesUnordered::new();
     let mut live: HashMap<TaskId, CancellationToken> = HashMap::new();
     let mut drain_only = token.is_cancelled();
     let mut cancelled_children = false;
@@ -560,7 +586,7 @@ pub async fn run_admission(
         'admit: while !drain_only
             && !claim_failed
             && inflight.len() < concurrency as usize
-            && !pending.is_empty()
+            && (!to_resume.is_empty() || !pending.is_empty())
             && !token.is_cancelled()
         {
             // Acquire a shared permit, but KEEP DRAINING `inflight` while we wait. Each
@@ -586,25 +612,46 @@ pub async fn run_admission(
                 }
             };
 
+            // Resume an existing Working child first (its row already exists; re-run from
+            // checkpoints). The permit is owned by the returned future, or dropped inside
+            // `resumed_child_future` on a terminal/exhausted short-circuit — so acquiring the
+            // permit HERE (inside the drain-aware loop) keeps the cap honored on boot without
+            // the cross-batch deadlock of acquiring inline before the loop runs.
+            if let Some(child) = to_resume.front().cloned() {
+                if let Some((fut, task, ctok)) =
+                    resumed_child_future(&deps, &child, cap, permit).await
+                {
+                    live.insert(task, ctok);
+                    inflight.push(fut);
+                }
+                to_resume.pop_front();
+                continue;
+            }
+
             let Some(item) = pending.front().cloned() else {
                 drop(permit);
                 continue;
             };
+            // A missing batch row / unparsable or hot-removed workflow can't be admitted; fail
+            // the whole batch (so it doesn't sit Working forever) and stop admitting.
             let workflow_name = match deps.detached.task_store.get_batch(&bid).await {
                 Ok(Some(batch)) => batch.workflow,
                 _ => {
                     drop(permit);
+                    fail_batch_unavailable(&deps, &bid).await;
                     claim_failed = true;
                     break;
                 }
             };
             let Ok(workflow) = WorkflowId::parse(workflow_name) else {
                 drop(permit);
+                fail_batch_unavailable(&deps, &bid).await;
                 claim_failed = true;
                 break;
             };
             let Some(graph) = deps.detached.workflows.get(&workflow).cloned() else {
                 drop(permit);
+                fail_batch_unavailable(&deps, &bid).await;
                 claim_failed = true;
                 break;
             };
@@ -745,7 +792,9 @@ pub async fn run_admission(
         }
 
         if drain_only || claim_failed {
-            if token.is_cancelled() && !cancelled_children {
+            // Cancel in-flight siblings on a batch cancel OR a claim/workflow failure — a
+            // failed batch must not leave live children running (whole-branch review).
+            if (token.is_cancelled() || claim_failed) && !cancelled_children {
                 for t in live.values() {
                     t.cancel();
                 }
@@ -776,7 +825,7 @@ pub async fn run_admission(
         }
     }
 
-    if token.is_cancelled() && !cancelled_children {
+    if (token.is_cancelled() || claim_failed) && !cancelled_children {
         for t in live.values() {
             t.cancel();
         }
@@ -1418,6 +1467,110 @@ mod tests {
         assert_eq!(child.status, TaskRecordStatus::Canceled);
     }
 
+    // Whole-branch review: seeded Working children EXCEEDING the cap must not deadlock boot
+    // resume (the permit is acquired inside run_admission's drain-aware loop, not inline).
+    #[tokio::test]
+    async fn resume_seeded_working_over_cap_does_not_deadlock() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(1, gate.clone()); // cap 1, two Working children
+        let bid = BatchId::parse("batch-resume-overcap").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-resume-overcap",
+                BatchStatus::Working,
+                2,
+                2,
+            ))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(
+                &bid,
+                "item-0",
+                TaskRecordStatus::Working,
+                true,
+            ))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(
+                &bid,
+                "item-1",
+                TaskRecordStatus::Working,
+                true,
+            ))
+            .await
+            .unwrap();
+
+        resume_batches(&deps, 3).await;
+        gate.wait_calls(1).await;
+        assert!(gate.max.load(Ordering::SeqCst) <= 1);
+        gate.release(20);
+        // Completes (does not hang) and the cap held throughout.
+        wait_batch_status(&store, &bid, BatchStatus::Completed).await;
+        assert!(gate.max.load(Ordering::SeqCst) <= 1);
+    }
+
+    // Whole-branch review: a resumed child must be registered in `live` so a later CancelBatch
+    // reaches it (without the fix, run_admission started with an empty `live`).
+    #[tokio::test]
+    async fn cancel_batch_cancels_resumed_children() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(3, gate.clone());
+        let bid = BatchId::parse("batch-resume-cancelable").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-resume-cancelable",
+                BatchStatus::Working,
+                1,
+                1,
+            ))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(
+                &bid,
+                "item-0",
+                TaskRecordStatus::Working,
+                true,
+            ))
+            .await
+            .unwrap();
+
+        resume_batches(&deps, 3).await;
+        gate.wait_calls(1).await; // the resumed child is in-flight, parked on the gate
+        assert!(cancel_batch(&deps, &bid).await.unwrap());
+        // The resumed child's token (in `live`) fires → it cancels → batch settles Canceled,
+        // WITHOUT ever releasing the gate.
+        wait_batch_status(&store, &bid, BatchStatus::Canceled).await;
+    }
+
+    // Whole-branch review: a resumed batch whose workflow is no longer registered must CAS to
+    // Failed (not sit Working forever).
+    #[tokio::test]
+    async fn resume_missing_workflow_fails_batch() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(3, gate.clone());
+        let bid = BatchId::parse("batch-missing-wf").unwrap();
+        store
+            .create_batch(&BatchRecord {
+                id: bid.clone(),
+                workflow: "no-such-workflow".into(),
+                concurrency: 2,
+                total: 1,
+                status: BatchStatus::Working,
+                items_json: r#"{"v":1,"items":[{"item_id":"item-0","input":"x"}]}"#.into(),
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        resume_batches(&deps, 3).await;
+        wait_batch_status(&store, &bid, BatchStatus::Failed).await;
+    }
+
     #[tokio::test]
     async fn batch_caps_within_one_batch() {
         let gate = Gate::new(None);
@@ -1532,10 +1685,11 @@ mod tests {
         let h = tokio::spawn(run_admission(
             deps,
             bid.clone(),
+            VecDeque::new(),
             VecDeque::from(items(1)),
-            FuturesUnordered::new(),
             1,
             token.clone(),
+            0,
         ));
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1571,10 +1725,11 @@ mod tests {
         run_admission(
             deps,
             bid.clone(),
+            VecDeque::new(),
             VecDeque::from(items(1)),
-            FuturesUnordered::new(),
             1,
             CancellationToken::new(),
+            0,
         )
         .await;
 
@@ -1628,10 +1783,11 @@ mod tests {
         run_admission(
             deps,
             bid.clone(),
+            VecDeque::new(),
             VecDeque::from(items(1)),
-            FuturesUnordered::new(),
             1,
             CancellationToken::new(),
+            0,
         )
         .await;
 

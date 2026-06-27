@@ -3121,6 +3121,9 @@ fn parse_batch_manifest(toml_str: &str, base_dir: &Path) -> Result<Vec<BatchWire
     let mut out = Vec::with_capacity(manifest.item.len());
     for (idx, item) in manifest.item.into_iter().enumerate() {
         let item_id = item.id.unwrap_or_else(|| idx.to_string());
+        if item_id.is_empty() {
+            return Err("run-batch: item id must not be empty".into());
+        }
         if !seen.insert(item_id.clone()) {
             return Err(format!("run-batch: duplicate item id {item_id:?}").into());
         }
