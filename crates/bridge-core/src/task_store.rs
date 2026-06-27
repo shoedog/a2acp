@@ -3,7 +3,7 @@
 //! responsibility. Timestamps are passed IN — the core forbids `Date::now`.
 
 use crate::error::BridgeError;
-use crate::ids::{NodeId, OperationId, TaskId};
+use crate::ids::{BatchId, NodeId, OperationId, TaskId};
 
 /// Durable status of a detached task. `Interrupted` is distinct from `Failed`
 /// (a crash mid-run, swept on the next boot) so triage can tell them apart; the
@@ -198,6 +198,56 @@ pub trait TaskStore: Send + Sync {
     /// Return all rows whose status is `Working` (for the boot-time resume scan).
     async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError>;
 
+    async fn create_batch(&self, _rec: &BatchRecord) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    async fn get_batch(&self, _id: &BatchId) -> Result<Option<BatchRecord>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    async fn list_batches(&self, _limit: usize) -> Result<Vec<BatchRecord>, BridgeError> {
+        Ok(vec![])
+    }
+    /// Return batches that still need boot/resume ownership: `Working` or `Canceling`.
+    async fn active_batches(&self) -> Result<Vec<BatchRecord>, BridgeError> {
+        Ok(vec![])
+    }
+    async fn batch_children(&self, _id: &BatchId) -> Result<Vec<TaskRecord>, BridgeError> {
+        Ok(vec![])
+    }
+    /// Atomic insert-or-observe on `(batch_id, item_id)`. Spawn only on `Created`.
+    async fn claim_batch_child(
+        &self,
+        _batch: &BatchId,
+        _item: &str,
+        _rec: &TaskRecord,
+    ) -> Result<ChildClaim, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    /// CAS `Working` -> `Canceling`; false if not currently working.
+    async fn cancel_batch_if_working(&self, _id: &BatchId, _ts: i64) -> Result<bool, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    /// CAS `expect` -> `new`; false if the current status differs.
+    async fn settle_batch_if_status(
+        &self,
+        _id: &BatchId,
+        _expect: BatchStatus,
+        _new: BatchStatus,
+        _ts: i64,
+    ) -> Result<bool, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    /// CAS `expect` -> `Failed`, recording the failure reason.
+    async fn fail_batch_if_status(
+        &self,
+        _id: &BatchId,
+        _expect: BatchStatus,
+        _error: &str,
+        _ts: i64,
+    ) -> Result<bool, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
     // ── Seq-bearing progress methods (Phase A: streaming reattach substrate) ──
 
     /// Record that a node has started executing. Returns the allocated seq.
@@ -385,6 +435,7 @@ pub struct MemoryTaskStore {
     /// Coarse guard for Memory fold-input consistency across the split maps.
     journal_fold_guard: Mutex<()>,
     inner: Mutex<HashMap<String, TaskRecord>>,
+    batches: Mutex<HashMap<BatchId, BatchRecord>>,
     /// Tasks created under S6 code have complete journal coverage from birth.
     birth: Mutex<HashSet<String>>,
     /// Key: (task_id, node_id) → (output, ok, ts, seq, usage)
@@ -404,6 +455,7 @@ impl MemoryTaskStore {
         Self {
             journal_fold_guard: Mutex::new(()),
             inner: Mutex::new(HashMap::new()),
+            batches: Mutex::new(HashMap::new()),
             birth: Mutex::new(HashSet::new()),
             checkpoints: Mutex::new(HashMap::new()),
             seq_counters: Mutex::new(HashMap::new()),
@@ -551,6 +603,122 @@ impl TaskStore for MemoryTaskStore {
             .filter(|r| r.status == TaskRecordStatus::Working)
             .cloned()
             .collect())
+    }
+
+    async fn create_batch(&self, rec: &BatchRecord) -> Result<(), BridgeError> {
+        let mut g = self.batches.lock().unwrap();
+        if g.contains_key(&rec.id) {
+            return Err(BridgeError::StoreFailure);
+        }
+        g.insert(rec.id.clone(), rec.clone());
+        Ok(())
+    }
+
+    async fn get_batch(&self, id: &BatchId) -> Result<Option<BatchRecord>, BridgeError> {
+        Ok(self.batches.lock().unwrap().get(id).cloned())
+    }
+
+    async fn list_batches(&self, limit: usize) -> Result<Vec<BatchRecord>, BridgeError> {
+        let g = self.batches.lock().unwrap();
+        let mut v: Vec<BatchRecord> = g.values().cloned().collect();
+        v.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+        v.truncate(limit);
+        Ok(v)
+    }
+
+    async fn active_batches(&self) -> Result<Vec<BatchRecord>, BridgeError> {
+        let g = self.batches.lock().unwrap();
+        Ok(g.values()
+            .filter(|r| matches!(r.status, BatchStatus::Working | BatchStatus::Canceling))
+            .cloned()
+            .collect())
+    }
+
+    async fn batch_children(&self, id: &BatchId) -> Result<Vec<TaskRecord>, BridgeError> {
+        let g = self.inner.lock().unwrap();
+        Ok(g.values()
+            .filter(|r| r.batch_id.as_ref() == Some(id))
+            .cloned()
+            .collect())
+    }
+
+    async fn claim_batch_child(
+        &self,
+        batch: &BatchId,
+        item: &str,
+        rec: &TaskRecord,
+    ) -> Result<ChildClaim, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
+        if let Some(existing) = g
+            .values()
+            .find(|r| r.batch_id.as_ref() == Some(batch) && r.item_id.as_deref() == Some(item))
+        {
+            return Ok(if existing.status == TaskRecordStatus::Working {
+                ChildClaim::ExistingWorking
+            } else {
+                ChildClaim::ExistingTerminal
+            });
+        }
+        if g.contains_key(rec.id.as_str()) {
+            return Err(BridgeError::StoreFailure);
+        }
+        let mut rec = rec.clone();
+        rec.batch_id = Some(batch.clone());
+        rec.item_id = Some(item.to_string());
+        let task_id = rec.id.as_str().to_string();
+        g.insert(task_id.clone(), rec);
+        self.birth.lock().unwrap().insert(task_id);
+        Ok(ChildClaim::Created)
+    }
+
+    async fn cancel_batch_if_working(&self, id: &BatchId, ts: i64) -> Result<bool, BridgeError> {
+        let mut g = self.batches.lock().unwrap();
+        match g.get_mut(id) {
+            Some(row) if row.status == BatchStatus::Working => {
+                row.status = BatchStatus::Canceling;
+                row.updated_ms = ts;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn settle_batch_if_status(
+        &self,
+        id: &BatchId,
+        expect: BatchStatus,
+        new: BatchStatus,
+        ts: i64,
+    ) -> Result<bool, BridgeError> {
+        let mut g = self.batches.lock().unwrap();
+        match g.get_mut(id) {
+            Some(row) if row.status == expect => {
+                row.status = new;
+                row.updated_ms = ts;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn fail_batch_if_status(
+        &self,
+        id: &BatchId,
+        expect: BatchStatus,
+        error: &str,
+        ts: i64,
+    ) -> Result<bool, BridgeError> {
+        let mut g = self.batches.lock().unwrap();
+        match g.get_mut(id) {
+            Some(row) if row.status == expect => {
+                row.status = BatchStatus::Failed;
+                row.error = Some(error.to_string());
+                row.updated_ms = ts;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn record_node_started(
@@ -871,7 +1039,7 @@ impl TaskStore for MemoryTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{NodeId, OperationId};
+    use crate::ids::{BatchId, NodeId, OperationId};
     use crate::orch::{OrchEvent, OrchEventKind, UsageSnapshot, ORCH_V};
 
     fn rec(id: &str, ms: i64) -> TaskRecord {
@@ -889,6 +1057,38 @@ mod tests {
             session_cwd: None,
             batch_id: None,
             item_id: None,
+        }
+    }
+
+    fn sample_batch(bid: &BatchId, status: BatchStatus, total: u32, ms: i64) -> BatchRecord {
+        BatchRecord {
+            id: bid.clone(),
+            workflow: "code-review".into(),
+            concurrency: 2,
+            total,
+            status,
+            items_json: r#"{"v":1,"items":[]}"#.into(),
+            error: None,
+            created_ms: ms,
+            updated_ms: ms,
+        }
+    }
+
+    fn batch_child_record(tid: &TaskId, bid: &BatchId, item: &str) -> TaskRecord {
+        TaskRecord {
+            id: tid.clone(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 0,
+            updated_ms: 0,
+            input: "DIFF".into(),
+            workflow_spec_json: Some(r#"{"v":1,"nodes":[]}"#.into()),
+            resume_attempts: 0,
+            session_cwd: None,
+            batch_id: Some(bid.clone()),
+            item_id: Some(item.to_string()),
         }
     }
 
@@ -916,6 +1116,66 @@ mod tests {
     fn task_record_batch_fields_default_none() {
         let rec = rec("task-1", 0);
         assert!(rec.batch_id.is_none() && rec.item_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_batch_roundtrip_and_claim_and_cas() {
+        let s = MemoryTaskStore::new();
+        let bid = BatchId::parse("b1").unwrap();
+        s.create_batch(&sample_batch(&bid, BatchStatus::Working, 2, 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_batch(&bid).await.unwrap().unwrap().status,
+            BatchStatus::Working
+        );
+        assert_eq!(s.active_batches().await.unwrap().len(), 1);
+
+        let t1 = TaskId::parse("t1").unwrap();
+        let rec = batch_child_record(&t1, &bid, "item-a");
+        assert_eq!(
+            s.claim_batch_child(&bid, "item-a", &rec).await.unwrap(),
+            ChildClaim::Created
+        );
+        let t2 = TaskId::parse("t2").unwrap();
+        let rec2 = batch_child_record(&t2, &bid, "item-a");
+        assert_eq!(
+            s.claim_batch_child(&bid, "item-a", &rec2).await.unwrap(),
+            ChildClaim::ExistingWorking
+        );
+        assert_eq!(s.batch_children(&bid).await.unwrap().len(), 1);
+
+        assert!(s
+            .settle_batch_if_status(&bid, BatchStatus::Working, BatchStatus::Completed, 1)
+            .await
+            .unwrap());
+        assert!(!s.cancel_batch_if_working(&bid, 2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn memory_fail_batch_if_status() {
+        let s = MemoryTaskStore::new();
+        let bid = BatchId::parse("b-fail").unwrap();
+        s.create_batch(&sample_batch(&bid, BatchStatus::Working, 1, 0))
+            .await
+            .unwrap();
+
+        assert!(s
+            .fail_batch_if_status(&bid, BatchStatus::Working, "bad plan", 7)
+            .await
+            .unwrap());
+        let got = s.get_batch(&bid).await.unwrap().unwrap();
+        assert_eq!(got.status, BatchStatus::Failed);
+        assert_eq!(got.error.as_deref(), Some("bad plan"));
+        assert_eq!(got.updated_ms, 7);
+        assert!(!s
+            .fail_batch_if_status(&bid, BatchStatus::Working, "ignored", 8)
+            .await
+            .unwrap());
+        assert_eq!(
+            s.get_batch(&bid).await.unwrap().unwrap().error.as_deref(),
+            Some("bad plan")
+        );
     }
 
     #[test]
