@@ -376,3 +376,96 @@ fn commit_precedence_and_comment_only_falls_back_to_title() {
 - **No placeholders:** every task has full test code + the load-bearing implementation (the parser fence-rule, the validate/empty-check, the 3-edit error ripple, the run-init render block, the gate wirings, the commit precedence) is spelled out; the implementer fills boilerplate to pass the pinned tests.
 - **Type consistency:** `TaskSpec`/`Section`/`SchemaDef`/`SectionDef`/`TaskSpecError` used identically T1–T5; `validate_input` helper signature consistent T5/T7/T9; `fields()` neutral (no `task.` prefix) T3 ↔ bridge-workflow prefixes T6; `commit_message` 4-arg signature consistent T10.
 - **Ordering:** bottom-up — bridge-core lib (T1–T4) → CLI (T5) → executor render (T6) → gates (T7) → migration (T8) → implement (T9–T10). Each compiles green; T6/T7 depend on T1–T4; T9/T10 on T1–T4 + T7's `read_input`.
+
+---
+
+## v2 (BINDING — fold of the dual plan-review; supersedes the v1 task text where they conflict)
+
+Dual PLAN-review (codex compile-green + Opus architecture). Both `needs-revision`, strongly corroborating, with a
+LARGE verified-sound list: BOTH confirmed the architecture, the `bridge-core::task_spec` home, the
+`RouteTarget::Workflow`-keyed gate (single A2A choke point, scope-correct), the CLI read-hoist seam, the render-free/
+`task.`-prefix layering, the batch/Coordinator/implement anchors, the migration scope, and the Slice A/B cut are all
+SOUND. The findings are anchor/ripple/test-concreteness sharpenings + 2 correctness catches. PR-FIX-1..10 are BINDING.
+
+### PR-FIX-1 (BLOCKER — codex) — T4's error ripple is FIVE edits, not three
+`bin/a2a-bridge/src/resilient.rs:154` `table_key(&BridgeError)` is an **exhaustive `match`** (no `_` arm) — adding
+`TaskSpecInvalid` breaks the build there. The full ripple:
+1. the `TaskSpecInvalid { message }` variant (error.rs);
+2. `error.rs` `disposition()` arm `TaskSpecInvalid { .. } => RejectRequest` (before `_ => SetState(Failed)`) — mandatory;
+3. `error.rs` `is_transient_covers_every_variant` test list (`:283`) → not-transient;
+4. `resilient.rs:154` `table_key` arm `TaskSpecInvalid { .. } => "TaskSpecInvalid"` + classify `Death::Fatal`;
+5. `resilient.rs:183` the table test case.
+(The controller's `cargo build --workspace` catches any further exhaustive `match BridgeError`.)
+
+### PR-FIX-2 (MAJOR — both) — the shared helper RETURNS the parsed spec (read-once stdin can't re-read)
+`validate_input(raw) -> Result<(), BridgeError>` loses the spec, but the CLI (T5), and implement (T9/T10) need the
+body/title/`Commit Message` AFTER a single read of `-`/stdin. Fix: **`task_spec::validate_input(raw) ->
+Result<TaskSpec, BridgeError>`** in **bridge-core** (parse + validate + map `TaskSpecError` → `TaskSpecInvalid {
+<sanitized Display> }` ONCE — this also kills the per-crate mapping drift, Opus). A2A's `gate` ignores the returned
+spec; CLI + implement RETAIN it.
+
+### PR-FIX-3 (MAJOR — both) — fix the T5↔T7 ordering inversion
+T5 (`task-spec input`) references `read_input`/`validate_input`, but the plan introduces them in T7 (later). Fix:
+**introduce `read_input(<file|->)` (file or `-`→stdin) AND use `task_spec::validate_input` in T5** (the first CLI
+consumer); T7 REUSES them. Helpers land with their first user; bottom-up holds.
+
+### PR-FIX-4 (MAJOR — both) — T6 present-invalid YIELDS a Terminal, not an Err
+A render-parse `Err` is **swallowed** by the default no-op `WorkflowSink::error` (detached.rs:202) → the generic
+`finalize_detached(Failed, "workflow ended without terminal")` (detached.rs:1279), LOSING the safe discovery message.
+Fix: `run_from_with_context_inner`, on `parse_for_render` present-but-invalid, **`yield Ok(WorkflowEvent::Terminal {
+outcome: Failed, output: safe_msg })` + return, BEFORE scheduling** (so detached/CLI surface it). The adjacent
+seed-validation `yield Err(...)` (executor.rs:658/670) is the ANTI-PATTERN to avoid. Make a **REQUIRED named test**:
+a present-but-invalid input drives a detached run to terminal `Failed` carrying the safe message (NOT the generic
+string) — the `drain_workflow`/`DetachedProgressSink` harness (detached.rs:210) is available.
+
+### PR-FIX-5 (MAJOR — codex) — title validation needs a `TaskSpecError` variant
+The plan requires a title for non-freeform types but `TaskSpecError` has no title variant. Add
+`TaskSpecError::{MissingTitle, EmptyTitle}` (non-freeform require the H1); add `Display` arms + tests for `NoTaskType`
+(the most common gate failure) and missing/empty title.
+
+### PR-FIX-6 (MAJOR — codex) — replace placeholder tests with concrete failing-first tests
+T6 (comment-only), T7 (`/* … */`), T9 (a sentence) are placeholders. Write CONCRETE tests: T6 = a full executor
+harness (a graph whose node template references `{{input}}`+`{{task.*}}`, a fake backend; assert body-as-input + token
+resolution + the present-invalid Terminal); T7 = a full gate test (a Workflow-routed no-top-matter `message/send`
+rejects with `TaskSpecInvalid` BEFORE any store-put/SSE; a Local route is exempt); T9 = concrete `implement --input`
+arg-parse fixtures. Reuse the existing fake backends / store counters.
+
+### PR-FIX-7 (MAJOR — codex) — T5 must prove the `task-spec` subcommand is REGISTERED
+T5's wiring test only calls `bridge_core::task_spec` (would pass even if no subcommand is registered — the dispatch
+list at main.rs:4460 lacks it). Add parser/dispatch/usage tests proving `task-spec schema|template|input` is
+reachable from the CLI.
+
+### PR-FIX-8 (MAJOR — codex) — T1 parser tests add the binding grammar edges (SR-FIX-7/spec)
+Add failing-first tests: list/nested front-matter (`  - x` / `k:\n  a: b`) → `Parse`; `##x` (no trailing space) is
+NOT a heading; `~~~` fences behave like ``` ```; an info-string fence (` ```rust `) opens/closes correctly.
+
+### PR-FIX-9 (MAJOR — both) — `commit_message`'s signature change RIPPLES; merge.rs IS changed
+New signature: `commit_message(typed: Option<String>, file: Option<String>, title: &str, task: &str) -> (String,
+CommitSource)`. Update ALL call sites: `main.rs:2133` (pass the parsed `Commit Message` as `typed` + the parsed
+`title`); **`merge.rs:465`** (currently 2-arg `commit_message(ck.original_message.clone(), &ck.task_brief)` → pass the
+persisted `original_message` as the highest-precedence `typed`, `file=None`, `title=&ck.task_brief`); the
+**`implement.rs:698/702/708/710` tests** (2-arg → new sig). Re-spec the return `.1` (currently "used task-derived
+fallback", consumed by the `main.rs:2134` "no A2A_COMMIT_MSG" warning) so a `title`-sourced message does NOT mis-warn
+"task-derived". **DROP the `tweak.rs` reference** — `tweak.rs:260` passes `original_message` into `decide`; it does
+NOT call `commit_message`.
+
+### PR-FIX-10 (MINOR — Opus) — the A2A gate joins `parts` with the EXACT dispatch join
+RR2-FIX-1's validate==dispatch must hold on A2A too: the dispatched `input` is
+`parts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n")` (streaming server.rs:1995, detached
+server.rs:2461). The `gate` validation MUST join `parts` with the IDENTICAL `"\n"`. (Cleaner optional: produce the
+joined input ONCE in `gate` and carry it on `RoutedCall` (server.rs:393), eliminating the 3× re-join and structurally
+guaranteeing validate==dispatch.)
+
+### Updated task deltas
+- **T1** → + the grammar-edge tests (PR-8).
+- **T2** → + `MissingTitle`/`EmptyTitle` + `NoTaskType`/missing-title Display tests (PR-5).
+- **T4** → the 5-edit ripple incl. `resilient.rs` (PR-1).
+- **T5** → introduce `read_input` + use `validate_input` HERE (PR-3); the subcommand-registered test (PR-7).
+- **T6** → `yield Ok(Terminal{Failed})` + the REQUIRED detached present-invalid test (PR-4); concrete harness (PR-6).
+- **T7** → reuse T5's helpers; `validate_input` returns `TaskSpec` (PR-2); the exact `.join("\n")` (PR-10); the
+  reject-before-store/SSE test (PR-6).
+- **T9/T10** → `validate_input` returns the spec (PR-2); the full `commit_message` ripple incl. merge.rs + the 4
+  tests + the `.1`/warning re-spec; drop tweak.rs (PR-9).
+
+**PLAN v2 VERDICT TARGET:** with PR-FIX-1..10 → ready-to-implement (architecture + decomposition + faithfulness
+confirmed sound by both lenses; these are ripple/ordering/test-concreteness corrections + the 2 correctness catches).
