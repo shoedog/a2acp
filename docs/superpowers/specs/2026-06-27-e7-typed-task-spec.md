@@ -367,3 +367,105 @@ Q4 → ONE run-init parse covers cold/warm/detached/resume rendering; implement 
   criteria→verify-rung. Data-driven schema-from-file.
 
 **RE-REVIEW TARGET:** with SR-FIX-1..12 folded → ready for the focused re-review, then plan.
+
+---
+
+## v3 (BINDING — supersedes v2/v1 where they conflict)
+
+Dual RE-REVIEW (codex xhigh + Opus). Both `needs-revision`, strongly corroborating; all spec edits, no spikes. The
+core holds; v3 closes the gate-scope + gate-placement + wire-redaction trio and the render/commit-timing sharpenings.
+
+### RR-FIX-1 (BLOCKER — both; SCOPE CONFIRMED) — the gate covers USER-SUBMITTED workflow/batch/implement inputs ONLY
+1a's "mandatory top-matter EVERYWHERE" is reworded to **every user-submitted workflow/batch/implement task input**.
+EXEMPT (not task-specs, NOT gated): (a) **conversational single-agent turns** — A2A `message/send` to one agent
+(`RouteTarget::Local`/delegate/fanout), `Coordinator::prompt`/`continue_turn`, MCP `op`/`continue` (a chat turn is not
+a task-spec); (b) **internal generated inputs** — implement's own review step `review::build_review_input` →
+`executor.run_with_context` (main.rs:1455/1461) is machine-generated plumbing, not a user task. This is the honest
+reading of E7's stated surface (run-workflow / run-batch / implement); it does NOT regress 1a (every *task* input is
+still gated).
+
+### RR-FIX-2 (BLOCKER — both) — A2A gate = synchronous in `InboundServer::gate`, keyed off `RouteTarget::Workflow`
+The streaming arm (server.rs:844) has already committed to SSE by `:853` and mutated session state by `:790`, so a
+gate there can't be the required JSON-RPC error. Fix: validate **in `InboundServer::gate`** (the existing pre-flight:
+auth/version/route/cwd) AFTER route resolution, ONLY when `target == RouteTarget::Workflow`, BEFORE any store-put /
+SSE. That is the SINGLE A2A choke point (unary + streaming + detached all flow through `gate`). The other entries:
+CLI (RR-FIX-5), `Coordinator::run_workflow` (covers MCP), `run_batch` item loop (RR-FIX-11), implement. **Invariant
+(state it + test it):** every executor/`run_workflow`/batch caller is pre-gated; the lenient executor parse (RR-FIX-4)
+is a DEFENSIVE backstop, not a policy bypass — a per-entry "no-top-matter input is rejected" test guards each site.
+
+### RR-FIX-3 (BLOCKER — both) — `BridgeError::TaskSpecInvalid { message: String }` (the discovery text must ride the wire)
+`client_message()` (error.rs:99) redacts `ConfigInvalid`/`InvalidRequest` to static strings, so the discovery message
+would be stripped on A2A/MCP. Fix: add `BridgeError::TaskSpecInvalid { message: String }` with a **`RejectRequest`**
+disposition (not `Failed`) and an **unredacted** `client_message` arm; every gate maps `TaskSpecError::Display` → this
+variant; `bridge_err_to_jsonrpc` (server.rs:3464) then carries the full discovery text.
+
+### RR-FIX-4 (MAJOR — both) — define the lenient render parse for PRESENT-but-invalid front-matter
+v2 only specified "no top-matter → freeform." Define `parse_for_render(input)` at the run-init point: **bare input
+(no front-matter) → freeform** (raw body as `{{input}}`, no `task.*` vars); **present front-matter that parse-fails OR
+is schema-invalid → fail-closed** (the executor NEVER fabricates `task.*` vars from invalid input; it surfaces the
+error, not a silent valid-typed render). Because every caller is pre-gated (RR-FIX-2), this path is a defensive
+backstop that should be observable, not a second policy.
+
+### RR-FIX-5 (MAJOR — codex) — CLI validate immediately after arg-parse (main.rs:2675)
+v2's `:2834` anchor is AFTER config load (`:2691`) + snapshot/registry (`:2735`) + LSP warm. Fix: read+validate
+`--input <file|->` right after arg-parse (main.rs:2675), before config/serve-POST, for BOTH local AND `--serve`. Add
+stdin (`-`) at BOTH read sites (the local read AND the `--serve` client read at main.rs:2554).
+
+### RR-FIX-6 (MAJOR — both) — commit-message capture timing
+The implement checkpoint is first written only AFTER `host_commit` (main.rs:2206), so SR-FIX-8's "captured at submit"
+is wrong. Revise: the sanitized typed `Commit Message` (trim + NUL-strip + 64KiB) is the highest-precedence source in
+`implement::commit_message` and is written as the `original_message` at the **first checkpoint save** (post-host-commit,
+main.rs:2189), which `merge.rs:465` reuses — NO new persisted field.
+
+### RR-FIX-7 (MINOR — codex) — CRLF normalize BEFORE front-matter detection
+Normalize `\r\n → \n` as the FIRST parser step, before the leading-`---` front-matter check (else Windows `---\r\n`
+fails detection). Update SR-FIX-7's ordering.
+
+### RR-FIX-8 (MAJOR — Opus) — Q4 warm-path reword
+"ONE run-init parse covers every EXECUTOR rendering path (cold / warm-WORKFLOW via `WarmWorkflowNodeDispatcher`
+server.rs:2027 / detached / resume), all funneling through `run_from_with_context_inner`." The warm SINGLE-AGENT turn
+(`collect_turn`, coordinator.rs:276) has NO template and renders no `{{input}}` — it is governed by the gate SCOPE
+(RR-FIX-1: exempt), not the render.
+
+### RR-FIX-9 (MAJOR — Opus) — preserve implement's task-via-FILE rationale
+implement writes the task to `.git/A2A_TASK.md` *specifically because* a large/non-ASCII task in the ACP prompt
+crashes the in-container claude session (main.rs:2106-2109). E7 keeps this: **body-sans-front-matter → `A2A_TASK.md`**;
+the implement-edit template continues to read the FILE — there is **NO `{{input}}` interpolation for implement-edit**.
+State this so a planner does not "uniformly render `{{input}}`" and reintroduce the crash.
+
+### RR-FIX-10 (MINOR — Opus) — `fields()` flattens nested subsection tokens under a flat schema
+`fields(&TaskSpec)` (bridge-core, render-free) emits the nested subsection entries (`x.y` normalized names) from the
+recursive PARSER `Section` even though the validated `SchemaDef` is flat (RR-FIX-10/SR-FIX-10); bridge-workflow only
+prefixes `task.` + seeds. So `{{task.description.context}}` resolves without the registry being recursive.
+
+### RR-FIX-11 (MINOR — Opus) — batch defensive-gate anchor
+The defensive item validation is the **item loop in `run_batch` (batch.rs:83)**, before `tokio::spawn(run_admission)`
+— NOT "before `claim_batch_child`" (which runs inside the spawned `run_admission`, batch.rs:697). The user-facing gate
+is `run_batch_rpc` (item-named); the `run_batch` loop is the non-RPC-caller defense.
+
+### RR-FIX-12 (MINOR — both) — SR-FIX-6 comment-strip is for the EMPTINESS check only
+The HTML-comment strip applies to the "is this required section non-empty" VALIDATION check only — the section's
+RENDERED content / `{{task.*}}` token is verbatim (comments included). So a description that is ONLY a `<!-- … -->`
+comment → empty → fails; a description with prose + a comment → non-empty → passes, rendered verbatim.
+
+### Migration scope (refines SR-FIX-9 with RR-FIX-1)
+Internal generated inputs (implement's review) are EXEMPT (RR-FIX-1) → NO migration there. Migration = the
+USER-SUBMITTED freeform callers: live smoke `--input README.md`/`--input /dev/null` commands, `onboarding.md:104/107`,
+`containerized-agents.md:126-130`, `examples/sample-input.md`, `submit`/workflow client docs. Does NOT cascade into the
+unit-test suite (the lenient executor covers bare-string fixtures).
+
+### Updated rulings
+D1/D2/D4/D6/D7 stand. **D3 → 1a, SCOPED** (user-submitted workflow/batch/implement inputs; conversational + internal
+exempt, RR-FIX-1). **D5 → run-init parse + the fail-closed-on-present-invalid lenient rule** (RR-FIX-4). D8/D9 stand.
+
+### SR-FIX closure
+SR-FIX-2/3/5/10/11 → RESOLVED. SR-FIX-1/4/7/8/9/12 → completed by RR-FIX-1..12 above. SR-FIX-6 → RESOLVED + clarified
+(RR-FIX-12).
+
+### Planning note (slice size)
+One plan, with a clean optional cut if it grows: **Slice A** = `bridge-core::task_spec` lib + `TaskSpecInvalid` error
++ `task-spec` CLI + render/seed wiring + the workflow/detached/MCP/batch gates + migration; **Slice B** = implement
+`--input` ingestion + `commit_message` precedence + `A2A_TASK.md` body (the implement rework is the most independent +
+the most likely to need its own container live-gate).
+
+**RE-REVIEW TARGET (round 2):** with RR-FIX-1..12 → ready-to-plan.
