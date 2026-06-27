@@ -5,17 +5,19 @@ use bridge_core::error::BridgeError;
 use bridge_core::ids::{BatchId, TaskId, WorkflowId};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{
-    BatchItem, BatchRecord, BatchStatus, BatchSummary, ChildClaim, TaskRecord, TaskRecordStatus,
+    BatchItem, BatchRecord, BatchStatus, BatchSummary, ChildClaim, ResumeClaim, TaskRecord,
+    TaskRecordStatus,
 };
 use bridge_workflow::executor::WorkflowRunContext;
+use bridge_workflow::graph::WorkflowGraph;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use serde_json::json;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::detached::{
     encode_workflow_spec, finalize_detached, new_detached_task_id, spawn_detached_workflow,
-    TaskProgressHub,
+    TaskProgressHub, SUPPORTED_SNAPSHOT_VERSION,
 };
 
 #[derive(Clone)]
@@ -134,13 +136,361 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
 }
 
 pub async fn resume_all(deps: &BatchDeps, cap: u32) {
-    // TODO(T7): orphan sweep
+    match deps.detached.task_store.active_batches().await {
+        Ok(active) => {
+            let active: HashSet<BatchId> = active.into_iter().map(|b| b.id).collect();
+            match deps.detached.task_store.working_tasks().await {
+                Ok(working) => {
+                    for task in working {
+                        let Some(bid) = task.batch_id.as_ref() else {
+                            continue;
+                        };
+                        if active.contains(bid) {
+                            continue;
+                        }
+                        if let Err(e) = finalize_detached(
+                            &deps.detached.task_store,
+                            &deps.detached.progress_hubs,
+                            &task.id,
+                            TaskRecordStatus::Interrupted,
+                            None,
+                            Some("orphan batch child"),
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::warn!(task = task.id.as_str(), batch = bid.as_str(), error = ?e, "batch resume: orphan child sweep failed");
+                        } else {
+                            tracing::warn!(task = task.id.as_str(), batch = bid.as_str(), "batch resume: interrupted orphan batch child");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "batch resume: working_tasks() failed; skipping orphan sweep");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "batch resume: active_batches() failed; skipping orphan sweep");
+        }
+    }
     crate::detached::resume_non_batch_tasks(&deps.detached, cap).await;
     resume_batches(deps, cap).await;
 }
 
-pub async fn resume_batches(_deps: &BatchDeps, _cap: u32) {
-    // TODO(T7): real batch resume
+#[derive(serde::Deserialize)]
+struct BatchPlanEnvelope {
+    v: u32,
+    items: Vec<BatchItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchWorkflowSpecEnvelope {
+    v: u32,
+    graph: WorkflowGraph,
+}
+
+fn decode_batch_plan(raw: &str) -> Option<Vec<BatchItem>> {
+    let env: BatchPlanEnvelope = serde_json::from_str(raw).ok()?;
+    (env.v == 1).then_some(env.items)
+}
+
+async fn cancel_working_children(deps: &BatchDeps, children: &[TaskRecord], reason: &str) {
+    for child in children {
+        if child.status != TaskRecordStatus::Working {
+            continue;
+        }
+        if let Err(e) = finalize_detached(
+            &deps.detached.task_store,
+            &deps.detached.progress_hubs,
+            &child.id,
+            TaskRecordStatus::Canceled,
+            None,
+            Some(reason),
+            None,
+        )
+        .await
+        {
+            tracing::warn!(task = child.id.as_str(), error = ?e, "batch resume: cancel child failed");
+        }
+        deps.detached.workflow_cancels.lock().await.remove(&child.id);
+    }
+}
+
+async fn resumed_child_future(
+    deps: &BatchDeps,
+    child: &TaskRecord,
+    cap: u32,
+    permit: OwnedSemaphorePermit,
+) -> Option<BoxFuture<'static, TaskId>> {
+    let task = child.id.clone();
+    let Some(spec_json) = child.workflow_spec_json.as_deref() else {
+        let _ = finalize_detached(
+            &deps.detached.task_store,
+            &deps.detached.progress_hubs,
+            &task,
+            TaskRecordStatus::Interrupted,
+            None,
+            Some("not resumable: no workflow snapshot"),
+            None,
+        )
+        .await;
+        drop(permit);
+        return None;
+    };
+
+    let graph = match serde_json::from_str::<BatchWorkflowSpecEnvelope>(spec_json) {
+        Ok(env) if env.v == SUPPORTED_SNAPSHOT_VERSION => env.graph,
+        _ => {
+            let _ = finalize_detached(
+                &deps.detached.task_store,
+                &deps.detached.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: unreadable workflow snapshot"),
+                None,
+            )
+            .await;
+            drop(permit);
+            return None;
+        }
+    };
+
+    let cps = match deps.detached.task_store.node_checkpoints(&task).await {
+        Ok(cps) => cps,
+        Err(e) => {
+            tracing::warn!(task = task.as_str(), error = ?e, "batch resume: node_checkpoints() failed; skipping task");
+            drop(permit);
+            return None;
+        }
+    };
+    let seed: HashMap<String, (String, bool, Option<bridge_core::orch::UsageSnapshot>)> = cps
+        .iter()
+        .map(|(node, output, ok, usage)| {
+            (
+                node.as_str().to_string(),
+                (output.clone(), *ok, usage.clone()),
+            )
+        })
+        .collect();
+
+    let terminal_id = match graph.terminal() {
+        Some(n) => n.id.as_str().to_string(),
+        None => {
+            let _ = finalize_detached(
+                &deps.detached.task_store,
+                &deps.detached.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: workflow snapshot has no terminal node"),
+                None,
+            )
+            .await;
+            drop(permit);
+            return None;
+        }
+    };
+    if let Some((output, ok, _usage)) = seed.get(&terminal_id) {
+        let (status, result, error) = if *ok {
+            (TaskRecordStatus::Completed, Some(output.as_str()), None)
+        } else {
+            (TaskRecordStatus::Failed, None, Some(output.as_str()))
+        };
+        let _ = finalize_detached(
+            &deps.detached.task_store,
+            &deps.detached.progress_hubs,
+            &task,
+            status,
+            result,
+            error,
+            None,
+        )
+        .await;
+        drop(permit);
+        return None;
+    }
+
+    let attempt = match deps
+        .detached
+        .task_store
+        .claim_resume_attempt(&task, cap, deps.detached.clock.now_ms())
+        .await
+    {
+        Ok(ResumeClaim::Exhausted) => {
+            let _ = finalize_detached(
+                &deps.detached.task_store,
+                &deps.detached.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("resume attempt cap exceeded"),
+                None,
+            )
+            .await;
+            drop(permit);
+            return None;
+        }
+        Ok(ResumeClaim::Resumable { attempt }) => attempt,
+        Err(e) => {
+            tracing::warn!(task = task.as_str(), error = ?e, "batch resume: claim_resume_attempt() failed; skipping task");
+            drop(permit);
+            return None;
+        }
+    };
+
+    let ctx = match child.session_cwd.as_deref() {
+        Some(s) => match SessionCwd::parse(s) {
+            Ok(c) => WorkflowRunContext {
+                session_cwd: Some(c),
+                make_rich_sink: None,
+            },
+            Err(_) => {
+                let _ = finalize_detached(
+                    &deps.detached.task_store,
+                    &deps.detached.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: unreadable session cwd"),
+                    None,
+                )
+                .await;
+                drop(permit);
+                return None;
+            }
+        },
+        None => WorkflowRunContext::default(),
+    };
+
+    let hub = Arc::new(TaskProgressHub::new());
+    deps.detached
+        .progress_hubs
+        .lock()
+        .await
+        .insert(task.clone(), hub.clone());
+    let token = CancellationToken::new();
+    deps.detached
+        .workflow_cancels
+        .lock()
+        .await
+        .insert(task.clone(), token.clone());
+    let run_id = format!("{}-resume-{}", task.as_str(), attempt);
+    let h = spawn_detached_workflow(
+        &deps.detached,
+        task.clone(),
+        child.input.clone(),
+        Arc::new(graph),
+        run_id,
+        token,
+        seed,
+        ctx,
+        hub,
+    );
+    Some(Box::pin(async move {
+        let _permit = permit;
+        let _ = h.await;
+        task
+    }))
+}
+
+pub async fn resume_batches(deps: &BatchDeps, cap: u32) {
+    let batches = match deps.detached.task_store.active_batches().await {
+        Ok(batches) => batches,
+        Err(e) => {
+            tracing::warn!(error = ?e, "batch resume: active_batches() failed; skipping batch resume");
+            return;
+        }
+    };
+
+    for batch in batches {
+        let bid = batch.id.clone();
+        let token = CancellationToken::new();
+        deps.runtime
+            .batch_cancels
+            .lock()
+            .await
+            .insert(bid.clone(), token.clone());
+
+        let items = match decode_batch_plan(&batch.items_json) {
+            Some(items) => items,
+            None => {
+                if let Ok(children) = deps.detached.task_store.batch_children(&bid).await {
+                    cancel_working_children(deps, &children, "corrupt plan").await;
+                }
+                let _ = deps
+                    .detached
+                    .task_store
+                    .fail_batch_if_status(
+                        &bid,
+                        batch.status,
+                        "corrupt plan",
+                        deps.detached.clock.now_ms(),
+                    )
+                    .await;
+                deps.runtime.batch_cancels.lock().await.remove(&bid);
+                continue;
+            }
+        };
+
+        let children = match deps.detached.task_store.batch_children(&bid).await {
+            Ok(children) => children,
+            Err(e) => {
+                tracing::warn!(batch = bid.as_str(), error = ?e, "batch resume: batch_children() failed; skipping batch");
+                deps.runtime.batch_cancels.lock().await.remove(&bid);
+                continue;
+            }
+        };
+        let existing: HashSet<String> =
+            children.iter().filter_map(|c| c.item_id.clone()).collect();
+
+        if batch.status == BatchStatus::Canceling {
+            cancel_working_children(deps, &children, "batch canceled during resume").await;
+            let _ = deps
+                .detached
+                .task_store
+                .settle_batch_if_status(
+                    &bid,
+                    BatchStatus::Canceling,
+                    BatchStatus::Canceled,
+                    deps.detached.clock.now_ms(),
+                )
+                .await;
+            deps.runtime.batch_cancels.lock().await.remove(&bid);
+            continue;
+        }
+
+        let inflight: FuturesUnordered<BoxFuture<'static, TaskId>> = FuturesUnordered::new();
+        for child in children
+            .iter()
+            .filter(|c| c.status == TaskRecordStatus::Working)
+        {
+            let permit = deps
+                .runtime
+                .semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("batch semaphore closed");
+            if let Some(fut) = resumed_child_future(deps, child, cap, permit).await {
+                inflight.push(fut);
+            }
+        }
+
+        let pending: VecDeque<BatchItem> = items
+            .into_iter()
+            .filter(|item| !existing.contains(&item.item_id))
+            .collect();
+        tokio::spawn(run_admission(
+            deps.clone(),
+            bid,
+            pending,
+            inflight,
+            batch.concurrency,
+            token,
+        ));
+    }
 }
 
 pub async fn run_admission(
@@ -680,6 +1030,47 @@ mod tests {
             .collect()
     }
 
+    fn items_json(items: &[BatchItem]) -> String {
+        serde_json::to_string(&json!({"v": 1, "items": items})).unwrap()
+    }
+
+    fn batch_record(id: &str, status: BatchStatus, total: u32, concurrency: u32) -> BatchRecord {
+        BatchRecord {
+            id: BatchId::parse(id).unwrap(),
+            workflow: "batch-test".into(),
+            concurrency,
+            total,
+            status,
+            items_json: items_json(&items(total as usize)),
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        }
+    }
+
+    fn batch_child(
+        batch: &BatchId,
+        item_id: &str,
+        status: TaskRecordStatus,
+        snapshot: bool,
+    ) -> TaskRecord {
+        TaskRecord {
+            id: TaskId::parse(format!("task-{}-{}", batch.as_str(), item_id)).unwrap(),
+            workflow: "batch-test".into(),
+            status,
+            result: (status == TaskRecordStatus::Completed).then(|| "ok".into()),
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            input: format!("input {item_id}"),
+            workflow_spec_json: snapshot.then(|| encode_workflow_spec(&test_graph())),
+            resume_attempts: 0,
+            session_cwd: None,
+            batch_id: Some(batch.clone()),
+            item_id: Some(item_id.into()),
+        }
+    }
+
     async fn wait_batch_status(
         store: &Arc<dyn TaskStore>,
         bid: &BatchId,
@@ -698,6 +1089,175 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn resume_readmits_tail_and_reruns_working_no_double_spawn() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(4, gate.clone());
+        let bid = BatchId::parse("batch-resume-readmits").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-resume-readmits",
+                BatchStatus::Working,
+                4,
+                4,
+            ))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(
+                &bid,
+                "item-0",
+                TaskRecordStatus::Completed,
+                false,
+            ))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(&bid, "item-1", TaskRecordStatus::Working, true))
+            .await
+            .unwrap();
+
+        resume_batches(&deps, 3).await;
+        gate.wait_calls(3).await;
+        gate.release(3);
+        wait_batch_status(&store, &bid, BatchStatus::Completed).await;
+
+        let children = store.batch_children(&bid).await.unwrap();
+        assert_eq!(children.len(), 4);
+        let mut counts = HashMap::new();
+        for child in children {
+            *counts.entry(child.item_id.unwrap()).or_insert(0usize) += 1;
+        }
+        for item in ["item-0", "item-1", "item-2", "item-3"] {
+            assert_eq!(counts.get(item), Some(&1));
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_holds_cap_on_boot() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(3, gate.clone());
+        let a = BatchId::parse("batch-resume-cap-a").unwrap();
+        let b = BatchId::parse("batch-resume-cap-b").unwrap();
+        store
+            .create_batch(&batch_record("batch-resume-cap-a", BatchStatus::Working, 5, 5))
+            .await
+            .unwrap();
+        store
+            .create_batch(&batch_record("batch-resume-cap-b", BatchStatus::Working, 5, 5))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(&a, "item-0", TaskRecordStatus::Working, true))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(&b, "item-0", TaskRecordStatus::Working, true))
+            .await
+            .unwrap();
+
+        let deps_for_resume = deps.clone();
+        let h = tokio::spawn(async move {
+            resume_batches(&deps_for_resume, 3).await;
+        });
+        gate.wait_calls(3).await;
+        assert_eq!(gate.current.load(Ordering::SeqCst), 3);
+        assert!(gate.max.load(Ordering::SeqCst) <= 3);
+        gate.release(20);
+        h.await.unwrap();
+        wait_batch_status(&store, &a, BatchStatus::Completed).await;
+        wait_batch_status(&store, &b, BatchStatus::Completed).await;
+        assert!(gate.max.load(Ordering::SeqCst) <= 3);
+    }
+
+    #[tokio::test]
+    async fn resume_canceling_cancels_children_admits_no_tail_settles_canceled() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(3, gate.clone());
+        let bid = BatchId::parse("batch-resume-canceling").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-resume-canceling",
+                BatchStatus::Canceling,
+                3,
+                3,
+            ))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(&bid, "item-0", TaskRecordStatus::Working, true))
+            .await
+            .unwrap();
+
+        resume_batches(&deps, 3).await;
+
+        let rec = store.get_batch(&bid).await.unwrap().unwrap();
+        let children = store.batch_children(&bid).await.unwrap();
+        assert_eq!(rec.status, BatchStatus::Canceled);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, TaskRecordStatus::Canceled);
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resume_sweeps_orphan_working_child_to_interrupted() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(1, gate);
+        let bid = BatchId::parse("batch-resume-orphan").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-resume-orphan",
+                BatchStatus::Completed,
+                1,
+                1,
+            ))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(&bid, "item-0", TaskRecordStatus::Working, true))
+            .await
+            .unwrap();
+
+        resume_all(&deps, 3).await;
+
+        let child = store
+            .batch_children(&bid)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(child.status, TaskRecordStatus::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn resume_corrupt_plan_fails_batch() {
+        let gate = Gate::new(None);
+        let (deps, store) = batch_deps(1, gate);
+        let bid = BatchId::parse("batch-resume-corrupt").unwrap();
+        let mut rec = batch_record("batch-resume-corrupt", BatchStatus::Working, 1, 1);
+        rec.items_json = r#"{"v":99,"items":[]}"#.into();
+        store.create_batch(&rec).await.unwrap();
+        store
+            .create(&batch_child(&bid, "item-0", TaskRecordStatus::Working, true))
+            .await
+            .unwrap();
+
+        resume_batches(&deps, 3).await;
+
+        let rec = store.get_batch(&bid).await.unwrap().unwrap();
+        let child = store
+            .batch_children(&bid)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(rec.status, BatchStatus::Failed);
+        assert_eq!(rec.error.as_deref(), Some("corrupt plan"));
+        assert_eq!(child.status, TaskRecordStatus::Canceled);
     }
 
     #[tokio::test]
