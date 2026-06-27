@@ -151,10 +151,26 @@ pub struct RegistryConfig {
     /// `[merge]` (ADR-0027): merge hand-off target + operator identity override. Absent → defaults.
     #[serde(default)]
     pub merge: Option<MergeToml>,
+    /// `[batch]` (E3): parallel batch admission limits. Absent → batch RPCs are not wired.
+    #[serde(default)]
+    pub batch: Option<BatchToml>,
     /// `[worktrees]` host worktree isolation. Changes require a serve restart: the spawn
     /// factory captures this config once, and hot-reload does not re-read it.
     #[serde(default)]
     pub worktrees: Option<WorktreesToml>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BatchToml {
+    pub max_concurrent: u32,
+    #[serde(default)]
+    pub default_concurrency: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchConfig {
+    pub max_concurrent: u32,
+    pub default_concurrency: u32,
 }
 
 /// Host worktree isolation config. Changes require a serve restart because the spawn
@@ -930,6 +946,30 @@ impl RegistryConfig {
             }
         }
         Ok(cfg)
+    }
+
+    pub fn batch_config(&self) -> Result<Option<BatchConfig>, ConfigError> {
+        let Some(batch) = &self.batch else {
+            return Ok(None);
+        };
+        if batch.max_concurrent == 0 {
+            return Err(ConfigError::Registry(
+                "[batch] max_concurrent must be >= 1".into(),
+            ));
+        }
+        let default_concurrency = match batch.default_concurrency {
+            None => batch.max_concurrent,
+            Some(0) => {
+                return Err(ConfigError::Registry(
+                    "[batch] default_concurrency must be >= 1".into(),
+                ));
+            }
+            Some(n) => n.min(batch.max_concurrent),
+        };
+        Ok(Some(BatchConfig {
+            max_concurrent: batch.max_concurrent,
+            default_concurrency,
+        }))
     }
 
     pub fn language_profiles(
@@ -2878,6 +2918,49 @@ path = "/tmp/x.db"
         // absent [merge] -> None
         let none = "default = \"x\"\nallowed_cwd_root = \"/x\"\n[server]\n";
         assert!(super::RegistryConfig::parse(none).unwrap().merge.is_none());
+    }
+
+    #[test]
+    fn batch_config_parses_and_rejects_zero() {
+        fn batch_cfg(batch: &str) -> Result<Option<BatchConfig>, ConfigError> {
+            let raw = format!("default = \"x\"\n[server]\naddr = \"127.0.0.1:8080\"\n{batch}");
+            RegistryConfig::parse(&raw).unwrap().batch_config()
+        }
+
+        let b = batch_cfg("[batch]\nmax_concurrent = 6\ndefault_concurrency = 4\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            b,
+            BatchConfig {
+                max_concurrent: 6,
+                default_concurrency: 4,
+            }
+        );
+
+        assert!(batch_cfg("[batch]\nmax_concurrent = 0\ndefault_concurrency = 4\n").is_err());
+
+        let omitted = batch_cfg("[batch]\nmax_concurrent = 5\n").unwrap().unwrap();
+        assert_eq!(
+            omitted,
+            BatchConfig {
+                max_concurrent: 5,
+                default_concurrency: 5,
+            }
+        );
+
+        let clamped = batch_cfg("[batch]\nmax_concurrent = 3\ndefault_concurrency = 9\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            clamped,
+            BatchConfig {
+                max_concurrent: 3,
+                default_concurrency: 3,
+            }
+        );
+
+        assert!(batch_cfg("[batch]\nmax_concurrent = 3\ndefault_concurrency = 0\n").is_err());
     }
 
     // ---- [review] slice + threshold fields (Task 5) ----

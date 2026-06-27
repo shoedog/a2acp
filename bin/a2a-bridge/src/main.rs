@@ -17,6 +17,8 @@
 //   a2a-bridge init [--dir <p>] [--agents ..] [--force]  — scaffold a config + prompts
 //   a2a-bridge run-workflow <id> --input <file>
 //             [--out <file>] [--config <path>]           — run a workflow offline
+//   a2a-bridge run-batch <workflow> --manifest <file>    — submit a workflow batch to serve
+//   a2a-bridge batch status|list|cancel                  — inspect/cancel serve-side batches
 //   a2a-bridge submit <skill> --input <file> [--url <url>]
 //                                                        — submit a detached task
 //   a2a-bridge task get <id> [--url <url>]               — get task by id
@@ -94,6 +96,9 @@ USAGE:
 SUBCOMMANDS:
   run-workflow <id>   Run a workflow against a repo (design | code-review | spec-review | plan-review | …).
                       --input <file> --session-cwd <repo> [--config <f>] [--out <f>]
+  run-batch <workflow> Submit a manifest of independent workflow runs to a running serve.
+                      --manifest <file> [--concurrency K] [--detach] [--url <url>]
+  batch               Batch store.  status <id> | list | cancel <id>
   models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
   implement <task>    Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
@@ -524,6 +529,14 @@ fn resolve_worktree_runtime_cfg(
         enabled: true,
         root,
         allowed_root: Some(allowed_root),
+    }))
+}
+
+fn batch_runtime(
+    cfg: &RegistryConfig,
+) -> Result<Option<bridge_coordinator::BatchRuntime>, config::ConfigError> {
+    Ok(cfg.batch_config()?.map(|batch| {
+        bridge_coordinator::BatchRuntime::new(batch.max_concurrent, batch.default_concurrency)
     }))
 }
 
@@ -3022,7 +3035,7 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
 }
 
 // ---------------------------------------------------------------------------
-// A2A client helpers: submit + task get/list/cancel
+// A2A client helpers: submit + task get/list/cancel + batch
 // ---------------------------------------------------------------------------
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -3057,6 +3070,309 @@ async fn rpc_call(
         .await
         .map_err(|e| format!("bad response: {e}"))?;
     Ok(v)
+}
+
+const RUN_BATCH_USAGE: &str = "\
+usage: a2a-bridge run-batch <workflow> --manifest <file> [--concurrency K] [--detach] [--url <url>]
+
+Submit a batch to a running a2a-bridge serve. The manifest is TOML:
+  [[item]]
+  id = \"optional-item-id\"
+  input = \"inline prompt\"
+  session_cwd = \"/optional/repo\"
+
+Use input_file instead of input to inline file contents relative to the manifest directory.";
+
+const BATCH_USAGE: &str = "\
+usage: a2a-bridge batch status <batch-id> [--url <url>]
+       a2a-bridge batch list [--url <url>]
+       a2a-bridge batch cancel <batch-id> [--url <url>]";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct BatchWireItem {
+    item_id: String,
+    input: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_cwd: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchManifest {
+    #[serde(default)]
+    item: Vec<BatchManifestItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchManifestItem {
+    id: Option<String>,
+    input: Option<String>,
+    input_file: Option<String>,
+    session_cwd: Option<String>,
+}
+
+fn parse_batch_manifest(toml_str: &str, base_dir: &Path) -> Result<Vec<BatchWireItem>, BoxError> {
+    let manifest: BatchManifest =
+        toml::from_str(toml_str).map_err(|e| format!("run-batch: invalid manifest TOML: {e}"))?;
+    if manifest.item.is_empty() {
+        return Err("run-batch: manifest must contain at least one [[item]]".into());
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(manifest.item.len());
+    for (idx, item) in manifest.item.into_iter().enumerate() {
+        let item_id = item.id.unwrap_or_else(|| idx.to_string());
+        if item_id.is_empty() {
+            return Err("run-batch: item id must not be empty".into());
+        }
+        if !seen.insert(item_id.clone()) {
+            return Err(format!("run-batch: duplicate item id {item_id:?}").into());
+        }
+        let input = match (item.input, item.input_file) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "run-batch: item {item_id:?} must set exactly one of input/input_file"
+                )
+                .into());
+            }
+            (None, None) => {
+                return Err(format!(
+                    "run-batch: item {item_id:?} must set exactly one of input/input_file"
+                )
+                .into());
+            }
+            (Some(input), None) => input,
+            (None, Some(input_file)) => {
+                let path = base_dir.join(input_file);
+                std::fs::read_to_string(&path)
+                    .map_err(|e| format!("run-batch: cannot read input_file {path:?}: {e}"))?
+            }
+        };
+        out.push(BatchWireItem {
+            item_id,
+            input,
+            session_cwd: item.session_cwd,
+        });
+    }
+    Ok(out)
+}
+
+struct RunBatchArgs {
+    workflow: String,
+    manifest: PathBuf,
+    concurrency: Option<u32>,
+    detach: bool,
+    url: String,
+}
+
+fn parse_run_batch_args(args: &[String]) -> Result<RunBatchArgs, BoxError> {
+    let mut positionals = Vec::new();
+    let mut manifest = None;
+    let mut concurrency = None;
+    let mut detach = false;
+    let mut url = "http://127.0.0.1:8080".to_string();
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--manifest" => {
+                idx += 1;
+                manifest = Some(PathBuf::from(
+                    args.get(idx)
+                        .ok_or("run-batch: --manifest requires a value")?,
+                ));
+                idx += 1;
+            }
+            "--concurrency" => {
+                idx += 1;
+                let raw = args
+                    .get(idx)
+                    .ok_or("run-batch: --concurrency requires a value")?;
+                concurrency = Some(
+                    raw.parse::<u32>()
+                        .map_err(|e| format!("run-batch: invalid --concurrency {raw:?}: {e}"))?,
+                );
+                idx += 1;
+            }
+            "--detach" => {
+                detach = true;
+                idx += 1;
+            }
+            "--url" => {
+                idx += 1;
+                url = args
+                    .get(idx)
+                    .ok_or("run-batch: --url requires a value")?
+                    .clone();
+                idx += 1;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("run-batch: unknown flag {other:?}\n{RUN_BATCH_USAGE}").into());
+            }
+            other => {
+                positionals.push(other.to_string());
+                idx += 1;
+            }
+        }
+    }
+    if positionals.len() != 1 {
+        return Err(format!(
+            "run-batch: expected exactly one <workflow>, got {}\n{RUN_BATCH_USAGE}",
+            positionals.len()
+        )
+        .into());
+    }
+    let manifest = manifest
+        .ok_or_else(|| format!("run-batch: --manifest <file> is required\n{RUN_BATCH_USAGE}"))?;
+    Ok(RunBatchArgs {
+        workflow: positionals.remove(0),
+        manifest,
+        concurrency,
+        detach,
+        url,
+    })
+}
+
+fn rpc_result(v: serde_json::Value, label: &str) -> Result<serde_json::Value, BoxError> {
+    if let Some(err) = v.get("error") {
+        return Err(format!("{label} failed: {err}").into());
+    }
+    Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+fn batch_status_text(summary: &serde_json::Value) -> String {
+    let status = summary["status"].as_str().unwrap_or("?");
+    let running = summary["running"].as_u64().unwrap_or(0);
+    let pending = summary["pending"].as_u64().unwrap_or(0);
+    if status == "working" && running == 0 && pending == 0 {
+        "settling…".to_string()
+    } else {
+        status.to_string()
+    }
+}
+
+fn batch_rollup(summary: &serde_json::Value) -> String {
+    format!(
+        "{}  ok={} failed={} canceled={} running={} pending={}",
+        batch_status_text(summary),
+        summary["ok"].as_u64().unwrap_or(0),
+        summary["failed"].as_u64().unwrap_or(0),
+        summary["canceled"].as_u64().unwrap_or(0),
+        summary["running"].as_u64().unwrap_or(0),
+        summary["pending"].as_u64().unwrap_or(0)
+    )
+}
+
+fn batch_is_terminal(summary: &serde_json::Value) -> bool {
+    matches!(
+        summary["status"].as_str(),
+        Some("completed" | "failed" | "canceled")
+    )
+}
+
+async fn batch_status(url: &str, id: &str) -> Result<serde_json::Value, BoxError> {
+    let v = rpc_call(url, "BatchStatus", serde_json::json!({ "id": id })).await?;
+    rpc_result(v, "batch status")
+}
+
+async fn poll_batch(url: &str, id: &str) -> Result<(), BoxError> {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => return Ok(()),
+            _ = interval.tick() => {
+                let summary = batch_status(url, id).await?;
+                println!("{}", batch_rollup(&summary));
+                if batch_is_terminal(&summary) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn run_batch_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{RUN_BATCH_USAGE}");
+        return Ok(());
+    }
+    let parsed = parse_run_batch_args(args)?;
+    let raw = std::fs::read_to_string(&parsed.manifest)
+        .map_err(|e| format!("run-batch: cannot read manifest {:?}: {e}", parsed.manifest))?;
+    let base = parsed
+        .manifest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let items = parse_batch_manifest(&raw, base)?;
+    let mut params = serde_json::json!({
+        "workflow": parsed.workflow,
+        "items": items,
+    });
+    if let Some(concurrency) = parsed.concurrency {
+        params["concurrency"] = serde_json::json!(concurrency);
+    }
+    let result = rpc_result(
+        rpc_call(&parsed.url, "RunBatch", params).await?,
+        "run-batch",
+    )?;
+    let batch_id = result["batchId"]
+        .as_str()
+        .ok_or("run-batch: response missing result.batchId")?
+        .to_string();
+    println!("{batch_id}");
+    if !parsed.detach {
+        poll_batch(&parsed.url, &batch_id).await?;
+    }
+    Ok(())
+}
+
+async fn batch_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{BATCH_USAGE}");
+        return Ok(());
+    }
+    let sub = args
+        .first()
+        .map(|s| s.as_str())
+        .ok_or_else(|| format!("batch: missing subcommand (status|list|cancel)\n{BATCH_USAGE}"))?;
+    let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
+    match sub {
+        "status" => {
+            let id = args
+                .get(1)
+                .cloned()
+                .ok_or("batch status: missing <batch-id>")?;
+            let summary = batch_status(url, &id).await?;
+            println!("{}", batch_rollup(&summary));
+        }
+        "list" => {
+            let result = rpc_result(
+                rpc_call(url, "BatchList", serde_json::json!({})).await?,
+                "batch list",
+            )?;
+            for batch in result["batches"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{}\t{}\t{}",
+                    batch["id"].as_str().unwrap_or("?"),
+                    batch["workflow"].as_str().unwrap_or("?"),
+                    batch_rollup(&batch)
+                );
+            }
+        }
+        "cancel" => {
+            let id = args
+                .get(1)
+                .cloned()
+                .ok_or("batch cancel: missing <batch-id>")?;
+            let result = rpc_result(
+                rpc_call(url, "CancelBatch", serde_json::json!({ "id": id })).await?,
+                "batch cancel",
+            )?;
+            println!("{}", result["canceled"].as_bool().unwrap_or(false));
+        }
+        other => return Err(format!("batch: unknown subcommand {other:?}\n{BATCH_USAGE}").into()),
+    }
+    Ok(())
 }
 
 async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
@@ -4113,6 +4429,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         .map(bridge_core::session_cwd::SessionCwd::parse)
         .transpose()
         .map_err(|e| format!("a2a-bridge mcp: invalid allowed_cwd_root: {e:?}"))?;
+    let batch = batch_runtime(&cfg).map_err(|e| format!("a2a-bridge mcp: {e}"))?;
 
     let coordinator = Arc::new(
         bridge_coordinator::Coordinator::new(
@@ -4125,6 +4442,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
             Arc::clone(&registry) as Arc<dyn AgentRegistry>,
             clock,
             allowed_cwd_root,
+            batch,
             resume_cap,
         )
         .with_permission_registry(Arc::clone(&perm_registry)),
@@ -4141,6 +4459,8 @@ async fn main() -> Result<(), BoxError> {
     let raw_args: Vec<String> = std::env::args().collect();
     match raw_args.get(1).map(|s| s.as_str()) {
         Some("run-workflow") => return run_workflow_cmd(&raw_args[2..]).await,
+        Some("run-batch") => return run_batch_cmd(&raw_args[2..]).await,
+        Some("batch") => return batch_cmd(&raw_args[2..]).await,
         Some("models") => return models_cmd(&raw_args[2..]).await,
         Some("implement") => return implement_cmd(&raw_args[2..]).await,
         Some("merge") => return merge::merge_cmd(&raw_args[2..]).await,
@@ -4160,7 +4480,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         Some(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | models | implement | merge | containers | submit | task | session | init | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | session | init | help)"
             )
             .into());
         }
@@ -4417,6 +4737,7 @@ async fn main() -> Result<(), BoxError> {
     // The inbound server holds the agent registry (3b): first-message LOCAL dispatch
     // resolves the routed agent id, applies its effective config, and binds the task.
     let base_url = format!("http://{}", cfg.server.addr);
+    let batch = batch_runtime(&cfg)?;
     let server = Arc::new(
         InboundServer::new(
             Arc::clone(&registry) as _,
@@ -4433,6 +4754,7 @@ async fn main() -> Result<(), BoxError> {
         .with_session_manager(session_manager)
         .with_permission_registry(Arc::clone(&perm_registry))
         .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
+        .with_batch_runtime(batch)
         .with_model_catalog(Arc::clone(&model_catalog)),
     );
 
@@ -5320,6 +5642,57 @@ cmd = "true"
         assert_eq!(impl_agent.cmd.as_deref(), Some("codex-acp"));
         assert_eq!(impl_agent.effort, Some(bridge_core::domain::Effort::High));
         assert_eq!(impl_agent.kind, bridge_core::domain::AgentKind::ContainerRw);
+    }
+
+    #[test]
+    fn manifest_parse_defaults_id_dedups_and_xor_input() {
+        let base = std::path::Path::new(".");
+        let items = super::parse_batch_manifest(
+            r#"
+[[item]]
+input = "one"
+"#,
+            base,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_id, "0");
+        assert_eq!(items[0].input, "one");
+
+        assert!(super::parse_batch_manifest(
+            r#"
+[[item]]
+id = "same"
+input = "one"
+
+[[item]]
+id = "same"
+input = "two"
+"#,
+            base,
+        )
+        .is_err());
+
+        assert!(super::parse_batch_manifest(
+            r#"
+[[item]]
+input = "one"
+input_file = "one.md"
+"#,
+            base,
+        )
+        .is_err());
+
+        assert!(super::parse_batch_manifest(
+            r#"
+[[item]]
+id = "empty"
+"#,
+            base,
+        )
+        .is_err());
+
+        assert!(super::parse_batch_manifest("", base).is_err());
     }
 
     // ---- Task 10: task watch <id> arg-parsing ----

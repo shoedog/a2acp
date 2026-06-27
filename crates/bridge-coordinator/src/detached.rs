@@ -245,7 +245,7 @@ pub fn now_ms() -> i64 {
 
 use bridge_core::ids::{NodeId, OperationId, TaskId};
 use bridge_core::ports::{RichEventSink, RichEventSinkFactory};
-use bridge_core::task_store::{TaskRecordStatus, TaskStore};
+use bridge_core::task_store::{ResumeClaim, TaskRecord, TaskRecordStatus, TaskStore};
 use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
 use bridge_workflow::graph::WorkflowGraph;
 use std::collections::{HashMap, VecDeque};
@@ -616,6 +616,8 @@ mod sink_tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         }
     }
 
@@ -736,6 +738,8 @@ mod sink_tests {
                 workflow_spec_json: None,
                 resume_attempts: 0,
                 session_cwd: None,
+                batch_id: None,
+                item_id: None,
             })
             .await
             .unwrap();
@@ -1420,9 +1424,240 @@ pub fn encode_workflow_spec(graph: &bridge_workflow::graph::WorkflowGraph) -> St
 /// is awaited here) and runs in the background, exactly like a fresh detached submit.
 /// The cancel token is registered in `workflow_cancels` BEFORE the spawn so a
 /// concurrent `tasks/cancel` arriving during resume can find and fire it.
-pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
-    use bridge_core::task_store::{ResumeClaim, TaskRecordStatus};
+pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: u32) {
+    let task = wt.id.clone();
 
+    // (1) No snapshot → cannot reconstruct the graph that was running. Interrupt.
+    let Some(spec_json) = wt.workflow_spec_json.as_deref() else {
+        // Pre-spawn terminal (no hub inserted): finalize via the sequenced path
+        // (hub: None) so terminal_seq is never NULL.
+        if let Err(e) = finalize_detached(
+            &deps.task_store,
+            &deps.progress_hubs,
+            &task,
+            TaskRecordStatus::Interrupted,
+            None,
+            Some("not resumable: no workflow snapshot"),
+            None,
+        )
+        .await
+        {
+            tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-snapshot) failed");
+        } else {
+            tracing::info!(
+                task = task.as_str(),
+                "resume scan: interrupted (no workflow snapshot)"
+            );
+        }
+        return;
+    };
+
+    // (2) Parse the envelope. Unparseable JSON, an unknown `v`, or a `graph` that
+    //     won't deserialize into a `WorkflowGraph` all mean "not resumable". The
+    //     version check is the forward-compat door (unknown version → Interrupted,
+    //     never a panic).
+    let graph = match serde_json::from_str::<WorkflowSpecEnvelope>(spec_json) {
+        Ok(env) if env.v == SUPPORTED_SNAPSHOT_VERSION => env.graph,
+        _ => {
+            if let Err(e) = finalize_detached(
+                &deps.task_store,
+                &deps.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: unreadable workflow snapshot"),
+                None,
+            )
+            .await
+            {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/unreadable) failed");
+            } else {
+                tracing::info!(
+                    task = task.as_str(),
+                    "resume scan: interrupted (unreadable workflow snapshot)"
+                );
+            }
+            return;
+        }
+    };
+
+    // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok, usage).
+    let cps = match deps.task_store.node_checkpoints(&task).await {
+        Ok(cps) => cps,
+        Err(e) => {
+            tracing::warn!(task = task.as_str(), error = ?e, "resume scan: node_checkpoints() failed; skipping task");
+            return;
+        }
+    };
+    let seed: std::collections::HashMap<
+        String,
+        (String, bool, Option<bridge_core::orch::UsageSnapshot>),
+    > = cps
+        .iter()
+        .map(|(node, output, ok, usage)| {
+            (
+                node.as_str().to_string(),
+                (output.clone(), *ok, usage.clone()),
+            )
+        })
+        .collect();
+
+    // (4) Terminal short-circuit: if the graph's terminal node already has a
+    //     checkpoint, the workflow had actually FINISHED before the crash (its
+    //     terminal output was produced but the row wasn't flipped — the W3a §8
+    //     write-failure gap). Finalize DIRECTLY from the checkpoint, with NO
+    //     re-run and WITHOUT consuming a resume attempt. Completed carries the
+    //     output as `result`; Failed carries it as `error` (mirrors
+    //     `finalize_detached` / `DetachedProgressSink::terminal`).
+    let terminal_id = match graph.terminal() {
+        Some(n) => n.id.as_str().to_string(),
+        None => {
+            // A snapshot that validate()'d at submit time always has exactly one
+            // terminal; a malformed snapshot with no terminal is not resumable.
+            if let Err(e) = finalize_detached(
+                &deps.task_store,
+                &deps.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: workflow snapshot has no terminal node"),
+                None,
+            )
+            .await
+            {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-terminal) failed");
+            } else {
+                tracing::info!(
+                    task = task.as_str(),
+                    "resume scan: interrupted (unreadable workflow snapshot)"
+                );
+            }
+            return;
+        }
+    };
+    if let Some((output, ok, _usage)) = seed.get(&terminal_id) {
+        let (status, result, error) = if *ok {
+            (TaskRecordStatus::Completed, Some(output.as_str()), None)
+        } else {
+            (TaskRecordStatus::Failed, None, Some(output.as_str()))
+        };
+        // Pre-spawn terminal (no hub inserted): sequenced finalize so terminal_seq
+        // is never NULL.
+        if let Err(e) = finalize_detached(
+            &deps.task_store,
+            &deps.progress_hubs,
+            &task,
+            status,
+            result,
+            error,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(short-circuit) failed");
+        } else {
+            tracing::info!(task = task.as_str(), status = ?status, "resume scan: short-circuited to terminal");
+        }
+        return;
+    }
+
+    // (5) Otherwise claim a resume attempt (atomic; increments resume_attempts).
+    match deps
+        .task_store
+        .claim_resume_attempt(&task, cap, deps.clock.now_ms())
+        .await
+    {
+        Ok(ResumeClaim::Exhausted) => {
+            // Poison-pill guard: a task that keeps crashing the server is marked
+            // Interrupted after `cap` attempts instead of looping forever.
+            if let Err(e) = finalize_detached(
+                &deps.task_store,
+                &deps.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("resume attempt cap exceeded"),
+                None,
+            )
+            .await
+            {
+                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/cap) failed");
+            } else {
+                tracing::info!(
+                    task = task.as_str(),
+                    "resume scan: interrupted (resume attempt cap exceeded)"
+                );
+            }
+        }
+        Ok(ResumeClaim::Resumable { attempt }) => {
+            // Re-validate the persisted session_cwd before spawning: never trust
+            // the stored string blindly. A corrupt/invalid stored cwd is not
+            // resumable — interrupt BEFORE registering the cancel token or spawning
+            // so no orphaned token/runner is left behind.
+            let ctx = match wt.session_cwd.as_deref() {
+                Some(s) => match bridge_core::SessionCwd::parse(s) {
+                    Ok(c) => bridge_workflow::executor::WorkflowRunContext {
+                        session_cwd: Some(c),
+                        make_rich_sink: None,
+                    },
+                    Err(_) => {
+                        let _ = finalize_detached(
+                            &deps.task_store,
+                            &deps.progress_hubs,
+                            &task,
+                            TaskRecordStatus::Interrupted,
+                            None,
+                            Some("not resumable: unreadable session cwd"),
+                            None,
+                        )
+                        .await;
+                        tracing::info!(
+                            task = task.as_str(),
+                            "resume scan: interrupted (unreadable session cwd)"
+                        );
+                        return;
+                    }
+                },
+                None => bridge_workflow::executor::WorkflowRunContext::default(),
+            };
+            // Insert the progress hub BEFORE spawning (mirrors the fresh-submit
+            // path) so a reattach subscriber can find it.
+            let hub = Arc::new(TaskProgressHub::new());
+            deps.progress_hubs
+                .lock()
+                .await
+                .insert(task.clone(), hub.clone());
+            // Register a fresh cancel token BEFORE spawning so a concurrent
+            // tasks/cancel during resume can find and fire it.
+            let token = tokio_util::sync::CancellationToken::new();
+            deps.workflow_cancels
+                .lock()
+                .await
+                .insert(task.clone(), token.clone());
+            let run_id = format!("{}-resume-{}", task.as_str(), attempt);
+            // Detached: the runner re-runs only the un-checkpointed nodes
+            // (run_from skips the seeded ones) and writes their checkpoints + the
+            // terminal as usual. No JoinHandle is awaited here.
+            drop(spawn_detached_workflow(
+                deps,
+                task.clone(),
+                wt.input.clone(),
+                Arc::new(graph),
+                run_id.clone(),
+                token,
+                seed,
+                ctx,
+                hub,
+            ));
+            tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
+        }
+        Err(e) => {
+            tracing::warn!(task = task.as_str(), error = ?e, "resume scan: claim_resume_attempt() failed; skipping task");
+        }
+    }
+}
+
+pub async fn resume_non_batch_tasks(deps: &DetachedDeps, cap: u32) {
     let working = match deps.task_store.working_tasks().await {
         Ok(w) => w,
         Err(e) => {
@@ -1434,239 +1669,15 @@ pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
     };
 
     for wt in working {
-        let task = wt.id.clone();
-
-        // (1) No snapshot → cannot reconstruct the graph that was running. Interrupt.
-        let Some(spec_json) = wt.workflow_spec_json.as_deref() else {
-            // Pre-spawn terminal (no hub inserted): finalize via the sequenced path
-            // (hub: None) so terminal_seq is never NULL.
-            if let Err(e) = finalize_detached(
-                &deps.task_store,
-                &deps.progress_hubs,
-                &task,
-                TaskRecordStatus::Interrupted,
-                None,
-                Some("not resumable: no workflow snapshot"),
-                None,
-            )
-            .await
-            {
-                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-snapshot) failed");
-            } else {
-                tracing::info!(
-                    task = task.as_str(),
-                    "resume scan: interrupted (no workflow snapshot)"
-                );
-            }
-            continue;
-        };
-
-        // (2) Parse the envelope. Unparseable JSON, an unknown `v`, or a `graph` that
-        //     won't deserialize into a `WorkflowGraph` all mean "not resumable". The
-        //     version check is the forward-compat door (unknown version → Interrupted,
-        //     never a panic).
-        let graph = match serde_json::from_str::<WorkflowSpecEnvelope>(spec_json) {
-            Ok(env) if env.v == SUPPORTED_SNAPSHOT_VERSION => env.graph,
-            _ => {
-                if let Err(e) = finalize_detached(
-                    &deps.task_store,
-                    &deps.progress_hubs,
-                    &task,
-                    TaskRecordStatus::Interrupted,
-                    None,
-                    Some("not resumable: unreadable workflow snapshot"),
-                    None,
-                )
-                .await
-                {
-                    tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/unreadable) failed");
-                } else {
-                    tracing::info!(
-                        task = task.as_str(),
-                        "resume scan: interrupted (unreadable workflow snapshot)"
-                    );
-                }
-                continue;
-            }
-        };
-
-        // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok, usage).
-        let cps = match deps.task_store.node_checkpoints(&task).await {
-            Ok(cps) => cps,
-            Err(e) => {
-                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: node_checkpoints() failed; skipping task");
-                continue;
-            }
-        };
-        let seed: std::collections::HashMap<
-            String,
-            (String, bool, Option<bridge_core::orch::UsageSnapshot>),
-        > = cps
-            .iter()
-            .map(|(node, output, ok, usage)| {
-                (
-                    node.as_str().to_string(),
-                    (output.clone(), *ok, usage.clone()),
-                )
-            })
-            .collect();
-
-        // (4) Terminal short-circuit: if the graph's terminal node already has a
-        //     checkpoint, the workflow had actually FINISHED before the crash (its
-        //     terminal output was produced but the row wasn't flipped — the W3a §8
-        //     write-failure gap). Finalize DIRECTLY from the checkpoint, with NO
-        //     re-run and WITHOUT consuming a resume attempt. Completed carries the
-        //     output as `result`; Failed carries it as `error` (mirrors
-        //     `finalize_detached` / `DetachedProgressSink::terminal`).
-        let terminal_id = match graph.terminal() {
-            Some(n) => n.id.as_str().to_string(),
-            None => {
-                // A snapshot that validate()'d at submit time always has exactly one
-                // terminal; a malformed snapshot with no terminal is not resumable.
-                if let Err(e) = finalize_detached(
-                    &deps.task_store,
-                    &deps.progress_hubs,
-                    &task,
-                    TaskRecordStatus::Interrupted,
-                    None,
-                    Some("not resumable: workflow snapshot has no terminal node"),
-                    None,
-                )
-                .await
-                {
-                    tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/no-terminal) failed");
-                } else {
-                    tracing::info!(
-                        task = task.as_str(),
-                        "resume scan: interrupted (unreadable workflow snapshot)"
-                    );
-                }
-                continue;
-            }
-        };
-        if let Some((output, ok, _usage)) = seed.get(&terminal_id) {
-            let (status, result, error) = if *ok {
-                (TaskRecordStatus::Completed, Some(output.as_str()), None)
-            } else {
-                (TaskRecordStatus::Failed, None, Some(output.as_str()))
-            };
-            // Pre-spawn terminal (no hub inserted): sequenced finalize so terminal_seq
-            // is never NULL.
-            if let Err(e) = finalize_detached(
-                &deps.task_store,
-                &deps.progress_hubs,
-                &task,
-                status,
-                result,
-                error,
-                None,
-            )
-            .await
-            {
-                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(short-circuit) failed");
-            } else {
-                tracing::info!(task = task.as_str(), status = ?status, "resume scan: short-circuited to terminal");
-            }
+        if wt.batch_id.is_some() {
             continue;
         }
-
-        // (5) Otherwise claim a resume attempt (atomic; increments resume_attempts).
-        match deps
-            .task_store
-            .claim_resume_attempt(&task, cap, deps.clock.now_ms())
-            .await
-        {
-            Ok(ResumeClaim::Exhausted) => {
-                // Poison-pill guard: a task that keeps crashing the server is marked
-                // Interrupted after `cap` attempts instead of looping forever.
-                if let Err(e) = finalize_detached(
-                    &deps.task_store,
-                    &deps.progress_hubs,
-                    &task,
-                    TaskRecordStatus::Interrupted,
-                    None,
-                    Some("resume attempt cap exceeded"),
-                    None,
-                )
-                .await
-                {
-                    tracing::warn!(task = task.as_str(), error = ?e, "resume scan: set_terminal(Interrupted/cap) failed");
-                } else {
-                    tracing::info!(
-                        task = task.as_str(),
-                        "resume scan: interrupted (resume attempt cap exceeded)"
-                    );
-                }
-                continue;
-            }
-            Ok(ResumeClaim::Resumable { attempt }) => {
-                // Re-validate the persisted session_cwd before spawning: never trust
-                // the stored string blindly. A corrupt/invalid stored cwd is not
-                // resumable — interrupt BEFORE registering the cancel token or spawning
-                // so no orphaned token/runner is left behind.
-                let ctx = match wt.session_cwd.as_deref() {
-                    Some(s) => match bridge_core::SessionCwd::parse(s) {
-                        Ok(c) => bridge_workflow::executor::WorkflowRunContext {
-                            session_cwd: Some(c),
-                            make_rich_sink: None,
-                        },
-                        Err(_) => {
-                            let _ = finalize_detached(
-                                &deps.task_store,
-                                &deps.progress_hubs,
-                                &task,
-                                TaskRecordStatus::Interrupted,
-                                None,
-                                Some("not resumable: unreadable session cwd"),
-                                None,
-                            )
-                            .await;
-                            tracing::info!(
-                                task = task.as_str(),
-                                "resume scan: interrupted (unreadable session cwd)"
-                            );
-                            continue;
-                        }
-                    },
-                    None => bridge_workflow::executor::WorkflowRunContext::default(),
-                };
-                // Insert the progress hub BEFORE spawning (mirrors the fresh-submit
-                // path) so a reattach subscriber can find it.
-                let hub = Arc::new(TaskProgressHub::new());
-                deps.progress_hubs
-                    .lock()
-                    .await
-                    .insert(task.clone(), hub.clone());
-                // Register a fresh cancel token BEFORE spawning so a concurrent
-                // tasks/cancel during resume can find and fire it.
-                let token = tokio_util::sync::CancellationToken::new();
-                deps.workflow_cancels
-                    .lock()
-                    .await
-                    .insert(task.clone(), token.clone());
-                let run_id = format!("{}-resume-{}", task.as_str(), attempt);
-                // Detached: the runner re-runs only the un-checkpointed nodes
-                // (run_from skips the seeded ones) and writes their checkpoints + the
-                // terminal as usual. No JoinHandle is awaited here.
-                drop(spawn_detached_workflow(
-                    deps,
-                    task.clone(),
-                    wt.input.clone(),
-                    Arc::new(graph),
-                    run_id.clone(),
-                    token,
-                    seed,
-                    ctx,
-                    hub,
-                ));
-                tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
-            }
-            Err(e) => {
-                tracing::warn!(task = task.as_str(), error = ?e, "resume scan: claim_resume_attempt() failed; skipping task");
-                continue;
-            }
-        }
+        resume_one_working_task(deps, &wt, cap).await;
     }
+}
+
+pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
+    resume_non_batch_tasks(deps, cap).await;
 }
 
 #[cfg(test)]
@@ -1842,6 +1853,8 @@ mod resume_tests {
                 workflow_spec_json: Some(encode_workflow_spec(&graph)),
                 resume_attempts: 0,
                 session_cwd: None,
+                batch_id: None,
+                item_id: None,
             })
             .await
             .unwrap();
@@ -1942,6 +1955,8 @@ mod resume_tests {
                 workflow_spec_json: Some(encode_workflow_spec(&graph)),
                 resume_attempts: 0,
                 session_cwd: None,
+                batch_id: None,
+                item_id: None,
             })
             .await
             .unwrap();

@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{ContextId, OperationId, TaskId, WorkflowId};
+use bridge_core::ids::{BatchId, ContextId, OperationId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{AgentRegistry, PolicyEngine, SessionStore};
 use bridge_core::session_cwd::SessionCwd;
-use bridge_core::task_store::{TaskRecord, TaskRecordStatus, TaskStore};
+use bridge_core::task_store::{BatchSummary, TaskRecord, TaskRecordStatus, TaskStore};
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
 use bridge_workflow::graph::WorkflowGraph;
@@ -17,6 +17,7 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::batch::{BatchDeps, BatchParams, BatchRuntime};
 use crate::clock::Clock;
 use crate::detached::{
     new_detached_task_id, resume_working_tasks, spawn_detached_workflow, DetachedDeps,
@@ -106,6 +107,7 @@ pub struct Coordinator {
     permission_registry: Option<Arc<PermissionRegistry>>,
     clock: Arc<dyn Clock>,
     allowed_cwd_root: Option<SessionCwd>,
+    batch: Option<BatchRuntime>,
     resume_attempt_cap: u32,
 }
 
@@ -134,6 +136,7 @@ impl Coordinator {
         registry: Arc<dyn AgentRegistry>,
         clock: Arc<dyn Clock>,
         allowed_cwd_root: Option<SessionCwd>,
+        batch: Option<BatchRuntime>,
         resume_attempt_cap: u32,
     ) -> Self {
         Self {
@@ -151,6 +154,7 @@ impl Coordinator {
             permission_registry: None,
             clock,
             allowed_cwd_root,
+            batch,
             resume_attempt_cap,
         }
     }
@@ -171,6 +175,42 @@ impl Coordinator {
             progress_hubs: self.progress_hubs.clone(),
             clock: self.clock.clone(),
         }
+    }
+
+    pub fn batch_deps(&self) -> Option<BatchDeps> {
+        Some(BatchDeps {
+            detached: self.detached_deps(),
+            runtime: self.batch.clone()?,
+            allowed_cwd_root: self.allowed_cwd_root.clone(),
+        })
+    }
+
+    pub async fn run_batch(&self, p: BatchParams) -> Result<BatchId, BridgeError> {
+        let bdeps = self.batch_deps().ok_or(BridgeError::InvalidRequest {
+            field: "batch (not configured)",
+        })?;
+        crate::batch::run_batch(&bdeps, p).await
+    }
+
+    pub async fn batch_status(&self, id: &BatchId) -> Result<BatchSummary, BridgeError> {
+        let bdeps = self.batch_deps().ok_or(BridgeError::InvalidRequest {
+            field: "batch (not configured)",
+        })?;
+        crate::batch::batch_status(&bdeps, id).await
+    }
+
+    pub async fn batch_list(&self, limit: usize) -> Result<Vec<BatchSummary>, BridgeError> {
+        let bdeps = self.batch_deps().ok_or(BridgeError::InvalidRequest {
+            field: "batch (not configured)",
+        })?;
+        crate::batch::batch_list(&bdeps, limit).await
+    }
+
+    pub async fn cancel_batch(&self, id: &BatchId) -> Result<bool, BridgeError> {
+        let bdeps = self.batch_deps().ok_or(BridgeError::InvalidRequest {
+            field: "batch (not configured)",
+        })?;
+        crate::batch::cancel_batch(&bdeps, id).await
     }
 
     fn mint_context_id(&self) -> ContextId {
@@ -390,6 +430,8 @@ impl Coordinator {
             workflow_spec_json,
             resume_attempts: 0,
             session_cwd: session_cwd.as_ref().map(|c| c.as_str().to_string()),
+            batch_id: None,
+            item_id: None,
         };
         self.task_store.create(&rec).await?;
 
@@ -497,7 +539,10 @@ impl Coordinator {
 
     /// Boot-time detached task resume.
     pub async fn resume(&self) {
-        resume_working_tasks(&self.detached_deps(), self.resume_attempt_cap).await;
+        match self.batch_deps() {
+            Some(bdeps) => crate::batch::resume_all(&bdeps, self.resume_attempt_cap).await,
+            None => resume_working_tasks(&self.detached_deps(), self.resume_attempt_cap).await,
+        }
     }
 }
 
@@ -874,6 +919,7 @@ mod tests {
             registry,
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
             3,
         );
 
@@ -915,6 +961,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         }
     }
 
@@ -957,6 +1005,7 @@ mod tests {
             registry,
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
             3,
         );
         Fixture {
@@ -1015,6 +1064,7 @@ mod tests {
             registry,
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
             3,
         )
     }

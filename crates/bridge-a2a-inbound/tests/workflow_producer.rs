@@ -321,6 +321,8 @@ async fn detached_runner_persists_completed_result() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -1551,6 +1553,8 @@ async fn tasks_get_returns_completed_with_artifact() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -1610,6 +1614,8 @@ async fn cancel_terminal_detached_returns_true_state_not_recancel() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -1667,6 +1673,8 @@ async fn cancel_working_no_token_flips_to_canceled() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -1721,6 +1729,8 @@ async fn tasks_list_returns_recent_newest_first() {
                 workflow_spec_json: None,
                 resume_attempts: 0,
                 session_cwd: None,
+                batch_id: None,
+                item_id: None,
             })
             .await
             .unwrap();
@@ -2074,6 +2084,8 @@ async fn runner_panic_finalizes_failed_no_orphan() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -2155,6 +2167,8 @@ async fn detached_runner_persists_failed_on_node_failure() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -2208,6 +2222,8 @@ async fn detached_runner_persists_canceled_on_token_fire() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -2256,6 +2272,8 @@ async fn swept_interrupted_reports_failed_over_wire() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -2324,6 +2342,8 @@ async fn detached_runner_checkpoints_each_node() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -2621,6 +2641,8 @@ async fn detached_runner_checkpoint_write_failure_fails_task() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -2675,6 +2697,8 @@ async fn detached_runner_sequenced_terminal_and_hub_cleanup() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -2829,6 +2853,8 @@ async fn resume_short_circuit_sets_terminal_seq() {
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -2883,6 +2909,8 @@ async fn resume_no_snapshot_interrupt_sets_terminal_seq() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -3056,6 +3084,8 @@ async fn resume_runs_only_pending_nodes() {
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -3124,6 +3154,8 @@ async fn resume_no_snapshot_interrupts() {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -3157,6 +3189,8 @@ async fn resume_unparseable_snapshot_interrupts() {
             workflow_spec_json: Some("not json".into()),
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -3192,6 +3226,8 @@ async fn resume_unknown_version_interrupts() {
             workflow_spec_json: Some(review_snapshot(2)),
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -3228,6 +3264,8 @@ async fn resume_cap_exhausted_interrupts() {
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: cap, // already at the cap
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -3295,6 +3333,8 @@ async fn resume_poison_task_terminates_at_cap() {
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -3406,6 +3446,8 @@ async fn resume_terminal_checkpoint_short_circuits() {
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -3589,6 +3631,8 @@ async fn resume_then_cancel_mid_run_finalizes_canceled() {
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -3953,6 +3997,8 @@ async fn resume_restores_session_cwd() {
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: Some("/req".into()),
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();
@@ -4023,6 +4069,8 @@ async fn resume_corrupt_session_cwd_interrupts() {
             resume_attempts: 0,
             // Relative path — SessionCwd::parse rejects this.
             session_cwd: Some("relative-or-bad".into()),
+            batch_id: None,
+            item_id: None,
         })
         .await
         .unwrap();

@@ -39,12 +39,15 @@ use bridge_core::domain::{
     SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
-use bridge_core::ids::{AgentId, ContextId, OperationId, SessionGeneration, SessionId, TaskId};
+use bridge_core::ids::{
+    AgentId, BatchId, ContextId, OperationId, SessionGeneration, SessionId, TaskId,
+};
 use bridge_core::permission::{PermissionRegistry, TurnMeta};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
     RouteDecision, SessionStore,
 };
+use bridge_core::task_store::BatchItem;
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 use bridge_core::SessionCwd;
 use bridge_workflow::executor::{
@@ -54,8 +57,9 @@ use bridge_workflow::graph::WorkflowNode;
 
 use bridge_coordinator::coordinator::apply_permit;
 use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
-use bridge_coordinator::params::{InjectParams, PermitParams};
+use bridge_coordinator::params::{validate_cwd_str, InjectParams, PermitParams};
 use bridge_coordinator::turn_parts::assemble_turn_parts;
+use bridge_coordinator::{BatchDeps, BatchRuntime};
 
 use crate::card::{agent_card, assert_supported_version, A2A_PINNED_VERSION};
 use crate::fanout::{self, Source};
@@ -152,6 +156,7 @@ pub struct InboundServer {
             std::collections::HashMap<TaskId, Arc<crate::reattach::TaskProgressHub>>,
         >,
     >,
+    batch: Option<BatchRuntime>,
     /// Live per-agent model catalog (advertise-models). Probed host-side at `serve` startup and on
     /// `SIGHUP`; [`serve_card`] reads it lock-free via `ArcSwap` so the card path never probes. Default
     /// empty → the card omits the `agent-models` extension (same as a fully-failed probe). Wired from
@@ -193,6 +198,7 @@ impl InboundServer {
             permission_registry: None,
             allowed_cwd_root: None,
             progress_hubs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            batch: None,
             model_catalog: Arc::new(arc_swap::ArcSwap::from_pointee(
                 bridge_core::catalog::ModelCatalog::new(),
             )),
@@ -249,6 +255,12 @@ impl InboundServer {
     #[must_use]
     pub fn with_allowed_cwd_root(mut self, root: Option<String>) -> Self {
         self.allowed_cwd_root = root;
+        self
+    }
+
+    #[must_use]
+    pub fn with_batch_runtime(mut self, rt: Option<BatchRuntime>) -> Self {
+        self.batch = rt;
         self
     }
 
@@ -724,6 +736,11 @@ async fn jsonrpc(
         "SessionCancel" => session_cancel(srv, headers, id, params).await,
         "SessionClear" => session_clear(srv, headers, id, params).await,
         "SessionCompact" => session_compact(srv, headers, id, params).await,
+        // bridge-private batch RPCs (not A2A-spec methods)
+        "RunBatch" => run_batch_rpc(srv, headers, id, params).await,
+        "BatchStatus" => batch_status_rpc(srv, headers, id, params).await,
+        "BatchList" => batch_list_rpc(srv, headers, id, params).await,
+        "CancelBatch" => cancel_batch_rpc(srv, headers, id, params).await,
         "" => jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "missing method"),
         _ => jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "method not found"),
     }
@@ -2057,6 +2074,19 @@ fn detached_deps(srv: &Arc<InboundServer>) -> bridge_coordinator::detached::Deta
     }
 }
 
+pub fn batch_deps(srv: &Arc<InboundServer>) -> Option<BatchDeps> {
+    let runtime = srv.batch.clone()?;
+    let allowed_cwd_root = match srv.allowed_cwd_root.as_deref() {
+        Some(root) => Some(SessionCwd::parse(root).ok()?),
+        None => None,
+    };
+    Some(BatchDeps {
+        detached: detached_deps(srv),
+        runtime,
+        allowed_cwd_root,
+    })
+}
+
 /// Mint a fresh unique task id for a detached submit (SDK UUIDv7). NOT
 /// `task_id_from_params`, which returns the fixed `"task-1"` stub.
 fn new_detached_task_id() -> TaskId {
@@ -2153,7 +2183,12 @@ pub async fn spawn_detached_workflow_with_token_for_test(
 /// Boot-time crash-resume scan (W3b Task 10a). Thin adapter kept in the inbound
 /// surface while the implementation lives in bridge-coordinator.
 pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
-    bridge_coordinator::detached::resume_working_tasks(&detached_deps(srv), cap).await;
+    match batch_deps(srv) {
+        Some(bdeps) => bridge_coordinator::batch::resume_all(&bdeps, cap).await,
+        None => {
+            bridge_coordinator::detached::resume_non_batch_tasks(&detached_deps(srv), cap).await
+        }
+    }
 }
 
 /// Background claimer: as each fan-out source's stream ENDS (its `*_done` flag
@@ -2456,6 +2491,8 @@ async fn unary_message(
                 workflow_spec_json,
                 resume_attempts: 0,
                 session_cwd: routed.session_cwd.as_ref().map(|c| c.as_str().to_string()),
+                batch_id: None,
+                item_id: None,
             };
             if srv.task_store.create(&rec).await.is_err() {
                 return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure);
@@ -3179,11 +3216,190 @@ async fn list_tasks(
                         "workflow": r.workflow,
                         "state": r.status.as_str(),
                         "updated_ms": r.updated_ms,
+                        "batch_id": r.batch_id.as_ref().map(|b| b.as_str()),
+                        "item_id": r.item_id,
                     })
                 })
                 .collect();
             jsonrpc_ok(id, json!({ "tasks": tasks }))
         }
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RunBatchRpcParams {
+    workflow: String,
+    concurrency: Option<u32>,
+    items: Vec<RunBatchRpcItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct RunBatchRpcItem {
+    item_id: Option<String>,
+    input: String,
+    session_cwd: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchIdRpcParams {
+    id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchListRpcParams {
+    limit: Option<usize>,
+}
+
+async fn run_batch_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(bdeps) = batch_deps(&srv) else {
+        return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "batch not configured");
+    };
+    let params: RunBatchRpcParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(_) => return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "invalid RunBatch params"),
+    };
+    if params.items.is_empty() {
+        return jsonrpc_err(
+            id,
+            JSONRPC_INVALID_REQUEST,
+            "RunBatch items must not be empty",
+        );
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::with_capacity(params.items.len());
+    for (idx, item) in params.items.into_iter().enumerate() {
+        let item_id = item.item_id.unwrap_or_else(|| idx.to_string());
+        if item_id.is_empty() {
+            return jsonrpc_err(
+                id,
+                JSONRPC_INVALID_REQUEST,
+                "RunBatch item_id must not be empty",
+            );
+        }
+        if !seen.insert(item_id.clone()) {
+            return jsonrpc_err(
+                id,
+                JSONRPC_INVALID_REQUEST,
+                &format!("duplicate RunBatch item_id: {item_id}"),
+            );
+        }
+        let session_cwd = match item.session_cwd {
+            Some(raw) => {
+                match validate_cwd_str(&raw, bdeps.allowed_cwd_root.as_ref(), "batch.item.cwd") {
+                    Ok(cwd) => Some(cwd.as_str().to_string()),
+                    Err(_) => {
+                        return jsonrpc_err(
+                            id,
+                            JSONRPC_INVALID_REQUEST,
+                            &format!("invalid batch.item.cwd for item_id: {item_id}"),
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+        items.push(BatchItem {
+            item_id,
+            input: item.input,
+            session_cwd,
+        });
+    }
+
+    match bridge_coordinator::batch::run_batch(
+        &bdeps,
+        bridge_coordinator::batch::BatchParams {
+            workflow: params.workflow,
+            concurrency: params.concurrency,
+            items,
+        },
+    )
+    .await
+    {
+        Ok(bid) => jsonrpc_ok(id, json!({ "batchId": bid.as_str() })),
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    }
+}
+
+async fn batch_status_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(bdeps) = batch_deps(&srv) else {
+        return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "batch not configured");
+    };
+    let params: BatchIdRpcParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(_) => return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "invalid BatchStatus params"),
+    };
+    let bid = match BatchId::parse(params.id) {
+        Ok(bid) => bid,
+        Err(e) => return bridge_err_to_jsonrpc(id, &e),
+    };
+    match bridge_coordinator::batch::batch_status(&bdeps, &bid).await {
+        Ok(summary) => jsonrpc_ok(id, json!(summary)),
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    }
+}
+
+async fn batch_list_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(bdeps) = batch_deps(&srv) else {
+        return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "batch not configured");
+    };
+    let params: BatchListRpcParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(_) => return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "invalid BatchList params"),
+    };
+    match bridge_coordinator::batch::batch_list(&bdeps, params.limit.unwrap_or(50)).await {
+        Ok(batches) => jsonrpc_ok(id, json!({ "batches": batches })),
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
+    }
+}
+
+async fn cancel_batch_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    if let Err(e) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &e);
+    }
+    let Some(bdeps) = batch_deps(&srv) else {
+        return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "batch not configured");
+    };
+    let params: BatchIdRpcParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(_) => return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "invalid CancelBatch params"),
+    };
+    let bid = match BatchId::parse(params.id) {
+        Ok(bid) => bid,
+        Err(e) => return bridge_err_to_jsonrpc(id, &e),
+    };
+    match bridge_coordinator::batch::cancel_batch(&bdeps, &bid).await {
+        Ok(canceled) => jsonrpc_ok(id, json!({ "canceled": canceled })),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
 }
@@ -4322,6 +4538,27 @@ mod tests {
         assert!(
             body.contains("auth required"),
             "expected auth-required message: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_batch_rpc_requires_auth() {
+        // Whole-branch review: batch RPCs must authorize like the Session* RPCs. RejectAuth
+        // must short-circuit RunBatch before it touches batch state (or the "batch not
+        // configured" path).
+        let srv = build(Arc::new(PanicBackend), Arc::new(RejectAuth));
+        let resp = router(srv)
+            .oneshot(post_request(
+                "RunBatch",
+                json!({ "workflow": "code", "items": [{ "input": "x" }] }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("auth required"),
+            "RunBatch must reject unauthenticated callers: {body}"
         );
     }
 
@@ -8507,6 +8744,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         };
         store.create(&rec).await.unwrap();
 
@@ -8555,6 +8794,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         };
         store.create(&rec).await.unwrap();
 
@@ -8717,6 +8958,8 @@ mod tests {
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
+            batch_id: None,
+            item_id: None,
         }
     }
 
