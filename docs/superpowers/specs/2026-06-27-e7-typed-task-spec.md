@@ -243,4 +243,127 @@ task-type: implement
   discovery message is the mitigation (an un-migrated call fails loudly with the fix).
 - **Schema evolution** — the registry is the one evolvable seam; new types/sections are a one-line edit driving all
   three outputs.
-```
+
+---
+
+## v2 (BINDING — supersedes v1 where they conflict)
+
+Dual spec-review (codex xhigh correctness + Opus architecture). Both `needs-revision`, **strongly corroborating**.
+The CORE design is UPHELD by both lenses — D1 (shape A), D2 (markdown+front-matter), D4 (one schema registry), D6
+(no path-existence check), D7 (`commit_message → implement` the one wire) all stand. The two BLOCKERs are
+entry-point coverage + implement ingestion; the rest sharpen the parser/render seam. All SR-FIX items are BINDING.
+
+### SR-FIX-1 (BLOCKER — both) — UNIVERSAL validation gate (decision: 1a, mandatory top-matter EVERYWHERE)
+The v1 gate (CLI + RunBatch only) misses every programmatic workflow entry. Fix: ONE shared
+`task_spec::validate_input(raw) -> Result<TaskSpec, TaskSpecError>` called BEFORE persist/spawn/render at EVERY entry:
+- **CLI run-workflow** — local (right after arg-parse, before config/LSP/registry, main.rs:2834) AND `--serve`
+  (before the POST, main.rs:2554).
+- **A2A streaming `message/send`** — server.rs:1994, before `executor.run_*`.
+- **A2A detached submit** — server.rs:2461, before the `TaskRecord` create (:2490).
+- **MCP / `Coordinator::run_workflow`** — coordinator.rs:419, before persist/spawn (covers bridge-mcp/server.rs:105).
+- **RunBatch** — per item in `run_batch_rpc` (server.rs, item-named) + a **defensive coordinator check** in
+  `batch::run_batch` before `claim_batch_child` (for non-RPC callers).
+- **implement** — before clone (SR-FIX-2).
+Top-matter is MANDATORY at every entry (1a — chosen for machine repeatability/testability, not just human
+discovery); missing/unknown `task-type` → reject with the discovery message (on the wire = a JSON-RPC error carrying
+that text). The migration is IN-SCOPE (SR-FIX-9). RATIONALE for 1a over the lenient-wire alternative: a programmatic
+caller forced to declare `task-type` is a caller whose run is reproducible + testable.
+
+### SR-FIX-2 (BLOCKER — both) — implement ingestion = `--input <file|->` (retire the positional string)
+implement's `<task>` is a positional string (main.rs:847) → `.git/A2A_TASK.md`, never rendering `{{input}}`. Under
+1a the positional sentence is rejected anyway (no top-matter). Fix: implement takes **`--input <file>` or `-`
+(stdin)** (uniform with run-workflow; `--input` == `task-spec input` everywhere), parses+validates via the shared
+gate BEFORE clone, writes **body-sans-front-matter** → `.git/A2A_TASK.md` (the agent never sees the YAML, Q1), and
+passes the parsed `Commit Message` into the host-commit (SR-FIX-8). The legacy positional `<task>` string is retired.
+
+### SR-FIX-3 (the `--input` channel — decision D8) — `<file>` or `-` (stdin); the wire carries the text as the body
+The payload is ALWAYS multi-line markdown; only the transport differs. `--input` accepts a **file path or `-`
+(stdin)** at the CLI (so multi-line markdown pipes/heredocs with no file); A2A/MCP carry the SAME markdown text as the
+message body (`message.parts[].text` / the MCP input string). Same text, same gate, three transports. The only
+hostile channel was the shell *argument* — never markdown itself.
+
+### SR-FIX-4 (MAJOR — both) — D5 REVISED: parse at run-INIT, lenient executor parse
+The v1 anchor (executor.rs:708 `("input", input)`) is PER-NODE (inside `schedule_ready!`), not per-run. Fix: derive
+the task tokens ONCE at run-init in `run_from_with_context_inner`, BEFORE any `NodeStarted`; build an owned render-var
+block (incl. `{{task.*}}` + the empty-seeds, SR-FIX-5) reused per node. The executor's parse is **LENIENT/infallible**
+(no top-matter → `freeform`; `{{input}}`=raw body, no task tokens; never fails a render) — the STRICT gate is SR-FIX-1
+at the entry. This strict-at-entry / lenient-at-render split is deliberate (covers existing bare-string test fixtures
++ any path defensively). D5's durability claim stands: `input` is the one persisted channel (detached persists it at
+server.rs:2490, resume re-derives from `wt.input`) — nothing new is threaded or persisted.
+
+### SR-FIX-5 (MAJOR — both, Q2) — seed empty tokens at vars-build; `template::render` UNCHANGED
+At run-init, seed `("task.<section>", "")` for every section DECLARED by the resolved `task-type`'s schema, so an
+absent OPTIONAL field renders empty; present + extension sections override with content. `template::render`
+(template.rs) is **NOT touched** — an undeclared `{{task.x}}` / a typo stays verbatim (preserves the single-pass +
+typo-surfacing invariants). "Resolve schema-declared tokens to ''" — never "resolve every `{{task.*}}`".
+
+### SR-FIX-6 (MAJOR — codex) — scaffold comments are NOT content
+`task-spec template` emits required sections as `<!-- … -->` HTML comments. Validation's non-empty check MUST strip
+HTML comments + whitespace, so a freshly-scaffolded (comments-only) template **FAILS** validation (correctly "empty"
+→ the "reject underspecified" goal holds). The template round-trip test asserts the output **PARSES** clean (not
+"validates" clean).
+
+### SR-FIX-7 (MAJOR — both) — pin the parser mini-grammar
+- **Front-matter:** leading `---\n…\n---`; `key: scalar` lines + `#` comments + blank lines only; **lists/nested maps
+  rejected** (`Parse` error) for the MVP (so a real-YAML swap is a clean drop-in, Q3); unclosed front-matter →
+  `Parse` error.
+- **Body:** CRLF normalized to LF; **ATX headings only** (`## `/`### ` require the trailing space; `##x` is not a
+  heading); the first `# ` → title.
+- **Fences:** ``` ``` ``` / `~~~`, matched open/close, **no nested** — a `## ` inside a fence is BODY, not a section
+  (the keystone).
+- **Extension sections** appear ONCE per channel: their content is a `{{task.<name>}}` token AND their raw text
+  remains in the body (body and tokens are distinct channels — no double-render).
+
+### SR-FIX-8 (MAJOR — both, Q5) — `commit_message` precedence + the merge path
+The typed `Commit Message` WINS over `.git/A2A_COMMIT_MSG` and the task-derived default, after **trim + NUL-strip +
+64KiB bound** (mirror `read_commit_msg_file`, implement.rs:136). It is captured at submit into the persisted
+commit-checkpoint so the **merge.rs:465** `original_message` path uses it too (not re-derived). `implement::commit_message`
+gains the typed message as the highest-precedence source.
+
+### SR-FIX-9 (scope — both, Q7) — the migration is IN-SCOPE + enumerated (a plan deliverable)
+Under 1a every freeform `--input`/message caller adds top-matter. The plan enumerates + migrates: shipped
+`examples/*.toml` workflow inputs, the dogfooded review/design configs, docs (onboarding/init, containerized smoke,
+AGENTS), tests, and any `/dev/null` smoke commands. The discovery message is the safety net (an un-migrated call
+fails loudly with the exact fix).
+
+### SR-FIX-10 (MINOR — Opus) — drop recursive `SectionDef.subsections` (YAGNI)
+No shipped type declares a required/optional SUBsection. Keep the recursive PARSER `Section` (extension
+`{{task.x.y}}` tokens fall out free), but the validated `SchemaDef`/`SectionDef` registry is **FLAT** for the MVP
+(a one-line add when a type first needs a required subsection).
+
+### SR-FIX-11 (MINOR — Opus) — `task_vars` layering
+bridge-core's parser + schema + `validate` stay **render-free**; bridge-core exposes neutral
+`fields(&TaskSpec) -> Vec<(normalized_name, value)>` (NO `task.` prefix). bridge-workflow adds the `task.` prefix +
+the empty-seeds + builds the render vars (the `{{task.*}}` vocabulary is a render concern, beside `render_costs_table`
+in bridge-workflow).
+
+### SR-FIX-12 (NIT — both) — anchor corrections
+`main.rs:2554` = the `--serve` client read; local run-workflow reads at `:2834`; implement is positional at `:847`.
+Entry sites: streaming `server.rs:1994`, detached `server.rs:2461`, `Coordinator::run_workflow` `coordinator.rs:419`,
+MCP `bridge-mcp/src/server.rs:105`. `read_commit_msg_file` at `implement.rs:136`.
+
+### New decisions
+- **D8** — `--input` accepts `<file>` or `-` (stdin); A2A/MCP carry the markdown text as the message body.
+- **D9 (file clutter)** — the user's responsibility, but minimized by: stdin (throwaway → no file); the bridge is the
+  system of record (`TaskRecord.input` is durably persisted → re-viewable via `task get`; a `task get --spec` view is
+  a later add); keepers are deliberate source artifacts (a `tasks/` dir, gitignored for one-offs). The bridge does
+  not manage user files. Documented as a convention; no enforcement.
+
+### Updated rulings
+D1/D2/D4/D6/D7 stand. **D3 → 1a** (universal mandatory-top-matter gate, migration in-scope). **D5 → revised**
+(run-init parse + lenient executor, SR-FIX-4). D8/D9 new.
+
+### Resolved Q1–Q7
+Q1 → strip front-matter for `{{input}}` AND implement's `A2A_TASK.md`; persist the raw `input` for resume. Q2 →
+SR-FIX-5 (seed empties; render unchanged). Q3 → hand-roll the `task-type:`+scalar subset, grammar pinned (SR-FIX-7).
+Q4 → ONE run-init parse covers cold/warm/detached/resume rendering; implement is a SEPARATE ingestion (SR-FIX-2). Q5
+→ SR-FIX-8. Q6 → RunBatch arm (user-facing) + coordinator defense. Q7 → SR-FIX-9 (in-scope migration).
+
+### Deferrals (added)
+- **JSON / YAML task-spec formats + a CLI-arg-per-section** — the parser sits behind ONE `parse()` seam with the same
+  schema registry + validation behind it, so a future format/transport is a pluggable front-end (add when a use-case
+  appears; not MVP).
+- `task get --spec` (retrieve a submitted spec from the store). Machine-verify of criteria (C1). files→edit-scope /
+  criteria→verify-rung. Data-driven schema-from-file.
+
+**RE-REVIEW TARGET:** with SR-FIX-1..12 folded → ready for the focused re-review, then plan.
