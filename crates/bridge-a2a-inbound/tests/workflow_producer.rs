@@ -376,7 +376,7 @@ async fn streaming_workflow_emits_node_status_synth_artifact_and_completed() {
         .oneshot(post_request(
             methods::SEND_STREAMING_MESSAGE,
             json!({ "message": {
-                "text": "DIFF",
+                "text": "---\ntask-type: freeform\n---\nDIFF",
                 "metadata": { "a2a-bridge.skill": "code-review" }
             }}),
         ))
@@ -712,7 +712,7 @@ fn workflow_stream_params(task: &str, ctx: &str) -> Value {
         "taskId": task,
         "message": {
             "contextId": ctx,
-            "text": "DIFF",
+            "text": "---\ntask-type: freeform\n---\nDIFF",
             "metadata": { "a2a-bridge.skill": "code-review" }
         }
     })
@@ -1309,7 +1309,7 @@ async fn synth_receives_both_fan_out_reviews() {
         .oneshot(post_request(
             methods::SEND_STREAMING_MESSAGE,
             json!({ "message": {
-                "text": "DIFF_CONTENT",
+                "text": "---\ntask-type: freeform\n---\nDIFF_CONTENT",
                 "metadata": { "a2a-bridge.skill": "code-review" }
             }}),
         ))
@@ -1356,7 +1356,7 @@ async fn unary_workflow_send_returns_working_task() {
         .oneshot(post_request(
             methods::SEND_MESSAGE,
             json!({ "message": {
-                "text": "DIFF",
+                "text": "---\ntask-type: freeform\n---\nDIFF",
                 "metadata": { "a2a-bridge.skill": "code-review" }
             }}),
         ))
@@ -1442,7 +1442,7 @@ async fn cancel_task_fires_workflow_token_stream_ends_canceled() {
                 "params": {
                     "taskId": TASK_ID,
                     "message": {
-                        "text": "DIFF",
+                        "text": "---\ntask-type: freeform\n---\nDIFF",
                         "metadata": { "a2a-bridge.skill": "code-review" }
                     }
                 }
@@ -1854,7 +1854,7 @@ async fn submit_returns_working_before_completion_then_completes() {
         .router()
         .oneshot(post_request(
             methods::SEND_MESSAGE,
-            json!({ "message": { "text": "DIFF",
+            json!({ "message": { "text": "---\ntask-type: freeform\n---\nDIFF",
                 "metadata": { "a2a-bridge.skill": "code-review" } } }),
         ))
         .await
@@ -1920,7 +1920,7 @@ async fn workflow_with_failing_synth_ends_in_failed_state() {
         .oneshot(post_request(
             methods::SEND_STREAMING_MESSAGE,
             json!({ "message": {
-                "text": "DIFF",
+                "text": "---\ntask-type: freeform\n---\nDIFF",
                 "metadata": { "a2a-bridge.skill": "code-review" }
             }}),
         ))
@@ -2561,7 +2561,7 @@ async fn detached_submit_persists_input_and_spec() {
         .oneshot(post_request(
             methods::SEND_MESSAGE,
             serde_json::json!({ "message": {
-                "text": "DIFF",
+                "text": "---\ntask-type: freeform\n---\nDIFF",
                 "metadata": { "a2a-bridge.skill": "code-review" }
             }}),
         ))
@@ -2588,7 +2588,7 @@ async fn detached_submit_persists_input_and_spec() {
 
     // The persisted input must equal the submitted text.
     assert_eq!(
-        rec.input, "DIFF",
+        rec.input, "---\ntask-type: freeform\n---\nDIFF",
         "record.input must equal the submitted text"
     );
 
@@ -2793,7 +2793,7 @@ async fn detached_unknown_workflow_reject_sets_terminal_seq() {
         .oneshot(post_request(
             methods::SEND_MESSAGE,
             json!({ "message": {
-                "text": "DIFF",
+                "text": "---\ntask-type: freeform\n---\nDIFF",
                 "metadata": { "a2a-bridge.skill": "code-review" }
             }}),
         ))
@@ -3791,7 +3791,7 @@ async fn streaming_workflow_threads_cwd_to_every_node() {
         .oneshot(post_request(
             methods::SEND_STREAMING_MESSAGE,
             json!({ "message": {
-                "text": "DIFF",
+                "text": "---\ntask-type: freeform\n---\nDIFF",
                 "metadata": {
                     "a2a-bridge.skill": "code-review",
                     "a2a-bridge.cwd": "/req"
@@ -3875,7 +3875,7 @@ async fn detached_workflow_threads_cwd_to_every_node() {
         .oneshot(post_request(
             methods::SEND_MESSAGE,
             json!({ "message": {
-                "text": "DIFF",
+                "text": "---\ntask-type: freeform\n---\nDIFF",
                 "metadata": {
                     "a2a-bridge.skill": "code-review",
                     "a2a-bridge.cwd": "/req"
@@ -4108,7 +4108,7 @@ async fn detached_submit_persists_session_cwd() {
         .oneshot(post_request(
             methods::SEND_MESSAGE,
             serde_json::json!({ "message": {
-                "text": "DIFF",
+                "text": "---\ntask-type: freeform\n---\nDIFF",
                 "metadata": {
                     "a2a-bridge.skill": "code-review",
                     "a2a-bridge.cwd": "/req"

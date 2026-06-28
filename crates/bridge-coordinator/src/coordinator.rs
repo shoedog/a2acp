@@ -413,6 +413,7 @@ impl Coordinator {
             .cloned()
             .ok_or(BridgeError::InvalidRequest { field: "workflow" })?;
         let session_cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
+        bridge_core::task_spec::validate_input(&p.input)?;
 
         let task = new_detached_task_id();
         let now = self.clock.now_ms();
@@ -1018,7 +1019,7 @@ mod tests {
         OpParams {
             workflow: Some("code-review".into()),
             skill: None,
-            input: "hello".into(),
+            input: typed_code_review_input().into(),
             context: None,
             agent: None,
             model: None,
@@ -1026,6 +1027,10 @@ mod tests {
             mode: None,
             cwd: Some("/tmp/repo".into()),
         }
+    }
+
+    fn typed_code_review_input() -> &'static str {
+        "---\ntask-type: code-review\n---\n# Review task\n\n## Description\nReview the change.\n\n## Acceptance Criteria\n- Report findings\n"
     }
 
     fn prompt_params(input: &str) -> OpParams {
@@ -1467,13 +1472,31 @@ mod tests {
         assert_eq!(rec.id, id);
         assert_eq!(rec.workflow, "code-review");
         assert_eq!(rec.status, TaskRecordStatus::Working);
-        assert_eq!(rec.input, "hello");
+        assert_eq!(rec.input, typed_code_review_input());
         assert_eq!(rec.session_cwd.as_deref(), Some("/tmp/repo"));
         assert!(rec.workflow_spec_json.is_some());
         assert!(
             fixture.task_store.create(&rec).await.is_err(),
             "task creates must be non-clobbering"
         );
+    }
+
+    #[tokio::test]
+    async fn run_workflow_rejects_untyped_input() {
+        let mut workflows = HashMap::new();
+        workflows.insert(
+            WorkflowId::parse("code-review").unwrap(),
+            workflow("code-review"),
+        );
+        let fixture = coordinator_fixture(Arc::new(workflows));
+        let mut params = workflow_params();
+        params.input = "bare workflow request".into();
+
+        match fixture.coordinator.run_workflow(params).await {
+            Err(BridgeError::TaskSpecInvalid { .. }) => {}
+            Err(other) => panic!("expected TaskSpecInvalid, got {other:?}"),
+            Ok(id) => panic!("expected TaskSpecInvalid, got Ok({id:?})"),
+        }
     }
 
     #[tokio::test]

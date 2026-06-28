@@ -18,6 +18,7 @@ pub mod session;
 pub mod session_cwd;
 pub mod session_fingerprint;
 pub mod task;
+pub mod task_spec;
 pub mod task_store;
 pub mod translator;
 

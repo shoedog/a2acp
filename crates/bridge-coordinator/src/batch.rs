@@ -87,6 +87,7 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
         if !seen.insert(item.item_id.clone()) {
             return Err(BridgeError::InvalidRequest { field: "item_id" });
         }
+        bridge_core::task_spec::validate_input(&item.input)?;
         if let Some(raw) = &item.session_cwd {
             let cwd = validate_cwd_str(raw, deps.allowed_cwd_root.as_ref(), "batch.item.cwd")?;
             item.session_cwd = Some(cwd.as_str().to_string());
@@ -1130,10 +1131,16 @@ mod tests {
         (0..n)
             .map(|i| BatchItem {
                 item_id: format!("item-{i}"),
-                input: format!("input item-{i}"),
+                input: typed_code_review_input(i),
                 session_cwd: None,
             })
             .collect()
+    }
+
+    fn typed_code_review_input(i: usize) -> String {
+        format!(
+            "---\ntask-type: code-review\n---\n# Review item-{i}\n\n## Description\nReview item-{i}.\n\n## Acceptance Criteria\n- Report findings\n"
+        )
     }
 
     fn items_json(items: &[BatchItem]) -> String {
@@ -1596,6 +1603,31 @@ mod tests {
 
         wait_batch_status(&store, &bid, BatchStatus::Completed).await;
         assert!(gate.max.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn run_batch_rejects_untyped_item() {
+        let gate = Gate::new(None);
+        let (deps, _store) = batch_deps(2, gate);
+
+        match run_batch(
+            &deps,
+            BatchParams {
+                workflow: "batch-test".into(),
+                concurrency: Some(1),
+                items: vec![BatchItem {
+                    item_id: "item-0".into(),
+                    input: "bare batch item".into(),
+                    session_cwd: None,
+                }],
+            },
+        )
+        .await
+        {
+            Err(BridgeError::TaskSpecInvalid { .. }) => {}
+            Err(other) => panic!("expected TaskSpecInvalid, got {other:?}"),
+            Ok(id) => panic!("expected TaskSpecInvalid, got Ok({id:?})"),
+        }
     }
 
     #[tokio::test]

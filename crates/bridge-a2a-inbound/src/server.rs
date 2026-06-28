@@ -334,6 +334,15 @@ impl InboundServer {
         let task_meta = task_meta_from_params(params)?;
         let target = self.route.route(&task_meta)?;
 
+        if matches!(&target, RouteTarget::Workflow(_)) {
+            let text = parts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            bridge_core::task_spec::validate_input(&text)?;
+        }
+
         let context_id = context_id_from_params(params)?;
         if context_id.is_some()
             && !matches!(target, RouteTarget::Local(_) | RouteTarget::Workflow(_))
@@ -3308,6 +3317,16 @@ async fn run_batch_rpc(
             }
             None => None,
         };
+        if let Err(e) = bridge_core::task_spec::validate_input(&item.input) {
+            return jsonrpc_err(
+                id,
+                JSONRPC_INVALID_REQUEST,
+                &format!(
+                    "invalid task-spec for item_id {item_id}: {}",
+                    e.client_message()
+                ),
+            );
+        }
         items.push(BatchItem {
             item_id,
             input: item.input,
@@ -4718,13 +4737,45 @@ mod tests {
         ))
     }
 
+    fn typed_code_review_input() -> &'static str {
+        "---\ntask-type: code-review\n---\n# Review task\n\n## Description\nReview the change.\n\n## Acceptance Criteria\n- Report findings\n"
+    }
+
+    #[test]
+    fn workflow_route_rejects_untyped_input_local_route_exempt() {
+        let workflow_srv = build_workflow_route(Arc::new(FakeStore::default()));
+        let workflow_params = serde_json::json!({
+            "message": {
+                "text": "bare workflow request",
+                "metadata": { "a2a-bridge.skill": "code-review" }
+            }
+        });
+
+        match workflow_srv.gate(&HeaderMap::new(), &workflow_params) {
+            Err(BridgeError::TaskSpecInvalid { .. }) => {}
+            Err(other) => panic!("expected TaskSpecInvalid, got: {other:?}"),
+            Ok(_) => panic!("expected TaskSpecInvalid, got Ok"),
+        }
+
+        let local_srv = build(Arc::new(PanicBackend), Arc::new(AlwaysGrant));
+        let local_params = serde_json::json!({
+            "message": {
+                "text": "bare conversational request"
+            }
+        });
+        let routed = local_srv
+            .gate(&HeaderMap::new(), &local_params)
+            .expect("local conversational route is exempt from task-spec gate");
+        assert!(matches!(routed.target, RouteTarget::Local(_)));
+    }
+
     #[test]
     fn gate_allows_contextid_on_workflow_streaming() {
         let srv = build_workflow_route(Arc::new(FakeStore::default()));
         let params = serde_json::json!({
             "message": {
                 "contextId": "c-1",
-                "text": "hi",
+                "text": typed_code_review_input(),
                 "metadata": { "a2a-bridge.skill": "code-review" }
             }
         });
@@ -4747,7 +4798,7 @@ mod tests {
                 serde_json::json!({
                     "message": {
                         "contextId": "c-1",
-                        "text": "hi",
+                        "text": typed_code_review_input(),
                         "metadata": { "a2a-bridge.skill": "code-review" }
                     }
                 }),

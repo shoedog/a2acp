@@ -21,6 +21,7 @@ pub fn classify_death(e: &BridgeError) -> Death {
         AgentCrashed { .. } | AgentOverloaded | SessionNotFound | CancelTimeout | FrameError => {
             Death::Transient
         }
+        TaskSpecInvalid { .. } => Death::Fatal,
         _ => Death::Fatal,
     }
 }
@@ -176,6 +177,7 @@ mod tests {
             BridgeError::ConfigReseedRequired { .. } => "ConfigReseedRequired",
             BridgeError::SessionExpired => "SessionExpired",
             BridgeError::HandleBusy => "HandleBusy",
+            BridgeError::TaskSpecInvalid { .. } => "TaskSpecInvalid",
         }
     }
 
@@ -222,6 +224,12 @@ mod tests {
             ),
             (BridgeError::SessionExpired, Death::Fatal),
             (BridgeError::HandleBusy, Death::Fatal),
+            (
+                BridgeError::TaskSpecInvalid {
+                    message: "x".into(),
+                },
+                Death::Fatal,
+            ),
         ];
         for (err, want) in cases {
             let _ = table_key(&err);
