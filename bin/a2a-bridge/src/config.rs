@@ -121,6 +121,10 @@ pub struct RegistryConfig {
     pub registry: Option<RegistrySection>,
     #[serde(default)]
     pub agents: Vec<AgentEntryToml>,
+    /// `[[prompts]]` named-prompt registry (E8a). Each entry is `file=` XOR `text=` (+ optional
+    /// `description`); workflow nodes reference one by id via `prompt = "<id>"`.
+    #[serde(default)]
+    pub prompts: Vec<PromptEntryToml>,
     pub server: ServerConfig,
     #[serde(default)]
     pub delegation: Option<DelegationConfig>,
@@ -284,11 +288,100 @@ pub struct RetryToml {
 pub struct WorkflowNodeToml {
     pub id: String,
     pub agent: String,
-    pub prompt_file: String,
+    #[serde(default)]
+    pub prompt_file: Option<String>,
+    /// E8a: reference a `[[prompts]]` entry by id (alternative to `prompt_file`; exactly one per node).
+    #[serde(default)]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub inputs: Vec<String>,
     #[serde(default)]
     pub retry: Option<RetryToml>,
+}
+
+/// `[[prompts]]` registry entry (E8a). Exactly one of `file` / `text` is required (validated at load).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptEntryToml {
+    pub id: String,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PromptSource {
+    File(std::path::PathBuf),
+    Text,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedPrompt {
+    pub template: String,
+    // `description`/`source` are unread in E8a (RR-FIX-3: `prompt list` reads `cfg.prompts` directly; the
+    // seam + `show` read only `.template`). E8b (composition / `prompt show --resolved`) reads them.
+    #[allow(dead_code)]
+    pub description: Option<String>,
+    #[allow(dead_code)]
+    pub source: PromptSource,
+}
+
+/// Resolve ONE `[[prompts]]` entry: validate the id, require exactly-one-of `file`/`text`, read the file.
+/// Empty template permitted (matches an empty `prompt_file` today). `base` = the config file's directory.
+/// `pub(crate)` so the `prompt show` CLI can resolve a single entry.
+pub(crate) fn resolve_one(
+    entry: &PromptEntryToml,
+    base: &std::path::Path,
+) -> Result<ResolvedPrompt, ConfigError> {
+    bridge_core::ids::PromptId::parse(entry.id.clone())
+        .map_err(|_| ConfigError::Registry(format!("prompt id {:?} is invalid", entry.id)))?;
+    match (&entry.file, &entry.text) {
+        (Some(f), None) => {
+            let path = base.join(f);
+            let template = std::fs::read_to_string(&path).map_err(|e| {
+                ConfigError::Registry(format!("prompt {:?} file {:?}: {e}", entry.id, path))
+            })?;
+            Ok(ResolvedPrompt {
+                template,
+                description: entry.description.clone(),
+                source: PromptSource::File(path),
+            })
+        }
+        (None, Some(t)) => Ok(ResolvedPrompt {
+            template: t.clone(),
+            description: entry.description.clone(),
+            source: PromptSource::Text,
+        }),
+        _ => Err(ConfigError::Registry(format!(
+            "prompt {:?} must set exactly one of `file` or `text`",
+            entry.id
+        ))),
+    }
+}
+
+/// Eagerly resolve ALL registered prompts (fail-fast at boot); duplicate ids rejected. Used by the load
+/// seam (NOT by `prompt list`, which is lazy/no-I/O).
+pub(crate) fn resolve_prompt_registry(
+    prompts: &[PromptEntryToml],
+    base: &std::path::Path,
+) -> Result<std::collections::BTreeMap<bridge_core::ids::PromptId, ResolvedPrompt>, ConfigError> {
+    use bridge_core::ids::PromptId;
+    let mut map = std::collections::BTreeMap::new();
+    for entry in prompts {
+        let id = PromptId::parse(entry.id.clone())
+            .map_err(|_| ConfigError::Registry(format!("prompt id {:?} is invalid", entry.id)))?;
+        let resolved = resolve_one(entry, base)?;
+        if map.insert(id, resolved).is_some() {
+            return Err(ConfigError::Registry(format!(
+                "duplicate prompt id {:?}",
+                entry.id
+            )));
+        }
+    }
+    Ok(map)
 }
 
 /// `[registry]` section — optional; controls which cmds are allowed.
@@ -999,6 +1092,10 @@ impl RegistryConfig {
 
         let agent_ids: std::collections::HashSet<&str> =
             self.agents.iter().map(|a| a.id.as_str()).collect();
+        // E8a: resolve the named-prompt registry ONCE before the node loop (fail-fast; dup-id rejected).
+        let prompt_registry = resolve_prompt_registry(&self.prompts, base)?;
+        let available_ids =
+            || -> String { prompt_registry.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(", ") };
         let mut map = std::collections::HashMap::new();
         for w in &self.workflows {
             let id = WorkflowId::parse(w.id.clone())
@@ -1011,12 +1108,44 @@ impl RegistryConfig {
                         w.id, n.id, n.agent
                     )));
                 }
-                let tpl = std::fs::read_to_string(base.join(&n.prompt_file)).map_err(|e| {
-                    ConfigError::Registry(format!(
-                        "workflow {} node {} prompt_file {:?}: {e}",
-                        w.id, n.id, n.prompt_file
-                    ))
-                })?;
+                // E8a: a node's prompt comes from EXACTLY ONE of `prompt = "<id>"` (registry) or
+                // `prompt_file = "<path>"` (read from disk, unchanged behavior).
+                let tpl = match (&n.prompt, &n.prompt_file) {
+                    (Some(id_str), None) => {
+                        let id = bridge_core::ids::PromptId::parse(id_str.clone()).map_err(|_| {
+                            ConfigError::Registry(format!(
+                                "workflow {} node {} prompt id {:?} is invalid",
+                                w.id, n.id, id_str
+                            ))
+                        })?;
+                        prompt_registry
+                            .get(&id)
+                            .map(|r| r.template.clone())
+                            .ok_or_else(|| {
+                                ConfigError::Registry(format!(
+                                    "workflow {} node {} references unknown prompt {:?}; available: [{}]",
+                                    w.id,
+                                    n.id,
+                                    id_str,
+                                    available_ids()
+                                ))
+                            })?
+                    }
+                    (None, Some(path)) => {
+                        std::fs::read_to_string(base.join(path)).map_err(|e| {
+                            ConfigError::Registry(format!(
+                                "workflow {} node {} prompt_file {:?}: {e}",
+                                w.id, n.id, path
+                            ))
+                        })?
+                    }
+                    _ => {
+                        return Err(ConfigError::Registry(format!(
+                            "workflow {} node {} must set exactly one of `prompt` or `prompt_file`",
+                            w.id, n.id
+                        )))
+                    }
+                };
                 nodes.push(WorkflowNode {
                     id: NodeId::parse(n.id.clone())
                         .map_err(|e| ConfigError::Registry(format!("node id {:?}: {e:?}", n.id)))?,
@@ -2485,6 +2614,114 @@ addr="127.0.0.1:8080"
     const AGENTS_HEADER: &str =
         "default = \"codex\"\n[[agents]]\nid = \"codex\"\ncmd = \"codex-acp\"\n";
     const SERVER_FOOTER: &str = "[server]\naddr = \"127.0.0.1:8080\"\n";
+
+    // ===== E8a — Named Prompt Registry (T2..T5) =====
+
+    #[test]
+    fn prompts_block_parses_file_text_and_description() {
+        let toml = format!(
+            "{AGENTS_HEADER}\n\
+             [[prompts]]\nid = \"rev\"\nfile = \"r.md\"\ndescription = \"reviewer\"\n\
+             [[prompts]]\nid = \"smoke\"\ntext = \"hi\"\n{SERVER_FOOTER}"
+        );
+        let cfg: RegistryConfig = toml::from_str(&toml).expect("parse");
+        assert_eq!(cfg.prompts.len(), 2);
+        assert_eq!(cfg.prompts[0].id, "rev");
+        assert_eq!(cfg.prompts[0].file.as_deref(), Some("r.md"));
+        assert_eq!(cfg.prompts[0].description.as_deref(), Some("reviewer"));
+        assert_eq!(cfg.prompts[1].text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn node_accepts_prompt_ref_and_prompt_file_independently() {
+        let by_ref: WorkflowNodeToml =
+            toml::from_str("id=\"n\"\nagent=\"a\"\nprompt=\"rev\"\n").unwrap();
+        assert_eq!(by_ref.prompt.as_deref(), Some("rev"));
+        assert!(by_ref.prompt_file.is_none());
+        let by_file: WorkflowNodeToml =
+            toml::from_str("id=\"n\"\nagent=\"a\"\nprompt_file=\"p.md\"\n").unwrap();
+        assert_eq!(by_file.prompt_file.as_deref(), Some("p.md"));
+        let neither: WorkflowNodeToml = toml::from_str("id=\"n\"\nagent=\"a\"\n").unwrap();
+        assert!(neither.prompt.is_none() && neither.prompt_file.is_none());
+    }
+
+    #[test]
+    fn resolve_prompt_registry_file_text_and_errors() {
+        use bridge_core::ids::PromptId;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("r.md"), "REVIEW {{input}}").unwrap();
+        let ok = vec![
+            PromptEntryToml { id: "rev".into(), file: Some("r.md".into()), text: None, description: Some("d".into()) },
+            PromptEntryToml { id: "s".into(), file: None, text: Some("hi".into()), description: None },
+            PromptEntryToml { id: "e".into(), file: None, text: Some("".into()), description: None },
+        ];
+        let reg = resolve_prompt_registry(&ok, dir.path()).unwrap();
+        assert_eq!(reg.get(&PromptId::parse("rev").unwrap()).unwrap().template, "REVIEW {{input}}");
+        assert_eq!(reg.get(&PromptId::parse("s").unwrap()).unwrap().template, "hi");
+        assert_eq!(reg.get(&PromptId::parse("e").unwrap()).unwrap().template, ""); // empty permitted
+        assert!(resolve_prompt_registry(
+            &[PromptEntryToml { id: "x".into(), file: Some("r.md".into()), text: Some("t".into()), description: None }],
+            dir.path()).is_err());
+        assert!(resolve_prompt_registry(
+            &[PromptEntryToml { id: "x".into(), file: None, text: None, description: None }],
+            dir.path()).is_err());
+        assert!(resolve_prompt_registry(
+            &[PromptEntryToml { id: "d".into(), file: None, text: Some("a".into()), description: None },
+              PromptEntryToml { id: "d".into(), file: None, text: Some("b".into()), description: None }],
+            dir.path()).is_err());
+        assert!(resolve_prompt_registry(
+            &[PromptEntryToml { id: "m".into(), file: Some("missing.md".into()), text: None, description: None }],
+            dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_workflows_resolves_named_prompt_and_is_byte_identical_to_prompt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("r.md"), "REVIEW {{input}}\n").unwrap();
+        let named = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+             [[prompts]]\nid=\"rev\"\nfile=\"r.md\"\n\
+             [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"rev\"\ninputs=[]\n\
+             [server]\naddr=\"127.0.0.1:8080\"\n";
+        let by_file = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+             [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt_file=\"r.md\"\ninputs=[]\n\
+             [server]\naddr=\"127.0.0.1:8080\"\n";
+        let g_named = toml::from_str::<RegistryConfig>(named).unwrap().load_workflows(dir.path()).unwrap();
+        let g_file = toml::from_str::<RegistryConfig>(by_file).unwrap().load_workflows(dir.path()).unwrap();
+        let w = bridge_core::ids::WorkflowId::parse("w").unwrap();
+        assert_eq!(g_named.get(&w).unwrap().nodes[0].prompt_template,
+                   g_file.get(&w).unwrap().nodes[0].prompt_template);
+        assert_eq!(g_named.get(&w).unwrap().nodes[0].prompt_template, "REVIEW {{input}}\n");
+    }
+
+    #[test]
+    fn load_workflows_rejects_unknown_ref_dup_both_neither_and_bad_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let unknown = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[prompts]]\nid=\"beta\"\ntext=\"b\"\n[[prompts]]\nid=\"alpha\"\ntext=\"a\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"ghost\"\ninputs=[]\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n";
+        let err = toml::from_str::<RegistryConfig>(unknown).unwrap().load_workflows(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("ghost"), "names offending id: {err}");
+        assert!(err.contains("alpha, beta"), "lists sorted available ids: {err}");
+        let both = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[prompts]]\nid=\"rev\"\ntext=\"t\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"rev\"\nprompt_file=\"x.md\"\ninputs=[]\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n";
+        assert!(toml::from_str::<RegistryConfig>(both).unwrap().load_workflows(dir.path()).is_err());
+        let neither = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\ninputs=[]\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n";
+        assert!(toml::from_str::<RegistryConfig>(neither).unwrap().load_workflows(dir.path()).is_err());
+        let bad_reg_id = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[prompts]]\nid=\"bad id\"\ntext=\"x\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"bad id\"\ninputs=[]\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n";
+        assert!(toml::from_str::<RegistryConfig>(bad_reg_id).unwrap().load_workflows(dir.path()).is_err());
+        let bad_ref = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"bad id\"\ninputs=[]\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n";
+        assert!(toml::from_str::<RegistryConfig>(bad_ref).unwrap().load_workflows(dir.path()).is_err());
+    }
 
     #[test]
     fn worktrees_config_parses_and_preflight() {
