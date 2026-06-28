@@ -332,7 +332,9 @@ mod tests {
             InvalidStateTransition,
             UnknownAgent { id: "a".into() },
             ConfigInvalid { reason: "x".into() },
-            TaskSpecInvalid { message: "x".into() },
+            TaskSpecInvalid {
+                message: "x".into(),
+            },
         ] {
             assert!(!e.is_transient(), "{e:?} must not be transient");
         }

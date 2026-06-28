@@ -189,10 +189,12 @@ pub fn validate(spec: &TaskSpec) -> Result<(), TaskSpecError> {
     }
 
     for section in schema.sections.iter().filter(|section| section.required) {
-        let parsed = spec.section(section.name).ok_or_else(|| TaskSpecError::MissingSection {
-            task_type: spec.task_type.clone(),
-            section: section.name.to_string(),
-        })?;
+        let parsed = spec
+            .section(section.name)
+            .ok_or_else(|| TaskSpecError::MissingSection {
+                task_type: spec.task_type.clone(),
+                section: section.name.to_string(),
+            })?;
         if is_blank(&parsed.content) {
             return Err(TaskSpecError::EmptySection {
                 task_type: spec.task_type.clone(),
@@ -238,7 +240,11 @@ pub fn template(t: &str) -> Option<String> {
     let mut out = format!("---\ntask-type: {}\n---\n# <title>\n", schema.task_type);
 
     for section in schema.sections {
-        let requirement = if section.required { "REQUIRED" } else { "OPTIONAL" };
+        let requirement = if section.required {
+            "REQUIRED"
+        } else {
+            "OPTIONAL"
+        };
         out.push_str(&format!(
             "\n## {}\n<!-- {}: {} -->\n",
             section.name, requirement, section.description
@@ -341,10 +347,7 @@ fn parse_frontmatter(input: &str) -> Result<(String, String), TaskSpecError> {
     Err(TaskSpecError::Parse("unclosed front-matter".to_string()))
 }
 
-fn parse_frontmatter_line(
-    line: &str,
-    task_type: &mut Option<String>,
-) -> Result<(), TaskSpecError> {
+fn parse_frontmatter_line(line: &str, task_type: &mut Option<String>) -> Result<(), TaskSpecError> {
     if line.trim().is_empty() || line.starts_with('#') {
         return Ok(());
     }
@@ -541,7 +544,11 @@ fn task_spec_hint() -> &'static str {
 
 fn sanitize_task_type(got: &str) -> String {
     const MAX_LEN: usize = 32;
-    if got.is_empty() || !got.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if got.is_empty()
+        || !got
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return "invalid".to_string();
     }
     got.chars().take(MAX_LEN).collect()
@@ -603,7 +610,10 @@ mod tests {
                 .task_type,
             "freeform"
         );
-        assert!(matches!(parse("# no frontmatter"), Err(TaskSpecError::NoTaskType)));
+        assert!(matches!(
+            parse("# no frontmatter"),
+            Err(TaskSpecError::NoTaskType)
+        ));
         assert!(matches!(
             parse("---\ntask-type: x\n# unclosed"),
             Err(TaskSpecError::Parse(_))
@@ -676,10 +686,8 @@ mod tests {
             assert!(validate(&spec).is_ok(), "{task_type} should validate");
         }
 
-        let missing = parse(
-            "---\ntask-type: implement\n---\n# Work\n\n## Description\nDo it.\n",
-        )
-        .unwrap();
+        let missing =
+            parse("---\ntask-type: implement\n---\n# Work\n\n## Description\nDo it.\n").unwrap();
         assert!(matches!(
             validate(&missing),
             Err(TaskSpecError::MissingSection { section, .. }) if section == "Acceptance Criteria"

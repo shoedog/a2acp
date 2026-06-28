@@ -742,11 +742,21 @@ mod tests {
     #[test]
     fn commit_message_file_else_fallback() {
         assert_eq!(
-            commit_message(None, Some("  Fix the widget\n\ndetails\n".into()), "", "task ignored"),
+            commit_message(
+                None,
+                Some("  Fix the widget\n\ndetails\n".into()),
+                "",
+                "task ignored"
+            ),
             ("Fix the widget\n\ndetails".to_string(), CommitSource::File)
         );
         assert_eq!(
-            commit_message(None, None, "", "Add a FOO marker file to the repo root\nmore"),
+            commit_message(
+                None,
+                None,
+                "",
+                "Add a FOO marker file to the repo root\nmore"
+            ),
             (
                 "implement: Add a FOO marker file to the repo root".to_string(),
                 CommitSource::Derived

@@ -1039,10 +1039,10 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
                 return Err(format!("implement: unknown flag {other:?}\n{IMPLEMENT_USAGE}").into());
             }
             other => {
-                return Err(
-                    format!("implement: unexpected positional arg {other:?}\n{IMPLEMENT_USAGE}")
-                        .into(),
-                );
+                return Err(format!(
+                    "implement: unexpected positional arg {other:?}\n{IMPLEMENT_USAGE}"
+                )
+                .into());
             }
         }
     }
@@ -4567,7 +4567,9 @@ fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
     match sub {
         "schema" => {
             if args.len() > 2 {
-                return Err(format!("task-spec schema: too many arguments\n{TASK_SPEC_USAGE}").into());
+                return Err(
+                    format!("task-spec schema: too many arguments\n{TASK_SPEC_USAGE}").into(),
+                );
             }
 
             if let Some(task_type) = args.get(1) {
@@ -4597,7 +4599,9 @@ fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
         }
         "template" => {
             if args.len() != 2 {
-                return Err(format!("task-spec template: expected <type>\n{TASK_SPEC_USAGE}").into());
+                return Err(
+                    format!("task-spec template: expected <type>\n{TASK_SPEC_USAGE}").into(),
+                );
             }
             let task_type = &args[1];
             let template = bridge_core::task_spec::template(task_type).ok_or_else(|| {
@@ -4611,7 +4615,9 @@ fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
         }
         "input" => {
             if args.len() != 2 {
-                return Err(format!("task-spec input: expected <file|->\n{TASK_SPEC_USAGE}").into());
+                return Err(
+                    format!("task-spec input: expected <file|->\n{TASK_SPEC_USAGE}").into(),
+                );
             }
             let raw = read_input(&args[1])?;
             match bridge_core::task_spec::validate_input(&raw) {
@@ -5897,11 +5903,10 @@ id = "empty"
 
         let path = temp_task_spec_path("task-spec-registered");
         std::fs::write(&path, valid_implement_task_spec()).unwrap();
-        assert!(super::task_spec_cmd(&[
-            "input".to_string(),
-            path.to_string_lossy().to_string(),
-        ])
-        .is_ok());
+        assert!(
+            super::task_spec_cmd(&["input".to_string(), path.to_string_lossy().to_string(),])
+                .is_ok()
+        );
         let _ = std::fs::remove_file(&path);
 
         assert!(super::task_spec_cmd(&["bogus".to_string()]).is_err());
@@ -5928,10 +5933,7 @@ id = "empty"
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "a2a-{label}-{}-{nanos}.md",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("a2a-{label}-{}-{nanos}.md", std::process::id()))
     }
 
     fn valid_implement_task_spec() -> &'static str {
