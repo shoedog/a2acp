@@ -121,13 +121,15 @@ docker rm -f roprobe
 ```
 
 **(c) Per-agent auth smoke** (single-agent workflows — `design`/`code-review` would run BOTH agents).
-**Run from a dir under the mount** (`run-workflow` uses the static cwd, not a per-request `session_cwd`):
+**Run from a dir under the mount** (`run-workflow` uses the static cwd, not a per-request `session_cwd`).
+`--input` is a typed task-spec (E7) — wrap the smoke prompt as `freeform`:
+`printf '%s\n' '---' 'task-type: freeform' '---' 'List the repo files.' > smoke-task.md`.
 ```bash
-a2a-bridge run-workflow smoke-claude --input README.md --config examples/a2a-bridge.containerized.toml   # -> SMOKE_OK: <repo files>
-a2a-bridge run-workflow smoke-codex  --input README.md --config examples/a2a-bridge.containerized.toml
-a2a-bridge run-workflow smoke-kiro   --input README.md --config examples/a2a-bridge.containerized.toml
-OLLAMA_API_KEY=... a2a-bridge run-workflow smoke-ollama       --input README.md --config examples/a2a-bridge.containerized.toml
-OLLAMA_API_KEY=... a2a-bridge run-workflow smoke-ollama-cloud --input README.md --config examples/a2a-bridge.containerized.toml
+a2a-bridge run-workflow smoke-claude --input smoke-task.md --config examples/a2a-bridge.containerized.toml   # -> SMOKE_OK: <repo files>
+a2a-bridge run-workflow smoke-codex  --input smoke-task.md --config examples/a2a-bridge.containerized.toml
+a2a-bridge run-workflow smoke-kiro   --input smoke-task.md --config examples/a2a-bridge.containerized.toml
+OLLAMA_API_KEY=... a2a-bridge run-workflow smoke-ollama       --input smoke-task.md --config examples/a2a-bridge.containerized.toml
+OLLAMA_API_KEY=... a2a-bridge run-workflow smoke-ollama-cloud --input smoke-task.md --config examples/a2a-bridge.containerized.toml
 ```
 
 **(d) cwd gate** (only the `serve`+A2A path enforces it — method is CamelCase `SendMessage`, needs the

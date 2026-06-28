@@ -99,12 +99,17 @@ serve boot.
 lenses (codex + claude) plus a synthesis node. They reference `codex` and
 `claude`, so `init` only emits them when both are scaffolded.
 
+`--input` is a **typed task-spec** (E7): a file (or `-` for stdin) with YAML front-matter
+declaring `task-type:` + a markdown body (`## Acceptance Criteria`, …), validated before dispatch.
+Run `a2a-bridge task-spec template code-review > task.md` to scaffold one, or
+`a2a-bridge task-spec schema` to list the types. (`task-type: freeform` wraps plain prose.)
+
 ```sh
 # Offline (foreground) — prints the synthesis:
-a2a-bridge run-workflow code-review --input diff.txt --config ./a2a-bridge.toml
+a2a-bridge run-workflow code-review --input task.md --config ./a2a-bridge.toml
 
 # Detached (durable) — returns a task id, then follow live progress over SSE:
-a2a-bridge submit code-review --input diff.txt --url http://127.0.0.1:8080
+a2a-bridge submit code-review --input task.md --url http://127.0.0.1:8080
 a2a-bridge task watch <task-id> --url http://127.0.0.1:8080   # reattachable (ADR-0015)
 ```
 
