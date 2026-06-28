@@ -236,6 +236,7 @@ git commit -m "feat(config): WorkflowNodeToml prompt_file Option + prompt ref (E
 ```rust
 #[test]
 fn resolve_prompt_registry_file_text_and_errors() {
+    use bridge_core::ids::PromptId; // PRR-FIX: config.rs imports only AgentId at top; impl imports are fn-local.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("r.md"), "REVIEW {{input}}").unwrap();
     // happy: file + text + empty text permitted
@@ -289,6 +290,9 @@ pub enum PromptSource {
 #[derive(Debug, Clone)]
 pub struct ResolvedPrompt {
     pub template: String,
+    // PRR-FIX: `description` is ALSO unread in E8a (RR-FIX-3 made `prompt list` read `cfg.prompts`
+    // directly; the seam + `show` read only `.template`). Repo clippy is `-D warnings` → hard gate fail.
+    #[allow(dead_code)] // E8b reads this (`prompt list --resolved` / registry introspection).
     pub description: Option<String>,
     #[allow(dead_code)] // E8b (composition / `prompt show --resolved`) reads this.
     pub source: PromptSource,
@@ -854,6 +858,13 @@ description = "one-line smoke (inline text=)"
 ```
 (Keep multi-line smokes — `smoke-read`, `impl-smoke` — as `file=`.) Then change those nodes to
 `prompt = "review-implement"` / `prompt = "smoke-reply"`.
+
+> **PRR-FIX (scope): MINIMAL migration set — do NOT migrate all 37 nodes.** `containerized.toml` has ~16
+> workflows / 37 nodes / 28 distinct prompts. Back-compat permits a MIXED `prompt=`/`prompt_file=` config,
+> so this slice migrates ONLY the `review-implement` reuse cluster (5 nodes) + the one `smoke-reply` inline
+> `text=`; **every other node intentionally stays `prompt_file=`** (a follow-up cleanup slice may finish the
+> sweep). This keeps the diff small and criterion 6 (variance: `file=` reuse + inline `text=`) is met by the
+> minimal set. Apply the IDENTICAL edits to `.podman.toml` so the parity test stays green.
 
 - [ ] **Step 4: Verify the migrated configs load + the parity test passes**
 
