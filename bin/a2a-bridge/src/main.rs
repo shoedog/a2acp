@@ -26,6 +26,7 @@
 //   a2a-bridge task cancel <id> [--url <url>]            — cancel task by id
 //   a2a-bridge task watch <id> [--from <seq>] [--url <url>]
 //                                                        — stream a task's progress (SSE)
+//   a2a-bridge task-spec schema|template|input           — inspect/validate typed task-spec inputs
 
 mod catalog_probe;
 mod config;
@@ -108,6 +109,7 @@ SUBCOMMANDS:
   serve               Run the A2A server.  [--config <path>]
   mcp                 Serve the MCP protocol over stdio (one stable Coordinator; A2A/CLI/MCP are thin adapters).
                       [--config <path>] [--store <path>]
+  task-spec           Inspect or validate typed task-spec inputs. schema | template | input
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
@@ -122,6 +124,55 @@ Serve the MCP protocol over stdio. STDOUT is reserved for NDJSON MCP replies; tr
 
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --store <path>   override the [store] path for this MCP process";
+
+const TASK_SPEC_USAGE: &str = "\
+usage: a2a-bridge task-spec schema [type]
+       a2a-bridge task-spec template <type>
+       a2a-bridge task-spec input <file|->
+
+Inspect and validate typed task-spec inputs. Use `task-spec schema` to discover valid
+task types and `task-spec template <type>` to scaffold one.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TopSubcommand {
+    RunWorkflow,
+    RunBatch,
+    Batch,
+    Models,
+    Implement,
+    Merge,
+    Containers,
+    Submit,
+    Task,
+    Session,
+    Init,
+    Mcp,
+    TaskSpec,
+    Help,
+    Serve,
+    Unknown(String),
+}
+
+fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
+    match raw_args.get(1).map(|s| s.as_str()) {
+        Some("run-workflow") => TopSubcommand::RunWorkflow,
+        Some("run-batch") => TopSubcommand::RunBatch,
+        Some("batch") => TopSubcommand::Batch,
+        Some("models") => TopSubcommand::Models,
+        Some("implement") => TopSubcommand::Implement,
+        Some("merge") => TopSubcommand::Merge,
+        Some("containers") => TopSubcommand::Containers,
+        Some("submit") => TopSubcommand::Submit,
+        Some("task") => TopSubcommand::Task,
+        Some("session") => TopSubcommand::Session,
+        Some("init") => TopSubcommand::Init,
+        Some("mcp") => TopSubcommand::Mcp,
+        Some("task-spec") => TopSubcommand::TaskSpec,
+        Some("help") | Some("--help") | Some("-h") => TopSubcommand::Help,
+        Some("serve") | None => TopSubcommand::Serve,
+        Some(other) => TopSubcommand::Unknown(other.to_string()),
+    }
+}
 
 /// Resolve the static (config-time) ACP session cwd for an agent entry.
 /// Resolution chain: `session_cwd` → `cwd` → `"."`.
@@ -4453,34 +4504,130 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Read a task input from a file path, or stdin when `path` is "-". Returns the raw String.
+fn read_input(path: &str) -> Result<String, BoxError> {
+    if path == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+        Ok(s)
+    } else {
+        Ok(std::fs::read_to_string(path)?)
+    }
+}
+
+fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{TASK_SPEC_USAGE}");
+        return Ok(());
+    }
+
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        return Err(format!("task-spec: missing subcommand\n{TASK_SPEC_USAGE}").into());
+    };
+
+    match sub {
+        "schema" => {
+            if args.len() > 2 {
+                return Err(format!("task-spec schema: too many arguments\n{TASK_SPEC_USAGE}").into());
+            }
+
+            if let Some(task_type) = args.get(1) {
+                let schema = bridge_core::task_spec::schema(task_type).ok_or_else(|| {
+                    bridge_core::task_spec::TaskSpecError::UnknownType {
+                        got: task_type.clone(),
+                    }
+                    .to_string()
+                })?;
+                println!("{}: {}", schema.task_type, schema.summary);
+                for section in schema.sections {
+                    let requirement = if section.required {
+                        "REQUIRED"
+                    } else {
+                        "OPTIONAL"
+                    };
+                    println!("{} [{}] {}", section.name, requirement, section.description);
+                }
+            } else {
+                for task_type in bridge_core::task_spec::task_types() {
+                    if let Some(schema) = bridge_core::task_spec::schema(task_type) {
+                        println!("{}: {}", schema.task_type, schema.summary);
+                    }
+                }
+            }
+            Ok(())
+        }
+        "template" => {
+            if args.len() != 2 {
+                return Err(format!("task-spec template: expected <type>\n{TASK_SPEC_USAGE}").into());
+            }
+            let task_type = &args[1];
+            let template = bridge_core::task_spec::template(task_type).ok_or_else(|| {
+                bridge_core::task_spec::TaskSpecError::UnknownType {
+                    got: task_type.clone(),
+                }
+                .to_string()
+            })?;
+            print!("{template}");
+            Ok(())
+        }
+        "input" => {
+            if args.len() != 2 {
+                return Err(format!("task-spec input: expected <file|->\n{TASK_SPEC_USAGE}").into());
+            }
+            let raw = read_input(&args[1])?;
+            match bridge_core::task_spec::validate_input(&raw) {
+                Ok(spec) => {
+                    let body = bridge_core::task_spec::body(&spec);
+                    print!("{body}");
+                    if !body.ends_with('\n') {
+                        println!();
+                    }
+                    let keys: Vec<String> = bridge_core::task_spec::fields(&spec)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                        .collect();
+                    println!("fields: {}", keys.join(", "));
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{}", e.client_message());
+                    Err(e.into())
+                }
+            }
+        }
+        other => Err(format!("task-spec: unknown subcommand {other:?}\n{TASK_SPEC_USAGE}").into()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     // Dispatch subcommands BEFORE the server path touches the filesystem.
     let raw_args: Vec<String> = std::env::args().collect();
-    match raw_args.get(1).map(|s| s.as_str()) {
-        Some("run-workflow") => return run_workflow_cmd(&raw_args[2..]).await,
-        Some("run-batch") => return run_batch_cmd(&raw_args[2..]).await,
-        Some("batch") => return batch_cmd(&raw_args[2..]).await,
-        Some("models") => return models_cmd(&raw_args[2..]).await,
-        Some("implement") => return implement_cmd(&raw_args[2..]).await,
-        Some("merge") => return merge::merge_cmd(&raw_args[2..]).await,
-        Some("containers") => return containers_cmd(&raw_args[2..]),
-        Some("submit") => return submit_cmd(&raw_args[2..]).await,
-        Some("task") => return task_cmd(&raw_args[2..]).await,
-        Some("session") => return session_cmd(&raw_args[2..]).await,
-        Some("init") => return init_cmd(&raw_args[2..]),
-        Some("mcp") => return mcp_cmd(&raw_args[2..]).await,
-        Some("help") | Some("--help") | Some("-h") => {
+    match parse_top_subcommand(&raw_args) {
+        TopSubcommand::RunWorkflow => return run_workflow_cmd(&raw_args[2..]).await,
+        TopSubcommand::RunBatch => return run_batch_cmd(&raw_args[2..]).await,
+        TopSubcommand::Batch => return batch_cmd(&raw_args[2..]).await,
+        TopSubcommand::Models => return models_cmd(&raw_args[2..]).await,
+        TopSubcommand::Implement => return implement_cmd(&raw_args[2..]).await,
+        TopSubcommand::Merge => return merge::merge_cmd(&raw_args[2..]).await,
+        TopSubcommand::Containers => return containers_cmd(&raw_args[2..]),
+        TopSubcommand::Submit => return submit_cmd(&raw_args[2..]).await,
+        TopSubcommand::Task => return task_cmd(&raw_args[2..]).await,
+        TopSubcommand::Session => return session_cmd(&raw_args[2..]).await,
+        TopSubcommand::Init => return init_cmd(&raw_args[2..]),
+        TopSubcommand::Mcp => return mcp_cmd(&raw_args[2..]).await,
+        TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
+        TopSubcommand::Help => {
             println!("{TOP_USAGE}");
             return Ok(());
         }
         // `serve` (explicit) and the bare invocation fall through to the server path.
-        Some("serve") | None => {}
+        TopSubcommand::Serve => {}
         // An unknown first token must NOT silently serve (a typo'd subcommand or flag
         // would otherwise be swallowed and the default served).
-        Some(other) => {
+        TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | session | init | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | session | init | help)"
             )
             .into());
         }
@@ -5693,6 +5840,74 @@ id = "empty"
         .is_err());
 
         assert!(super::parse_batch_manifest("", base).is_err());
+    }
+
+    #[test]
+    fn task_spec_subcommand_is_registered() {
+        let raw_args: Vec<String> = ["a2a-bridge", "task-spec", "schema"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            super::parse_top_subcommand(&raw_args),
+            super::TopSubcommand::TaskSpec
+        );
+
+        assert!(super::task_spec_cmd(&["schema".to_string()]).is_ok());
+        assert!(super::task_spec_cmd(&["template".to_string(), "implement".to_string()]).is_ok());
+
+        let path = temp_task_spec_path("task-spec-registered");
+        std::fs::write(&path, valid_implement_task_spec()).unwrap();
+        assert!(super::task_spec_cmd(&[
+            "input".to_string(),
+            path.to_string_lossy().to_string(),
+        ])
+        .is_ok());
+        let _ = std::fs::remove_file(&path);
+
+        assert!(super::task_spec_cmd(&["bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn read_input_file() {
+        let path = temp_task_spec_path("read-input-file");
+        std::fs::write(&path, "raw file contents\n").unwrap();
+        let raw = super::read_input(&path.to_string_lossy()).unwrap();
+        assert_eq!(raw, "raw file contents\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn task_spec_template_round_trips() {
+        let t = bridge_core::task_spec::template("implement").unwrap();
+        assert!(bridge_core::task_spec::parse(&t).is_ok());
+        assert!(bridge_core::task_spec::task_types().contains(&"implement"));
+    }
+
+    fn temp_task_spec_path(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "a2a-{label}-{}-{nanos}.md",
+            std::process::id()
+        ))
+    }
+
+    fn valid_implement_task_spec() -> &'static str {
+        "\
+---
+task-type: implement
+---
+# Add task-spec CLI
+
+## Description
+Add the task-spec command.
+
+## Acceptance Criteria
+The command prints schemas, templates, and validates input.
+"
     }
 
     // ---- Task 10: task watch <id> arg-parsing ----
