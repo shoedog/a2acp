@@ -457,7 +457,7 @@ async fn tools_call_run_workflow_returns_task_id() {
         "tools/call",
         json!({
             "name": "run_workflow",
-            "arguments": { "workflow": "code-review", "input": "review this", "cwd": "/tmp/repo" }
+            "arguments": { "workflow": "code-review", "input": "---\ntask-type: freeform\n---\nreview this", "cwd": "/tmp/repo" }
         }),
     ));
     let replies = run_session(fixture().coord, reqs).await;
