@@ -104,8 +104,10 @@ Add to the `#[cfg(test)] mod tests` in `config.rs`:
 ```rust
 #[test]
 fn prompts_block_parses_file_text_and_description() {
+    // PR-FIX (m2): the real consts are AGENTS_HEADER (which ALREADY contains `default = "codex"`)
+    // + SERVER_FOOTER (config.rs:~2485). Do NOT prepend another `default=` (duplicate-key TOML error).
     let toml = format!(
-        "default = \"codex\"\n{AGENT_FOOTER}\n\
+        "{AGENTS_HEADER}\n\
          [[prompts]]\nid = \"rev\"\nfile = \"r.md\"\ndescription = \"reviewer\"\n\
          [[prompts]]\nid = \"smoke\"\ntext = \"hi\"\n{SERVER_FOOTER}"
     );
@@ -117,12 +119,12 @@ fn prompts_block_parses_file_text_and_description() {
     assert_eq!(cfg.prompts[1].text.as_deref(), Some("hi"));
 }
 ```
-(Use the existing `AGENT_FOOTER`/`SERVER_FOOTER` test consts; if none exists, inline a minimal
-`[[agents]] id=\"codex\" cmd=\"codex-acp\"` + `[server] addr=\"127.0.0.1:8080\"`.)
+(Verify the exact const names `AGENTS_HEADER`/`SERVER_FOOTER` in the `config.rs` test module before
+use; `AGENTS_HEADER` already declares `default = "codex"` and an agent, so do not add another.)
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib prompts_block_parses -j 1`
+Run: `cargo test -p a2a-bridge prompts_block_parses -j 1`
 Expected: FAIL — no `prompts` field.
 
 - [ ] **Step 3: Implement the struct + field**
@@ -149,7 +151,7 @@ Add to `RegistryConfig` (`config.rs:117`):
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p a2a-bridge --lib prompts_block_parses -j 1`
+Run: `cargo test -p a2a-bridge prompts_block_parses -j 1`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -184,10 +186,10 @@ fn node_accepts_prompt_ref_and_prompt_file_independently() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib node_accepts_prompt_ref -j 1`
+Run: `cargo test -p a2a-bridge node_accepts_prompt_ref -j 1`
 Expected: FAIL — `prompt_file` is required `String`; `prompt` field missing.
 
-- [ ] **Step 3: Implement the field changes**
+- [ ] **Step 3: Implement the field changes + the MANDATORY transitional shim**
 
 In `WorkflowNodeToml` (`config.rs:~283`):
 ```rust
@@ -196,13 +198,26 @@ In `WorkflowNodeToml` (`config.rs:~283`):
     #[serde(default)]
     pub prompt: Option<String>,
 ```
+**PR-FIX (M1): the shim is REQUIRED, not optional** — changing `prompt_file` to `Option` breaks
+`base.join(&n.prompt_file)` at `config.rs:1014`, so the crate (and thus this task's own test) won't compile
+without it. Apply this transitional edit at `:1014` now (Task 5 replaces the whole block):
+```rust
+                let tpl = std::fs::read_to_string(
+                    base.join(n.prompt_file.as_deref().unwrap_or_default()),
+                ).map_err(|e| {
+                    ConfigError::Registry(format!(
+                        "workflow {} node {} prompt_file {:?}: {e}",
+                        w.id, n.id, n.prompt_file
+                    ))
+                })?;
+```
+(Audit confirmed by both reviewers: `config.rs:1014/1017` is the ONLY production reader of `.prompt_file` —
+the test-only parser at `integration_run_workflow.rs:~97` is out of scope.)
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p a2a-bridge --lib node_accepts_prompt_ref -j 1`
-Expected: PASS. (The `load_workflows` body at `:1014` will not compile yet — Task 5 fixes it; if needed to
-keep the crate compiling between tasks, temporarily `n.prompt_file.as_deref().unwrap_or_default()` — Task 5
-replaces this region wholesale.)
+Run: `cargo test -p a2a-bridge node_accepts_prompt_ref -j 1`
+Expected: PASS (crate compiles via the shim; existing `prompt_file` tests still green).
 
 - [ ] **Step 5: Commit**
 ```bash
@@ -256,13 +271,15 @@ fn resolve_prompt_registry_file_text_and_errors() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib resolve_prompt_registry_file_text -j 1`
+Run: `cargo test -p a2a-bridge resolve_prompt_registry_file_text -j 1`
 Expected: FAIL — items not defined.
 
 - [ ] **Step 3: Implement the resolver**
 
 Add to `config.rs` (module scope, near `load_workflows`):
 ```rust
+// PR-FIX (m3): `source` is unread in E8a (E8b's `--resolved`/partials read it). The 0-warning gate may
+// flag it as dead — keep the field and silence the lint with a forward-looking note.
 #[derive(Debug, Clone)]
 pub enum PromptSource {
     File(std::path::PathBuf),
@@ -273,12 +290,14 @@ pub enum PromptSource {
 pub struct ResolvedPrompt {
     pub template: String,
     pub description: Option<String>,
+    #[allow(dead_code)] // E8b (composition / `prompt show --resolved`) reads this.
     pub source: PromptSource,
 }
 
 /// Resolve ONE entry: exactly-one-of file/text (+ read). Empty template permitted (matches an empty
 /// `prompt_file` today). `base` = the config file's directory.
-fn resolve_one(entry: &PromptEntryToml, base: &std::path::Path) -> Result<ResolvedPrompt, ConfigError> {
+/// PR-FIX (M6): `pub(crate)` so the CLI (`prompt show`, T8) can call it from `main.rs`.
+pub(crate) fn resolve_one(entry: &PromptEntryToml, base: &std::path::Path) -> Result<ResolvedPrompt, ConfigError> {
     use bridge_core::ids::PromptId;
     PromptId::parse(entry.id.clone())
         .map_err(|_| ConfigError::Registry(format!("prompt id {:?} is invalid", entry.id)))?;
@@ -324,7 +343,7 @@ fn resolve_prompt_registry(
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p a2a-bridge --lib resolve_prompt_registry_file_text -j 1`
+Run: `cargo test -p a2a-bridge resolve_prompt_registry_file_text -j 1`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -357,20 +376,25 @@ fn load_workflows_resolves_named_prompt_and_is_byte_identical_to_prompt_file() {
          [server]\naddr=\"127.0.0.1:8080\"\n");
     let g_named = toml::from_str::<RegistryConfig>(&named).unwrap().load_workflows(dir.path()).unwrap();
     let g_file = toml::from_str::<RegistryConfig>(&by_file).unwrap().load_workflows(dir.path()).unwrap();
+    // PR-FIX-1: WorkflowId has no FromStr; use inherent parse + .get() (HashMap<WorkflowId, Arc<WorkflowGraph>>).
+    let w = bridge_core::ids::WorkflowId::parse("w").unwrap();
     // byte-identical prompt_template (file= path == prompt_file path: same read)
-    assert_eq!(g_named[&"w".parse().unwrap()].nodes[0].prompt_template,
-               g_file[&"w".parse().unwrap()].nodes[0].prompt_template);
-    assert_eq!(g_named[&"w".parse().unwrap()].nodes[0].prompt_template, "REVIEW {{input}}\n");
+    assert_eq!(g_named.get(&w).unwrap().nodes[0].prompt_template,
+               g_file.get(&w).unwrap().nodes[0].prompt_template);
+    assert_eq!(g_named.get(&w).unwrap().nodes[0].prompt_template, "REVIEW {{input}}\n");
 }
 
 #[test]
-fn load_workflows_rejects_unknown_ref_dup_and_both_neither() {
+fn load_workflows_rejects_unknown_ref_dup_both_neither_and_bad_id() {
     let dir = tempfile::tempdir().unwrap();
+    // PR-FIX (M3): register TWO prompts so the unknown-ref error must list the SORTED available ids.
     let unknown = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+        [[prompts]]\nid=\"beta\"\ntext=\"b\"\n[[prompts]]\nid=\"alpha\"\ntext=\"a\"\n\
         [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"ghost\"\ninputs=[]\n\
         [server]\naddr=\"127.0.0.1:8080\"\n";
-    let err = toml::from_str::<RegistryConfig>(unknown).unwrap().load_workflows(dir.path()).unwrap_err();
-    assert!(format!("{err}").contains("ghost")); // names the id (and lists available)
+    let err = toml::from_str::<RegistryConfig>(unknown).unwrap().load_workflows(dir.path()).unwrap_err().to_string();
+    assert!(err.contains("ghost"), "names offending id: {err}");
+    assert!(err.contains("alpha, beta"), "lists sorted available ids: {err}"); // BTreeMap order
     let both = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
         [[prompts]]\nid=\"rev\"\ntext=\"t\"\n\
         [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"rev\"\nprompt_file=\"x.md\"\ninputs=[]\n\
@@ -380,12 +404,23 @@ fn load_workflows_rejects_unknown_ref_dup_and_both_neither() {
         [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\ninputs=[]\n\
         [server]\naddr=\"127.0.0.1:8080\"\n";
     assert!(toml::from_str::<RegistryConfig>(neither).unwrap().load_workflows(dir.path()).is_err());
+    // PR-FIX (M4): a malformed [[prompts]] id (space) fails THROUGH load (resolver-level validation).
+    let bad_reg_id = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+        [[prompts]]\nid=\"bad id\"\ntext=\"x\"\n\
+        [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"bad id\"\ninputs=[]\n\
+        [server]\naddr=\"127.0.0.1:8080\"\n";
+    assert!(toml::from_str::<RegistryConfig>(bad_reg_id).unwrap().load_workflows(dir.path()).is_err());
+    // PR-FIX (M4): a malformed node prompt ref (space) fails at the node loop.
+    let bad_ref = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+        [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"bad id\"\ninputs=[]\n\
+        [server]\naddr=\"127.0.0.1:8080\"\n";
+    assert!(toml::from_str::<RegistryConfig>(bad_ref).unwrap().load_workflows(dir.path()).is_err());
 }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib load_workflows_resolves_named_prompt -j 1`
+Run: `cargo test -p a2a-bridge load_workflows_resolves_named_prompt -j 1`
 Expected: FAIL (resolution not wired; or the temporary `unwrap_or_default` from T3 mis-resolves `prompt=`).
 
 - [ ] **Step 3: Implement — build the registry before the loop, resolve per node**
@@ -435,7 +470,7 @@ Then REPLACE the `let tpl = std::fs::read_to_string(base.join(&n.prompt_file))�
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p a2a-bridge --lib load_workflows_resolves_named_prompt -j 1 && cargo test -p a2a-bridge --lib load_workflows_rejects_unknown_ref -j 1`
+Run: `cargo test -p a2a-bridge load_workflows_resolves_named_prompt -j 1 && cargo test -p a2a-bridge load_workflows_rejects_unknown_ref -j 1`
 Expected: PASS both.
 
 - [ ] **Step 5: Commit**
@@ -468,7 +503,7 @@ fn prompt_only_parse_ignores_unrelated_sections_and_errors() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib prompt_only_parse_ignores -j 1`
+Run: `cargo test -p a2a-bridge prompt_only_parse_ignores -j 1`
 Expected: FAIL — `parse_prompts_only` not defined.
 
 - [ ] **Step 3: Implement the minimal parse**
@@ -490,7 +525,7 @@ pub fn parse_prompts_only(toml_str: &str) -> Result<Vec<PromptEntryToml>, Config
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p a2a-bridge --lib prompt_only_parse_ignores -j 1`
+Run: `cargo test -p a2a-bridge prompt_only_parse_ignores -j 1`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -525,31 +560,41 @@ fn prompt_list_sorts_ids_no_file_io() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib prompt_list_sorts_ids -j 1`
+Run: `cargo test -p a2a-bridge prompt_list_sorts_ids -j 1`
 Expected: FAIL — `prompt_list_lines` not defined.
 
 - [ ] **Step 3: Implement (a testable core + the command shell)**
 ```rust
-/// Pure-ish core for `prompt list`: read prompts (no file I/O on `file=`), sort by id.
+/// Pure-ish core for `prompt list`: read prompts (NO file I/O on `file=`), validate ids + reject dups,
+/// sort by id. PR-FIX (M5): validate every id as a `PromptId` and reject duplicates here too, so `list`
+/// surfaces the same id errors as the load seam — without reading any prompt file.
 fn prompt_list_lines(config_path: &std::path::Path) -> Result<Vec<String>, BoxError> {
+    use bridge_core::ids::PromptId;
     let raw = std::fs::read_to_string(config_path)
         .map_err(|e| format!("prompt: read {config_path:?}: {e}"))?;
-    let mut prompts = config::parse_prompts_only(&raw)
-        .map_err(|e| format!("{e}"))?;
-    // sort by id (deterministic) — separate id-sort, NOT the resolved BTreeMap (RR-FIX-3).
-    prompts.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(prompts
-        .iter()
-        .map(|p| format!("{} — {}", p.id, p.description.as_deref().unwrap_or("(no description)")))
+    let prompts = config::parse_prompts_only(&raw).map_err(|e| format!("{e}"))?;
+    // validate ids + dedup (no I/O); BTreeMap gives the deterministic id ordering (RR-FIX-3: separate
+    // id-sort, NOT the resolved registry).
+    let mut by_id: std::collections::BTreeMap<PromptId, Option<String>> = std::collections::BTreeMap::new();
+    for p in &prompts {
+        let id = PromptId::parse(p.id.clone())
+            .map_err(|_| format!("prompt id {:?} is invalid", p.id))?;
+        if by_id.insert(id, p.description.clone()).is_some() {
+            return Err(format!("duplicate prompt id {:?}", p.id).into());
+        }
+    }
+    Ok(by_id
+        .into_iter()
+        .map(|(id, desc)| format!("{} — {}", id.as_str(), desc.as_deref().unwrap_or("(no description)")))
         .collect())
 }
 ```
-(Use the real module path for `parse_prompts_only`; in this crate it is `crate::config::parse_prompts_only`
-if `config` is a local module, else the crate path. Verify the actual `mod config;` location in `main.rs`.)
+(`config::parse_prompts_only` — `config` is a local `mod config` in this bin crate, referenced as
+`config::…` from `main.rs` (verified `main.rs:32` `mod config;`).)
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p a2a-bridge --lib prompt_list_sorts_ids -j 1`
+Run: `cargo test -p a2a-bridge prompt_list_sorts_ids -j 1`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -584,7 +629,7 @@ fn prompt_show_resolves_one_and_errors_on_unknown() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib prompt_show_resolves_one -j 1`
+Run: `cargo test -p a2a-bridge prompt_show_resolves_one -j 1`
 Expected: FAIL — `prompt_show_text` not defined.
 
 - [ ] **Step 3: Implement**
@@ -595,15 +640,18 @@ fn prompt_show_text(config_path: &std::path::Path, id: &str) -> Result<String, B
     let raw = std::fs::read_to_string(config_path)
         .map_err(|e| format!("prompt: read {config_path:?}: {e}"))?;
     let prompts = config::parse_prompts_only(&raw).map_err(|e| format!("{e}"))?;
-    // dup-id scan (no read) for a clean error, matching load-seam semantics.
+    // PR-FIX (M5): validate each id as a PromptId + dedup (NO read), matching load-seam semantics.
     let mut seen = std::collections::HashSet::new();
     for p in &prompts {
+        bridge_core::ids::PromptId::parse(p.id.clone())
+            .map_err(|_| format!("prompt id {:?} is invalid", p.id))?;
         if !seen.insert(p.id.as_str()) {
             return Err(format!("duplicate prompt id {:?}", p.id).into());
         }
     }
     let base = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
     match prompts.iter().find(|p| p.id == id) {
+        // resolve_one reads ONLY this entry (resilient to other entries' bad file=).
         Some(entry) => Ok(config::resolve_one(entry, base)
             .map_err(|e| format!("{e}"))?
             .template),
@@ -615,12 +663,12 @@ fn prompt_show_text(config_path: &std::path::Path, id: &str) -> Result<String, B
     }
 }
 ```
-(Expose `resolve_one` for the CLI as `pub fn resolve_one_pub` re-export, or make `resolve_one` `pub` —
-whichever matches the crate's existing visibility convention. Keep `show` reading ONLY the found entry.)
+(PR-FIX (M6): `config::resolve_one` is `pub(crate)` per T4 — no re-export/hand-wave needed. `show` reads
+ONLY the found entry.)
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p a2a-bridge --lib prompt_show_resolves_one -j 1`
+Run: `cargo test -p a2a-bridge prompt_show_resolves_one -j 1`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -639,18 +687,23 @@ git commit -m "feat(cli): prompt show <id> — resolve one entry, discovery erro
 - [ ] **Step 1: Write the failing test**
 ```rust
 #[test]
-fn prompt_cmd_dispatch_help_and_unknown_sub() {
-    assert!(super::prompt_cmd(&["--help".to_string()]).is_ok());
-    assert!(super::prompt_cmd(&["bogus".to_string()]).is_err());
+fn prompt_cmd_dispatch_help_unknown_sub_and_strict_args() {
+    let s = |a: &str| a.to_string();
+    assert!(super::prompt_cmd(&[s("--help")]).is_ok());
+    assert!(super::prompt_cmd(&[s("bogus")]).is_err());
     assert!(super::prompt_cmd(&[]).is_err()); // missing subcommand
     // --resolved is reserved for E8b -> rejected
-    assert!(super::prompt_cmd(&["show".to_string(), "x".to_string(), "--resolved".to_string()]).is_err());
+    assert!(super::prompt_cmd(&[s("show"), s("x"), s("--resolved")]).is_err());
+    // PR-FIX (m1): unknown flag + extra positionals rejected
+    assert!(super::prompt_cmd(&[s("list"), s("--bogusflag")]).is_err());
+    assert!(super::prompt_cmd(&[s("list"), s("extra")]).is_err());
+    assert!(super::prompt_cmd(&[s("show"), s("a"), s("b")]).is_err());
 }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib prompt_cmd_dispatch -j 1`
+Run: `cargo test -p a2a-bridge prompt_cmd_dispatch -j 1`
 Expected: FAIL — `prompt_cmd` not defined.
 
 - [ ] **Step 3: Implement dispatch + usage + the `prompt_cmd` shell**
@@ -674,19 +727,28 @@ fn prompt_cmd(args: &[String]) -> Result<(), BoxError> {
     if args.iter().any(|a| a == "--resolved") {
         return Err(format!("prompt: --resolved is reserved for a later release\n{PROMPT_USAGE}").into());
     }
-    // --config <path> default ./a2a-bridge.toml (run-workflow model)
-    let mut config = std::path::PathBuf::from("a2a-bridge.toml");
+    // PR-FIX (n3): reuse the existing CONFIG_PATH const (main.rs:65) as the default (run-workflow model).
+    let mut config = std::path::PathBuf::from(CONFIG_PATH);
     let mut positional: Vec<&String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--config" {
-            config = it.next().ok_or("prompt: --config requires a value")?.into();
-        } else {
-            positional.push(a);
+        match a.as_str() {
+            "--config" => {
+                config = it.next().ok_or("prompt: --config requires a value")?.into();
+            }
+            // PR-FIX (m1): reject unknown flags instead of silently treating them as positionals.
+            s if s.starts_with("--") => {
+                return Err(format!("prompt: unknown flag {a:?}\n{PROMPT_USAGE}").into())
+            }
+            _ => positional.push(a),
         }
     }
     match positional.first().map(|s| s.as_str()) {
         Some("list") => {
+            // PR-FIX (m1): `list` takes no extra positional args.
+            if positional.len() > 1 {
+                return Err(format!("prompt list: unexpected argument {:?}\n{PROMPT_USAGE}", positional[1]).into());
+            }
             for line in prompt_list_lines(&config)? {
                 println!("{line}");
             }
@@ -694,6 +756,10 @@ fn prompt_cmd(args: &[String]) -> Result<(), BoxError> {
         }
         Some("show") => {
             let id = positional.get(1).ok_or_else(|| format!("prompt show: expected <id>\n{PROMPT_USAGE}"))?;
+            // PR-FIX (m1): exactly one id.
+            if positional.len() > 2 {
+                return Err(format!("prompt show: unexpected argument {:?}\n{PROMPT_USAGE}", positional[2]).into());
+            }
             print!("{}", prompt_show_text(&config, id)?);
             Ok(())
         }
@@ -702,13 +768,14 @@ fn prompt_cmd(args: &[String]) -> Result<(), BoxError> {
     }
 }
 ```
-Wire dispatch: add `Some("prompt") => TopSubcommand::Prompt` to `parse_top_subcommand` (`~:168`), the
-`TopSubcommand::Prompt` enum variant, the `TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..])` arm
-(`~:4668`), add `prompt` to `TOP_USAGE` (`~:97`) and to the unknown-subcommand expected list (`~:4679`).
+Wire dispatch (PR-FIX n2 — anchors verified): add `Some("prompt") => TopSubcommand::Prompt` to
+`parse_top_subcommand` (`~:170`), the `TopSubcommand::Prompt` enum variant (`~:137`), the
+`TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..])` arm (`~:4668`), add `prompt` to `TOP_USAGE`
+(`~:91`, NOT :97) and to the unknown-subcommand expected list string (`~:4679`).
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p a2a-bridge --lib prompt_cmd_dispatch -j 1`
+Run: `cargo test -p a2a-bridge prompt_cmd_dispatch -j 1`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -722,9 +789,14 @@ git commit -m "feat(cli): a2a-bridge prompt {list,show} dispatch + usage (E8a T9
 ### Task 10: Migration of the variance set + the determinism golden
 
 **Files:**
-- Modify: `examples/a2a-bridge.workflows.toml`, `examples/a2a-bridge.containerized.toml`
-  (+ `.podman.toml` if mechanical)
+- Modify: `examples/a2a-bridge.workflows.toml`, `examples/a2a-bridge.containerized.toml`,
+  **`examples/a2a-bridge.containerized.podman.toml` (MANDATORY — PR-FIX M2)**
 - Modify: `bin/a2a-bridge/src/config.rs` (a synthetic-pair golden test)
+
+> **PR-FIX (M2):** a parity test (`main.rs:~5615–5659`) asserts the docker and podman containerized configs
+> are structurally identical except for comments / `runtime` / the egress allowlist. Migrating only
+> `containerized.toml` and not `.podman.toml` (or vice-versa) FAILS that test. Migrate BOTH identically and
+> `git add` both in Step 5.
 
 - [ ] **Step 1: Write the failing golden test (synthetic old/new pair)**
 ```rust
@@ -740,11 +812,11 @@ fn migrated_named_graph_byte_identical_to_prompt_file_for_file_backed() {
         [[workflows.nodes]]\nid=\"b\"\nagent=\"c\"\nprompt=\"rev\"\ninputs=[]\n[server]\naddr=\"127.0.0.1:8080\"\n";
     let go = toml::from_str::<RegistryConfig>(old).unwrap().load_workflows(dir.path()).unwrap();
     let gn = toml::from_str::<RegistryConfig>(new).unwrap().load_workflows(dir.path()).unwrap();
-    let w = "w".parse().unwrap();
+    let w = bridge_core::ids::WorkflowId::parse("w").unwrap(); // PR-FIX-1: no FromStr
     for node in ["a", "b"] {
-        let n = node.parse().unwrap();
-        let fo = go[&w].nodes.iter().find(|x| x.id == n).unwrap();
-        let fn_ = gn[&w].nodes.iter().find(|x| x.id == n).unwrap();
+        let n = bridge_core::ids::NodeId::parse(node).unwrap();
+        let fo = go.get(&w).unwrap().nodes.iter().find(|x| x.id == n).unwrap();
+        let fn_ = gn.get(&w).unwrap().nodes.iter().find(|x| x.id == n).unwrap();
         assert_eq!(fo.prompt_template, fn_.prompt_template); // byte-identical, reuse across nodes
     }
 }
@@ -752,7 +824,7 @@ fn migrated_named_graph_byte_identical_to_prompt_file_for_file_backed() {
 
 - [ ] **Step 2: Run to verify it fails (then passes — it exercises T5)**
 
-Run: `cargo test -p a2a-bridge --lib migrated_named_graph_byte_identical -j 1`
+Run: `cargo test -p a2a-bridge migrated_named_graph_byte_identical -j 1`
 Expected: PASS once T5 is in (this test guards the migration claim; it should be GREEN — if it fails, T5 is
 wrong). Keep it as the regression guard.
 
@@ -783,15 +855,17 @@ description = "one-line smoke (inline text=)"
 (Keep multi-line smokes — `smoke-read`, `impl-smoke` — as `file=`.) Then change those nodes to
 `prompt = "review-implement"` / `prompt = "smoke-reply"`.
 
-- [ ] **Step 4: Verify the migrated configs load**
+- [ ] **Step 4: Verify the migrated configs load + the parity test passes**
 
-Run: `cargo build -j 2 && ./target/debug/a2a-bridge prompt list --config examples/a2a-bridge.workflows.toml && ./target/debug/a2a-bridge prompt list --config examples/a2a-bridge.containerized.toml`
-Expected: both list the registered ids without error; `cargo test -p a2a-bridge --lib migrated_named_graph -j 1` PASS.
+Run: `cargo build -j 2 && for c in workflows containerized containerized.podman; do ./target/debug/a2a-bridge prompt list --config examples/a2a-bridge.$c.toml; done`
+Then: `cargo test -p a2a-bridge migrated_named_graph -j 1` PASS **and** the docker/podman parity test still
+passes: `cargo test -p a2a-bridge -j 1` (the `~main.rs:5615` parity test must stay green — PR-FIX M2).
 
 - [ ] **Step 5: Commit**
 ```bash
-git add bin/a2a-bridge/src/config.rs examples/a2a-bridge.workflows.toml examples/a2a-bridge.containerized.toml
-git commit -m "feat(examples): migrate reference + containerized configs to named prompts (E8a T10)"
+git add bin/a2a-bridge/src/config.rs examples/a2a-bridge.workflows.toml \
+  examples/a2a-bridge.containerized.toml examples/a2a-bridge.containerized.podman.toml
+git commit -m "feat(examples): migrate reference + containerized (docker+podman) configs to named prompts (E8a T10)"
 ```
 
 ---
@@ -806,7 +880,9 @@ git commit -m "feat(examples): migrate reference + containerized configs to name
 #[test]
 fn init_scaffold_resolves_named_prompts() {
     let dir = tempfile::tempdir().unwrap();
-    super::init_cmd_at(dir.path()).unwrap(); // a path-injectable variant of init_cmd
+    // PR-FIX (n1): init_cmd is already path-injectable via --dir (mirror the existing tests, ~main.rs:5593).
+    let d = dir.path().to_str().unwrap();
+    super::init_cmd(&["--dir".into(), d.into(), "--agents".into(), "codex,claude".into()]).unwrap();
     let cfg = dir.path().join("a2a-bridge.toml");
     // the scaffolded config uses [[prompts]] + prompt="<id>" and resolves with no dangling ref.
     let lines = super::prompt_list_lines(&cfg).unwrap();
@@ -814,28 +890,26 @@ fn init_scaffold_resolves_named_prompts() {
     let raw = std::fs::read_to_string(&cfg).unwrap();
     assert!(raw.contains("[[prompts]]") && raw.contains("prompt = \""));
     // every node prompt ref resolves (load_workflows succeeds)
-    let base = dir.path();
-    toml::from_str::<RegistryConfig>(&raw).unwrap().load_workflows(base).unwrap();
+    toml::from_str::<RegistryConfig>(&raw).unwrap().load_workflows(dir.path()).unwrap();
 }
 ```
-(If `init_cmd` is not path-injectable, add a thin `init_cmd_at(dir)` that `init_cmd` calls with CWD — keeps
-the test hermetic.)
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p a2a-bridge --lib init_scaffold_resolves_named_prompts -j 1`
-Expected: FAIL — scaffold still emits `prompt_file`, or `init_cmd_at` missing.
+Run: `cargo test -p a2a-bridge init_scaffold_resolves_named_prompts -j 1`
+Expected: FAIL — scaffold still emits `prompt_file` (no `[[prompts]]`).
 
 - [ ] **Step 3: Implement**
 
-Update the `init_cmd` config template to include a `[[prompts]]` section and change scaffolded workflow
-nodes from `prompt_file = "prompts/X.md"` to `prompt = "X"`. Ensure the `prompts/` files are written (they
-already are) — order within `init` is irrelevant (refs resolve at later config-load, RR-FIX-4). Add
-`init_cmd_at(dir)` if needed for the test.
+Update the `init_cmd` config template (the `config` string built in `init_cmd`, `~main.rs:4070`, + any
+`INIT_*` consts it references) to include a `[[prompts]]` section and change scaffolded workflow nodes from
+`prompt_file = "prompts/X.md"` to `prompt = "X"`. The `prompts/` files are already written by `init`; order
+within `init` is irrelevant (refs resolve at the later config-load, RR-FIX-4). No new `init_cmd_at` —
+`init_cmd(&["--dir", …])` is the injection point.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p a2a-bridge --lib init_scaffold_resolves_named_prompts -j 1`
+Run: `cargo test -p a2a-bridge init_scaffold_resolves_named_prompts -j 1`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -868,3 +942,42 @@ git commit -m "feat(init): scaffold [[prompts]] + prompt=\"<id>\" nodes (E8a T11
   determinism golden (Task 10) is the automated guard.
 - E8b (composition / `{{> partial}}` includes + `prompt show --resolved`) builds on this `BTreeMap<PromptId,
   ResolvedPrompt>` substrate with no breaking change.
+
+---
+
+## Plan v2 — fold of the dual plan-review (PR-FIX)
+
+Both lenses verified the plan's DESIGN is sound (edit-ripple contained to `config.rs:1014/1017`; seam
+correct; full SR-FIX/RR-FIX + acceptance coverage). codex = needs-rework, claude = fix-then-ship — same
+issues, different severity weighting on the two compile-blockers. v2 folds all 13 in place:
+
+- **BLOCKER (compile) — `--lib`:** `a2a-bridge` is bin-only (no lib target); every task command dropped
+  `--lib` → `cargo test -p a2a-bridge <filter> -j 1` (bridge-core keeps `--lib`).
+- **BLOCKER (compile) — `.parse()` / `FromStr`:** `WorkflowId`/`NodeId` have no `FromStr`; `load_workflows`
+  returns `HashMap<WorkflowId, Arc<WorkflowGraph>>`. T5/T10 now use `WorkflowId::parse(..).unwrap()` +
+  `.get(&w).unwrap()`, `NodeId::parse(..).unwrap()`.
+- **M1 — T3 transitional shim is MANDATORY** (with the exact `unwrap_or_default()` edit at `:1014`), else
+  the crate (and T3's own test) won't compile.
+- **M2 — `.podman.toml` migration is MANDATORY** (the docker/podman parity test `~main.rs:5615` requires
+  structural identity); both committed in T10.
+- **M3 — unknown-ref test registers ≥2 prompts** and asserts the SORTED available-id list, not just the
+  offending id.
+- **M4 — resolver/load-level malformed-id tests** added (bad `[[prompts]] id` and bad node `prompt` ref
+  both fail THROUGH `load_workflows`).
+- **M5 — `prompt list`/`show` validate ids as `PromptId` + reject dups** (no file I/O); `list` orders via a
+  `BTreeMap<PromptId,_>`.
+- **M6 — `resolve_one` is `pub(crate)`** (declared in T4), killing T8's visibility hand-wave.
+- **m1 — `prompt_cmd` rejects unknown flags + extra positionals** (matching `run-workflow`/`task-spec`);
+  test asserts it.
+- **m2 — T2 fixture uses `AGENTS_HEADER`+`SERVER_FOOTER`** (not a nonexistent `AGENT_FOOTER`; no duplicate
+  `default=`).
+- **m3 — `ResolvedPrompt.source` gets `#[allow(dead_code)]`** + an E8b note (unread until E8b; the 0-warning
+  gate would flag it).
+- **n1 — T11 uses the real `init_cmd(&["--dir", …])`** (no invented `init_cmd_at`).
+- **n2 — `TOP_USAGE` anchor corrected to `~:91`** (+ enum/dispatch/string add-points enumerated).
+- **n3 — `prompt_cmd` reuses the `CONFIG_PATH` const** instead of a hardcoded literal.
+
+Both lenses' confirmed non-issues (do NOT over-correct): the `available_ids` closure borrow compiles; no
+`deny_unknown_fields` so the tolerant `PromptsOnly` parse works; back-compat holds
+(`workflow_missing_prompt_file_fails_loud` tests *unreadable*, not *absent*); empty-text is permitted; T10's
+golden is a green guard, not a red test.
