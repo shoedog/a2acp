@@ -69,6 +69,8 @@ pub enum BridgeError {
     UnknownAgent { id: String },
     #[error("invalid config: {reason}")]
     ConfigInvalid { reason: String },
+    #[error("{message}")]
+    TaskSpecInvalid { message: String },
 }
 
 impl BridgeError {
@@ -120,6 +122,7 @@ impl BridgeError {
             AuthRequired { .. } | AgentNotAuthenticated => SetState(S::AuthRequired),
             PermissionRequired { .. } => SetState(S::InputRequired),
             CancelTimeout => SetState(S::Canceled),
+            TaskSpecInvalid { .. } => RejectRequest,
             _ => SetState(S::Failed),
         }
     }
@@ -280,6 +283,18 @@ mod tests {
     }
 
     #[test]
+    fn task_spec_invalid_rejects_request_and_surfaces_message() {
+        let message = "unknown task-type. valid: implement, code-review".to_string();
+        let e = BridgeError::TaskSpecInvalid {
+            message: message.clone(),
+        };
+
+        assert_eq!(e.disposition(), A2aDisposition::RejectRequest);
+        assert_eq!(e.client_message(), message);
+        assert!(!e.is_transient());
+    }
+
+    #[test]
     fn is_transient_covers_every_variant() {
         use BridgeError::*;
 
@@ -317,6 +332,7 @@ mod tests {
             InvalidStateTransition,
             UnknownAgent { id: "a".into() },
             ConfigInvalid { reason: "x".into() },
+            TaskSpecInvalid { message: "x".into() },
         ] {
             assert!(!e.is_transient(), "{e:?} must not be transient");
         }

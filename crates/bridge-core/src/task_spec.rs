@@ -204,6 +204,19 @@ pub fn validate(spec: &TaskSpec) -> Result<(), TaskSpecError> {
     Ok(())
 }
 
+/// Parse + validate; map any TaskSpecError to a BridgeError carrying the
+/// sanitized discovery message. Returns the parsed spec so read-once callers can
+/// reuse body/title/sections without re-reading input.
+pub fn validate_input(raw: &str) -> Result<TaskSpec, crate::error::BridgeError> {
+    let spec = parse(raw).map_err(|e| crate::error::BridgeError::TaskSpecInvalid {
+        message: e.to_string(),
+    })?;
+    validate(&spec).map_err(|e| crate::error::BridgeError::TaskSpecInvalid {
+        message: e.to_string(),
+    })?;
+    Ok(spec)
+}
+
 pub fn fields(spec: &TaskSpec) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     fields.push(("title".to_string(), spec.title.clone().unwrap_or_default()));
@@ -753,5 +766,26 @@ mod tests {
         assert!(t.contains("## Acceptance Criteria"));
         assert!(t.contains("OPTIONAL"));
         assert!(parse(&t).is_ok());
+    }
+
+    #[test]
+    fn validate_input_ok_returns_spec_and_bad_maps_to_taskspecinvalid() {
+        let raw = "---\ntask-type: implement\n---\n# Add foo\n\n## Description\nDo it.\n\n## Acceptance Criteria\n- It works.\n";
+
+        let spec = validate_input(raw).unwrap();
+        assert_eq!(spec.task_type, "implement");
+        assert_eq!(spec.title.as_deref(), Some("Add foo"));
+        assert_eq!(
+            spec.section("Acceptance Criteria").unwrap().content.trim(),
+            "- It works."
+        );
+
+        let err = validate_input("# no frontmatter").unwrap_err();
+        match err {
+            crate::error::BridgeError::TaskSpecInvalid { message } => {
+                assert!(message.contains("task-spec schema"), "{message}");
+            }
+            other => panic!("expected TaskSpecInvalid, got {other:?}"),
+        }
     }
 }
