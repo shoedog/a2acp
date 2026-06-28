@@ -61,12 +61,20 @@ boot.
 lenses (codex + claude) and a synthesis. They reference `codex` and `claude`, so
 they are only present if you scaffolded both.
 
+Workflow/batch/implement inputs are **typed task-specs** (YAML front-matter
+`task-type` + a markdown body) and are validated before dispatch. Scaffold one
+with `task-spec template`, then fill in the body:
+
 ```sh
+# Scaffold a task-spec (`freeform` is the catch-all type), then edit it.
+a2a-bridge task-spec template freeform > review-input.md
+a2a-bridge task-spec schema            # list types + sections
+
 # Offline (foreground): run a workflow and print the synthesis.
-a2a-bridge run-workflow code-review --input diff.txt --config ./a2a-bridge.toml
+a2a-bridge run-workflow code-review --input review-input.md --config ./a2a-bridge.toml
 
 # Detached (durable): submit, then follow live progress over SSE (reattachable).
-a2a-bridge submit code-review --input diff.txt --url http://127.0.0.1:8080
+a2a-bridge submit code-review --input review-input.md --url http://127.0.0.1:8080
 a2a-bridge task watch <task-id> --url http://127.0.0.1:8080
 ```
 

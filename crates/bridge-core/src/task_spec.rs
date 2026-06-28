@@ -195,7 +195,9 @@ pub fn validate(spec: &TaskSpec) -> Result<(), TaskSpecError> {
                 task_type: spec.task_type.clone(),
                 section: section.name.to_string(),
             })?;
-        if is_blank(&parsed.content) {
+        // Aggregate descendant subsection content (whole-branch review): a `## Description` whose
+        // prose lives under a `### Context` subsection is NOT empty.
+        if is_blank(&section_aggregate(parsed)) {
             return Err(TaskSpecError::EmptySection {
                 task_type: spec.task_type.clone(),
                 section: section.name.to_string(),
@@ -225,10 +227,25 @@ pub fn fields(spec: &TaskSpec) -> Vec<(String, String)> {
     fields.push(("type".to_string(), spec.task_type.clone()));
 
     for section in &spec.sections {
+        // Reserved built-in tokens (`title`, `type`) must not be shadowed by a same-named
+        // section (whole-branch review): a `## Title` / `## Type` section is dropped as a token.
+        let name = normalize_field_name(&section.name);
+        if name == "title" || name == "type" {
+            continue;
+        }
         push_section_fields(&mut fields, "", section);
     }
 
     fields
+}
+
+/// A section's content plus all descendant subsection content (for the validation emptiness check).
+fn section_aggregate(section: &Section) -> String {
+    let mut out = section.content.clone();
+    for sub in &section.subsections {
+        out.push_str(&section_aggregate(sub));
+    }
+    out
 }
 
 pub fn body(spec: &TaskSpec) -> &str {
@@ -271,7 +288,9 @@ fn push_section_fields(fields: &mut Vec<(String, String)>, prefix: &str, section
     }
 }
 
-fn normalize_field_name(name: &str) -> String {
+/// Normalize a section name to a field-token name (lowercase; runs of non-alphanumeric → `_`).
+/// `pub` so bridge-workflow's render seeds use the SAME normalizer as `fields()` (no drift).
+pub fn normalize_field_name(name: &str) -> String {
     let mut out = String::new();
     let mut previous_was_separator = false;
 
@@ -301,7 +320,9 @@ pub fn parse(raw: &str) -> Result<TaskSpec, TaskSpecError> {
     })
 }
 
-fn strip_html_comments(s: &str) -> String {
+/// Strip `<!-- … -->` HTML comments. `pub` so implement's commit-message strip uses the SAME
+/// semantics as the validation emptiness check (whole-branch review: no cross-crate divergence).
+pub fn strip_html_comments(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
 
@@ -390,22 +411,22 @@ fn parse_body(body: &str) -> (Option<String>, Vec<Section>) {
     let mut sections = Vec::new();
     let mut current_section: Option<Section> = None;
     let mut current_subsection: Option<Section> = None;
-    let mut fence: Option<&'static str> = None;
+    let mut fence: Option<(char, usize)> = None;
 
     for line in body.split_inclusive('\n') {
         let line_content = line.strip_suffix('\n').unwrap_or(line);
 
-        if let Some(marker) = fence {
+        if let Some((ch, len)) = fence {
             append_content(&mut current_section, &mut current_subsection, line);
-            if fence_marker(line_content) == Some(marker) {
+            if is_closing_fence(line_content, ch, len) {
                 fence = None;
             }
             continue;
         }
 
-        if let Some(marker) = fence_marker(line_content) {
+        if let Some((ch, len)) = fence_open(line_content) {
             append_content(&mut current_section, &mut current_subsection, line);
-            fence = Some(marker);
+            fence = Some((ch, len));
             continue;
         }
 
@@ -447,15 +468,25 @@ fn parse_body(body: &str) -> (Option<String>, Vec<Section>) {
     (title, sections)
 }
 
-fn fence_marker(line: &str) -> Option<&'static str> {
+/// An OPENING code fence: a run of >= 3 backticks or tildes (an info string may follow).
+/// Returns `(fence_char, run_length)`.
+fn fence_open(line: &str) -> Option<(char, usize)> {
     let trimmed = line.trim_start();
-    if trimmed.starts_with("```") {
-        Some("```")
-    } else if trimmed.starts_with("~~~") {
-        Some("~~~")
-    } else {
-        None
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
     }
+    let run = trimmed.chars().take_while(|&c| c == ch).count();
+    (run >= 3).then_some((ch, run))
+}
+
+/// A CLOSING fence: the SAME char as the opener, a run >= the opener's run, and NOTHING after it
+/// (no info string). A shorter inner run (e.g. ``` inside a ```` block) does NOT close — this is the
+/// whole-branch-review fix for the variable-length-fence validation bypass.
+fn is_closing_fence(line: &str, open_char: char, open_len: usize) -> bool {
+    let trimmed = line.trim();
+    let run = trimmed.chars().take_while(|&c| c == open_char).count();
+    run >= open_len && trimmed.len() == run * open_char.len_utf8()
 }
 
 fn append_content(
@@ -668,6 +699,50 @@ mod tests {
         assert!(s.section("not tilde").is_none());
         assert!(s.section("not rust").is_none());
         assert_eq!(s.section("Next").unwrap().content.trim(), "n");
+    }
+
+    #[test]
+    fn four_backtick_fence_does_not_close_on_inner_triple() {
+        // whole-branch BLOCKER: a 4-backtick block holding an inner ``` must NOT close early, so a
+        // `## Acceptance Criteria` inside it is NOT a real section (no validation bypass).
+        let s = parse(
+            "---\ntask-type: implement\n---\n# T\n\n## Description\n````\n```\n## Acceptance Criteria\n````\nprose\n",
+        )
+        .unwrap();
+        assert!(s.section("Acceptance Criteria").is_none());
+        assert!(s
+            .section("Description")
+            .unwrap()
+            .content
+            .contains("## Acceptance Criteria"));
+        // ...and the spec is correctly rejected as missing the real required section.
+        assert!(matches!(
+            validate(&s),
+            Err(TaskSpecError::MissingSection { section, .. }) if section == "Acceptance Criteria"
+        ));
+    }
+
+    #[test]
+    fn reserved_section_does_not_shadow_builtins() {
+        // whole-branch MAJOR: a `## Title` / `## Type` section must not override {{task.title}}/{{task.type}}.
+        let s = parse(
+            "---\ntask-type: freeform\n---\n# Real Title\n\n## Title\nhijacked\n\n## Type\nspoof\n",
+        )
+        .unwrap();
+        let f: std::collections::HashMap<_, _> = fields(&s).into_iter().collect();
+        assert_eq!(f.get("title").map(String::as_str), Some("Real Title"));
+        assert_eq!(f.get("type").map(String::as_str), Some("freeform"));
+    }
+
+    #[test]
+    fn section_with_only_subsection_content_is_not_empty() {
+        // whole-branch MAJOR: a required `## Description` whose prose lives under `### Context`
+        // (no direct content) must validate, not reject as empty.
+        let s = parse(
+            "---\ntask-type: implement\n---\n# T\n\n## Description\n### Context\nthe context.\n\n## Acceptance Criteria\n- ok\n",
+        )
+        .unwrap();
+        assert!(validate(&s).is_ok());
     }
 
     #[test]

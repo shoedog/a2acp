@@ -82,23 +82,6 @@ fn parse_for_render(raw: &str) -> RenderInput {
     }
 }
 
-fn task_field_name(name: &str) -> String {
-    let mut out = String::new();
-    let mut previous_was_separator = false;
-
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            previous_was_separator = false;
-        } else if !previous_was_separator {
-            out.push('_');
-            previous_was_separator = true;
-        }
-    }
-
-    out.trim_matches('_').to_string()
-}
-
 fn render_vars_for_input(input: &str) -> Result<Vec<(String, String)>, String> {
     match parse_for_render(input) {
         RenderInput::Freeform(raw) => Ok(vec![("input".to_string(), raw)]),
@@ -112,7 +95,10 @@ fn render_vars_for_input(input: &str) -> Result<Vec<(String, String)>, String> {
             if let Some(schema) = bridge_core::task_spec::schema(&spec.task_type) {
                 for section in schema.sections {
                     task_vars.push((
-                        format!("task.{}", task_field_name(section.name)),
+                        format!(
+                            "task.{}",
+                            bridge_core::task_spec::normalize_field_name(section.name)
+                        ),
                         String::new(),
                     ));
                 }

@@ -3317,6 +3317,16 @@ async fn run_batch_rpc(
             }
             None => None,
         };
+        if let Err(e) = bridge_core::task_spec::validate_input(&item.input) {
+            return jsonrpc_err(
+                id,
+                JSONRPC_INVALID_REQUEST,
+                &format!(
+                    "invalid task-spec for item_id {item_id}: {}",
+                    e.client_message()
+                ),
+            );
+        }
         items.push(BatchItem {
             item_id,
             input: item.input,

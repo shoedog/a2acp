@@ -123,26 +123,9 @@ pub enum CommitSource {
     Derived,
 }
 
-fn strip_html_comments(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-
-    while let Some(start) = rest.find("<!--") {
-        out.push_str(&rest[..start]);
-        let after_start = &rest[start + "<!--".len()..];
-        let Some(end) = after_start.find("-->") else {
-            return out;
-        };
-        rest = &after_start[end + "-->".len()..];
-    }
-
-    out.push_str(rest);
-    out
-}
-
 fn commit_candidate(raw: String, strip_comments: bool) -> Option<String> {
     let without_comments = if strip_comments {
-        strip_html_comments(&raw)
+        bridge_core::task_spec::strip_html_comments(&raw)
     } else {
         raw
     };

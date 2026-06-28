@@ -3171,7 +3171,11 @@ Submit a batch to a running a2a-bridge serve. The manifest is TOML:
   input = \"inline prompt\"
   session_cwd = \"/optional/repo\"
 
-Use input_file instead of input to inline file contents relative to the manifest directory.";
+Use input_file instead of input to inline file contents relative to the manifest directory.
+
+Each item input is a typed task-spec (YAML front-matter `task-type` + a markdown body),
+validated before the batch is created. See `a2a-bridge task-spec schema`; scaffold one with
+`a2a-bridge task-spec template <type>` (`freeform` is the catch-all).";
 
 const BATCH_USAGE: &str = "\
 usage: a2a-bridge batch status <batch-id> [--url <url>]
