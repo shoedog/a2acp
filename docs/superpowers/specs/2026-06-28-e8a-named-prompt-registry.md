@@ -195,3 +195,94 @@ with **cycle detection** (a → b → a → err) and a depth cap. `prompt show -
 form; raw stays the default. The 66+ duplicated review scaffolds collapse to shared partials
 (`_preamble/review-readonly`, `_contract/bounded-stop`, …). E8b touches only the resolver + the CLI flag —
 still nothing below the config-load seam.
+
+---
+
+## v2 — fold of the dual spec-review (SR-FIX-1..12)
+
+Both lenses (codex xhigh correctness + claude architecture) returned **fix-then-ship**, corroborating that
+the resolution seam and data model are sound. v2 supersedes v1 §4–§6 where they conflict. Verified each
+fact against the real code before folding.
+
+**SR-FIX-1 (seam name — both).** The sole config→`WorkflowNode.prompt_template` seam is
+`RegistryConfig::load_workflows` (`config.rs:987`, node loop `:1007`, `read_to_string` at `:1014`) — NOT
+`into_snapshot`/`into_graphs`. `into_snapshot` (`:1063`) builds only the *agent* registry;
+`FileConfigSource::load/watch` (`:1347`) hot-reloads only that agent snapshot; the MCP path
+(`main.rs:4451`) also calls `load_workflows`. §4.2 is re-anchored on `load_workflows`. All other
+`WorkflowNode { prompt_template … }` literals (coordinator.rs:933, detached.rs:1084/1823/2031,
+batch.rs:1099, main.rs:5247) are synthetic single-turn wrappers with a hard-coded `"{{input}}"` and never
+read config prompts → confirmed immune.
+
+**SR-FIX-2 (richer registry type + lazy `list` — both).** `resolve_prompt_registry` returns
+`BTreeMap<PromptId, ResolvedPrompt>` with `ResolvedPrompt { template: String, description: Option<String>,
+source: PromptSource }` (`PromptSource = File(PathBuf) | Text`). BTreeMap = deterministic ordering for
+`prompt list` and for the unknown-ref "available ids" list. **Per-entry** resolution is a shared helper
+`resolve_one(entry, base) -> Result<ResolvedPrompt, ConfigError>` (file/text-XOR + read). The **load seam**
+maps `resolve_one` over ALL entries (eager). **`prompt list`** does NOT call it — it reads `id` +
+`description` straight off `cfg.prompts` (zero file I/O), so a moved/unreadable file never breaks discovery.
+**`prompt show <id>`** validates ids (dup scan, no read), finds the requested entry, and calls `resolve_one`
+for that ONE entry only (resilient to other entries' bad files).
+
+**SR-FIX-3 (prompt-only CLI load — both).** `prompt_cmd` must NOT run agent validation, DAG building, or
+snapshotting (those fail on unrelated config errors). It uses a permissive prompt-extraction parse that
+deserializes only the `[[prompts]]` array (tolerant of/ignoring other sections) and resolves `file=`
+against the config-file directory. `--config` defaults to `./a2a-bridge.toml` and accepts `--config <path>`
+— modeled on `run-workflow` (`main.rs:781`), NOT on `task_spec_cmd` (which takes no config).
+
+**SR-FIX-4 (explicit `PromptId` grammar now — both).** Add a `PromptId` newtype to
+`crates/bridge-core/src/ids.rs` (beside `AgentId`/`WorkflowId`/`NodeId`): **non-empty after trim; reject
+control chars and whitespace; allow alphanumerics + `/` `_` `-` `.`**. This admits E8b namespaced partial
+ids (`_preamble/review-readonly`, `design.synth`) with NO future grammar change. Registry keys and node
+refs are `PromptId`.
+
+**SR-FIX-5 (`text=` byte-identity scope — both).** Criterion 6 is split by source:
+- A node `prompt="<id>"` whose prompt is `file=F` is **byte-identical** to a node `prompt_file=F` (same
+  `read_to_string`) — the determinism golden test asserts byte-equality for this case.
+- A node migrated to inline `text=` is **semantic** equality only (TOML strings don't carry the file's
+  trailing `\n`; `"""…"""` trims a leading newline). To avoid the trap entirely, **only genuinely
+  single-line prompts migrate to `text=`**; multi-line prompts stay `file=`. (Verified: of the smokes only
+  `prompts/smoke-reply.md` is one line; `smoke-read.md`=3, `impl-smoke.md`=6 lines stay `file=`.)
+
+**SR-FIX-6 (migration factual corrections — claude precise, codex corroborates).** Corrected §4.5 variance
+set (verified against the real configs):
+- `examples/a2a-bridge.workflows.toml` — **3** workflows: `code-review`, `spec-review`, `plan-review`
+  (there is **no `design` workflow**). Each is fan-in; demonstrates `file=`. (No intra-file prompt reuse
+  here — the three workflows use distinct per-lens prompts.)
+- `examples/a2a-bridge.containerized.toml` (+ `.podman.toml` if mechanical) — demonstrates **cross-node
+  prompt reuse**: `../prompts/review-implement.md` is referenced **5×** → becomes ONE `[[prompts]]` entry
+  referenced by `prompt="review-implement"` from all five nodes. Also hosts the single-line `text=` demo
+  (a one-line smoke).
+- `init` scaffold — emits `[[prompts]]` + `prompt="<id>"`, files written before referenced.
+
+**SR-FIX-7 (empty template — both; user decision).** **Permit** an empty resolved template (`text=""` or
+an empty `file`), preserving today's behavior (an empty `prompt_file` already loads). No new rejection;
+back-compat-clean. §4.3 states this.
+
+**SR-FIX-8 (eager vs lazy — claude; user-aligned).** The **load seam resolves ALL registered prompts
+eagerly** (fail-fast at boot — a broken `file=`, even if unreferenced, is a real config error worth
+surfacing). **`prompt list` is the deliberate lazy exception** (id+description only) so discovery survives
+a missing file. `prompt show <id>` reads only the requested entry. Stated explicitly in §4.2/§4.4.
+
+**SR-FIX-9 (error ordering — claude).** The registry is fully validated (dup-id, file/text-XOR, file read)
+**before** the node loop; node-ref resolution (unknown id → list available) runs after, so the available-id
+list is always derivable. Pinned in §4.3.
+
+**SR-FIX-10 (second parse path — claude).** `bin/a2a-bridge/tests/integration_run_workflow.rs:97` is a
+test-only parallel parser (its own `Node { prompt_file: String }`, no `prompt` field). It is NOT the seam,
+stays out of scope, and must NOT be fed a `prompt="<id>"` fixture. Noted in §3 non-goals + §5.
+
+**SR-FIX-11 (golden testability — both).** The determinism/back-compat test uses **synthetic old/new
+fixture pairs** (a `prompt_file=F` config vs an equivalent `[[prompts]] file=F` + `prompt="id"` config),
+asserting byte-identical graphs — NOT in-place pre/post comparison. Criterion 7 ("no diff below the seam")
+is reclassified as a **review-checklist inspection item**, not an automated test; the determinism golden is
+the real guard. §5 + criteria updated.
+
+**SR-FIX-12 (CLI help — codex).** Add `prompt` to `TOP_USAGE` (`main.rs:97`) and to the unknown-subcommand
+expected list (`main.rs:4679`), alongside the dispatch wiring. §4.4.
+
+**Unchanged / corroborated positives:** E8b forward-compat is clean — a partial is a `[[prompts]]` entry,
+transitive expansion + cycle detection live inside the resolver, `--resolved` extends `show`; the
+`BTreeMap<PromptId, ResolvedPrompt>` substrate (raw, un-expanded `template`) admits all of this with no
+breaking change. The E7/E8 boundary holds — a `text=` prompt containing `{{input}}`/`{{task.*}}` renders
+unchanged (render path untouched). Back-compat holds — `prompt_file: String → Option<String>` regresses no
+test (`workflow_missing_prompt_file_fails_loud` tests *unreadable*, not *absent*).
