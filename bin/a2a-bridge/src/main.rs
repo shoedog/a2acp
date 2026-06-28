@@ -2214,8 +2214,13 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             return Err(format!("implement: stage check: {e}").into());
         }
     };
-    let msg = implement::commit_message(implement::read_commit_msg_file(&clone), &task);
-    if msg.1 {
+    let msg = implement::commit_message(
+        spec.section("Commit Message").map(|s| s.content.clone()),
+        implement::read_commit_msg_file(&clone),
+        spec.title.as_deref().unwrap_or(""),
+        &task,
+    );
+    if msg.1 == implement::CommitSource::Derived {
         eprintln!("[implement] no .git/A2A_COMMIT_MSG — using task-derived message");
     }
     match implement::decide(completed, guard, stage, msg) {

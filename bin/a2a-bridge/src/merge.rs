@@ -462,7 +462,12 @@ pub fn merge_clone(
                 );
                 return MergeOutcome::Unlanded;
             }
-            let (msg, _) = commit_message(ck.original_message.clone(), &ck.task_brief);
+            let (msg, _) = commit_message(
+                ck.original_message.clone(),
+                None,
+                &ck.task_brief,
+                &ck.task_brief,
+            );
             let rt = match reauthor_commit(clone, cur, &ck.base_commit, &msg, &op) {
                 Ok(r) => r,
                 Err(e) => {

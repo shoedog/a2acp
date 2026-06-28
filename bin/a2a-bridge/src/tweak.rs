@@ -256,8 +256,12 @@ pub async fn run_tweak_loop(
                     }
                 };
                 // completed==true here, so `decide`'s only Abort cause is the head guard → Diverged.
-                let action =
-                    implement::decide(true, guard, stage, (original_message.to_string(), false));
+                let action = implement::decide(
+                    true,
+                    guard,
+                    stage,
+                    (original_message.to_string(), implement::CommitSource::Typed),
+                );
                 match fix_step(&action) {
                     FixDisposition::Amend => match implement::host_amend_commit(clone) {
                         Ok(s) => {
