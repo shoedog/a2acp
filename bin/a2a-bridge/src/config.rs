@@ -384,6 +384,20 @@ pub(crate) fn resolve_prompt_registry(
     Ok(map)
 }
 
+/// Deserialize ONLY the `[[prompts]]` array, tolerant of (ignoring) every other section. This powers
+/// `prompt list/show` so they work even when the agent/workflow config has unrelated errors (no
+/// agent/DAG/snapshot validation runs). E8a.
+pub(crate) fn parse_prompts_only(toml_str: &str) -> Result<Vec<PromptEntryToml>, ConfigError> {
+    #[derive(serde::Deserialize)]
+    struct PromptsOnly {
+        #[serde(default)]
+        prompts: Vec<PromptEntryToml>,
+    }
+    let parsed: PromptsOnly =
+        toml::from_str(toml_str).map_err(|e| ConfigError::Registry(format!("config parse: {e}")))?;
+    Ok(parsed.prompts)
+}
+
 /// `[registry]` section — optional; controls which cmds are allowed.
 #[derive(Debug, serde::Deserialize)]
 pub struct RegistrySection {
@@ -2721,6 +2735,18 @@ addr="127.0.0.1:8080"
             [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"bad id\"\ninputs=[]\n\
             [server]\naddr=\"127.0.0.1:8080\"\n";
         assert!(toml::from_str::<RegistryConfig>(bad_ref).unwrap().load_workflows(dir.path()).is_err());
+    }
+
+    #[test]
+    fn prompt_only_parse_ignores_unrelated_sections() {
+        // an unknown agent would fail load_workflows, but prompt-only parse still reads prompts.
+        let toml = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[prompts]]\nid=\"rev\"\nfile=\"r.md\"\ndescription=\"d\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"GHOST\"\nprompt=\"rev\"\ninputs=[]\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n";
+        let prompts = parse_prompts_only(toml).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].id, "rev");
     }
 
     #[test]

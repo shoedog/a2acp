@@ -110,6 +110,7 @@ SUBCOMMANDS:
   mcp                 Serve the MCP protocol over stdio (one stable Coordinator; A2A/CLI/MCP are thin adapters).
                       [--config <path>] [--store <path>]
   task-spec           Inspect or validate typed task-spec inputs. schema | template | input
+  prompt              Inspect the named prompt registry ([[prompts]]). list | show <id>  [--config <f>]
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
@@ -148,6 +149,7 @@ enum TopSubcommand {
     Init,
     Mcp,
     TaskSpec,
+    Prompt,
     Help,
     Serve,
     Unknown(String),
@@ -168,6 +170,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("init") => TopSubcommand::Init,
         Some("mcp") => TopSubcommand::Mcp,
         Some("task-spec") => TopSubcommand::TaskSpec,
+        Some("prompt") => TopSubcommand::Prompt,
         Some("help") | Some("--help") | Some("-h") => TopSubcommand::Help,
         Some("serve") | None => TopSubcommand::Serve,
         Some(other) => TopSubcommand::Unknown(other.to_string()),
@@ -4558,6 +4561,126 @@ fn read_input(path: &str) -> Result<String, BoxError> {
     }
 }
 
+const PROMPT_USAGE: &str = "\
+usage: a2a-bridge prompt list [--config <path>]
+       a2a-bridge prompt show <id> [--config <path>]
+
+Inspect the named prompt registry ([[prompts]]). `list` shows ids + descriptions;
+`show <id>` prints the raw template. Default config is ./a2a-bridge.toml.";
+
+/// Core for `prompt list`: read prompts (NO file I/O on `file=`), validate ids + reject dups, sort by id.
+fn prompt_list_lines(config_path: &std::path::Path) -> Result<Vec<String>, BoxError> {
+    use bridge_core::ids::PromptId;
+    let raw = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("prompt: read {config_path:?}: {e}"))?;
+    let prompts = config::parse_prompts_only(&raw).map_err(|e| format!("{e}"))?;
+    let mut by_id: std::collections::BTreeMap<PromptId, Option<String>> =
+        std::collections::BTreeMap::new();
+    for p in &prompts {
+        let id =
+            PromptId::parse(p.id.clone()).map_err(|_| format!("prompt id {:?} is invalid", p.id))?;
+        if by_id.insert(id, p.description.clone()).is_some() {
+            return Err(format!("duplicate prompt id {:?}", p.id).into());
+        }
+    }
+    Ok(by_id
+        .into_iter()
+        .map(|(id, desc)| {
+            format!(
+                "{} — {}",
+                id.as_str(),
+                desc.as_deref().unwrap_or("(no description)")
+            )
+        })
+        .collect())
+}
+
+/// Core for `prompt show <id>`: validate ids + dedup (no read), then resolve ONLY the requested entry.
+fn prompt_show_text(config_path: &std::path::Path, id: &str) -> Result<String, BoxError> {
+    let raw = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("prompt: read {config_path:?}: {e}"))?;
+    let prompts = config::parse_prompts_only(&raw).map_err(|e| format!("{e}"))?;
+    let mut seen = std::collections::HashSet::new();
+    for p in &prompts {
+        bridge_core::ids::PromptId::parse(p.id.clone())
+            .map_err(|_| format!("prompt id {:?} is invalid", p.id))?;
+        if !seen.insert(p.id.as_str()) {
+            return Err(format!("duplicate prompt id {:?}", p.id).into());
+        }
+    }
+    let base = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    match prompts.iter().find(|p| p.id == id) {
+        Some(entry) => Ok(config::resolve_one(entry, base)
+            .map_err(|e| format!("{e}"))?
+            .template),
+        None => {
+            let mut ids: Vec<&str> = prompts.iter().map(|p| p.id.as_str()).collect();
+            ids.sort_unstable();
+            Err(format!("unknown prompt {id:?}; available: [{}]", ids.join(", ")).into())
+        }
+    }
+}
+
+fn prompt_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{PROMPT_USAGE}");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--resolved") {
+        return Err(format!("prompt: --resolved is reserved for a later release\n{PROMPT_USAGE}").into());
+    }
+    let mut config = std::path::PathBuf::from(CONFIG_PATH);
+    let mut positional: Vec<&String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--config" => {
+                config = it
+                    .next()
+                    .ok_or("prompt: --config requires a value")?
+                    .into();
+            }
+            s if s.starts_with("--") => {
+                return Err(format!("prompt: unknown flag {a:?}\n{PROMPT_USAGE}").into())
+            }
+            _ => positional.push(a),
+        }
+    }
+    match positional.first().map(|s| s.as_str()) {
+        Some("list") => {
+            if positional.len() > 1 {
+                return Err(format!(
+                    "prompt list: unexpected argument {:?}\n{PROMPT_USAGE}",
+                    positional[1]
+                )
+                .into());
+            }
+            for line in prompt_list_lines(&config)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Some("show") => {
+            let id = positional
+                .get(1)
+                .ok_or_else(|| format!("prompt show: expected <id>\n{PROMPT_USAGE}"))?;
+            if positional.len() > 2 {
+                return Err(format!(
+                    "prompt show: unexpected argument {:?}\n{PROMPT_USAGE}",
+                    positional[2]
+                )
+                .into());
+            }
+            print!("{}", prompt_show_text(&config, id)?);
+            Ok(())
+        }
+        Some(other) => Err(format!("prompt: unknown subcommand {other:?}\n{PROMPT_USAGE}").into()),
+        None => Err(format!("prompt: missing subcommand\n{PROMPT_USAGE}").into()),
+    }
+}
+
 fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{TASK_SPEC_USAGE}");
@@ -4666,6 +4789,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Init => return init_cmd(&raw_args[2..]),
         TopSubcommand::Mcp => return mcp_cmd(&raw_args[2..]).await,
         TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
+        TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
         TopSubcommand::Help => {
             println!("{TOP_USAGE}");
             return Ok(());
@@ -4676,7 +4800,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | session | init | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | prompt | session | init | help)"
             )
             .into());
         }
@@ -5930,6 +6054,49 @@ id = "empty"
         let t = bridge_core::task_spec::template("implement").unwrap();
         assert!(bridge_core::task_spec::parse(&t).is_ok());
         assert!(bridge_core::task_spec::task_types().contains(&"implement"));
+    }
+
+    // ===== E8a — prompt CLI (T7..T9) =====
+
+    #[test]
+    fn prompt_list_sorts_ids_no_file_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("a2a-bridge.toml");
+        // `file` points at a MISSING file — `list` must still work (no read).
+        std::fs::write(&cfg, "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[prompts]]\nid=\"zeta\"\nfile=\"missing.md\"\ndescription=\"z\"\n\
+            [[prompts]]\nid=\"alpha\"\ntext=\"hi\"\n[server]\naddr=\"127.0.0.1:8080\"\n").unwrap();
+        let out = super::prompt_list_lines(&cfg).unwrap();
+        assert_eq!(
+            out,
+            vec!["alpha — (no description)".to_string(), "zeta — z".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompt_show_resolves_one_and_errors_on_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("r.md"), "REVIEW {{input}}\n").unwrap();
+        let cfg = dir.path().join("a2a-bridge.toml");
+        std::fs::write(&cfg, "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[prompts]]\nid=\"rev\"\nfile=\"r.md\"\n[[prompts]]\nid=\"s\"\ntext=\"hi\"\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n").unwrap();
+        assert_eq!(super::prompt_show_text(&cfg, "rev").unwrap(), "REVIEW {{input}}\n");
+        assert_eq!(super::prompt_show_text(&cfg, "s").unwrap(), "hi");
+        let err = super::prompt_show_text(&cfg, "ghost").unwrap_err().to_string();
+        assert!(err.contains("ghost") && err.contains("rev")); // unknown + available ids
+    }
+
+    #[test]
+    fn prompt_cmd_dispatch_help_unknown_sub_and_strict_args() {
+        let s = |a: &str| a.to_string();
+        assert!(super::prompt_cmd(&[s("--help")]).is_ok());
+        assert!(super::prompt_cmd(&[s("bogus")]).is_err());
+        assert!(super::prompt_cmd(&[]).is_err()); // missing subcommand
+        assert!(super::prompt_cmd(&[s("show"), s("x"), s("--resolved")]).is_err());
+        assert!(super::prompt_cmd(&[s("list"), s("--bogusflag")]).is_err());
+        assert!(super::prompt_cmd(&[s("list"), s("extra")]).is_err());
+        assert!(super::prompt_cmd(&[s("show"), s("a"), s("b")]).is_err());
     }
 
     fn temp_task_spec_path(label: &str) -> std::path::PathBuf {
