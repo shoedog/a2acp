@@ -3,7 +3,7 @@
 > Roadmap tail item E8 ("prompt-template lib"), split into **E8a (named registry, this spec)** and
 > **E8b (composition / `{{> partial}}` includes, a later slice)**. E8a is the foundation E8b composes on.
 
-**Status:** ready-for-review (v1)
+**Status:** ready-to-plan (v3) — `## v2` (SR-FIX) + `## v3` (RR-FIX) supersede v1 §3–§6 where they conflict
 **Date:** 2026-06-28
 **Branch (impl):** `feat/e8a-named-prompt-registry` (off `main` `cfb5431`+, after E7)
 
@@ -62,7 +62,8 @@ final_agent_prompt = render( node.prompt_template , { input: taskspec.body, task
 - **Migrating the per-slice scratch configs** (`examples/*-codex.toml`) → a separate follow-up cleanup slice.
 - Naming prompts at sites other than **workflow nodes** (the only `prompt_file` site today).
 - Changing the **runtime render path, the executor, the wire, or the E7 gate** — E8a is purely a
-  config-load-time indirection; the resolved `WorkflowNode.prompt_template` is byte-identical to today.
+  config-load-time indirection. (Byte-identity of `prompt_template` holds for `file=`/`prompt_file`; a
+  node migrated to inline `text=` is *semantic*-equal only — see `## v2` SR-FIX-5.)
 
 ## 4. Design
 
@@ -286,3 +287,48 @@ transitive expansion + cycle detection live inside the resolver, `--resolved` ex
 breaking change. The E7/E8 boundary holds — a `text=` prompt containing `{{input}}`/`{{task.*}}` renders
 unchanged (render path untouched). Back-compat holds — `prompt_file: String → Option<String>` regresses no
 test (`workflow_missing_prompt_file_fails_loud` tests *unreadable*, not *absent*).
+
+---
+
+## v3 — fold of the dual re-review (RR-FIX-1..5)
+
+Both lenses re-reviewed v2: **fix-then-ship**, all 12 SR-FIX RESOLVED, no BLOCKER/MAJOR of substance — the
+seam, data model, CLI-load, migration facts, and E8b forward-compat all verified against source. v3 folds
+the residual precision points (the only concrete one is the `PromptId` `Ord` derivation).
+
+**RR-FIX-1 (`PromptId` must derive `Ord` — codex MAJOR / claude MINOR, corroborated; the one real gap).**
+`PromptId` is the key of `BTreeMap<PromptId, ResolvedPrompt>` (SR-FIX-2), so it MUST
+`#[derive(PartialOrd, Ord)]` (in addition to `Eq, Hash, Clone`). The existing `ids.rs` newtype families it
+was loosely said to "mirror" — `id_newtype!` (`AgentId`, non-empty only) and `id_newtype_strict!`
+(`WorkflowId`/`NodeId`, `[a-z0-9_-]`, lowercase) — do NOT derive `Ord`, so a copy-paste would not compile.
+Amends SR-FIX-4.
+
+**RR-FIX-2 (`PromptId` is a NEW third grammar, not "consistent with" the others — claude NIT).** Correcting
+SR-FIX-4's framing: `PromptId` is deliberately MORE permissive than the strict newtypes — it admits
+uppercase, `/`, and `.` (for E8b namespacing like `_preamble/review-readonly`). It is its own
+`id_newtype`-style macro (non-empty trimmed; reject control/whitespace; allow alnum + `/ _ - .`), NOT a
+clone of `id_newtype_strict!`. Do not claim consistency with `WorkflowId`/`NodeId`.
+
+**RR-FIX-3 (`prompt list` ordering is a SEPARATE id-sort, not the resolved `BTreeMap` — both, NIT).**
+Clarifying SR-FIX-2/8: the resolved `BTreeMap<PromptId, ResolvedPrompt>` requires file I/O, so `prompt list`
+does NOT build it. `list` reads `id` + `description` off `cfg.prompts` (zero I/O) and **sorts the ids
+itself** (collect → sort, or a `BTreeMap<PromptId, Option<String>>` of id→description with no template). The
+resolved `BTreeMap` (and its ordering) serves the **load seam** and **`prompt show`**'s available-ids list,
+not `list`.
+
+**RR-FIX-4 (init write-order claim — codex MINOR).** Correcting SR-FIX-6's "files written before
+referenced": `init_cmd` writes BOTH the `a2a-bridge.toml` and the `prompts/` files to disk; the
+`prompt="<id>"` references are resolved later at **config-load**, by which point all files exist — so the
+internal write order *within* `init` is irrelevant to correctness. (Today config is queued/written before
+prompts at `main.rs:~4097/4125`; no reorder is required.) The criterion is "after `init`, a fresh
+`prompt list`/`serve` resolves every reference" — not an init-internal ordering.
+
+**RR-FIX-5 (anchor drift + benign omissions — both, NIT).** Line anchors may have drifted ≈+3 since v1
+(file edits); the implementer VERIFIES each anchor at impl time (the function/struct NAMES are the durable
+reference). The SR-FIX-1 wrapper enumeration also omits `detached.rs:~1795` (`prompt_template:
+prompt.into()`) — confirmed a `#[cfg(test)]` helper fed an already-resolved template, NOT a config→graph
+seam, so the "single seam = `load_workflows`" claim stands. The `integration_run_workflow.rs:~97` test-only
+parser carve-out (SR-FIX-10) likewise stands (out of scope; never fed a `prompt="<id>"` fixture).
+
+**Plan-ready.** No surviving "mirror X" hand-wave of substance; every acceptance criterion is verifiable
+(determinism golden via synthetic fixture pairs; CLI list/show; load-error cases). Proceed to the plan.
