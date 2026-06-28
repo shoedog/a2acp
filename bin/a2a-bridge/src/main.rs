@@ -101,7 +101,7 @@ SUBCOMMANDS:
                       --manifest <file> [--concurrency K] [--detach] [--url <url>]
   batch               Batch store.  status <id> | list | cancel <id>
   models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
-  implement <task>    Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
+  implement --input <file|-> Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
                       (Mode A: fast-forward --onto). [--config <f>] [--onto <branch>] [--force]
@@ -866,7 +866,7 @@ fn parse_run_workflow_args(
 
 enum ImplementMode {
     Fresh {
-        task: String,
+        input: String,
         repo: PathBuf,
         base_ref: Option<String>,
         workflow: String,
@@ -897,9 +897,9 @@ struct ImplementArgs {
 }
 
 const IMPLEMENT_USAGE: &str = "\
-usage: a2a-bridge implement <task> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth auto|light|standard|thorough]
+usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth auto|light|standard|thorough]
        a2a-bridge implement --resume <id> [--config <path>]
-  <task>          what to implement (a sentence/paragraph the agent acts on)
+  --input <file|-> task-spec markdown to implement; use '-' to read stdin (required)
   --repo <path>   the repo to implement in; cloned into a quarantine under allowed_cwd_root (required)
   --config <path> registry config defining the impl agent + [implement]/[verify]/[review] (default: ./a2a-bridge.toml)
   --base-ref      branch/SHA to start from (default: the repo HEAD)
@@ -964,75 +964,93 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
         });
     }
 
-    let mut iter = args.iter();
-    let task = iter
-        .next()
-        .cloned()
-        .ok_or_else(|| format!("implement: missing <task>\n{IMPLEMENT_USAGE}"))?;
-    if task.starts_with("--") {
-        return Err(
-            format!("implement: missing <task> (got flag {task:?})\n{IMPLEMENT_USAGE}").into(),
-        );
-    }
-    let (mut repo, mut base_ref, mut config, mut workflow) = (None, None, None, None);
+    let (mut input, mut repo, mut base_ref, mut config, mut workflow) =
+        (None, None, None, None, None);
     let mut merge = false;
     let mut onto = None;
     let mut depth: Option<review::Depth> = None;
     let mut lang = LangArg::Auto;
-    while let Some(f) = iter.next() {
-        match f.as_str() {
-            "--merge" => merge = true,
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--merge" => {
+                merge = true;
+                i += 1;
+            }
             "--onto" => {
                 onto = Some(
-                    iter.next()
+                    args.get(i + 1)
                         .ok_or("implement: --onto needs a value")?
                         .clone(),
-                )
+                );
+                i += 2;
+            }
+            "--input" => {
+                input = Some(
+                    args.get(i + 1)
+                        .ok_or("implement: --input needs a value")?
+                        .clone(),
+                );
+                i += 2;
             }
             "--repo" => {
                 repo = Some(PathBuf::from(
-                    iter.next().ok_or("implement: --repo needs a value")?,
-                ))
+                    args.get(i + 1).ok_or("implement: --repo needs a value")?,
+                ));
+                i += 2;
             }
             "--base-ref" => {
                 base_ref = Some(
-                    iter.next()
+                    args.get(i + 1)
                         .ok_or("implement: --base-ref needs a value")?
                         .clone(),
-                )
+                );
+                i += 2;
             }
             "--config" => {
                 config = Some(PathBuf::from(
-                    iter.next().ok_or("implement: --config needs a value")?,
-                ))
+                    args.get(i + 1).ok_or("implement: --config needs a value")?,
+                ));
+                i += 2;
             }
             "--workflow" => {
                 workflow = Some(
-                    iter.next()
+                    args.get(i + 1)
                         .ok_or("implement: --workflow needs a value")?
                         .clone(),
-                )
+                );
+                i += 2;
             }
             "--depth" => {
-                let val = iter.next().ok_or("implement: --depth needs a value")?;
+                let val = args.get(i + 1).ok_or("implement: --depth needs a value")?;
                 depth = Some(review::Depth::parse_flag(val.as_str())?);
+                i += 2;
             }
             "--lang" => {
-                let val = iter.next().ok_or("implement: --lang needs a value")?;
+                let val = args.get(i + 1).ok_or("implement: --lang needs a value")?;
                 lang = match val.as_str() {
                     "auto" => LangArg::Auto,
                     "none" => LangArg::None,
                     s => LangArg::Explicit(s.to_string()),
                 };
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("implement: unknown flag {other:?}\n{IMPLEMENT_USAGE}").into());
             }
             other => {
-                return Err(format!("implement: unknown flag {other:?}\n{IMPLEMENT_USAGE}").into());
+                return Err(
+                    format!("implement: unexpected positional arg {other:?}\n{IMPLEMENT_USAGE}")
+                        .into(),
+                );
             }
         }
     }
     Ok(ImplementArgs {
         mode: ImplementMode::Fresh {
-            task,
+            input: input.ok_or_else(|| {
+                format!("implement: --input <file|-> is required\n{IMPLEMENT_USAGE}")
+            })?,
             repo: repo.ok_or_else(|| {
                 format!("implement: --repo <path> is required\n{IMPLEMENT_USAGE}")
             })?,
@@ -1901,7 +1919,18 @@ fn merge_after_loop(
     }
 }
 
-/// `a2a-bridge implement <task> --repo <path>` — clone a quarantine, run the 1-node `implement-edit`
+fn write_implement_task_file(
+    clone: &std::path::Path,
+    spec: &bridge_core::task_spec::TaskSpec,
+) -> Result<(), BoxError> {
+    std::fs::write(
+        clone.join(".git").join("A2A_TASK.md"),
+        bridge_core::task_spec::body(spec).as_bytes(),
+    )
+    .map_err(|e| format!("implement: write task file: {e}").into())
+}
+
+/// `a2a-bridge implement --input <file|-> --repo <path>` — clone a quarantine, run the 1-node `implement-edit`
 /// workflow on the ContainerRw `impl` agent (session_cwd = the clone), then commit + the bounded
 /// review→tweak loop (B2b-3b) + the operator hand-off. The agent owns staging; the bridge owns the commit.
 async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
@@ -1916,13 +1945,13 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let onto = a.onto.clone();
     let depth = a.depth;
     let lang = a.lang;
-    let (task, repo, base_ref, workflow) = match a.mode {
+    let (input, repo, base_ref, workflow) = match a.mode {
         ImplementMode::Fresh {
-            task,
+            input,
             repo,
             base_ref,
             workflow,
-        } => (task, repo, base_ref, workflow),
+        } => (input, repo, base_ref, workflow),
         ImplementMode::Resume { resume_id } => {
             return implement_resume_cmd(
                 &resume_id,
@@ -1934,6 +1963,10 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             .await;
         }
     };
+    let raw_input = read_input(&input)?;
+    let spec = bridge_core::task_spec::validate_input(&raw_input)
+        .map_err(|e| format!("implement: {e}"))?;
+    let task = bridge_core::task_spec::body(&spec).to_string();
 
     // 1. config + canonical allowed_cwd_root (the ContainerRw mount anchor).
     let raw = std::fs::read_to_string(&config_path)
@@ -2159,8 +2192,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // non-ASCII interaction; ASCII or small is fine). Writing it to `.git/A2A_TASK.md` keeps the prompt
     // small + ASCII while the agent reads the full (arbitrarily large / unicode) task from the file
     // (file-read of unicode is safe — validated). implement-edit.md reads this file instead of {{input}}.
-    std::fs::write(clone.join(".git").join("A2A_TASK.md"), task.as_bytes())
-        .map_err(|e| format!("implement: write task file: {e}"))?;
+    write_implement_task_file(&clone, &spec)?;
     // First edit turn — on the WARM session (off the executor). The edit template now points the agent at
     // `.git/A2A_TASK.md` (no task interpolation), so the prompt itself is small + ASCII regardless of task.
     let edit_vars: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
@@ -6292,9 +6324,10 @@ The command prints schemas, templates, and validates input.
     }
 
     #[test]
-    fn parse_implement_args_basic() {
+    fn implement_input_arg_parse() {
         let a: Vec<String> = [
-            "Add a FOO file",
+            "--input",
+            "task.md",
             "--repo",
             "/src/repo",
             "--base-ref",
@@ -6308,12 +6341,12 @@ The command prints schemas, templates, and validates input.
         let p = super::parse_implement_args(&a).unwrap();
         match p.mode {
             ImplementMode::Fresh {
-                task,
+                input,
                 repo,
                 base_ref,
                 workflow,
             } => {
-                assert_eq!(task, "Add a FOO file");
+                assert_eq!(input, "task.md");
                 assert_eq!(repo, std::path::PathBuf::from("/src/repo"));
                 assert_eq!(base_ref.as_deref(), Some("main"));
                 assert_eq!(workflow, "implement-edit");
@@ -6322,20 +6355,40 @@ The command prints schemas, templates, and validates input.
         }
         assert_eq!(p.config, std::path::PathBuf::from("c.toml"));
         assert_eq!(p.depth, None);
+
+        let stdin = super::parse_implement_args(&[
+            "--input".into(),
+            "-".into(),
+            "--repo".into(),
+            "/src/repo".into(),
+        ])
+        .unwrap();
+        match stdin.mode {
+            ImplementMode::Fresh { input, .. } => assert_eq!(input, "-"),
+            ImplementMode::Resume { .. } => panic!("expected Fresh"),
+        }
+
+        assert!(super::parse_implement_args(&[
+            "legacy positional task".into(),
+            "--repo".into(),
+            "/src/repo".into(),
+        ])
+        .is_err());
     }
 
     #[test]
-    fn parse_implement_args_requires_task_and_repo() {
-        // first token is a flag -> treated as missing <task>
+    fn parse_implement_args_requires_input_and_repo() {
+        // --repo alone is missing --input.
         assert!(super::parse_implement_args(&["--repo".into(), "/r".into()]).is_err());
-        // task present but no --repo
-        assert!(super::parse_implement_args(&["task".into()]).is_err());
+        // --input present but no --repo.
+        assert!(super::parse_implement_args(&["--input".into(), "task.md".into()]).is_err());
     }
 
     #[test]
     fn parse_implement_fresh_and_resume() {
         let fresh = super::parse_implement_args(&[
-            "do X".into(),
+            "--input".into(),
+            "task.md".into(),
             "--repo".into(),
             "/r".into(),
             "--config".into(),
@@ -6343,8 +6396,8 @@ The command prints schemas, templates, and validates input.
         ])
         .unwrap();
         match fresh.mode {
-            ImplementMode::Fresh { task, repo, .. } => {
-                assert_eq!(task, "do X");
+            ImplementMode::Fresh { input, repo, .. } => {
+                assert_eq!(input, "task.md");
                 assert_eq!(repo, std::path::PathBuf::from("/r"));
             }
             ImplementMode::Resume { .. } => panic!("expected Fresh"),
@@ -6369,7 +6422,23 @@ The command prints schemas, templates, and validates input.
             "/r".into()
         ])
         .is_err());
-        assert!(super::parse_implement_args(&["do X".into()]).is_err());
+        assert!(super::parse_implement_args(&["--input".into(), "task.md".into()]).is_err());
+    }
+
+    #[test]
+    fn implement_input_writes_body_sans_frontmatter() {
+        let raw = valid_implement_task_spec();
+        let spec = bridge_core::task_spec::validate_input(raw).unwrap();
+        let root = temp_task_spec_path("implement-body");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        super::write_implement_task_file(&root, &spec).unwrap();
+
+        let written = std::fs::read_to_string(root.join(".git").join("A2A_TASK.md")).unwrap();
+        assert_eq!(written, bridge_core::task_spec::body(&spec));
+        assert!(written.starts_with("# Add task-spec CLI"));
+        assert!(!written.contains("task-type: implement"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -6402,14 +6471,14 @@ The command prints schemas, templates, and validates input.
     #[test]
     fn parse_implement_args_threads_depth_thorough() {
         // Integration: --depth thorough flows through the arg parser to Some(Forced(Thorough)).
-        let a: Vec<String> = ["do X", "--repo", "/r", "--depth", "thorough"]
+        let a: Vec<String> = ["--input", "task.md", "--repo", "/r", "--depth", "thorough"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let p = super::parse_implement_args(&a).unwrap();
         assert_eq!(p.depth, Some(review::Depth::Forced(review::Tier::Thorough)));
         // an unknown --depth value is rejected.
-        let bad: Vec<String> = ["do X", "--repo", "/r", "--depth", "bogus"]
+        let bad: Vec<String> = ["--input", "task.md", "--repo", "/r", "--depth", "bogus"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -6419,7 +6488,12 @@ The command prints schemas, templates, and validates input.
     #[test]
     fn parse_implement_args_lang_flag() {
         let a = |extra: &[&str]| -> Vec<String> {
-            let mut v = vec!["do X".to_string(), "--repo".to_string(), "/r".to_string()];
+            let mut v = vec![
+                "--input".to_string(),
+                "task.md".to_string(),
+                "--repo".to_string(),
+                "/r".to_string(),
+            ];
             v.extend(extra.iter().map(|s| s.to_string()));
             v
         };
