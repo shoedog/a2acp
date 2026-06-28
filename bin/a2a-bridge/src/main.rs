@@ -713,14 +713,14 @@ fn permission_timeout_ms(server: &ServerConfig) -> u64 {
     server.permission_timeout_ms.unwrap_or(120_000)
 }
 
-/// Parse `a2a-bridge run-workflow <id> --input <file> [--out <file>] [--config <path>]`
+/// Parse `a2a-bridge run-workflow <id> --input <file|-> [--out <file>] [--config <path>]`
 /// from a raw args iterator (skipping the binary name at position 0 and the
 /// subcommand name at position 1).
 const RUN_WORKFLOW_USAGE: &str = "\
-usage: a2a-bridge run-workflow <workflow-id> --input <file> [--session-cwd <repo>] [--config <path>] [--out <file>]
-       a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file> [--session-cwd <repo>] [--out <file>]
+usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <repo>] [--config <path>] [--out <file>]
+       a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file|-> [--session-cwd <repo>] [--out <file>]
   <workflow-id>   design | code-review | spec-review | plan-review | … (whatever your --config defines)
-  --input <file>  the problem statement / material the workflow acts on (required)
+  --input <file|-> the typed task-spec markdown the workflow acts on (required; '-' reads stdin)
   --session-cwd   the repo the agents read/work in (per-request cwd; without it they use the launch cwd)
   --config <path> registry config (default: ./a2a-bridge.toml)
   --serve         call a running a2a-bridge serve via SendStreamingMessage instead of local execution
@@ -844,8 +844,9 @@ fn parse_run_workflow_args(
     if serve && config.is_some() {
         return Err("run-workflow: --config cannot be used with --serve".into());
     }
-    let input = input
-        .ok_or_else(|| format!("run-workflow: --input <file> is required\n{RUN_WORKFLOW_USAGE}"))?;
+    let input = input.ok_or_else(|| {
+        format!("run-workflow: --input <file|-> is required\n{RUN_WORKFLOW_USAGE}")
+    })?;
     let config = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
     Ok((
         workflow_id,
@@ -2596,15 +2597,13 @@ fn message_text(message: &a2a::Message) -> String {
 
 async fn run_workflow_serve_client(
     workflow_id: &str,
-    input_path: &Path,
+    input: &str,
     out_path: Option<&Path>,
     url: &str,
     context: &str,
     session_cwd: Option<&str>,
 ) -> Result<(), BoxError> {
-    let input = std::fs::read_to_string(input_path)
-        .map_err(|e| format!("run-workflow: cannot read input {:?}: {e}", input_path))?;
-    let body = build_run_workflow_streaming_request(workflow_id, &input, context, session_cwd);
+    let body = build_run_workflow_streaming_request(workflow_id, input, context, session_cwd);
     let resp = reqwest::Client::new()
         .post(url)
         .header(a2a::SVC_PARAM_VERSION, a2a::VERSION)
@@ -2726,11 +2725,18 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let (workflow_id, input_path, out_path, config_path, session_cwd, serve, url, context) =
         parse_run_workflow_args(args)?;
 
+    let input = read_input(&input_path.to_string_lossy())
+        .map_err(|e| format!("run-workflow: cannot read input {:?}: {e}", input_path))?;
+    if let Err(e) = bridge_core::task_spec::validate_input(&input) {
+        eprintln!("{}", e.client_message());
+        return Err(e.into());
+    }
+
     if serve {
         let context = context.expect("parse_run_workflow_args requires --context with --serve");
         return run_workflow_serve_client(
             &workflow_id,
-            &input_path,
+            &input,
             out_path.as_deref(),
             &url,
             &context,
@@ -2880,10 +2886,6 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
-
-    // Read input.
-    let input = std::fs::read_to_string(&input_path)
-        .map_err(|e| format!("run-workflow: cannot read input {:?}: {e}", input_path))?;
 
     // Unique run id.
     let run_id = format!(
@@ -6175,7 +6177,7 @@ The command prints schemas, templates, and validates input.
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.md");
         let out = dir.path().join("out.md");
-        std::fs::write(&input, "hello").unwrap();
+        std::fs::write(&input, valid_implement_task_spec()).unwrap();
         let args: Vec<String> = vec![
             "--serve".into(),
             "--url".into(),
@@ -6241,7 +6243,7 @@ The command prints schemas, templates, and validates input.
             .await;
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.md");
-        std::fs::write(&input, "hello").unwrap();
+        std::fs::write(&input, valid_implement_task_spec()).unwrap();
         let args: Vec<String> = vec![
             "--serve".into(),
             "--url".into(),
