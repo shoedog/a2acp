@@ -63,6 +63,72 @@ type NodeFut<'a> = std::pin::Pin<
     Box<dyn futures::Future<Output = (NodeId, String, bool, Option<UsageSnapshot>)> + Send + 'a>,
 >;
 
+enum RenderInput {
+    Freeform(String),
+    Spec(bridge_core::task_spec::TaskSpec),
+    Invalid(String),
+}
+
+fn parse_for_render(raw: &str) -> RenderInput {
+    use bridge_core::task_spec::{parse, validate, TaskSpecError};
+
+    match parse(raw) {
+        Ok(spec) => match validate(&spec) {
+            Ok(()) => RenderInput::Spec(spec),
+            Err(e) => RenderInput::Invalid(e.to_string()),
+        },
+        Err(TaskSpecError::NoTaskType) => RenderInput::Freeform(raw.to_string()),
+        Err(e) => RenderInput::Invalid(e.to_string()),
+    }
+}
+
+fn task_field_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut previous_was_separator = false;
+
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            out.push('_');
+            previous_was_separator = true;
+        }
+    }
+
+    out.trim_matches('_').to_string()
+}
+
+fn render_vars_for_input(input: &str) -> Result<Vec<(String, String)>, String> {
+    match parse_for_render(input) {
+        RenderInput::Freeform(raw) => Ok(vec![("input".to_string(), raw)]),
+        RenderInput::Spec(spec) => {
+            let mut vars = vec![(
+                "input".to_string(),
+                bridge_core::task_spec::body(&spec).to_string(),
+            )];
+            let mut task_vars = Vec::new();
+
+            if let Some(schema) = bridge_core::task_spec::schema(&spec.task_type) {
+                for section in schema.sections {
+                    task_vars.push((
+                        format!("task.{}", task_field_name(section.name)),
+                        String::new(),
+                    ));
+                }
+            }
+
+            for (name, value) in bridge_core::task_spec::fields(&spec) {
+                task_vars.push((format!("task.{name}"), value));
+            }
+
+            vars.extend(task_vars);
+            Ok(vars)
+        }
+        RenderInput::Invalid(msg) => Err(msg),
+    }
+}
+
 /// Render the reserved `{{workflow.costs}}` synth var: a markdown table of each
 /// input source's captured usage. Per-field `n/a` when absent.
 /// `windowFraction = used/size` as a raw fraction.
@@ -650,6 +716,17 @@ impl WorkflowExecutor {
             registry: self.registry.clone(),
         };
         Box::pin(async_stream::stream! {
+            let base_render_vars = match render_vars_for_input(&input) {
+                Ok(vars) => vars,
+                Err(msg) => {
+                    yield Ok(WorkflowEvent::Terminal {
+                        outcome: WorkflowOutcome::Failed,
+                        output: msg,
+                    });
+                    return;
+                }
+            };
+
             // --- Seed validation ---
             // 1. Every seed key must name a real node.
             let node_ids: HashSet<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
@@ -705,7 +782,7 @@ impl WorkflowExecutor {
                             if n.inputs.iter().all(|i| done.contains(i.as_str())) {
                                 scheduled.insert(id.to_string());
                                 started.push(n.id.clone());
-                                let mut owned: Vec<(String, String)> = vec![("input".into(), input.clone())];
+                                let mut owned: Vec<(String, String)> = base_render_vars.clone();
                                 for inp in &n.inputs {
                                     if let Some((t, _, _)) = outputs.get(inp.as_str()) {
                                         owned.push((inp.as_str().into(), t.clone()));
@@ -904,12 +981,16 @@ mod tests {
         }
     }
     pub(super) fn one_node_graph() -> Arc<WorkflowGraph> {
+        one_node_graph_with_template("echo {{input}}")
+    }
+
+    fn one_node_graph_with_template(prompt_template: &str) -> Arc<WorkflowGraph> {
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("w").unwrap(),
             nodes: vec![WorkflowNode {
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("codex").unwrap(),
-                prompt_template: "echo {{input}}".into(),
+                prompt_template: prompt_template.into(),
                 inputs: vec![],
                 retry: None,
             }],
@@ -946,6 +1027,108 @@ mod tests {
             cost: None,
             at_ms: used as i64,
         }
+    }
+
+    #[tokio::test]
+    async fn renders_body_as_input_and_task_tokens() {
+        let body = "# T\n\n## Description\nBuild it.\n\n## Acceptance Criteria\n- Works\n\n## Files\n- a.rs\n";
+        let input = format!("---\ntask-type: implement\n---\n{body}");
+        let rec = Arc::new(Rec::default());
+        let reg = Arc::new(FakeRegistry {
+            backends: [("codex".to_string(), ("OK".to_string(), rec.clone()))].into(),
+        });
+        let ex = WorkflowExecutor::new(reg);
+
+        let events: Vec<_> = ex
+            .run(
+                one_node_graph_with_template("{{input}}::{{task.files}}::{{task.spec_refs}}"),
+                input,
+                "r".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(matches!(
+            events.last(),
+            Some(WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                output
+            }) if output == "OK"
+        ));
+        let prompt = &rec.prompts.lock().unwrap()[0];
+        assert_eq!(prompt, &format!("{body}::- a.rs\n::"));
+    }
+
+    #[tokio::test]
+    async fn bare_input_is_freeform_no_task_tokens() {
+        let rec = Arc::new(Rec::default());
+        let reg = Arc::new(FakeRegistry {
+            backends: [("codex".to_string(), ("OK".to_string(), rec.clone()))].into(),
+        });
+        let ex = WorkflowExecutor::new(reg);
+
+        let events: Vec<_> = ex
+            .run(
+                one_node_graph_with_template("{{input}}::{{task.files}}"),
+                "plain task".into(),
+                "r".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert!(matches!(
+            events.last(),
+            Some(WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                output
+            }) if output == "OK"
+        ));
+        assert_eq!(rec.prompts.lock().unwrap()[0], "plain task::{{task.files}}");
+    }
+
+    #[tokio::test]
+    async fn present_invalid_yields_failed_terminal() {
+        let input =
+            "---\ntask-type: implement\n---\n# T\n\n## Description\nBuild it.\n".to_string();
+        let rec = Arc::new(Rec::default());
+        let reg = Arc::new(FakeRegistry {
+            backends: [("codex".to_string(), ("OK".to_string(), rec.clone()))].into(),
+        });
+        let ex = WorkflowExecutor::new(reg);
+
+        let events: Vec<_> = ex
+            .run(
+                one_node_graph_with_template("{{input}}"),
+                input,
+                "r".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Failed,
+                output
+            } if output.contains("task-spec schema")
+        ));
+        assert!(
+            rec.prompts.lock().unwrap().is_empty(),
+            "present-invalid input must fail before spawning any node"
+        );
     }
 
     #[derive(Clone)]
