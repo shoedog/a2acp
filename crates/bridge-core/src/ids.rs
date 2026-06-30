@@ -80,6 +80,31 @@ macro_rules! id_newtype_strict {
 id_newtype_strict!(WorkflowId);
 id_newtype_strict!(NodeId);
 
+/// Prompt registry id (E8a). Deliberately MORE permissive than `id_newtype_strict!` (admits uppercase,
+/// `/`, `.`) so E8b namespaced partials (`_preamble/review-readonly`) need no grammar change. Derives
+/// `Ord` so it can key a `BTreeMap` (the resolved registry / `prompt list` ordering).
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct PromptId(String);
+impl PromptId {
+    pub fn parse(s: impl Into<String>) -> Result<Self, BridgeError> {
+        let s = s.into();
+        let trimmed = s.trim();
+        let ok = !trimmed.is_empty()
+            && trimmed.len() == s.len() // no leading/trailing whitespace
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'));
+        if !ok {
+            return Err(BridgeError::InvalidRequest { field: "PromptId" });
+        }
+        Ok(Self(s))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod slice0_id_tests {
     use super::*;
@@ -112,6 +137,31 @@ mod slice0_id_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_id_accepts_namespaced_and_mixed_case_rejects_blank_and_ws() {
+        for ok in [
+            "review-correctness",
+            "_preamble/review-readonly",
+            "design.synth",
+            "Smoke_Read",
+        ] {
+            assert!(PromptId::parse(ok).is_ok(), "{ok} should parse");
+        }
+        for bad in ["", "  ", "a b", "tab\there", "ctrl\u{0}x"] {
+            assert!(PromptId::parse(bad).is_err(), "{bad:?} should reject");
+        }
+        // Ord is derivable -> usable as a BTreeMap key (compile + order check).
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(PromptId::parse("b").unwrap(), 1);
+        m.insert(PromptId::parse("a").unwrap(), 2);
+        assert_eq!(m.keys().next().unwrap().as_str(), "a");
+
+        let namespaced = PromptId::parse("_preamble/review-readonly").unwrap();
+        let mut by_id = std::collections::BTreeMap::new();
+        by_id.insert(namespaced.clone(), "ok");
+        assert_eq!(by_id.get(&namespaced), Some(&"ok"));
+    }
 
     #[test]
     fn parses_nonempty_rejects_empty() {

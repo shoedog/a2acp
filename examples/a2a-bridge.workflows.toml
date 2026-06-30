@@ -8,25 +8,70 @@ cmd = "codex-acp"
 id = "claude"
 cmd = "claude-agent-acp"
 
+[[prompts]]
+id = "review-correctness"
+file = "../prompts/review-correctness.md"
+description = "code-review correctness lens"
+
+[[prompts]]
+id = "review-architecture"
+file = "../prompts/review-architecture.md"
+description = "code-review architecture lens"
+
+[[prompts]]
+id = "review-synth"
+file = "../prompts/review-synth.md"
+description = "code-review synthesis prompt"
+
+[[prompts]]
+id = "spec-review-rigor"
+file = "../prompts/spec-review-rigor.md"
+description = "spec-review rigor lens"
+
+[[prompts]]
+id = "spec-review-soundness"
+file = "../prompts/spec-review-soundness.md"
+description = "spec-review soundness lens"
+
+[[prompts]]
+id = "spec-review-synth"
+file = "../prompts/spec-review-synth.md"
+description = "spec-review synthesis prompt"
+
+[[prompts]]
+id = "plan-review-exec"
+file = "../prompts/plan-review-exec.md"
+description = "plan-review executability lens"
+
+[[prompts]]
+id = "plan-review-coverage"
+file = "../prompts/plan-review-coverage.md"
+description = "plan-review coverage lens"
+
+[[prompts]]
+id = "plan-review-synth"
+file = "../prompts/plan-review-synth.md"
+description = "plan-review synthesis prompt"
+
 [[workflows]]
 id = "code-review"
 
 [[workflows.nodes]]
 id = "correctness"
 agent = "codex"
-prompt_file = "../prompts/review-correctness.md"
+prompt = "review-correctness"
 inputs = []
 
 [[workflows.nodes]]
 id = "architecture"
 agent = "claude"
-prompt_file = "../prompts/review-architecture.md"
+prompt = "review-architecture"
 inputs = []
 
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
-prompt_file = "../prompts/review-synth.md"
+prompt = "review-synth"
 inputs = ["correctness", "architecture"]
 
 # spec-review: rigor (completeness/ambiguity) + soundness (design) -> synth.
@@ -37,19 +82,19 @@ id = "spec-review"
 [[workflows.nodes]]
 id = "rigor"
 agent = "codex"
-prompt_file = "../prompts/spec-review-rigor.md"
+prompt = "spec-review-rigor"
 inputs = []
 
 [[workflows.nodes]]
 id = "soundness"
 agent = "claude"
-prompt_file = "../prompts/spec-review-soundness.md"
+prompt = "spec-review-soundness"
 inputs = []
 
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
-prompt_file = "../prompts/spec-review-synth.md"
+prompt = "spec-review-synth"
 inputs = ["rigor", "soundness"]
 
 # plan-review: executability (compile/ordering/ripple) + coverage (spec/decomposition) -> synth.
@@ -59,19 +104,19 @@ id = "plan-review"
 [[workflows.nodes]]
 id = "exec"
 agent = "codex"
-prompt_file = "../prompts/plan-review-exec.md"
+prompt = "plan-review-exec"
 inputs = []
 
 [[workflows.nodes]]
 id = "coverage"
 agent = "claude"
-prompt_file = "../prompts/plan-review-coverage.md"
+prompt = "plan-review-coverage"
 inputs = []
 
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
-prompt_file = "../prompts/plan-review-synth.md"
+prompt = "plan-review-synth"
 inputs = ["exec", "coverage"]
 
 [server]
