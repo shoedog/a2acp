@@ -35,10 +35,23 @@ rebuilds a fresh db — but `/var/db/SystemPolicyConfiguration/` is **SIP-protec
 `csrutil status: enabled`), so **`sudo mv` fails with `Operation not permitted`.** Can't touch it while
 SIP is on.
 
-**FIX IN PROGRESS (2026-06-29):** installing **macOS 26.5.2** (was on 26.5.1 `25F80`; `26.5.2-25F84` was
-pending). The OS updater rebuilds SIP-protected security dbs on a blessed path + reinitializes the security
-subsystem on a fresh boot → should clear the wedged WAL. **If this handoff is being read, the update may NOT
-have cleared it — work the ladder below.**
+**FIX IN PROGRESS (2026-06-29) — LOW CONFIDENCE, expect to fall through to Recovery:** installing
+**macOS 26.5.2** (was on 26.5.1 `25F80`; `26.5.2-25F84` pending). **Recalibrated odds ~1-in-4 it clears the
+wedge**, because:
+- The user **already updated 26.4.x → 26.5.1 this morning**, and the crate built fine ~50 min into the
+  session AFTER that — the WAL wedged *later*, under today's heavy build load. So an OS update is not what
+  prevents/heals this.
+- **`ExecPolicy` is Data-volume runtime state** (`/private/var/db/...`). macOS updates replace the sealed
+  **System** volume and **PRESERVE** the Data volume by design → a point update **likely leaves ExecPolicy
+  intact** rather than rebuilding it.
+- The only reasons to let 26.5.2 finish: it's already running; it's a **controlled clean restart** (better
+  WAL-checkpoint odds than the user's manual reboots, which may have SIGKILL'd a churning syspolicyd before
+  it could checkpoint); and the update is wanted anyway. Cheap to test, not the expected fix.
+
+**So: when resuming, run the §1 re-confirm check FIRST. Expect `ExecPolicy-wal` to still be multi-MB →
+go straight to step 2 (Recovery-mode reset), which is the deterministic fix.** Note the user's earlier
+`sudo killall syspolicyd` already restarted syspolicyd and did NOT checkpoint the WAL — proof that no
+plain restart/reboot heals this and the file-level removal in step 2 is required.
 
 ### Remediation ladder (do in order; stop when a build links without freezing)
 
