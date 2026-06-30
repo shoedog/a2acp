@@ -133,13 +133,15 @@ impl Translator {
             let mut stream = backend.prompt(session, parts).await?;
             // Accumulated text awaiting flush as a Status chunk.
             let mut acc = String::new();
-            // Last text we saw (used as the Artifact payload on Done if available).
-            let mut last_text = String::new();
+            // Full text emitted by the backend, used as the Artifact payload on Done.
+            let mut artifact_text = String::new();
+            let mut saw_text_delta = false;
 
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(Update::Text(t)) => {
-                        last_text = t.clone();
+                        saw_text_delta = true;
+                        artifact_text.push_str(&t);
                         acc.push_str(&t);
                         // Flush as many full chunks as the accumulator allows.
                         while acc.chars().count() >= max_chunk {
@@ -186,9 +188,9 @@ impl Translator {
                         // BEFORE moving `stop_reason` into the artifact payload, so we
                         // can emit a terminal Canceled signal after the artifact.
                         let cancelled = stop_reason == STOP_REASON_CANCELLED;
-                        // Final artifact carries the accumulated/last text or stop_reason.
-                        let payload = if !last_text.is_empty() {
-                            last_text.clone()
+                        // Final artifact carries the complete text or stop_reason.
+                        let payload = if saw_text_delta {
+                            artifact_text
                         } else {
                             stop_reason
                         };
@@ -420,9 +422,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_chunk_artifact_carries_full_text() {
+        let be = FakeBackend::new(vec![
+            Ok(Update::Text("AL".into())),
+            Ok(Update::Text("PH".into())),
+            Ok(Update::Text("A".into())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ]);
+        let st = FakeStore::default();
+        let pol = AutoApprove;
+        let (t, s) = ids();
+        let evs: Vec<Event> = Translator::new()
+            .run(&be, &st, &pol, &t, &s, vec![])
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let artifact = evs
+            .iter()
+            .rev()
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .expect("artifact event");
+        assert_eq!(artifact.text(), "ALPHA");
+    }
+
+    #[tokio::test]
+    async fn empty_text_delta_produces_empty_artifact() {
+        let be = FakeBackend::new(vec![
+            Ok(Update::Text(String::new())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ]);
+        let st = FakeStore::default();
+        let pol = AutoApprove;
+        let (t, s) = ids();
+        let evs: Vec<Event> = Translator::new()
+            .run(&be, &st, &pol, &t, &s, vec![])
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let artifact = evs
+            .iter()
+            .rev()
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .expect("artifact event");
+        assert_eq!(artifact.text(), "");
+    }
+
+    #[tokio::test]
     async fn coalesces_and_caps_chunks_at_1200() {
         // 50 updates of 40 chars = 2000 chars -> coalesced into >=2 Status chunks,
-        // each <=1200 chars, far fewer than 50 events.
+        // each <=1200 chars, far fewer than 50 events. The final Artifact carries
+        // the full text and is not capped.
         let mut v: Vec<Result<Update, BridgeError>> =
             (0..50).map(|_| Ok(Update::Text("x".repeat(40)))).collect();
         v.push(Ok(Update::Done {
@@ -444,7 +503,16 @@ mod tests {
             .filter(|e| e.kind() == &EventKind::Status)
             .count();
         assert!((2..50).contains(&status), "status events: {status}");
-        assert!(evs.iter().all(|e| e.text_len() <= 1200));
+        assert!(evs
+            .iter()
+            .filter(|e| e.kind() == &EventKind::Status)
+            .all(|e| e.text_len() <= 1200));
+        let artifact = evs
+            .iter()
+            .rev()
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .expect("artifact event");
+        assert_eq!(artifact.text_len(), 2000);
     }
 
     #[tokio::test]
@@ -576,7 +644,41 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         // ... Status("partial"), Artifact("partial"), Terminal(Canceled).
-        assert!(evs.iter().any(|e| e.kind() == &EventKind::Artifact));
+        let artifact = evs
+            .iter()
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .expect("artifact event");
+        assert_eq!(artifact.text(), "partial");
+        let last = evs.last().unwrap();
+        assert_eq!(last.kind(), &EventKind::Terminal);
+        assert_eq!(last.outcome(), Some(TaskOutcome::Canceled));
+    }
+
+    #[tokio::test]
+    async fn cancelled_multi_chunk_artifact_carries_full_partial_text() {
+        let be = FakeBackend::new(vec![
+            Ok(Update::Text("PAR".into())),
+            Ok(Update::Text("TIAL".into())),
+            Ok(Update::Done {
+                stop_reason: STOP_REASON_CANCELLED.into(),
+            }),
+        ]);
+        let st = FakeStore::default();
+        let pol = AutoApprove;
+        let (t, s) = ids();
+        let evs: Vec<Event> = Translator::new()
+            .run(&be, &st, &pol, &t, &s, vec![])
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let artifact = evs
+            .iter()
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .expect("artifact event");
+        assert_eq!(artifact.text(), "PARTIAL");
         let last = evs.last().unwrap();
         assert_eq!(last.kind(), &EventKind::Terminal);
         assert_eq!(last.outcome(), Some(TaskOutcome::Canceled));

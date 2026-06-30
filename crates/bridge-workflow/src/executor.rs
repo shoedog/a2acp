@@ -1,5 +1,5 @@
 //! WorkflowExecutor — runs a validated DAG over the registry. Each node: configure_session
-//! → prompt → concatenate Update::Text (NOT the translator's last_text). Cancel via token.
+//! → prompt → concatenate Update::Text into the node output. Cancel via token.
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::template::render;
 use bridge_core::domain::{effective_config, Part, SessionSpec};
