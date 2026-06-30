@@ -83,7 +83,9 @@ id_newtype_strict!(NodeId);
 /// Prompt registry id (E8a). Deliberately MORE permissive than `id_newtype_strict!` (admits uppercase,
 /// `/`, `.`) so E8b namespaced partials (`_preamble/review-readonly`) need no grammar change. Derives
 /// `Ord` so it can key a `BTreeMap` (the resolved registry / `prompt list` ordering).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct PromptId(String);
 impl PromptId {
     pub fn parse(s: impl Into<String>) -> Result<Self, BridgeError> {
@@ -154,6 +156,11 @@ mod tests {
         m.insert(PromptId::parse("b").unwrap(), 1);
         m.insert(PromptId::parse("a").unwrap(), 2);
         assert_eq!(m.keys().next().unwrap().as_str(), "a");
+
+        let namespaced = PromptId::parse("_preamble/review-readonly").unwrap();
+        let mut by_id = std::collections::BTreeMap::new();
+        by_id.insert(namespaced.clone(), "ok");
+        assert_eq!(by_id.get(&namespaced), Some(&"ok"));
     }
 
     #[test]

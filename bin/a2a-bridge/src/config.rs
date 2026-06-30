@@ -290,7 +290,10 @@ pub struct WorkflowNodeToml {
     pub agent: String,
     #[serde(default)]
     pub prompt_file: Option<String>,
-    /// E8a: reference a `[[prompts]]` entry by id (alternative to `prompt_file`; exactly one per node).
+    /// Inline text escape hatch. Prefer a named `[[prompts]]` registry entry for reusable prompts.
+    #[serde(default)]
+    pub prompt_text: Option<String>,
+    /// E8a: reference a `[[prompts]]` entry by id (alternative to file/text; exactly one per node).
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
@@ -314,7 +317,12 @@ pub struct PromptEntryToml {
 
 #[derive(Debug, Clone)]
 pub enum PromptSource {
-    File(std::path::PathBuf),
+    File {
+        #[allow(dead_code)]
+        relative: String,
+        #[allow(dead_code)]
+        absolute: std::path::PathBuf,
+    },
     Text,
 }
 
@@ -347,7 +355,10 @@ pub(crate) fn resolve_one(
             Ok(ResolvedPrompt {
                 template,
                 description: entry.description.clone(),
-                source: PromptSource::File(path),
+                source: PromptSource::File {
+                    relative: f.clone(),
+                    absolute: path,
+                },
             })
         }
         (None, Some(t)) => Ok(ResolvedPrompt {
@@ -393,8 +404,8 @@ pub(crate) fn parse_prompts_only(toml_str: &str) -> Result<Vec<PromptEntryToml>,
         #[serde(default)]
         prompts: Vec<PromptEntryToml>,
     }
-    let parsed: PromptsOnly =
-        toml::from_str(toml_str).map_err(|e| ConfigError::Registry(format!("config parse: {e}")))?;
+    let parsed: PromptsOnly = toml::from_str(toml_str)
+        .map_err(|e| ConfigError::Registry(format!("config parse: {e}")))?;
     Ok(parsed.prompts)
 }
 
@@ -1108,8 +1119,13 @@ impl RegistryConfig {
             self.agents.iter().map(|a| a.id.as_str()).collect();
         // E8a: resolve the named-prompt registry ONCE before the node loop (fail-fast; dup-id rejected).
         let prompt_registry = resolve_prompt_registry(&self.prompts, base)?;
-        let available_ids =
-            || -> String { prompt_registry.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(", ") };
+        let available_ids = || -> String {
+            prompt_registry
+                .keys()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let mut map = std::collections::HashMap::new();
         for w in &self.workflows {
             let id = WorkflowId::parse(w.id.clone())
@@ -1122,16 +1138,17 @@ impl RegistryConfig {
                         w.id, n.id, n.agent
                     )));
                 }
-                // E8a: a node's prompt comes from EXACTLY ONE of `prompt = "<id>"` (registry) or
-                // `prompt_file = "<path>"` (read from disk, unchanged behavior).
-                let tpl = match (&n.prompt, &n.prompt_file) {
-                    (Some(id_str), None) => {
-                        let id = bridge_core::ids::PromptId::parse(id_str.clone()).map_err(|_| {
-                            ConfigError::Registry(format!(
-                                "workflow {} node {} prompt id {:?} is invalid",
-                                w.id, n.id, id_str
-                            ))
-                        })?;
+                // E8a: a node's prompt comes from EXACTLY ONE source: registry id, prompt file,
+                // or inline text.
+                let tpl = match (&n.prompt, &n.prompt_file, &n.prompt_text) {
+                    (Some(id_str), None, None) => {
+                        let id =
+                            bridge_core::ids::PromptId::parse(id_str.clone()).map_err(|_| {
+                                ConfigError::Registry(format!(
+                                    "workflow {} node {} prompt id {:?} is invalid",
+                                    w.id, n.id, id_str
+                                ))
+                            })?;
                         prompt_registry
                             .get(&id)
                             .map(|r| r.template.clone())
@@ -1145,7 +1162,7 @@ impl RegistryConfig {
                                 ))
                             })?
                     }
-                    (None, Some(path)) => {
+                    (None, Some(path), None) => {
                         std::fs::read_to_string(base.join(path)).map_err(|e| {
                             ConfigError::Registry(format!(
                                 "workflow {} node {} prompt_file {:?}: {e}",
@@ -1153,9 +1170,16 @@ impl RegistryConfig {
                             ))
                         })?
                     }
+                    (None, None, Some(text)) => text.clone(),
+                    (None, None, None) => {
+                        return Err(ConfigError::Registry(format!(
+                            "workflow {} node {} must set one of `prompt`, `prompt_file`, or `prompt_text`",
+                            w.id, n.id
+                        )))
+                    }
                     _ => {
                         return Err(ConfigError::Registry(format!(
-                            "workflow {} node {} must set exactly one of `prompt` or `prompt_file`",
+                            "workflow {} node {} must set exactly one of `prompt`, `prompt_file`, or `prompt_text`",
                             w.id, n.id
                         )))
                     }
@@ -2647,16 +2671,28 @@ addr="127.0.0.1:8080"
     }
 
     #[test]
-    fn node_accepts_prompt_ref_and_prompt_file_independently() {
+    fn node_accepts_prompt_ref_prompt_file_and_prompt_text_independently() {
         let by_ref: WorkflowNodeToml =
             toml::from_str("id=\"n\"\nagent=\"a\"\nprompt=\"rev\"\n").unwrap();
         assert_eq!(by_ref.prompt.as_deref(), Some("rev"));
         assert!(by_ref.prompt_file.is_none());
+        assert!(by_ref.prompt_text.is_none());
         let by_file: WorkflowNodeToml =
             toml::from_str("id=\"n\"\nagent=\"a\"\nprompt_file=\"p.md\"\n").unwrap();
         assert_eq!(by_file.prompt_file.as_deref(), Some("p.md"));
+        assert!(by_file.prompt.is_none());
+        assert!(by_file.prompt_text.is_none());
+        let by_text: WorkflowNodeToml =
+            toml::from_str("id=\"n\"\nagent=\"a\"\nprompt_text=\"hello\"\n").unwrap();
+        assert_eq!(by_text.prompt_text.as_deref(), Some("hello"));
+        assert!(by_text.prompt.is_none());
+        assert!(by_text.prompt_file.is_none());
         let neither: WorkflowNodeToml = toml::from_str("id=\"n\"\nagent=\"a\"\n").unwrap();
-        assert!(neither.prompt.is_none() && neither.prompt_file.is_none());
+        assert!(
+            neither.prompt.is_none()
+                && neither.prompt_file.is_none()
+                && neither.prompt_text.is_none()
+        );
     }
 
     #[test]
@@ -2665,27 +2701,86 @@ addr="127.0.0.1:8080"
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("r.md"), "REVIEW {{input}}").unwrap();
         let ok = vec![
-            PromptEntryToml { id: "rev".into(), file: Some("r.md".into()), text: None, description: Some("d".into()) },
-            PromptEntryToml { id: "s".into(), file: None, text: Some("hi".into()), description: None },
-            PromptEntryToml { id: "e".into(), file: None, text: Some("".into()), description: None },
+            PromptEntryToml {
+                id: "rev".into(),
+                file: Some("r.md".into()),
+                text: None,
+                description: Some("d".into()),
+            },
+            PromptEntryToml {
+                id: "s".into(),
+                file: None,
+                text: Some("hi".into()),
+                description: None,
+            },
+            PromptEntryToml {
+                id: "e".into(),
+                file: None,
+                text: Some("".into()),
+                description: None,
+            },
         ];
         let reg = resolve_prompt_registry(&ok, dir.path()).unwrap();
-        assert_eq!(reg.get(&PromptId::parse("rev").unwrap()).unwrap().template, "REVIEW {{input}}");
-        assert_eq!(reg.get(&PromptId::parse("s").unwrap()).unwrap().template, "hi");
-        assert_eq!(reg.get(&PromptId::parse("e").unwrap()).unwrap().template, ""); // empty permitted
+        assert_eq!(
+            reg.get(&PromptId::parse("rev").unwrap()).unwrap().template,
+            "REVIEW {{input}}"
+        );
+        assert_eq!(
+            reg.get(&PromptId::parse("s").unwrap()).unwrap().template,
+            "hi"
+        );
+        assert_eq!(
+            reg.get(&PromptId::parse("e").unwrap()).unwrap().template,
+            ""
+        ); // empty permitted
         assert!(resolve_prompt_registry(
-            &[PromptEntryToml { id: "x".into(), file: Some("r.md".into()), text: Some("t".into()), description: None }],
-            dir.path()).is_err());
+            &[PromptEntryToml {
+                id: "x".into(),
+                file: Some("r.md".into()),
+                text: Some("t".into()),
+                description: None
+            }],
+            dir.path()
+        )
+        .is_err());
         assert!(resolve_prompt_registry(
-            &[PromptEntryToml { id: "x".into(), file: None, text: None, description: None }],
-            dir.path()).is_err());
+            &[PromptEntryToml {
+                id: "x".into(),
+                file: None,
+                text: None,
+                description: None
+            }],
+            dir.path()
+        )
+        .is_err());
         assert!(resolve_prompt_registry(
-            &[PromptEntryToml { id: "d".into(), file: None, text: Some("a".into()), description: None },
-              PromptEntryToml { id: "d".into(), file: None, text: Some("b".into()), description: None }],
-            dir.path()).is_err());
+            &[
+                PromptEntryToml {
+                    id: "d".into(),
+                    file: None,
+                    text: Some("a".into()),
+                    description: None
+                },
+                PromptEntryToml {
+                    id: "d".into(),
+                    file: None,
+                    text: Some("b".into()),
+                    description: None
+                }
+            ],
+            dir.path()
+        )
+        .is_err());
         assert!(resolve_prompt_registry(
-            &[PromptEntryToml { id: "m".into(), file: Some("missing.md".into()), text: None, description: None }],
-            dir.path()).is_err());
+            &[PromptEntryToml {
+                id: "m".into(),
+                file: Some("missing.md".into()),
+                text: None,
+                description: None
+            }],
+            dir.path()
+        )
+        .is_err());
     }
 
     #[test]
@@ -2699,12 +2794,454 @@ addr="127.0.0.1:8080"
         let by_file = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
              [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt_file=\"r.md\"\ninputs=[]\n\
              [server]\naddr=\"127.0.0.1:8080\"\n";
-        let g_named = toml::from_str::<RegistryConfig>(named).unwrap().load_workflows(dir.path()).unwrap();
-        let g_file = toml::from_str::<RegistryConfig>(by_file).unwrap().load_workflows(dir.path()).unwrap();
+        let by_text = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+             [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt_text=\"REVIEW {{input}}\\n\"\ninputs=[]\n\
+             [server]\naddr=\"127.0.0.1:8080\"\n";
+        let g_named = toml::from_str::<RegistryConfig>(named)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap();
+        let g_file = toml::from_str::<RegistryConfig>(by_file)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap();
+        let g_text = toml::from_str::<RegistryConfig>(by_text)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap();
         let w = bridge_core::ids::WorkflowId::parse("w").unwrap();
-        assert_eq!(g_named.get(&w).unwrap().nodes[0].prompt_template,
-                   g_file.get(&w).unwrap().nodes[0].prompt_template);
-        assert_eq!(g_named.get(&w).unwrap().nodes[0].prompt_template, "REVIEW {{input}}\n");
+        assert_eq!(
+            g_named.get(&w).unwrap().nodes[0].prompt_template,
+            g_file.get(&w).unwrap().nodes[0].prompt_template
+        );
+        assert_eq!(
+            g_named.get(&w).unwrap().nodes[0].prompt_template,
+            g_text.get(&w).unwrap().nodes[0].prompt_template
+        );
+        assert_eq!(
+            g_named.get(&w).unwrap().nodes[0].prompt_template,
+            "REVIEW {{input}}\n"
+        );
+    }
+
+    #[test]
+    fn migrated_named_graph_byte_identical_to_prompt_file_for_file_backed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rev.md"),
+            "You are a reviewer.\n{{input}}\n",
+        )
+        .unwrap();
+        let old = "default=\"c\"\n[[agents]]\nid=\"c\"\ncmd=\"codex-acp\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"a\"\nagent=\"c\"\nprompt_file=\"rev.md\"\ninputs=[]\n\
+            [[workflows.nodes]]\nid=\"b\"\nagent=\"c\"\nprompt_file=\"rev.md\"\ninputs=[\"a\"]\n[server]\naddr=\"127.0.0.1:8080\"\n";
+        let new = "default=\"c\"\n[[agents]]\nid=\"c\"\ncmd=\"codex-acp\"\n[[prompts]]\nid=\"rev\"\nfile=\"rev.md\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"a\"\nagent=\"c\"\nprompt=\"rev\"\ninputs=[]\n\
+            [[workflows.nodes]]\nid=\"b\"\nagent=\"c\"\nprompt=\"rev\"\ninputs=[\"a\"]\n[server]\naddr=\"127.0.0.1:8080\"\n";
+        let go = toml::from_str::<RegistryConfig>(old)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap();
+        let gn = toml::from_str::<RegistryConfig>(new)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap();
+        let w = bridge_core::ids::WorkflowId::parse("w").unwrap();
+        for node in ["a", "b"] {
+            let n = bridge_core::ids::NodeId::parse(node).unwrap();
+            let fo = go
+                .get(&w)
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|x| x.id == n)
+                .unwrap();
+            let fn_ = gn
+                .get(&w)
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|x| x.id == n)
+                .unwrap();
+            assert_eq!(fo.id, fn_.id);
+            assert_eq!(fo.agent, fn_.agent);
+            assert_eq!(fo.prompt_template, fn_.prompt_template);
+            assert_eq!(fo.inputs, fn_.inputs);
+            assert_eq!(fo.retry, fn_.retry);
+        }
+    }
+
+    #[test]
+    fn migrated_example_named_prompts_match_pre_migration_bodies() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+
+        let file_expectations = [
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "code-review",
+                "correctness",
+                "prompts/review-correctness.md",
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "code-review",
+                "architecture",
+                "prompts/review-architecture.md",
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "code-review",
+                "synth",
+                "prompts/review-synth.md",
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "spec-review",
+                "rigor",
+                "prompts/spec-review-rigor.md",
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "spec-review",
+                "soundness",
+                "prompts/spec-review-soundness.md",
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "spec-review",
+                "synth",
+                "prompts/spec-review-synth.md",
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "plan-review",
+                "exec",
+                "prompts/plan-review-exec.md",
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "plan-review",
+                "coverage",
+                "prompts/plan-review-coverage.md",
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "plan-review",
+                "synth",
+                "prompts/plan-review-synth.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review",
+                "reviewer_codex",
+                "prompts/review-implement.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review",
+                "reviewer_claude",
+                "prompts/review-implement.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review-light",
+                "reviewer",
+                "prompts/review-implement.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review-thorough",
+                "reviewer_codex_draft",
+                "prompts/review-implement.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review-thorough",
+                "reviewer_claude_draft",
+                "prompts/review-implement.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review",
+                "reviewer_codex",
+                "prompts/review-implement.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review",
+                "reviewer_claude",
+                "prompts/review-implement.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review-light",
+                "reviewer",
+                "prompts/review-implement.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review-thorough",
+                "reviewer_codex_draft",
+                "prompts/review-implement.md",
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review-thorough",
+                "reviewer_claude_draft",
+                "prompts/review-implement.md",
+            ),
+        ];
+
+        for (config_rel, workflow, node, prompt_rel) in file_expectations {
+            let expected = std::fs::read_to_string(root.join(prompt_rel)).unwrap();
+            assert_example_node_prompt(&root, config_rel, workflow, node, &expected);
+        }
+
+        let smoke_reply = std::fs::read_to_string(root.join("prompts/smoke-reply.md")).unwrap();
+        for config_rel in [
+            "examples/a2a-bridge.containerized.toml",
+            "examples/a2a-bridge.containerized.podman.toml",
+        ] {
+            for workflow in ["smoke-ollama", "smoke-ollama-cloud"] {
+                assert_example_node_prompt(&root, config_rel, workflow, "go", &smoke_reply);
+            }
+        }
+
+        let shape_expectations: &[(&str, &str, &str, &str, &[&str])] = &[
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "code-review",
+                "correctness",
+                "codex",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "code-review",
+                "architecture",
+                "claude",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "code-review",
+                "synth",
+                "claude",
+                &["correctness", "architecture"],
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "spec-review",
+                "rigor",
+                "codex",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "spec-review",
+                "soundness",
+                "claude",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "spec-review",
+                "synth",
+                "claude",
+                &["rigor", "soundness"],
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "plan-review",
+                "exec",
+                "codex",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "plan-review",
+                "coverage",
+                "claude",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.workflows.toml",
+                "plan-review",
+                "synth",
+                "claude",
+                &["exec", "coverage"],
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review",
+                "reviewer_codex",
+                "codex",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review",
+                "reviewer_claude",
+                "claude",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review-light",
+                "reviewer",
+                "codex",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review-thorough",
+                "reviewer_codex_draft",
+                "codex",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "implement-review-thorough",
+                "reviewer_claude_draft",
+                "claude",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "smoke-ollama",
+                "go",
+                "ollama",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.toml",
+                "smoke-ollama-cloud",
+                "go",
+                "ollama-cloud",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review",
+                "reviewer_codex",
+                "codex",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review",
+                "reviewer_claude",
+                "claude",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review-light",
+                "reviewer",
+                "codex",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review-thorough",
+                "reviewer_codex_draft",
+                "codex",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "implement-review-thorough",
+                "reviewer_claude_draft",
+                "claude",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "smoke-ollama",
+                "go",
+                "ollama",
+                &[],
+            ),
+            (
+                "examples/a2a-bridge.containerized.podman.toml",
+                "smoke-ollama-cloud",
+                "go",
+                "ollama-cloud",
+                &[],
+            ),
+        ];
+        for &(config_rel, workflow, node, agent, inputs) in shape_expectations {
+            assert_example_node_shape(&root, config_rel, workflow, node, agent, inputs);
+        }
+    }
+
+    fn assert_example_node_prompt(
+        root: &std::path::Path,
+        config_rel: &str,
+        workflow: &str,
+        node: &str,
+        expected: &str,
+    ) {
+        let config_path = root.join(config_rel);
+        let cfg = RegistryConfig::parse(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let workflows = cfg.load_workflows(config_path.parent().unwrap()).unwrap();
+        let workflow_id = bridge_core::ids::WorkflowId::parse(workflow).unwrap();
+        let node_id = bridge_core::ids::NodeId::parse(node).unwrap();
+        let actual = workflows
+            .get(&workflow_id)
+            .unwrap_or_else(|| panic!("{config_rel}: missing workflow {workflow}"))
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == node_id)
+            .unwrap_or_else(|| panic!("{config_rel}: workflow {workflow} missing node {node}"));
+        assert_eq!(
+            actual.prompt_template, expected,
+            "{config_rel} workflow {workflow} node {node}"
+        );
+    }
+
+    fn assert_example_node_shape(
+        root: &std::path::Path,
+        config_rel: &str,
+        workflow: &str,
+        node: &str,
+        expected_agent: &str,
+        expected_inputs: &[&str],
+    ) {
+        let config_path = root.join(config_rel);
+        let cfg = RegistryConfig::parse(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let workflows = cfg.load_workflows(config_path.parent().unwrap()).unwrap();
+        let workflow_id = bridge_core::ids::WorkflowId::parse(workflow).unwrap();
+        let node_id = bridge_core::ids::NodeId::parse(node).unwrap();
+        let actual = workflows
+            .get(&workflow_id)
+            .unwrap_or_else(|| panic!("{config_rel}: missing workflow {workflow}"))
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == node_id)
+            .unwrap_or_else(|| panic!("{config_rel}: workflow {workflow} missing node {node}"));
+        assert_eq!(
+            actual.agent.as_str(),
+            expected_agent,
+            "{config_rel} workflow {workflow} node {node} agent"
+        );
+        let actual_inputs = actual
+            .inputs
+            .iter()
+            .map(|input| input.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_inputs, expected_inputs,
+            "{config_rel} workflow {workflow} node {node} inputs"
+        );
+        assert!(
+            actual.retry.is_none(),
+            "{config_rel} workflow {workflow} node {node} retry should stay unset"
+        );
     }
 
     #[test]
@@ -2714,27 +3251,61 @@ addr="127.0.0.1:8080"
             [[prompts]]\nid=\"beta\"\ntext=\"b\"\n[[prompts]]\nid=\"alpha\"\ntext=\"a\"\n\
             [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"ghost\"\ninputs=[]\n\
             [server]\naddr=\"127.0.0.1:8080\"\n";
-        let err = toml::from_str::<RegistryConfig>(unknown).unwrap().load_workflows(dir.path()).unwrap_err().to_string();
+        let err = toml::from_str::<RegistryConfig>(unknown)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("ghost"), "names offending id: {err}");
-        assert!(err.contains("alpha, beta"), "lists sorted available ids: {err}");
+        assert!(
+            err.contains("alpha, beta"),
+            "lists sorted available ids: {err}"
+        );
         let both = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
             [[prompts]]\nid=\"rev\"\ntext=\"t\"\n\
             [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"rev\"\nprompt_file=\"x.md\"\ninputs=[]\n\
             [server]\naddr=\"127.0.0.1:8080\"\n";
-        assert!(toml::from_str::<RegistryConfig>(both).unwrap().load_workflows(dir.path()).is_err());
+        assert!(toml::from_str::<RegistryConfig>(both)
+            .unwrap()
+            .load_workflows(dir.path())
+            .is_err());
+        let prompt_and_text = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[prompts]]\nid=\"rev\"\ntext=\"t\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"rev\"\nprompt_text=\"inline\"\ninputs=[]\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n";
+        assert!(toml::from_str::<RegistryConfig>(prompt_and_text)
+            .unwrap()
+            .load_workflows(dir.path())
+            .is_err());
+        let file_and_text = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt_file=\"x.md\"\nprompt_text=\"inline\"\ninputs=[]\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n";
+        assert!(toml::from_str::<RegistryConfig>(file_and_text)
+            .unwrap()
+            .load_workflows(dir.path())
+            .is_err());
         let neither = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
             [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\ninputs=[]\n\
             [server]\naddr=\"127.0.0.1:8080\"\n";
-        assert!(toml::from_str::<RegistryConfig>(neither).unwrap().load_workflows(dir.path()).is_err());
+        assert!(toml::from_str::<RegistryConfig>(neither)
+            .unwrap()
+            .load_workflows(dir.path())
+            .is_err());
         let bad_reg_id = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
             [[prompts]]\nid=\"bad id\"\ntext=\"x\"\n\
             [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"bad id\"\ninputs=[]\n\
             [server]\naddr=\"127.0.0.1:8080\"\n";
-        assert!(toml::from_str::<RegistryConfig>(bad_reg_id).unwrap().load_workflows(dir.path()).is_err());
+        assert!(toml::from_str::<RegistryConfig>(bad_reg_id)
+            .unwrap()
+            .load_workflows(dir.path())
+            .is_err());
         let bad_ref = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
             [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n\"\nagent=\"codex\"\nprompt=\"bad id\"\ninputs=[]\n\
             [server]\naddr=\"127.0.0.1:8080\"\n";
-        assert!(toml::from_str::<RegistryConfig>(bad_ref).unwrap().load_workflows(dir.path()).is_err());
+        assert!(toml::from_str::<RegistryConfig>(bad_ref)
+            .unwrap()
+            .load_workflows(dir.path())
+            .is_err());
     }
 
     #[test]

@@ -3928,27 +3928,97 @@ fn agent_fragment(name: &str) -> &'static str {
     }
 }
 
-/// The three review workflows (relative `prompts/` paths for `init` output).
+/// The review workflows and their named prompt registry entries for `init` output.
 /// All reference both `codex` and `claude`, so they're only emitted when both
 /// are selected (else `load_workflows` would fail on a missing agent at boot).
 const INIT_WORKFLOWS: &str = r#"
+[[prompts]]
+id = "review-correctness"
+file = "prompts/review-correctness.md"
+description = "code-review correctness lens"
+
+[[prompts]]
+id = "review-architecture"
+file = "prompts/review-architecture.md"
+description = "code-review architecture lens"
+
+[[prompts]]
+id = "review-synth"
+file = "prompts/review-synth.md"
+description = "code-review synthesis prompt"
+
+[[prompts]]
+id = "review-implement"
+file = "prompts/review-implement.md"
+description = "shared implement-review prompt"
+
+[[prompts]]
+id = "review-implement-synth"
+file = "prompts/review-implement-synth.md"
+description = "implement-review synthesis prompt"
+
+[[prompts]]
+id = "spec-review-rigor"
+file = "prompts/spec-review-rigor.md"
+description = "spec-review rigor lens"
+
+[[prompts]]
+id = "spec-review-soundness"
+file = "prompts/spec-review-soundness.md"
+description = "spec-review soundness lens"
+
+[[prompts]]
+id = "spec-review-synth"
+file = "prompts/spec-review-synth.md"
+description = "spec-review synthesis prompt"
+
+[[prompts]]
+id = "plan-review-exec"
+file = "prompts/plan-review-exec.md"
+description = "plan-review executability lens"
+
+[[prompts]]
+id = "plan-review-coverage"
+file = "prompts/plan-review-coverage.md"
+description = "plan-review coverage lens"
+
+[[prompts]]
+id = "plan-review-synth"
+file = "prompts/plan-review-synth.md"
+description = "plan-review synthesis prompt"
+
+[[prompts]]
+id = "design-executability"
+file = "prompts/design-executability.md"
+description = "design executability lens"
+
+[[prompts]]
+id = "design-structure"
+file = "prompts/design-structure.md"
+description = "design structure lens"
+
+[[prompts]]
+id = "design-synth"
+file = "prompts/design-synth.md"
+description = "design synthesis prompt"
+
 # ── Review workflows (two independent lenses + a synthesis) ──
 [[workflows]]
 id = "code-review"
 [[workflows.nodes]]
 id = "correctness"
 agent = "codex"
-prompt_file = "prompts/review-correctness.md"
+prompt = "review-correctness"
 inputs = []
 [[workflows.nodes]]
 id = "architecture"
 agent = "claude"
-prompt_file = "prompts/review-architecture.md"
+prompt = "review-architecture"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
-prompt_file = "prompts/review-synth.md"
+prompt = "review-synth"
 inputs = ["correctness", "architecture"]
 
 # ── implement-review (B2b-3a): two folded reviewers of the committed diff → synth verdict ──
@@ -3957,17 +4027,17 @@ id = "implement-review"
 [[workflows.nodes]]
 id = "reviewer_codex"
 agent = "codex"
-prompt_file = "prompts/review-implement.md"
+prompt = "review-implement"
 inputs = []
 [[workflows.nodes]]
 id = "reviewer_claude"
 agent = "claude"
-prompt_file = "prompts/review-implement.md"
+prompt = "review-implement"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
-prompt_file = "prompts/review-implement-synth.md"
+prompt = "review-implement-synth"
 inputs = ["reviewer_codex", "reviewer_claude"]
 
 [[workflows]]
@@ -3975,17 +4045,17 @@ id = "spec-review"
 [[workflows.nodes]]
 id = "rigor"
 agent = "codex"
-prompt_file = "prompts/spec-review-rigor.md"
+prompt = "spec-review-rigor"
 inputs = []
 [[workflows.nodes]]
 id = "soundness"
 agent = "claude"
-prompt_file = "prompts/spec-review-soundness.md"
+prompt = "spec-review-soundness"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
-prompt_file = "prompts/spec-review-synth.md"
+prompt = "spec-review-synth"
 inputs = ["rigor", "soundness"]
 
 [[workflows]]
@@ -3993,17 +4063,17 @@ id = "plan-review"
 [[workflows.nodes]]
 id = "exec"
 agent = "codex"
-prompt_file = "prompts/plan-review-exec.md"
+prompt = "plan-review-exec"
 inputs = []
 [[workflows.nodes]]
 id = "coverage"
 agent = "claude"
-prompt_file = "prompts/plan-review-coverage.md"
+prompt = "plan-review-coverage"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
-prompt_file = "prompts/plan-review-synth.md"
+prompt = "plan-review-synth"
 inputs = ["exec", "coverage"]
 
 # design: two clean-room architect lenses (firewalled via inputs=[]) + synth.
@@ -4012,17 +4082,17 @@ id = "design"
 [[workflows.nodes]]
 id = "executability"
 agent = "codex"
-prompt_file = "prompts/design-executability.md"
+prompt = "design-executability"
 inputs = []
 [[workflows.nodes]]
 id = "structure"
 agent = "claude"
-prompt_file = "prompts/design-structure.md"
+prompt = "design-structure"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
 agent = "claude"
-prompt_file = "prompts/design-synth.md"
+prompt = "design-synth"
 inputs = ["executability", "structure"]
 "#;
 
@@ -4577,8 +4647,8 @@ fn prompt_list_lines(config_path: &std::path::Path) -> Result<Vec<String>, BoxEr
     let mut by_id: std::collections::BTreeMap<PromptId, Option<String>> =
         std::collections::BTreeMap::new();
     for p in &prompts {
-        let id =
-            PromptId::parse(p.id.clone()).map_err(|_| format!("prompt id {:?} is invalid", p.id))?;
+        let id = PromptId::parse(p.id.clone())
+            .map_err(|_| format!("prompt id {:?} is invalid", p.id))?;
         if by_id.insert(id, p.description.clone()).is_some() {
             return Err(format!("duplicate prompt id {:?}", p.id).into());
         }
@@ -4629,7 +4699,9 @@ fn prompt_cmd(args: &[String]) -> Result<(), BoxError> {
         return Ok(());
     }
     if args.iter().any(|a| a == "--resolved") {
-        return Err(format!("prompt: --resolved is reserved for a later release\n{PROMPT_USAGE}").into());
+        return Err(
+            format!("prompt: --resolved is reserved for a later release\n{PROMPT_USAGE}").into(),
+        );
     }
     let mut config = std::path::PathBuf::from(CONFIG_PATH);
     let mut positional: Vec<&String> = Vec::new();
@@ -4637,10 +4709,7 @@ fn prompt_cmd(args: &[String]) -> Result<(), BoxError> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--config" => {
-                config = it
-                    .next()
-                    .ok_or("prompt: --config requires a value")?
-                    .into();
+                config = it.next().ok_or("prompt: --config requires a value")?.into();
             }
             s if s.starts_with("--") => {
                 return Err(format!("prompt: unknown flag {a:?}\n{PROMPT_USAGE}").into())
@@ -5892,6 +5961,44 @@ cmd = "true"
     }
 
     #[test]
+    fn init_scaffold_resolves_named_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        init_cmd(&[
+            "--dir".into(),
+            d.into(),
+            "--agents".into(),
+            "codex,claude".into(),
+        ])
+        .unwrap();
+        let cfg = dir.path().join("a2a-bridge.toml");
+        let lines = prompt_list_lines(&cfg).unwrap();
+        assert!(
+            !lines.is_empty(),
+            "init should scaffold at least one named prompt"
+        );
+        let raw = std::fs::read_to_string(&cfg).unwrap();
+        assert!(raw.contains("[[prompts]]") && raw.contains("prompt = \""));
+        let workflows = toml::from_str::<config::RegistryConfig>(&raw)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap();
+        let workflow_id = bridge_core::ids::WorkflowId::parse("code-review").unwrap();
+        let node_id = bridge_core::ids::NodeId::parse("correctness").unwrap();
+        let node = workflows
+            .get(&workflow_id)
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == node_id)
+            .unwrap();
+        assert_eq!(
+            node.prompt_template,
+            include_str!("../../../prompts/review-correctness.md")
+        );
+    }
+
+    #[test]
     fn init_clobber_guard_and_force_and_unknown_agent() {
         let dir = std::env::temp_dir().join(format!("a2a-init-test-force-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6063,13 +6170,20 @@ id = "empty"
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("a2a-bridge.toml");
         // `file` points at a MISSING file — `list` must still work (no read).
-        std::fs::write(&cfg, "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+        std::fs::write(
+            &cfg,
+            "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
             [[prompts]]\nid=\"zeta\"\nfile=\"missing.md\"\ndescription=\"z\"\n\
-            [[prompts]]\nid=\"alpha\"\ntext=\"hi\"\n[server]\naddr=\"127.0.0.1:8080\"\n").unwrap();
+            [[prompts]]\nid=\"alpha\"\ntext=\"hi\"\n[server]\naddr=\"127.0.0.1:8080\"\n",
+        )
+        .unwrap();
         let out = super::prompt_list_lines(&cfg).unwrap();
         assert_eq!(
             out,
-            vec!["alpha — (no description)".to_string(), "zeta — z".to_string()]
+            vec![
+                "alpha — (no description)".to_string(),
+                "zeta — z".to_string()
+            ]
         );
     }
 
@@ -6078,12 +6192,21 @@ id = "empty"
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("r.md"), "REVIEW {{input}}\n").unwrap();
         let cfg = dir.path().join("a2a-bridge.toml");
-        std::fs::write(&cfg, "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+        std::fs::write(
+            &cfg,
+            "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
             [[prompts]]\nid=\"rev\"\nfile=\"r.md\"\n[[prompts]]\nid=\"s\"\ntext=\"hi\"\n\
-            [server]\naddr=\"127.0.0.1:8080\"\n").unwrap();
-        assert_eq!(super::prompt_show_text(&cfg, "rev").unwrap(), "REVIEW {{input}}\n");
+            [server]\naddr=\"127.0.0.1:8080\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::prompt_show_text(&cfg, "rev").unwrap(),
+            "REVIEW {{input}}\n"
+        );
         assert_eq!(super::prompt_show_text(&cfg, "s").unwrap(), "hi");
-        let err = super::prompt_show_text(&cfg, "ghost").unwrap_err().to_string();
+        let err = super::prompt_show_text(&cfg, "ghost")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("ghost") && err.contains("rev")); // unknown + available ids
     }
 

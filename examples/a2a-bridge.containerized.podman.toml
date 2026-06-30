@@ -291,7 +291,19 @@ base_url    = "https://ollama.com/v1"
 api_key_env = "OLLAMA_API_KEY"
 model       = "qwen3-coder:480b"
 
+[[prompts]]
+id = "review-implement"
+file = "../prompts/review-implement.md"
+description = "shared implement-review prompt"
+
+[[prompts]]
+id = "smoke-reply"
+file = "../prompts/smoke-reply.md"
+description = "one-line smoke reply prompt"
+
 # ── Review/design workflows (single-pass here; Phase D restructures design/spec/plan into two-pass) ──
+# E8a migrates duplicated shared prompts first. Remaining prompt_file nodes stay file-backed until the
+# broader E8b registry/partial migration.
 [[workflows]]
 id = "code-review"
 [[workflows.nodes]]
@@ -317,12 +329,12 @@ id = "implement-review"
 [[workflows.nodes]]
 id = "reviewer_codex"
 agent = "codex"
-prompt_file = "../prompts/review-implement.md"
+prompt = "review-implement"
 inputs = []
 [[workflows.nodes]]
 id = "reviewer_claude"
 agent = "claude"
-prompt_file = "../prompts/review-implement.md"
+prompt = "review-implement"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
@@ -337,7 +349,7 @@ id = "implement-review-light"
 [[workflows.nodes]]
 id = "reviewer"
 agent = "codex"
-prompt_file = "../prompts/review-implement.md"
+prompt = "review-implement"
 inputs = []
 [[workflows.nodes]]
 id = "synth"
@@ -352,12 +364,12 @@ id = "implement-review-thorough"
 [[workflows.nodes]]
 id = "reviewer_codex_draft"
 agent = "codex"
-prompt_file = "../prompts/review-implement.md"
+prompt = "review-implement"
 inputs = []
 [[workflows.nodes]]
 id = "reviewer_claude_draft"
 agent = "claude"
-prompt_file = "../prompts/review-implement.md"
+prompt = "review-implement"
 inputs = []
 [[workflows.nodes]]
 id = "reviewer_codex"
@@ -531,7 +543,7 @@ id = "smoke-ollama"
 [[workflows.nodes]]
 id = "go"
 agent = "ollama"
-prompt_file = "../prompts/smoke-reply.md"
+prompt = "smoke-reply"
 inputs = []
 
 [[workflows]]
@@ -539,5 +551,5 @@ id = "smoke-ollama-cloud"
 [[workflows.nodes]]
 id = "go"
 agent = "ollama-cloud"
-prompt_file = "../prompts/smoke-reply.md"
+prompt = "smoke-reply"
 inputs = []
