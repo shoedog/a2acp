@@ -9,9 +9,9 @@
 //     -> Translator.run(backend, ...)    (drive the AgentBackend, anti-corruption)
 //     -> events streamed back            (SSE for streaming; collected for unary)
 //
-// The streaming method guarantees a final flush: the translator emits the
-// Artifact event last, and we forward events in order, so the terminal SSE
-// frame is always the artifact.
+// The streaming method forwards translated events in order and appends a
+// terminal status frame on clean completion. The Artifact is the final output
+// frame before that terminal StatusUpdate.
 //
 // We hand-roll the server on axum 0.7 rather than adopting `a2a-server-lf`
 // (see docs/adr/0003-a2a-sdk.md): that crate requires axum 0.8 and inverts
@@ -4446,7 +4446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_preserves_order_final_is_artifact() {
+    async fn streaming_preserves_order_artifact_before_terminal_status() {
         let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
         let resp = router(srv)
             .oneshot(post_request(
