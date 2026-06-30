@@ -360,26 +360,19 @@ impl Coordinator {
             return Err(e.clone());
         }
         let events: Vec<Event> = collected.into_iter().filter_map(Result::ok).collect();
-        // The full reply is the coalesced Status chunks: the translator OVERWRITES `last_text` per
-        // `Update::Text`, so the terminal Artifact event carries only the LAST delta — a truncation on
-        // delta-streaming agents (codex-acp streams "OAK","LE","AF" → Artifact="AF"). Joining the Status
-        // chunks reconstructs the complete text; fall back to the Artifact for a turn with no streamed
-        // text (e.g. a stop_reason-only Done). This is the MCP surface only — the A2A unary path keeps
-        // its own (artifact + status_chunks) wire shape unchanged.
-        let status_text: String = events
+        let out_text = if let Some(artifact_text) = events
             .iter()
-            .filter(|e| e.kind() == &EventKind::Status)
-            .map(|e| e.text())
-            .collect();
-        let out_text = if status_text.is_empty() {
+            .rev()
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .map(|e| e.text().to_string())
+        {
+            artifact_text
+        } else {
             events
                 .iter()
-                .rev()
-                .find(|e| e.kind() == &EventKind::Artifact)
-                .map(|e| e.text().to_string())
-                .unwrap_or_default()
-        } else {
-            status_text
+                .filter(|e| e.kind() == &EventKind::Status)
+                .map(|e| e.text())
+                .collect()
         };
         let stop_reason = match events.iter().rev().find_map(|e| e.outcome()) {
             Some(TaskOutcome::Canceled) => "cancelled",
@@ -737,8 +730,8 @@ mod tests {
         }
     }
 
-    /// Emits each string as a SEPARATE `Update::Text` delta (then Done) — models a streaming agent
-    /// like codex-acp, where the translator's Artifact carries only the last delta.
+    /// Emits each string as a separate `Update::Text` delta, then Done. This models a
+    /// streaming agent; the translator accumulates these deltas into the final Artifact.
     struct DeltaBackend {
         deltas: Vec<String>,
     }
@@ -758,6 +751,32 @@ mod tests {
             updates.push(Ok(Update::Done {
                 stop_reason: "end_turn".into(),
             }));
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    /// Emits text deltas without a terminal Done. The translator flushes these as Status
+    /// events only, so coordinator text collection must fall back when no Artifact exists.
+    struct NoDoneBackend {
+        deltas: Vec<String>,
+    }
+
+    #[async_trait]
+    impl AgentBackend for NoDoneBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates: Vec<Result<Update, BridgeError>> = self
+                .deltas
+                .iter()
+                .map(|d| Ok(Update::Text(d.clone())))
+                .collect();
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
 
@@ -1231,10 +1250,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_reconstructs_full_text_from_streamed_chunks() {
+    async fn prompt_returns_full_text_from_streamed_chunks() {
         // s8 T10 live-gate: a delta-streaming agent (Text "OAK","LE","AF") must yield the FULL reply,
-        // NOT the last delta. The translator's terminal Artifact = last_text = "AF"; the full text lives
-        // in the coalesced Status chunks, which `collect_turn` joins.
+        // NOT the last delta. The translator's terminal Artifact carries the full text, which
+        // `collect_turn` consumes directly.
         let backend = Arc::new(DeltaBackend {
             deltas: vec!["OAK".into(), "LE".into(), "AF".into()],
         });
@@ -1248,6 +1267,24 @@ mod tests {
 
         let out = coordinator.prompt(prompt_params("hi")).await.unwrap();
         assert_eq!(out.text, "OAKLEAF");
+    }
+
+    #[tokio::test]
+    async fn prompt_falls_back_to_status_text_when_stream_ends_without_done() {
+        let backend = Arc::new(NoDoneBackend {
+            deltas: vec!["OAK".into(), "LEAF".into()],
+        });
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend,
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let coordinator = coordinator_fixture_with_registry(registry, clock);
+
+        let out = coordinator.prompt(prompt_params("hi")).await.unwrap();
+        assert_eq!(out.text, "OAKLEAF");
+        assert_eq!(out.stop_reason, "completed");
     }
 
     #[tokio::test]

@@ -9,9 +9,9 @@
 //     -> Translator.run(backend, ...)    (drive the AgentBackend, anti-corruption)
 //     -> events streamed back            (SSE for streaming; collected for unary)
 //
-// The streaming method guarantees a final flush: the translator emits the
-// Artifact event last, and we forward events in order, so the terminal SSE
-// frame is always the artifact.
+// The streaming method forwards translated events in order and appends a
+// terminal status frame on clean completion. The Artifact is the final output
+// frame before that terminal StatusUpdate.
 //
 // We hand-roll the server on axum 0.7 rather than adopting `a2a-server-lf`
 // (see docs/adr/0003-a2a-sdk.md): that crate requires axum 0.8 and inverts
@@ -4035,6 +4035,40 @@ mod tests {
         }
     }
 
+    struct MultiChunkBackend {
+        deltas: Vec<String>,
+        stop_reason: String,
+    }
+    impl MultiChunkBackend {
+        fn new(deltas: Vec<&str>, stop_reason: &str) -> Arc<Self> {
+            Arc::new(Self {
+                deltas: deltas.into_iter().map(str::to_owned).collect(),
+                stop_reason: stop_reason.to_owned(),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for MultiChunkBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let mut updates: Vec<Result<Update, BridgeError>> = self
+                .deltas
+                .iter()
+                .map(|delta| Ok(Update::Text(delta.clone())))
+                .collect();
+            updates.push(Ok(Update::Done {
+                stop_reason: self.stop_reason.clone(),
+            }));
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
     /// Backend that panics if prompt is ever called — proves gating short-circuits.
     struct PanicBackend;
     #[async_trait::async_trait]
@@ -4326,6 +4360,16 @@ mod tests {
             .collect()
     }
 
+    fn artifact_text_from_stream_response(sr: &a2a::StreamResponse) -> Option<String> {
+        match sr {
+            a2a::StreamResponse::ArtifactUpdate(e) => {
+                let data = serde_json::to_value(&e.artifact).unwrap();
+                data["parts"][0]["text"].as_str().map(str::to_owned)
+            }
+            _ => None,
+        }
+    }
+
     #[tokio::test]
     async fn streaming_message_yields_artifact_event() {
         let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
@@ -4376,7 +4420,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_preserves_order_final_is_artifact() {
+    async fn streaming_message_yields_full_multichunk_artifact() {
+        let srv = build(
+            MultiChunkBackend::new(vec!["FOO", "BAR"], "end_turn"),
+            Arc::new(AlwaysGrant),
+        );
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let payloads = sse_data_payloads(&body);
+        assert!(!payloads.is_empty(), "no data payloads in SSE body: {body}");
+        let artifact_texts: Vec<String> = payloads
+            .iter()
+            .filter_map(|p| serde_json::from_str::<a2a::StreamResponse>(p).ok())
+            .filter_map(|sr| artifact_text_from_stream_response(&sr))
+            .collect();
+        assert_eq!(artifact_texts, vec!["FOOBAR"], "SSE body: {body}");
+    }
+
+    #[tokio::test]
+    async fn streaming_preserves_order_artifact_before_terminal_status() {
         let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
         let resp = router(srv)
             .oneshot(post_request(
@@ -4482,6 +4552,27 @@ mod tests {
     async fn unary_cancelled_done_returns_canceled_state() {
         // The unary local path must report TASK_STATE_CANCELED for a cancelled turn.
         let srv = build(Arc::new(CancelledBackend), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_CANCELED");
+        assert_eq!(v["result"]["artifact"]["text"], "PARTIAL");
+    }
+
+    #[tokio::test]
+    async fn unary_cancelled_done_returns_full_partial_artifact() {
+        let srv = build(
+            MultiChunkBackend::new(vec!["PAR", "TIAL"], STOP_REASON_CANCELLED),
+            Arc::new(AlwaysGrant),
+        );
         let resp = router(srv)
             .oneshot(post_request(
                 methods::SEND_MESSAGE,
@@ -4620,6 +4711,30 @@ mod tests {
         let body = body_string(resp).await;
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["result"]["artifact"]["text"], "PONG");
+    }
+
+    #[tokio::test]
+    async fn unary_send_message_returns_full_multichunk_artifact() {
+        let srv = build(
+            MultiChunkBackend::new(vec!["AL", "PHA"], "end_turn"),
+            Arc::new(AlwaysGrant),
+        );
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["artifact"]["text"], "ALPHA");
+        assert!(
+            v["result"].get("artifacts").is_none(),
+            "single-source unary shape must remain unchanged: {body}"
+        );
     }
 
     #[tokio::test]
@@ -5467,6 +5582,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unary_fanout_kiro_artifact_carries_full_multichunk_text() {
+        let deleg = FakeDelegation::new(vec![Ok(Event::artifact("PA"))], Some("p1"));
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let srv = build_fanout(
+            MultiChunkBackend::new(vec!["K", "A"], "end_turn"),
+            store,
+            deleg,
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("unary fanout response must be valid JSON: {e}: {body}"));
+        assert!(v.get("error").is_none(), "expected no error: {body}");
+        assert_eq!(v["result"]["status"]["state"], "TASK_STATE_COMPLETED");
+        let artifacts = v["result"]["artifacts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("result.artifacts must be an array: {body}"));
+        let kiro_art = artifacts
+            .iter()
+            .find(|a| a["name"] == "kiro")
+            .unwrap_or_else(|| panic!("must have kiro artifact: {body}"));
+        assert_eq!(
+            kiro_art["parts"][0]["text"].as_str().unwrap_or(""),
+            "KA",
+            "kiro artifact text must be the full multi-delta text: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn unary_single_source_response_unchanged() {
         // Regression: plain (non-fanout) unary SendMessage still returns the legacy shape.
         // The existing unary_send_message_returns_artifact test expects result.artifact.text == "PONG".
@@ -5490,7 +5639,7 @@ mod tests {
         // Must NOT have result.artifacts (that's only the fan-out shape).
         // In the legacy shape, result has "task" (with id+state), "artifact" (with text), "status".
         assert!(
-            v["result"]["artifacts"].is_null(),
+            v["result"].get("artifacts").is_none(),
             "single-source must not have result.artifacts (fan-out only): {body}"
         );
     }

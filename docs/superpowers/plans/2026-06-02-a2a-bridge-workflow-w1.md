@@ -10,7 +10,7 @@
 
 **Conventions (project standing rules):** subagent task commits do **NOT** add a `Co-Authored-By` trailer (only the ADR commit does, Task 11). Coverage measured **after** `cargo llvm-cov clean --workspace`. `~/code/a2a-local-bridge` is firewall-black-box. Every task ends green: `cargo build`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`, `cargo test` (touched crate).
 
-**Plan status — folds the spec's rev2 corrections + the PLAN dual review (Codex + Claude):** the executor does NOT reuse `Translator::run` (its artifact is `last_text` → would drop content); cancellation is explicit (`backend.cancel` per in-flight node, not stream-drop); workflows load-once; triggers streaming-only. **Plan-rev2 fixes folded:** valid one-key-per-line TOML (the `;`-separated form is illegal TOML); boot-time agent-resolvability check + fail-loud tests (DoD-5/9); UTF-8-safe single-pass template (not `byte as char`); full `spawn_workflow_producer` code + concrete cancel via an `InboundServer` `workflow_cancels: HashMap<TaskId, CancellationToken>` + a `cancel_task` arm; the `RouteTarget` ripple is only 2 match sites (`:454`/`:1042`) — the real ripple is the `.with_workflows` builder (avoids the `new` call-site break) + the `agent_card` signature; early-cancel before scheduling/resolve; session id `workflow-{wf}-{node}-{run_id}`. Reviewers verified non-issues: `tokio-util` `CancellationToken` compiles as-is; the executor `join_all`/borrow design is sound; both exhaustive `RouteTarget` matches are the only ones.
+**Plan status — folds the spec's rev2 corrections + the PLAN dual review (Codex + Claude):** the executor does NOT reuse `Translator::run` (workflow node output is direct `Update::Text` concatenation, separate from A2A artifact framing); cancellation is explicit (`backend.cancel` per in-flight node, not stream-drop); workflows load-once; triggers streaming-only. **Plan-rev2 fixes folded:** valid one-key-per-line TOML (the `;`-separated form is illegal TOML); boot-time agent-resolvability check + fail-loud tests (DoD-5/9); UTF-8-safe single-pass template (not `byte as char`); full `spawn_workflow_producer` code + concrete cancel via an `InboundServer` `workflow_cancels: HashMap<TaskId, CancellationToken>` + a `cancel_task` arm; the `RouteTarget` ripple is only 2 match sites (`:454`/`:1042`) — the real ripple is the `.with_workflows` builder (avoids the `new` call-site break) + the `agent_card` signature; early-cancel before scheduling/resolve; session id `workflow-{wf}-{node}-{run_id}`. Reviewers verified non-issues: `tokio-util` `CancellationToken` compiles as-is; the executor `join_all`/borrow design is sound; both exhaustive `RouteTarget` matches are the only ones.
 
 ---
 
@@ -426,7 +426,7 @@ mod tests {
 - [ ] **Step 3: Implement.** Replace `// placeholder` in `executor.rs`:
 ```rust
 //! WorkflowExecutor — runs a validated DAG over the registry. Each node: configure_session
-//! → prompt → concatenate Update::Text (NOT the translator's last_text). Cancel via token.
+//! → prompt → concatenate Update::Text into the node output. Cancel via token.
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::template::render;
 use bridge_core::domain::{effective_config, Part};
@@ -1009,7 +1009,7 @@ cargo llvm-cov --workspace --fail-under-lines 85
 ```
 If `bridge-workflow` < 90, add deterministic executor tests for the uncovered arms (the gated live test adds no coverage).
 
-- [ ] **Step 3: ADR-0009** — create `docs/adr/0009-workflow-orchestration.md`: the workflow-DAG capability (chain-of-brains, ADR-0008 re-trigger #5 first build), the rev2 design corrections (Translator NOT reused — `last_text` would drop content; cancellation explicit; load-once; streaming-only), and that this is W1 of the self-hosting program (W2-4 deferred). **Controller doc — trailer REQUIRED.**
+- [ ] **Step 3: ADR-0009** — create `docs/adr/0009-workflow-orchestration.md`: the workflow-DAG capability (chain-of-brains, ADR-0008 re-trigger #5 first build), the rev2 design corrections (Translator NOT reused for workflow node output; cancellation explicit; load-once; streaming-only), and that this is W1 of the self-hosting program (W2-4 deferred). **Controller doc — trailer REQUIRED.**
 
 - [ ] **Step 4: Full sweep:** `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
 
