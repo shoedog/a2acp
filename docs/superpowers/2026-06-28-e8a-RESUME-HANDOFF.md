@@ -10,24 +10,76 @@
 
 ---
 
-## 0. The blocker that stopped us (likely gone after reboot)
+## 0. The blocker that stopped us — DIAGNOSED (root cause + remediation ladder)
 
-`syspolicyd` pinned 30–40% CPU and `rustc` blocked at ~0% CPU on the FINAL `a2a_bridge` codegen/link
-(progress stuck at `303/304` build, `319/326` test). The same crate compiled + linked + ran 288 tests fine
-~50 min earlier in the SAME session, so it's environmental — almost certainly a silent background
-macOS security-data update (XProtect/notarization cache) that triggered a re-assessment storm.
+**Symptom:** `rustc` freezes FOREVER at the codegen→link boundary of the FINAL `a2a_bridge` unit
+(`rustc` cputime crawls then sticks at a fixed value = **0% CPU = blocked on a syscall**, NOT computing;
+build sticks at `303/304`, test at `319/326`). `syspolicyd` (PID-of-the-boot) spikes to **30–40% CPU**
+during the build and has burned **156 min cumulative CPU** this boot.
 
-**Tried, did NOT fix:** killing `syspolicyd` (auto-respawns, build re-triggers it); `spctl developer-mode
-enable-terminal` (per-terminal scope doesn't reach codegen/link assessment, and we run under tmux anyway).
-**Not yet tried at interruption:** `sudo spctl --master-disable` (global), and a **reboot** (the clean fix —
-restarts syspolicyd/amfid fresh + lets the security-data update settle).
+**ROOT CAUSE (confirmed 2026-06-29):** the macOS **exec-assessment database is wedged.**
+`/var/db/SystemPolicyConfiguration/ExecPolicy` is a SQLite db (proof: `ExecPolicy-wal` / `ExecPolicy-shm`
+sidecars) that syspolicyd hits on the **first execution of every newly-built executable**. Its **WAL is
+runaway and never checkpoints** — observed growing **4.1 MB → 5.9 MB with NO build running** (stuck at /
+past SQLite's 1000-page auto-checkpoint threshold; a long-lived reader is blocking the checkpoint). Every
+`cargo build` spawns dozens of fresh executables (build scripts, proc-macro dylibs, the **linker**) → each
+first-exec thrashes the wedged db → the linker `execve` blocks → rustc freezes.
+- **Survives reboot** because the WAL is on-disk and isn't cleanly checkpointed at shutdown (user rebooted
+  twice — did NOT clear it). This is why "just reboot" is WRONG.
+- **NOT an XProtect issue:** XProtect is current + healthy (bundle `5347`, installed 2026-06-03, scans
+  enabled). Ruled out.
+- **Was fine earlier same session** (288 tests ran ~50 min before) → the WAL wedged mid-session.
 
-**On resume:** a reboot almost certainly cleared it. Just build (below). If it hangs AGAIN at the final
-`a2a_bridge` unit: in a real terminal `sudo spctl --master-disable`, build, then `sudo spctl --master-enable`.
+**Why the obvious fix is blocked:** the targeted fix is to move the `ExecPolicy*` trio aside so syspolicyd
+rebuilds a fresh db — but `/var/db/SystemPolicyConfiguration/` is **SIP-protected** (`restricted` flag +
+`csrutil status: enabled`), so **`sudo mv` fails with `Operation not permitted`.** Can't touch it while
+SIP is on.
+
+**FIX IN PROGRESS (2026-06-29):** installing **macOS 26.5.2** (was on 26.5.1 `25F80`; `26.5.2-25F84` was
+pending). The OS updater rebuilds SIP-protected security dbs on a blessed path + reinitializes the security
+subsystem on a fresh boot → should clear the wedged WAL. **If this handoff is being read, the update may NOT
+have cleared it — work the ladder below.**
+
+### Remediation ladder (do in order; stop when a build links without freezing)
+
+1. **Re-confirm state after the update.** A build is unblocked iff syspolicyd stays low during compile AND
+   the WAL is small:
+   ```
+   ls -laO /var/db/SystemPolicyConfiguration/ExecPolicy*      # ExecPolicy-wal should be SMALL or absent
+   ps aux | grep '[s]yspolicyd' | awk '{print $3"%", $10}'    # cumulative TIME reset on fresh boot
+   ```
+   Then try the build (§2). If it links → blocker gone, proceed with E8a. If it freezes again at the final
+   `a2a_bridge` unit (rustc cputime sticks at a fixed value, 0% CPU) → the WAL is still wedged; continue.
+
+2. **Recovery-mode reset (guaranteed, targeted — needs the user; ~4 reboots).** This removes the SIP block:
+   - Shut down. On Apple Silicon: hold the **power button** until "Loading startup options" → **Options** →
+     Continue → pick admin user + password.
+   - **Utilities → Terminal:** `csrutil disable` → `reboot`.
+   - Back in macOS, real terminal:
+     ```
+     sudo mv /var/db/SystemPolicyConfiguration/ExecPolicy{,.bak}
+     sudo mv /var/db/SystemPolicyConfiguration/ExecPolicy-wal{,.bak}
+     sudo mv /var/db/SystemPolicyConfiguration/ExecPolicy-shm{,.bak}
+     sudo reboot
+     ```
+     (move ALL THREE together — leaving an orphan `-wal` corrupts the rebuild; moving aside is reversible.)
+   - syspolicyd rebuilds a fresh empty `ExecPolicy` on boot. Verify build links.
+   - Re-secure: boot to Recovery again → Terminal → `csrutil enable` → `reboot`. (Leaving SIP off is a
+     security regression — re-enable once builds are confirmed healthy.)
+
+3. **Last-resort to SHIP TODAY (NON-durable, uncertain).** `sudo spctl --master-disable` (on macOS 26 it
+   also needs System Settings → Privacy & Security → "Allow applications from: **Anywhere**", which only
+   appears after running the command). **Caveat:** `spctl` governs **quarantine-based Gatekeeper**, which is
+   a DIFFERENT mechanism than the ExecPolicy exec-assessment that's actually wedged — it may NOT unblock the
+   build. Try it only if Recovery isn't available; `sudo spctl --master-enable` immediately after.
+
+**The deeper "why now":** likely a background security-data update mid-session left a long-lived reader on
+the ExecPolicy db, blocking WAL checkpoint; the WAL then grew unbounded and every exec-assessment degraded.
 
 **Separately — this machine OOM-stalls parallel `cargo`:** always build/test/clippy the bin crate with
-**`-j 1`** (one rustc ≈ 800 MB; parallel rustc exhaust swap → all stall at 0% CPU in `S` state). See E7's
-gotcha. Reserve `-j 2` for small crates only.
+**`-j 1`** (one rustc ≈ 800 MB; parallel rustc exhaust swap → all stall at 0% CPU in `S` state — a DIFFERENT
+failure than the syspolicyd freeze above, same 0%-CPU symptom). See E7's gotcha. Reserve `-j 2` for small
+crates only.
 
 ---
 
