@@ -516,6 +516,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_output_keeps_full_artifact_and_caps_status_chunks() {
+        // A single large delta (3001 chars) must coalesce into the 1200/1200/601
+        // chunking contract: two Status flushes while the delta is processed, plus
+        // a trailing flush of the remainder on Done. The final Artifact still
+        // carries the complete, uncapped text.
+        let expected = "x".repeat(3_001);
+        let be = FakeBackend::new(vec![
+            Ok(Update::Text(expected.clone())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ]);
+        let st = FakeStore::default();
+        let pol = AutoApprove;
+        let (t, s) = ids();
+        let evs: Vec<Event> = Translator::new()
+            .run(&be, &st, &pol, &t, &s, vec![])
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let status: Vec<&Event> = evs
+            .iter()
+            .filter(|e| e.kind() == &EventKind::Status)
+            .collect();
+        assert_eq!(status.len(), 3, "status events: {status:?}");
+        assert!(status.iter().all(|e| e.text_len() <= 1200));
+        let joined: String = status.iter().map(|e| e.text()).collect();
+        assert_eq!(joined, expected);
+
+        let artifact = evs
+            .iter()
+            .rev()
+            .find(|e| e.kind() == &EventKind::Artifact)
+            .expect("artifact event");
+        assert_eq!(artifact.text(), expected);
+    }
+
+    #[tokio::test]
     async fn interactive_permission_suspends_and_persists_pending() {
         let be = FakeBackend::new(vec![Ok(Update::Permission(PermissionRequest::with_id(
             "r1", true,

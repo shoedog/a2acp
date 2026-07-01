@@ -2575,6 +2575,12 @@ async fn unary_message(
         return bridge_err_to_jsonrpc(id, e);
     }
     let events: Vec<Event> = collected.into_iter().filter_map(|r| r.ok()).collect();
+    // Local unary responses intentionally keep BOTH the `status` chunks and
+    // `artifact.text` (large outputs can appear twice on the wire today).
+    // `artifact.text` prefers the translator's Artifact text and only falls back
+    // to the joined Status text for local no-Artifact/no-Done streams;
+    // non-local routes retain the existing empty-string fallback when no
+    // Artifact exists.
     let status_chunks: Vec<&str> = events
         .iter()
         .filter(|e| e.kind() == &EventKind::Status)
@@ -4768,6 +4774,53 @@ mod tests {
         let body = body_string(resp).await;
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["result"]["artifact"]["text"], "ALPHA");
+        assert!(
+            v["result"].get("artifacts").is_none(),
+            "single-source unary shape must remain unchanged: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_send_message_large_output_preserves_artifact_and_status_chunks() {
+        // Local unary responses intentionally carry a large output TWICE today:
+        // once as the full `artifact.text` and once split across `status` chunks
+        // capped at 1200 chars each. This duplication is accepted for today's
+        // unary response shape (no public shape change in this slice).
+        let expected = "x".repeat(3_001);
+        let srv = build(
+            MultiChunkBackend::new(vec![expected.as_str()], "end_turn"),
+            Arc::new(AlwaysGrant),
+        );
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("error").is_none(), "expected no error: {body}");
+        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_COMPLETED");
+        assert!(v["result"]["task"]["id"].is_string());
+        assert_eq!(v["result"]["artifact"]["text"], expected);
+        let status = v["result"]["status"]
+            .as_array()
+            .expect("status array")
+            .clone();
+        assert_eq!(status.len(), 3, "status chunks: {status:?}");
+        let joined: String = status
+            .iter()
+            .map(|c| c.as_str().expect("status chunk is a string"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            status.iter().all(|c| c.as_str().unwrap().len() <= 1200),
+            "status chunks: {status:?}"
+        );
+        assert_eq!(joined, expected);
         assert!(
             v["result"].get("artifacts").is_none(),
             "single-source unary shape must remain unchanged: {body}"
