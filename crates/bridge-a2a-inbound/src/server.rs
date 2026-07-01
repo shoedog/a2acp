@@ -2341,6 +2341,8 @@ async fn unary_message(
         return unary_fanout_message(srv, id, routed).await;
     }
 
+    let route_was_local = matches!(&routed.target, RouteTarget::Local(_));
+
     // Collect the same event stream the streaming path produces, into one JSON
     // response. Local drives the translator; Delegate drives the delegation.
     let collected: Vec<Result<Event, BridgeError>> = match routed.target {
@@ -2573,17 +2575,23 @@ async fn unary_message(
         return bridge_err_to_jsonrpc(id, e);
     }
     let events: Vec<Event> = collected.into_iter().filter_map(|r| r.ok()).collect();
-    let artifact_text = events
-        .iter()
-        .rev()
-        .find(|e| e.kind() == &EventKind::Artifact)
-        .map(|e| e.text().to_string())
-        .unwrap_or_default();
     let status_chunks: Vec<&str> = events
         .iter()
         .filter(|e| e.kind() == &EventKind::Status)
         .map(|e| e.text())
         .collect();
+    let artifact_text = events
+        .iter()
+        .rev()
+        .find(|e| e.kind() == &EventKind::Artifact)
+        .map(|e| e.text().to_string())
+        .unwrap_or_else(|| {
+            if route_was_local {
+                status_chunks.join("")
+            } else {
+                String::new()
+            }
+        });
 
     // The terminal state is Completed unless the translator emitted a terminal
     // outcome (a cancelled local turn -> Canceled); a backend error is handled
@@ -4069,6 +4077,35 @@ mod tests {
         }
     }
 
+    struct NoDoneBackend {
+        deltas: Vec<String>,
+    }
+    impl NoDoneBackend {
+        fn new(deltas: Vec<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                deltas: deltas.into_iter().map(str::to_owned).collect(),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for NoDoneBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates: Vec<Result<Update, BridgeError>> = self
+                .deltas
+                .iter()
+                .map(|delta| Ok(Update::Text(delta.clone())))
+                .collect();
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
     /// Backend that panics if prompt is ever called — proves gating short-circuits.
     struct PanicBackend;
     #[async_trait::async_trait]
@@ -4731,6 +4768,59 @@ mod tests {
         let body = body_string(resp).await;
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["result"]["artifact"]["text"], "ALPHA");
+        assert!(
+            v["result"].get("artifacts").is_none(),
+            "single-source unary shape must remain unchanged: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_send_message_falls_back_to_status_text_without_done() {
+        let srv = build(NoDoneBackend::new(vec!["AL", "PHA"]), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("error").is_none(), "expected no error: {body}");
+        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_COMPLETED");
+        // No-Done local streams intentionally duplicate the post-coalescing Status
+        // text into artifact.text so unary callers still receive a final answer.
+        assert_eq!(v["result"]["artifact"]["text"], "ALPHA");
+        assert_eq!(v["result"]["status"], json!(["ALPHA"]));
+        assert!(
+            v["result"].get("artifacts").is_none(),
+            "single-source unary shape must remain unchanged: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_send_message_no_text_done_returns_stop_reason_as_artifact() {
+        let srv = build(
+            MultiChunkBackend::new(vec![], "ran_out_of_turns"),
+            Arc::new(AlwaysGrant),
+        );
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("error").is_none(), "expected no error: {body}");
+        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(v["result"]["artifact"]["text"], "ran_out_of_turns");
+        assert_eq!(v["result"]["status"], json!([]));
         assert!(
             v["result"].get("artifacts").is_none(),
             "single-source unary shape must remain unchanged: {body}"
@@ -5425,6 +5515,33 @@ mod tests {
             store.peer_task_for(&local).await.unwrap(),
             Some(PeerTaskId("p1".into())),
             "unary delegate must persist local->peer after draining events"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_delegate_status_only_completion_keeps_empty_artifact() {
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let deleg = FakeDelegation::new(vec![Ok(Event::status("PEER"))], Some("p1"));
+        let srv = build_delegate(FakeBackend::new(), store, deleg);
+
+        let resp = router(srv)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("error").is_none(), "expected no error: {body}");
+        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(v["result"]["artifact"]["text"], "");
+        assert_eq!(v["result"]["status"], json!(["PEER"]));
+        assert!(
+            v["result"].get("artifacts").is_none(),
+            "delegate unary shape must remain unchanged: {body}"
         );
     }
 
