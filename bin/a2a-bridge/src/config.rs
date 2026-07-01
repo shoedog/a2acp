@@ -1130,6 +1130,12 @@ impl RegistryConfig {
         for w in &self.workflows {
             let id = WorkflowId::parse(w.id.clone())
                 .map_err(|e| ConfigError::Registry(format!("workflow id {:?}: {e:?}", w.id)))?;
+            if map.contains_key(&id) {
+                return Err(ConfigError::Registry(format!(
+                    "duplicate workflow id {:?}",
+                    w.id
+                )));
+            }
             let mut nodes = Vec::with_capacity(w.nodes.len());
             for n in &w.nodes {
                 if !agent_ids.contains(n.agent.as_str()) {
@@ -3306,6 +3312,16 @@ addr="127.0.0.1:8080"
             .unwrap()
             .load_workflows(dir.path())
             .is_err());
+        let duplicate_workflow = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n1\"\nagent=\"codex\"\nprompt_text=\"one\"\ninputs=[]\n\
+            [[workflows]]\nid=\"w\"\n[[workflows.nodes]]\nid=\"n2\"\nagent=\"codex\"\nprompt_text=\"two\"\ninputs=[]\n\
+            [server]\naddr=\"127.0.0.1:8080\"\n";
+        let err = toml::from_str::<RegistryConfig>(duplicate_workflow)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate workflow id"), "{err}");
     }
 
     #[test]

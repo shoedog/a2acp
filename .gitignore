@@ -16,5 +16,10 @@
 *.db
 *.db.lock
 
+# Local agent/operator scratch
+.codex/
+examples/runs/
+prompts/runs/
+
 # Nested crate/fixture build outputs (e.g. test fixtures) — the bare /target/ above only covers the root.
 **/target/
