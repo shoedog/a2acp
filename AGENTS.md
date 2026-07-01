@@ -8,6 +8,23 @@ If you were sent here to "run a workflow / review / design through the bridge," 
 Do NOT read `bin/a2a-bridge/src/*.rs` to find the invocation — it's below, and every subcommand has
 `--help`.
 
+## 0. Where configs, prompts, and workflows live
+
+Keep this repo's `examples/` and `prompts/` for generic bridge examples. Codebase-specific workflow material
+belongs with the codebase that owns it, not in `a2a-bridge`; for example, Prism/slicing workflows should live
+under that repo, such as `tools/a2a-bridge/configs/` and `tools/a2a-bridge/prompts/`. Disposable one-off
+configs/prompts/workflows should live under `/private/tmp` or another scratch directory.
+
+Before serving or handing a config to another agent, run:
+
+```bash
+a2a-bridge validate --config /path/to/a2a-bridge.toml
+```
+
+Use `--examples-policy deny` in cleanup/CI gates when you want to reject project-specific workflow material
+under an `examples/` directory; pass the strings that identify that project with repeated
+`--project-marker` flags, for example `--project-marker code/slicing --project-marker prism-mcp`.
+
 ## 1. Build / install
 
 ```bash

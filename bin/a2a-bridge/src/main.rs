@@ -27,6 +27,7 @@
 //   a2a-bridge task watch <id> [--from <seq>] [--url <url>]
 //                                                        — stream a task's progress (SSE)
 //   a2a-bridge task-spec schema|template|input           — inspect/validate typed task-spec inputs
+//   a2a-bridge validate --config <path>                  — validate config, workflows, and prompt refs
 
 mod catalog_probe;
 mod config;
@@ -106,6 +107,8 @@ SUBCOMMANDS:
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
                       (Mode A: fast-forward --onto). [--config <f>] [--onto <branch>] [--force]
   init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
+  validate            Validate config schema, registry, workflow DAGs, and prompt refs.
+                      [--config <f>] [--examples-policy off|warn|deny] [--project-marker <text>]...
   serve               Run the A2A server.  [--config <path>]
   mcp                 Serve the MCP protocol over stdio (one stable Coordinator; A2A/CLI/MCP are thin adapters).
                       [--config <path>] [--store <path>]
@@ -120,11 +123,17 @@ Run `a2a-bridge <subcommand> --help` for details. Quickstart + cwd/creds/concurr
 
 const MCP_USAGE: &str = "\
 usage: a2a-bridge mcp [--config <path>] [--store <path>]
+                      [--examples-policy off|warn|deny] [--project-marker <text>]...
 
 Serve the MCP protocol over stdio. STDOUT is reserved for NDJSON MCP replies; tracing is written to STDERR.
 
   --config <path>  registry config (default: ./a2a-bridge.toml)
-  --store <path>   override the [store] path for this MCP process";
+  --store <path>   override the [store] path for this MCP process
+  --examples-policy off|warn|deny
+                   optional examples/ hygiene policy for project-specific workflow material
+  --project-marker <text>
+                   non-empty marker string to match when --examples-policy is warn|deny; repeatable.
+                   Passing a marker without --examples-policy implies warn.";
 
 const TASK_SPEC_USAGE: &str = "\
 usage: a2a-bridge task-spec schema [type]
@@ -147,6 +156,7 @@ enum TopSubcommand {
     Task,
     Session,
     Init,
+    Validate,
     Mcp,
     TaskSpec,
     Prompt,
@@ -168,6 +178,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("task") => TopSubcommand::Task,
         Some("session") => TopSubcommand::Session,
         Some("init") => TopSubcommand::Init,
+        Some("validate") => TopSubcommand::Validate,
         Some("mcp") => TopSubcommand::Mcp,
         Some("task-spec") => TopSubcommand::TaskSpec,
         Some("prompt") => TopSubcommand::Prompt,
@@ -559,13 +570,9 @@ fn default_worktrees_root() -> String {
     root.to_string_lossy().into_owned()
 }
 
-/// Resolve `[worktrees]` into a runtime cfg. Worktrees are opt-in, host-only, and require
-/// `allowed_cwd_root` so the decorator can self-gate before any git operation. `[worktrees]`
-/// changes require a serve restart because the spawn factory captures this config once;
-/// hot-reload does not re-read it.
-fn resolve_worktree_runtime_cfg(
+fn worktree_runtime_parts(
     cfg: &RegistryConfig,
-) -> Result<Option<WorktreeRuntimeCfg>, String> {
+) -> Result<Option<(String, bridge_core::SessionCwd)>, String> {
     let Some(w) = cfg.worktrees.as_ref().filter(|w| w.enabled) else {
         return Ok(None);
     };
@@ -578,6 +585,19 @@ fn resolve_worktree_runtime_cfg(
     let root = w.root.clone().unwrap_or_else(default_worktrees_root);
     config::preflight_worktrees_root(std::path::Path::new(&root), Some(&allowed_root))
         .map_err(|e| e.to_string())?;
+    Ok(Some((root, allowed_root)))
+}
+
+/// Resolve `[worktrees]` into a runtime cfg. Worktrees are opt-in, host-only, and require
+/// `allowed_cwd_root` so the decorator can self-gate before any git operation. `[worktrees]`
+/// changes require a serve restart because the spawn factory captures this config once;
+/// hot-reload does not re-read it.
+fn resolve_worktree_runtime_cfg(
+    cfg: &RegistryConfig,
+) -> Result<Option<WorktreeRuntimeCfg>, String> {
+    let Some((root, allowed_root)) = worktree_runtime_parts(cfg)? else {
+        return Ok(None);
+    };
     std::fs::create_dir_all(&root).map_err(|e| format!("[worktrees] root {root:?}: {e}"))?;
     Ok(Some(WorktreeRuntimeCfg {
         enabled: true,
@@ -592,6 +612,11 @@ fn batch_runtime(
     Ok(cfg.batch_config()?.map(|batch| {
         bridge_coordinator::BatchRuntime::new(batch.max_concurrent, batch.default_concurrency)
     }))
+}
+
+fn validate_worktree_runtime_cfg(cfg: &RegistryConfig) -> Result<(), String> {
+    let _ = worktree_runtime_parts(cfg)?;
+    Ok(())
 }
 
 /// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
@@ -4429,6 +4454,8 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
 
     let mut explicit_config: Option<PathBuf> = None;
     let mut store_override: Option<PathBuf> = None;
+    let mut examples_policy = None;
+    let mut project_markers = Vec::new();
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -4445,6 +4472,19 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
                 store_override = Some(PathBuf::from(
                     iter.next().ok_or("mcp: --store requires a <path>")?,
                 ));
+            }
+            "--examples-policy" => {
+                examples_policy = Some(ExamplesPolicy::parse(
+                    iter.next()
+                        .ok_or("mcp: --examples-policy requires off|warn|deny")?,
+                )?);
+            }
+            "--project-marker" => {
+                project_markers.push(
+                    iter.next()
+                        .ok_or("mcp: --project-marker requires a value")?
+                        .to_string(),
+                );
             }
             other => {
                 return Err(format!("mcp: unknown flag {other:?}\n{MCP_USAGE}").into());
@@ -4477,6 +4517,17 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
             config_path.display()
         )
     })?;
+    let examples_policy = finalize_examples_policy(examples_policy, &project_markers)?;
+    let validation = validate_config_file(
+        &config_path,
+        examples_policy,
+        &project_markers,
+        ValidationScope::Startup,
+    )
+    .map_err(|e| format!("mcp: config validation failed: {e}"))?;
+    for warning in validation.warnings {
+        eprintln!("a2a-bridge mcp: warning: {warning}");
+    }
 
     let host = bridge_core::liveness::host_id();
     let instance_id = format!("{}-{}", std::process::id(), implement::nonce(8));
@@ -4629,6 +4680,274 @@ fn read_input(path: &str) -> Result<String, BoxError> {
     } else {
         Ok(std::fs::read_to_string(path)?)
     }
+}
+
+const VALIDATE_USAGE: &str = "\
+usage: a2a-bridge validate [--config <path>] [--examples-policy off|warn|deny] [--project-marker <text>]...
+
+Validate a bridge config without spawning agents. This parses the config, eagerly resolves
+workflow prompt files and named prompts, validates workflow DAGs, builds the registry snapshot,
+and runs the registry validation gate.
+
+Examples policy: configs/prompts/workflows owned by another codebase should live in that
+codebase, or in /private/tmp for disposable local runs. Use --examples-policy deny with one
+or more --project-marker values in CI or cleanup gates to reject project-specific workflow
+material under an examples/ directory. Passing --project-marker without --examples-policy
+implies warn.
+
+Scope: validate covers config parsing, workflows, prompts, registry startup, serve/mcp startup
+sections, language profile syntax, and may run a local git root check for [worktrees]. It does
+not execute agent or container subprocesses. [implement], [review], [merge], and [verify]
+details are checked by their owning subcommands when invoked.
+";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExamplesPolicy {
+    Off,
+    Warn,
+    Deny,
+}
+
+impl ExamplesPolicy {
+    fn parse(s: &str) -> Result<Self, BoxError> {
+        match s {
+            "off" => Ok(Self::Off),
+            "warn" => Ok(Self::Warn),
+            "deny" => Ok(Self::Deny),
+            other => {
+                Err(format!("invalid --examples-policy {other:?} (expected off|warn|deny)").into())
+            }
+        }
+    }
+}
+
+fn finalize_examples_policy(
+    mode: Option<ExamplesPolicy>,
+    markers: &[String],
+) -> Result<ExamplesPolicy, BoxError> {
+    if markers.iter().any(|marker| marker.trim().is_empty()) {
+        return Err("examples policy markers must be non-empty".into());
+    }
+    match mode {
+        Some(ExamplesPolicy::Warn | ExamplesPolicy::Deny) if markers.is_empty() => Err(
+            "examples policy requires at least one --project-marker when mode is warn or deny"
+                .into(),
+        ),
+        Some(mode) => Ok(mode),
+        None if markers.is_empty() => Ok(ExamplesPolicy::Off),
+        None => Ok(ExamplesPolicy::Warn),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationScope {
+    Startup,
+    Full,
+}
+
+#[derive(Debug)]
+struct ConfigValidationReport {
+    config_path: PathBuf,
+    agent_count: usize,
+    workflow_count: usize,
+    prompt_count: usize,
+    warnings: Vec<String>,
+}
+
+#[cfg(test)]
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+fn examples_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut cursor = path.parent();
+    while let Some(dir) = cursor {
+        if dir.file_name().and_then(|s| s.to_str()) == Some("examples") {
+            return Some(dir.to_path_buf());
+        }
+        cursor = dir.parent();
+    }
+    None
+}
+
+fn contains_project_marker(text: &str, markers: &[String]) -> bool {
+    let lower = text.to_ascii_lowercase();
+    markers
+        .iter()
+        .any(|marker| lower.contains(&marker.to_ascii_lowercase()))
+}
+
+fn has_project_marker_in_examples(config_path: &Path, raw: &str, markers: &[String]) -> bool {
+    if markers.is_empty() {
+        return false;
+    }
+    let Ok(config) = std::fs::canonicalize(config_path) else {
+        return false;
+    };
+    if examples_ancestor(&config).is_none() {
+        return false;
+    }
+    contains_project_marker(raw, markers)
+}
+
+fn examples_policy_warning_for_config(config_path: &Path) -> Vec<String> {
+    let Some(examples) = examples_ancestor(config_path) else {
+        return Vec::new();
+    };
+    vec![format!(
+        "{} appears to contain project-specific workflow material under examples/ directory {}; \
+         keep owning-project configs, prompts, and workflows in that project's repo (for example \
+         tools/a2a-bridge/) or in /private/tmp for disposable local runs",
+        config_path.display(),
+        examples.display()
+    )]
+}
+
+fn validate_config_file(
+    config_path: &Path,
+    examples_policy: ExamplesPolicy,
+    project_markers: &[String],
+    scope: ValidationScope,
+) -> Result<ConfigValidationReport, BoxError> {
+    let config_path = std::fs::canonicalize(config_path)
+        .map_err(|e| format!("cannot resolve config path {}: {e}", config_path.display()))?;
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("read {}: {e}", config_path.display()))?;
+
+    let cfg = RegistryConfig::parse(&raw).map_err(|e| format!("config parse: {e}"))?;
+    let base = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let workflows = cfg
+        .load_workflows(base)
+        .map_err(|e| format!("workflow load: {e}"))?;
+    let named_prompts = config::resolve_prompt_registry(&cfg.prompts, base)
+        .map_err(|e| format!("prompt registry: {e}"))?;
+    let warnings = match examples_policy {
+        ExamplesPolicy::Off => Vec::new(),
+        ExamplesPolicy::Warn | ExamplesPolicy::Deny => {
+            let config_in_examples = examples_ancestor(&config_path).is_some();
+            let raw_match = has_project_marker_in_examples(&config_path, &raw, project_markers);
+            let workflow_prompt_match = workflows.values().any(|workflow| {
+                workflow
+                    .nodes
+                    .iter()
+                    .any(|node| contains_project_marker(&node.prompt_template, project_markers))
+            });
+            let named_prompt_match = named_prompts
+                .values()
+                .any(|prompt| contains_project_marker(&prompt.template, project_markers));
+            if config_in_examples && (raw_match || workflow_prompt_match || named_prompt_match) {
+                examples_policy_warning_for_config(&config_path)
+            } else {
+                Vec::new()
+            }
+        }
+    };
+    if examples_policy == ExamplesPolicy::Deny && !warnings.is_empty() {
+        return Err(format!("examples policy denied: {}", warnings.join("; ")).into());
+    }
+    if scope == ValidationScope::Full {
+        cfg.language_profiles()
+            .map_err(|e| format!("language profiles: {e}"))?;
+    }
+    validate_worktree_runtime_cfg(&cfg).map_err(|e| e.to_string())?;
+    batch_runtime(&cfg).map_err(|e| e.to_string())?;
+    let agent_count = cfg.agents.len();
+    let prompt_count = cfg.prompts.len();
+    let workflow_count = workflows.len();
+    let snap = cfg
+        .into_snapshot()
+        .map_err(|e| format!("registry snapshot: {e}"))?;
+
+    // Registry::new validates the snapshot without resolving any agent. Keep the validate path explicit:
+    // if this invariant changes, the no-op spawn fails instead of starting agents or containers.
+    let spawn: SpawnFn = Arc::new(|_| {
+        Box::pin(async {
+            Err(BridgeError::ConfigInvalid {
+                reason: "validate must not spawn agents".into(),
+            })
+        })
+    });
+    bridge_registry::registry::Registry::new(snap, spawn)
+        .map_err(|e| format!("registry: {}", e.client_message()))?;
+
+    Ok(ConfigValidationReport {
+        config_path,
+        agent_count,
+        workflow_count,
+        prompt_count,
+        warnings,
+    })
+}
+
+fn validate_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{VALIDATE_USAGE}");
+        return Ok(());
+    }
+    let mut config = PathBuf::from(CONFIG_PATH);
+    let mut examples_policy = None;
+    let mut project_markers = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--config" => {
+                config = it
+                    .next()
+                    .ok_or("validate: --config requires a <path>")?
+                    .into();
+            }
+            "--examples-policy" => {
+                examples_policy = Some(ExamplesPolicy::parse(
+                    it.next()
+                        .ok_or("validate: --examples-policy requires off|warn|deny")?,
+                )?);
+            }
+            "--project-marker" => {
+                project_markers.push(
+                    it.next()
+                        .ok_or("validate: --project-marker requires a value")?
+                        .to_string(),
+                );
+            }
+            other => {
+                return Err(format!("validate: unknown flag {other:?}\n{VALIDATE_USAGE}").into())
+            }
+        }
+    }
+
+    let examples_policy = finalize_examples_policy(examples_policy, &project_markers)?;
+    let report = validate_config_file(
+        &config,
+        examples_policy,
+        &project_markers,
+        ValidationScope::Full,
+    )
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.starts_with("cannot resolve config path") {
+            format!(
+                "a2a-bridge: config not found or inaccessible at {}; run `a2a-bridge init` to create one",
+                config.display()
+            )
+        } else {
+            format!("validate: {msg}")
+        }
+    })?;
+    println!("validated {}", report.config_path.display());
+    println!("agents: {}", report.agent_count);
+    println!("workflows: {}", report.workflow_count);
+    println!("named_prompts: {}", report.prompt_count);
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
 }
 
 const PROMPT_USAGE: &str = "\
@@ -4856,6 +5175,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Task => return task_cmd(&raw_args[2..]).await,
         TopSubcommand::Session => return session_cmd(&raw_args[2..]).await,
         TopSubcommand::Init => return init_cmd(&raw_args[2..]),
+        TopSubcommand::Validate => return validate_cmd(&raw_args[2..]),
         TopSubcommand::Mcp => return mcp_cmd(&raw_args[2..]).await,
         TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
         TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
@@ -4869,7 +5189,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | prompt | session | init | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | help)"
             )
             .into());
         }
@@ -4915,6 +5235,16 @@ async fn main() -> Result<(), BoxError> {
             config_path.display()
         )
     })?;
+    let validation = validate_config_file(
+        &config_path,
+        ExamplesPolicy::Off,
+        &[],
+        ValidationScope::Startup,
+    )
+    .map_err(|e| format!("serve: config validation failed: {e}"))?;
+    for warning in validation.warnings {
+        eprintln!("a2a-bridge serve: warning: {warning}");
+    }
 
     // Increment A: ONE run identity + flock lease for the serve lifetime (the lease — held until this
     // process exits — is what a future run's `classify_sweep` reads to decide we're alive). serve is
@@ -6145,6 +6475,275 @@ id = "empty"
         let _ = std::fs::remove_file(&path);
 
         assert!(super::task_spec_cmd(&["bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn validate_subcommand_is_registered_and_validates_reference_configs() {
+        let raw_args: Vec<String> = ["a2a-bridge", "validate", "--config", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            super::parse_top_subcommand(&raw_args),
+            super::TopSubcommand::Validate
+        );
+
+        let root = super::repo_root();
+        for rel in [
+            "examples/a2a-bridge.multi-agent.toml",
+            "examples/a2a-bridge.containerized.toml",
+            "examples/a2a-bridge.containerized.podman.toml",
+            "examples/a2a-bridge.workflows.toml",
+            "examples/a2a-bridge.panel.toml",
+        ] {
+            let report = super::validate_config_file(
+                &root.join(rel),
+                super::ExamplesPolicy::Off,
+                &[],
+                super::ValidationScope::Full,
+            )
+            .unwrap();
+            assert!(
+                report.workflow_count > 0,
+                "{rel} should load at least one workflow"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_startup_only_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("a2a-bridge.toml");
+        let base = "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n[server]\n";
+
+        std::fs::write(
+            &cfg,
+            format!("{base}\n[batch]\nmax_concurrent = 0\n").as_bytes(),
+        )
+        .unwrap();
+        let err = super::validate_config_file(
+            &cfg,
+            super::ExamplesPolicy::Off,
+            &[],
+            super::ValidationScope::Startup,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("[batch] max_concurrent"),
+            "batch validation should match serve/mcp startup"
+        );
+
+        std::fs::write(
+            &cfg,
+            format!("{base}\n[worktrees]\nenabled = true\n").as_bytes(),
+        )
+        .unwrap();
+        let err = super::validate_config_file(
+            &cfg,
+            super::ExamplesPolicy::Off,
+            &[],
+            super::ValidationScope::Startup,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[worktrees] enabled requires allowed_cwd_root"),
+            "worktree validation should match serve/mcp startup"
+        );
+    }
+
+    #[test]
+    fn startup_validation_skips_language_profile_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("a2a-bridge.toml");
+        std::fs::write(
+            &cfg,
+            r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[server]
+
+[[languages]]
+id = "rust"
+fetch = "cargo fetch --locked"
+warm_cache = "a2a-test-cache"
+dep_cache_path = "/cargo"
+verify_cache_path = "/verify"
+"#,
+        )
+        .unwrap();
+
+        super::validate_config_file(
+            &cfg,
+            super::ExamplesPolicy::Off,
+            &[],
+            super::ValidationScope::Startup,
+        )
+        .unwrap();
+        let err = super::validate_config_file(
+            &cfg,
+            super::ExamplesPolicy::Off,
+            &[],
+            super::ValidationScope::Full,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("language profiles"));
+    }
+
+    #[test]
+    fn examples_policy_flags_project_specific_examples() {
+        let dir = tempfile::tempdir().unwrap();
+        let examples = dir.path().join("examples");
+        std::fs::create_dir(&examples).unwrap();
+        let cfg = examples.join("project.toml");
+        std::fs::write(
+            &cfg,
+            "command = \"/Users/wesleyjinks/code/slicing/target/release/prism-mcp\"",
+        )
+        .unwrap();
+        let matched = super::has_project_marker_in_examples(
+            &cfg,
+            "command = \"/Users/wesleyjinks/code/slicing/target/release/prism-mcp\"",
+            &["code/slicing".to_string()],
+        );
+        assert!(
+            matched,
+            "examples policy should flag project-specific material in examples/"
+        );
+    }
+
+    #[test]
+    fn examples_policy_uses_runtime_examples_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let examples = dir.path().join("examples");
+        std::fs::create_dir(&examples).unwrap();
+        let cfg = examples.join("project.toml");
+        std::fs::write(&cfg, "command = \"prism-mcp\"\n").unwrap();
+        assert!(super::has_project_marker_in_examples(
+            &cfg,
+            "command = \"prism-mcp\"\n",
+            &["prism-mcp".to_string()],
+        ));
+        let warnings =
+            super::examples_policy_warning_for_config(&std::fs::canonicalize(&cfg).unwrap());
+        assert!(
+            warnings
+                .first()
+                .is_some_and(|w| w.contains(&examples.to_string_lossy().to_string())),
+            "policy warning should derive the examples root from the runtime config path"
+        );
+    }
+
+    #[test]
+    fn examples_policy_rejects_empty_markers() {
+        assert!(super::finalize_examples_policy(
+            Some(super::ExamplesPolicy::Deny),
+            &["".to_string()]
+        )
+        .is_err());
+        assert!(super::finalize_examples_policy(
+            Some(super::ExamplesPolicy::Warn),
+            &["   ".to_string()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn examples_policy_explicit_off_does_not_promote_markers() {
+        assert_eq!(
+            super::finalize_examples_policy(None, &["prism-mcp".to_string()]).unwrap(),
+            super::ExamplesPolicy::Warn
+        );
+        assert_eq!(
+            super::finalize_examples_policy(
+                Some(super::ExamplesPolicy::Off),
+                &["prism-mcp".to_string()]
+            )
+            .unwrap(),
+            super::ExamplesPolicy::Off
+        );
+    }
+
+    #[test]
+    fn examples_policy_scans_resolved_workflow_prompt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let examples = dir.path().join("examples");
+        let prompts = dir.path().join("prompts");
+        std::fs::create_dir(&examples).unwrap();
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(prompts.join("project.md"), "use prism-mcp here\n").unwrap();
+        let cfg = examples.join("project.toml");
+        std::fs::write(
+            &cfg,
+            r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[server]
+
+[[workflows]]
+id = "review"
+
+[[workflows.nodes]]
+id = "n"
+agent = "codex"
+prompt_file = "../prompts/project.md"
+"#,
+        )
+        .unwrap();
+
+        let err = super::validate_config_file(
+            &cfg,
+            super::ExamplesPolicy::Deny,
+            &["prism-mcp".to_string()],
+            super::ValidationScope::Full,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("examples policy denied"));
+    }
+
+    #[test]
+    fn examples_policy_scans_named_prompt_files_even_when_unused() {
+        let dir = tempfile::tempdir().unwrap();
+        let examples = dir.path().join("examples");
+        let prompts = dir.path().join("prompts");
+        std::fs::create_dir(&examples).unwrap();
+        std::fs::create_dir(&prompts).unwrap();
+        std::fs::write(prompts.join("named.md"), "marker: prism-mcp\n").unwrap();
+        let cfg = examples.join("project.toml");
+        std::fs::write(
+            &cfg,
+            r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[server]
+
+[[prompts]]
+id = "project"
+file = "../prompts/named.md"
+"#,
+        )
+        .unwrap();
+
+        let err = super::validate_config_file(
+            &cfg,
+            super::ExamplesPolicy::Deny,
+            &["prism-mcp".to_string()],
+            super::ValidationScope::Full,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("examples policy denied"));
     }
 
     #[test]

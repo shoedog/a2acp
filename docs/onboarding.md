@@ -141,12 +141,22 @@ a refine pass — is deferred; see the design spec.)
 
 ## Path + reload rules
 
+- Keep codebase-specific configs, prompts, and workflows in the owning project
+  repo, not in `a2a-bridge`. A typical layout is
+  `tools/a2a-bridge/configs/` and `tools/a2a-bridge/prompts/` beside that
+  project's source. Use `/private/tmp` for disposable local runs. The
+  `a2a-bridge` repo's `examples/` and `prompts/` are for generic bridge
+  exemplars.
 - Workflow `prompt_file` paths and a **relative** `[store] path` resolve relative
   to the **config file's directory** (so `serve --config /elsewhere/...` keeps
   prompts + task state beside the config, not in the launch CWD).
 - Registry agent entries **hot-reload** when you edit the config. **Workflows, the
   server addr, and the store are read once at boot** — restart `serve` to change
   them.
+- Run `a2a-bridge validate --config /path/to/a2a-bridge.toml` before handing a
+  config to `serve`, `mcp`, or another agent. Use `--examples-policy deny` with
+  repeated `--project-marker <text>` flags as a cleanup gate to reject
+  project-specific material under an `examples/` directory.
 
 ## See also
 

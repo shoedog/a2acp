@@ -143,7 +143,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "run_workflow",
-            "description": "Start a detached workflow run.",
+            "description": "Start a detached workflow run from this MCP process's config. Keep project-specific configs/prompts/workflows in the owning repo or /private/tmp; preflight with `a2a-bridge validate --config` and marker-driven `--examples-policy deny` gates when needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
