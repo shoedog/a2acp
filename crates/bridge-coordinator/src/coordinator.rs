@@ -1267,6 +1267,24 @@ mod tests {
 
         let out = coordinator.prompt(prompt_params("hi")).await.unwrap();
         assert_eq!(out.text, "OAKLEAF");
+
+        // Same contract at translator chunk-cap scale (max_chunk = 1200): a single
+        // large delta spanning multiple Status chunks must still surface as one
+        // FULL Artifact text from Coordinator::prompt, not a truncated value.
+        let expected_large = "z".repeat(3_001);
+        let large_backend = Arc::new(DeltaBackend {
+            deltas: vec![expected_large.clone()],
+        });
+        let large_registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend: large_backend,
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let large_coordinator = coordinator_fixture_with_registry(large_registry, clock);
+
+        let out = large_coordinator.prompt(prompt_params("hi")).await.unwrap();
+        assert_eq!(out.text, expected_large);
     }
 
     #[tokio::test]
