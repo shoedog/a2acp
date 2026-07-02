@@ -72,9 +72,12 @@ single-agent kiro config if the file is absent):
 Project-specific configs, prompts, and workflows should live in the owning project
 repo, not in `a2a-bridge`. Keep this repo's `examples/` and `prompts/` generic;
 use the owning repo (for example `tools/a2a-bridge/configs/` and
-`tools/a2a-bridge/prompts/`) or `/private/tmp` for local one-off runs. Preflight
-configs with `a2a-bridge validate --config /path/to/a2a-bridge.toml`; cleanup
-gates can add `--examples-policy deny --project-marker <text>`.
+`tools/a2a-bridge/prompts/`) or `/tmp` (or `/private/tmp` on macOS) for local
+one-off runs. Preflight configs with
+`a2a-bridge validate --config /path/to/a2a-bridge.toml`; run
+`cargo run -p a2a-bridge -- validate --repo-hygiene` before committing changes
+to this repo. Cleanup gates can add `--examples-policy deny --project-marker
+<text>`.
 
 ```toml
 # Top-level default agent id — required. Must match one [[agents]] entry's id.

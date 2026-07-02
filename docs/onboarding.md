@@ -144,9 +144,9 @@ a refine pass — is deferred; see the design spec.)
 - Keep codebase-specific configs, prompts, and workflows in the owning project
   repo, not in `a2a-bridge`. A typical layout is
   `tools/a2a-bridge/configs/` and `tools/a2a-bridge/prompts/` beside that
-  project's source. Use `/private/tmp` for disposable local runs. The
-  `a2a-bridge` repo's `examples/` and `prompts/` are for generic bridge
-  exemplars.
+  project's source. Use `/tmp` (or `/private/tmp` on macOS) for disposable local
+  runs. The `a2a-bridge` repo's `examples/` and `prompts/` are for generic
+  bridge exemplars.
 - Workflow `prompt_file` paths and a **relative** `[store] path` resolve relative
   to the **config file's directory** (so `serve --config /elsewhere/...` keeps
   prompts + task state beside the config, not in the launch CWD).
@@ -157,6 +157,9 @@ a refine pass — is deferred; see the design spec.)
   config to `serve`, `mcp`, or another agent. Use `--examples-policy deny` with
   repeated `--project-marker <text>` flags as a cleanup gate to reject
   project-specific material under an `examples/` directory.
+- Run `cargo run -p a2a-bridge -- validate --repo-hygiene` before committing
+  changes in this repo to catch untracked or newly committed root workflow
+  artifacts under `examples/` and `prompts/`.
 
 ## See also
 

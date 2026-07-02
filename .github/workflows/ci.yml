@@ -47,6 +47,9 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
+      - name: Workflow artifact hygiene
+        run: cargo run -p a2a-bridge -- validate --repo-hygiene
+
       - name: Coverage — workspace (≥85% line coverage)
         run: cargo llvm-cov --workspace --fail-under-lines 85
 

@@ -12,6 +12,8 @@ passes. Those belong in the owning project repo, for example:
 - `tools/a2a-bridge/prompts/`
 - `docs/agent-workflows/`
 
-Use `/private/tmp` for disposable local configs, prompts, workflow outputs, and
-review scratch material. If a prompt/config becomes broadly reusable across
-projects, reduce it to a generic exemplar before adding it to this repo.
+Use `/tmp` (or `/private/tmp` on macOS) for disposable local configs, prompts,
+workflow outputs, and review scratch material. Run
+`cargo run -p a2a-bridge -- validate --repo-hygiene` before committing changes
+to this repo. If a prompt/config becomes broadly reusable across projects,
+reduce it to a generic exemplar before adding it to this repo.
