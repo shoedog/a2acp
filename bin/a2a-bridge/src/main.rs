@@ -43,6 +43,7 @@ mod turn;
 mod tweak;
 mod verify;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +65,8 @@ use route::SkillRoute;
 
 /// Path of the on-disk registry config the bridge watches + hot-reloads.
 const CONFIG_PATH: &str = "a2a-bridge.toml";
+const DEFAULT_ARTIFACT_ALLOWLIST_PATH: &str = ".github/workflow-artifact-allowlist.txt";
+const DISPOSABLE_ARTIFACT_DEST: &str = "/tmp (or /private/tmp on macOS)";
 
 /// Built-in default config (new 3b registry schema) materialised to disk when
 /// `a2a-bridge.toml` is absent, so the `FileConfigSource` load/watch pipeline has
@@ -109,6 +112,7 @@ SUBCOMMANDS:
   init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
   validate            Validate config schema, registry, workflow DAGs, and prompt refs.
                       [--config <f>] [--examples-policy off|warn|deny] [--project-marker <text>]...
+                      or --repo-hygiene [--artifact-allowlist <path>]
   serve               Run the A2A server.  [--config <path>]
   mcp                 Serve the MCP protocol over stdio (one stable Coordinator; A2A/CLI/MCP are thin adapters).
                       [--config <path>] [--store <path>]
@@ -4684,16 +4688,26 @@ fn read_input(path: &str) -> Result<String, BoxError> {
 
 const VALIDATE_USAGE: &str = "\
 usage: a2a-bridge validate [--config <path>] [--examples-policy off|warn|deny] [--project-marker <text>]...
+       a2a-bridge validate --repo-hygiene [--artifact-allowlist <path>]
 
 Validate a bridge config without spawning agents. This parses the config, eagerly resolves
 workflow prompt files and named prompts, validates workflow DAGs, builds the registry snapshot,
 and runs the registry validation gate.
 
 Examples policy: configs/prompts/workflows owned by another codebase should live in that
-codebase, or in /private/tmp for disposable local runs. Use --examples-policy deny with one
-or more --project-marker values in CI or cleanup gates to reject project-specific workflow
-material under an examples/ directory. Passing --project-marker without --examples-policy
-implies warn.
+codebase, or in /tmp (or /private/tmp on macOS) for disposable local runs. Use
+--examples-policy deny with one or more --project-marker values in CI or cleanup gates to
+reject project-specific workflow material under an examples/ directory. Passing
+--project-marker without --examples-policy implies warn.
+
+Repo hygiene: --repo-hygiene rejects untracked root examples/*.toml and prompts/*.md,
+rejects tracked root workflow artifacts not listed in .github/workflow-artifact-allowlist.txt,
+rejects stale allowlist entries, and validates tracked root examples/*.toml configs.
+Staged but uncommitted root artifacts are treated as tracked and require an intentional allowlist
+update before commit.
+--repo-hygiene cannot be combined with --config, --examples-policy, or --project-marker.
+--artifact-allowlist is valid only with --repo-hygiene; relative paths are resolved from the
+Git repository root.
 
 Scope: validate covers config parsing, workflows, prompts, registry startup, serve/mcp startup
 sections, language profile syntax, and may run a local git root check for [worktrees]. It does
@@ -4754,6 +4768,26 @@ struct ConfigValidationReport {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ValidateMode {
+    Config {
+        config: PathBuf,
+        examples_policy: ExamplesPolicy,
+        project_markers: Vec<String>,
+    },
+    RepoHygiene {
+        allowlist_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoHygieneReport {
+    allowlist_path: PathBuf,
+    allowlist_rel: String,
+    tracked_artifact_count: usize,
+    validated_example_config_count: usize,
+}
+
 #[cfg(test)]
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4801,7 +4835,7 @@ fn examples_policy_warning_for_config(config_path: &Path) -> Vec<String> {
     vec![format!(
         "{} appears to contain project-specific workflow material under examples/ directory {}; \
          keep owning-project configs, prompts, and workflows in that project's repo (for example \
-         tools/a2a-bridge/) or in /private/tmp for disposable local runs",
+         tools/a2a-bridge/) or in {DISPOSABLE_ARTIFACT_DEST} for disposable local runs",
         config_path.display(),
         examples.display()
     )]
@@ -4886,22 +4920,31 @@ fn validate_config_file(
     })
 }
 
-fn validate_cmd(args: &[String]) -> Result<(), BoxError> {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{VALIDATE_USAGE}");
-        return Ok(());
-    }
-    let mut config = PathBuf::from(CONFIG_PATH);
+fn parse_validate_args(args: &[String]) -> Result<ValidateMode, BoxError> {
+    let mut config = None;
+    let mut repo_hygiene = false;
+    let mut allowlist_path = None;
     let mut examples_policy = None;
     let mut project_markers = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--config" => {
-                config = it
-                    .next()
-                    .ok_or("validate: --config requires a <path>")?
-                    .into();
+                config = Some(
+                    it.next()
+                        .ok_or("validate: --config requires a <path>")?
+                        .into(),
+                );
+            }
+            "--repo-hygiene" => {
+                repo_hygiene = true;
+            }
+            "--artifact-allowlist" => {
+                allowlist_path = Some(
+                    it.next()
+                        .ok_or("validate: --artifact-allowlist requires a <path>")?
+                        .into(),
+                );
             }
             "--examples-policy" => {
                 examples_policy = Some(ExamplesPolicy::parse(
@@ -4922,32 +4965,471 @@ fn validate_cmd(args: &[String]) -> Result<(), BoxError> {
         }
     }
 
-    let examples_policy = finalize_examples_policy(examples_policy, &project_markers)?;
-    let report = validate_config_file(
-        &config,
-        examples_policy,
-        &project_markers,
-        ValidationScope::Full,
+    if repo_hygiene {
+        let mut conflicts = Vec::new();
+        if config.is_some() {
+            conflicts.push("--config");
+        }
+        if examples_policy.is_some() {
+            conflicts.push("--examples-policy");
+        }
+        if !project_markers.is_empty() {
+            conflicts.push("--project-marker");
+        }
+        if !conflicts.is_empty() {
+            return Err(format!(
+                "validate: --repo-hygiene cannot be combined with {}\n{VALIDATE_USAGE}",
+                conflicts.join(", ")
+            )
+            .into());
+        }
+        return Ok(ValidateMode::RepoHygiene { allowlist_path });
+    }
+
+    if allowlist_path.is_some() {
+        return Err(format!(
+            "validate: --artifact-allowlist requires --repo-hygiene\n{VALIDATE_USAGE}"
+        )
+        .into());
+    }
+
+    Ok(ValidateMode::Config {
+        config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
+        examples_policy: finalize_examples_policy(examples_policy, &project_markers)?,
+        project_markers,
+    })
+}
+
+fn git_output(repo_root: &Path, argv: &[&str]) -> Result<String, BoxError> {
+    // Deliberately mirrors implement::git_ok's success semantics while adapting the error type.
+    let out = implement::run_git(Some(repo_root), argv)
+        .map_err(|e| format!("git {}: {e}", argv.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            argv.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn repo_root_from_git(start_cwd: &Path) -> Result<PathBuf, BoxError> {
+    let root = git_output(start_cwd, &["rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(root))
+}
+
+fn artifact_allowlist_regeneration_command(allowlist_rel: &str) -> String {
+    format!(
+        "git ls-files ':(glob)examples/*.toml' ':(glob)prompts/*.md' | LC_ALL=C sort > {}",
+        shell_single_quote(allowlist_rel)
     )
-    .map_err(|e| {
-        let msg = e.to_string();
-        if msg.starts_with("cannot resolve config path") {
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn is_root_example_config_path(path: &str) -> bool {
+    if let Some(name) = path.strip_prefix("examples/") {
+        !name.is_empty() && !name.contains('/') && name.ends_with(".toml")
+    } else {
+        false
+    }
+}
+
+fn is_root_prompt_path(path: &str) -> bool {
+    if let Some(name) = path.strip_prefix("prompts/") {
+        !name.is_empty() && !name.contains('/') && name.ends_with(".md")
+    } else {
+        false
+    }
+}
+
+fn is_root_workflow_artifact_path(path: &str) -> bool {
+    is_root_example_config_path(path) || is_root_prompt_path(path)
+}
+
+fn parse_artifact_allowlist(raw: &str) -> Result<BTreeSet<String>, BoxError> {
+    if raw
+        .lines()
+        .next()
+        .is_some_and(|first_line| first_line.starts_with('\u{FEFF}'))
+    {
+        return Err("artifact allowlist must not start with a UTF-8 BOM".into());
+    }
+
+    let mut entries = BTreeSet::new();
+    let mut previous = None::<String>;
+    for (idx, line) in raw.lines().enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line_no = idx + 1;
+        if line.is_empty() {
+            return Err(format!("artifact allowlist contains blank line at {line_no}").into());
+        }
+        if Path::new(line).is_absolute() {
+            return Err(format!(
+                "artifact allowlist path must be relative at line {line_no}: {line:?}"
+            )
+            .into());
+        }
+        if !line.is_ascii() {
+            return Err(format!(
+                "artifact allowlist path must be ASCII at line {line_no}: {line:?}"
+            )
+            .into());
+        }
+        // Root-only by design; nested paths belong in owning projects or a follow-up policy.
+        if !is_root_workflow_artifact_path(line) {
+            return Err(format!(
+                "artifact allowlist path is outside root examples/*.toml or prompts/*.md at line {line_no}: {line:?}"
+            )
+            .into());
+        }
+        if !entries.insert(line.to_string()) {
+            return Err(format!("artifact allowlist contains duplicate entry {line:?}").into());
+        }
+        if previous.as_ref().is_some_and(|prev| line < prev.as_str()) {
+            return Err(format!(
+                "artifact allowlist is not sorted at line {line_no}: {line:?} sorts before {:?}",
+                previous.as_deref().unwrap_or("")
+            )
+            .into());
+        }
+        previous = Some(line.to_string());
+    }
+    Ok(entries)
+}
+
+fn read_artifact_allowlist(path: &Path, allowlist_rel: &str) -> Result<BTreeSet<String>, BoxError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
             format!(
-                "a2a-bridge: config not found or inaccessible at {}; run `a2a-bridge init` to create one",
-                config.display()
+                "artifact allowlist not found at {}; regenerate it from the repository root with:\n  {}",
+                path.display(),
+                artifact_allowlist_regeneration_command(allowlist_rel)
             )
         } else {
-            format!("validate: {msg}")
+            format!("read artifact allowlist {}: {e}", path.display())
         }
     })?;
-    println!("validated {}", report.config_path.display());
-    println!("agents: {}", report.agent_count);
-    println!("workflows: {}", report.workflow_count);
-    println!("named_prompts: {}", report.prompt_count);
-    for warning in &report.warnings {
-        eprintln!("warning: {warning}");
+    parse_artifact_allowlist(&raw)
+}
+
+fn repo_relative_path_string(repo_root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(repo_root).ok()?;
+    if rel.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn require_repo_relative_path_string(repo_root: &Path, path: &Path) -> Result<String, BoxError> {
+    repo_relative_path_string(repo_root, path).ok_or_else(|| {
+        format!(
+            "repo hygiene: artifact allowlist {} must live under repository root {}",
+            path.display(),
+            repo_root.display()
+        )
+        .into()
+    })
+}
+
+fn git_lines_set(output: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn tracked_root_artifacts(repo_root: &Path) -> Result<BTreeSet<String>, BoxError> {
+    let output = git_output(
+        repo_root,
+        &[
+            "ls-files",
+            "--",
+            ":(glob)examples/*.toml",
+            ":(glob)prompts/*.md",
+        ],
+    )?;
+    Ok(git_lines_set(&output))
+}
+
+fn untracked_root_artifacts(repo_root: &Path) -> Result<Vec<String>, BoxError> {
+    let output = git_output(
+        repo_root,
+        &[
+            "ls-files",
+            "--others",
+            "--",
+            ":(glob)examples/*.toml",
+            ":(glob)prompts/*.md",
+        ],
+    )?;
+    let mut artifacts: Vec<_> = output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    artifacts.sort();
+    Ok(artifacts)
+}
+
+fn ensure_allowlist_tracked(
+    repo_root: &Path,
+    allowlist_path: &Path,
+    allowlist_rel: &str,
+) -> Result<(), BoxError> {
+    if is_root_workflow_artifact_path(allowlist_rel) {
+        return Err(format!(
+            "repo hygiene: artifact allowlist path {allowlist_rel} is itself a workflow artifact; move the allowlist outside examples/ and prompts/"
+        )
+        .into());
+    }
+    let file_tracking_result =
+        git_lines_set(&git_output(repo_root, &["ls-files", "--", allowlist_rel])?);
+    if file_tracking_result.contains(allowlist_rel) {
+        return Ok(());
+    }
+    if !allowlist_path.exists() {
+        return Err(format!(
+            "artifact allowlist not found at {}; regenerate it from the repository root with:\n  {}",
+            allowlist_path.display(),
+            artifact_allowlist_regeneration_command(allowlist_rel)
+        )
+        .into());
+    }
+    Err(format!(
+        "repo hygiene: artifact allowlist {allowlist_rel} is not tracked by git; add it before relying on validate --repo-hygiene in CI"
+    )
+    .into())
+}
+
+fn ensure_allowlist_within_repo(repo_root: &Path, allowlist_path: &Path) -> Result<(), BoxError> {
+    let canonical_allowlist = match allowlist_path.canonicalize() {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "repo hygiene: resolve artifact allowlist {}: {e}",
+                allowlist_path.display()
+            )
+            .into());
+        }
+    };
+    let canonical_repo = repo_root.canonicalize().map_err(|e| {
+        format!(
+            "repo hygiene: resolve repository root {}: {e}",
+            repo_root.display()
+        )
+    })?;
+    if !canonical_allowlist.starts_with(&canonical_repo) {
+        return Err(format!(
+            "repo hygiene: artifact allowlist {} resolves outside repository root {}",
+            allowlist_path.display(),
+            repo_root.display()
+        )
+        .into());
     }
     Ok(())
+}
+
+fn unstaged_hygiene_paths(repo_root: &Path, allowlist_rel: &str) -> Result<Vec<String>, BoxError> {
+    let output = git_output(
+        repo_root,
+        &[
+            "diff",
+            "--name-only",
+            "--",
+            ":(glob)examples/*.toml",
+            ":(glob)prompts/*.md",
+            allowlist_rel,
+        ],
+    )?;
+    let mut paths: Vec<_> = output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+fn resolve_artifact_allowlist_path(repo_root: &Path, allowlist_path: Option<&Path>) -> PathBuf {
+    let path = allowlist_path.unwrap_or_else(|| Path::new(DEFAULT_ARTIFACT_ALLOWLIST_PATH));
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    }
+}
+
+fn ensure_artifact_allowlist_matches(
+    tracked: &BTreeSet<String>,
+    allowlist: &BTreeSet<String>,
+    allowlist_rel: &str,
+) -> Result<(), BoxError> {
+    let missing: Vec<_> = tracked.difference(allowlist).cloned().collect();
+    let stale: Vec<_> = allowlist.difference(tracked).cloned().collect();
+    if missing.is_empty() && stale.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg =
+        String::from("repo hygiene: tracked root workflow artifacts and allowlist differ");
+    if !missing.is_empty() {
+        msg.push_str("\ntracked artifacts missing from allowlist:");
+        for path in &missing {
+            msg.push_str(&format!("\n  {path}"));
+        }
+    }
+    if !stale.is_empty() {
+        msg.push_str("\nallowlist entries without tracked files:");
+        for path in &stale {
+            msg.push_str(&format!("\n  {path}"));
+        }
+    }
+    msg.push_str("\nmove project-owned files to their owning repo, or intentionally update the artifact allowlist from the repository root with:");
+    msg.push_str(&format!(
+        "\n  {}",
+        artifact_allowlist_regeneration_command(allowlist_rel)
+    ));
+    Err(msg.into())
+}
+
+fn validate_repo_hygiene_at(
+    repo_root: &Path,
+    allowlist_path: Option<&Path>,
+) -> Result<RepoHygieneReport, BoxError> {
+    let allowlist_path = resolve_artifact_allowlist_path(repo_root, allowlist_path);
+    let allowlist_rel = require_repo_relative_path_string(repo_root, &allowlist_path)?;
+
+    let untracked = untracked_root_artifacts(repo_root)?;
+    if !untracked.is_empty() {
+        let mut msg = format!(
+            "repo hygiene: untracked root workflow artifacts found; move generated or project-specific files to the owning project repo or {DISPOSABLE_ARTIFACT_DEST}:"
+        );
+        for path in &untracked {
+            msg.push_str(&format!("\n  {path}"));
+        }
+        return Err(msg.into());
+    }
+
+    let unstaged = unstaged_hygiene_paths(repo_root, &allowlist_rel)?;
+    if !unstaged.is_empty() {
+        let mut msg = String::from(
+            "repo hygiene: unstaged changes found in guarded workflow artifact paths; stage or revert them before running validate --repo-hygiene:",
+        );
+        for path in &unstaged {
+            msg.push_str(&format!("\n  {path}"));
+        }
+        return Err(msg.into());
+    }
+
+    let tracked = tracked_root_artifacts(repo_root)?;
+    ensure_allowlist_tracked(repo_root, &allowlist_path, &allowlist_rel)?;
+    ensure_allowlist_within_repo(repo_root, &allowlist_path)?;
+    let allowlist = read_artifact_allowlist(&allowlist_path, &allowlist_rel)?;
+    // ASCII-only artifact pathnames are an intentional repo invariant; Rust str ordering matches
+    // `LC_ALL=C sort` for the current allowlist under that invariant.
+    ensure_artifact_allowlist_matches(&tracked, &allowlist, &allowlist_rel)?;
+
+    let mut validated_example_config_count = 0;
+    let mut config_errors = Vec::new();
+    // If a root prompts/ file is deleted or renamed, tracked examples/*.toml that reference it must
+    // be updated or removed too. This validation intentionally catches stale prompt references.
+    for rel in tracked
+        .iter()
+        .filter(|path| is_root_example_config_path(path))
+    {
+        validated_example_config_count += 1;
+        let path = repo_root.join(rel);
+        if let Err(e) = validate_config_file(&path, ExamplesPolicy::Off, &[], ValidationScope::Full)
+        {
+            config_errors.push(format!("{rel}: {e}"));
+        }
+    }
+    if !config_errors.is_empty() {
+        let mut msg = String::from("repo hygiene: tracked example configs failed validation");
+        for error in &config_errors {
+            msg.push_str(&format!("\n  {error}"));
+        }
+        return Err(msg.into());
+    }
+
+    Ok(RepoHygieneReport {
+        allowlist_path,
+        allowlist_rel,
+        tracked_artifact_count: tracked.len(),
+        validated_example_config_count,
+    })
+}
+
+fn format_repo_hygiene_report(report: &RepoHygieneReport) -> String {
+    format!(
+        "repository hygiene validated\nallowlist: {}\ntracked_artifacts: {}\nvalidated_example_configs: {}\n",
+        report.allowlist_rel,
+        report.tracked_artifact_count,
+        report.validated_example_config_count
+    )
+}
+
+fn validate_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{VALIDATE_USAGE}");
+        return Ok(());
+    }
+
+    match parse_validate_args(args)? {
+        ValidateMode::Config {
+            config,
+            examples_policy,
+            project_markers,
+        } => {
+            let report = validate_config_file(
+                &config,
+                examples_policy,
+                &project_markers,
+                ValidationScope::Full,
+            )
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.starts_with("cannot resolve config path") {
+                    format!(
+                        "a2a-bridge: config not found or inaccessible at {}; run `a2a-bridge init` to create one",
+                        config.display()
+                    )
+                } else {
+                    format!("validate: {msg}")
+                }
+            })?;
+            println!("validated {}", report.config_path.display());
+            println!("agents: {}", report.agent_count);
+            println!("workflows: {}", report.workflow_count);
+            println!("named_prompts: {}", report.prompt_count);
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+            Ok(())
+        }
+        ValidateMode::RepoHygiene { allowlist_path } => {
+            let cwd = std::env::current_dir().map_err(|e| format!("validate: current dir: {e}"))?;
+            let repo_root = repo_root_from_git(&cwd).map_err(|e| format!("validate: {e}"))?;
+            let report = validate_repo_hygiene_at(&repo_root, allowlist_path.as_deref())
+                .map_err(|e| format!("validate: {e}"))?;
+            print!("{}", format_repo_hygiene_report(&report));
+            Ok(())
+        }
+    }
 }
 
 const PROMPT_USAGE: &str = "\
@@ -6508,6 +6990,373 @@ id = "empty"
                 "{rel} should load at least one workflow"
             );
         }
+    }
+
+    fn validate_repo_hygiene_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    fn validate_repo_hygiene_git(repo: &std::path::Path, args: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} should succeed"
+        );
+    }
+
+    fn validate_repo_hygiene_temp_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let td = tempfile::tempdir().unwrap();
+        let repo = td.path().to_path_buf();
+        validate_repo_hygiene_git(&repo, &["init", "-q", "-b", "main"]);
+        validate_repo_hygiene_git(&repo, &["config", "user.name", "t"]);
+        validate_repo_hygiene_git(&repo, &["config", "user.email", "t@t"]);
+        std::fs::write(repo.join("README.md"), "hi\n").unwrap();
+        validate_repo_hygiene_git(&repo, &["add", "README.md"]);
+        validate_repo_hygiene_git(&repo, &["commit", "-q", "-m", "init"]);
+        (td, repo)
+    }
+
+    fn validate_repo_hygiene_write(repo: &std::path::Path, rel: &str, contents: &str) {
+        let path = repo.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn validate_repo_hygiene_write_allowlist(repo: &std::path::Path, entries: &[&str]) {
+        let mut raw = entries.join("\n");
+        if !raw.is_empty() {
+            raw.push('\n');
+        }
+        validate_repo_hygiene_write(repo, DEFAULT_ARTIFACT_ALLOWLIST_PATH, &raw);
+        validate_repo_hygiene_stage(repo, &[DEFAULT_ARTIFACT_ALLOWLIST_PATH]);
+    }
+
+    fn validate_repo_hygiene_stage(repo: &std::path::Path, rels: &[&str]) {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo).arg("add").args(rels);
+        assert!(cmd.status().unwrap().success(), "git add {rels:?}");
+    }
+
+    fn validate_repo_hygiene_valid_config() -> &'static str {
+        r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[server]
+
+[[workflows]]
+id = "review"
+
+[[workflows.nodes]]
+id = "n"
+agent = "codex"
+prompt_file = "../prompts/project.md"
+"#
+    }
+
+    fn validate_repo_hygiene_write_valid_artifacts(repo: &std::path::Path) {
+        validate_repo_hygiene_write(
+            repo,
+            "examples/good.toml",
+            validate_repo_hygiene_valid_config(),
+        );
+        validate_repo_hygiene_write(repo, "prompts/project.md", "review this\n");
+        validate_repo_hygiene_stage(repo, &["examples/good.toml", "prompts/project.md"]);
+        validate_repo_hygiene_write_allowlist(repo, &["examples/good.toml", "prompts/project.md"]);
+    }
+
+    #[test]
+    fn validate_repo_hygiene_parse_validate_args_modes() {
+        match super::parse_validate_args(&[]).unwrap() {
+            super::ValidateMode::Config {
+                config,
+                examples_policy,
+                project_markers,
+            } => {
+                assert_eq!(config, std::path::PathBuf::from(super::CONFIG_PATH));
+                assert_eq!(examples_policy, super::ExamplesPolicy::Off);
+                assert!(project_markers.is_empty());
+            }
+            other => panic!("expected config mode, got {other:?}"),
+        }
+
+        match super::parse_validate_args(&validate_repo_hygiene_args(&[
+            "--repo-hygiene",
+            "--artifact-allowlist",
+            ".github/workflow-artifact-allowlist.txt",
+        ]))
+        .unwrap()
+        {
+            super::ValidateMode::RepoHygiene {
+                allowlist_path: Some(path),
+            } => assert_eq!(
+                path,
+                std::path::PathBuf::from(".github/workflow-artifact-allowlist.txt")
+            ),
+            other => panic!("expected repo hygiene mode, got {other:?}"),
+        }
+
+        for args in [
+            &["--repo-hygiene", "--config", "x"][..],
+            &["--repo-hygiene", "--examples-policy", "warn"][..],
+            &["--repo-hygiene", "--project-marker", "x"][..],
+            &[
+                "--repo-hygiene",
+                "--examples-policy",
+                "warn",
+                "--project-marker",
+                "x",
+            ][..],
+            &["--artifact-allowlist", "x"][..],
+        ] {
+            let err = super::parse_validate_args(&validate_repo_hygiene_args(args))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(super::VALIDATE_USAGE));
+        }
+
+        match super::parse_validate_args(&validate_repo_hygiene_args(&[
+            "--project-marker",
+            "prism-mcp",
+        ]))
+        .unwrap()
+        {
+            super::ValidateMode::Config {
+                examples_policy,
+                project_markers,
+                ..
+            } => {
+                assert_eq!(examples_policy, super::ExamplesPolicy::Warn);
+                assert_eq!(project_markers, vec!["prism-mcp".to_string()]);
+            }
+            other => panic!("expected config mode, got {other:?}"),
+        }
+
+        assert!(super::VALIDATE_USAGE.contains("--repo-hygiene"));
+        assert!(super::VALIDATE_USAGE.contains("/tmp (or /private/tmp on macOS)"));
+    }
+
+    #[test]
+    fn validate_repo_hygiene_allowlist_parser_rejects_bad_content() {
+        let parsed =
+            super::parse_artifact_allowlist("examples/a.toml\r\nprompts/a.md\r\n").unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains("examples/a.toml"));
+        assert!(parsed.contains("prompts/a.md"));
+
+        for (raw, expected) in [
+            ("\n", "blank line"),
+            ("examples/a.toml\nexamples/a.toml\n", "duplicate"),
+            ("prompts/a.md\nexamples/a.toml\n", "not sorted"),
+            ("/tmp/a.toml\n", "relative"),
+            ("examples/nested/foo.toml\n", "outside root"),
+            ("prompts/nested/foo.md\n", "outside root"),
+            ("examples/foo.md\n", "outside root"),
+            ("other/foo.toml\n", "outside root"),
+            ("examples/résumé.toml\n", "ASCII"),
+            ("\u{FEFF}examples/a.toml\n", "UTF-8 BOM"),
+        ] {
+            let err = super::parse_artifact_allowlist(raw)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "expected {expected:?} in error {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_repo_hygiene_allowlist_comparison_and_report_format() {
+        let tracked: BTreeSet<String> = ["examples/a.toml", "prompts/a.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let allowlist = tracked.clone();
+        super::ensure_artifact_allowlist_matches(
+            &tracked,
+            &allowlist,
+            DEFAULT_ARTIFACT_ALLOWLIST_PATH,
+        )
+        .unwrap();
+
+        let stale: BTreeSet<String> = ["examples/missing.toml", "prompts/a.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err =
+            super::ensure_artifact_allowlist_matches(&tracked, &stale, "custom/allowlist.txt")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("examples/a.toml"));
+        assert!(err.contains("examples/missing.toml"));
+        assert!(err.contains("> 'custom/allowlist.txt'"));
+        assert!(
+            super::artifact_allowlist_regeneration_command("custom/my allowlist.txt")
+                .contains("> 'custom/my allowlist.txt'")
+        );
+
+        let report = super::RepoHygieneReport {
+            allowlist_path: std::path::PathBuf::from(".github/workflow-artifact-allowlist.txt"),
+            allowlist_rel: ".github/workflow-artifact-allowlist.txt".to_string(),
+            tracked_artifact_count: 2,
+            validated_example_config_count: 1,
+        };
+        let output = super::format_repo_hygiene_report(&report);
+        assert!(output.contains("allowlist: .github/workflow-artifact-allowlist.txt"));
+        assert!(output.contains("tracked_artifacts: 2"));
+        assert!(output.contains("validated_example_configs: 1"));
+    }
+
+    #[test]
+    fn validate_repo_hygiene_git_backed_checks_cover_artifacts() {
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write_valid_artifacts(&repo);
+        let report = super::validate_repo_hygiene_at(&repo, None).unwrap();
+        assert_eq!(report.tracked_artifact_count, 2);
+        assert_eq!(report.validated_example_config_count, 1);
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write_allowlist(&repo, &[]);
+        validate_repo_hygiene_write(&repo, "examples/local.toml", "local\n");
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("untracked root workflow artifacts"));
+        assert!(err.contains("examples/local.toml"));
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write_allowlist(&repo, &[]);
+        validate_repo_hygiene_write(&repo, "prompts/local.md", "local\n");
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prompts/local.md"));
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write_allowlist(&repo, &[]);
+        validate_repo_hygiene_write(&repo, ".gitignore", "examples/*.toml\n");
+        validate_repo_hygiene_stage(&repo, &[".gitignore"]);
+        validate_repo_hygiene_write(&repo, "examples/ignored.toml", "ignored\n");
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("examples/ignored.toml"));
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write(repo.as_path(), DEFAULT_ARTIFACT_ALLOWLIST_PATH, "");
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(
+            "artifact allowlist .github/workflow-artifact-allowlist.txt is not tracked by git"
+        ));
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write_valid_artifacts(&repo);
+        validate_repo_hygiene_write(
+            &repo,
+            DEFAULT_ARTIFACT_ALLOWLIST_PATH,
+            "examples/good.toml\nexamples/missing.toml\nprompts/project.md\n",
+        );
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unstaged changes"));
+        assert!(err.contains(DEFAULT_ARTIFACT_ALLOWLIST_PATH));
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write_valid_artifacts(&repo);
+        validate_repo_hygiene_write(&repo, "examples/good.toml", "not toml");
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unstaged changes"));
+        assert!(err.contains("examples/good.toml"));
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        let external = repo
+            .parent()
+            .unwrap()
+            .join("external-workflow-artifact-allowlist.txt");
+        std::fs::write(&external, "").unwrap();
+        let err = super::validate_repo_hygiene_at(&repo, Some(&external))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must live under repository root"));
+
+        #[cfg(unix)]
+        {
+            let (_td, repo) = validate_repo_hygiene_temp_repo();
+            validate_repo_hygiene_write_valid_artifacts(&repo);
+            let external = repo.parent().unwrap().join("external-allowlist.txt");
+            std::fs::write(&external, "examples/good.toml\nprompts/project.md\n").unwrap();
+            let symlink_rel = ".github/symlink-allowlist.txt";
+            std::os::unix::fs::symlink(&external, repo.join(symlink_rel)).unwrap();
+            validate_repo_hygiene_stage(&repo, &[symlink_rel]);
+            let err =
+                super::validate_repo_hygiene_at(&repo, Some(std::path::Path::new(symlink_rel)))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("resolves outside repository root"));
+        }
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write_valid_artifacts(&repo);
+        validate_repo_hygiene_write_allowlist(&repo, &["prompts/project.md"]);
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tracked artifacts missing from allowlist"));
+        assert!(err.contains("examples/good.toml"));
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write_valid_artifacts(&repo);
+        validate_repo_hygiene_write_allowlist(
+            &repo,
+            &[
+                "examples/good.toml",
+                "examples/missing.toml",
+                "prompts/project.md",
+            ],
+        );
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowlist entries without tracked files"));
+        assert!(err.contains("examples/missing.toml"));
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write_allowlist(&repo, &[]);
+        validate_repo_hygiene_write(&repo, "examples/sample-input.md", "sample\n");
+        super::validate_repo_hygiene_at(&repo, None).unwrap();
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("artifact allowlist not found"));
+        assert!(err.contains("repository root"));
+
+        let (_td, repo) = validate_repo_hygiene_temp_repo();
+        validate_repo_hygiene_write(&repo, "examples/bad.toml", "not toml");
+        validate_repo_hygiene_stage(&repo, &["examples/bad.toml"]);
+        validate_repo_hygiene_write_allowlist(&repo, &["examples/bad.toml"]);
+        let err = super::validate_repo_hygiene_at(&repo, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tracked example configs failed validation"));
+        assert!(err.contains("examples/bad.toml"));
     }
 
     #[test]
