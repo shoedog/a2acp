@@ -52,15 +52,15 @@ the advertised options, with the SDK calls confined to `AcpBackend`:
    options from each `set_config_option` response). `model_values` finds the `category=="model"`
    option, flattening `Grouped`/`Ungrouped` and falling back to an `Other`-category id; `effort_opt`
    finds the thought-level option and its `config_id` (`effort` vs `reasoning_effort`) + levels.
-2. **Model — validated, fatal, two surfaces.** Resolve the requested model against the advertised
+2. **Model — validated, fatal, config-option surface.** Resolve the requested model against the advertised
    values; a pin **not** in the set **hard-fails the session** (`BridgeError::config_invalid`)
-   *before any prompt is sent*. Aliases resolve **before** validation via a small static map
-   (`fable → claude-fable-5[1m]`, `opus → default`). The bridge supports **both** model-selection
-   surfaces (see the 2026-06-10 amendment): (a) **`config_options` (category=model)** — claude
-   0.44.0 / codex, applied via `set_config_option`; (b) the unstable **`models` state +
-   `session/set_model`** — kiro, which returns `config_options: None` but advertises
-   `SessionModelState` (`current_model_id` + `available_models`). Advertises a surface + valid pin →
-   apply; advertises neither + a pin → `config_invalid`; advertises neither + no pin → skip.
+   *before any prompt is sent*. Raw advertised ids win; fallback aliases then resolve via a small
+   static map (`opus → default` when `opus` is not advertised). As of the 2026-07-02 SDK 1.x amendment,
+   the bridge applies model pins only through **`config_options` (category=model)** via
+   `session/set_config_option`; the former unstable typed `models` state + `session/set_model`
+   Kiro fallback is no longer exposed by the Rust client schema. Advertises a config option +
+   valid pin → apply; advertises no config option + a pin → `config_invalid`; advertises no
+   config option + no pin → skip.
 3. **Effort — walked-down, non-fatal.** Resolve against the **refreshed** post-model options. Fall
    back to the highest supported level **≤** requested. The ACP path **errors** (`-32603`) on an
    unsupported level rather than clamping, so the bridge **walks down itself** by `EFFORT_ORDER`,
@@ -83,8 +83,7 @@ the advertised options, with the SDK calls confined to `AcpBackend`:
   `examples/a2a-bridge.multi-agent.toml`, the `init` scaffold fragment (`main.rs`), and the config
   parse-test fixture — kiro advertises **no** model option, so the pin would now hard-fail at mint.
   Any external config pinning a non-advertised model (notably kiro) must drop it. **claude effort now
-  actually applies.** Model typos **fail fast at mint**, not mid-turn. **Fable serves end-to-end**
-  (`model="fable"` → `claude-fable-5`).
+  actually applies.** Model typos **fail fast at mint**, not mid-turn.
 - **Docs.** README, onboarding, the init template, and the config headers were rewritten off the old
   `set_model`/"codex-only effort"/"claude model not observable" claims; an effort-level guidance table
   (model-dependent levels) was added.
@@ -137,3 +136,31 @@ the same `resolve_model` validation + alias map; a pin on neither surface is sti
 The live-only `live_edit_changes_new_session_model` e2e (kiro `auto` → `claude-sonnet-4.5` on a new
 session, same warm backend) now **PASSES** (both turns PONG/`end_turn`). 24 `model_effort` unit tests +
 99 `bridge-acp` tests green; effort is unaffected (kiro advertises no thought-level option → skipped).
+
+## Amendment (2026-07-02) — ACP SDK 1.x removes the typed models surface
+
+The Rust SDK was upgraded to `agent-client-protocol =1.0.1`. In that SDK line,
+the typed `models` state and `session/set_model` request used by the 2026-06-10
+Kiro fallback are no longer exposed on the v1 client schema. The current bridge
+therefore applies model pins only through `session/set_config_option` on an
+advertised `category="model"` config option.
+
+Operationally, this preserves the validated/fail-fast contract: a pinned model
+that is not in the advertised config-option values hard-fails mint, and a pinned
+model on an agent with no model config option hard-fails with "advertised no
+model option". The live catalog now separates discovery from configurability:
+Kiro's native `kiro-cli chat --list-models` values remain visible for operator
+awareness, but the Agent Card / `models --json` entry marks them with
+`model_configurable: false`, and the table output labels the model override as
+unavailable. Current `kiro-cli acp` configs should leave `model` unset unless
+the catalog marks that agent `model_configurable: true`.
+
+## Amendment (2026-07-02) — Fable-family model ids are blocked
+
+The bridge now blocks model ids containing `fable` even when an ACP agent
+advertises them. A config pin or per-request `a2a-bridge.model` override using a
+Fable-family value fails at mint with `BridgeError::config_invalid` before any
+prompt is sent. The same ids are filtered out of the usable model catalog so
+Agent Card and `models` output do not present them as valid override choices.
+The remaining Claude fallback shorthand is `opus -> default` when `opus` is not
+advertised.

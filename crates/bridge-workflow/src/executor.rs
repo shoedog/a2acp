@@ -276,7 +276,10 @@ impl WorkflowExecutor {
                     item = stream.next() => match item {
                         Some(Ok(Update::Text(t))) => text.push_str(&t),
                         Some(Ok(Update::Permission(_))) => {}
-                        Some(Ok(Update::Usage(u))) => {
+                        Some(Ok(Update::Usage(mut u))) => {
+                            if let Some(previous) = &last_usage {
+                                u.merge_missing_from(previous);
+                            }
                             last_usage = Some(u);
                         }
                         Some(Ok(Update::Done { stop_reason })) => {
@@ -469,7 +472,10 @@ impl WorkflowExecutor {
                         item = stream.next() => match item {
                             Some(Ok(Update::Text(t))) => text.push_str(&t),
                             Some(Ok(Update::Permission(_))) => {} // safe: backends resolve permission internally
-                            Some(Ok(Update::Usage(u))) => {
+                            Some(Ok(Update::Usage(mut u))) => {
+                                if let Some(previous) = &last_usage {
+                                    u.merge_missing_from(previous);
+                                }
                                 last_usage = Some(u);
                             }
                             Some(Ok(Update::Done { stop_reason })) => {
@@ -1011,6 +1017,7 @@ mod tests {
             used: Some(used),
             size: Some(10_000),
             cost: None,
+            terminal: None,
             at_ms: used as i64,
         }
     }
@@ -1579,6 +1586,21 @@ mod tests {
                         used: Some(15071),
                         size: Some(258400),
                         cost: None,
+                        terminal: None,
+                        at_ms: 1,
+                    })),
+                    Ok(Update::Usage(bridge_core::orch::UsageSnapshot {
+                        used: None,
+                        size: None,
+                        cost: None,
+                        terminal: Some(bridge_core::orch::TerminalUsage {
+                            total_tokens: 321,
+                            input_tokens: 300,
+                            output_tokens: 21,
+                            thought_tokens: None,
+                            cached_read_tokens: None,
+                            cached_write_tokens: None,
+                        }),
                         at_ms: 1,
                     })),
                     Ok(Update::Done {
@@ -1635,7 +1657,11 @@ mod tests {
             .unwrap();
         match nf {
             WorkflowEvent::NodeFinished { usage: Some(u), .. } => {
-                assert_eq!(u.used, Some(15071))
+                assert_eq!((u.used, u.size), (Some(15071), Some(258400)));
+                assert_eq!(
+                    u.terminal.as_ref().map(|usage| usage.total_tokens),
+                    Some(321)
+                );
             }
             other => panic!("expected captured usage, got {other:?}"),
         }
@@ -1659,6 +1685,7 @@ mod tests {
                     used: Some(self.used),
                     size: Some(100_000),
                     cost: None,
+                    terminal: None,
                     at_ms: 1,
                 })),
                 Err(BridgeError::ConfigInvalid {
@@ -1787,6 +1814,7 @@ mod tests {
                     used: Some(15071),
                     size: Some(258400),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 }),
             ),
@@ -1799,6 +1827,7 @@ mod tests {
                         amount: 0.03,
                         currency: "USD".into(),
                     }),
+                    terminal: None,
                     at_ms: 0,
                 }),
             ),
@@ -3375,6 +3404,7 @@ mod tests {
                     used: Some(15071),
                     size: Some(258400),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 }),
             ),

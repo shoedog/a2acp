@@ -122,7 +122,7 @@ edit that reuses the warm slot takes effect for new sessions without any respawn
 
 The `AcpBackend` stashes config per `SessionId` in a `Mutex<HashMap>` and reads it at
 `session/new` mint (lazy, exactly-once per session). Model id is the **agent-native id**
-passed verbatim to `session/set_model` — NO `{provider}@{model}` construction.
+passed verbatim to the advertised ACP model config option — NO `{provider}@{model}` construction.
 `model_provider` is descriptive/routing metadata only and is never put in the wire frame.
 
 ### 7. Instance-keyed task binding (`TaskBinding` + `BindingGuard`)
@@ -185,8 +185,9 @@ conductor-compatible: they do not foreclose the conductor option.
 - **Hot-reload**: editing `a2a-bridge.toml` on disk is detected by a parent-directory
   `notify` watcher (atomic-rename safe) with a 200 ms debounce settle window. A parse
   error keeps the last-good snapshot; the stream does not tear down.
-- **Opaque agent-native model ids**: the bridge passes `model` verbatim to
-  `session/set_model`; no vendor-prefixing is injected. `model_provider` is metadata only.
+- **Opaque agent-native model ids**: the bridge passes `model` verbatim to the
+  advertised ACP model config option; no vendor-prefixing is injected.
+  `model_provider` is metadata only.
 - The `AgentRegistry` / `ConfigSource` / `AgentBackend` port seams are
   conductor-compatible; the fork/continue decision is not foreclosed.
 

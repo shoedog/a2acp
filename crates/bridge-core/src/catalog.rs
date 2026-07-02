@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 pub struct AgentCaps {
     pub current_model: Option<String>,
     pub models: Vec<String>,
+    /// True when `a2a-bridge.model` can apply one of `models` for this agent.
+    /// Kiro's native list is discoverable but not configurable through ACP SDK 1.x.
+    pub model_configurable: bool,
     pub effort_levels: Vec<String>,
     pub modes: Vec<String>,
     pub current_mode: Option<String>,
@@ -15,6 +18,31 @@ pub struct AgentCaps {
 
 /// agent_id -> caps. An agent that failed to probe is ABSENT (not a stub).
 pub type ModelCatalog = BTreeMap<String, AgentCaps>;
+
+/// Model-id markers intentionally blocked by this bridge even if an agent advertises them.
+pub const BLOCKED_MODEL_MARKERS: &[&str] = &["fable"];
+
+pub fn is_blocked_model_id(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    BLOCKED_MODEL_MARKERS
+        .iter()
+        .any(|marker| model.contains(marker))
+}
+
+pub fn sanitize_model_caps(mut caps: AgentCaps) -> AgentCaps {
+    caps.models.retain(|model| !is_blocked_model_id(model));
+    if caps
+        .current_model
+        .as_deref()
+        .is_some_and(is_blocked_model_id)
+    {
+        caps.current_model = None;
+    }
+    if caps.models.is_empty() {
+        caps.model_configurable = false;
+    }
+    caps
+}
 
 /// Parse `kiro-cli chat --list-models` text. Each model line is
 /// `[*] <id> <multiplier>x credits  <description>`; the `*` marks the default.
@@ -34,6 +62,9 @@ pub fn parse_kiro_list_models(stdout: &str) -> AgentCaps {
         if !rest.contains("credits") || id.is_empty() {
             continue; // header / blank / non-model line
         }
+        if is_blocked_model_id(id) {
+            continue;
+        }
         caps.models.push(id.to_string());
         if is_default {
             caps.current_model = Some(id.to_string());
@@ -43,14 +74,22 @@ pub fn parse_kiro_list_models(stdout: &str) -> AgentCaps {
 }
 
 /// The per-agent JSON object the Agent Card extension AND the `a2a-bridge models --json` CLI both
-/// emit (DRY). `current`/`models`/`current_mode` ride through; empty `effort`/`modes` keys are OMITTED
-/// (no `"effort":[]` noise for kiro/api). Renderers wrap a map of these under `params.agents`.
+/// emit (DRY). `current`/`models`/`model_configurable`/`current_mode` ride through; empty
+/// `effort`/`modes` keys are OMITTED (no `"effort":[]` noise for kiro/api). Renderers wrap a map
+/// of these under `params.agents`.
 pub fn caps_to_json(caps: &AgentCaps) -> serde_json::Value {
+    let caps = sanitize_model_caps(caps.clone());
     let mut object = serde_json::Map::new();
     if let Some(model) = &caps.current_model {
         object.insert("current".into(), serde_json::json!(model));
     }
     object.insert("models".into(), serde_json::json!(caps.models));
+    if !caps.models.is_empty() {
+        object.insert(
+            "model_configurable".into(),
+            serde_json::json!(caps.model_configurable),
+        );
+    }
     if !caps.effort_levels.is_empty() {
         object.insert("effort".into(), serde_json::json!(caps.effort_levels));
     }
@@ -76,10 +115,11 @@ pub fn parse_ollama_models(body: &str) -> Result<AgentCaps, serde_json::Error> {
     }
 
     let list: List = serde_json::from_str(body)?;
-    Ok(AgentCaps {
+    Ok(sanitize_model_caps(AgentCaps {
         models: list.data.into_iter().map(|e| e.id).collect(),
+        model_configurable: true,
         ..Default::default()
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -95,22 +135,32 @@ mod tests {
 
     #[test]
     fn parses_kiro_list_models() {
-        let out = "Available models (* = default):\n\n* auto                 1.00x credits      Models chosen by task\n  claude-sonnet-4.5    1.30x credits      The Claude Sonnet 4.5 model\n  claude-haiku-4.5     0.40x credits      The latest Claude Haiku model\n";
+        let out = "Available models (* = default):\n\n* auto                 1.00x credits      Models chosen by task\n  claude-sonnet-4.5    1.30x credits      The Claude Sonnet 4.5 model\n  claude-fable-5.1     1.00x credits      Blocked model\n  claude-haiku-4.5     0.40x credits      The latest Claude Haiku model\n";
         let caps = parse_kiro_list_models(out);
         assert_eq!(
             caps.models,
             vec!["auto", "claude-sonnet-4.5", "claude-haiku-4.5"]
         );
         assert_eq!(caps.current_model.as_deref(), Some("auto"));
+        assert!(!caps.model_configurable);
         assert!(caps.effort_levels.is_empty() && caps.modes.is_empty());
     }
 
     #[test]
     fn parses_ollama_models_list() {
-        let body = r#"{"object":"list","data":[{"id":"qwen2.5-coder:7b","object":"model"},{"id":"llama3.1:8b","object":"model"}]}"#;
+        let body = r#"{"object":"list","data":[{"id":"qwen2.5-coder:7b","object":"model"},{"id":"claude-fable-5.1[1m]","object":"model"},{"id":"llama3.1:8b","object":"model"}]}"#;
         let caps = parse_ollama_models(body).expect("valid list");
         assert_eq!(caps.models, vec!["qwen2.5-coder:7b", "llama3.1:8b"]);
+        assert!(caps.model_configurable);
         assert!(caps.current_model.is_none() && caps.effort_levels.is_empty());
+    }
+
+    #[test]
+    fn parse_ollama_models_all_blocked_disables_model_configurable() {
+        let body = r#"{"object":"list","data":[{"id":"claude-fable-5.1[1m]","object":"model"}]}"#;
+        let caps = parse_ollama_models(body).expect("valid list");
+        assert!(caps.models.is_empty());
+        assert!(!caps.model_configurable);
     }
 
     #[test]
@@ -122,7 +172,12 @@ mod tests {
     fn caps_to_json_emits_present_keys_and_omits_empty() {
         let caps = AgentCaps {
             current_model: Some("sonnet".into()),
-            models: vec!["default".into(), "sonnet".into()],
+            models: vec![
+                "default".into(),
+                "claude-fable-5.1[1m]".into(),
+                "sonnet".into(),
+            ],
+            model_configurable: true,
             effort_levels: vec!["low".into(), "high".into()],
             modes: vec![],
             current_mode: None,
@@ -130,6 +185,7 @@ mod tests {
         let value = caps_to_json(&caps);
         assert_eq!(value["current"], serde_json::json!("sonnet"));
         assert_eq!(value["models"], serde_json::json!(["default", "sonnet"]));
+        assert_eq!(value["model_configurable"], serde_json::json!(true));
         assert_eq!(value["effort"], serde_json::json!(["low", "high"]));
         assert!(value.get("modes").is_none(), "empty modes omitted");
         assert!(
@@ -150,5 +206,6 @@ mod tests {
         assert!(value.get("effort").is_none());
         assert!(value.get("modes").is_none());
         assert_eq!(value["models"], serde_json::json!(["auto", "glm-5"]));
+        assert_eq!(value["model_configurable"], serde_json::json!(false));
     }
 }

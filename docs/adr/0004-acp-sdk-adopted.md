@@ -186,3 +186,20 @@ the translator check.
   hang at the prompt step (the no-fs-caps property under test in `e2e_acp_kiro`).
   This is intentional; adding fs/terminal support is a future increment and would
   require a new ADR.
+
+## Amendment (2026-07-02) — ACP Rust SDK 1.0.1
+
+The bridge now pins `agent-client-protocol =1.0.1`. The generated v1 schema types
+moved under `agent_client_protocol::schema::v1`, while shared helpers such as
+`ProtocolVersion` remain at `schema`.
+
+The SDK 1.x surface no longer exposes the typed `NewSessionResponse.models` /
+`session/set_model` path used by the 0.12.1-era Kiro fallback. The bridge therefore
+supports model pinning through the ACP v1 `config_options` model selector only. A
+configured model on an agent that advertises no model config option remains a hard
+`config_invalid` mint failure.
+
+The `bridge-acp` feature gates changed with the SDK: `unstable_auth_methods` is
+kept for advertised auth selection, and `unstable_end_turn_token_usage` is kept so
+usage-bearing frames remain modeled. The old `unstable_session_model` and
+`unstable_session_usage` gates are no longer used.

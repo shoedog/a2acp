@@ -3042,7 +3042,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
 const MODELS_USAGE: &str = "\
 usage: a2a-bridge models [--config <path>] [--agent <id>] [--json]
   List each configured agent's advertised models (+ effort levels + modes), probed live host-side.
-  Pass one of these to the per-request override (message.metadata a2a-bridge.{model,effort,mode}).
+  Pass models only when model_configurable=true; effort/mode only when those lists are present.
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --agent <id>     show only this agent
   --json           emit JSON (same shape as the card's agent-models extension params.agents)";
@@ -3141,7 +3141,15 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
             match catalog.get(id) {
                 Some(caps) => {
                     let current = caps.current_model.as_deref().unwrap_or("?");
-                    println!("{id}: {}  (current: {current})", caps.models.join(", "));
+                    let configurable = if caps.models.is_empty() || caps.model_configurable {
+                        ""
+                    } else {
+                        "; model override unavailable"
+                    };
+                    println!(
+                        "{id}: {}  (current: {current}{configurable})",
+                        caps.models.join(", ")
+                    );
                     if !caps.effort_levels.is_empty() {
                         println!("    effort: {}", caps.effort_levels.join(", "));
                     }
@@ -3942,13 +3950,13 @@ fn known_init_agents() -> [(&'static str, Option<&'static str>); 4] {
 fn agent_fragment(name: &str) -> &'static str {
     match name {
         "kiro" => {
-            "\n# kiro: zero-auth local default (kiro-cli acp). Unpinned (default model `auto`).\n# kiro advertises its model via the `models` surface + session/set_model, so you MAY\n# pin an advertised id, e.g. model = \"claude-sonnet-4.5\".\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\n"
+            "\n# kiro: zero-auth local default (kiro-cli acp). ACP SDK 1.x can discover Kiro's\n# native model list, but cannot apply Kiro model pins unless the catalog marks\n# the agent `model_configurable: true`; leave model unpinned by default.\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\n"
         }
         "codex" => {
-            "\n# codex: gpt-5.5 with reasoning_effort.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
+            "\n# codex: gpt-5.5 with reasoning_effort. Auth defaults to ChatGPT-style login\n# when advertised; API-key-only installs should set auth_method explicitly.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
         }
         "claude" => {
-            "\n# claude: subscription. `model` is validated against the advertised values and\n# applied; aliases work too (e.g. model = \"fable\" -> claude-fable-5[1m]).\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n"
+            "\n# claude: subscription. `model` is validated against the advertised values and\n# applied. Fable ids are blocked by this bridge; use another advertised model.\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n"
         }
         "api" => {
             "\n# api: OpenAI-compatible non-process backend. `api_key_env` is the NAME of an\n# env var holding the token (never the secret itself). Effort is not applied for api.\n[[agents]]\nid          = \"api\"\nkind        = \"api\"\nbase_url    = \"https://api.openai.com/v1\"\napi_key_env = \"OPENAI_API_KEY\"\nmodel       = \"gpt-4o-mini\"\n"

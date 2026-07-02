@@ -3,7 +3,8 @@
 > A durable quick-reference for the ACP v1 spec, folded down to the facts that bear on the bridge.
 > The bridge is the **Client** (it launches agents as subprocesses and drives them); codex-acp / claude /
 > kiro are **Agents**. Source: <https://agentclientprotocol.com/protocol/v1/overview.md> (fetched
-> 2026-06-17). Keep this updated when the pinned SDK (`agent-client-protocol`) or the spec moves.
+> 2026-06-17; bridge SDK pin refreshed 2026-07-02 to `agent-client-protocol` 1.0.1).
+> Keep this updated when the pinned SDK or the spec moves.
 
 ## Spec pages (v1)
 
@@ -83,8 +84,9 @@ the config/mode surface; load/resume/close/delete are advertised-but-unused.
   Session Config Options.**
 - **Key fact:** config (mode/model/effort) **can change at any point, idle OR generating — no new session
   required.** The bridge already sends `set_mode` (HARD after `session/new`) and `set_config_option`
-  (model/effort pinning) — `acp_backend.rs:451/76`, golden-frame-tested. codex moved model/effort into
-  `config_options`; kiro uses `models` + `session/set_model`; claude varies by version.
+  (model/effort pinning) — `acp_backend.rs`, golden-frame-tested. Current bridge support for model
+  pinning is the ACP v1 `config_options` model selector; agents that do not advertise a model config
+  option should be left unpinned.
 
 ## Prompt turn
 

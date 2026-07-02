@@ -1,14 +1,14 @@
 //! Pure capability-driven resolution of model and effort against advertised config options.
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory as Cat,
-    SessionConfigSelectOptions, SessionModelState,
+    SessionConfigSelectOptions,
 };
-use bridge_core::catalog::AgentCaps;
+use bridge_core::catalog::{is_blocked_model_id, AgentCaps};
 use bridge_core::domain::Effort;
 
 /// Static shorthand to advertised-id map, applied before validation.
-pub const MODEL_ALIASES: &[(&str, &str)] = &[("fable", "claude-fable-5[1m]"), ("opus", "default")];
+pub const MODEL_ALIASES: &[(&str, &str)] = &[("opus", "default")];
 
 pub fn apply_alias(want: &str) -> &str {
     MODEL_ALIASES
@@ -16,6 +16,19 @@ pub fn apply_alias(want: &str) -> &str {
         .find(|(alias, _)| *alias == want)
         .map(|(_, value)| *value)
         .unwrap_or(want)
+}
+
+pub fn is_blocked_model(model: &str) -> bool {
+    let mapped = apply_alias(model);
+    is_blocked_model_id(model) || is_blocked_model_id(mapped)
+}
+
+fn allowed_model_values(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .filter(|value| !is_blocked_model(value))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -30,30 +43,41 @@ pub struct ModelNotAdvertised {
     pub valid: Vec<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ModelResolutionError {
+    Blocked { want: String, valid: Vec<String> },
+    NotAdvertised(ModelNotAdvertised),
+}
+
 /// `want == None` leaves the agent default. Otherwise: prefer the RAW id when the agent
 /// advertises it directly, then fall back to the alias map. The raw-first order matters
-/// because the advertised id is adapter-version-dependent — e.g. claude-agent-acp advertises
-/// the bare `fable`, while older builds advertised `claude-fable-5[1m]`; forcing the alias
-/// would make a now-advertised bare id fail validation. The alias remains the fallback so
-/// `fable`/`opus` keep working against adapters that only advertise the long id.
+/// because the advertised id is adapter-version-dependent for non-blocked models. Blocked
+/// models fail before validation even if an agent advertises them.
 pub fn resolve_model(
     want: Option<&str>,
     values: &[String],
-) -> Result<ModelDecision, ModelNotAdvertised> {
+) -> Result<ModelDecision, ModelResolutionError> {
     let Some(raw) = want else {
         return Ok(ModelDecision::Default);
     };
-    if values.iter().any(|value| value == raw) {
+    let valid = allowed_model_values(values);
+    if is_blocked_model(raw) {
+        return Err(ModelResolutionError::Blocked {
+            want: raw.to_string(),
+            valid,
+        });
+    }
+    if valid.iter().any(|value| value == raw) {
         return Ok(ModelDecision::Apply(raw.to_string()));
     }
     let mapped = apply_alias(raw);
-    if values.iter().any(|value| value == mapped) {
+    if valid.iter().any(|value| value == mapped) {
         Ok(ModelDecision::Apply(mapped.to_string()))
     } else {
-        Err(ModelNotAdvertised {
+        Err(ModelResolutionError::NotAdvertised(ModelNotAdvertised {
             want: raw.to_string(),
-            valid: values.to_vec(),
-        })
+            valid,
+        }))
     }
 }
 
@@ -106,24 +130,16 @@ fn find_select(
 }
 
 pub fn model_values(opts: &[SessionConfigOption]) -> Option<(String, String, Vec<String>)> {
-    find_select(opts, Cat::Model, &["model"])
+    find_select(opts, Cat::Model, &["model"]).map(|(id, current, values)| {
+        let values = allowed_model_values(&values);
+        (id, current, values)
+    })
 }
 
 /// Returns `(config_id, current_value, values)` for the advertised mode select, if any.
 /// Mirrors `model_values` against the `Mode` category (id `"mode"`).
 pub fn mode_values(opts: &[SessionConfigOption]) -> Option<(String, String, Vec<String>)> {
     find_select(opts, Cat::Mode, &["mode"])
-}
-
-/// Advertised model ids from the unstable `models` surface (`SessionModelState`).
-/// kiro-cli returns `config_options: None` but DOES advertise this + accepts
-/// `session/set_model`; claude 0.44.0 / codex use `config_options` instead.
-pub fn model_state_values(state: &SessionModelState) -> Vec<String> {
-    state
-        .available_models
-        .iter()
-        .map(|model| model.model_id.0.to_string())
-        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -147,9 +163,13 @@ pub fn effort_opt(opts: &[SessionConfigOption]) -> Option<AdvertisedEffort> {
 /// Map advertised ACP `configOptions` (claude/codex) -> AgentCaps. effort_opt already
 /// filters out the "default" pseudo-level (see effort_opt at model_effort.rs:128).
 pub fn caps_from_config_options(opts: &[SessionConfigOption]) -> AgentCaps {
-    let (current_model, models) = match model_values(opts) {
-        Some((_, current, values)) => (Some(current), values),
-        None => (None, Vec::new()),
+    let (current_model, models, model_configurable) = match model_values(opts) {
+        Some((_, current, values)) if !values.is_empty() => {
+            let current = (!is_blocked_model(&current)).then_some(current);
+            (current, values, true)
+        }
+        None => (None, Vec::new(), false),
+        Some(_) => (None, Vec::new(), false),
     };
     let effort_levels = effort_opt(opts).map(|e| e.levels).unwrap_or_default();
     let (current_mode, modes) = match mode_values(opts) {
@@ -159,6 +179,7 @@ pub fn caps_from_config_options(opts: &[SessionConfigOption]) -> AgentCaps {
     AgentCaps {
         current_model,
         models,
+        model_configurable,
         effort_levels,
         modes,
         current_mode,
@@ -273,7 +294,7 @@ pub fn resolved_log_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{SessionConfigSelectGroup, SessionConfigSelectOption};
+    use agent_client_protocol::schema::v1::{SessionConfigSelectGroup, SessionConfigSelectOption};
     use serde_json::json;
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -332,65 +353,66 @@ mod tests {
     }
 
     #[test]
-    fn raw_advertised_id_preferred_over_alias() {
-        // claude-agent-acp advertises the BARE `fable` (not `claude-fable-5[1m]`). The raw id,
-        // being advertised, must win over the alias remap — else `model="fable"` hard-fails
-        // ("model=fable is not advertised") despite `fable` being a valid advertised value.
+    fn raw_advertised_fable_id_is_blocked() {
         let values = strings(&["default", "fable", "sonnet", "sonnet[1m]", "haiku"]);
+        let err = resolve_model(Some("fable"), &values).unwrap_err();
         assert_eq!(
-            resolve_model(Some("fable"), &values).unwrap(),
-            ModelDecision::Apply("fable".into())
-        );
-    }
-
-    fn kiro_model_state() -> agent_client_protocol::schema::SessionModelState {
-        use agent_client_protocol::schema::{ModelInfo, SessionModelState};
-        SessionModelState::new(
-            "auto",
-            vec![
-                ModelInfo::new("auto", "auto"),
-                ModelInfo::new("claude-sonnet-4.5", "Claude Sonnet 4.5"),
-                ModelInfo::new("claude-haiku-4.5", "Claude Haiku 4.5"),
-            ],
-        )
-    }
-
-    #[test]
-    fn model_state_values_lists_available_model_ids() {
-        assert_eq!(
-            model_state_values(&kiro_model_state()),
-            strings(&["auto", "claude-sonnet-4.5", "claude-haiku-4.5"])
+            err,
+            ModelResolutionError::Blocked {
+                want: "fable".into(),
+                valid: strings(&["default", "sonnet", "sonnet[1m]", "haiku"])
+            }
         );
     }
 
     #[test]
-    fn models_surface_id_is_applied() {
-        // The kiro path reuses resolve_model against the `models` surface ids.
-        let values = model_state_values(&kiro_model_state());
+    fn fable_alias_is_blocked() {
+        let err = resolve_model(Some("fable"), &claude_values()).unwrap_err();
         assert_eq!(
-            resolve_model(Some("claude-sonnet-4.5"), &values).unwrap(),
-            ModelDecision::Apply("claude-sonnet-4.5".into())
+            err,
+            ModelResolutionError::Blocked {
+                want: "fable".into(),
+                valid: strings(&["default", "sonnet", "sonnet[1m]", "haiku"])
+            }
         );
     }
 
     #[test]
-    fn unadvertised_models_surface_id_errs_with_valid_list() {
-        let values = model_state_values(&kiro_model_state());
-        let err = resolve_model(Some("gpt-5.5"), &values).unwrap_err();
-        assert_eq!(err.want, "gpt-5.5");
-        assert!(err.valid.contains(&"claude-sonnet-4.5".to_string()));
-    }
-
-    #[test]
-    fn fable_alias_maps_to_1m() {
+    fn concrete_fable_model_is_blocked() {
+        let err = resolve_model(Some("claude-fable-5[1m]"), &claude_values()).unwrap_err();
         assert_eq!(
-            resolve_model(Some("fable"), &claude_values()).unwrap(),
-            ModelDecision::Apply("claude-fable-5[1m]".into())
+            err,
+            ModelResolutionError::Blocked {
+                want: "claude-fable-5[1m]".into(),
+                valid: strings(&["default", "sonnet", "sonnet[1m]", "haiku"])
+            }
         );
     }
 
     #[test]
-    fn opus_alias_maps_to_default() {
+    fn future_fable_family_model_is_blocked() {
+        let values = strings(&["default", "claude-fable-5.1[1m]", "sonnet"]);
+        let err = resolve_model(Some("claude-fable-5.1[1m]"), &values).unwrap_err();
+        assert_eq!(
+            err,
+            ModelResolutionError::Blocked {
+                want: "claude-fable-5.1[1m]".into(),
+                valid: strings(&["default", "sonnet"])
+            }
+        );
+    }
+
+    #[test]
+    fn raw_advertised_opus_id_preferred_over_alias() {
+        let values = strings(&["default", "opus", "sonnet"]);
+        assert_eq!(
+            resolve_model(Some("opus"), &values).unwrap(),
+            ModelDecision::Apply("opus".into())
+        );
+    }
+
+    #[test]
+    fn opus_alias_falls_back_to_default() {
         assert_eq!(
             resolve_model(Some("opus"), &claude_values()).unwrap(),
             ModelDecision::Apply("default".into())
@@ -400,13 +422,24 @@ mod tests {
     #[test]
     fn typo_errs_with_valid_list() {
         let err = resolve_model(Some("bogus"), &claude_values()).unwrap_err();
-        assert_eq!(err.want, "bogus");
-        assert!(err.valid.contains(&"haiku".into()));
+        assert_eq!(
+            err,
+            ModelResolutionError::NotAdvertised(ModelNotAdvertised {
+                want: "bogus".into(),
+                valid: strings(&["default", "sonnet", "sonnet[1m]", "haiku"])
+            })
+        );
     }
 
     #[test]
-    fn alias_target_not_advertised_errs() {
-        assert!(resolve_model(Some("fable"), &["sonnet".to_string()]).is_err());
+    fn fable_blocks_even_when_target_not_advertised() {
+        assert_eq!(
+            resolve_model(Some("fable"), &["sonnet".to_string()]).unwrap_err(),
+            ModelResolutionError::Blocked {
+                want: "fable".into(),
+                valid: strings(&["sonnet"])
+            }
+        );
     }
 
     #[test]
@@ -438,7 +471,11 @@ mod tests {
     #[test]
     fn model_values_flattens_grouped_model_option() {
         let groups = vec![
-            SessionConfigSelectGroup::new("claude", "Claude", options(&["default", "haiku"])),
+            SessionConfigSelectGroup::new(
+                "claude",
+                "Claude",
+                options(&["default", "claude-fable-5[1m]", "haiku"]),
+            ),
             SessionConfigSelectGroup::new("codex", "Codex", options(&["gpt-5.5"])),
         ];
         let opt =
@@ -451,6 +488,26 @@ mod tests {
                 strings(&["default", "haiku", "gpt-5.5"])
             ))
         );
+    }
+
+    #[test]
+    fn caps_from_config_options_filters_blocked_models() {
+        let opts = vec![select_opt(
+            "model",
+            Some(Cat::Model),
+            "sonnet",
+            &[
+                "default",
+                "claude-fable-5[1m]",
+                "claude-fable-5.1[1m]",
+                "fable",
+                "sonnet",
+            ],
+        )];
+        let caps = caps_from_config_options(&opts);
+        assert_eq!(caps.current_model.as_deref(), Some("sonnet"));
+        assert_eq!(caps.models, vec!["default", "sonnet"]);
+        assert!(caps.model_configurable);
     }
 
     #[test]

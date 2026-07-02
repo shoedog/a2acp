@@ -682,8 +682,9 @@ impl SessionManager {
         })
     }
 
-    /// Record the latest usage snapshot for a warm handle (latest-wins). Stamps `at_ms` from
-    /// the injected wall clock. FIX-7: does NOT
+    /// Record the latest usage snapshot for a warm handle. Partial snapshots merge with the
+    /// previous one so terminal token totals cannot erase the context-window gauge. Stamps
+    /// `at_ms` from the injected wall clock. FIX-7: does NOT
     /// touch `last_used` (usage during a turn is already covered by Running + finish_turn's
     /// refresh; bumping it here only races reap_idle). No-ops a missing/removed handle. [Slice 2]
     pub async fn record_usage(
@@ -697,6 +698,7 @@ impl SessionManager {
         if let Some(h) = self.by_context.lock().await.get_mut(ctx) {
             if h.generation == gen && h.op.as_ref() == Some(op) && h.state == SessionState::Running
             {
+                snap.merge_missing_from(&h.usage);
                 h.usage = snap;
             }
         }
@@ -1756,6 +1758,7 @@ mod tests {
                     used: Some(7),
                     size: Some(9),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -2210,6 +2213,7 @@ mod tests {
                     used: Some(7),
                     size: Some(9),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -2235,6 +2239,7 @@ mod tests {
                     used: Some(99),
                     size: Some(100),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -2629,6 +2634,7 @@ mod tests {
                     used: Some(5),
                     size: Some(9),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -2687,6 +2693,7 @@ mod tests {
                     used: Some(99),
                     size: Some(100),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -3818,6 +3825,7 @@ mod tests {
                     used: Some(10),
                     size: Some(100),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -3831,6 +3839,7 @@ mod tests {
                     used: Some(42),
                     size: Some(100),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -3873,6 +3882,7 @@ mod tests {
                     used: Some(90),
                     size: Some(100),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -3885,6 +3895,79 @@ mod tests {
         let w = turn.usage_warning.expect("0.90 >= 0.80 warns");
         assert_eq!((w.used, w.size), (90, 100));
         assert_eq!(manager.status(&c).await.unwrap().over_threshold, Some(true));
+    }
+
+    #[tokio::test]
+    async fn terminal_usage_merges_without_clobbering_window_usage() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
+        let manager =
+            SessionManager::new(registry, Duration::from_secs(30)).with_warn_fraction(Some(0.8));
+        let c = ctx("terminal-usage-merge");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager
+            .record_usage(
+                &c,
+                turn.generation,
+                &turn.op,
+                UsageSnapshot {
+                    used: Some(90),
+                    size: Some(100),
+                    cost: None,
+                    terminal: None,
+                    at_ms: 0,
+                },
+            )
+            .await;
+        manager
+            .record_usage(
+                &c,
+                turn.generation,
+                &turn.op,
+                UsageSnapshot {
+                    used: None,
+                    size: None,
+                    cost: None,
+                    terminal: Some(bridge_core::orch::TerminalUsage {
+                        total_tokens: 321,
+                        input_tokens: 300,
+                        output_tokens: 21,
+                        thought_tokens: None,
+                        cached_read_tokens: None,
+                        cached_write_tokens: None,
+                    }),
+                    at_ms: 0,
+                },
+            )
+            .await;
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+
+        let status = manager.status(&c).await.unwrap();
+        assert_eq!(
+            (status.usage.used, status.usage.size),
+            (Some(90), Some(100))
+        );
+        assert_eq!(
+            status
+                .usage
+                .terminal
+                .as_ref()
+                .map(|usage| usage.total_tokens),
+            Some(321)
+        );
+        assert_eq!(status.over_threshold, Some(true));
+
+        let next = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let warning = next
+            .usage_warning
+            .expect("merged window usage should still warn");
+        assert_eq!((warning.used, warning.size), (90, 100));
     }
 
     #[tokio::test]
@@ -3908,6 +3991,7 @@ mod tests {
                     used: Some(10),
                     size: Some(100),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -3941,6 +4025,7 @@ mod tests {
                     used: Some(99),
                     size: Some(100),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -3971,6 +4056,7 @@ mod tests {
                     used: Some(99),
                     size: None,
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )
@@ -4021,6 +4107,7 @@ mod tests {
                     used: Some(1),
                     size: Some(2),
                     cost: None,
+                    terminal: None,
                     at_ms: 0,
                 },
             )

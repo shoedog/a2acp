@@ -147,7 +147,7 @@ fn new_session_request_includes_substituted_mcp_servers() {
 // untagged block is caught here).
 #[test]
 fn prompt_request_params_are_wire_conformant() {
-    use agent_client_protocol::schema::SessionId as AgentSessionId;
+    use agent_client_protocol::schema::v1::SessionId as AgentSessionId;
     use bridge_core::domain::Part;
 
     // The exact request value `prompt` transmits for a single text part.
@@ -208,7 +208,7 @@ fn prompt_request_params_are_wire_conformant() {
 // regression to a camelCase method or a renamed `modeId` field is caught here.
 #[test]
 fn set_mode_request_is_wire_conformant() {
-    use agent_client_protocol::schema::SessionId as AgentSessionId;
+    use agent_client_protocol::schema::v1::SessionId as AgentSessionId;
 
     // The EXACT request value `ensure_session` transmits for a configured mode.
     let req = AcpBackend::set_mode_request(AgentSessionId::new("agent-sess-1"), "yolo");
@@ -263,7 +263,7 @@ fn set_mode_request_is_wire_conformant() {
 // session/set_config_option wire-golden for model/effort pinning.
 #[test]
 fn set_config_option_request_is_wire_conformant() {
-    use agent_client_protocol::schema::SessionId as AgentSessionId;
+    use agent_client_protocol::schema::v1::SessionId as AgentSessionId;
 
     let req = AcpBackend::set_config_option_request(
         AgentSessionId::new("agent-sess-1"),
@@ -308,7 +308,7 @@ fn set_config_option_request_is_wire_conformant() {
 // frame (an `id` appearing) or a renamed/wrong sessionId field is caught here.
 #[test]
 fn cancel_notification_is_a_wire_conformant_notification() {
-    use agent_client_protocol::schema::SessionId as AgentSessionId;
+    use agent_client_protocol::schema::v1::SessionId as AgentSessionId;
 
     // The EXACT notification value the backend transmits for an active session.
     let notif = AcpBackend::cancel_notification(AgentSessionId::new("agent-sess-1"));

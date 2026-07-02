@@ -1536,6 +1536,7 @@ mod tests {
             used: Some(15071),
             size: Some(258400),
             cost: None,
+            terminal: None,
             at_ms: 7,
         };
 

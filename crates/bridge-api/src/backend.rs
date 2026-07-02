@@ -1,6 +1,7 @@
 //! ApiBackend — the non-process OpenAI-compatible AgentBackend.
 use crate::config::ApiConfig;
 use crate::wire::{ChatRequest, Message, SseAccumulator, ToolCall};
+use bridge_core::catalog::is_blocked_model_id;
 use bridge_core::domain::{
     Part, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
 };
@@ -111,6 +112,15 @@ impl ApiBackend {
     fn resolve_model(&self, s: &SessionId) -> Option<String> {
         self.session_model(s).or_else(|| self.cfg.model.clone())
     }
+
+    fn reject_blocked_model(model: Option<&str>) -> Result<(), BridgeError> {
+        if let Some(model) = model.filter(|model| is_blocked_model_id(model)) {
+            return Err(BridgeError::config_invalid(format!(
+                "api model={model} is blocked by this bridge"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -125,6 +135,7 @@ impl AgentBackend for ApiBackend {
             self.cfg.base_url.trim_end_matches('/')
         );
         let model = self.resolve_model(session);
+        Self::reject_blocked_model(model.as_deref())?;
         let api_key = self.resolve_api_key();
         let do_stream = self.cfg.stream;
         let client = self.client.clone();
@@ -236,6 +247,7 @@ impl AgentBackend for ApiBackend {
         session: &SessionId,
         spec: &SessionSpec,
     ) -> Result<(), BridgeError> {
+        Self::reject_blocked_model(spec.config.model.as_deref())?;
         let mut map = self.sessions.lock().expect("sessions lock");
         map.entry(session.clone()).or_default().model = spec.config.model.clone();
         Ok(())
@@ -304,6 +316,44 @@ mod tests {
         let _obj: Arc<dyn AgentBackend> = Arc::new(ApiBackend::new(crate::config::ApiConfig::new(
             "http://127.0.0.1:1",
         )));
+    }
+
+    #[tokio::test]
+    async fn configure_session_rejects_blocked_fable_family_model() {
+        let be = ApiBackend::new(crate::config::ApiConfig::new("http://127.0.0.1:1"));
+        let s = SessionId::parse("s1").unwrap();
+        let err = be
+            .configure_session(
+                &s,
+                &SessionSpec::from_config(EffectiveConfig {
+                    model: Some("claude-fable-5.1[1m]".into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("api model=claude-fable-5.1[1m] is blocked by this bridge"),
+            "{err}"
+        );
+        assert!(be.session_model(&s).is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_rejects_static_blocked_fable_family_model_before_http() {
+        let mut cfg = crate::config::ApiConfig::new("http://127.0.0.1:1");
+        cfg.model = Some("claude-fable-5.1[1m]".into());
+        let be = ApiBackend::new(cfg);
+        let s = SessionId::parse("s1").unwrap();
+        match be.prompt(&s, vec![Part { text: "hi".into() }]).await {
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("api model=claude-fable-5.1[1m] is blocked by this bridge"),
+                "{err}"
+            ),
+            Ok(_) => panic!("blocked API model must fail before creating a stream"),
+        }
     }
 
     #[tokio::test]

@@ -388,6 +388,7 @@ mod tests {
                 used: Some(7),
                 size: Some(9),
                 cost: None,
+                terminal: None,
                 at_ms: 0,
             })),
             Ok(Update::Text("body".into())),

@@ -246,6 +246,9 @@ volumes = ["a2a-kiro-data:/root/.local/share"]
 id     = "impl"
 kind   = "container_rw"
 cmd    = "codex-acp"
+# Explicitly force the ChatGPT auth contract this image mounts; the bridge default
+# also prefers ChatGPT-style auth when advertised.
+auth_method = "chat-gpt"
 model  = "gpt-5.5"                             # explicit + validated (codex advertises it); was implicit-default
 effort = "high"
 args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]

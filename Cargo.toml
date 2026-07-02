@@ -24,12 +24,12 @@ libc = "0.2"
 futures = "0.3"
 async-stream = "0.3"
 
-# Protocol SDKs — pinned exact versions verified 2026-05-30
+# Protocol SDKs — pinned exact versions verified 2026-07-02
 # a2a-lf is the crates.io package name for the `a2a` crate in a2aproject/a2a-rs
 # agent-client-protocol: wired in Increment 3a via AcpBackend (bridge-acp) — drives the
 # conformant SDK initialize/prompt/cancel path. The legacy KiroBackend JSON-RPC framing over
 # serde_json + the in-house FrameReader is retained for keep-green (see ADR-0003 Addendum 2).
-agent-client-protocol = "=0.12.1"
+agent-client-protocol = "=1.0.1"
 a2a = { package = "a2a-lf", version = "=0.3.0" }
 
 # Dev-only deps live in [workspace.dependencies] (Cargo has no workspace.dev-dependencies);
