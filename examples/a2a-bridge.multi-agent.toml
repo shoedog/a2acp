@@ -7,15 +7,16 @@
 #     a2a-bridge serve --config examples/a2a-bridge.multi-agent.toml
 #
 # model/effort/mode (all OPTIONAL, all applied per session):
-#   model  -> set on whichever surface the agent advertises, VALIDATED at mint
+#   model  -> set via the agent's advertised model config option, VALIDATED at mint
 #             (pinning an unadvertised value hard-fails the session, listing the
-#             advertised values): claude 0.44.0 / codex advertise it via
-#             session/set_config_option(category="model"); kiro advertises it via
-#             the `models` surface and accepts session/set_model (ids: auto,
-#             claude-sonnet-4.5, claude-sonnet-4, claude-haiku-4.5, ...). Aliases
-#             resolve BEFORE validation (`fable` -> claude-fable-5[1m], `opus` ->
-#             default). claude's served model is visible in claude's own session
-#             transcript, not surfaced through the bridge.
+#             advertised values): claude/codex advertise it via
+#             session/set_config_option(category="model"). Agents that do not
+#             advertise a model config option should be left unpinned; the live
+#             catalog marks discovery-only lists as `model_configurable: false`.
+#             Raw advertised ids win; if `opus` is not advertised it falls back
+#             to default. Fable-family model ids are blocked by this bridge and
+#             omitted from the usable model catalog. claude's served model is visible in
+#             claude's own session transcript, not surfaced through the bridge.
 #   effort -> session/set_config_option(thought-level) for ANY agent that
 #             advertises one (codex `reasoning_effort`, claude `effort`). Falls
 #             back to the highest supported level <= requested; skipped with a warn
@@ -41,15 +42,17 @@ resume_attempt_cap = 3
 [server]
 addr = "127.0.0.1:8080"
 
-# kiro: zero-auth local default (kiro-cli acp). Left unpinned here (default model
-# `auto`). kiro advertises its model via the `models` surface + session/set_model,
-# so you MAY pin an advertised id, e.g. `model = "claude-sonnet-4.5"`.
+# kiro: zero-auth local default (kiro-cli acp). ACP SDK 1.x can discover Kiro's
+# native model list, but cannot apply Kiro model pins unless the catalog marks
+# the agent `model_configurable: true`; leave model unpinned by default.
 [[agents]]
 id    = "kiro"
 cmd   = "kiro-cli"
 args  = ["acp"]
 
 # codex: gpt-5.5 with reasoning_effort.
+# Auth omitted: the bridge prefers ChatGPT-style auth (`chat-gpt` or legacy `chatgpt`)
+# when advertised. Set auth_method explicitly for API-key-only installs.
 [[agents]]
 id     = "codex"
 cmd    = "codex-acp"
@@ -57,7 +60,7 @@ model  = "gpt-5.5"
 effort = "high"
 
 # claude: subscription. `model` is validated against the advertised values and
-# applied; aliases work too (e.g. `model = "fable"` -> claude-fable-5[1m]).
+# applied. Fable-family model ids are blocked by this bridge; use another advertised model.
 [[agents]]
 id    = "claude"
 cmd   = "claude-agent-acp"

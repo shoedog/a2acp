@@ -1679,6 +1679,7 @@ mod tests {
             used: Some(15071),
             size: Some(258400),
             cost: None,
+            terminal: None,
             at_ms: 7,
         };
         store
@@ -1958,6 +1959,7 @@ mod tests {
             used: Some(15071),
             size: Some(258400),
             cost: None,
+            terminal: None,
             at_ms: 7,
         };
         let s1 = store.record_node_started(&t, &a, &op, 1).await.unwrap();

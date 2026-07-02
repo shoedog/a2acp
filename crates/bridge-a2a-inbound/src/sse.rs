@@ -226,6 +226,7 @@ mod tests {
             used: Some(7),
             size: Some(9),
             cost: None,
+            terminal: None,
             at_ms: 0,
         };
         assert!(event_to_sse(&Event::usage(snap), "t", "c").is_none());

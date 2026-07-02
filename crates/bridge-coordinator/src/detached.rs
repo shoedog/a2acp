@@ -752,6 +752,7 @@ mod sink_tests {
             used: Some(123),
             size: Some(1000),
             cost: None,
+            terminal: None,
             at_ms: 1,
         };
         sink.node_finished("member", true, "OUT", Some(&usage))
@@ -1866,12 +1867,14 @@ mod resume_tests {
             used: Some(15071),
             size: Some(258400),
             cost: None,
+            terminal: None,
             at_ms: 10,
         };
         let claude_usage = UsageSnapshot {
             used: Some(42),
             size: Some(100),
             cost: None,
+            terminal: None,
             at_ms: 11,
         };
         store

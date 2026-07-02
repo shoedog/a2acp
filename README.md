@@ -9,7 +9,7 @@ JSON-RPC/stdio) via a conformant SDK client, and streams results back over SSE.
 Increment 3b (ADR-0005) added the agent registry: a hot-reloadable, runtime-mutable
 `[[agents]]` config that supports live add/edit/remove of agents without restarting the
 bridge. Increment 3a (ADR-0004) replaced the hand-rolled ACP driver with a fully
-conformant `AcpBackend` over the official `agent-client-protocol =0.12.1` SDK.
+conformant `AcpBackend` over the official `agent-client-protocol =1.0.1` SDK.
 See `docs/superpowers/specs/2026-05-31-a2a-bridge-v3b-design.md` for the 3b design
 and `docs/superpowers/specs/2026-05-29-a2a-bridge-v1-design.md` for the v1 design.
 
@@ -46,7 +46,7 @@ A2A caller ──HTTP/JSON-RPC/SSE──▶ bridge-a2a-inbound (axum)
 - **A2A v1** via the official `a2a` crate (package `a2a-lf` =0.3.0). Methods: `SendMessage`,
   `SendStreamingMessage`, `GetTask`, `CancelTask`, `SubscribeToTask`. Version pinned to
   `a2a::VERSION = "1.0"`; header `A2A-Version`.
-- **ACP** via `agent-client-protocol` =0.12.1 (Apache-2.0,
+- **ACP** via `agent-client-protocol` =1.0.1 (Apache-2.0,
   `github.com/agentclientprotocol/rust-sdk`) — the official SDK drives the full
   conformant lifecycle: `initialize` → `authenticate` → `session/new` →
   `session/set_mode` → `session/set_config_option` (model + effort) →
@@ -94,12 +94,12 @@ cmd  = "kiro-cli"   # Agent binary (must be on PATH and in allowed_cmds if [regi
 args = ["acp"]      # Arguments passed to cmd
 # Optional per-agent ACP session settings:
 # name         = "Kiro"           # Human-readable name (fan-out source label); defaults to id
-# model        = "sonnet"         # Validated via session/set_config_option(model); hard-fails at mint if the agent doesn't advertise it (aliases: fable, opus)
 # model_provider = "openai"      # LLM vendor label — descriptive only, never on the wire
 # effort       = "high"          # Effort tier: minimal / low / medium / high / xhigh / max (model-dependent; falls back to highest supported ≤ requested)
 # mode         = "read-only"     # Hard session/set_mode (fatal if agent rejects)
 # cwd          = "/work/dir"     # Absolute working dir for session/new (defaults to current_dir)
-# auth_method  = "oauth"         # Auth method id for authenticate (defaults to first advertised)
+# auth_method  = "oauth"         # Auth method id for authenticate (optional; see selector behavior below)
+# Leave current Kiro unpinned; add model only to agents with model_configurable=true.
 
 [[agents]]
 id   = "codex"
@@ -119,12 +119,12 @@ addr = "127.0.0.1:8080"
 | `cmd` | yes | Agent binary to spawn (must be on PATH; must be in `allowed_cmds` if `[registry]` is set) |
 | `args` | no | Arguments passed to `cmd` (e.g. `["acp"]` for kiro-cli) |
 | `name` | no | Human-readable display name; drives the fan-out source label in artifacts (defaults to `id`) |
-| `model` | no | Model id set on the agent's advertised surface — `session/set_config_option(category="model")` for claude 0.44.0 / codex, or the unstable `models` + `session/set_model` for kiro (`auto`/`claude-sonnet-4.5`/…); **validated** against advertised values (hard-fails at mint if not advertised). Aliases resolve first (`fable`→`claude-fable-5[1m]`, `opus`→`default`) |
+| `model` | no | Model id set on the agent's advertised config-option surface — `session/set_config_option(category="model")` for claude/codex and any other agent that advertises `model_configurable: true`; **validated** against advertised values (hard-fails at mint if not advertised). Raw advertised ids win; fallback aliases then apply (`opus`→`default` when `opus` is not advertised). Fable-family ids are blocked by this bridge and omitted from the usable model catalog. Current Kiro models are discoverable but not configurable through ACP SDK 1.x, so leave Kiro unpinned unless the catalog marks it configurable. |
 | `model_provider` | no | LLM vendor label — descriptive/routing metadata only, never sent on the wire |
 | `effort` | no | Effort tier set via `session/set_config_option` for agents that advertise one (codex `reasoning_effort`, claude `effort`): `minimal` / `low` / `medium` / `high` / `xhigh` / `max`. Falls back to the highest supported level ≤ requested |
 | `mode` | no | Mode id for `session/set_mode` (hard error if agent rejects) |
 | `cwd` | no | Working directory for `session/new`; relative values are joined onto the bridge's `current_dir()` |
-| `auth_method` | no | Auth method id for `authenticate`; defaults to first method the agent advertises |
+| `auth_method` | no | Auth method id for `authenticate`; when omitted, ChatGPT-style auth (`chat-gpt` or legacy `chatgpt`) is preferred when advertised, otherwise the first advertised method is used. Set explicitly for API-key-only installs. |
 | `description` | no | Human description (seamed for future per-entry Agent Cards) |
 | `tags` | no | String tags (seamed for future per-entry Agent Cards) |
 | `version` | no | Config version string (seamed for future per-entry Agent Cards) |
@@ -149,18 +149,21 @@ effort = "high"      # codex thought-level id          -> "reasoning_effort":"hi
 [[agents]]
 id     = "claude"
 cmd    = "claude-agent-acp"
-model  = "fable"     # advertised id, or alias -> claude-fable-5[1m]  (claude-agent-acp >= 0.44.0)
+model  = "sonnet"    # advertised by claude-agent-acp
 effort = "high"      # claude thought-level id "effort" -> "effort":"high" (now actually applied)
 ```
 
-A model id validates against what the agent advertises. The aliases `fable`
-(→ `claude-fable-5[1m]`) and `opus` (→ `default`) apply as a **fallback** when the raw id
-isn't advertised — so `model = "fable"` works whether the adapter advertises the bare `fable`
-or the long `claude-fable-5[1m]` (the advertised id varies by adapter version/session).
+A model id validates against what the agent advertises. If the raw id is
+advertised, it is used as-is; otherwise the fallback alias `opus` maps to
+`default`.
+Fable-family model ids are intentionally blocked by this bridge even if an
+agent advertises them; use another advertised Claude model such as
+`sonnet`, `sonnet[1m]`, `haiku`, or `default`.
 `effort` maps to each agent's advertised thought-level id automatically (`reasoning_effort` for
 codex, `effort` for claude); a model that advertises no thought level (e.g. kiro) just skips it.
-To override per request instead of per agent, pass `a2a-bridge.model` / `a2a-bridge.effort` in
-the call metadata (see [Per-request agent selection and overrides](#per-request-agent-selection-and-overrides)).
+To override per request instead of per agent, pass `a2a-bridge.model` only when the selected
+agent's catalog has `model_configurable: true`, and pass `a2a-bridge.effort` when effort levels
+are advertised (see [Per-request agent selection and overrides](#per-request-agent-selection-and-overrides)).
 
 ### `[registry]` section
 
@@ -196,9 +199,9 @@ the file changes:
 4. On **parse error**: the error is logged and the last-good snapshot is kept. The bridge
    does not go down.
 
-Hot-reload was validated live: a model edit to a running registry took effect on the next
-new session with no respawn (`Arc::ptr_eq` warm-backend reuse proven against kiro-cli
-2.5.0 + codex-acp 0.15.0 simultaneously). See ADR-0005.
+Hot-reload was validated live: a config-only edit to a running registry took effect on the next
+new session with no respawn (`Arc::ptr_eq` warm-backend reuse proven in the original
+kiro-cli 2.5.0 + codex-acp 0.15.0 gate). See ADR-0005.
 
 ### Breaking config change: `[agent]` → `[[agents]]` + `default =`
 
@@ -211,7 +214,6 @@ fail with a TOML parse error on startup. To migrate:
 name = "kiro"
 cmd  = "kiro-cli"
 args = ["acp"]
-model = "gpt-4o"
 
 [server]
 addr = "127.0.0.1:8080"
@@ -223,11 +225,21 @@ default = "kiro"
 id   = "kiro"
 cmd  = "kiro-cli"
 args = ["acp"]
-model = "gpt-4o"
 
 [server]
 addr = "127.0.0.1:8080"
 ```
+
+If an older config pinned a Kiro model, remove that `model = ...` line during
+migration. ACP SDK 1.x no longer exposes Kiro's former `session/set_model`
+surface; Kiro model names may still appear in discovery output, but the catalog
+marks them `model_configurable: false` and a Kiro model pin now fails session
+mint instead of being silently ignored.
+
+For Codex ACP adapters that advertise `api-key` before `chat-gpt`, the bridge's
+default auth selector prefers ChatGPT-style auth when advertised. API-key
+deployments should set `auth_method = "api-key"` or the adapter-specific
+API-key method id explicitly.
 
 ## Testing & coverage
 
@@ -254,9 +266,9 @@ Typestate invariants (e.g. prompting a non-ready session, resuming a terminal ta
 proven uncompilable by `trybuild` compile-fail tests.
 
 Wire conformance is verified by `tests/golden_frames.rs` (hand-authored expected
-JSON for every outbound ACP frame) and `tests/corpus_replay.rs` (real captured
-frames from `kiro-cli 2.5.0` and `codex-acp 0.15.0` fed through the live mapping
-functions).
+JSON for every outbound ACP frame) and `tests/corpus_replay.rs` (historical real
+captures from `kiro-cli 2.5.0` and `codex-acp 0.15.0` fed through the live
+mapping functions).
 
 ### Per-request agent selection and overrides
 
@@ -267,7 +279,7 @@ that request only. All keys are optional and orthogonal to each other.
 | Metadata key | Type | Description |
 |---|---|---|
 | `a2a-bridge.agent` | string | Agent id to route to (must match an `[[agents]]` entry `id`). Absent → registry `default` |
-| `a2a-bridge.model` | string | Model id override for this request's ACP session (agent-native id, passed verbatim) |
+| `a2a-bridge.model` | string | Model id override for this request's session; valid only for agents whose `agent-models` catalog entry has `model_configurable: true` |
 | `a2a-bridge.effort` | string | Effort tier override: `minimal` / `low` / `medium` / `high` / `max` |
 | `a2a-bridge.mode` | string | Mode id override for `session/set_mode` (hard error if agent rejects) |
 | `a2a-bridge.skill` | string | Routing skill: `delegate` (outbound peer) or `fan-out` (default + peer concurrently) |
@@ -308,14 +320,15 @@ lifecycle (`initialize` → `session/new` → `session/prompt`), asserts the str
 text contains `PONG` and the turn ends with `end_turn`. This was run against
 kiro-cli 2.5.0 and passed — the kiro DoD gate is MET.
 
-**codex-acp** (gate MET — run and passing against zed-industries/codex-acp 0.15.0):
+**codex-acp** (historical gate MET against zed-industries/codex-acp 0.15.0; the
+containerized reader image now installs `@agentclientprotocol/codex-acp@1.1.0`):
 
 ```bash
 cargo test -p a2a-bridge --test e2e_acp_codex -- --ignored --nocapture
 # Prereqs: codex-acp on PATH and authenticated; codex-acp is distinct from codex-cli
 ```
 
-This test spawns a real zed-industries/codex-acp 0.15.0 process, drives the full
+This test spawns the real `codex-acp` process on `PATH`, drives the full
 conformant lifecycle (`initialize` → `authenticate` → `session/new` →
 `session/set_mode` → `session/prompt`), and yielded streamed `PONG` (across two
 `agent_message_chunk` frames) and `end_turn` — the codex DoD gate is MET. The real
@@ -341,12 +354,12 @@ This test:
 1. Starts the full bridge stack (registry + inbound server + ACP backends) in-process.
 2. Sends a `SendStreamingMessage` with `a2a-bridge.agent=kiro` — asserts `PONG` from kiro-cli.
 3. Sends a `SendStreamingMessage` with `a2a-bridge.agent=codex` — asserts `PONG` from codex-acp.
-4. Sends with a per-request `a2a-bridge.model` override — asserts the override was applied.
-5. Edits the registry config (model-only change on kiro's entry) and calls `apply()` — asserts
+4. Sends with a per-request `a2a-bridge.model` override for codex — asserts the override was applied.
+5. Edits the registry config (model-only change on codex's entry) and calls `apply()` — asserts
    that `Arc::ptr_eq` confirms the **same slot instance** was reused (no respawn), and that the
    new model is live on the next session.
 
-Gate MET: run live against kiro-cli 2.5.0 + codex-acp 0.15.0 — both returned `PONG`,
+Gate MET: originally run live against kiro-cli 2.5.0 + codex-acp 0.15.0 — both returned `PONG`,
 per-request routing and overrides worked, and the warm-backend reuse was proven. See ADR-0005.
 
 ### Original gated smoke (pre-3a, v1 inbound pipeline)
@@ -394,7 +407,7 @@ source and fan-out alike, so a task can carry multiple artifacts before its term
 **In:** inbound A2A with **A2A-conformant `StreamResponse` SSE** + a terminal-status task
 model; **runtime-mutable agent registry** (hot-reload, per-request agent selection and
 model/effort/mode overrides, lease-draining retirement, task binding); **conformant ACP
-client** (`agent-client-protocol` =0.12.1 SDK, bidirectional, wire-golden-tested, live
+client** (`agent-client-protocol` =1.0.1 SDK, bidirectional, wire-golden-tested, live
 kiro + codex validated); **outbound delegation** (passthrough) and **fan-out / second
 opinion** (Kiro + peer merged, source-labeled, degrade-to-survivor); streaming with
 coalescing; cancellation (prompt-result semantics; both-source cancel on inbound

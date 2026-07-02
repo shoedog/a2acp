@@ -34,12 +34,45 @@ pub struct UsageCost {
     pub currency: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalUsage {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_write_tokens: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub used: Option<u64>,
     pub size: Option<u64>,
     pub cost: Option<UsageCost>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TerminalUsage>,
     pub at_ms: i64,
+}
+
+impl UsageSnapshot {
+    pub fn merge_missing_from(&mut self, previous: &Self) {
+        if self.used.is_none() {
+            self.used = previous.used;
+        }
+        if self.size.is_none() {
+            self.size = previous.size;
+        }
+        if self.cost.is_none() {
+            self.cost = previous.cost.clone();
+        }
+        if self.terminal.is_none() {
+            self.terminal = previous.terminal.clone();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -198,6 +231,7 @@ mod tests {
                     used: Some(10),
                     size: Some(200),
                     cost: None,
+                    terminal: None,
                     at_ms: 100,
                 },
             },
@@ -288,6 +322,7 @@ mod tests {
                 used: Some(15071),
                 size: Some(258400),
                 cost: None,
+                terminal: None,
                 at_ms: 5,
             }),
         };

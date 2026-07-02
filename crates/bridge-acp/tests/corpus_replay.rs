@@ -17,7 +17,7 @@
 // Both kiro-cli and codex-acp are MET (real captures): kiro-cli from `kiro-cli acp`
 // 2.5.0, codex-acp from zed-industries/codex-acp 0.15.0.
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionRequest, SessionNotification, StopReason,
 };
 use bridge_acp::acp_backend::AcpBackend;
@@ -111,10 +111,10 @@ fn replay(frame: &Value) -> Option<ReplayOutcome> {
             // is NOT benign here — on a deser failure its typed dispatch auto-emits a
             // `-32602` error notification BACK to the agent, which a real agent reacts to
             // by stalling the turn (the `end_turn` result never arrives → hang). That is
-            // exactly what `usage_update{cost}` did before we enabled `unstable_session_usage`.
-            // So a genuinely-unknown `session/update` variant must be MODELED (feature/version
-            // bump), not relied on to "drop" here. We keep the tolerant `None` only so the
-            // corpus never panics on a future unknown — it does NOT mean production is safe.
+            // exactly what `usage_update{cost}` did before the SDK 1.x schema modeled
+            // usage-bearing streaming frames. So a genuinely-unknown `session/update` variant must be MODELED (feature/version bump),
+            // not relied on to "drop" here. We keep the tolerant `None` only so the corpus never
+            // panics on a future unknown — it does NOT mean production is safe.
             "session/update" => {
                 return match serde_json::from_value::<SessionNotification>(params) {
                     Ok(notif) => AcpBackend::map_session_update(notif).map(ReplayOutcome::Update),
@@ -357,12 +357,12 @@ fn gemini_available_commands_update_is_modeled_not_parse_error() {
 #[test]
 fn usage_update_is_modeled_and_surfaced_not_a_minus_32602() {
     // Regression for the live HANG: claude-agent-acp emits a `session/update` of variant
-    // `usage_update` (with a `cost`). WITHOUT the `unstable_session_usage` feature the SDK's
-    // internally-tagged `SessionUpdate` enum (no `#[serde(other)]`) HARD-FAILS to deserialize it,
-    // the live SDK auto-emits a spurious `-32602` to the agent, and the turn stalls (multi-minute
-    // hang). With the feature on, it deserializes into the modeled `UsageUpdate` variant and
-    // `map_session_update` surfaces it as `Update::Usage`. MUST be a MODELED update (Ok), not a
-    // parse error (Err).
+    // `usage_update` (with a `cost`). Before the SDK 1.x schema modeled `UsageUpdate`,
+    // the internally-tagged `SessionUpdate` enum (no `#[serde(other)]`) HARD-FAILED to
+    // deserialize it, the live SDK auto-emitted a spurious `-32602` to the agent, and the turn
+    // stalled (multi-minute hang). In schema 1.1 this deserializes into the modeled
+    // stable `UsageUpdate` variant and `map_session_update` surfaces it as `Update::Usage`.
+    // MUST be a MODELED update (Ok), not a parse error (Err).
     let params = serde_json::json!({
         "sessionId": "s1",
         "update": {
@@ -373,7 +373,7 @@ fn usage_update_is_modeled_and_surfaced_not_a_minus_32602() {
         }
     });
     let notif = serde_json::from_value::<SessionNotification>(params).expect(
-        "usage_update MUST deserialize (modeled via unstable_session_usage) — a parse error here \
+        "usage_update MUST deserialize — a parse error here \
          is the live-hang bug (the SDK would emit a turn-stalling -32602)",
     );
     match AcpBackend::map_session_update(notif).expect("usage_update maps") {

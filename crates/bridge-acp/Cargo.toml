@@ -5,20 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# `unstable_session_usage` models the `usage_update` SessionUpdate variant. WITHOUT it the SDK's
-# internally-tagged `SessionUpdate` enum (no `#[serde(other)]`) HARD-FAILS to deserialize an agent's
-# `session/update` of variant `usage_update` and auto-emits a spurious `-32602` back to the agent, which
-# stalls the turn → the `end_turn` result never arrives → a multi-minute hang (live-found vs claude-agent-acp,
-# which now sends `usage_update{cost}`). With the feature on, the variant deserializes and is dropped as an
-# unmodeled update by `map_session_update`. The variant already ships in the pinned 0.12.1 — feature only, no bump.
-# `unstable_session_model` gates the `NewSessionResponse.models` field (`SessionModelState`:
-# current_model_id + available_models) and `session/set_model` (`SetSessionModelRequest`). This is
-# the model-selection surface kiro-cli uses: kiro returns `config_options: None` but DOES advertise
-# `models` and accepts `session/set_model`. claude 0.44.0 / codex moved model into `config_options`;
-# kiro did NOT, so the bridge must support BOTH surfaces. (Probed live 2026-06-10.)
+# ACP SDK 1.x made model/config and streaming UsageUpdate surfaces stable, but auth methods
+# and terminal PromptResponse.usage still ride feature gates. Keep both enabled: auth
+# methods drive login selection, and terminal usage carries per-turn token totals.
 agent-client-protocol = { workspace = true, features = [
-    "unstable_session_usage",
-    "unstable_session_model",
+    "unstable_auth_methods",
+    "unstable_end_turn_token_usage",
 ] }
 bridge-core = { path = "../bridge-core" }
 thiserror.workspace = true

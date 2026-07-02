@@ -8,12 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git ripgrep ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin the ACP agent CLIs (portable Node packages; versions match the host as of 2026-06-04).
+# Pin the ACP agent CLIs (portable Node packages; versions verified 2026-07-02).
 # claude-agent-acp pulls @anthropic-ai/claude-agent-sdk, whose optional dep is the platform `claude`
 # binary — the LINUX build resolves here, not the host's macOS one.
 RUN npm install -g \
-      @agentclientprotocol/claude-agent-acp@0.39.0 \
-      @zed-industries/codex-acp@0.15.0
+      @agentclientprotocol/claude-agent-acp@0.55.0 \
+      @agentclientprotocol/codex-acp@1.1.0
 
 # kiro-cli: install the LINUX build (the host's macOS binary can't run in this Linux image). Official
 # zip method (https://kiro.dev/docs/cli/installation/#with-a-zip-file); arch-aware so it works whether

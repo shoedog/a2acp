@@ -33,7 +33,7 @@ args = ["--repo", "{cwd}", "--cache-dir", "/Users/wesleyjinks/.local/share/a2a/p
 [[agents]]
 id = "claude"
 cmd = "claude-agent-acp"
-model = "fable"
+model = "sonnet"
 effort = "high"
 
 [[agents.mcp]]

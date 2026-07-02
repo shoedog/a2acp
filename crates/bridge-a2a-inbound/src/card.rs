@@ -119,7 +119,7 @@ pub fn agent_card(
         }])
     };
 
-    // agent-models extension: per-agent override matrix from the live catalog. The per-agent object
+    // agent-models extension: per-agent model catalog from the live probes. The per-agent object
     // (empty effort/modes omitted) is built by the shared `caps_to_json` the CLI also uses (DRY).
     let mut ext_vec = extensions.unwrap_or_default();
     if !catalog.is_empty() {
@@ -132,9 +132,9 @@ pub fn agent_card(
         ext_vec.push(AgentExtension {
             uri: "https://github.com/shoedog/a2acp/ext/agent-models/v1".to_string(),
             description: Some(
-                "Per-agent model/effort/mode override matrix. To override a default, send \
-            message.metadata `a2a-bridge.model` / `a2a-bridge.effort` / `a2a-bridge.mode` targeting \
-            that agent."
+                "Per-agent model/effort/mode catalog. To override a default, send message.metadata \
+            `a2a-bridge.model` only for agents with `model_configurable: true`, and \
+            `a2a-bridge.effort` / `a2a-bridge.mode` only when those lists are present."
                     .to_string(),
             ),
             required: Some(false),
@@ -355,6 +355,7 @@ mod tests {
             AgentCaps {
                 current_model: Some("sonnet".into()),
                 models: vec!["default".into(), "sonnet".into(), "haiku".into()],
+                model_configurable: true,
                 effort_levels: vec!["low".into(), "high".into()],
                 modes: vec![],
                 current_mode: None,
@@ -375,6 +376,10 @@ mod tests {
         assert_eq!(
             agents["claude"]["models"],
             serde_json::json!(["default", "sonnet", "haiku"])
+        );
+        assert_eq!(
+            agents["claude"]["model_configurable"],
+            serde_json::json!(true)
         );
         assert_eq!(
             agents["claude"]["effort"],

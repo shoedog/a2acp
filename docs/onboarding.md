@@ -70,11 +70,13 @@ advertised models (+ effort levels + modes), so you know exactly what to put in 
 config or a per-request override. The same matrix rides the Agent Card as the
 `agent-models` extension (`capabilities.extensions[].params.agents`), probed at
 `serve` startup and refreshed on `SIGHUP` — a remote A2A orchestrator can read it
-to pick a valid override with no out-of-band knowledge.
+to pick a valid override with no out-of-band knowledge. Use `a2a-bridge.model`
+only when that agent's catalog entry has `model_configurable: true`; Kiro's
+native model list is currently discovery-only under ACP SDK 1.x.
 
 | knob     | how it's applied                              | caveat |
 |----------|-----------------------------------------------|--------|
-| `model`  | set on the agent's advertised surface | **VALIDATED at mint** — pinning a value the agent does not advertise hard-fails the session (the error lists the advertised values). claude 0.44.0 / codex advertise it via `session/set_config_option(category="model")`; **kiro** via the unstable `models` surface + `session/set_model` (ids `auto`/`claude-sonnet-4.5`/…). Aliases resolve first (`fable`→`claude-fable-5[1m]`, `opus`→`default`). claude's served model shows in claude's own transcript, not the bridge's. |
+| `model`  | `session/set_config_option` (model) | **VALIDATED at mint** — pinning a value the agent does not advertise hard-fails the session (the error lists the advertised values). claude and codex advertise model ids via `session/set_config_option(category="model")`; agents whose catalog entry has `model_configurable: false` must be left unpinned. Raw advertised ids win; if `opus` is not advertised it falls back to `default`. Fable-family model ids are blocked by this bridge and omitted from the usable model catalog. claude's served model shows in claude's own transcript, not the bridge's. |
 | `effort` | `session/set_config_option` (thought-level)   | Applied to **any** agent that advertises one (codex `reasoning_effort`, claude `effort`). Falls back to the highest supported level **≤** requested; skipped with a warn if the agent advertises none. Values: minimal/low/medium/high/xhigh/max |
 | `mode`   | `session/set_mode`                            | **HARD-fails** on an unknown/invalid mode id — set only to a mode your agent advertises (the reference config omits it) |
 | api      | only `model` is applied                       | `effort`/`mode` are ignored for `kind="api"` |
@@ -86,7 +88,7 @@ agent's lowest advertised level is skipped (with a warn), leaving the default.
 
 | model | supported effort levels |
 |-------|--------------------------|
-| Fable 5, Opus 4.8, Opus 4.7 | low, medium, high, xhigh, max |
+| Opus 4.8, Opus 4.7          | low, medium, high, xhigh, max |
 | Opus 4.6, Sonnet 4.6        | low, medium, high, max |
 | codex (gpt-5.x)             | low, medium, high, xhigh |
 

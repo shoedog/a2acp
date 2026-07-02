@@ -14,7 +14,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use bridge_acp::acp_backend::{AcpBackend, AcpConfig};
-use bridge_core::catalog::{parse_kiro_list_models, parse_ollama_models, AgentCaps, ModelCatalog};
+use bridge_core::catalog::{
+    parse_kiro_list_models, parse_ollama_models, sanitize_model_caps, AgentCaps, ModelCatalog,
+};
 use bridge_core::domain::{AgentEntry, AgentKind};
 use bridge_core::ports::AgentBackend; // for `.retire()`
 
@@ -151,7 +153,7 @@ fn collect_catalog(results: Vec<(String, Result<AgentCaps, String>)>) -> ModelCa
     results
         .into_iter()
         .filter_map(|(id, result)| match result {
-            Ok(caps) => Some((id, caps)),
+            Ok(caps) => Some((id, sanitize_model_caps(caps))),
             Err(reason) => {
                 tracing::warn!(agent = %id, %reason, "model probe failed; omitting from catalog");
                 None
@@ -230,7 +232,7 @@ mod tests {
             (
                 "ok".to_string(),
                 Ok(AgentCaps {
-                    models: vec!["m".into()],
+                    models: vec!["m".into(), "claude-fable-5.1[1m]".into()],
                     ..Default::default()
                 }),
             ),
