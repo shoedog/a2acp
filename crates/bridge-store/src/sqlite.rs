@@ -26,6 +26,8 @@ impl SqliteStore {
         let conn = rusqlite::Connection::open_in_memory().map_err(|_| BridgeError::StoreFailure)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|_| BridgeError::StoreFailure)?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")
+            .map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             _lock: None,
@@ -63,6 +65,18 @@ impl SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         let conn = rusqlite::Connection::open(path).map_err(|_| BridgeError::StoreFailure)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if journal_mode != "wal" {
+            tracing::warn!(
+                mode = %journal_mode,
+                path = %path.display(),
+                "PRAGMA journal_mode=WAL not honored; continuing without WAL"
+            );
+        }
+        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")
             .map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -2120,5 +2134,35 @@ mod tests {
             .await
             .unwrap();
         assert!(b > a, "seq continues across a resumed run, not reset");
+    }
+
+    #[tokio::test]
+    async fn file_backed_open_sets_wal_synchronous_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pragmas.db");
+        let s = SqliteStore::open(&path).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1);
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000);
+    }
+
+    #[tokio::test]
+    async fn in_memory_open_sets_busy_timeout_only() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let conn = s.conn.lock().unwrap();
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000);
     }
 }
