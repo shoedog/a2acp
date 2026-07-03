@@ -62,26 +62,28 @@ A workflow is just `[[workflows]]` + `[[workflows.nodes]]` in the config — cop
 ## 3. Implement a task in a repo (clone → edit → verify → review → commit)
 
 ```bash
-a2a-bridge implement "Add a --json flag to the export command" \
+a2a-bridge task-spec template implement > task.md   # scaffold a typed task-spec; edit it
+a2a-bridge implement --input task.md \
   --repo   /path/to/target-repo \
   --config examples/a2a-bridge.containerized.toml \
-  [--depth light|standard]                          # override the auto review depth (optional)
+  [--depth auto|light|standard|thorough]             # override the auto review depth (optional)
 ```
 
 Clones the repo into a quarantine under `allowed_cwd_root`, runs the **warm** containerized `impl` agent
 (edit + fix turns share ONE container + session), build/test-verifies, reviews the diff, and hands off a
 branch for you to merge. The default `impl` agent is **codex (gpt-5.5, effort=high)**.
 
-The **review-the-diff** scales to the diff: small diffs get a fast 1-reviewer **light** pass, larger ones the
-2-reviewer **standard** pass + a prism diff-slice. Auto-sized from `git diff --numstat`; `--depth` forces a
-tier (persisted across `--resume`). Reviewers run host-side with prism code-nav (read-only).
+The **review-the-diff** scales to the diff: **light** (1-reviewer, fast) for small diffs, **standard**
+(2-reviewer + a prism diff-slice) by default, and **thorough** (draft→refine double pass) for large code/infra
+diffs. Auto-sized from `git diff --numstat`; `--depth` forces a tier (persisted across `--resume`). Reviewers
+run host-side with prism code-nav (read-only).
 
 **Land it (`merge`, ADR-0027).** Integrate an **Approved** run's commit into its source repo, re-authored to
 **you** (the operator), without touching your working checkout:
 
 ```bash
 a2a-bridge merge <id> --onto main          # land run <id> onto `main` (fast-forward off its base_commit)
-a2a-bridge implement "…" --repo … --merge --onto main   # implement + auto-merge when Approved
+a2a-bridge implement --input task.md --repo … --merge --onto main   # implement + auto-merge when Approved
 ```
 
 `merge` re-authors the clone's commit via `git commit-tree` and lands it with
