@@ -3,6 +3,7 @@ name = "bridge-acp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 # ACP SDK 1.x made model/config and streaming UsageUpdate surfaces stable, but auth methods

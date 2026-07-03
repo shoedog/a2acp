@@ -3,6 +3,7 @@ name = "a2a-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "a2a-bridge"
@@ -37,7 +38,7 @@ async-trait = { workspace = true }
 arc-swap = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde_json = { workspace = true }
-a2a = { package = "a2a-lf", version = "=0.3.0" }
+a2a.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
