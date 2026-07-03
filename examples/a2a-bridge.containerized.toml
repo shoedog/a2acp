@@ -187,6 +187,7 @@ addr = "127.0.0.1:8080"
 #    Moved from :ro container to host-side so it can use prism structural navigation for deeper reviews.
 #    Read-only is PROMPT-CONTRACT only here (claude-agent-acp has no read-only flag) — softer than codex's
 #    hard sandbox_mode=read-only below; acceptable for an advisory reviewer, but note the asymmetry. ──
+# Tier 0 — prompt-contract only (claude has no native sandbox flag)
 [[agents]]
 id  = "claude"
 cmd = "claude-agent-acp"
@@ -204,6 +205,7 @@ args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/Users/wesleyjin
 
 # ── codex: host-side reviewer with prism code-nav (no container sandbox; runs host codex-acp in read-only
 #    mode). sandbox_mode=read-only + approval_policy=never enforces hard read-only on the host-side agent. ──
+# Tier 1 — codex agent-native read-only sandbox (host)
 [[agents]]
 id  = "codex"
 cmd = "codex-acp"
@@ -222,6 +224,7 @@ args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/Users/wesleyjin
 
 # ── kiro: Linux build baked into the image. VERIFIED: Linux auth is ~/.local/share/kiro-cli/data.sqlite3
 #    (NOT ~/.aws); minted once via `kiro-cli login --use-device-flow` into the a2a-kiro-data volume. ──
+# Tier 2 — container :ro + locked egress
 [[agents]]
 id   = "kiro"
 cmd  = "kiro-cli"
@@ -243,6 +246,7 @@ volumes = ["a2a-kiro-data:/root/.local/share"]
 #    OWN bubblewrap sandbox (absent from the image) so it can edit the :rw clone — the Docker container IS
 #    the sandbox. effort=high is now honored by the warm session (the ADR-0024 effective_config fold).
 #    To use claude instead: cmd="claude-agent-acp", drop the codex args, and mount the claude creds.
+# Tier 3 — container_rw (Docker is the boundary; codex bwrap absent in-container)
 [[agents]]
 id     = "impl"
 kind   = "container_rw"

@@ -9,10 +9,11 @@ to a running multi-agent bridge.
 > See [`AGENTS.md`](../AGENTS.md) for the copy-paste quickstart, and `a2a-bridge help` /
 > `a2a-bridge <subcommand> --help` for flags. You do not need to read the source.
 >
-> **Running several in parallel?** A containerized run's container owner is
-> `hash(config_path, mount, agent_id)` — **not** the target repo. Parallel runs are safe only with a
-> **distinct config file** (or distinct impl agent id) each; the same config pointed at two repos at once
-> will collide on the container name + boot-sweep. Give each concurrent project its own config.
+> **Running several in parallel?** Concurrent containerized runs are **safe with one shared config** — same
+> repo twice, or different repos at once. Each run stamps a unique `a2a.run` instance id (`{pid}-{nonce}`)
+> into its container names (no name clash) and holds an OS `flock` lease that marks it alive, so a peer's
+> before-first-use recovery classifies + reaps only **crashed** (Dead) orphans, never a live run's containers
+> (ADR-0025). Inspect or clean up with `a2a-bridge containers list|reap`.
 
 > **Podman (macOS):** use `examples/a2a-bridge.containerized.podman.toml` and see
 > `docs/containerized-agents.md` → §9 Podman (separate image store, `podman-egress.sh`, re-up after a
@@ -135,11 +136,13 @@ rigor) to the committed diff size:
   diff-slice** (defect-focused: blast radius, taint paths, missing symmetry)
   written to `<clone>/.git/a2a-bridge/review-slices/…` and handed to the reviewers
   as a reference file.
+- **thorough** (diff ≥ `[review].thorough_min_lines` OR ≥ `thorough_min_files`): a
+  draft→refine double pass for large code/infra diffs — each reviewer drafts,
+  then refines its own draft with fresh eyes, before the synth.
 
 Auto-selected from `git diff --numstat` each attempt; override with
-`a2a-bridge implement … --depth light|standard`. A forced depth is stored in the
-resume checkpoint (and `--depth` on `--resume` overrides it). (`thorough` —
-a refine pass — is deferred; see the design spec.)
+`a2a-bridge implement … --depth auto|light|standard|thorough`. A forced depth is
+stored in the resume checkpoint (and `--depth` on `--resume` overrides it).
 
 ## Path + reload rules
 

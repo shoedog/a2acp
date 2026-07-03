@@ -1,23 +1,78 @@
 # a2a-bridge
 
-A single Rust binary that exposes one or more local CLI coding agents (**Kiro**,
-**codex-acp**, or any ACP-speaking agent) as an **A2A**-compliant network service.
-Remote A2A callers send tasks; the bridge resolves the target agent from a
-runtime-mutable registry, drives it over **ACP** (the Agent Client Protocol,
-JSON-RPC/stdio) via a conformant SDK client, and streams results back over SSE.
+A single Rust binary that exposes one or more local CLI coding agents (**codex**, **claude**,
+**Kiro**, or any other ACP-speaking agent, plus OpenAI-compatible HTTP backends) as an
+**A2A**-compliant network service. It also runs multi-agent **workflows** (fan-out/pipeline
+review, design, autonomous implement-and-hand-off) directly from the CLI, with or without a
+server running. Remote A2A callers — or the CLI — resolve the target agent(s) from a
+runtime-mutable registry, drive them over **ACP** (the Agent Client Protocol, JSON-RPC/stdio)
+via a conformant SDK client, and get results back over SSE or as workflow output.
 
-Increment 3b (ADR-0005) added the agent registry: a hot-reloadable, runtime-mutable
-`[[agents]]` config that supports live add/edit/remove of agents without restarting the
-bridge. Increment 3a (ADR-0004) replaced the hand-rolled ACP driver with a fully
-conformant `AcpBackend` over the official `agent-client-protocol =1.0.1` SDK.
-See `docs/superpowers/specs/2026-05-31-a2a-bridge-v3b-design.md` for the 3b design
-and `docs/superpowers/specs/2026-05-29-a2a-bridge-v1-design.md` for the v1 design.
+## What this is
+
+a2a-bridge is a **reference implementation**: a working, opinionated answer to "how do you
+bridge A2A and ACP, and how do you orchestrate several coding agents against one repo." It is
+an actively developed personal tool published openly, not a maintained platform with support
+commitments — see [CONTRIBUTING.md](CONTRIBUTING.md) for the exact stance ("maintained, not
+(yet) supported", no API/config stability guarantees pre-1.0, breaking changes are recorded in
+[`docs/adr/`](docs/adr/)). Read it before filing an issue or opening a PR.
+
+## Quickstart (5 minutes)
+
+```bash
+# 1. Build (pinned toolchain: rust-toolchain.toml, Rust 1.94.0)
+cargo build --release --bin a2a-bridge
+
+# 2. Scaffold a config + review prompts for two agents already on your PATH
+./target/release/a2a-bridge init --agents codex,claude
+
+# 3. Sanity-check the config before using it (parses + resolves prompts/workflows, spawns nothing)
+./target/release/a2a-bridge validate --config ./a2a-bridge.toml
+
+# 4. Scaffold a typed task input, then run a two-reviewer workflow against a repo
+./target/release/a2a-bridge task-spec template code-review > task.md
+./target/release/a2a-bridge run-workflow code-review \
+  --input task.md --session-cwd . --config ./a2a-bridge.toml
+```
+
+That last command prints the synthesized review to stdout (see
+[What a review run looks like](#what-a-review-run-looks-like) below for a sample). To run as a
+long-lived server instead: `a2a-bridge serve --config ./a2a-bridge.toml` (Agent Card at
+`GET /.well-known/agent-card.json`), then `a2a-bridge submit`/`task watch`/`session status`
+against it. For the full agent-facing walkthrough (workflows against *any* repo, `implement`,
+containers) see [AGENTS.md](AGENTS.md); for running your own multi-agent bridge end to end see
+[docs/onboarding.md](docs/onboarding.md).
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `run-workflow <id>` | Run a workflow (`design`, `code-review`, `spec-review`, `plan-review`, or a custom one) against a repo. `--input <spec> --session-cwd <repo> [--config <f>] [--out <f>]` |
+| `run-batch <workflow>` | Submit a manifest of independent workflow runs to a running `serve`, admitted under a shared concurrency cap. `--manifest <file> [--concurrency K] [--detach]` |
+| `batch` | Inspect the batch store: `status <id>` \| `list` \| `cancel <id>` |
+| `implement` | Clone a repo, implement a task on a warm containerized agent, build/test-verify, review the diff, hand off a branch. `--input <file|-> --repo <path> [--config <f>] [--merge [--onto <branch>]]` |
+| `merge <id>` | Land an **Approved** `implement` run's commit into its source repo, fast-forward, re-authored to the operator. `[--onto <branch>] [--force]` |
+| `models` | List each configured agent's advertised models/effort/modes (probed live). `[--config <f>] [--agent <id>] [--json]` |
+| `init` | Scaffold `a2a-bridge.toml` + prompts for the given agents. `--agents codex,claude [--dir <d>] [--force]` |
+| `validate` | Validate config schema, registry, workflow DAGs, and prompt refs — or `--repo-hygiene` (this repo's own workflow-artifact hygiene gate) |
+| `serve` | Run the A2A server. `[--config <path>]` |
+| `mcp` | Serve the MCP protocol over stdio, backed by the same `Coordinator` service API. `[--config <path>] [--store <path>]` |
+| `task-spec` | Inspect/scaffold/validate typed task-spec inputs: `schema` \| `template <type>` \| `input <file>` |
+| `prompt` | Inspect the named `[[prompts]]` registry: `list` \| `show <id>` |
+| `containers` | List/reap this config's managed containers (crash-orphan cleanup): `list [--all]` \| `reap [--stale] [--force <name>]` |
+| `submit` | Send one message to a running `serve` over A2A. `[skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--cwd <dir>]` |
+| `task` | Query a running `serve`'s durable task store: `get` \| `list` \| `cancel` \| `watch <id>` (reattachable SSE) |
+| `session` | Warm-session control against a running `serve`: `status` \| `release` \| `cancel` \| `clear` \| `compact <contextId>` |
+
+Run `a2a-bridge <subcommand> --help` for full flags on any of these; `a2a-bridge help` prints the
+same summary table.
 
 ## Architecture
 
-Hexagonal / ports-and-adapters. The domain-only `bridge-core` (Task/Session typestate,
-all port traits, the translator) is driven by adapters; nothing in the core depends on an
-adapter.
+Hexagonal / ports-and-adapters. `bridge-core` is the protocol-SDK-free core — the
+`Task`/`Session` typestate, all port traits, the streaming translator, and operational
+substrate (sandbox/profile/task-spec/catalog types) that every adapter shares — driven by
+adapters; nothing in the core depends on an adapter.
 
 ```
 A2A caller ──HTTP/JSON-RPC/SSE──▶ bridge-a2a-inbound (axum)
@@ -26,86 +81,87 @@ A2A caller ──HTTP/JSON-RPC/SSE──▶ bridge-a2a-inbound (axum)
                                   bridge-core (Translator, typestate, ports)
                                       │  AgentRegistry / AgentBackend (streaming)
                                       ▼
-                                  bridge-registry ──SpawnFn──▶ bridge-acp ──ACP/NDJSON/stdio──▶ kiro-cli / codex-acp
+                                  bridge-registry ──SpawnFn──▶ bridge-acp / bridge-api / bridge-container
+                                                                    │  ACP·NDJSON·stdio / HTTP / container
+                                                                    ▼
+                                                        kiro-cli · codex-acp · claude-agent-acp · …
 ```
+
+`bridge-coordinator` hosts `Coordinator`, the one stable Rust service API meant to sit under
+every protocol adapter (A2A, CLI, MCP alike — Slice 8, ADR pending consolidation). Today
+`bridge-mcp`'s stdio adapter (`a2a-bridge mcp`) is built directly on `Arc<Coordinator>`, and the
+CLI's `submit`/`task`/`session` subcommands are thin A2A HTTP clients against a running `serve`.
+The A2A inbound server (`bridge-a2a-inbound`) has **not yet** been migrated onto `Coordinator`
+— it still owns its own parallel `SessionManager`/task-store wiring, duplicating some
+turn-lifecycle logic that `Coordinator` also implements. This is a known, tracked gap (see
+`docs/2026-07-03-strategic-analysis.md`), not a design flaw: the seam exists, the migration
+just hasn't landed.
+
+**Honest note on the typestate:** the compile-time `Task<S>`/`Session<S>` typestate in
+`bridge-core` (`trybuild`-verified — invalid transitions fail to *compile*) is a spec artifact,
+not the thing that actually gates concurrent turns at runtime. The runtime lifecycle is
+`SessionManager`'s claim-state enum (`Idle` / `Running` / `Resetting` / `Compacting` / …, in
+`bridge-coordinator`), which is where the hard-won invariants (cancel tokens, generation
+guards, single-flight claims) actually live. The typestate seam is preserved for later wiring.
+
+## Crates
 
 | Crate | Responsibility |
 |-------|----------------|
-| `bridge-core` | Domain types, `Task`/`Session` typestate, all port traits, the streaming translator (coalescer + anti-corruption rules) |
+| `bridge-core` | Domain types, `Task`/`Session` typestate, all port traits, the streaming translator (coalescer + anti-corruption rules), plus shared sandbox/profile/task-spec/catalog types |
 | `bridge-registry` | Runtime-mutable `Registry` over `ArcSwap<RegistryState>`; lazy-spawn via `SpawnFn`; atomic `apply()` reconcile; lease-draining async retirement |
-| `bridge-acp` | NDJSON frame reader, process supervisor (group-kill), conformant `AcpBackend`, replay backend |
+| `bridge-acp` | NDJSON frame reader, process supervisor (group-kill), conformant `AcpBackend` over the official ACP SDK, replay backend |
+| `bridge-api` | Non-process, OpenAI-compatible HTTP `AgentBackend` (`kind="api"`) — for API-only local/hosted models |
+| `bridge-container` | Write-capable containerized ACP agent (`ContainerRwBackend`); per-turn or warm-session container lifecycle over Docker/Podman |
+| `bridge-worktree` | Worktree-per-session isolation: a `WorktreeBackend` decorator + host-`git worktree` provider |
 | `bridge-a2a-inbound` | A2A v1 JSON-RPC server (axum), Agent Card, SSE, task binding |
-| `bridge-a2a-outbound` | `DelegationPort` stub (Increment 2.5) |
-| `bridge-store` | SQLite `SessionStore` (task↔session + pending-request) |
-| `bridge-policy` | `AutoPolicy` + `AlwaysGrant` auth (invoked seams) |
+| `bridge-a2a-outbound` | Outbound A2A `DelegationPort`: real HTTP/SSE client to a remote A2A peer (delegate / fan-out skills) |
+| `bridge-store` | SQLite-backed `SessionStore` (task↔session mapping) and durable `TaskStore` impl |
+| `bridge-policy` | `PolicyEngine` / `AuthMiddleware` port impls (auto-approve, always-grant, interactive permission) |
 | `bridge-observ` | `tracing` setup + correlated task spans |
-| `bin/a2a-bridge` | Composition root: `[[agents]]` config, `FileConfigSource`, registry wiring, `main` |
+| `bridge-workflow` | Workflow-DAG orchestration engine: fan-out/pipeline/fan-in execution over `[[workflows]]` |
+| `bridge-coordinator` | `Coordinator`, the stable Rust service API — session lifecycle, batch, compact, detached-task orchestration |
+| `bridge-mcp` | MCP-over-stdio adapter (`a2a-bridge mcp`) driving `bridge-coordinator` |
+| `lsp-mcp` | LSP-over-MCP shim: wraps a language server (rust-analyzer, gopls, basedpyright, tsserver, …) as type-resolved MCP nav tools |
+| `bin/a2a-bridge` | Composition root: CLI parsing, config, registry/coordinator wiring, `main` |
 
 ## Protocol bindings
 
-- **A2A v1** via the official `a2a` crate (package `a2a-lf` =0.3.0). Methods: `SendMessage`,
+- **A2A v1** via the official `a2a` crate (package `a2a-lf` `=0.3.0`). Methods: `SendMessage`,
   `SendStreamingMessage`, `GetTask`, `CancelTask`, `SubscribeToTask`. Version pinned to
-  `a2a::VERSION = "1.0"`; header `A2A-Version`.
-- **ACP** via `agent-client-protocol` =1.0.1 (Apache-2.0,
+  `a2a::VERSION = "1.0"`; header `A2A-Version`. Agent Card served at
+  `GET /.well-known/agent-card.json`.
+- **ACP** via `agent-client-protocol` `=1.0.1` (Apache-2.0,
   `github.com/agentclientprotocol/rust-sdk`) — the official SDK drives the full
   conformant lifecycle: `initialize` → `authenticate` → `session/new` →
   `session/set_mode` → `session/set_config_option` (model + effort) →
-  `session/prompt` (streamed
-  `agent_message_chunk` → `PromptResponse`) → `session/cancel`. Reverse
-  `request_permission` from the agent is handled bidirectionally via `PolicyEngine`.
+  `session/prompt` (streamed `agent_message_chunk` → `PromptResponse`) → `session/cancel`.
+  Reverse `request_permission` from the agent is handled bidirectionally via `PolicyEngine`.
   See ADR-0004.
 
-Both SDK versions are pinned (`Cargo.lock` committed) and maintained per the
-dependency-currency policy in the spec (§11.2).
+Both SDK versions are pinned (`Cargo.lock` committed).
 
-## Build & run
+## Configuration
 
-Requires the pinned toolchain (`rust-toolchain.toml`, Rust 1.94.0).
-
-```bash
-cargo build --release
-```
-
-Create `a2a-bridge.toml` (or rely on the built-in default — the bridge materializes a
-single-agent kiro config if the file is absent):
-
-Project-specific configs, prompts, and workflows should live in the owning project
-repo, not in `a2a-bridge`. Keep this repo's `examples/` and `prompts/` generic;
-use the owning repo (for example `tools/a2a-bridge/configs/` and
-`tools/a2a-bridge/prompts/`) or `/tmp` (or `/private/tmp` on macOS) for local
-one-off runs. Preflight configs with
-`a2a-bridge validate --config /path/to/a2a-bridge.toml`; run
-`cargo run -p a2a-bridge -- validate --repo-hygiene` before committing changes
-to this repo. Cleanup gates can add `--examples-policy deny --project-marker
-<text>`.
+Create `a2a-bridge.toml` (or run `a2a-bridge init`; bare `a2a-bridge`/`serve` with no config also
+materializes a single-agent kiro default if the file is absent):
 
 ```toml
-# Top-level default agent id — required. Must match one [[agents]] entry's id.
-default = "kiro"
+default = "kiro"                       # top-level default agent id — must match an [[agents]] id
 
-# Optional registry section. If absent, every entry's cmd is automatically allowed.
 [registry]
-allowed_cmds = ["kiro-cli", "codex-acp"]
+allowed_cmds = ["kiro-cli", "codex-acp"]   # optional; defaults to the union of all entry `cmd`s
 
-# One [[agents]] table per agent. Add as many as needed.
 [[agents]]
-id   = "kiro"       # Caller-facing agent id; also used in a2a-bridge.agent metadata
-cmd  = "kiro-cli"   # Agent binary (must be on PATH and in allowed_cmds if [registry] is set)
-args = ["acp"]      # Arguments passed to cmd
-# Optional per-agent ACP session settings:
-# name         = "Kiro"           # Human-readable name (fan-out source label); defaults to id
-# model_provider = "openai"      # LLM vendor label — descriptive only, never on the wire
-# effort       = "high"          # Effort tier: minimal / low / medium / high / xhigh / max (model-dependent; falls back to highest supported ≤ requested)
-# mode         = "read-only"     # Hard session/set_mode (fatal if agent rejects)
-# cwd          = "/work/dir"     # Absolute working dir for session/new (defaults to current_dir)
-# auth_method  = "oauth"         # Auth method id for authenticate (optional; see selector behavior below)
-# Leave current Kiro unpinned; add model only to agents with model_configurable=true.
+id   = "kiro"
+cmd  = "kiro-cli"
+args = ["acp"]
+# name / model / model_provider / effort / mode / cwd / auth_method — all optional, see below
 
 [[agents]]
 id   = "codex"
 cmd  = "codex-acp"
 args = []
-# name, model, effort, mode, cwd, auth_method — all optional
 
 [server]
 addr = "127.0.0.1:8080"
@@ -115,180 +171,76 @@ addr = "127.0.0.1:8080"
 
 | Key | Required | Description |
 |---|---|---|
-| `id` | yes | Caller-facing agent id; used in `a2a-bridge.agent` request metadata and as `default` value |
-| `cmd` | yes | Agent binary to spawn (must be on PATH; must be in `allowed_cmds` if `[registry]` is set) |
-| `args` | no | Arguments passed to `cmd` (e.g. `["acp"]` for kiro-cli) |
+| `id` | yes | Caller-facing agent id; used in `a2a-bridge.agent` request metadata and as `default` |
+| `cmd` | yes (kind=`acp`) | Agent binary to spawn (must be on PATH; must be in `allowed_cmds` if `[registry]` is set) |
+| `kind` | no | `acp` (default, a process over ACP), `api` (OpenAI-compatible HTTP, needs `base_url`/`api_key_env`), or `container_rw` (write-capable containerized ACP agent) |
+| `args` | no | Arguments passed to `cmd` |
 | `name` | no | Human-readable display name; drives the fan-out source label in artifacts (defaults to `id`) |
-| `model` | no | Model id set on the agent's advertised config-option surface — `session/set_config_option(category="model")` for claude/codex and any other agent that advertises `model_configurable: true`; **validated** against advertised values (hard-fails at mint if not advertised). Raw advertised ids win; fallback aliases then apply (`opus`→`default` when `opus` is not advertised). Fable-family ids are blocked by this bridge and omitted from the usable model catalog. Current Kiro models are discoverable but not configurable through ACP SDK 1.x, so leave Kiro unpinned unless the catalog marks it configurable. |
+| `model` | no | Model id, validated against what the agent advertises (`session/set_config_option(category="model")`); hard-fails at session mint if not advertised |
 | `model_provider` | no | LLM vendor label — descriptive/routing metadata only, never sent on the wire |
-| `effort` | no | Effort tier set via `session/set_config_option` for agents that advertise one (codex `reasoning_effort`, claude `effort`): `minimal` / `low` / `medium` / `high` / `xhigh` / `max`. Falls back to the highest supported level ≤ requested |
-| `mode` | no | Mode id for `session/set_mode` (hard error if agent rejects) |
-| `cwd` | no | Working directory for `session/new`; relative values are joined onto the bridge's `current_dir()` |
-| `auth_method` | no | Auth method id for `authenticate`; when omitted, ChatGPT-style auth (`chat-gpt` or legacy `chatgpt`) is preferred when advertised, otherwise the first advertised method is used. Set explicitly for API-key-only installs. |
-| `description` | no | Human description (seamed for future per-entry Agent Cards) |
-| `tags` | no | String tags (seamed for future per-entry Agent Cards) |
-| `version` | no | Config version string (seamed for future per-entry Agent Cards) |
+| `effort` | no | Effort tier (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`); falls back to the highest supported level ≤ requested |
+| `mode` | no | Mode id for `session/set_mode` (hard error if the agent rejects it) |
+| `cwd` | no | Working directory for `session/new`; relative values join onto the bridge's `current_dir()` |
+| `auth_method` | no | Auth method id for `authenticate` (defaults to ChatGPT-style auth when advertised, else the first advertised method) |
+| `description`, `tags`, `version` | no | Seamed for future per-entry Agent Cards |
 
-### Pinning model & effort (worked example)
+Model/effort resolution details, the effort-level-per-model table, and the `kind="api"` fields
+are in [docs/onboarding.md](docs/onboarding.md#model--effort--mode) — this table only covers
+what's parsed.
 
-`model` and `effort` are resolved **per-agent at session mint** (ADR-0029): the model is
-validated against what the agent advertises — a non-advertised id **hard-fails the session
-before any prompt is sent** — and `effort` walks down to the highest supported level ≤
-requested. Both are optional and apply to **every workflow node** that uses the agent. A
-two-agent review config pinning each side to a specific model + reasoning level:
+### Beyond the basics: pointer table
 
-```toml
-default = "codex"
+These blocks are real and shipped, but documenting them fully here would duplicate the guides
+that already cover them:
 
-[[agents]]
-id     = "codex"
-cmd    = "codex-acp"
-model  = "gpt-5.5"   # advertised by codex-acp        -> rollout "model":"gpt-5.5"
-effort = "high"      # codex thought-level id          -> "reasoning_effort":"high"
+| Block | Scope | What it's for | See |
+|---|---|---|---|
+| `[agents.sandbox]` | per `[[agents]]` entry | Docker/Podman container isolation for that agent (`:ro`/`:rw` mount, default-deny egress proxy, volumes) | [docs/containerized-agents.md](docs/containerized-agents.md), ADR-0016–0021 |
+| `[worktrees]` | top-level | Per-session `git worktree` isolation instead of a shared checkout | [AGENTS.md](AGENTS.md), [docs/onboarding.md](docs/onboarding.md) |
+| `[[prompts]]` | top-level | Named, reusable prompt registry (`file=`/`text=` + `description`) referenced from workflow nodes by id | [AGENTS.md](AGENTS.md), [docs/onboarding.md](docs/onboarding.md) |
+| `[[languages]]` | top-level | Per-language LSP-MCP nav + build/test verify profiles the `implement` review loop uses in-container | [docs/onboarding.md](docs/onboarding.md), `lsp-mcp` crate |
+| `[review]` / `[implement]` | top-level | `implement`'s review-the-diff sizing and the review→tweak loop | `a2a-bridge implement --help`, ADR-0022–0024, ADR-0026 |
+| `[merge]` | top-level | `merge` hand-off target + operator identity override | `a2a-bridge merge --help`, [ADR-0027](docs/adr/0027-merge-handoff.md) |
+| `[batch]` | top-level | `run-batch` concurrency admission caps | `a2a-bridge run-batch --help` |
 
-[[agents]]
-id     = "claude"
-cmd    = "claude-agent-acp"
-model  = "sonnet"    # advertised by claude-agent-acp
-effort = "high"      # claude thought-level id "effort" -> "effort":"high" (now actually applied)
-```
+Registry agent entries (`[[agents]]`, `[registry]`) hot-reload on file change (200 ms debounce,
+atomic-rename-safe, config-only edits reuse the warm backend with no respawn). Workflows, the
+server address, and `[store]` are read once at boot — restart `serve` to change them. Full
+hot-reload mechanics: [docs/onboarding.md](docs/onboarding.md).
 
-A model id validates against what the agent advertises. If the raw id is
-advertised, it is used as-is; otherwise the fallback alias `opus` maps to
-`default`.
-Fable-family model ids are intentionally blocked by this bridge even if an
-agent advertises them; use another advertised Claude model such as
-`sonnet`, `sonnet[1m]`, `haiku`, or `default`.
-`effort` maps to each agent's advertised thought-level id automatically (`reasoning_effort` for
-codex, `effort` for claude); a model that advertises no thought level (e.g. kiro) just skips it.
-To override per request instead of per agent, pass `a2a-bridge.model` only when the selected
-agent's catalog has `model_configurable: true`, and pass `a2a-bridge.effort` when effort levels
-are advertised (see [Per-request agent selection and overrides](#per-request-agent-selection-and-overrides)).
+### Task store
 
-### `[registry]` section
-
-| Key | Required | Description |
-|---|---|---|
-| `allowed_cmds` | no | Allowlist of binary names agents may use; if absent, defaults to the union of all entry `cmd` values |
-
-### `[server]` section
-
-| Key | Default | Description |
-|---|---|---|
-| `addr` | `127.0.0.1:8080` | TCP address the bridge listens on |
-
-```bash
-./target/release/a2a-bridge    # loads a2a-bridge.toml, serves A2A on addr
-```
-
-The Agent Card is published at `GET /.well-known/agent-card.json`. Each configured agent
-binary must be installed and authenticated on the host (e.g. `kiro-cli whoami`).
-
-### Hot-reload (no restart required)
-
-The bridge watches `a2a-bridge.toml`'s parent directory for changes using `notify`
-(atomic-rename–safe: editors that save by write-then-rename are handled correctly). When
-the file changes:
-
-1. A 200 ms debounce window settles any burst of filesystem events.
-2. The file is re-read and re-parsed.
-3. On **success**: `Registry::apply()` reconciles the new snapshot atomically —
-   config-only edits (same `cmd`/`args`/`cwd`/`auth_method`) reuse the warm backend
-   with no respawn; cmd/args changes replace the slot; removed agents are retired
-   (lease-draining: in-flight tasks finish before the backend is shut down).
-4. On **parse error**: the error is logged and the last-good snapshot is kept. The bridge
-   does not go down.
-
-Hot-reload was validated live: a config-only edit to a running registry took effect on the next
-new session with no respawn (`Arc::ptr_eq` warm-backend reuse proven in the original
-kiro-cli 2.5.0 + codex-acp 0.15.0 gate). See ADR-0005.
-
-### Breaking config change: `[agent]` → `[[agents]]` + `default =`
-
-**Increment 3b replaces the Increment 3a `[agent]` config schema.** Old configs will
-fail with a TOML parse error on startup. To migrate:
+The task store is **file-backed SQLite (WAL mode where the filesystem supports it) when `[store] path` is set** — durable across
+restart, with a single-writer lock (`SqliteStore::open`) — and **in-memory (ephemeral)** when
+`[store]` is absent:
 
 ```toml
-# Before (Increment 3a and prior — NO LONGER VALID):
-[agent]
-name = "kiro"
-cmd  = "kiro-cli"
-args = ["acp"]
-
-[server]
-addr = "127.0.0.1:8080"
-
-# After (Increment 3b):
-default = "kiro"
-
-[[agents]]
-id   = "kiro"
-cmd  = "kiro-cli"
-args = ["acp"]
-
-[server]
-addr = "127.0.0.1:8080"
+[store]
+path = ".a2a-bridge/tasks.sqlite"
+resume_attempt_cap = 3   # optional; default 3
 ```
 
-If an older config pinned a Kiro model, remove that `model = ...` line during
-migration. ACP SDK 1.x no longer exposes Kiro's former `session/set_model`
-surface; Kiro model names may still appear in discovery output, but the catalog
-marks them `model_configurable: false` and a Kiro model pin now fails session
-mint instead of being silently ignored.
+A relative `path` resolves against the config file's own directory, not the process CWD.
+Durable mode is what makes `run-batch`, crash-resume, and `task watch` reattachment work across
+a `serve` restart (ADR-0010, ADR-0011, ADR-0015).
 
-For Codex ACP adapters that advertise `api-key` before `chat-gpt`, the bridge's
-default auth selector prefers ChatGPT-style auth when advertised. API-key
-deployments should set `auth_method = "api-key"` or the adapter-specific
-API-key method id explicitly.
+## Per-request agent selection and overrides
 
-## Testing & coverage
-
-```bash
-cargo test --workspace                # ~200 tests, all in-process (no external agent)
-```
-
-Coverage is gated in CI (`cargo-llvm-cov`), enforced as a floor, measured per crate:
-
-| Scope | Gate | Current (Increment 3b) |
-|-------|------|---------|
-| Workspace | ≥ 85% lines | ~94% |
-| `bridge-core` (domain/typestate/translator/ports) | ≥ 90% lines | ~98% |
-| `bridge-registry` (registry, reconcile, retirement) | ≥ 90% lines | ~93% |
-
-```bash
-cargo llvm-cov clean --workspace          # mandatory before measuring (stale-cache bug)
-cargo llvm-cov --workspace --fail-under-lines 85
-cargo llvm-cov -p bridge-core     --fail-under-lines 90
-cargo llvm-cov -p bridge-registry --fail-under-lines 90
-```
-
-Typestate invariants (e.g. prompting a non-ready session, resuming a terminal task) are
-proven uncompilable by `trybuild` compile-fail tests.
-
-Wire conformance is verified by `tests/golden_frames.rs` (hand-authored expected
-JSON for every outbound ACP frame) and `tests/corpus_replay.rs` (historical real
-captures from `kiro-cli 2.5.0` and `codex-acp 0.15.0` fed through the live
-mapping functions).
-
-### Per-request agent selection and overrides
-
-Send per-request metadata keys in the A2A `SendMessage` or `SendStreamingMessage`
-`message.metadata` object to select the agent and override its model/effort/mode for
-that request only. All keys are optional and orthogonal to each other.
+Send per-request metadata keys in the A2A `SendMessage`/`SendStreamingMessage`
+`message.metadata` object to select the agent and override its model/effort/mode for that
+request only. All keys are optional and orthogonal to each other.
 
 | Metadata key | Type | Description |
 |---|---|---|
 | `a2a-bridge.agent` | string | Agent id to route to (must match an `[[agents]]` entry `id`). Absent → registry `default` |
-| `a2a-bridge.model` | string | Model id override for this request's session; valid only for agents whose `agent-models` catalog entry has `model_configurable: true` |
-| `a2a-bridge.effort` | string | Effort tier override: `minimal` / `low` / `medium` / `high` / `max` |
-| `a2a-bridge.mode` | string | Mode id override for `session/set_mode` (hard error if agent rejects) |
-| `a2a-bridge.skill` | string | Routing skill: `delegate` (outbound peer) or `fan-out` (default + peer concurrently) |
+| `a2a-bridge.model` | string | Model id override for this request's session; valid only for agents whose catalog entry has `model_configurable: true` |
+| `a2a-bridge.effort` | string | Effort tier override: `minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
+| `a2a-bridge.mode` | string | Mode id override for `session/set_mode` (hard error if the agent rejects it) |
+| `a2a-bridge.skill` | string | Routing skill: `delegate` (forward to a configured outbound peer) or `fan-out` (default agent + peer concurrently, source-labeled, degrade-to-survivor) |
+| `a2a-bridge.cwd` | string | Per-request session working directory (ADR-0014) — without it, agents act in the launch cwd, not your target repo |
 
-Override keys layer on top of the entry's defaults for the selected agent. An invalid
-`a2a-bridge.agent` (unknown id or empty string) or invalid `a2a-bridge.effort` value
+An invalid `a2a-bridge.agent` (unknown id or empty string) or invalid `a2a-bridge.effort` value
 returns a clean JSON-RPC `InvalidRequest` error to the caller.
-
-Example request JSON-RPC payload:
 
 ```json
 {
@@ -303,137 +255,131 @@ Example request JSON-RPC payload:
 }
 ```
 
-### Gated real-agent e2e tests (ACP conformant client)
-
-Two gated end-to-end tests drive the conformant `AcpBackend` directly against a
-real agent (`#[ignore]`-gated, not in default CI):
-
-**kiro-cli** (gate MET — run and passing against kiro-cli 2.5.0):
-
-```bash
-cargo test -p a2a-bridge --test e2e_acp_kiro -- --ignored --nocapture
-# Prereqs: kiro-cli on PATH and authenticated (kiro-cli whoami), network access
-```
-
-This test spawns a real `kiro-cli acp` process, drives the full conformant
-lifecycle (`initialize` → `session/new` → `session/prompt`), asserts the streamed
-text contains `PONG` and the turn ends with `end_turn`. This was run against
-kiro-cli 2.5.0 and passed — the kiro DoD gate is MET.
-
-**codex-acp** (historical gate MET against zed-industries/codex-acp 0.15.0; the
-containerized reader image now installs `@agentclientprotocol/codex-acp@1.1.0`):
-
-```bash
-cargo test -p a2a-bridge --test e2e_acp_codex -- --ignored --nocapture
-# Prereqs: codex-acp on PATH and authenticated; codex-acp is distinct from codex-cli
-```
-
-This test spawns the real `codex-acp` process on `PATH`, drives the full
-conformant lifecycle (`initialize` → `authenticate` → `session/new` →
-`session/set_mode` → `session/prompt`), and yielded streamed `PONG` (across two
-`agent_message_chunk` frames) and `end_turn` — the codex DoD gate is MET. The real
-captured round-trip lives in `tests/corpus/codex-acp.jsonl` (`_provenance:REAL-CAPTURE`)
-and replays through the live mapping functions; the `real_capture_corpus_present` test
-now passes (un-ignored) since both kiro-cli and codex-acp have real captures. codex-acp
-emits a few unmodeled `session/update` variants (`available_commands_update`,
-`config_option_update`, `usage_update`) which the tolerant reader drops.
-
-### Gated multi-agent registry e2e test (Increment 3b)
-
-The registry e2e test validates the full 3b story: two real agents registered
-simultaneously, per-request routing by id, per-request override, and live
-config-only model edit taking effect on a new session with no respawn.
-
-```bash
-cargo test -p a2a-bridge --test e2e_registry -- --ignored --nocapture
-# Prereqs: BOTH kiro-cli (authenticated) AND codex-acp on PATH and authenticated
-```
-
-This test:
-
-1. Starts the full bridge stack (registry + inbound server + ACP backends) in-process.
-2. Sends a `SendStreamingMessage` with `a2a-bridge.agent=kiro` — asserts `PONG` from kiro-cli.
-3. Sends a `SendStreamingMessage` with `a2a-bridge.agent=codex` — asserts `PONG` from codex-acp.
-4. Sends with a per-request `a2a-bridge.model` override for codex — asserts the override was applied.
-5. Edits the registry config (model-only change on codex's entry) and calls `apply()` — asserts
-   that `Arc::ptr_eq` confirms the **same slot instance** was reused (no respawn), and that the
-   new model is live on the next session.
-
-Gate MET: originally run live against kiro-cli 2.5.0 + codex-acp 0.15.0 — both returned `PONG`,
-per-request routing and overrides worked, and the warm-backend reuse was proven. See ADR-0005.
-
-### Original gated smoke (pre-3a, v1 inbound pipeline)
-
-```bash
-cargo test -p a2a-bridge --test e2e_kiro -- --ignored --nocapture   # needs kiro-cli whoami
-```
-
-### Outbound delegation (Increment 2.5)
-
-The bridge can forward a task to a configured remote A2A peer: send a `SendStreamingMessage`
-with `metadata["a2a-bridge.skill"]="delegate"`, and the bridge POSTs it to the peer and
-streams the peer's `StreamResponse` events back to the caller. Configure one peer:
+`delegate` and `fan-out` require a `[delegation]` peer:
 
 ```toml
 [delegation]
-peer_url    = "https://peer.example/"
-auth        = "bearer:${PEER_TOKEN}"   # ${ENV} expanded; missing var = error
+peer_url     = "https://peer.example/"
+auth         = "bearer:${PEER_TOKEN}"   # ${ENV} expanded; missing var = error
 timeout_secs = 60                       # optional
 ```
 
-Without a `[delegation]` section the bridge runs local-only (delegation is a no-op). A gated
-bridge-to-bridge e2e (one bridge's `delegate` skill → another bridge's `kiro-code`) is
-`#[ignore]`d: `cargo test -p a2a-bridge --test e2e_delegate_bridge -- --ignored`.
-
-### Fan-out / second opinion (Increment 2.6)
-
-Send a `SendStreamingMessage` with `metadata["a2a-bridge.skill"]="fan-out"` to run the **same
-prompt on both Kiro and the configured peer concurrently**, merged into one SSE. Every frame
-is source-labeled (`metadata["a2a-bridge.source"]="kiro"|"peer"`, and `artifact.name` on
-artifacts); both run to completion (two labeled artifacts) and the task ends with one terminal
-`StatusUpdate`. **Degrade-to-survivor:** if one source fails, its labeled error frame plus the
-survivor's result still come back and the task completes (`Completed`); only if both fail does
-it `Fail`. Cancel/disconnect cancels both sources. Requires a `[delegation]` peer. Gated e2e:
-`cargo test -p a2a-bridge --test e2e_fanout_bridge -- --ignored`.
-
-### A2A terminal model
+Without `[delegation]` the bridge runs local-only. Gated bridge-to-bridge e2e tests:
+`cargo test -p a2a-bridge --test e2e_delegate_bridge -- --ignored` and
+`--test e2e_fanout_bridge -- --ignored`.
 
 A streamed task ends with a terminal `StatusUpdate` (`Completed`/`Failed`/`Canceled`) — not an
-artifact's `lastChunk` (which marks only that artifact's completion). This holds for single-
-source and fan-out alike, so a task can carry multiple artifacts before its terminal status.
+artifact's `lastChunk` (which marks only that artifact's completion). This holds for
+single-source and fan-out alike, so a task can carry multiple artifacts before its terminal
+status.
 
-## What the bridge does / doesn't do
+## Testing & coverage
 
-**In:** inbound A2A with **A2A-conformant `StreamResponse` SSE** + a terminal-status task
-model; **runtime-mutable agent registry** (hot-reload, per-request agent selection and
-model/effort/mode overrides, lease-draining retirement, task binding); **conformant ACP
-client** (`agent-client-protocol` =1.0.1 SDK, bidirectional, wire-golden-tested, live
-kiro + codex validated); **outbound delegation** (passthrough) and **fan-out / second
-opinion** (Kiro + peer merged, source-labeled, degrade-to-survivor); streaming with
-coalescing; cancellation (prompt-result semantics; both-source cancel on inbound
-`CancelTask` and caller disconnect); permission/auth suspend→resume; **real message
-content threaded to the agent and the peer**; process-group reaping; structured tracing.
+```bash
+cargo test --workspace     # full in-process suite, no external agent required
+```
 
-**Deferred:** per-entry A2A AgentCards (Option-3); admin HTTP API + `ConfigStore`
-write-back (3b.2); DB/remote `ConfigSource` adapters; fan-out across the registry (3d);
-conductor fork/continue decision (post-3c); real permission policy; `session/load` resume;
-MCP-over-ACP; fs/terminal client capabilities; JWT/mTLS enforcement; container isolation;
-multiple peers / discovery / mesh; result reconciliation/voting.
+Coverage is gated in CI (`cargo-llvm-cov`), enforced as a per-crate floor — see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the authoritative list; as of this
+writing:
 
-### Known limitations (called out honestly; see ADR-0003, ADR-0004, ADR-0005 + reviews)
+| Scope | Floor |
+|-------|------|
+| Workspace | ≥ 85% lines |
+| `bridge-core` | ≥ 90% lines |
+| `bridge-acp` | ≥ 90% lines |
+| `bridge-api` | ≥ 90% lines |
+| `bridge-workflow` | ≥ 90% lines |
+| `bridge-coordinator` | ≥ 85% lines |
+| `bridge-mcp` | ≥ 70% lines |
 
-- **The `Task`/`Session` typestate is a compile-time spec artifact, not yet load-bearing.**
-  It is `trybuild`-verified but the runtime pipeline does not yet route through
-  `Session<Ready>::send_prompt`. The seam is preserved for later wiring.
-- **Coalescing is char-cap only** (1200 chars + boundary flush); the 200 ms idle-flush half
-  of the spec contract is not yet implemented.
-- **The running binary uses an in-memory SQLite store** (`open_in_memory`), so persisted
-  state (pending-request resume, delegated-task mapping) is not durable across restart. The
-  store seam supports a file-backed DB; wiring it is a one-line change.
-- **Agent Card path:** served at `/.well-known/agent-card.json`; the published A2A v1
-  standard may use `/.well-known/agent.json` — verify before claiming external conformance.
-- **Outbound passthrough only; caller identity is not forwarded** to the peer (a configured
-  bearer is presented instead) — identity propagation is a later concern.
+```bash
+cargo llvm-cov clean --workspace                 # mandatory before measuring (stale-cache bug)
+cargo llvm-cov --workspace --fail-under-lines 85
+cargo llvm-cov -p bridge-core --fail-under-lines 90   # repeat per crate above
+```
+
+Typestate invariants (e.g. prompting a non-ready session, resuming a terminal task) are proven
+uncompilable by `trybuild` compile-fail tests (`crates/bridge-core/tests/compile_fail.rs`). Wire
+conformance is verified by `crates/bridge-acp/tests/golden_frames.rs` (hand-authored expected JSON per outbound
+ACP frame) and `crates/bridge-acp/tests/corpus_replay.rs` (real historical ACP captures replayed through the live
+mapping functions).
+
+Several `#[ignore]`-gated end-to-end tests drive real agent processes and are not part of
+default CI (each needs the named binary on PATH and authenticated):
+
+```bash
+cargo test -p a2a-bridge --test e2e_acp_kiro    -- --ignored --nocapture   # kiro-cli
+cargo test -p a2a-bridge --test e2e_acp_codex   -- --ignored --nocapture   # codex-acp
+cargo test -p a2a-bridge --test e2e_registry    -- --ignored --nocapture   # both, multi-agent routing
+```
+
+## Troubleshooting
+
+- **"agent binary not found" / spawn failure** — the agent's `cmd` must be on `PATH`, and if
+  `[registry] allowed_cmds` is set, `cmd` must appear there verbatim (renamed wrappers or
+  absolute paths must match exactly).
+- **Auth error on first request** — auth failures generally surface on the *first* request to
+  an agent, not at `serve` boot. Re-authenticate: `kiro-cli login`, `codex login`, or re-run
+  `claude` interactively to refresh its subscription token (`claude-agent-acp`'s OAuth token
+  expires roughly hourly under containerized use — see
+  [docs/containerized-agents.md](docs/containerized-agents.md)).
+- **Agent edits/reads the wrong repo** — `run-workflow`/`submit` run agents in the *launch* cwd
+  unless you pass `--session-cwd`/`a2a-bridge.cwd`; `implement` derives cwd from `--repo`
+  instead. See [ADR-0014](docs/adr/0014-session-cwd.md).
+- **`Address already in use`** — another `serve` (or a leftover process) already holds
+  `[server].addr`; change the port or stop the other process. `session`/`task`/`submit`
+  subcommands default to `http://127.0.0.1:8080` — pass `--url` if yours differs.
+- **`cargo build --all-targets` / `cargo test --all-targets` stalls or OOMs** — on
+  memory-constrained machines, build test targets serially: `cargo build --all-targets -j 1`.
+- **A containerized MCP server reports "no such tool" despite being configured** — containerized
+  agents hand spawned MCP servers a *stripped* environment, not the image's `ENV`; put required
+  vars in that server's `[[agents.mcp.env]]` (or `lsp_env` for `[[languages]]`) explicitly. See
+  [docs/containerized-mcp-env-trap.md](docs/containerized-mcp-env-trap.md).
+
+## What a review run looks like
+
+Abridged, **illustrative** output of `run-workflow code-review` run against some other repo's
+diff (two independent reviewer lenses + a synthesis node; the shape is real, the finding text
+below is a fabricated example, not an actual a2a-bridge finding):
+
+```
+$ a2a-bridge run-workflow code-review \
+    --input task.md --session-cwd ~/code/some-other-repo --config a2a-bridge.toml
+
+[synth]
+BLOCKER — src/export.rs:142
+  `write_csv` opens the output file before validating `--format`; an invalid value leaves
+  a truncated file on disk. Validate first, then open.
+  (Codex: correctness; Claude agreed on read.)
+
+MAJOR — src/cli.rs:58
+  The new `--json` flag and the existing `--format json` alias set different fields on
+  `Options`, so `--json --format csv` silently picks `--format`'s value. Unify into one.
+
+MINOR — src/export.rs:9
+  Dead `#[allow(unused)]` import left over from the previous refactor.
+
+Verdict: ship after fixing the BLOCKER; MAJOR can follow in a fast-follow.
+```
+
+The terminal node's text is what `run-workflow` prints (or writes to `--out`); detached runs
+(`submit` + `task watch`) stream the same content over SSE as it's produced.
+
+## Known limitations
+
+Called out honestly; see the ADRs in `docs/adr/` for the full record.
+
+- **The A2A inbound server has not been migrated onto `Coordinator`** (see Architecture above)
+  — it owns a parallel session/task-store wiring, so some lifecycle logic exists twice.
+- **The `Task`/`Session` typestate is a compile-time spec artifact, not yet load-bearing** at
+  runtime — see the honest note in Architecture above.
+- **Coalescing is char-cap only** (1200 chars + boundary flush); a time-based idle-flush is not
+  implemented.
+- **Outbound delegation forwards a configured bearer token, not caller identity** — identity
+  propagation to a peer is a later concern.
+- **Per-entry A2A AgentCards, JWT/mTLS enforcement, and `session/load` resume** are not
+  implemented.
 
 ## License
 
