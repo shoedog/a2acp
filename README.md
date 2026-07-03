@@ -437,4 +437,8 @@ multiple peers / discovery / mesh; result reconciliation/voting.
 
 ## License
 
-Apache-2.0.
+AGPL-3.0-only (relicensed from Apache-2.0 on 2026-07-03, while the project had a single
+copyright holder). Protocol SDK dependencies remain under their own permissive licenses.
+
+Contributions require signing the [Contributor License Agreement](CLA.md) (enforced by a
+CLA-Assistant check on pull requests) — see [CONTRIBUTING.md](CONTRIBUTING.md).
