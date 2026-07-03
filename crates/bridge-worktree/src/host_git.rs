@@ -1,8 +1,9 @@
 use crate::provider::{add_argv, is_repo_argv, prune_argv, remove_argv, WorktreeProvider};
 use bridge_core::error::BridgeError;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::Duration;
+use tokio::process::Command;
 
 pub struct HostGitWorktree;
 
@@ -18,10 +19,11 @@ impl Default for HostGitWorktree {
     }
 }
 
-fn run_git(argv: &[&str]) -> Result<Output, BridgeError> {
+async fn run_git(argv: &[&str]) -> Result<Output, BridgeError> {
     Command::new("git")
         .args(argv)
         .output()
+        .await
         .map_err(|e| BridgeError::ConfigInvalid {
             reason: format!("git spawn: {e}"),
         })
@@ -34,26 +36,27 @@ fn retryable_lock_error(err: &str) -> bool {
         || err.contains("cannot lock")
 }
 
-fn cleanup_failed_add(repo: &str, wt: &str) {
+async fn cleanup_failed_add(repo: &str, wt: &str) {
     let _ = std::fs::remove_dir_all(wt);
-    let _ = run_git(&prune_argv(repo));
+    let _ = run_git(&prune_argv(repo)).await;
 }
 
-fn common_dir(repo: &str) -> String {
+async fn common_dir(repo: &str) -> String {
     let absolute = run_git(&[
         "-C",
         repo,
         "rev-parse",
         "--path-format=absolute",
         "--git-common-dir",
-    ]);
+    ])
+    .await;
     if let Ok(out) = absolute {
         if out.status.success() {
             return String::from_utf8_lossy(&out.stdout).trim().to_string();
         }
     }
 
-    let fallback = run_git(&["-C", repo, "rev-parse", "--git-common-dir"]);
+    let fallback = run_git(&["-C", repo, "rev-parse", "--git-common-dir"]).await;
     let Ok(out) = fallback else {
         return String::new();
     };
@@ -81,37 +84,37 @@ impl WorktreeProvider for HostGitWorktree {
     async fn add(&self, repo: &str, wt: &str) -> Result<String, BridgeError> {
         let mut last_err = String::new();
         for _ in 0..5 {
-            let out = run_git(&add_argv(repo, wt, "HEAD"))?;
+            let out = run_git(&add_argv(repo, wt, "HEAD")).await?;
             if out.status.success() {
-                return Ok(common_dir(repo));
+                return Ok(common_dir(repo).await);
             }
 
             let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
             if !retryable_lock_error(&err) {
-                cleanup_failed_add(repo, wt);
+                cleanup_failed_add(repo, wt).await;
                 return Err(BridgeError::ConfigInvalid {
                     reason: format!("worktree add failed: {err}"),
                 });
             }
 
             last_err = err;
-            std::thread::sleep(Duration::from_millis(200));
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
-        cleanup_failed_add(repo, wt);
+        cleanup_failed_add(repo, wt).await;
         Err(BridgeError::ConfigInvalid {
             reason: format!("worktree add failed after lock retries: {last_err}"),
         })
     }
 
     async fn remove(&self, repo: &str, wt: &str) -> Result<(), BridgeError> {
-        let _ = run_git(&remove_argv(repo, wt));
-        let _ = run_git(&prune_argv(repo));
+        let _ = run_git(&remove_argv(repo, wt)).await;
+        let _ = run_git(&prune_argv(repo)).await;
         Ok(())
     }
 
     async fn is_git_repo(&self, path: &str) -> bool {
-        matches!(run_git(&is_repo_argv(path)), Ok(out) if out.status.success()
+        matches!(run_git(&is_repo_argv(path)).await, Ok(out) if out.status.success()
             && String::from_utf8_lossy(&out.stdout).trim() == "true")
     }
 }
