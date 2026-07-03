@@ -138,7 +138,7 @@ rigor) to the committed diff size:
   as a reference file.
 - **thorough** (diff ≥ `[review].thorough_min_lines` OR ≥ `thorough_min_files`): a
   draft→refine double pass for large code/infra diffs — each reviewer drafts,
-  then refines against the other's draft, before the synth.
+  then refines its own draft with fresh eyes, before the synth.
 
 Auto-selected from `git diff --numstat` each attempt; override with
 `a2a-bridge implement … --depth auto|light|standard|thorough`. A forced depth is
