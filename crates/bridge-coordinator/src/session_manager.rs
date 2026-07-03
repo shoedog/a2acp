@@ -167,6 +167,15 @@ pub struct SessionManager {
     clock: Arc<dyn Clock>,
     seq: std::sync::atomic::AtomicU64,
     turn_op_seq: std::sync::atomic::AtomicU64,
+    /// Test-only deterministic-interleaving hook (whole-branch review regression test): when armed via
+    /// `block_next_lock2`, `checkout_turn_inner` parks here between the off-lock resolve/fingerprint and
+    /// lock #2. Compiled out entirely in non-test builds; a no-op in test builds unless armed.
+    #[cfg(test)]
+    lock2_pause_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    #[cfg(test)]
+    lock2_pause_started: tokio::sync::Notify,
+    #[cfg(test)]
+    lock2_pause_started_count: std::sync::atomic::AtomicUsize,
 }
 
 impl SessionManager {
@@ -190,6 +199,12 @@ impl SessionManager {
             clock,
             seq: std::sync::atomic::AtomicU64::new(0),
             turn_op_seq: std::sync::atomic::AtomicU64::new(1),
+            #[cfg(test)]
+            lock2_pause_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            lock2_pause_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            lock2_pause_started_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -277,6 +292,39 @@ impl SessionManager {
     #[cfg(test)]
     async fn child_parent_registered(&self, parent: &ContextId) -> bool {
         self.children.lock().await.contains_key(parent)
+    }
+
+    /// Test-only: parks the caller here (between the off-lock resolve/fingerprint and lock #2 in
+    /// `checkout_turn_inner`) if a test has armed the gate via `block_next_lock2`; otherwise a no-op.
+    /// Mirrors `FakeBackend`'s `block_next_*`/`wait_for_*` gate style (started-counter + `Notify` to
+    /// avoid a lost-wakeup race, `oneshot` to resume).
+    #[cfg(test)]
+    async fn pause_before_lock2(&self) {
+        let gate = self.lock2_pause_gate.lock().unwrap().take();
+        self.lock2_pause_started_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.lock2_pause_started.notify_waiters();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn block_next_lock2(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.lock2_pause_gate.lock().unwrap() = Some(rx);
+        tx
+    }
+
+    #[cfg(test)]
+    async fn wait_for_lock2_pause(&self) {
+        while self
+            .lock2_pause_started_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            self.lock2_pause_started.notified().await;
+        }
     }
 
     fn eval_warn(&self, u: &UsageSnapshot) -> Option<UsageWarning> {
@@ -399,9 +447,17 @@ impl SessionManager {
         // unchanged) and is dropped before either await. An Idle-or-absent handle tells us nothing more
         // under the lock, so we resolve + fingerprint OFF-lock and re-validate at lock #2 (optimistic
         // re-check) before doing anything stateful.
+        //
+        // v2.1 (whole-branch review MAJOR, codex xhigh): lock #1 also records whether it observed a live
+        // handle at all (`saw_handle`), independent of the busy/retired checks below. Lock #2 uses it to
+        // distinguish "no handle at #1, none at #2 either" (proceed fresh, unchanged) from "a handle was
+        // here at #1 but is gone at #2" (a concurrent release/reap landed in the off-lock window below —
+        // must NOT fresh-mint; see the check at lock #2).
+        let mut saw_handle = false;
         {
             let tab = self.by_context.lock().await;
             if let Some(h) = tab.get(ctx) {
+                saw_handle = true;
                 if h.lease.is_retired() {
                     return (Err(BridgeError::SessionExpired), Vec::new());
                 }
@@ -423,6 +479,13 @@ impl SessionManager {
             config: eff.clone(),
             cwd: cwd.as_ref().map(|c| c.as_str().to_string()),
         };
+
+        // Test-only deterministic-interleaving hook (regression test for the v2.1 fix below): parks the
+        // in-flight checkout here, between the off-lock resolve/fingerprint and lock #2, so a test can
+        // force a concurrent release to land in this exact window. No-op unless armed via
+        // `block_next_lock2`; compiled out entirely in non-test builds.
+        #[cfg(test)]
+        self.pause_before_lock2().await;
 
         // Lock #2: re-validate against CURRENT state — it may have appeared, disappeared, or changed
         // state while we were off-lock. Same guards as lock #1, now correct against fresh state (may
@@ -586,8 +649,25 @@ impl SessionManager {
             );
         }
 
-        // ---- fresh path: no handle exists at lock #2 either. Claim it as `Configuring` with a minted
-        // claim id stashed in `op` (a claim, NOT a turn op — the real turn op mints at settle below).
+        // v2.1 (whole-branch review MAJOR, codex xhigh, fixed here): lock #1 observed a live Idle handle
+        // for this ctx, but it is gone now — a concurrent release (or reap) removed it from `by_context`
+        // while we were off-lock (registry.resolve + fingerprint, and/or paused above) and is possibly
+        // still awaiting `backend.release_session("ctx-{ctx}-g0")` (`release_inner` drops the lock before
+        // that await). Falling into the fresh path below would mint that SAME deterministic backend
+        // session id and race `configure_session(g0)` against the in-flight `release_session(g0)` —
+        // ACP/container backends insert per-session state on configure and remove it on release, so the
+        // interleaving can corrupt the new session. Treat this exactly like the caller's implicit target
+        // having been released/reaped out from under them: SessionExpired, nothing local to clean up, the
+        // caller's retry starts a clean checkout. (The narrower case — lock #1 saw NO handle, i.e. the
+        // checkout started entirely after the release completed — still proceeds fresh below; that
+        // exposure is pre-existing on main and out of scope here, see the spec addendum.)
+        if saw_handle {
+            return (Err(BridgeError::SessionExpired), Vec::new());
+        }
+
+        // ---- fresh path: no handle exists at lock #2 either, and none was observed at lock #1. Claim it
+        // as `Configuring` with a minted claim id stashed in `op` (a claim, NOT a turn op — the real turn
+        // op mints at settle below).
         // `capabilities()` is sync so it is set now; NO `turn_abort` is installed (no real turn exists
         // yet — installing one here would widen the documented single-slot `turn_abort` hazard). Drop
         // the lock, THEN run the (possibly slow) `configure_session` off-lock. ----
@@ -4492,6 +4572,88 @@ mod tests {
             .unwrap();
         assert_eq!(manager.status(&a).await.unwrap().state, "running");
         manager.finish_turn(&a, turn_a.generation, &turn_a.op).await;
+    }
+
+    #[tokio::test]
+    async fn checkout_does_not_fresh_mint_when_handle_vanishes_before_lock2() {
+        // Whole-branch review MAJOR (codex xhigh, v2.1 fix): lock #1 observes a live Idle handle for ctx
+        // but historically did not record that fact. If a concurrent `release` removes the handle from
+        // `by_context` and its (off-lock) `backend.release_session("ctx-{ctx}-g0")` is still in flight
+        // when lock #2 re-checks, lock #2 used to see NO handle and fall into the fresh path — re-minting
+        // the SAME deterministic backend session id and racing `configure_session(g0)` against the
+        // still-in-flight `release_session(g0)`. Assert the fixed behavior: the racing checkout returns
+        // SessionExpired, and `configure_session` is called exactly once total (the original warm mint) —
+        // never a second time to re-mint g0 while the release is still in flight.
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = Arc::new(SessionManager::new(registry, Duration::from_secs(30)));
+        let c = ctx("lock2-race");
+
+        // Warm the context to Idle (one configure_session call) so lock #1 observes a live handle.
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+        assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+        assert_eq!(backend.configured().len(), 1);
+
+        // Arm the deterministic pause: the next checkout will park immediately after its off-lock resolve
+        // (registry.resolve + fingerprint), before lock #2 re-checks `by_context`. Also gate
+        // release_session so we can prove it is still in flight when the checkout resumes.
+        let resume_checkout = manager.block_next_lock2();
+        let unblock_release = backend.block_next_release();
+
+        let checkout = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move { manager.checkout_turn(&c, agent(), None, None).await })
+        };
+        manager.wait_for_lock2_pause().await;
+        // Lock #1 has already run (it observed the Idle handle) and the off-lock resolve has completed;
+        // the checkout is now parked immediately before lock #2.
+
+        let release = {
+            let manager = manager.clone();
+            let c = c.clone();
+            tokio::spawn(async move { manager.release(&c).await })
+        };
+        // release_inner removes the handle from `by_context` synchronously (under its own lock) and THEN
+        // awaits backend.release_session — wait_for_release only resolves once that await has been
+        // entered, so by this point the handle is provably gone AND the release is provably still parked
+        // on its gate (in flight).
+        backend.wait_for_release().await;
+        assert!(
+            manager.status(&c).await.is_none(),
+            "handle must already be gone before the parked checkout resumes into lock #2"
+        );
+
+        // Let the parked checkout resume into lock #2. It must see no handle and, per the fix, must NOT
+        // fall into the fresh path while the release is still in flight.
+        let _ = resume_checkout.send(());
+        let result = tokio::time::timeout(Duration::from_secs(2), checkout)
+            .await
+            .expect("checkout must not deadlock behind the in-flight release")
+            .unwrap();
+        assert!(
+            matches!(result, Err(BridgeError::SessionExpired)),
+            "handle-gone-at-lock-#2 must return SessionExpired, not fresh-mint"
+        );
+
+        // No second configure_session call happened while release_session(g0) was still in flight — no
+        // g0 re-mint race against the in-flight release.
+        assert_eq!(
+            backend.configured().len(),
+            1,
+            "configure_session must not be called again while release_session(g0) is still in flight"
+        );
+
+        // Finally let the release complete.
+        let _ = unblock_release.send(());
+        tokio::time::timeout(Duration::from_secs(2), release)
+            .await
+            .expect("release must complete")
+            .unwrap();
     }
 
     #[tokio::test]

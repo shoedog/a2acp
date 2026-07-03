@@ -127,6 +127,34 @@ spawn blocks every context checkout serve-wide.
 **Explicit non-goals:** no fairness/queueing; no changes to `reconcile`/`release`/
 `reset` beyond teaching their claimed-state matches about `Configuring`; no warm-pool.
 
+**v2.1 (post branch-review):** whole-branch review (codex xhigh) found one MAJOR: lock
+#1 observed an existing Idle handle for the ctx but did not *record* that fact before
+dropping the lock and resolving off-lock. If a concurrent `release` removed the handle
+from `by_context` and its off-lock `backend.release_session("ctx-{ctx}-g0")` was still
+in flight when lock #2 re-checked, lock #2 saw NO handle and fell into the fresh path —
+re-minting the same deterministic backend session id and racing
+`configure_session(g0)` against the still-in-flight `release_session(g0)`. Fixed:
+lock #1 now records `saw_handle`; if lock #2 finds the handle gone but `saw_handle` was
+true, it returns `SessionExpired` instead of falling into the fresh path (the
+state-changed-but-present cases are unaffected — those already re-run the existing
+guards). Regression-tested (deterministic interleaving via a `cfg(test)`-only pause
+hook between the off-lock resolve and lock #2, mirroring the file's existing
+`block_next_*`/`wait_for_*` fake-backend gate style): a warm-idle handle is released
+while a racing checkout is parked in that window; asserts the checkout returns
+`SessionExpired` and `configure_session` is never called a second time while the
+release is still in flight.
+
+**Known pre-existing (out of scope):** a checkout that starts entirely *after* a
+release has already removed the handle (i.e. lock #1 itself observes no handle) can
+still fresh-mint `g0` against that release's still-in-flight `release_session(g0)` —
+this narrower window exists on `main` today and is unchanged by the v2.1 fix above.
+Candidate fix: hold an `Expiring` tombstone in `by_context` until `release_session`
+completes (rather than removing the entry up front), so a racing checkout sees
+`HandleBusy`/waits instead of finding an empty slot; deferred to a future wave.
+Separately (opus review note): `checkout_child_turn` still holds the `children` lock
+across a cold child's `configure_session` — improved by this wave's lock-scope work on
+the parent path but not itself restructured; also deferred to a future wave.
+
 ## W1-C: `spawn_blocking` / async process for blocking calls on live paths
 
 **Files:** `crates/bridge-worktree/src/host_git.rs` (`add`, `remove`, `is_git_repo` —
