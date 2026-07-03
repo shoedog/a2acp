@@ -1,0 +1,79 @@
+# Sandbox tier presets (docs/adr/0032-sandbox-tier-model.md) — one [[agents]] entry per tier, showing
+# what enforces each tier and what content class it is approved for. Flags copied verbatim from the
+# shipped configs (no invented settings): tier0/tier1 base cmds from a2a-bridge.workflows.toml; the
+# tier1 read-only args and the tier2/tier3 [agents.sandbox] blocks from a2a-bridge.containerized.toml
+# (minus agent-specific extras — the kiro auth volume, the impl agent's creds mount + in-container lsp
+# MCP wiring — which are operational detail, not tier-defining).
+#
+# Parse-level reference only, not a runnable `serve` config (no [[workflows]]/[[prompts]]):
+#   a2a-bridge validate --config examples/a2a-bridge.tiers.toml
+
+default = "tier0-review"
+
+allowed_cwd_root = "/Users/wesleyjinks/code"
+
+# Tier 0 — approved for: inlined-context review of ANY content, including adversarial/untrusted.
+# Enforced by: prompt contract only (workflow `inputs=[]` + an explicit "no tools, everything you need
+# is inlined" prompt clause) — no kernel or agent-native mechanism at all. Gap: a full coding agent
+# (claude-agent-acp has no read-only flag) that disregards the prompt could still attempt a tool call
+# against whatever cwd the process launched in. Copied verbatim from a2a-bridge.workflows.toml `claude`.
+[[agents]]
+id  = "tier0-review"
+cmd = "claude-agent-acp"
+
+# Tier 1 — approved for: read-only work on TRUSTED OWN-REPO content ONLY — never third-party/adversarial
+# content (no kernel isolation, no egress lock at this tier). Enforced by: codex's own agent-native
+# sandbox on a host (un-containerized) process; unaudited by the bridge (it trusts the flag, it does not
+# verify codex honored it). claude has no equivalent flag, so claude's Tier-1 ceiling is Tier 0. cmd
+# copied from a2a-bridge.workflows.toml `codex`; the read-only args copied verbatim from the host-side
+# codex reviewer in a2a-bridge.containerized.toml.
+[[agents]]
+id   = "tier1-codex-ro"
+cmd  = "codex-acp"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+
+# Tier 2 — approved for: any content an adversary could have authored (third-party PRs, dependencies,
+# issue text, untrusted repos) — REQUIRED for this content class, not optional. Enforced by:
+# kernel-enforced Docker/Podman `:ro` bind mount + default-deny egress proxy on an --internal network,
+# composed + enforced by the bridge's [agents.sandbox] block (two-layer validation, ADR-0017) — a
+# misconfigured block is a load error, not silent degradation. [agents.sandbox] copied verbatim from
+# a2a-bridge.containerized.toml `kiro` (kiro-cli has no host-native read-only flag, so it is always
+# Tier 2 in the kept configs, never Tier 1).
+[[agents]]
+id   = "tier2-reader"
+cmd  = "kiro-cli"
+args = ["acp"]
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+
+# Tier 3 — approved for: all write-capable/implement work, regardless of trust in the target repo — even
+# the operator's own repo goes through the quarantine clone + creds-XOR-egress verify split, because the
+# threat is agent-authored code nobody has reviewed yet, not the operator's trustworthiness. Enforced by:
+# kernel-enforced Docker/Podman `:rw` bind mount to a per-task quarantine clone (kind="container_rw" is
+# the only kind that PERMITS access="rw"; the plain "acp" kind rejects it), fresh container per turn (or
+# one warm container per `implement` run, ADR-0024) with reliable reap; the host, not the agent, runs the
+# commit with hooks neutralized. `sandbox_mode="danger-full-access"` here is Tier 3, not a violation of
+# it — see docs/adr/0032-sandbox-tier-model.md Consequences: codex's own bwrap sandbox is absent
+# in-container (ADR-0024), so disabling it is correct — Docker IS the sandbox. Copied verbatim from
+# a2a-bridge.containerized.toml `impl` (minus its host-specific creds volume mount and in-container lsp
+# MCP wiring, which are operational detail, not tier-defining).
+[[agents]]
+id     = "tier3-impl"
+kind   = "container_rw"
+cmd    = "codex-acp"
+args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+[agents.sandbox]
+image   = "a2a-toolchain:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "rw"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+
+[server]
+addr = "127.0.0.1:8080"

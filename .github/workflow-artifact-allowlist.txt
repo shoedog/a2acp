@@ -93,6 +93,7 @@ examples/a2a-bridge.slicing-analysis-codex.toml
 examples/a2a-bridge.slicing-analysis.toml
 examples/a2a-bridge.slicing-implement.toml
 examples/a2a-bridge.slicing-review.toml
+examples/a2a-bridge.tiers.toml
 examples/a2a-bridge.workflows.toml
 prompts/1d-plan-review.md
 prompts/c2b-nav.md
