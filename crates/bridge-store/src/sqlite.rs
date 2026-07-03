@@ -66,15 +66,24 @@ impl SqliteStore {
         let conn = rusqlite::Connection::open(path).map_err(|_| BridgeError::StoreFailure)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|_| BridgeError::StoreFailure)?;
-        let journal_mode: String = conn
-            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
-            .map_err(|_| BridgeError::StoreFailure)?;
-        if journal_mode != "wal" {
-            tracing::warn!(
-                mode = %journal_mode,
-                path = %path.display(),
-                "PRAGMA journal_mode=WAL not honored; continuing without WAL"
-            );
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(mode) if mode == "wal" => {}
+            Ok(mode) => {
+                tracing::warn!(
+                    mode = %mode,
+                    path = %path.display(),
+                    "PRAGMA journal_mode=WAL not honored; continuing without WAL"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "PRAGMA journal_mode=WAL failed; continuing without WAL"
+                );
+            }
         }
         conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")
             .map_err(|_| BridgeError::StoreFailure)?;
