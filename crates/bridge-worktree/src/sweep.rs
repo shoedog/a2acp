@@ -6,6 +6,10 @@ use bridge_core::SessionCwd;
 use std::collections::HashMap;
 use std::path::Path;
 
+// Stays sync (not de-blocked like host_git.rs's run_git): this call runs inside
+// `WorktreeRunEndGuard::drop` (a `Drop` impl cannot await) and during the
+// startup/boot sweep — not a per-turn path. See spec
+// docs/superpowers/specs/2026-07-03-wave-1-hardening.md §W1-C.
 fn run_git_sync(argv: &[&str]) {
     let _ = std::process::Command::new("git").args(argv).output();
 }
