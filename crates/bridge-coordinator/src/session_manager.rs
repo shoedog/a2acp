@@ -649,6 +649,9 @@ impl SessionManager {
             // Defensive: the claim invariants (Configuring blocks re-claim/removal; deferred-expiry
             // never mutates identity/state/op) mean this handle should still be exactly ours. Treat it
             // like the flagged-expired case below (nothing local to remove).
+            // INVARIANT PIN: this branch must stay unreachable while a successor handle can exist —
+            // the release below targets `ctx-{ctx}-g0`, an id a successor fresh checkout REUSES, so
+            // reaching here with a live successor would tear down the successor's backend session.
             drop(tab);
             return match cfg {
                 Ok(()) => {
