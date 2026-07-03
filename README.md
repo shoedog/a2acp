@@ -210,7 +210,7 @@ hot-reload mechanics: [docs/onboarding.md](docs/onboarding.md).
 
 ### Task store
 
-The task store is **file-backed SQLite (WAL mode) when `[store] path` is set** — durable across
+The task store is **file-backed SQLite (WAL mode where the filesystem supports it) when `[store] path` is set** — durable across
 restart, with a single-writer lock (`SqliteStore::open`) — and **in-memory (ephemeral)** when
 `[store]` is absent:
 
@@ -301,8 +301,8 @@ cargo llvm-cov -p bridge-core --fail-under-lines 90   # repeat per crate above
 
 Typestate invariants (e.g. prompting a non-ready session, resuming a terminal task) are proven
 uncompilable by `trybuild` compile-fail tests (`crates/bridge-core/tests/compile_fail.rs`). Wire
-conformance is verified by `tests/golden_frames.rs` (hand-authored expected JSON per outbound
-ACP frame) and `tests/corpus_replay.rs` (real historical ACP captures replayed through the live
+conformance is verified by `crates/bridge-acp/tests/golden_frames.rs` (hand-authored expected JSON per outbound
+ACP frame) and `crates/bridge-acp/tests/corpus_replay.rs` (real historical ACP captures replayed through the live
 mapping functions).
 
 Several `#[ignore]`-gated end-to-end tests drive real agent processes and are not part of
