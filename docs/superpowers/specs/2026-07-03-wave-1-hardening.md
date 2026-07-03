@@ -1,6 +1,6 @@
-# Wave 1 — Runtime & CI Hardening (spec, v1)
+# Wave 1 — Runtime & CI Hardening (spec, v2)
 
-**Status:** Draft, pending codex xhigh spec-review.
+**Status:** APPROVED for implementation — v1 reviewed by codex gpt-5.5 xhigh (verdict: W1-B needs-rework, W1-A/C/D findings); all review changes folded below. Review artifact: scratchpad `wave1-spec-review-out.md`.
 **Source:** `docs/2026-07-03-strategic-analysis.md` next-steps #1, #2, #8 (the S/M-effort code items).
 **Branch:** `feat/wave-1-hardening`.
 **Out of scope (later waves):** README rewrite / artifact purge / tier ADR (Wave 2, docs), CLI polish + doctor + A2A golden fixtures (Wave 3), release engineering M2 + eval harness M3, bin extraction (#9), Coordinator migration (#10).
@@ -37,87 +37,112 @@ pragma silently reports `memory` — do not warn for in-memory).
 
 **Tests:**
 - Unit: open a temp file-backed store, `query_row("PRAGMA journal_mode")` == `"wal"`,
-  `synchronous` == `1` (NORMAL), `busy_timeout` == `5000`.
+  `synchronous` == `1` (NORMAL), `busy_timeout` == `5000`. Assert the `-wal` sidecar
+  only AFTER a write (it is not created at open; per review) — or leave sidecar
+  assertion to the live gate.
 - Unit: in-memory store still opens and passes an existing smoke (no WAL assertion).
 - Existing full store suite stays green (no behavioral change expected).
 
 ## W1-B: `checkout_turn_inner` lock scope (the verified serialization point)
 
-**File:** `crates/bridge-coordinator/src/session_manager.rs` (`checkout_turn_inner`,
-~lines 378–620).
+**File:** `crates/bridge-coordinator/src/session_manager.rs` (`checkout_turn_inner`, :379–616).
 
 **Problem (verified):** the `by_context` mutex guard is held across
 `self.registry.resolve(&agent).await` (which lazy-spawns the agent process on first
-resolve) on **both** the existing-handle path (~:395) and the fresh path (~:554), and
-across `backend.configure_session(...).await` (~:574–579) on the fresh path. One slow
+resolve) on **both** the existing-handle path (:395) and the fresh path (:554), and
+across `backend.configure_session(...).await` (:574–579) on the fresh path. One slow
 spawn blocks every context checkout serve-wide.
 
-**Design — two changes, in order of decreasing safety:**
+**Design (v2 — per codex xhigh review):**
 
-1. **Hoist resolve + fingerprint above the lock (pure win).**
-   `registry.resolve()` reads `ArcSwap` registry state and never touches `by_context`;
-   the lock has never protected it. Move `resolve` + `effective_config` +
-   `SessionSpecFingerprint` construction to the top of `checkout_turn_inner`, before
-   `self.by_context.lock().await`. Both paths then use the pre-computed `resolved`/`fp`.
-   Semantics: the registry snapshot is taken marginally earlier; since the registry is
-   independently mutable (hot-reload) this is the same race exposure as today, only
-   narrower in time. NOTE: resolve is now paid even when the ctx turns out
-   busy/retired — acceptable (resolve on a warm registry is a map lookup; the lazy
-   spawn only fires for genuinely new agents, which is exactly the case we must not
-   serialize).
+1. **New claim state `SessionState::Configuring`** (session_manager.rs:23–37). It is a
+   claimed state like `Reconciling`/`Resetting`/`Compacting`: included in `is_claimed`
+   (:39–48), surfaced by `status()` (:660–682) as `"configuring"`, REJECTS
+   `inject` (which today accepts only `Running`, :210–237), and is treated by
+   `cancel`/`release`/`reset` like the other claimed states (defer/expire semantics,
+   NOT real-turn cancellation). Force-clear during `Configuring` follows the
+   deferred-expiry protocol below — it must NOT take the `Running if force` path
+   (:960–1003), which would race `release_session(old_id)` against the in-flight
+   `configure_session(old_id)`.
 
-2. **Fresh path: insert-claimed, configure outside the lock, settle on re-lock.**
-   - Under the lock: after the fresh-path guards pass, mint the op + abort token,
-     construct the handle in the **claimed** state (`SessionState::Running`, `op` set)
-     with the resolved backend + backend_session, insert into the map, **drop the lock**.
-   - Outside the lock: `configure_session(...).await`.
-   - On success: return the `WarmTurn` (no re-lock needed if the handle was fully
-     constructed at insert; verify nothing else must be written post-configure — if
-     capabilities/usage fields are set post-configure today, set them at insert from
-     `resolved.backend.capabilities()`, which is sync).
-   - On failure: re-lock, remove the handle **only if its op still equals the minted op**
-     (a force-clear/cancel may have raced and replaced it — never remove someone else's
-     handle), return the error.
-   - Concurrent checkout for the same ctx during configure now sees a claimed handle →
-     `HandleBusy`. This matches today's observable behavior (today the second caller
-     blocks on the mutex through the whole configure, then sees `Running` → `HandleBusy`)
-     — it just stops *unrelated contexts* from also blocking.
-   - Cancel/clear racing the configuring handle: both go through claim-state guards that
-     reject non-Idle states or fire the turn-abort token; the minted abort token exists
-     from insert, so `session cancel` during configure behaves like cancel-during-turn
-     (accepted, token fired; the configure result is settled by the op-equality check).
-     Spec-review should pressure-test this claim against `fire_lingering_turn_abort` and
-     the generation guards.
+2. **Optimistic re-check instead of blind hoisting** (preserves today's busy/retired
+   error precedence, :388–393):
+   - Lock #1: if handle exists → run the existing busy/retired checks FIRST (precedence
+     preserved). If Idle-with-matching-potential or absent → record what we saw, drop
+     the lock.
+   - Off-lock: `registry.resolve(&agent).await`, compute `effective_config` +
+     `SessionSpecFingerprint`.
+   - Lock #2: re-validate. If a handle now exists where none did (or state changed),
+     re-run the same guards against current state (may now return `HandleBusy` /
+     `SessionExpired` — correct). Existing-handle path (fingerprint diff → fast turn
+     mint, or reconcile/reseed flow) proceeds under lock #2 exactly as today
+     (:395–552 minus the resolve, which is pre-computed). The reconcile path already
+     drops the guard before its awaits (:473) — unchanged.
+   - Fresh path under lock #2: run the fresh-path guards, then insert a handle in
+     `Configuring` with a minted **claim id** (reuse `mint_turn_op()` output as the
+     claim token, stored in `h.op`) — but do NOT install `turn_abort` and do NOT mark
+     `Running` (per review findings (a)/(c)/(e): capabilities may be set at insert
+     (`capabilities()` is sync, ports.rs:90–92); `op` here means "claim", not "turn").
+     Drop the lock.
+   - Off-lock: `configure_session(&backend_session, &spec).await`.
+   - Lock #3 (settle — ALWAYS, success and failure): find the handle and validate the
+     EXACT claim: same handle identity, `state == Configuring`, `h.op == claim`.
+     - Claim intact + configure Ok → transition to `Running`, mint the real turn
+       (`turn_abort` token installed NOW), take `pending_seed`/`pending_injects`,
+       return the `WarmTurn`.
+     - Claim intact + configure Err → remove the handle, return the error.
+     - Claim gone/replaced (cancel/release/force-clear ran the deferred-expiry
+       protocol) → configure Ok: release the just-configured backend session
+       best-effort (`release_session`), return `SessionExpired`; configure Err: return
+       the error (nothing to clean).
+   - **Deferred expiry protocol:** cancel/release/clear arriving while `Configuring`
+     mark the claim expired (same mechanism the other claimed states use — the claim
+     check at settle detects it). They must NOT call backend `release_session` for the
+     configuring session themselves (the settle owns that), and must NOT fire a turn
+     abort token (none exists — this is exactly what avoids widening the documented
+     single-slot `turn_abort` hazard, :81–92).
 
-**Explicit non-goals:** no new `SessionState` variant (reuse `Running` + op-equality
-settle); no change to `reconcile`/`release`/`reset` (already drop the guard correctly);
-no fairness/queueing changes.
+3. **Observable-behavior notes:** same-ctx checkout during configure → `HandleBusy`
+   (today it blocks on the mutex then sees the handle; on configure-FAILURE today it
+   would then proceed fresh — v2 returns `HandleBusy` during the window instead; this
+   narrow difference is accepted and documented). Different-ctx checkout no longer
+   waits — the point of the fix.
 
-**Tests:**
-- Concurrency (the headline): fake backend whose `configure_session` awaits a
-  `Notify`/gate. Start checkout for ctx A (blocks in configure, off-lock). Assert a
-  checkout for ctx B (different agent, instant configure) completes while A is still
-  gated. Pre-fix this deadlocks/times out; post-fix passes. Bound with a generous
-  `tokio::time::timeout`, no sleeps.
-- Same-ctx busy: while A is gated in configure, a second checkout for ctx A returns
-  `HandleBusy` (not a hang, not a duplicate spawn).
-- Failure settle: gated configure resolves to `Err` → handle removed, next checkout for
-  that ctx succeeds fresh.
-- Race settle guard: while A is gated, force-clear ctx A; configure then fails/succeeds —
-  assert the settle does not clobber the post-clear state (op-equality branch).
-- Existing session_manager suite green (the ~70%-test file is the safety net).
+**Tests (all in session_manager tests, gated-configure fake backend):**
+- Different-ctx liveness: ctx A gated in configure; checkout ctx B completes while A
+  is gated (bounded by `tokio::time::timeout`, no sleeps).
+- Same-ctx busy: second checkout for ctx A during configure → `HandleBusy`, exactly
+  one `configure_session` call observed.
+- Failure settle: gated configure → `Err`; handle removed; next checkout succeeds fresh.
+- Cancel-during-configure: `session cancel` while `Configuring` → no panic, no
+  real-turn cancel path taken, no abort-token fired; on configure Ok the settle
+  returns `SessionExpired` and the backend session is released; no `WarmTurn` escapes
+  for a cancelled claim.
+- Force-clear-during-configure: same shape via `reset_session(force=true)` — settle
+  detects the replaced claim; no `release_session` vs `configure_session` race
+  (assert call ordering via the fake backend's log).
+- Status visibility: `status()` during the window reports `configuring`.
+- Existing suite green (the ~70%-test file is the safety net).
+
+**Explicit non-goals:** no fairness/queueing; no changes to `reconcile`/`release`/
+`reset` beyond teaching their claimed-state matches about `Configuring`; no warm-pool.
 
 ## W1-C: `spawn_blocking` / async process for blocking calls on live paths
 
 **Files:** `crates/bridge-worktree/src/host_git.rs` (`add`, `remove`, `is_git_repo` —
-sync `std::process::Command::output()` inside `async fn`), `crates/bridge-worktree/src/sweep.rs`
-(same pattern at ~:10 if it runs post-boot; if it is strictly boot-time-before-serve,
-leave it and note why).
+sync `std::process::Command::output()` via `run_git` :21–28 inside `async fn` :81–116,
+plus a `std::thread::sleep` retry backoff at :98 that also parks the runtime thread).
 
-**Change:** replace `std::process::Command` with `tokio::process::Command` +
-`.output().await` (preferred over `spawn_blocking` — same semantics, no thread-pool
-hop, kill-on-drop available). Preserve exact args, env, error mapping, and output
-parsing. No trait signature changes (methods are already `async`).
+**`sweep.rs` ruling (per review):** it is NOT boot-only — `WorktreeRunEndGuard::drop`
+runs it synchronously at run-end (:105–119; guards installed at three main.rs sites).
+A `Drop` impl cannot await, so converting sweep to async is a redesign, not hygiene.
+**Decision: sweep.rs stays sync this wave**, with a code comment stating the rationale
+(Drop-guard context; startup/run-end only, not a per-turn path).
+
+**Change (host_git.rs only):** replace `std::process::Command` with
+`tokio::process::Command` + `.output().await`; replace the `std::thread::sleep`
+backoff at :98 with `tokio::time::sleep(...).await`. Preserve exact args, env, error
+mapping, and output parsing. No trait signature changes (methods are already `async`).
 
 **Tests:** existing bridge-worktree suite green; add one test asserting `add` does not
 block the runtime: spawn `add` against a repo fixture concurrently with a
@@ -127,14 +152,15 @@ spec-review to rule whether the cadence test earns its flake risk).
 
 ## W1-D: CI/toolchain/pin hygiene
 
-**Files:** `.github/workflows/ci.yml`, root `Cargo.toml`, all 16 member `Cargo.toml`s,
-`bin/a2a-bridge/Cargo.toml`.
+**Files:** `.github/workflows/ci.yml`, root `Cargo.toml`, and all 16 member manifests
+(15 `crates/*/Cargo.toml` + `bin/a2a-bridge/Cargo.toml`).
 
 **Changes:**
 1. `ci.yml`: `dtolnay/rust-toolchain@stable` → explicit `toolchain: 1.94.0` (matching
    `rust-toolchain.toml`); add a one-line `rustc --version` echo step for the log.
-2. Root `Cargo.toml` `[workspace.package]`: add `rust-version = "1.94"`; each member
-   adds `rust-version.workspace = true` (mechanical, 17 manifests).
+2. Root `Cargo.toml` `[workspace.package]`: add `rust-version = "1.94"`; **every one
+   of the 16 member manifests** adds `rust-version.workspace = true` (inheritance is
+   explicit per package — workspace metadata alone enforces nothing; per review).
 3. `bin/a2a-bridge/Cargo.toml`: replace the hand-duplicated
    `a2a = { package = "a2a-lf", version = "=0.3.0" }` in `[dependencies]` with
    `a2a.workspace = true` (the dev-dependency already does this).
