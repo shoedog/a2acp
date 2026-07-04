@@ -24,7 +24,7 @@
 
 **Triggers:** `push: tags: ['v*']` (real release) + `workflow_dispatch` (dry-run: build
 and upload artifacts to the workflow run only, NO release created) — the dispatch mode
-is the pre-merge live gate.
+is the post-merge/pre-tag live gate (workflow_dispatch requires the file on the default branch).
 
 **Targets (3):**
 - `aarch64-apple-darwin` (macos-14 runner — the dev platform)
