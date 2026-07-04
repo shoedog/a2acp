@@ -100,16 +100,19 @@ fixture/ dir so `--session-cwd` navigation cannot leak it).
 
 - **Cross-family, via the bridge itself:** the judge is a single-node workflow
   (`inputs=[]`, judge prompt = rubric + truth + normalized findings) run through
-  `a2a-bridge run-workflow` against a **gemini** agent — third family, cross-lineage
-  from EVERY agent that authors graded artifacts (codex + claude reviewers AND the
-  claude synth — the guard covers the whole authorship set, not just "executors").
-  Gemini config (from the shipped adapter, plan 2026-06-01): `cmd="gemini"`,
-  `args=["--acp"]`, `auth_method="oauth-personal"`, `"gemini"` in `allowed_cmds` —
-  NOT in the default reference configs; `evals/configs/eval-agents.toml` defines it
-  and must pass `a2a-bridge validate --config`. "Tools-off" is enforced by: no
+  `a2a-bridge run-workflow` against a **kiro** agent (v2.1 pivot — gemini's OAuth is
+  dead on this machine, probe-verified `throwIneligibleOrProjectIdError`; kiro probe:
+  "Logged in with GitHub"). Kiro = Amazon family — cross-lineage from EVERY agent that
+  authors graded artifacts (codex + claude reviewers AND the claude synth — the guard
+  covers the whole authorship set, not just "executors"). Copy the kiro entry shape
+  from `examples/a2a-bridge.multi-agent.toml`; `evals/configs/eval-agents.toml` must
+  pass `a2a-bridge validate --config`. "Tools-off" is enforced by: no
   `[[agents.mcp]]` on the judge entry (the ACP client already advertises no
   FS/terminal capability and rejects reverse FS/terminal calls) + a no-tools judge
-  prompt. Fallback judge: kiro, permitted only via the harness family map.
+  prompt. Fallback chain: **ollama-cloud open-weight model** (`kind="api"`,
+  OLLAMA_API_KEY is set on this machine) → ollama-local `qwen2.5-coder:7b` (emergency
+  only — a 7B is weak for rubric-following; if used, the report carries a judge-tier
+  flag). Gemini re-enters the chain if its auth is restored.
   `config.py` owns a **harness-side family map** ({codex: openai, claude: anthropic,
   gemini: google, kiro: amazon}) since AgentEntry has no family field; it refuses a
   judge whose family appears in the graded-artifact authorship set unless explicitly
