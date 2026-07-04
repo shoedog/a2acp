@@ -256,12 +256,18 @@ jobs:
         run: |
           set -euo pipefail
           VER_RE="${VERSION//./\\.}"
+          NOTES="$(mktemp)"
+          awk -v ver="$VER_RE" '
+            $0 ~ ("^## \\[" ver "\\]") { p=1; next }
+            p && /^## \[/ { exit }
+            p { print }
+          ' CHANGELOG.md > "$NOTES"
+          if [[ ! -s "$NOTES" ]]; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}]' section — refusing to publish a blank-body release"
+            exit 1
+          fi
           gh release create "$TAG" \
             --verify-tag \
             --title "a2a-bridge $TAG" \
-            --notes-file <(awk -v ver="$VER_RE" '
-              $0 ~ ("^## \\[" ver "\\]") { p=1; next }
-              p && /^## \[/ { exit }
-              p { print }
-            ' CHANGELOG.md) \
+            --notes-file "$NOTES" \
             dist/SHA256SUMS dist/*.tar.gz
