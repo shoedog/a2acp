@@ -561,8 +561,9 @@ fn check_api_key_env(
 }
 
 /// Check 4 — sandbox egress: a `Locked` network must resolve (compose_sandbox would otherwise spawn
-/// against a nonexistent `--network`, a hard failure — `fail`); the image is advisory (the runtime may
-/// pull it on demand — `warn`). `Open` egress has no locked network to inspect.
+/// against a nonexistent `--network`, a hard failure — `fail`); the image is advisory for EVERY
+/// sandboxed entry regardless of egress policy (the runtime may pull it on demand — `warn`; spec
+/// §W3-B item 4). `Open` egress has no locked network to inspect.
 fn check_sandbox_egress(
     snapshot: &RegistrySnapshot,
     probes: &dyn RuntimeProbes,
@@ -573,11 +574,11 @@ fn check_sandbox_egress(
             continue;
         };
         let id = entry.id.as_str();
+        let runtime = sb.runtime();
+        let img_check = format!("agent:{id}:sandbox-image");
         match &sb.egress {
             EgressPolicy::Locked { network, .. } => {
-                let runtime = sb.runtime();
                 let net_check = format!("agent:{id}:sandbox-network");
-                let img_check = format!("agent:{id}:sandbox-image");
                 if !runtime_is_allowed(runtime, &snapshot.allowed_cmds) {
                     out.push(runtime_not_allowed_row(net_check, runtime));
                     out.push(runtime_not_allowed_row(img_check, runtime));
@@ -595,25 +596,32 @@ fn check_sandbox_egress(
                         format!("create it: `{runtime} network create {network}` (or fix [agents.sandbox].network for {id})"),
                     ));
                 }
-                if probes.image_exists(runtime, &sb.image) {
-                    out.push(CheckResult::ok(
-                        img_check,
-                        format!("image {:?} present locally", sb.image),
-                    ));
-                } else {
-                    out.push(CheckResult::warn(
-                        img_check,
-                        format!("image {:?} not present locally (advisory — the runtime may pull on demand)", sb.image),
-                        format!("pre-pull with `{runtime} pull {}` to avoid a first-run delay or an offline failure", sb.image),
-                    ));
-                }
             }
             EgressPolicy::Open => {
                 out.push(CheckResult::ok(
                     format!("agent:{id}:sandbox-egress"),
                     "egress open (no locked network to inspect)",
                 ));
+                if !runtime_is_allowed(runtime, &snapshot.allowed_cmds) {
+                    out.push(runtime_not_allowed_row(img_check, runtime));
+                    continue;
+                }
             }
+        }
+        if probes.image_exists(runtime, &sb.image) {
+            out.push(CheckResult::ok(
+                img_check,
+                format!("image {:?} present locally", sb.image),
+            ));
+        } else {
+            out.push(CheckResult::warn(
+                img_check,
+                format!(
+                    "image {:?} not present locally (advisory — the runtime may pull on demand)",
+                    sb.image
+                ),
+                format!("pre-pull with `{runtime} pull {}` to avoid a first-run delay or an offline failure", sb.image),
+            ));
         }
     }
 }
@@ -982,6 +990,9 @@ pub fn doctor_cmd(args: &[String]) -> Result<(), crate::BoxError> {
     }
 
     let config_path = crate::require_config_path(explicit_config)?;
+    // Canonicalize for serve-parity: serve resolves `[store].path` against the canonicalized
+    // config's directory, so a symlinked config must not make doctor stat a different parent.
+    let config_path = config_path.canonicalize().unwrap_or(config_path);
     let loaded = load_config(&config_path);
     let probes = RealProbes;
     let results = run_checks(&loaded, &probes);
@@ -1419,6 +1430,28 @@ mod tests {
         assert!(results
             .iter()
             .all(|r| r.check != "agent:impl:sandbox-network"));
+    }
+
+    #[test]
+    fn open_egress_missing_image_warns_advisory() {
+        // Branch-review MAJOR: the image advisory must fire for open-egress sandboxes too —
+        // it is per-sandbox, not per-egress-policy (spec §W3-B item 4).
+        let mut e = acp_entry("impl", "codex-acp");
+        e.sandbox = Some(SandboxConfig {
+            runtime: None,
+            image: "img".to_string(),
+            mount: "/work".to_string(),
+            access: MountAccess::Rw,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
+        let cfg = base_loaded(snapshot("impl", vec![e], vec!["docker"]));
+        let probes = FakeProbes::new().allow_runtime("docker");
+        let results = run_checks(&cfg, &probes);
+        let img = find(&results, "agent:impl:sandbox-image");
+        assert_eq!(img.status, CheckStatus::Warn);
+        assert!(img.detail.contains("advisory"), "detail: {}", img.detail);
+        assert!(!img.remedy.is_empty());
     }
 
     // ---- check 5: [verify] ----
