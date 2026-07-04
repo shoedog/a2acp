@@ -1,0 +1,24 @@
+{
+  "_provenance": "wave-1 live gate (2026-07-03): same live-gate session as the warm-turn pairs, but against a FRESH cold agent (`codex-cold`, a distinct registry entry pointed at the same codex-acp binary, spawned for the first time) on a different context, captured with json-rpc id=2. The `request` half is a RECONSTRUCTION of the shape actually sent; only the response was captured raw. Scrubbed identically.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "SendMessage",
+    "params": {
+      "message": {
+        "contextId": "ctx-livegate-cold",
+        "text": "Reply with exactly the single token COLDPONG and nothing else.",
+        "metadata": { "a2a-bridge.agent": "codex-cold" }
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+      "task": { "id": "task-1", "state": "TASK_STATE_COMPLETED" },
+      "artifact": { "text": "COLDPONG" },
+      "status": ["COLDPONG"]
+    }
+  }
+}
