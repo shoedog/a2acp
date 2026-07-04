@@ -1,0 +1,24 @@
+Subject: [PATCH] registry: return the stored command from register
+
+Adds `register`, which inserts the agent entry and hands back a borrowed handle
+to the stored command.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,6 +11,17 @@ impl Registry {
+         }
+     }
++
++    /// Register `id` with its launch command and return a handle to the stored
++    /// command string.
++    pub fn register(&mut self, id: &str, cmd: &str) -> &str {
++        self.agents.insert(id.to_string(), cmd.to_string());
++        // SAFETY/INVARIANT: we inserted `id` on the line above and hold `&mut
++        // self`, so no other code could have removed it before this lookup; the
++        // get is infallible here.
++        self.agents.get(id).map(String::as_str).unwrap()
++    }
+
+     pub fn get(&self, id: &str) -> Option<&str> {
+         self.agents.get(id).map(String::as_str)
+     }

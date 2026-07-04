@@ -1,0 +1,23 @@
+Subject: [PATCH] eventlog: replay missed events on reattach
+
+Adds `events_since(cursor)` so a reconnecting SSE subscriber can replay the
+events after its Last-Event-ID.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,17 @@ impl EventLog {
+             text: text.to_string(),
+         });
+     }
++
++    /// Return the events a reconnecting subscriber has NOT seen yet. `cursor`
++    /// is the seq of the last event it received (its Last-Event-ID). Only
++    /// strictly-newer events should be replayed.
++    pub fn events_since(&self, cursor: u64) -> Vec<Event> {
++        self.events
++            .iter()
++            .filter(|e| e.seq >= cursor)
++            .cloned()
++            .collect()
++    }
+ }

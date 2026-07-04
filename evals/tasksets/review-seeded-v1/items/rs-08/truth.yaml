@@ -1,0 +1,39 @@
+seeded: true
+defects:
+- id: rs-08-d1
+  defect_class: cancellation-unsafety
+  location: src/lib.rs:23
+  hunk_lines: 21-26
+  description: >-
+    `checkpoint` awaits `mark_complete` BEFORE `put_output`. If the future is
+    dropped (turn cancelled) after the first await resolves but before the
+    second, the node is durably marked complete with no output stored.
+  root_cause: >-
+    the two-step durable write commits the completion marker before the payload;
+    the await point between them is a cancellation seam that can leave the marker
+    set without the output.
+  bad_behavior: >-
+    a cancel between the two awaits leaves the node "complete" with no output; on
+    resume the node is skipped and every downstream node reads an empty/absent
+    output -- torn, silently-corrupt state that resume cannot recover.
+  minimal_trigger: >-
+    drop the `checkpoint` future after `mark_complete(node)` returns Ok but
+    before `put_output` runs; the store now reports `node` complete while its
+    output is missing.
+  acceptable_match: >-
+    any finding identifying that `mark_complete` is written before `put_output`,
+    so a node can end up marked done with no output present -- credit either
+    trigger of this one marker-before-payload root cause: (a) the future is
+    dropped (turn cancelled) between the two awaits, OR (b) `put_output` returns
+    Err (or otherwise fails) after the completion marker is already committed,
+    leaving the node marked done without its output.
+  reject_if: >-
+    a finding that only says "these two writes aren't transactional/atomic" in
+    the abstract, or "the ordering looks off", without noting that the marker is
+    written BEFORE the payload so a failure/drop between them leaves a done-marked
+    node with no output.
+  catchability: >-
+    catchable from diff because the added body shows `mark_complete(node).await`
+    on the line above `put_output(node, body).await`, and the doc contract says a
+    node must never be marked complete without its output -- the wrong order across
+    the await is visible in the hunk.

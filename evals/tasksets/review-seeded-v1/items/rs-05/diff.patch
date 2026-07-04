@@ -1,0 +1,21 @@
+Subject: [PATCH] manager: lazily spawn sessions via get_or_spawn
+
+Checks the session cache and spawns the agent-backed session on first use.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,6 +24,14 @@ impl Manager {
+         Session { id: id.to_string() }
+     }
+
++    /// Return the session for `id`, spawning it on first use.
++    pub fn get_or_spawn(&self, id: &str) {
++        if !self.sessions.lock().unwrap().contains_key(id) {
++            let session = self.spawn(id);
++            self.sessions.lock().unwrap().insert(id.to_string(), session);
++        }
++    }
++
+     pub fn spawn_count(&self) -> u32 {
+         *self.spawned.lock().unwrap()
+     }

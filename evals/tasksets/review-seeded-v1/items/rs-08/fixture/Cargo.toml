@@ -1,0 +1,9 @@
+[package]
+name = "rs08-cancel-torn-write"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Standalone crate: keep it out of the parent repo's cargo workspace.
+[workspace]

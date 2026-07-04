@@ -1,0 +1,35 @@
+seeded: true
+defects:
+- id: rs-05-d1
+  defect_class: TOCTOU check-then-act
+  location: src/lib.rs:29
+  hunk_lines: 27-33
+  description: >-
+    `get_or_spawn` checks `contains_key` under one lock acquisition, releases the
+    lock, spawns, then inserts under a SECOND, separate lock acquisition. The gap
+    between the check and the act is not atomic.
+  root_cause: >-
+    the existence check and the insert take the `sessions` mutex twice with the
+    guard dropped in between, instead of holding one lock (or using `entry`)
+    across the whole check-then-insert.
+  bad_behavior: >-
+    two threads calling `get_or_spawn(id)` for the same id can both observe the
+    key absent, both call the expensive `spawn`, and the second `insert`
+    overwrites the first -- two agent processes spawned, one session orphaned,
+    violating the "at most one spawn per id" contract.
+  minimal_trigger: >-
+    two concurrent `get_or_spawn("a")` calls interleaved so both pass the
+    `contains_key` check before either inserts; `spawn_count()` ends at 2.
+  acceptable_match: >-
+    any finding stating that the contains_key check and the insert use two
+    separate lock scopes (non-atomic check-then-act / TOCTOU), so concurrent
+    callers can double-spawn / the second insert clobbers the first.
+  reject_if: >-
+    a finding that only says "uses a mutex, watch for races" generally, without
+    identifying the non-atomic gap between the `contains_key` check and the
+    `insert` (should hold one lock or use `entry`).
+  catchability: >-
+    catchable from diff because the hunk shows `self.sessions.lock().unwrap()`
+    called once for `contains_key` and again for `insert`, with `spawn` between
+    the two -- the two distinct lock acquisitions around the check and the act
+    are both visible.

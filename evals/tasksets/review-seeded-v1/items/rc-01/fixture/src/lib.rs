@@ -1,0 +1,38 @@
+use tokio::sync::mpsc::Receiver;
+
+#[derive(Debug, PartialEq)]
+pub enum TurnOutcome {
+    Completed(String),
+    Cancelled,
+}
+
+/// Drive one warm turn: accumulate the agent's streamed deltas, but a cancel
+/// signal must win IMMEDIATELY (abort-first), even if a reply delta is ready at
+/// the same time.
+///
+/// Only an actual cancel value (`Some(())`) is a cancellation. If the cancel
+/// SENDER is dropped (`recv()` yields `None`) no cancel can ever arrive, which
+/// is benign: we stop watching that arm and keep draining deltas to completion.
+pub async fn run_turn(mut cancel: Receiver<()>, mut deltas: Receiver<String>) -> TurnOutcome {
+    let mut acc = String::new();
+    let mut cancel_open = true;
+    loop {
+        tokio::select! {
+            // `biased;` is intentional: cancellation must pre-empt draining
+            // another delta, so we poll the cancel arm first every iteration. A
+            // chatty agent could otherwise keep starving the cancel.
+            biased;
+
+            res = cancel.recv(), if cancel_open => match res {
+                Some(()) => return TurnOutcome::Cancelled,
+                // Sender dropped: no cancel can arrive. Disable this arm (so we
+                // don't spin on a closed channel) and finish the deltas.
+                None => cancel_open = false,
+            },
+            delta = deltas.recv() => match delta {
+                Some(d) => acc.push_str(&d),
+                None => return TurnOutcome::Completed(acc),
+            },
+        }
+    }
+}

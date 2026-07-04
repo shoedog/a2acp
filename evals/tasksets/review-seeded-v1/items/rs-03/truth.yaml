@@ -1,0 +1,34 @@
+seeded: true
+defects:
+- id: rs-03-d1
+  defect_class: wire-leak redaction miss
+  location: src/lib.rs:30
+  hunk_lines: 28-33
+  description: >-
+    the new `Upstream` arm of `client_message()` interpolates `{self}` -- the
+    full `Display`, which includes the upstream `url` and the `source` error --
+    into the client-facing string, unlike every other arm which returns a static
+    category.
+  root_cause: >-
+    formatting the internal error (`{self}` / the underlying `{source}`) into the
+    wire message instead of returning a fixed generic category string.
+  bad_behavior: >-
+    the remote A2A caller receives "upstream request failed: upstream
+    https://internal-host:8443/... failed: <source error>", leaking internal
+    routing/topology and the source error to an untrusted reader.
+  minimal_trigger: >-
+    `BridgeError::Upstream { url: "https://internal:8443/x".into(), source:
+    "connection refused".into() }.client_message()` returns a string containing
+    the internal URL and source.
+  acceptable_match: >-
+    any finding stating that the Upstream arm leaks internal detail (the url /
+    source / full Display) into the client-facing message via `{self}`, rather
+    than returning a redacted/generic category string.
+  reject_if: >-
+    a finding that only says "improve the error message" or "add upstream
+    handling" without noting that internal detail (url/source) is exposed on the
+    client-facing wire path.
+  catchability: >-
+    catchable from diff because the added arm reads `format!("...: {self}")`
+    while the sibling arms in the same match return static strings -- the lone
+    interpolation of the internal error into a client message is visible in the hunk.

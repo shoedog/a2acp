@@ -1,0 +1,27 @@
+Subject: [PATCH] dispatch: record the turn in place instead of re-locking
+
+Previously dispatch checked the session existed, dropped the lock, ran the
+turn, then re-locked to bump the counter. Simplify to a single lookup and
+record the turn count on the session directly.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -44,10 +44,10 @@ impl SessionManager {
+     /// Dispatch one turn for `id`: look up the session, run the turn, record it.
+     pub async fn dispatch(&self, id: &str, prompt: &str) -> Option<String> {
+-        {
+-            let sessions = self.sessions.lock().await;
+-            if !sessions.contains_key(id) {
+-                return None;
+-            }
+-        }
+-        let reply = self.agent.run_turn(id, prompt).await;
+-        let mut sessions = self.sessions.lock().await;
+-        let session = sessions.get_mut(id)?;
++        let mut sessions = self.sessions.lock().await;
++        let session = sessions.get_mut(id)?;
++        // Run the turn while we hold the session so we can record it in place.
++        let reply = self.agent.run_turn(id, prompt).await;
+         session.turns += 1;
+         Some(reply)
+     }

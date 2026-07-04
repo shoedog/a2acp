@@ -1,0 +1,32 @@
+seeded: true
+defects:
+- id: rs-09-d1
+  defect_class: integer truncation
+  location: src/lib.rs:20
+  hunk_lines: 17-22
+  description: >-
+    `encode` casts `payload.len()` (a `usize`) to `u16` for the length header.
+    Any payload >= 64 KiB (65536 bytes) truncates modulo 2^16, so the header
+    advertises a wrong, much smaller length than the payload actually is.
+  root_cause: >-
+    narrowing cast (`usize as u16`) of a length that can exceed `u16::MAX`, with
+    no bound/validation, despite payloads being allowed up to 1 MiB.
+  bad_behavior: >-
+    for a 100 KiB payload the header reports len % 65536 (~34 KiB); the reader
+    consumes only that many bytes, then reads the remaining payload bytes as the
+    next frame's header -- the stream desyncs / frames are silently corrupted.
+  minimal_trigger: >-
+    `encode(vec![0u8; 65536])` produces a Frame whose `len` is 0 (65536 mod
+    2^16), not 65536.
+  acceptable_match: >-
+    any finding stating that `payload.len() as u16` truncates for payloads >=
+    64 KiB (the length header can't hold the real length / u16 is too narrow),
+    corrupting framing.
+  reject_if: >-
+    a finding that only says "validate the length" or "use to_be_bytes carefully"
+    without identifying the `usize -> u16` truncation for large payloads.
+  catchability: >-
+    catchable from diff because the added line is literally
+    `let len = payload.len() as u16;` while the doc comment right above says
+    payloads may be up to 1 MiB -- the narrowing cast versus the stated size
+    bound is visible in the hunk.

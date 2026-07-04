@@ -1,0 +1,23 @@
+Subject: [PATCH] manager: run the stored prompt in dispatch
+
+Reads the session's prompt out of the map and runs it against the agent. The
+prompt is cloned so the map lock drops before the (slow) round-trip.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,6 +27,18 @@ impl Manager {
+             .insert(id.to_string(), prompt.to_string());
+     }
++
++    /// Run the session's stored prompt against the agent.
++    pub async fn dispatch(&self, id: &str) -> Option<String> {
++        // Clone the prompt out and let the map lock drop at the end of this
++        // block, BEFORE the slow agent round-trip, so other sessions are not
++        // serialized behind the map lock while this turn runs.
++        let prompt = {
++            let prompts = self.prompts.lock().await;
++            prompts.get(id)?.clone()
++        };
++        Some(self.agent.run_turn(&prompt).await)
++    }
+ }

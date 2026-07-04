@@ -1,0 +1,33 @@
+seeded: false
+defects: []
+clean_rationale: >-
+  The `biased;` in the `tokio::select!` is correct and required. The contract is
+  abort-first cancellation: when an actual cancel value is pending it must
+  pre-empt draining another delta. `biased;` makes select poll the arms
+  top-to-bottom, and the cancel arm is listed first, so cancellation always wins
+  over a simultaneously-ready delta. Removing `biased;` (random arm order) would
+  be the actual defect, because a continuously-ready delta stream could starve
+  the cancel. Cancellation is distinguished correctly: only `Some(())` returns
+  `Cancelled`; a dropped cancel sender (`recv() == None`) is benign and disables
+  the cancel arm (via the `if cancel_open` guard) so the loop neither
+  mis-reports cancellation nor spins on the closed channel, and it finishes the
+  deltas. The loop terminates normally when the delta stream closes.
+tempting_non_defects:
+- >-
+  The `biased;` looks like a fairness bug (it can "starve" the delta arm when
+  cancel is always ready), but that starvation is exactly the intended semantics
+  here -- cancel MUST out-prioritize deltas. It is not a defect.
+- >-
+  Polling `cancel.recv()` before `deltas.recv()` every iteration looks like it
+  could drop deltas, but deltas are only skipped once a real cancel is actually
+  pending, at which point the turn is ending anyway.
+- >-
+  The `if cancel_open` precondition and the `None => cancel_open = false` arm
+  look like extra machinery a reviewer might call unnecessary, but they are the
+  correctness fix for a closed cancel channel: without them a dropped cancel
+  sender would either be mis-read as a cancel or (under `biased;`) busy-loop on
+  the always-ready `None`. They are intentional, not dead code.
+- >-
+  Accumulating into `acc` across loop iterations looks like unbounded growth, but
+  it is bounded by the finite delta stream and returned in `Completed(acc)` when
+  the stream closes.

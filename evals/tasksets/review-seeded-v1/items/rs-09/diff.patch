@@ -1,0 +1,16 @@
+Subject: [PATCH] frame: add encode() to length-prefix a payload
+
+Frames a payload with its length header for the stdio MCP transport.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,3 +14,9 @@ impl Frame {
+         out
+     }
+ }
++
++/// Frame a payload for the wire. Payloads may be up to 1 MiB.
++pub fn encode(payload: Vec<u8>) -> Frame {
++    let len = payload.len() as u16;
++    Frame { len, payload }
++}

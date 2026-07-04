@@ -1,0 +1,136 @@
+# a2a-bridge config for M3 eval runs: the two reviewer agents (codex, claude)
+# + the BLIND judge agent (kiro -- v2.1 pivot: gemini's OAuth is dead on this
+# machine, probe-verified `throwIneligibleOrProjectIdError`; see
+# docs/superpowers/specs/2026-07-04-m3-eval-harness.md §Judge).
+#
+# Agent cmd/args are copied verbatim from the repo's own shipped reference
+# configs, not hand-guessed:
+#   - codex / claude: examples/a2a-bridge.workflows.toml (the shipping
+#     `code-review` workflow this harness's `code-review-duo` mirrors).
+#   - kiro: examples/a2a-bridge.multi-agent.toml ("kiro: zero-auth local
+#     default (kiro-cli acp)").
+#
+# Workflow ids implement the M3 spec's 3-cell matrix + the blind judge:
+#   code-review-duo          codex + claude reviewers -> claude synth
+#                             (mirrors examples/a2a-bridge.workflows.toml's
+#                             `code-review`; the GRADED artifact is the SYNTH
+#                             output -- the actual shipping terminal shape).
+#   code-review-codex-solo   codex reviewer only, single node = terminal
+#                             (RAW -- no synth pass: review-synth.md expects
+#                             two lens vars and unknown vars render
+#                             verbatim, so the raw reviewer output is the
+#                             cleaner estimand for this cell).
+#   code-review-claude-solo  claude reviewer only, single node = terminal
+#                             (RAW, same reasoning).
+#   judge                    single kiro node, tools-off (no [[agents.mcp]]
+#                             on the kiro entry below). `prompt_file` is a
+#                             bare `{{input}}` passthrough
+#                             (evals/rubrics/judge-task.md) -- harness/judge.py
+#                             builds the full rubric+truth+findings prompt
+#                             text and feeds it as the task-spec body
+#                             (task-type: freeform).
+#
+# `evals/harness/config.py` enforces the cross-family judge guard in Python
+# BEFORE any of this is spent (AgentEntry has no family field to check at
+# the bridge-config level) -- this file only needs to pass
+# `a2a-bridge validate --config`.
+
+default = "codex"
+
+[registry]
+# Exact allowlist of process commands the bridge may spawn.
+allowed_cmds = ["codex-acp", "claude-agent-acp", "kiro-cli"]
+
+[server]
+addr = "127.0.0.1:8080"
+
+[[agents]]
+id  = "codex"
+cmd = "codex-acp"
+
+[[agents]]
+id  = "claude"
+cmd = "claude-agent-acp"
+
+# kiro: zero-auth local default (kiro-cli acp) -- copied from
+# examples/a2a-bridge.multi-agent.toml. Used ONLY as the blind judge here:
+# Amazon family, cross-lineage from every agent that authors a graded
+# artifact (codex + claude reviewers AND the claude synth -- the
+# authorship set evals/harness/config.py's family guard covers). No
+# [[agents.mcp]] entry -- "tools-off" for the judge.
+[[agents]]
+id   = "kiro"
+cmd  = "kiro-cli"
+args = ["acp"]
+
+[[prompts]]
+id          = "review-correctness"
+file        = "../../prompts/review-correctness.md"
+description = "code-review correctness lens (shared with the shipping code-review workflow)"
+
+[[prompts]]
+id          = "review-architecture"
+file        = "../../prompts/review-architecture.md"
+description = "code-review architecture lens (shared with the shipping code-review workflow)"
+
+[[prompts]]
+id          = "review-synth"
+file        = "../../prompts/review-synth.md"
+description = "code-review synthesis prompt (shared with the shipping code-review workflow)"
+
+[[prompts]]
+id          = "judge-passthrough"
+file        = "../rubrics/judge-task.md"
+description = "blind judge passthrough -- {{input}} is the full rubric+truth+findings prompt harness/judge.py builds"
+
+# ── cell: duo -- the shipping code-review workflow shape, graded on the synth ──
+[[workflows]]
+id = "code-review-duo"
+
+[[workflows.nodes]]
+id     = "correctness"
+agent  = "codex"
+prompt = "review-correctness"
+inputs = []
+
+[[workflows.nodes]]
+id     = "architecture"
+agent  = "claude"
+prompt = "review-architecture"
+inputs = []
+
+[[workflows.nodes]]
+id     = "synth"
+agent  = "claude"
+prompt = "review-synth"
+inputs = ["correctness", "architecture"]
+
+# ── cell: codex-solo -- single reviewer, RAW (this one node is the terminal) ──
+[[workflows]]
+id = "code-review-codex-solo"
+
+[[workflows.nodes]]
+id     = "reviewer"
+agent  = "codex"
+prompt = "review-correctness"
+inputs = []
+
+# ── cell: claude-solo -- single reviewer, RAW ──
+[[workflows]]
+id = "code-review-claude-solo"
+
+[[workflows.nodes]]
+id     = "reviewer"
+agent  = "claude"
+prompt = "review-architecture"
+inputs = []
+
+# ── judge: single kiro node, tools-off, pure {{input}} passthrough ──
+[[workflows]]
+id = "judge"
+
+[[workflows.nodes]]
+id     = "grade"
+agent  = "kiro"
+prompt = "judge-passthrough"
+inputs = []

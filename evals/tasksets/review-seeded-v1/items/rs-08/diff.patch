@@ -1,0 +1,20 @@
+Subject: [PATCH] runner: checkpoint finished nodes for crash-resume
+
+Persists a node's completion marker and its output so a resume skips finished
+nodes and downstream nodes can read their inputs.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -18,4 +18,12 @@ pub struct Runner<S: Checkpoints> {
+     pub store: S,
+ }
+
++impl<S: Checkpoints> Runner<S> {
++    /// Checkpoint a finished node: record its output and mark it done so a
++    /// crash-resume skips it and downstream nodes can read the output.
++    pub async fn checkpoint(&self, node: &str, body: &str) -> Result<(), StoreError> {
++        self.store.mark_complete(node).await?;
++        self.store.put_output(node, body).await?;
++        Ok(())
++    }
++}
