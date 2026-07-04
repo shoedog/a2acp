@@ -161,7 +161,7 @@ git SHA), cell configs, taskset id — the C1 regression discipline.
    `a2a-bridge validate --config evals/configs/eval-agents.toml` green.
 2. `ci/test_integrity.py` green offline against a fabricated results dir (no agents).
 3. **Live smoke:** `--smoke` (3 items, duo cell) end-to-end with real codex+claude+
-   gemini-judge: findings extracted, judge JSON parses, metrics/report render.
+   kiro-judge: findings extracted, judge JSON parses, metrics/report render.
 4. **Baseline run:** the full 3-cell × 15-item matrix executed ONCE on this machine;
    `results/baselines/2026-07-<d>-review-seeded-v1/report.md` committed — the repo's
    first measured review catch-rate — plus `spotcheck.yaml` for the owner's C2 pass.

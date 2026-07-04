@@ -120,7 +120,8 @@ and asserts this before every call.
 
 Solo cells are graded RAW rather than through `review-synth.md` because that
 prompt expects two lens variables (`{{correctness}}`/`{{architecture}}`) --
-an unset one would render an empty string, not represent "no synth", so the
+an unset one renders VERBATIM (the template engine leaves unknown tokens as-is,
+not empty), producing a broken prompt rather than "no synth", so the
 raw reviewer terminal output is the cleaner estimand for those two cells.
 
 **Confound to read carefully (do NOT skip):** the cells differ on THREE axes
