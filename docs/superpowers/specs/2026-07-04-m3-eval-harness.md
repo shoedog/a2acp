@@ -1,6 +1,6 @@
-# M3 — Review-Quality Eval Harness (spec, v1)
+# M3 — Review-Quality Eval Harness (spec, v2)
 
-**Status:** Draft, pending codex xhigh spec-review.
+**Status:** APPROVED for implementation — v1 reviewed by codex gpt-5.5 xhigh; all findings folded (absolute cwd + --out-is-a-file MAJORs, solo-raw estimand, claude-synth family fact, gemini config, catchability gate, PROVISIONAL stats framing, 11th corpus class).
 **Source:** strategic-analysis M3 ("the strategic bet — self-hosted review quality — is
 unmeasured"), pulled forward by the identity ruling. Prior art: the owner's
 `~/code/prompts-skills-steering` harness (4 live-validated experiments) and its
@@ -16,10 +16,14 @@ where a **cell** = {workflow variant, agents, effort}. v1 matrix (3 cells):
 2. `codex-solo` — codex reviewer only (+ same synth prompt shape)
 3. `claude-solo` — claude reviewer only
 
-**Metrics (per cell, from the steering stack):** defect-level **catch-rate** (recall
-anchored to ground-truth defect ids — never inflated by judge-hallucinated matches),
-**false-finding count** on clean items, item-level confusion (TP/FP/TN/FN), Wilson CIs,
-McNemar exact p between cells on the paired item set.
+**Metrics (per cell, from the steering stack):** PRIMARY = defect-level **catch-rate**
+(recall anchored to ground-truth defect ids — never inflated by judge-hallucinated
+matches; CIs are descriptive given 1–2 defects/item cluster). Secondary: item-level
+confusion, false-finding count on clean items (FRAGILE at n=4 clean — descriptive
+only). Wilson CIs throughout; McNemar exact p REPORTED but demoted to a paired-flips
+display, never a pass/fail criterion. `report.md` carries a visible
+**`PROVISIONAL / n=14`** banner and avoids winner language unless effects are huge
+and paired flips obvious (per review).
 
 ## Layout (new top-level `evals/` — outside the cargo workspace, outside default CI)
 
@@ -64,30 +68,48 @@ defect APPLIED (the bridge's reviews are read-only-tools + `--session-cwd`, unli
 steering's tool-free inline-only reviews — items provide BOTH the inline diff and the
 navigable fixture).
 
-**v1 corpus: 14 items — 10 seeded (1–2 defects each), 4 clean.** Defect classes drawn
+**v1 corpus: 15 items — 11 seeded (1–2 defects each), 4 clean.** Defect classes drawn
 from this repo's own bug history (each class has a real ancestor):
 lock-across-await (the W1-B class), config-validation bypass (the S6 nested-volumes
 class), wire-leak redaction miss (the `{e}`-to-client class), error-swallowed
 (`let _ =` on a fallible cleanup), TOCTOU check-then-act, off-by-one on a cursor/
 pagination bound, unbounded channel/collection growth, cancellation-unsafety (partial
-write on future drop), integer-truncation cast, stale-lock/double-release. Clean items
-include `tempting_non_defects` (e.g., an intentional `biased;` select, a deliberate
-clone).
+write on future drop), integer-truncation cast, stale-lock/double-release, and
+**wrong-cwd/path propagation** (the 11th class, added per review — this repo's
+recurring scar). Clean items include `tempting_non_defects` (e.g., an intentional
+`biased;` select, a deliberate clone).
+**Fairness gate for the risky classes** (cancellation, stale-lock, unbounded growth):
+the diff must EXPOSE the invariant so a read-only reviewer can catch it without
+executing tests — each seeded item carries a one-line "catchable-from-diff because…"
+field in truth.yaml (`catchability`), human-checked at authoring.
 
-**Authoring discipline:** every seeded item's fixture must `cargo build` (defects are
-semantic, not syntax errors); every `acceptable_match` must be satisfiable by a
-paraphrase and every `reject_if` must exclude the tempting near-miss; `check_taskset.py`
-green is the merge gate for corpus commits.
+**Authoring discipline:** every seeded item's fixture must `cargo build -j 1` (defects
+are semantic, not syntax errors); every `acceptable_match` must be satisfiable by a
+paraphrase and every `reject_if` must exclude the tempting near-miss; the
+`catchability` line present on every seeded item; `check_taskset.py` green is the
+merge gate for corpus commits. Generated task-specs embed `context.md` + the fenced
+`diff.patch` in the body (task-spec `code-review` requires only Description +
+Acceptance Criteria); **truth.yaml is NEVER exposed to executors** (keep it out of the
+fixture/ dir so `--session-cwd` navigation cannot leak it).
 
 ## Judge
 
-- **Cross-family, via the bridge itself:** the judge is a single-node tools-off
-  workflow (`inputs=[]`, judge prompt = rubric + truth + normalized findings) run
-  through `a2a-bridge run-workflow` against a **gemini** agent (third family — cross-
-  lineage from BOTH executors under test, per the framework's preference-leakage
-  warning). Fallback judge agent: kiro. The steering same-family guard is replicated:
-  config.py refuses a judge whose family appears in the cell under test unless
-  explicitly overridden.
+- **Cross-family, via the bridge itself:** the judge is a single-node workflow
+  (`inputs=[]`, judge prompt = rubric + truth + normalized findings) run through
+  `a2a-bridge run-workflow` against a **gemini** agent — third family, cross-lineage
+  from EVERY agent that authors graded artifacts (codex + claude reviewers AND the
+  claude synth — the guard covers the whole authorship set, not just "executors").
+  Gemini config (from the shipped adapter, plan 2026-06-01): `cmd="gemini"`,
+  `args=["--acp"]`, `auth_method="oauth-personal"`, `"gemini"` in `allowed_cmds` —
+  NOT in the default reference configs; `evals/configs/eval-agents.toml` defines it
+  and must pass `a2a-bridge validate --config`. "Tools-off" is enforced by: no
+  `[[agents.mcp]]` on the judge entry (the ACP client already advertises no
+  FS/terminal capability and rejects reverse FS/terminal calls) + a no-tools judge
+  prompt. Fallback judge: kiro, permitted only via the harness family map.
+  `config.py` owns a **harness-side family map** ({codex: openai, claude: anthropic,
+  gemini: google, kiro: amazon}) since AgentEntry has no family field; it refuses a
+  judge whose family appears in the graded-artifact authorship set unless explicitly
+  overridden.
 - Output contract: strict JSON (`{item_pass, defects: [{id, found}], false_findings}`)
   — parse-or-retry-once-or-JudgeError.
 - **C2 calibration:** `spotcheck.yaml` — a random 10-item judge-decision sample
@@ -97,8 +119,13 @@ green is the merge gate for corpus commits.
 ## Runner
 
 Drives the REAL product path: `a2a-bridge run-workflow <cell-workflow> --input
-<generated task-spec> --session-cwd evals/tasksets/.../items/<id>/fixture --config
-evals/configs/eval-agents.toml --out <calls dir>`. Task-spec generated per item from
+<generated task-spec> --session-cwd <ABSOLUTE fixture path> --config
+evals/configs/eval-agents.toml --out calls/<cell>-<item>.md` — per review MAJORs:
+`--session-cwd` MUST be absolute (`SessionCwd::parse` rejects relative), and `--out`
+is a FILE (the terminal node's output), not a directory; the runner wraps
+timing/exit-code metadata in a sibling `calls/<cell>-<item>.json`. Note: local
+`run-workflow` does not enforce `allowed_cwd_root` (the served path does) — fine for
+local evals; documented in README for any future `--serve` runner. Task-spec generated per item from
 `context.md` + `diff.patch` using the shipped `code-review` task-type conventions.
 Concurrency 2 (subscription-quota politeness); per-item wall timeout; `--smoke` flag =
 3 items × 1 cell; budget gate aborts before the matrix if projected turns exceed the
@@ -111,8 +138,10 @@ git SHA), cell configs, taskset id — the C1 regression discipline.
   `BaseMetric` over run artifacts; pytest vocabulary). This is exactly how steering
   uses it in anger. NO deepeval LLM metrics (they'd need API keys the machine doesn't
   use, and the blind-judge architecture is strictly better calibrated here).
-- **opik** — optional tracing hook (steering's pattern: lazy import, enabled only when
-  `OPIK_API_KEY` is set, silent fallback to `trace.jsonl`).
+- **opik** — optional tracing hook ONLY (steering's pattern: lazy import inside
+  try/except, enabled only when `OPIK_API_KEY` is set, silent fallback to
+  `trace.jsonl`); NOT on the v1 critical path — if it costs more than the trivial
+  hook, defer it (per review).
 - **promptfoo — deliberately NOT used**, with reasoning recorded here: its load-bearing
   role in steering is parallel raw-CLI orchestration; the bridge IS the orchestrator
   under test, so a thin process pool over `run-workflow` replaces it without a Node
@@ -120,12 +149,13 @@ git SHA), cell configs, taskset id — the C1 regression discipline.
 
 ## Definition of done
 
-1. `check_taskset.py` green over the 14-item corpus; every fixture builds
-   (`cargo build` per fixture, `-j 1`).
+1. `check_taskset.py` green over the 15-item corpus; every fixture builds
+   (`cargo build -j 1` per fixture); every seeded item has its `catchability` line;
+   `a2a-bridge validate --config evals/configs/eval-agents.toml` green.
 2. `ci/test_integrity.py` green offline against a fabricated results dir (no agents).
 3. **Live smoke:** `--smoke` (3 items, duo cell) end-to-end with real codex+claude+
    gemini-judge: findings extracted, judge JSON parses, metrics/report render.
-4. **Baseline run:** the full 3-cell × 14-item matrix executed ONCE on this machine;
+4. **Baseline run:** the full 3-cell × 15-item matrix executed ONCE on this machine;
    `results/baselines/2026-07-<d>-review-seeded-v1/report.md` committed — the repo's
    first measured review catch-rate — plus `spotcheck.yaml` for the owner's C2 pass.
 5. Whole-branch dual review (opus + codex xhigh); merge; push. Eval runs are NEVER in
@@ -139,7 +169,7 @@ git SHA), cell configs, taskset id — the C1 regression discipline.
 - Judge validity: cross-family + blind + binary + C2 spotcheck; the AXIOM warning
   (complex agentic judges underperform simple rubric judges) argues for exactly this
   minimal judge.
-- Cost: 3 cells × 14 items ≈ 42 workflow runs + ~50 judge calls per full run —
+- Cost: 3 cells × 15 items ≈ 45 workflow runs + ~55 judge calls per full run —
   budget-gated, smoke-first, never scheduled.
 - Gemini agent availability on this machine (memory says the adapter shipped; verify
   live before the smoke — fallback kiro).
