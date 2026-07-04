@@ -36,10 +36,10 @@ a2a-bridge serve --config ./a2a-bridge.toml
 (and only ever touches those managed files).
 
 Bare `a2a-bridge` (no subcommand) also serves, but reads `./a2a-bridge.toml` from
-the CWD and materializes a **kiro-only** default if absent — that single-agent
-default is why a fresh checkout "only sees kiro". Use `init` + `serve --config`
-for multi-agent. An unknown subcommand or flag now errors instead of silently
-serving the default.
+the CWD and now **errors** (with an `init` hint) if that file is absent — `init`
+is the only thing that writes a config, so there's no more silent single-agent
+default to be surprised by. Use `init` + `serve --config` for multi-agent. An
+unknown subcommand or flag also errors instead of silently serving the default.
 
 ## Agent config reference
 

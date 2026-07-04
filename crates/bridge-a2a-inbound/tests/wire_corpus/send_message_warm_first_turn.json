@@ -1,0 +1,24 @@
+{
+  "_provenance": "wave-1 live gate (2026-07-03): the `response` half is REAL bytes captured from a live `a2a-bridge serve` driving a real codex-acp agent over a SendMessage call. The `request` half is a RECONSTRUCTION of the shape actually sent (SendMessage with message.contextId + message.text + message.metadata['a2a-bridge.agent']) -- only the response was captured raw, so this request text is a plausible stand-in, not verbatim captured bytes. Scrubbed of machine paths/hostnames; ids replaced with obvious placeholders (task-1 is also the server's real synthesized stub id for a taskId-less SendMessage, not a scrub placeholder).",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendMessage",
+    "params": {
+      "message": {
+        "contextId": "ctx-livegate-warm",
+        "text": "Reply with exactly the single token PONG and nothing else.",
+        "metadata": { "a2a-bridge.agent": "codex" }
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "task": { "id": "task-1", "state": "TASK_STATE_COMPLETED" },
+      "artifact": { "text": "PONG" },
+      "status": ["PONG"]
+    }
+  }
+}

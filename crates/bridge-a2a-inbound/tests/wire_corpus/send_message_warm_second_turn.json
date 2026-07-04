@@ -1,0 +1,24 @@
+{
+  "_provenance": "wave-1 live gate (2026-07-03): same live-gate session as send_message_warm_first_turn.json -- a SECOND SendMessage on the SAME contextId (warm continuation against the already-spawned codex-acp agent), captured with json-rpc id=3 (an intervening call, not part of this corpus, used id=2). The `request` half is a RECONSTRUCTION of the shape actually sent; only the response was captured raw. Scrubbed identically to the first-turn pair.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "SendMessage",
+    "params": {
+      "message": {
+        "contextId": "ctx-livegate-warm",
+        "text": "Reply with exactly the single token PONG2 and nothing else.",
+        "metadata": { "a2a-bridge.agent": "codex" }
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+      "task": { "id": "task-1", "state": "TASK_STATE_COMPLETED" },
+      "artifact": { "text": "PONG2" },
+      "status": ["PONG2"]
+    }
+  }
+}

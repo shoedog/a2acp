@@ -32,6 +32,7 @@
 mod catalog_probe;
 mod config;
 mod containers;
+mod doctor;
 mod implement;
 mod implement_resume;
 mod merge;
@@ -68,26 +69,6 @@ const CONFIG_PATH: &str = "a2a-bridge.toml";
 const DEFAULT_ARTIFACT_ALLOWLIST_PATH: &str = ".github/workflow-artifact-allowlist.txt";
 const DISPOSABLE_ARTIFACT_DEST: &str = "/tmp (or /private/tmp on macOS)";
 
-/// Built-in default config (new 3b registry schema) materialised to disk when
-/// `a2a-bridge.toml` is absent, so the `FileConfigSource` load/watch pipeline has
-/// a concrete path to read and the parent directory to watch. A sensible
-/// single-agent default: one `kiro` agent running `kiro-cli acp`.
-const DEFAULT_CONFIG: &str = r#"# Single-agent zero-auth default. For codex + claude + the review workflows,
-# run `a2a-bridge init` (or point `serve --config` at a multi-agent config).
-default = "kiro"
-
-[registry]
-allowed_cmds = ["kiro-cli"]
-
-[[agents]]
-id   = "kiro"
-cmd  = "kiro-cli"
-args = ["acp"]
-
-[server]
-addr = "127.0.0.1:8080"
-"#;
-
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Top-level usage, printed by `a2a-bridge help|--help|-h`. The detailed flags live in each subcommand's
@@ -122,6 +103,7 @@ SUBCOMMANDS:
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
   session             Warm session control.  status | release | cancel | clear | compact <contextId>
+  doctor              Read-only preflight: config, agent commands/runtimes, egress, verify/review, store, MCP.  [--config <f>] [--json]
 
 Run `a2a-bridge <subcommand> --help` for details. Quickstart + cwd/creds/concurrency notes: AGENTS.md.";
 
@@ -138,6 +120,35 @@ Serve the MCP protocol over stdio. STDOUT is reserved for NDJSON MCP replies; tr
   --project-marker <text>
                    non-empty marker string to match when --examples-policy is warn|deny; repeatable.
                    Passing a marker without --examples-policy implies warn.";
+
+/// `serve` has no dedicated `_cmd` function (its body is inlined in `main()`), so this usage
+/// constant lives beside the other top-level infra constants rather than beside a `fn`.
+const SERVE_USAGE: &str = "\
+usage: a2a-bridge serve [--config <path>]
+       a2a-bridge                    (bare invocation is equivalent to `serve` with no --config)
+
+Run the A2A server. `--config <path>` is a promise and must already exist; omitted, this reads
+./a2a-bridge.toml from the CWD, which must ALSO already exist — `a2a-bridge init` is the only
+thing that scaffolds a config (neither form of `serve` writes one anymore).
+  --config <path>  registry config defining the agent registry + [server]/[store]/[workflows]/etc.
+                   (default: ./a2a-bridge.toml)";
+
+/// `doctor` has no dedicated `_cmd` in main.rs (it lives in `doctor.rs`), but per the W3-A convention
+/// (see `SERVE_USAGE`) its usage constant is defined here so `dispatcher_help` can hand it out uniformly.
+const DOCTOR_USAGE: &str = "\
+usage: a2a-bridge doctor [--config <path>] [--json]
+
+Read-only, advisory preflight: parses + validates the config, then reports on the things that most
+commonly break a first run — agent commands/runtimes, api_key_env, sandbox egress (network/image),
+[verify] and [review] infrastructure, the [store] path, MCP servers, the lsp_env containerized-MCP
+trap, and configured credential bind-mounts. Every external probe is bounded (a wedged runtime is
+reported, never hung on) and NOTHING is written to disk — doctor never spawns an agent turn, creates a
+container, or touches the network beyond a local `<runtime> network|image inspect`.
+
+  --config <path>  registry config to check (default: ./a2a-bridge.toml)
+  --json           emit a stable {check, status, detail, remedy} JSON array instead of the text table
+
+Exit code is 0 unless at least one check is `fail` (warnings alone exit 0).";
 
 const TASK_SPEC_USAGE: &str = "\
 usage: a2a-bridge task-spec schema [type]
@@ -164,6 +175,7 @@ enum TopSubcommand {
     Mcp,
     TaskSpec,
     Prompt,
+    Doctor,
     Help,
     Serve,
     Unknown(String),
@@ -186,9 +198,39 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("mcp") => TopSubcommand::Mcp,
         Some("task-spec") => TopSubcommand::TaskSpec,
         Some("prompt") => TopSubcommand::Prompt,
+        Some("doctor") => TopSubcommand::Doctor,
         Some("help") | Some("--help") | Some("-h") => TopSubcommand::Help,
         Some("serve") | None => TopSubcommand::Serve,
         Some(other) => TopSubcommand::Unknown(other.to_string()),
+    }
+}
+
+/// Dispatcher-level `--help`/`-h` interception (wave 3, W3-A): if the first arg AFTER the
+/// subcommand is `--help`/`-h`, return that subcommand's usage text so `main()` can print it
+/// and exit 0 BEFORE any per-command parsing runs. Only `submit`/`task`/`session`/`serve`/
+/// `merge`/`init` need this — every other subcommand already checks `--help` inside its own
+/// parser. `init` is the dangerous case: its permissive `flag()` helper ignores unknown flags,
+/// so without this check `a2a-bridge init --help` would silently scaffold files instead of
+/// printing help. Nested forms (e.g. `task get --help`) are OUT of scope this wave — only the
+/// first post-subcommand arg is checked.
+///
+/// `doctor` (W3-B) is ALSO listed here even though `doctor_cmd`'s own parser checks `--help` too
+/// (belt-and-suspenders, matching the uniform "help is intercepted before any per-command work"
+/// contract this map exists for) — unlike `mcp`, which relies solely on its own internal check.
+fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static str> {
+    match raw_args.get(2).map(|s| s.as_str()) {
+        Some("--help") | Some("-h") => {}
+        _ => return None,
+    }
+    match sub {
+        TopSubcommand::Submit => Some(SUBMIT_USAGE),
+        TopSubcommand::Task => Some(TASK_USAGE),
+        TopSubcommand::Session => Some(SESSION_USAGE),
+        TopSubcommand::Serve => Some(SERVE_USAGE),
+        TopSubcommand::Merge => Some(merge::MERGE_USAGE),
+        TopSubcommand::Init => Some(INIT_USAGE),
+        TopSubcommand::Doctor => Some(DOCTOR_USAGE),
+        _ => None,
     }
 }
 
@@ -929,8 +971,8 @@ struct ImplementArgs {
 }
 
 const IMPLEMENT_USAGE: &str = "\
-usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth auto|light|standard|thorough]
-       a2a-bridge implement --resume <id> [--config <path>]
+usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth auto|light|standard|thorough] [--merge [--onto <branch>]]
+       a2a-bridge implement --resume <id> [--config <path>] [--merge [--onto <branch>]]
   --input <file|-> task-spec markdown to implement; use '-' to read stdin (required)
   --repo <path>   the repo to implement in; cloned into a quarantine under allowed_cwd_root (required)
   --config <path> registry config defining the impl agent + [implement]/[verify]/[review] (default: ./a2a-bridge.toml)
@@ -938,6 +980,8 @@ usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--
   --workflow <id> the edit workflow (default: implement-edit)
   --depth         review depth: auto|light|standard|thorough (default: [review].default_depth, else auto)
   --lang          language profile: auto|none|<id> (default: auto; auto detects from repo markers)
+  --merge         after an Approved run, land it via `merge` (sugar for `a2a-bridge merge <id>`)
+  --onto <branch> merge target when --merge is set (else [merge].target_ref, else the run's base_ref)
   --resume <id>   resume a stranded run by its <id> (the clone dir name)
 Clones --repo, runs the warm containerized impl agent (edit+fix turns share one container+session),
 verifies, reviews the diff, and hands off a branch to merge.";
@@ -3509,6 +3553,21 @@ async fn batch_cmd(args: &[String]) -> Result<(), BoxError> {
     Ok(())
 }
 
+const SUBMIT_USAGE: &str = "\
+usage: a2a-bridge submit [skill] --input <file> [--url <url>] [--context <id>] [--agent <id>]
+                         [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
+
+Send one unary message to a running a2a-bridge serve and print the response text.
+  [skill]         optional skill/workflow name (the first non-flag argument)
+  --input <file>  message body to send (required)
+  --url <url>     serve URL (default: http://127.0.0.1:8080)
+  --context <id>  reuse an existing contextId (continues that warm session)
+  --agent <id>    route to a specific agent id
+  --model <m>     override the agent model for this message
+  --effort <e>    override the reasoning effort for this message
+  --mode <m>      override the agent mode for this message
+  --cwd <dir>     override the session cwd for this message";
+
 async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
     let input_path = flag(args, "--input").ok_or("submit: --input <file> required")?;
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
@@ -3579,6 +3638,18 @@ fn artifact_text(artifact: &serde_json::Value) -> Option<&str> {
         .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()))
 }
 
+const TASK_USAGE: &str = "\
+usage: a2a-bridge task get <id> [--url <url>]
+       a2a-bridge task list [--limit <n>] [--url <url>]
+       a2a-bridge task cancel <id> [--url <url>]
+       a2a-bridge task watch <id> [--from <seq>] [--url <url>]
+
+Durable task store against a running a2a-bridge serve (default url http://127.0.0.1:8080).
+  get <id>     print the task record as JSON
+  list         list tasks, newest first (--limit, default 50)
+  cancel <id>  request cancellation; prints the task record as JSON
+  watch <id>   stream the task's progress over SSE (--from <seq> resumes after a cursor)";
+
 async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
     let sub = args
         .first()
@@ -3634,6 +3705,24 @@ async fn task_cmd(args: &[String]) -> Result<(), BoxError> {
     }
     Ok(())
 }
+
+const SESSION_USAGE: &str = "\
+usage: a2a-bridge session status <contextId> [--url <url>]
+       a2a-bridge session release <contextId> [--url <url>]
+       a2a-bridge session cancel <contextId> [--url <url>]
+       a2a-bridge session clear <contextId> [--force] [--url <url>]
+       a2a-bridge session compact <contextId> [--url <url>]
+       a2a-bridge session inject <contextId> --input <file> [--append] [--dedupe <key>] [--url <url>]
+       a2a-bridge session permit <requestId> --context <contextId> --generation <n> --op <operationId>
+                      (--approve | --deny | --modify <optionId> | --escalate)
+                      [--option <id>] [--reason <text>] [--url <url>]
+
+Warm session control against a running a2a-bridge serve (default url http://127.0.0.1:8080).
+  status|release|cancel   inspect / free / abort the warm session for <contextId>
+  clear                   reset to a fresh generation (--force overrides a live-turn guard)
+  compact                 summarize + reset, seeding the summary as the next turn's prefix
+  inject                  queue --input text to prepend (default) or append to the next turn
+  permit                  resolve a pending interactive permission request";
 
 async fn session_cmd(args: &[String]) -> Result<(), BoxError> {
     let sub = args
@@ -3869,6 +3958,23 @@ fn serve_config_flag(args: &[String]) -> Result<Option<PathBuf>, BoxError> {
         }
     }
     Ok(config)
+}
+
+/// Resolve the config path shared by `serve` and `mcp`: an explicit `--config <path>` is a
+/// PROMISE and must already exist; omitting it reads `./a2a-bridge.toml` (`CONFIG_PATH`),
+/// which must ALSO already exist. Wave 3 removed the zero-config auto-write both callers used
+/// to do on the implicit path — `a2a-bridge init` is now the only thing that writes a config,
+/// so both branches share this one missing-config error + `init` hint.
+fn require_config_path(explicit: Option<PathBuf>) -> Result<PathBuf, BoxError> {
+    let p = explicit.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
+    if !p.exists() {
+        return Err(format!(
+            "a2a-bridge: config not found at {}; run `a2a-bridge init` to create one",
+            p.display()
+        )
+        .into());
+    }
+    Ok(p)
 }
 
 /// The review prompt files embedded in the binary so `init` is self-contained
@@ -4175,6 +4281,17 @@ fn build_init_config(
     }
     Ok(out)
 }
+
+const INIT_USAGE: &str = "\
+usage: a2a-bridge init [--dir <path>] [--agents kiro,codex,claude,api] [--default <id>] [--force]
+
+Scaffold a working a2a-bridge.toml + prompts/*.md + README-a2a-bridge.md + a .a2a-bridge/ store
+dir into --dir (default: .). The ONLY thing that writes an a2a-bridge.toml — `serve`/`mcp`
+now hard-error on a missing config instead of auto-writing one.
+  --dir <path>    destination directory (default: .)
+  --agents <csv>  comma-separated agent ids to include (default: kiro,codex,claude,api)
+  --default <id>  override the top-level default agent (must be among --agents)
+  --force         overwrite existing managed files (refuses by default)";
 
 /// `a2a-bridge init [--dir <path>] [--agents kiro,codex,claude,api] [--default <id>] [--force]`
 fn init_cmd(args: &[String]) -> Result<(), BoxError> {
@@ -4504,25 +4621,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         }
     }
 
-    let config_path = match explicit_config {
-        Some(p) => {
-            if !p.exists() {
-                return Err(format!(
-                    "a2a-bridge: config not found at {}; run `a2a-bridge init` to create one",
-                    p.display()
-                )
-                .into());
-            }
-            p
-        }
-        None => {
-            let p = PathBuf::from(CONFIG_PATH);
-            if !p.exists() {
-                std::fs::write(&p, DEFAULT_CONFIG)?;
-            }
-            p
-        }
-    };
+    let config_path = require_config_path(explicit_config)?;
     let config_path = std::fs::canonicalize(&config_path).map_err(|e| {
         format!(
             "a2a-bridge: cannot resolve config path {}: {e}",
@@ -5653,7 +5752,15 @@ fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
 async fn main() -> Result<(), BoxError> {
     // Dispatch subcommands BEFORE the server path touches the filesystem.
     let raw_args: Vec<String> = std::env::args().collect();
-    match parse_top_subcommand(&raw_args) {
+    let sub = parse_top_subcommand(&raw_args);
+    // Dispatcher-level `--help`/`-h` for the subcommands whose own parser doesn't (yet) check
+    // it: see `dispatcher_help`'s doc comment for why `init` in particular needs this BEFORE
+    // any per-command parsing runs.
+    if let Some(usage) = dispatcher_help(&sub, &raw_args) {
+        println!("{usage}");
+        return Ok(());
+    }
+    match sub {
         TopSubcommand::RunWorkflow => return run_workflow_cmd(&raw_args[2..]).await,
         TopSubcommand::RunBatch => return run_batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Batch => return batch_cmd(&raw_args[2..]).await,
@@ -5669,6 +5776,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Mcp => return mcp_cmd(&raw_args[2..]).await,
         TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
         TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
+        TopSubcommand::Doctor => return doctor::doctor_cmd(&raw_args[2..]),
         TopSubcommand::Help => {
             println!("{TOP_USAGE}");
             return Ok(());
@@ -5679,7 +5787,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }
@@ -5690,35 +5798,17 @@ async fn main() -> Result<(), BoxError> {
 
     // 2. Configuration. `serve --config <path>` reads an EXPLICIT config (must already
     //    exist — an explicit path is a promise, so a missing one errors with an `init`
-    //    hint rather than silently materialising a kiro-only file). Bare `a2a-bridge`
-    //    (or `serve` with no --config) reads ./a2a-bridge.toml, materialising the
-    //    kiro-only DEFAULT_CONFIG if absent (zero-config first run). The path is
-    //    absolutised so workflow prompt + relative store paths resolve against the
-    //    config's OWN directory, not the process CWD.
+    //    hint). Bare `a2a-bridge` (or `serve` with no --config) reads ./a2a-bridge.toml,
+    //    which must ALSO already exist (wave 3: neither form silently scaffolds a config
+    //    anymore — `a2a-bridge init` is the only writer). The path is absolutised so
+    //    workflow prompt + relative store paths resolve against the config's OWN
+    //    directory, not the process CWD.
     let explicit_config = if raw_args.get(1).map(|s| s.as_str()) == Some("serve") {
         serve_config_flag(&raw_args[2..])?
     } else {
         None
     };
-    let config_path = match explicit_config {
-        Some(p) => {
-            if !p.exists() {
-                return Err(format!(
-                    "a2a-bridge: config not found at {}; run `a2a-bridge init` to create one",
-                    p.display()
-                )
-                .into());
-            }
-            p
-        }
-        None => {
-            let p = PathBuf::from(CONFIG_PATH);
-            if !p.exists() {
-                std::fs::write(&p, DEFAULT_CONFIG)?;
-            }
-            p
-        }
-    };
+    let config_path = require_config_path(explicit_config)?;
     let config_path = std::fs::canonicalize(&config_path).map_err(|e| {
         format!(
             "a2a-bridge: cannot resolve config path {}: {e}",
@@ -6560,6 +6650,183 @@ mod cli_tests {
         );
         assert!(serve_config_flag(&["--config".to_string()]).is_err()); // missing value
         assert!(serve_config_flag(&["--bogus".to_string()]).is_err()); // unknown flag
+    }
+
+    // ---- W3-A: dispatcher-level `--help`/`-h` + silent-config-write removal ----
+
+    #[test]
+    fn dispatcher_help_covers_the_six_newly_helped_subcommands() {
+        // Before wave 3 these six had NO `--help` handling at all (they'd fall straight into
+        // their own arg parser, which either errors on the unknown `--help` token or — for
+        // `init` — silently ignores it and scaffolds files). The dispatcher must now intercept
+        // `--help`/`-h` as the FIRST post-subcommand arg for every one of them.
+        let cases: &[(&str, &str)] = &[
+            ("submit", SUBMIT_USAGE),
+            ("task", TASK_USAGE),
+            ("session", SESSION_USAGE),
+            ("serve", SERVE_USAGE),
+            ("merge", merge::MERGE_USAGE),
+            ("init", INIT_USAGE),
+        ];
+        for (word, expected) in cases {
+            assert!(
+                expected.starts_with(&format!("usage: a2a-bridge {word}")),
+                "{word} usage constant must open with its own usage header: {expected:?}"
+            );
+            for help in ["--help", "-h"] {
+                let args = vec!["a2a-bridge".to_string(), word.to_string(), help.to_string()];
+                let sub = parse_top_subcommand(&args);
+                assert_eq!(
+                    dispatcher_help(&sub, &args),
+                    Some(*expected),
+                    "{word} {help} should print its usage and exit 0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatcher_help_covers_doctor() {
+        // W3-B: `doctor --help`/`-h` must be intercepted before `doctor_cmd`'s own parsing runs —
+        // exactly the same contract as the six W3-A subcommands above (see that test + the
+        // `dispatcher_help` doc comment for why `doctor` is listed even though its own parser
+        // also checks `--help` defensively).
+        assert!(DOCTOR_USAGE.starts_with("usage: a2a-bridge doctor"));
+        for help in ["--help", "-h"] {
+            let args = vec![
+                "a2a-bridge".to_string(),
+                "doctor".to_string(),
+                help.to_string(),
+            ];
+            let sub = parse_top_subcommand(&args);
+            assert_eq!(
+                dispatcher_help(&sub, &args),
+                Some(DOCTOR_USAGE),
+                "doctor {help} should print its usage and exit 0"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatcher_help_does_not_fire_outside_its_narrow_contract() {
+        // Not the first post-subcommand arg (nested forms are out of scope this wave).
+        let nested = vec![
+            "a2a-bridge".to_string(),
+            "task".to_string(),
+            "get".to_string(),
+            "--help".to_string(),
+        ];
+        assert_eq!(
+            dispatcher_help(&parse_top_subcommand(&nested), &nested),
+            None
+        );
+        // A normal (non-help) invocation of a newly-helped subcommand must pass through
+        // untouched, so real usage still reaches the subcommand's own handler.
+        let normal = vec![
+            "a2a-bridge".to_string(),
+            "init".to_string(),
+            "--agents".to_string(),
+            "kiro".to_string(),
+        ];
+        assert_eq!(
+            dispatcher_help(&parse_top_subcommand(&normal), &normal),
+            None
+        );
+        // A subcommand that already handles its own `--help` (e.g. `mcp`) is NOT in the
+        // dispatcher's map — it must stay None so `mcp_cmd`'s own check (still) prints
+        // MCP_USAGE.
+        let mcp = vec![
+            "a2a-bridge".to_string(),
+            "mcp".to_string(),
+            "--help".to_string(),
+        ];
+        assert_eq!(dispatcher_help(&parse_top_subcommand(&mcp), &mcp), None);
+        // Bare invocation (no subcommand at all) has nothing at index 2 to check.
+        let bare = vec!["a2a-bridge".to_string()];
+        assert_eq!(dispatcher_help(&parse_top_subcommand(&bare), &bare), None);
+    }
+
+    #[test]
+    fn dispatcher_help_intercepts_init_before_any_scaffold() {
+        // The dangerous case (verified in the spec): `init`'s permissive `flag()` helper
+        // ignores unknown flags, so `init --help` used to fall through into `init_cmd` and
+        // scaffold a full config + prompts. Mirror main()'s real prelude — parse the
+        // subcommand, then check `dispatcher_help` BEFORE ever calling `init_cmd` — and prove
+        // the `--dir` target (present in argv, exactly as a real invocation would have it) is
+        // never touched.
+        let dir = tempfile::tempdir().unwrap();
+        let args = vec![
+            "a2a-bridge".to_string(),
+            "init".to_string(),
+            "--help".to_string(),
+            "--dir".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        ];
+        let sub = parse_top_subcommand(&args);
+        let usage = dispatcher_help(&sub, &args)
+            .expect("dispatcher must intercept `init --help` before init_cmd's parser runs");
+        assert!(usage.starts_with("usage: a2a-bridge init"));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "init --help must not scaffold any files"
+        );
+    }
+
+    #[test]
+    fn require_config_path_none_matches_the_bare_serve_and_mcp_default() {
+        // No explicit --config: bare `a2a-bridge`/`serve` and `mcp` with no --config both
+        // resolve the same relative CONFIG_PATH ("a2a-bridge.toml") against the process cwd.
+        // Cargo runs this crate's unit tests with cwd == the package dir (bin/a2a-bridge/),
+        // which has no such file, so this exercises the real "no --config, no file present"
+        // path without mutating the process cwd (unsafe to do under parallel test threads).
+        let err = require_config_path(None).unwrap_err().to_string();
+        assert!(err.contains("a2a-bridge.toml"), "{err}");
+        assert!(err.contains("run `a2a-bridge init`"), "{err}");
+    }
+
+    #[test]
+    fn require_config_path_missing_explicit_errors_with_init_hint_and_writes_nothing() {
+        // Represents `serve --config <path>` / `mcp --config <path>` pointed at a config that
+        // doesn't exist yet. Wave 3 removed the silent DEFAULT_CONFIG auto-write both callers
+        // used to do here — it must now hard-error with the `init` hint and touch NOTHING.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("a2a-bridge.toml");
+        let err = require_config_path(Some(missing.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("run `a2a-bridge init`"), "{err}");
+        assert!(
+            !missing.exists(),
+            "must never write the config it was asked for"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "must create no files at all in the config's directory"
+        );
+
+        // An existing config still resolves Ok, unchanged (init remains the only writer).
+        std::fs::write(&missing, "default = \"kiro\"\n").unwrap();
+        assert_eq!(require_config_path(Some(missing.clone())).unwrap(), missing);
+    }
+
+    #[tokio::test]
+    async fn mcp_cmd_missing_explicit_config_errors_with_init_hint_and_creates_no_file() {
+        // End-to-end through the real `mcp_cmd` entry point (not just the shared helper):
+        // proves the wiring, not only the helper in isolation.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("a2a-bridge.toml");
+        let err = mcp_cmd(&["--config".to_string(), cfg.to_string_lossy().to_string()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("run `a2a-bridge init`"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "mcp must not scaffold a2a-bridge.toml on a missing config (init is the only writer)"
+        );
     }
 
     #[test]

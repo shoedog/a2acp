@@ -13,7 +13,7 @@ a2a-bridge serve --config ./a2a-bridge.toml
 ```
 
 Bare `a2a-bridge` (no args) also serves, but reads `./a2a-bridge.toml` from the
-current directory and writes a kiro-only default if absent — use `serve --config`
+current directory and errors (with an `init` hint) if absent — use `serve --config`
 to point at this file explicitly.
 
 ## Agents

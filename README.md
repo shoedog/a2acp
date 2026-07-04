@@ -143,8 +143,9 @@ Both SDK versions are pinned (`Cargo.lock` committed).
 
 ## Configuration
 
-Create `a2a-bridge.toml` (or run `a2a-bridge init`; bare `a2a-bridge`/`serve` with no config also
-materializes a single-agent kiro default if the file is absent):
+Run `a2a-bridge init` to scaffold a working `a2a-bridge.toml` (+ prompts), or hand-write one.
+Bare `a2a-bridge`/`serve` reads `./a2a-bridge.toml` and now **errors** (with an `init` hint) if
+it's missing — `init` is the only thing that writes a config:
 
 ```toml
 default = "kiro"                       # top-level default agent id — must match an [[agents]] id
