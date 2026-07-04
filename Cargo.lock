@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a2a-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "a2a-lf",
  "arc-swap",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-a2a-inbound"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "a2a-lf",
  "arc-swap",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-a2a-outbound"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "a2a-lf",
  "async-stream",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-acp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-container"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-coordinator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "a2a-lf",
  "async-trait",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bridge-coordinator",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-observ"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bridge-core",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bridge-core",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-workflow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-worktree"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bridge-core",
@@ -1648,7 +1648,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lsp-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

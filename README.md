@@ -17,6 +17,29 @@ commitments — see [CONTRIBUTING.md](CONTRIBUTING.md) for the exact stance ("ma
 (yet) supported", no API/config stability guarantees pre-1.0, breaking changes are recorded in
 [`docs/adr/`](docs/adr/)). Read it before filing an issue or opening a PR.
 
+## Install
+
+Pick one:
+
+1. **Prebuilt binary (GitHub Releases).** Download the tarball for your platform from
+   [Releases](https://github.com/shoedog/a2acp/releases) and extract it — the binary
+   sits at the archive root alongside `LICENSE`/`README.md`. On macOS, Gatekeeper will
+   quarantine the unsigned binary; clear it before running: `xattr -d
+   com.apple.quarantine ./a2a-bridge` (or right-click → Open once in Finder). Signing/
+   notarization is out of scope for now.
+2. **`cargo binstall`** (fetches the same prebuilt binary, no manual download):
+   ```bash
+   cargo binstall --git https://github.com/shoedog/a2acp a2a-bridge
+   ```
+   Plain `cargo binstall a2a-bridge` does **not** work — this crate isn't published to
+   crates.io (a deliberate non-goal for now), so the `--git` flag is required.
+3. **From source:**
+   ```bash
+   cargo install --path bin/a2a-bridge
+   ```
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
 ## Quickstart (5 minutes)
 
 ```bash
