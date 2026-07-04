@@ -1,0 +1,25 @@
+[project]
+name = "a2a-bridge-evals"
+version = "0.1.0"
+description = "M3 review-quality eval harness for the a2a-bridge (bridge-native, no promptfoo)."
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0",
+    "deepeval>=3.0",
+    "pytest>=8.0",
+]
+
+[project.optional-dependencies]
+# Optional tracing hook ONLY (see harness/runner.py's `_trace`) -- lazy
+# imported, enabled only when OPIK_API_KEY is set. NOT on the v1 critical
+# path; `uv sync` without this extra is the normal path.
+opik = ["opik>=1.7"]
+
+[tool.pytest.ini_options]
+testpaths = ["ci"]
+markers = [
+    "live: makes real agent turns via `a2a-bridge run-workflow` (never run in default CI; the harness's own budget gate + --smoke flag are the intended entry point, not pytest).",
+]
+
+[tool.uv]
+package = false

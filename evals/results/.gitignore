@@ -1,0 +1,6 @@
+# Eval run artifacts are gitignored EXCEPT committed baseline reports.
+# See docs/superpowers/specs/2026-07-04-m3-eval-harness.md §Layout.
+*
+!.gitignore
+!baselines/
+!baselines/**

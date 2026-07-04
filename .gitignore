@@ -23,3 +23,10 @@ prompts/runs/
 
 # Nested crate/fixture build outputs (e.g. test fixtures) — the bare /target/ above only covers the root.
 **/target/
+
+# M3 eval harness (evals/): gitignore run artifacts except committed
+# baselines, consistent with evals/results/.gitignore's own rule (defense in
+# depth at the root level too).
+/evals/results/*
+!/evals/results/.gitignore
+!/evals/results/baselines/
