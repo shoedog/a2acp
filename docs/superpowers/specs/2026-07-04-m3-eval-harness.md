@@ -11,10 +11,14 @@ engineering bridge-native.**
 ## What is measured
 
 The bridge's `code-review` workflow as a function `review(cell) → findings + verdict`,
-where a **cell** = {workflow variant, agents, effort}. v1 matrix (3 cells):
-1. `duo` — the shipping code-review workflow (codex + claude → synth), shipping efforts
-2. `codex-solo` — codex reviewer only (+ same synth prompt shape)
-3. `claude-solo` — claude reviewer only
+where a **cell** = {workflow variant, agents, effort}. v1 matrix (3 cells; per review):
+1. `duo` — the shipping code-review workflow (codex + claude reviewers → **claude**
+   synth, the actual shipping shape) — grades the SYNTH output (the shipping terminal
+   artifact)
+2. `codex-solo` — codex reviewer only, graded RAW (no synth: `review-synth.md` expects
+   two lens variables and unknown vars render verbatim — the raw reviewer terminal is
+   the cleaner estimand)
+3. `claude-solo` — claude reviewer only, graded RAW
 
 **Metrics (per cell, from the steering stack):** PRIMARY = defect-level **catch-rate**
 (recall anchored to ground-truth defect ids — never inflated by judge-hallucinated
@@ -22,7 +26,7 @@ matches; CIs are descriptive given 1–2 defects/item cluster). Secondary: item-
 confusion, false-finding count on clean items (FRAGILE at n=4 clean — descriptive
 only). Wilson CIs throughout; McNemar exact p REPORTED but demoted to a paired-flips
 display, never a pass/fail criterion. `report.md` carries a visible
-**`PROVISIONAL / n=14`** banner and avoids winner language unless effects are huge
+**`PROVISIONAL / n=15`** banner and avoids winner language unless effects are huge
 and paired flips obvious (per review).
 
 ## Layout (new top-level `evals/` — outside the cargo workspace, outside default CI)
