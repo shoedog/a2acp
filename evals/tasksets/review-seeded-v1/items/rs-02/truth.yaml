@@ -33,3 +33,10 @@ defects:
     (`overrides.extra_mounts`) that `effective_mounts()` binds, while `validate()`
     (unchanged, in the same file) still guards only `self.mounts` -- the new mount
     source visibly escapes the existing gate.
+neutral_findings:
+- >-
+  `under_root` uses `Path::starts_with`, which is a lexical/component prefix check
+  that does not canonicalize `..` or resolve symlinks, so a path like
+  `<allowed_root>/../etc` can pass the gate. This is a real but PRE-EXISTING
+  weakness in the base check, out of scope for the seeded overrides-bypass defect;
+  neither credited nor penalized.

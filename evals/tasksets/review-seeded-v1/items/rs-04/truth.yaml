@@ -18,8 +18,10 @@ defects:
     (admissions wrongly rejected forever) or over-granted after a restart re-reads
     the durable ledger.
   minimal_trigger: >-
-    an `evict` call where `persist_free` returns Err: `used` is still decremented,
-    leaving in-memory `used` lower than the durable count.
+    contract-level, not an executable repro against this fixture (the
+    `persist_free` stub always returns Ok): WHEN `persist_free` returns Err --
+    e.g. its durable write fails -- `evict` still runs `self.used -= 1`, so
+    in-memory `used` ends below the durable slot count.
   acceptable_match: >-
     any finding stating that the error from `persist_free` is ignored (`let _ =`)
     and that decrementing `used` regardless leaves the in-memory and durable slot

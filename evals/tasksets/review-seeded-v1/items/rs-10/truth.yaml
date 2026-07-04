@@ -33,3 +33,10 @@ defects:
     and then drops `lease`, while `impl Drop for Lease` (adjacent in the same file,
     its RAII "frees on drop" contract stated in context.md) also releases -- the
     double release of one slot follows from the hunk plus the visible Drop impl.
+neutral_findings:
+- >-
+  `checkout` does `fetch_sub(1)` then, if it observes 0, restores with a separate
+  `fetch_add(1)`; that sub-then-restore is not atomic, so concurrent callers can
+  transiently underflow `available` (usize wraps to a huge value) and race on the
+  guard. This is a real but PRE-EXISTING checkout race, out of scope for the
+  seeded double-release defect; neither credited nor penalized.

@@ -21,13 +21,17 @@ defects:
     before `put_output` runs; the store now reports `node` complete while its
     output is missing.
   acceptable_match: >-
-    any finding stating that the completion marker is written before the output,
-    so a cancellation/drop between the two awaits leaves a node marked done
-    without its stored output (ordering makes the write non-atomic under cancel).
+    any finding identifying that `mark_complete` is written before `put_output`,
+    so a node can end up marked done with no output present -- credit either
+    trigger of this one marker-before-payload root cause: (a) the future is
+    dropped (turn cancelled) between the two awaits, OR (b) `put_output` returns
+    Err (or otherwise fails) after the completion marker is already committed,
+    leaving the node marked done without its output.
   reject_if: >-
     a finding that only says "these two writes aren't transactional/atomic" in
-    the abstract without noting the ORDER (marker before payload) that makes a
-    drop leave a done-marked node with no output.
+    the abstract, or "the ordering looks off", without noting that the marker is
+    written BEFORE the payload so a failure/drop between them leaves a done-marked
+    node with no output.
   catchability: >-
     catchable from diff because the added body shows `mark_complete(node).await`
     on the line above `put_output(node, body).await`, and the doc contract says a
