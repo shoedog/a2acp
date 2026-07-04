@@ -4,6 +4,12 @@
 // counterpart. Hand-authored to docs/superpowers/specs/2026-07-03-wave-3-cli-wire.md
 // §W3-C.
 //
+// WHERE THE SDK TRIPWIRE ACTUALLY LIVES: the typed-family test
+// (get_task_durable_row_is_typed_nested_family) and the streaming
+// StreamResponse-deserialization test are the a2a-lf drift detectors — they
+// exercise SDK serialization. The legacy-family and corpus-replay tests freeze
+// bridge-owned hand-built literals and guard BRIDGE regressions, not SDK drift.
+//
 // SCOPE / BRITTLENESS RULES (normative, from the spec — v2, adversarially
 // reviewed): assert BRIDGE-OWNED wire semantics only. Concretely:
 //   * OK   — field presence/types, stable enum VALUES (TASK_STATE_*), stable
@@ -873,8 +879,8 @@ async fn send_streaming_message_unknown_agent_is_terminal_failure_frame() {
 
     let error_frame = payloads
         .iter()
-        .find_map(|p| serde_json::from_str::<Value>(p).ok())
-        .filter(|v| v.get("kind").and_then(Value::as_str) == Some("error"))
+        .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+        .find(|v| v.get("kind").and_then(Value::as_str) == Some("error"))
         .unwrap_or_else(|| panic!("expected an error-kind SSE frame: {body}"));
     assert_eq!(
         error_frame["text"], "unknown agent: nope-agent",
