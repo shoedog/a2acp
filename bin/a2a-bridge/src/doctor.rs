@@ -112,12 +112,16 @@ pub trait RuntimeProbes {
     /// `cmd` resolves to an executable file — either as a literal path (absolute or containing `/`) or
     /// by searching `$PATH` for a bare name.
     fn which_on_path(&self, cmd: &str) -> bool;
-    /// `<runtime> info` (or equivalent) exits 0 within a bound.
+    /// `<runtime> info` (or equivalent) exits 0 within a bound. Callers MUST gate on `runtime_is_allowed`
+    /// first — never on a config-named binary the allowlist would reject (defense-in-depth parity with
+    /// main.rs's `preflight_runtimes`).
     fn runtime_responds(&self, runtime: &str) -> bool;
-    /// `<runtime> network inspect <network>` exits 0 within a bound.
+    /// `<runtime> network inspect <network>` exits 0 within a bound. Same allowlist-gate requirement as
+    /// `runtime_responds`.
     fn network_exists(&self, runtime: &str, network: &str) -> bool;
     /// `<runtime> image inspect <image>` exits 0 within a bound. Advisory only — a missing image just
-    /// means the runtime will pull it on first use (or fail offline), never a hard requirement.
+    /// means the runtime will pull it on first use (or fail offline), never a hard requirement. Same
+    /// allowlist-gate requirement as `runtime_responds`.
     fn image_exists(&self, runtime: &str, image: &str) -> bool;
     /// Stat a host path. Never creates, never follows into a write probe (TOCTOU/mutating — cut per
     /// the spec's adversarial review).
@@ -428,7 +432,7 @@ pub fn run_checks(cfg: &LoadedConfig, probes: &dyn RuntimeProbes) -> Vec<CheckRe
     check_agent_commands(snapshot, probes, &mut out); // check 2
     check_api_key_env(snapshot, probes, &mut out); // check 3
     check_sandbox_egress(snapshot, probes, &mut out); // check 4
-    check_verify(&cfg.verify, probes, &mut out); // check 5
+    check_verify(&cfg.verify, &snapshot.allowed_cmds, probes, &mut out); // check 5
     check_store(&cfg.store_path, probes, &mut out); // check 6
     check_mcp_servers(snapshot, probes, &mut out); // check 7 (mcp half)
     check_lsp_env(&cfg.languages, &mut out); // check 7 (lsp_env lint half)
@@ -436,6 +440,26 @@ pub fn run_checks(cfg: &LoadedConfig, probes: &dyn RuntimeProbes) -> Vec<CheckRe
     check_creds(snapshot, probes, &mut out); // check 9
 
     out
+}
+
+/// Whether `runtime` is present in the snapshot's `[registry].allowed_cmds` allowlist. Every runtime
+/// probe (checks 2/4/5: `runtime_responds`/`network_exists`/`image_exists`) MUST gate on this BEFORE
+/// executing the config-named `runtime` binary — mirrors main.rs's `preflight_runtimes`, which restricts
+/// its own probing to allowlisted runtimes for the same reason: probing a non-allowlisted, config-named
+/// binary would EXECUTE it outside the allowlist (defense-in-depth; the allowlist/S3 gate is what
+/// actually enforces this at spawn time, but doctor's read-only probes must not shortcut it either).
+fn runtime_is_allowed(runtime: &str, allowed_cmds: &[String]) -> bool {
+    allowed_cmds.iter().any(|c| c == runtime)
+}
+
+/// A `fail` row reporting that `runtime` isn't allowlisted, for the given `check` name — used by every
+/// probe call site once `runtime_is_allowed` says no, instead of executing the probe.
+fn runtime_not_allowed_row(check: impl Into<String>, runtime: &str) -> CheckResult {
+    CheckResult::fail(
+        check,
+        format!("runtime {runtime:?} is not in allowed_cmds"),
+        "add it to allowed_cmds or fix the runtime name",
+    )
 }
 
 /// Check 2 — host-vs-sandbox command semantics. `Api`-kind entries have no `cmd`/runtime to check here
@@ -456,7 +480,9 @@ fn check_agent_commands(
             Some(sb) => {
                 let runtime = sb.runtime();
                 let check = format!("agent:{id}:runtime");
-                if probes.runtime_responds(runtime) {
+                if !runtime_is_allowed(runtime, &snapshot.allowed_cmds) {
+                    out.push(runtime_not_allowed_row(check, runtime));
+                } else if probes.runtime_responds(runtime) {
                     out.push(CheckResult::ok(
                         check,
                         format!("sandbox runtime {runtime:?} responds"),
@@ -551,6 +577,12 @@ fn check_sandbox_egress(
             EgressPolicy::Locked { network, .. } => {
                 let runtime = sb.runtime();
                 let net_check = format!("agent:{id}:sandbox-network");
+                let img_check = format!("agent:{id}:sandbox-image");
+                if !runtime_is_allowed(runtime, &snapshot.allowed_cmds) {
+                    out.push(runtime_not_allowed_row(net_check, runtime));
+                    out.push(runtime_not_allowed_row(img_check, runtime));
+                    continue;
+                }
                 if probes.network_exists(runtime, network) {
                     out.push(CheckResult::ok(
                         net_check,
@@ -563,7 +595,6 @@ fn check_sandbox_egress(
                         format!("create it: `{runtime} network create {network}` (or fix [agents.sandbox].network for {id})"),
                     ));
                 }
-                let img_check = format!("agent:{id}:sandbox-image");
                 if probes.image_exists(runtime, &sb.image) {
                     out.push(CheckResult::ok(
                         img_check,
@@ -589,9 +620,11 @@ fn check_sandbox_egress(
 
 /// Check 5 — `[verify]` preflight (added per review): its own runtime/image/locked-network, exactly like
 /// check 4's sandbox egress (a broken verify runtime or missing toolchain image must surface — it runs
-/// unattended after every `implement` commit).
+/// unattended after every `implement` commit). `allowed_cmds` comes from the same snapshot check 2/4
+/// already use — gated the same way, before any probe touches the config-named runtime.
 fn check_verify(
     verify: &Option<Result<VerifyCheckInput, String>>,
+    allowed_cmds: &[String],
     probes: &dyn RuntimeProbes,
     out: &mut Vec<CheckResult>,
 ) {
@@ -606,6 +639,14 @@ fn check_verify(
             "fix the [verify] block",
         )),
         Some(Ok(v)) => {
+            if !runtime_is_allowed(&v.runtime, allowed_cmds) {
+                out.push(runtime_not_allowed_row("verify:runtime", &v.runtime));
+                out.push(runtime_not_allowed_row("verify:image", &v.runtime));
+                if v.locked_network.is_some() {
+                    out.push(runtime_not_allowed_row("verify:network", &v.runtime));
+                }
+                return;
+            }
             if probes.runtime_responds(&v.runtime) {
                 out.push(CheckResult::ok(
                     "verify:runtime",
@@ -1063,6 +1104,10 @@ mod tests {
         images: HashSet<String>,
         env_vars: HashSet<String>,
         paths: HashMap<PathBuf, PathStat>,
+        /// Records every runtime-executing probe call (`runtime_responds`/`network_exists`/
+        /// `image_exists`) so tests can assert a config-named runtime binary was never actually invoked
+        /// once it fails the `allowed_cmds` gate. `RefCell` because `RuntimeProbes` methods take `&self`.
+        runtime_probe_calls: std::cell::RefCell<Vec<String>>,
     }
 
     impl FakeProbes {
@@ -1113,6 +1158,9 @@ mod tests {
                 },
             )
         }
+        fn runtime_probe_calls(&self) -> Vec<String> {
+            self.runtime_probe_calls.borrow().clone()
+        }
     }
 
     impl RuntimeProbes for FakeProbes {
@@ -1120,12 +1168,21 @@ mod tests {
             self.on_path.contains(cmd)
         }
         fn runtime_responds(&self, runtime: &str) -> bool {
+            self.runtime_probe_calls
+                .borrow_mut()
+                .push(format!("runtime_responds:{runtime}"));
             self.responsive_runtimes.contains(runtime)
         }
-        fn network_exists(&self, _runtime: &str, network: &str) -> bool {
+        fn network_exists(&self, runtime: &str, network: &str) -> bool {
+            self.runtime_probe_calls
+                .borrow_mut()
+                .push(format!("network_exists:{runtime}:{network}"));
             self.networks.contains(network)
         }
-        fn image_exists(&self, _runtime: &str, image: &str) -> bool {
+        fn image_exists(&self, runtime: &str, image: &str) -> bool {
+            self.runtime_probe_calls
+                .borrow_mut()
+                .push(format!("image_exists:{runtime}:{image}"));
             self.images.contains(image)
         }
         fn path_stat(&self, path: &Path) -> PathStat {
@@ -1227,6 +1284,45 @@ mod tests {
             .allow_image("reader:latest");
         let results = run_checks(&cfg, &probes);
         assert_eq!(find(&results, "agent:kiro:runtime").status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn sandbox_runtime_not_allowlisted_fails_all_checks_without_probing() {
+        // "docker" (the sandbox's default runtime) is deliberately absent from allowed_cmds — checks
+        // 2 (agent:kiro:runtime) and 4 (agent:kiro:sandbox-network/-image) must all fail WITHOUT ever
+        // executing the runtime binary, even though a permissive fake would otherwise report it healthy.
+        let mut kiro = acp_entry("kiro", "kiro-cli");
+        kiro.sandbox = Some(locked_sandbox("reader:latest", "a2a-net", vec![]));
+        let cfg = base_loaded(snapshot("kiro", vec![kiro], vec!["kiro-cli"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest");
+        let results = run_checks(&cfg, &probes);
+
+        let runtime_row = find(&results, "agent:kiro:runtime");
+        assert_eq!(runtime_row.status, CheckStatus::Fail);
+        assert!(
+            runtime_row.detail.contains("allowed_cmds"),
+            "{}",
+            runtime_row.detail
+        );
+        assert!(!runtime_row.remedy.is_empty());
+
+        assert_eq!(
+            find(&results, "agent:kiro:sandbox-network").status,
+            CheckStatus::Fail
+        );
+        assert_eq!(
+            find(&results, "agent:kiro:sandbox-image").status,
+            CheckStatus::Fail
+        );
+
+        assert!(
+            probes.runtime_probe_calls().is_empty(),
+            "runtime binary must never be probed once it fails the allowlist gate: {:?}",
+            probes.runtime_probe_calls()
+        );
     }
 
     // ---- check 3: api_key_env ----
@@ -1344,7 +1440,7 @@ mod tests {
         let mut cfg = base_loaded(snapshot(
             "codex",
             vec![acp_entry("codex", "codex-acp")],
-            vec!["codex-acp"],
+            vec!["codex-acp", "docker"],
         ));
         cfg.verify = Some(Ok(VerifyCheckInput {
             runtime: "docker".to_string(),
@@ -1367,7 +1463,7 @@ mod tests {
         let mut cfg = base_loaded(snapshot(
             "codex",
             vec![acp_entry("codex", "codex-acp")],
-            vec!["codex-acp"],
+            vec!["codex-acp", "podman"],
         ));
         cfg.verify = Some(Ok(VerifyCheckInput {
             runtime: "podman".to_string(),
@@ -1380,6 +1476,45 @@ mod tests {
         let results = run_checks(&cfg, &probes);
         assert_eq!(find(&results, "verify:runtime").status, CheckStatus::Fail);
         assert!(results.iter().all(|r| r.check != "verify:network")); // no locked network configured
+    }
+
+    #[test]
+    fn verify_runtime_not_allowlisted_fails_without_probing() {
+        // "docker" (the [verify] runtime) is deliberately absent from allowed_cmds — all three verify
+        // sub-checks must fail WITHOUT ever executing the runtime binary, even though a permissive fake
+        // would otherwise report it healthy (runtime responds, network + image both present).
+        let mut cfg = base_loaded(snapshot(
+            "codex",
+            vec![acp_entry("codex", "codex-acp")],
+            vec!["codex-acp"],
+        ));
+        cfg.verify = Some(Ok(VerifyCheckInput {
+            runtime: "docker".to_string(),
+            image: "toolchain:rust".to_string(),
+            locked_network: Some("a2a-net".to_string()),
+        }));
+        let probes = FakeProbes::new()
+            .allow_path("codex-acp")
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("toolchain:rust");
+        let results = run_checks(&cfg, &probes);
+
+        let runtime_row = find(&results, "verify:runtime");
+        assert_eq!(runtime_row.status, CheckStatus::Fail);
+        assert!(
+            runtime_row.detail.contains("allowed_cmds"),
+            "{}",
+            runtime_row.detail
+        );
+        assert_eq!(find(&results, "verify:image").status, CheckStatus::Fail);
+        assert_eq!(find(&results, "verify:network").status, CheckStatus::Fail);
+
+        assert!(
+            probes.runtime_probe_calls().is_empty(),
+            "runtime binary must never be probed once it fails the allowlist gate: {:?}",
+            probes.runtime_probe_calls()
+        );
     }
 
     // ---- check 6: store ----
