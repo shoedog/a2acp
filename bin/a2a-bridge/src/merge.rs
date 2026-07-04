@@ -500,6 +500,20 @@ pub fn merge_clone(
     }
 }
 
+/// Dispatcher-level `--help`/`-h` for `merge` is handled in `main.rs` (this constant is
+/// `pub` so the top-level dispatcher can print it) BEFORE `merge_cmd`'s own parser runs —
+/// its `--onto`/`--config`/`--force`-only loop would otherwise reject `--help` as an
+/// "unexpected arg".
+pub const MERGE_USAGE: &str = "\
+usage: a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--force]
+
+Land an Approved `implement` run's commit into its source_repo, re-authored to the operator,
+via `git commit-tree` + `git push --force-with-lease` (Mode A: fast-forward onto --onto).
+  <id>             the run id (the clone dir name under .a2a-implement/)
+  --config <path>  registry config providing allowed_cwd_root + [merge] (default: ./a2a-bridge.toml)
+  --onto <branch>  target branch to land onto (else [merge].target_ref, else the run's base_ref)
+  --force          also allow landing a LoopStopped (not Approved) run";
+
 /// `a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--force]`
 pub async fn merge_cmd(args: &[String]) -> Result<(), crate::BoxError> {
     let mut id: Option<String> = None;
@@ -559,6 +573,19 @@ mod tests {
 
     fn ok(t: &str) -> Result<String, String> {
         Ok(t.to_string())
+    }
+
+    #[test]
+    fn merge_usage_matches_the_actual_parser() {
+        // `merge_cmd`'s loop accepts exactly --config/--onto/--force plus a positional <id>;
+        // keep the usage constant honest against that, not a guess (W3-A).
+        assert!(MERGE_USAGE.starts_with("usage: a2a-bridge merge <id>"));
+        for flag in ["--config <path>", "--onto <branch>", "--force"] {
+            assert!(
+                MERGE_USAGE.contains(flag),
+                "missing {flag:?}: {MERGE_USAGE}"
+            );
+        }
     }
 
     #[test]
