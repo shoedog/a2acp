@@ -231,7 +231,13 @@ def _guard_stale_dir(d: Path, force: bool) -> None:
 # + taskset id stamped into every run dir).
 # --------------------------------------------------------------------------- #
 def _write_run_manifest(
-    out_dir: Path, *, cells: list[config_mod.Cell], taskset_id: str, bridge_bin: Path, bridge_config: Path
+    out_dir: Path,
+    *,
+    cells: list[config_mod.Cell],
+    taskset_id: str,
+    bridge_bin: Path,
+    bridge_config: Path,
+    allow_same_family_judge: bool = False,
 ) -> None:
     git_sha = None
     try:
@@ -266,6 +272,11 @@ def _write_run_manifest(
             for c in cells
         ],
         "judge_agent_id": config_mod.JUDGE_AGENT_ID,
+        # Provenance (MINOR-4): a baseline built with the cross-family judge
+        # guard OVERRIDDEN must carry that fact durably, so a same-family
+        # judge's self-preference risk can never be silently baked into a
+        # committed baseline report.
+        "allow_same_family_judge": bool(allow_same_family_judge),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     (out_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -324,6 +335,7 @@ def run_matrix(
             print(f"[runner] {key}: {status} ({meta['elapsed_s']}s)", flush=True)
 
     judge_errors = 0
+    call_failures = 0
     if not skip_judge:
         print(f"[runner] judging {len(work)} call(s)...", flush=True)
         for cell in cells:
@@ -333,7 +345,35 @@ def run_matrix(
                 out_path = Path(meta["out_path"])
                 raw = out_path.read_text() if out_path.is_file() else ""
                 findings_text = normalize_mod.normalize_findings(raw)
-                jr = judge_call(bridge_bin, bridge_config, rubric_text, item.truth_path, findings_text, judge_timeout_s)
+
+                # MAJOR-1: do NOT judge a failed/empty reviewer call. A crash/
+                # timeout/empty-output/failure-marker review is a REVIEWER
+                # failure, not a review the judge should grade -- feeding it to
+                # the judge would collide the rubric's marker rule
+                # (item_pass=false) with judge.py's mechanical clean-item
+                # cross-check (expected_pass = false_findings==0 = true),
+                # forcing a spurious JudgeError, OR (if kiro obeys the marker
+                # rule) laundering a reviewer crash into a clean TN. Skip the
+                # judge and record a distinct `call_failed` row that
+                # metrics.py's `_is_scoreable` excludes from every
+                # pass/confusion/recall/flip figure (counted as neither a pass
+                # nor a fail -- exactly what normalize.py documents).
+                call_failed = (not meta["ok"]) or normalize_mod.is_node_failure(raw) or (not findings_text.strip())
+                if call_failed:
+                    jr = {
+                        "call_failed": True,
+                        "judge_error": False,
+                        "item_pass": None,
+                        "defects": [],
+                        "false_findings": 0,
+                        "neutral_matched": 0,
+                    }
+                else:
+                    jr = judge_call(
+                        bridge_bin, bridge_config, rubric_text, item.truth_path, findings_text, judge_timeout_s
+                    )
+                    jr.setdefault("call_failed", False)
+
                 jr.update(
                     {
                         "cell": cell.id,
@@ -345,16 +385,31 @@ def run_matrix(
                     }
                 )
                 (judge_dir / f"{key}.json").write_text(json.dumps(jr, indent=2))
-                if jr["judge_error"]:
+                if jr["call_failed"]:
+                    call_failures += 1
+                    print(
+                        f"[runner] judge {key}: SKIPPED -- reviewer call failed/empty "
+                        f"(excluded from metrics, not scored as pass/fail)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                elif jr["judge_error"]:
                     judge_errors += 1
                     print(f"[runner] judge {key}: ERROR -- {jr.get('judge_error_detail')}", file=sys.stderr, flush=True)
                 else:
                     print(f"[runner] judge {key}: {'pass' if jr['item_pass'] else 'fail'}", flush=True)
-                _trace(out_dir, "judge_done", key=key, judge_error=jr["judge_error"])
+                _trace(out_dir, "judge_done", key=key, judge_error=jr["judge_error"], call_failed=jr["call_failed"])
 
         report_mod.render(out_dir, taskset_id=taskset_id, cells=[c.id for c in cells], n_items=len(items))
         print(f"[runner] report written to {out_dir}/report.md", flush=True)
 
+    if call_failures:
+        print(
+            f"[runner] {call_failures} reviewer call(s) failed and were NOT judged "
+            f"(excluded from metrics).",
+            file=sys.stderr,
+            flush=True,
+        )
     if judge_errors:
         print(f"[runner] {judge_errors} judge_error(s) -- run is not clean.", file=sys.stderr, flush=True)
         return 1
@@ -388,7 +443,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dry-run", action="store_true", help="print the planned matrix + budget projection and exit without touching agents"
     )
-    p.add_argument("--allow-same-family-judge", action="store_true")
+    p.add_argument(
+        "--allow-same-family-judge",
+        action="store_true",
+        help=(
+            "override the cross-family judge guard (a same-family judge risks "
+            "self-preference bias). Emits a stderr warning and is recorded in "
+            "run_manifest.json for provenance."
+        ),
+    )
     return p
 
 
@@ -403,6 +466,16 @@ def main(argv=None) -> int:
     except KeyError as e:
         print(f"runner: unknown cell {e.args[0]!r}; known cells: {sorted(config_mod.CELLS)}", file=sys.stderr)
         return 2
+
+    if args.allow_same_family_judge:
+        print(
+            "[runner] WARNING: --allow-same-family-judge is set -- the cross-family "
+            "judge guard is OVERRIDDEN. A judge sharing a model family with a graded "
+            "cell risks self-preference bias; this override is recorded in "
+            "run_manifest.json for the resulting report's provenance.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     try:
         config_mod.validate_same_family_judge(cells, config_mod.JUDGE_AGENT_ID, allow=args.allow_same_family_judge)
@@ -435,7 +508,14 @@ def main(argv=None) -> int:
         return 0
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    _write_run_manifest(out_dir, cells=cells, taskset_id=taskset_id, bridge_bin=bridge_bin, bridge_config=bridge_config)
+    _write_run_manifest(
+        out_dir,
+        cells=cells,
+        taskset_id=taskset_id,
+        bridge_bin=bridge_bin,
+        bridge_config=bridge_config,
+        allow_same_family_judge=args.allow_same_family_judge,
+    )
 
     return run_matrix(
         cells=cells,

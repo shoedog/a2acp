@@ -59,12 +59,13 @@ def _judge_row(
     seeded: bool,
     truth_path: Path,
     *,
-    item_pass: bool,
+    item_pass: bool | None,
     found_ids: list[str] | None = None,
     truth_ids: list[str] | None = None,
     false_findings: int = 0,
     neutral_matched: int = 0,
     judge_error: bool = False,
+    call_failed: bool = False,
 ) -> dict:
     truth_ids = truth_ids if truth_ids is not None else (["d1"] if seeded else [])
     found_ids = found_ids if found_ids is not None else []
@@ -74,10 +75,11 @@ def _judge_row(
         "seeded": seeded,
         "truth_path": str(truth_path),
         "normalized_block": f"[fabricated findings block for {cell}-{item}]",
-        "call_ok": True,
+        "call_ok": not call_failed,
         "judge_error": judge_error,
+        "call_failed": call_failed,
         "item_pass": item_pass,
-        "defects": [{"id": tid, "found": tid in found_ids} for tid in truth_ids],
+        "defects": [] if call_failed else [{"id": tid, "found": tid in found_ids} for tid in truth_ids],
         "false_findings": false_findings,
         "neutral_matched": neutral_matched,
     }
@@ -185,10 +187,13 @@ def _integrity_failures(results_dir: Path, cells: tuple[str, ...], n_items: int)
         except (OSError, json.JSONDecodeError) as e:
             failures.append(f"judge/{p.name}: unparseable ({e})")
             continue
-        if not isinstance(rec.get("item_pass"), bool):
-            failures.append(f"judge/{p.name}: 'item_pass' must be bool, got {rec.get('item_pass')!r}")
         if not isinstance(rec.get("judge_error"), bool):
             failures.append(f"judge/{p.name}: 'judge_error' must be bool, got {rec.get('judge_error')!r}")
+        # A call_failed (skipped-judge) row legitimately carries item_pass=None
+        # -- it is scored as neither a pass nor a fail. Only real judge rows
+        # must carry a bool item_pass.
+        if not rec.get("call_failed") and not isinstance(rec.get("item_pass"), bool):
+            failures.append(f"judge/{p.name}: 'item_pass' must be bool, got {rec.get('item_pass')!r}")
 
     # metrics.json: parses and carries every concept report.py promises.
     metrics_path = results_dir / "metrics.json"
@@ -320,3 +325,51 @@ def test_metric_fails_on_missing_judge_rows(tmp_path):
     score = metric.measure(test_case=None)
     assert score == 0.0
     assert "judge/" in metric.reason
+
+
+def test_call_failed_row_passes_gate_and_is_excluded_from_metrics(tmp_path):
+    # MAJOR-1 end to end: a call_failed row (item_pass=None) must (a) pass the
+    # integrity gate as a legitimate skipped-judge row, and (b) be excluded
+    # from the rendered per-cell metrics -- claude-solo here has one clean
+    # item skipped, so its scored n drops to 2 and the report surfaces the
+    # skipped-call count rather than scoring the failure as a clean TN.
+    out_dir = tmp_path / "run-with-skip"
+    calls_dir = out_dir / "calls"
+    judge_dir = out_dir / "judge"
+    calls_dir.mkdir(parents=True)
+    judge_dir.mkdir(parents=True)
+
+    items = [("s1", True), ("s2", True), ("c1", False)]
+    truth_paths = {item: _write_fabricated_truth(tmp_path, item, seeded) for item, seeded in items}
+    for cell in CELLS:
+        for item, seeded in items:
+            key = f"{cell}-{item}"
+            tp = truth_paths[item]
+            (calls_dir / f"{key}.md").write_text(f"[fabricated review text for {key}]\n")
+            # claude-solo/c1's reviewer call "failed": mark ok=false in calls/.
+            call_failed = cell == "claude-solo" and item == "c1"
+            call_meta = _call_row(cell, item, seeded, tp, ok=not call_failed)
+            (calls_dir / f"{key}.json").write_text(json.dumps(call_meta, indent=2))
+
+            if call_failed:
+                jr = _judge_row(cell, item, seeded, tp, item_pass=None, call_failed=True)
+            elif seeded:
+                jr = _judge_row(cell, item, seeded, tp, item_pass=True, found_ids=["d1"])
+            else:
+                jr = _judge_row(cell, item, seeded, tp, item_pass=True, false_findings=0)
+            (judge_dir / f"{key}.json").write_text(json.dumps(jr, indent=2))
+
+    s = report_mod.render(out_dir, taskset_id="fixture-taskset", cells=list(CELLS), n_items=3)
+
+    # Gate passes (call_failed rows are valid).
+    metric = HarnessIntegrityMetric(out_dir, CELLS, n_items=3)
+    assert metric.measure(test_case=None) == 1.0, metric.reason
+
+    # claude-solo's clean skipped item is excluded from its scored n and
+    # surfaced as a call failure, never as a TN.
+    cs = s["per_cell"]["claude-solo"]
+    assert cs["pass"]["n"] == 2
+    assert cs["pass"]["call_failures"] == 1
+    assert cs["confusion"]["tn"] == 0  # the skipped clean call is NOT a true negative
+    assert s["call_failures"] == 1
+    assert "calls skipped" in (out_dir / "report.md").read_text()

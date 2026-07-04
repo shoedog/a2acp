@@ -22,7 +22,7 @@ import random
 import yaml
 
 from harness.judge import load_truth, render_ground_truth
-from harness.metrics import confusion, load_rows, mcnemar_p, pass_rate, paired_flips
+from harness.metrics import confusion, load_rows, mcnemar_p, pass_rate, paired_flips, wilson_ci
 
 _SPOTCHECK_LIMIT = 10  # M3 spec's C2 calibration sample size (steering used 20)
 
@@ -32,8 +32,18 @@ _ESTIMAND = (
     "under three fixed configurations -- `duo` (the shipping shape, graded on "
     "the SYNTH output), `codex-solo` and `claude-solo` (single reviewer, "
     "graded RAW -- no synth pass). This is NOT a controlled ablation: cells "
-    "differ in agent composition AND the presence/absence of a synth pass "
-    "simultaneously, so cross-cell deltas below are a descriptive "
+    "differ simultaneously in (a) agent composition, (b) presence/absence of a "
+    "synth pass, AND (c) review LENS -- `codex-solo` runs the correctness lens "
+    "(`review-correctness`) while `claude-solo` runs the architecture lens "
+    "(`review-architecture`, whose prompt targets 'what a correctness-only pass "
+    "would miss'). Each solo cell mirrors that agent's role in the `duo` shape "
+    "(the design is deliberate), but the consequence must be read explicitly: "
+    "because this corpus is correctness-heavy (seeded defects are mostly "
+    "correctness bugs), the architecture lens is STRUCTURALLY disadvantaged at "
+    "seeded-defect recall by its lens, not by agent quality. `claude-solo`'s "
+    "seeded-defect recall is therefore confounded with the "
+    "architecture-lens/correctness-corpus mismatch and must NOT be read as "
+    "'claude is a worse reviewer'. Cross-cell deltas below are a descriptive "
     "paired-flips display, never a pass/fail criterion on their own."
 )
 
@@ -61,12 +71,14 @@ def summarize(out_dir, cells: list[str]) -> dict:
             flips.append(fp)
 
     judge_errors = sum(per_cell[c]["pass"]["judge_errors"] for c in cells)
+    call_failures = sum(per_cell[c]["pass"].get("call_failures", 0) for c in cells)
     return {
         "calls": calls,
         "judges": judges,
         "per_cell": per_cell,
         "flips": flips,
         "judge_errors": judge_errors,
+        "call_failures": call_failures,
     }
 
 
@@ -107,17 +119,32 @@ def render_report_md(s: dict, cells: list[str], taskset_id: str, n_items: int) -
 
     L.append("## Per-cell results")
     L.append("")
-    L.append("| cell | n | item-pass (95% CI) | defect recall | false findings (clean) | judge errors |")
-    L.append("|---|---|---|---|---|---|")
+    L.append(
+        "Defect recall is the PRIMARY metric; both it and item-pass carry a "
+        "Wilson 95% CI (per the spec's 'Wilson CIs throughout'). The CIs are "
+        "descriptive only -- with 1-2 defects per seeded item and n=15 the "
+        "intervals are wide and cluster-correlated; do not read a non-overlap "
+        "as a significance test."
+    )
+    L.append("")
+    L.append(
+        "| cell | n | item-pass (95% CI) | defect recall (95% CI) | false findings (clean) | judge errors | calls skipped |"
+    )
+    L.append("|---|---|---|---|---|---|---|")
     for cell in cells:
         pr = s["per_cell"][cell]["pass"]
         c = s["per_cell"][cell]["confusion"]
         dr = c["defect_recall"]
+        r_lo, r_hi = wilson_ci(dr["found"], dr["total"])
+        recall_cell = (
+            f"{dr['found']}/{dr['total']} = {dr['rate']:.3f}  (95% CI {r_lo:.3f}-{r_hi:.3f})"
+            if dr["total"]
+            else f"{dr['found']}/{dr['total']} = n/a"
+        )
         L.append(
-            f"| {cell} | {pr['n']} | {_pass_line(pr)} | "
-            f"{dr['found']}/{dr['total']} = {dr['rate']:.3f} | "
+            f"| {cell} | {pr['n']} | {_pass_line(pr)} | {recall_cell} | "
             f"{c['false_findings_clean_total']} (of {c['false_findings_total']} total) | "
-            f"{pr['judge_errors']} |"
+            f"{pr['judge_errors']} | {pr.get('call_failures', 0)} |"
         )
     L.append("")
 
@@ -153,12 +180,19 @@ def render_report_md(s: dict, cells: list[str], taskset_id: str, n_items: int) -
     )
     L.append("")
 
-    L.append("## Judge errors")
+    L.append("## Excluded rows (judge errors + skipped calls)")
     L.append("")
     L.append(f"- total judge_error rows across all cells: {s['judge_errors']}")
     L.append(
         "  (excluded from every rate/confusion figure above -- a judge_error is a "
-        "harness/agent failure, never silently folded into a result.)"
+        "harness/judge failure, never silently folded into a result.)"
+    )
+    L.append(f"- total skipped calls (reviewer call failed/empty, judge never invoked): {s.get('call_failures', 0)}")
+    L.append(
+        "  (also excluded from every rate/confusion/recall figure -- a reviewer "
+        "crash/timeout/empty output is a REVIEWER failure, scored as neither a "
+        "pass nor a fail, so it can neither inflate recall nor launder into a "
+        "clean true-negative.)"
     )
     L.append("")
     L.append("---")
@@ -186,7 +220,11 @@ def _sample_spotcheck(judges: list[dict], limit: int = _SPOTCHECK_LIMIT, seed: i
     reproduces the same sample rather than a new one every time -- "random"
     per the spec, reproducible in practice.
     """
-    graded = [r for r in judges if not r.get("judge_error")]
+    # Only REAL judge decisions are calibration candidates: exclude both
+    # judge_error rows (no valid grade produced) and call_failed rows (the
+    # reviewer call failed, so the judge was never invoked -- there is no
+    # judge decision to spot-check).
+    graded = [r for r in judges if not r.get("judge_error") and not r.get("call_failed")]
     by_cell: dict[str, list[dict]] = {}
     for r in graded:
         by_cell.setdefault(r.get("cell"), []).append(r)

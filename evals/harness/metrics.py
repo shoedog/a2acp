@@ -65,6 +65,26 @@ def load_rows(results_dir) -> tuple[list[dict], list[dict]]:
     return calls, judges
 
 
+def _is_scoreable(r: dict) -> bool:
+    """A judge row contributes to pass/confusion/recall/flip metrics iff it
+    carries a real judge decision. Two kinds of row are EXCLUDED, for two
+    distinct reasons, and are never counted as either a pass or a fail:
+
+      - `judge_error` -- the judge itself failed to produce a valid grade
+        after a retry (a harness/judge failure).
+      - `call_failed` -- the REVIEWER call failed/timed-out/emptied, so the
+        judge was deliberately never invoked (a reviewer/agent failure). This
+        is what `harness.normalize`'s own docstring means by "callers that
+        want to skip judging a failed call": conflating a reviewer crash with
+        a real judge verdict would either mislabel it a judge_error (if the
+        mechanical clean-item cross-check forces a raise) or launder it into a
+        clean TN (if the judge obeys the marker rule) -- both wrong.
+
+    Counting either separately (never folded into k/n or TP/FP/TN/FN) keeps a
+    partially-broken run from masquerading as a smaller clean one."""
+    return not r.get("judge_error") and not r.get("call_failed")
+
+
 # --------------------------------------------------------------------------- #
 # Pass rate + Wilson interval.
 # --------------------------------------------------------------------------- #
@@ -82,15 +102,21 @@ def wilson_ci(k: int, n: int, z: float = Z_95) -> tuple[float, float]:
 
 
 def pass_rate(rows: list[dict], cell: str) -> dict:
-    """Item pass rate for one cell. Excludes judge_error rows from k/n and
-    reports the excluded count as `judge_errors`.
+    """Item pass rate for one cell. Excludes both judge_error AND call_failed
+    rows from k/n (see `_is_scoreable`) and reports each excluded count
+    separately as `judge_errors` / `call_failures`.
 
     ADAPTED from steering's `pass_rate`: `arm` -> `cell`, tier-mixing guard
     dropped (this harness runs exactly one taskset per results dir, so there
-    is no second axis to accidentally mix)."""
+    is no second axis to accidentally mix); `call_failures` added for the
+    MAJOR-1 skip-failed-reviewer-calls path."""
     cell_rows = [r for r in rows if r.get("cell") == cell]
     judge_errors = sum(1 for r in cell_rows if r.get("judge_error"))
-    scored = [r for r in cell_rows if not r.get("judge_error")]
+    # call_failed rows are counted only when they are NOT also judge_error
+    # (a call_failed row never sets judge_error, but guard the arithmetic so
+    # the two counts can never double-count the same excluded row).
+    call_failures = sum(1 for r in cell_rows if r.get("call_failed") and not r.get("judge_error"))
+    scored = [r for r in cell_rows if _is_scoreable(r)]
     n = len(scored)
     k = sum(1 for r in scored if r.get("item_pass"))
     rate = (k / n) if n else 0.0
@@ -100,6 +126,7 @@ def pass_rate(rows: list[dict], cell: str) -> dict:
         "rate": rate,
         "wilson_ci": wilson_ci(k, n),
         "judge_errors": judge_errors,
+        "call_failures": call_failures,
     }
 
 
@@ -108,7 +135,8 @@ def pass_rate(rows: list[dict], cell: str) -> dict:
 # --------------------------------------------------------------------------- #
 def confusion(rows: list[dict], cell: str) -> dict:
     """Item-level TP/FP/TN/FN + base rate, defect-level recall, false
-    findings, for one cell. Excludes judge_error rows.
+    findings, for one cell. Excludes judge_error AND call_failed rows (see
+    `_is_scoreable`).
 
     ADAPTED from steering's `confusion`: steering derived "flagged" from a
     literal APPROVE/REJECT tag the reviewed artifact itself emitted
@@ -136,7 +164,7 @@ def confusion(rows: list[dict], cell: str) -> dict:
     "false-finding count on clean items (FRAGILE at n=4 clean)") as a
     breakdown of the overall `false_findings_total`.
     """
-    cell_rows = [r for r in rows if r.get("cell") == cell and not r.get("judge_error")]
+    cell_rows = [r for r in rows if r.get("cell") == cell and _is_scoreable(r)]
     tp = fp = tn = fn = 0
     found = total = false_findings = false_findings_clean = neutral_matched = 0
     for r in cell_rows:
@@ -189,9 +217,9 @@ def paired_flips(rows: list[dict], cell_a: str, cell_b: str) -> dict:
     ADAPTED from steering's `paired_flips`: generalized from a hardcoded
     baseline/treatment pair to two CALLER-NAMED cells, since this harness
     compares 3 cells pairwise (duo vs codex-solo, duo vs claude-solo) rather
-    than a single fixed arm pair. Items with a judge_error in either cell, or
-    missing from a cell entirely, are excluded (a flip needs a clean result
-    in both cells)."""
+    than a single fixed arm pair. Items with a judge_error OR a call_failed
+    (skipped-judge) row in either cell, or missing from a cell entirely, are
+    excluded (a flip needs a real judge verdict in both cells)."""
     by_item: dict[str, dict[str, dict]] = {}
     for r in rows:
         cell = r.get("cell")
@@ -205,7 +233,9 @@ def paired_flips(rows: list[dict], cell_a: str, cell_b: str) -> dict:
         b = cells.get(cell_b)
         if a is None or b is None:
             continue
-        if a.get("judge_error") or b.get("judge_error"):
+        # A flip needs a real judge verdict in BOTH cells -- exclude the pair
+        # if either side is a judge_error or a call_failed (skipped-judge) row.
+        if not _is_scoreable(a) or not _is_scoreable(b):
             continue
         ap = bool(a.get("item_pass"))
         bp = bool(b.get("item_pass"))

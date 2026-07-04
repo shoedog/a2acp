@@ -123,6 +123,20 @@ prompt expects two lens variables (`{{correctness}}`/`{{architecture}}`) --
 an unset one would render an empty string, not represent "no synth", so the
 raw reviewer terminal output is the cleaner estimand for those two cells.
 
+**Confound to read carefully (do NOT skip):** the cells differ on THREE axes
+at once -- agent composition, presence/absence of a synth pass, AND review
+**lens**. `codex-solo` runs the correctness lens (`review-correctness`);
+`claude-solo` runs the architecture lens (`review-architecture`, whose prompt
+explicitly targets "what a correctness-only pass would miss"). Each solo cell
+mirrors that agent's role in the shipping `duo` shape, so the design is
+deliberate -- but because this corpus is correctness-heavy (its seeded
+defects are mostly correctness bugs), the architecture lens is structurally
+disadvantaged at seeded-defect recall by its LENS, not by agent quality.
+**`claude-solo`'s seeded-defect recall must NOT be read as "claude is a worse
+reviewer"** -- it is confounded with the architecture-lens/correctness-corpus
+mismatch. `report.md`'s estimand statement carries this same disclosure so a
+reader of the committed baseline can't miss it.
+
 ## The blind judge
 
 The judge is itself just another workflow: a single **kiro** node

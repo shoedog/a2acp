@@ -63,6 +63,24 @@ def test_pass_rate_excludes_judge_errors_but_counts_them():
     assert pr["k"] == 1
     assert pr["rate"] == pytest.approx(0.5)
     assert pr["judge_errors"] == 1
+    assert pr["call_failures"] == 0
+
+
+def test_pass_rate_excludes_call_failed_rows_and_counts_them():
+    # MAJOR-1 skip path: a reviewer-call failure produces a call_failed row
+    # (judge never invoked). It must be counted as NEITHER pass nor fail, and
+    # surfaced separately as `call_failures`.
+    rows = [
+        _judge_row(item="t1", item_pass=True),
+        _judge_row(item="t2", item_pass=False),
+        _judge_row(item="t3", item_pass=None, call_failed=True),  # excluded
+    ]
+    pr = pass_rate(rows, "duo")
+    assert pr["n"] == 2  # only the two real verdicts
+    assert pr["k"] == 1
+    assert pr["rate"] == pytest.approx(0.5)
+    assert pr["call_failures"] == 1
+    assert pr["judge_errors"] == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +148,38 @@ def test_confusion_excludes_judge_error_rows():
     ]
     c = confusion(rows, "duo")
     assert c["n"] == 1
+
+
+def test_confusion_excludes_call_failed_rows_from_all_figures():
+    # A call_failed row on a CLEAN item is the exact collision MAJOR-1 fixes:
+    # if it were scored it could become a clean TN and inflate specificity, or
+    # (seeded) drag recall to 0/1. It must contribute to nothing.
+    rows = [
+        _judge_row(seeded=True, item_pass=True, defects=[{"id": "a", "found": True}]),
+        # a seeded call_failed row: no defects, would otherwise read as FN + 0/1 recall
+        _judge_row(seeded=True, item_pass=None, defects=[], call_failed=True),
+        # a clean call_failed row: would otherwise read as a TN
+        _judge_row(seeded=False, item_pass=None, call_failed=True),
+    ]
+    c = confusion(rows, "duo")
+    assert c["n"] == 1  # only the one real verdict
+    assert (c["tp"], c["fp"], c["tn"], c["fn"]) == (1, 0, 0, 0)
+    assert c["defect_recall"]["total"] == 1
+    assert c["defect_recall"]["found"] == 1
+
+
+def test_paired_flips_excludes_pair_when_either_side_call_failed():
+    rows = [
+        _judge_row(cell="duo", item="t1", item_pass=True),
+        _judge_row(cell="codex-solo", item="t1", item_pass=True),  # both_pass
+        _judge_row(cell="duo", item="t2", item_pass=True),
+        _judge_row(cell="codex-solo", item="t2", item_pass=None, call_failed=True),  # excluded pair
+    ]
+    fp = paired_flips(rows, "duo", "codex-solo")
+    assert fp["both_pass"] == 1
+    assert fp["both_fail"] == 0
+    assert fp["only_a"] == 0
+    assert fp["only_b"] == 0
 
 
 def test_load_json_glob_collects_named_integrity_errors(tmp_path):
