@@ -1,0 +1,38 @@
+Subject: [PATCH] sandbox: support per-agent mount overrides
+
+Adds an optional `overrides` layer so an agent entry can contribute extra
+mounts on top of the base config. `effective_mounts()` now unions the base
+mounts with the overrides.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6,12 +6,21 @@ pub struct Mount {
+     pub host: PathBuf,
+ }
+
++/// Optional per-agent overrides layered on top of the base sandbox config.
++pub struct Overrides {
++    pub extra_mounts: Vec<Mount>,
++}
++
+ pub struct SandboxConfig {
+     pub allowed_root: PathBuf,
+     pub mounts: Vec<Mount>,
++    pub overrides: Option<Overrides>,
+ }
+
+ impl SandboxConfig {
+@@ -28,4 +37,14 @@ impl SandboxConfig {
+         }
+         Ok(())
+     }
++
++    /// The full set of host paths this config will bind-mount at runtime.
++    pub fn effective_mounts(&self) -> Vec<&Path> {
++        let mut out: Vec<&Path> = self.mounts.iter().map(|m| m.host.as_path()).collect();
++        if let Some(ov) = &self.overrides {
++            out.extend(ov.extra_mounts.iter().map(|m| m.host.as_path()));
++        }
++        out
++    }
+ }

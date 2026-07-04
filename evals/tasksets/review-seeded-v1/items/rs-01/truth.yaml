@@ -1,0 +1,33 @@
+seeded: true
+defects:
+- id: rs-01-d1
+  defect_class: lock-across-await
+  location: src/lib.rs:47
+  hunk_lines: 44-56
+  description: >-
+    `dispatch` takes the `sessions` map lock into `sessions` and then awaits the
+    agent round-trip (`self.agent.run_turn(..).await`) while that guard is still
+    alive, so the map stays locked for the entire (multi-second) turn.
+  root_cause: >-
+    the refactor collapsed the two lock scopes into one, moving the `.await`
+    inside the region where the `MutexGuard` is held instead of dropping the
+    guard before the round-trip.
+  bad_behavior: >-
+    every other session's dispatch/open blocks on `self.sessions.lock().await`
+    for the full duration of the in-flight turn, serializing all sessions
+    behind one slow agent and defeating warm concurrency.
+  minimal_trigger: >-
+    two sessions dispatch concurrently; the second cannot acquire the map lock
+    until the first agent turn returns, even though they touch different keys.
+  acceptable_match: >-
+    any finding stating the sessions/map lock guard is held across the
+    `run_turn(..).await` (the await happens while the MutexGuard is alive),
+    blocking other sessions until the turn completes.
+  reject_if: >-
+    a finding that only mentions locking or concurrency generally (e.g. "watch
+    for contention") without identifying that the specific guard is held across
+    the await point.
+  catchability: >-
+    catchable from diff because the added `.await` sits textually between
+    `let mut sessions = self.sessions.lock().await;` and the end of `dispatch`,
+    with no `drop(sessions)` before it -- the held guard is visible in the hunk.

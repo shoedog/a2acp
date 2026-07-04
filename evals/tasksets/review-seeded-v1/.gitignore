@@ -1,0 +1,3 @@
+# Fixtures are tiny buildable crates; never commit their build artifacts.
+items/*/fixture/target/
+items/*/fixture/Cargo.lock

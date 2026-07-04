@@ -1,0 +1,24 @@
+seeded: false
+defects: []
+clean_rationale: >-
+  The `.unwrap()` in `register` cannot panic. The key is inserted on the
+  immediately preceding line, and the method holds `&mut self` for its whole
+  body, so the map cannot be mutated (no removal) between the insert and the
+  `get`. The lookup is therefore infallible, the invariant is documented in a
+  SAFETY comment, and returning the borrowed handle is sound. This is the
+  intended pattern for "insert then return the stored reference", not a latent
+  panic.
+tempting_non_defects:
+- >-
+  The `.unwrap()` looks like a latent panic a reviewer might flag, but it is
+  guarded by a locally-established invariant: the just-inserted key under `&mut
+  self` guarantees the get returns Some.
+- >-
+  Doing `insert` then a fresh `get` looks redundant (why not reuse the insert's
+  return?), but `HashMap::insert` returns the OLD value, not a reference to the
+  new one, so a second `get` is the correct way to borrow the stored string --
+  it is not a wasteful double-lookup bug.
+- >-
+  Returning a `&str` borrowed from `self` after a mutating `insert` looks like it
+  could be a borrow/aliasing problem, but the mutable borrow ends before the
+  shared borrow that produces the return value, so it is sound.

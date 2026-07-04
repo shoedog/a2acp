@@ -1,0 +1,35 @@
+seeded: true
+defects:
+- id: rs-02-d1
+  defect_class: config-validation bypass
+  location: src/lib.rs:30
+  hunk_lines: 9-50
+  description: >-
+    `validate()` iterates only `self.mounts`, but the new `overrides.extra_mounts`
+    are also real bind-mounts (they appear in `effective_mounts()`), so a mount
+    added via the overrides layer is never checked against `allowed_root`.
+  root_cause: >-
+    the validation loop was not extended when the nested `overrides.extra_mounts`
+    mount source was added, so a second source of mounts bypasses the gate that
+    guards the first.
+  bad_behavior: >-
+    a config with `overrides.extra_mounts` pointing outside `allowed_root` passes
+    `validate()` and is then bind-mounted by `effective_mounts()`, letting an
+    agent mount arbitrary host paths the gate was meant to forbid.
+  minimal_trigger: >-
+    a SandboxConfig with `mounts` all under `allowed_root` but
+    `overrides = Some(Overrides { extra_mounts: [Mount{ host: "/etc" }] })`;
+    `validate()` returns Ok yet `/etc` is outside `allowed_root`.
+  acceptable_match: >-
+    any finding stating that `overrides.extra_mounts` (the nested/override mount
+    source) is not run through the `allowed_root`/`under_root` check in
+    `validate()`, so those mounts bypass validation.
+  reject_if: >-
+    a finding that only says "validate should check more things" or flags the
+    `overrides` field generically, without identifying that extra_mounts are
+    mounted (effective_mounts) yet skip the allowed_root gate.
+  catchability: >-
+    catchable from diff+fixture because the hunk introduces a second mount source
+    (`overrides.extra_mounts`) that `effective_mounts()` binds, while `validate()`
+    (unchanged, in the same file) still guards only `self.mounts` -- the new mount
+    source visibly escapes the existing gate.

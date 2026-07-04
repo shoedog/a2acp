@@ -1,0 +1,21 @@
+Subject: [PATCH] slots: add evict() to return a slot to the pool
+
+Removes the session from the live set, frees its slot in the durable ledger,
+and decrements the in-memory count.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -35,6 +35,13 @@ impl SlotTable {
+         Ok(())
+     }
+
++    /// Evict a session and return its slot to the pool.
++    pub fn evict(&mut self, id: &str) {
++        self.live.remove(id);
++        let _ = self.persist_free(id);
++        self.used -= 1;
++    }
++
+     pub fn used(&self) -> u32 {
+         self.used
+     }

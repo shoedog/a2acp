@@ -1,0 +1,19 @@
+Subject: [PATCH] pool: add complete() to return a finished turn's slot
+
+Returns the turn's slot to the pool when it completes.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -30,6 +30,12 @@ impl Pool {
+     fn release(&self) {
+         self.available.fetch_add(1, Ordering::SeqCst);
+     }
++
++    /// Called when a turn finishes to return its slot to the pool.
++    pub fn complete(self: &Arc<Self>, lease: Lease) {
++        self.release();
++        drop(lease);
++    }
+ }
+
+ /// Holds a slot; frees it back to the pool on drop (RAII).

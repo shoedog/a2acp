@@ -1,0 +1,23 @@
+seeded: false
+defects: []
+clean_rationale: >-
+  `dispatch` deliberately clones the prompt inside a block so the `MutexGuard`
+  drops at the block's end, BEFORE the agent round-trip is awaited. This is the
+  correct way to avoid holding the map lock across `.await`: the lock protects
+  only the map lookup, and the slow `run_turn` happens with no lock held, so
+  concurrent sessions are not serialized. This is the correct counterpart to the
+  lock-across-await anti-pattern -- moving the await inside the lock block (to
+  save the clone) would be the actual defect.
+tempting_non_defects:
+- >-
+  The `.clone()` of the prompt looks like an avoidable allocation a reviewer
+  might flag as wasteful, but it is a deliberate lock-scope shortener: cloning
+  lets the guard drop before the await instead of borrowing across it.
+- >-
+  Scoping the lock in an inner `{ ... }` block with an early `?` looks like it
+  could leak the guard on the None path, but the guard drops on every exit from
+  the block (including the `?` return), so the lock is always released promptly.
+- >-
+  Awaiting `run_turn` in `dispatch` looks like it might hold a lock across an
+  await (the classic bug), but by this point the guard has already dropped -- no
+  lock is held during the round-trip.

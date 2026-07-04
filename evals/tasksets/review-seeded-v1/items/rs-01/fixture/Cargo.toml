@@ -1,0 +1,10 @@
+[package]
+name = "rs01-session-lock"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["sync"] }
+
+# Standalone crate: keep it out of the parent repo's cargo workspace.
+[workspace]

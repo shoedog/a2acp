@@ -1,0 +1,24 @@
+seeded: false
+defects: []
+clean_rationale: >-
+  The unbounded `std::sync::mpsc` channel is safe here because the producer is
+  provably bounded: the DAG's node count is fixed and validated (`<= MAX_NODES =
+  64`) at load, and each node sends exactly one result, so at most `nodes`
+  messages ever enter the queue. `collect` also caps the drain at `self.nodes`.
+  This is the correct counterpart to the unbounded-growth anti-pattern -- the
+  bound lives on the producer side (a fixed DAG), not on the channel type, so an
+  unbounded channel is the right, allocation-free choice.
+tempting_non_defects:
+- >-
+  The unbounded `channel()` looks like the unbounded-growth class (no capacity),
+  but the producer is finite by construction: a validated DAG of `<= 64` nodes
+  each sending once caps the queue at `nodes` messages.
+- >-
+  `rx.into_iter().take(self.nodes)` looks like it could hang if fewer than
+  `nodes` results arrive, but `collect` first drops the owned `tx`; once all
+  senders are gone the iterator terminates, so `take(nodes)` is an upper bound,
+  not a required count.
+- >-
+  Cloning a `Sender` per node looks like it could keep the channel alive
+  indefinitely, but node senders are dropped when their nodes finish, and
+  `collect` drops the collector's own `tx`, so the channel closes.

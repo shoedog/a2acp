@@ -1,0 +1,35 @@
+seeded: true
+defects:
+- id: rs-04-d1
+  defect_class: error-swallowed
+  location: src/lib.rs:46
+  hunk_lines: 38-44
+  description: >-
+    `evict` discards the `Result` of the fallible `persist_free` with `let _ =`,
+    then decrements `used` unconditionally, so a failed durable free still
+    reduces the in-memory count -- the in-memory and durable slot accountings
+    diverge.
+  root_cause: >-
+    swallowing a fallible cleanup (`let _ = self.persist_free(id)`) whose failure
+    leaves the durable ledger unchanged, while the code proceeds as if it succeeded.
+  bad_behavior: >-
+    when `persist_free` errors, the slot stays "used" durably but `used` drops in
+    memory; across evictions the two counts drift, so capacity is either leaked
+    (admissions wrongly rejected forever) or over-granted after a restart re-reads
+    the durable ledger.
+  minimal_trigger: >-
+    an `evict` call where `persist_free` returns Err: `used` is still decremented,
+    leaving in-memory `used` lower than the durable count.
+  acceptable_match: >-
+    any finding stating that the error from `persist_free` is ignored (`let _ =`)
+    and that decrementing `used` regardless leaves the in-memory and durable slot
+    accounting inconsistent / corrupts the slot count.
+  reject_if: >-
+    a finding that only says "you should log/handle the error" or "prefer if-let"
+    as a style nit, without noting that swallowing the failure corrupts the slot
+    accounting (state divergence / leaked capacity).
+  catchability: >-
+    catchable from diff because the added `evict` shows `let _ = self.persist_free(id);`
+    immediately followed by an unconditional `self.used -= 1;` -- the swallowed
+    fallible cleanup and the state mutation that assumes it succeeded are both in
+    the hunk.

@@ -1,0 +1,33 @@
+seeded: true
+defects:
+- id: rs-11-d1
+  defect_class: wrong-cwd/path propagation
+  location: src/lib.rs:20
+  hunk_lines: 17-24
+  description: >-
+    `resolve` joins `rel` onto `std::env::current_dir()` (the bridge process's
+    launch directory) instead of onto `self.session_cwd`, the configured repo for
+    this run. `session_cwd` is ignored entirely.
+  root_cause: >-
+    resolving a relative path against the process cwd rather than the configured
+    base (`self.session_cwd`); the field in scope that should anchor the join is
+    unused.
+  bad_behavior: >-
+    the agent reads/writes files under whatever directory `serve` was launched
+    from, not the target repository -- with one serve driving many repos, artifacts
+    resolve into the wrong repo (or a nonexistent path), touching the wrong files.
+  minimal_trigger: >-
+    `RunContext::new("/repos/project-a").resolve("src/main.rs")` returns
+    `<process-cwd>/src/main.rs` instead of `/repos/project-a/src/main.rs`.
+  acceptable_match: >-
+    any finding stating that `resolve` uses the process current_dir instead of
+    `self.session_cwd` (the configured base is ignored), so relative paths resolve
+    against the wrong directory / wrong repo.
+  reject_if: >-
+    a finding that only flags the `unwrap_or_default()` on `current_dir`, or says
+    "handle paths carefully", without identifying that `session_cwd` should be the
+    base instead of the process cwd.
+  catchability: >-
+    catchable from diff because the added body reads `std::env::current_dir()...
+    .join(rel)` while `self.session_cwd` sits unused in the same struct/method --
+    the wrong base is chosen in plain sight in the hunk.

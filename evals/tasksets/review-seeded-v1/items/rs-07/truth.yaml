@@ -1,0 +1,33 @@
+seeded: true
+defects:
+- id: rs-07-d1
+  defect_class: unbounded growth
+  location: src/lib.rs:22
+  hunk_lines: 1-25
+  description: >-
+    the "simplification" drops the `CAP` bound: the old `VecDeque` evicted the
+    oldest delta once it reached `CAP`, but the new `Vec` `push` appends
+    unconditionally, so `pending` grows one entry per delta with no upper bound.
+  root_cause: >-
+    removing the ring-buffer eviction (`if len >= CAP { pop_front }`) when
+    switching from `VecDeque` to `Vec`, leaving an unbounded accumulator on the
+    hot per-delta path.
+  bad_behavior: >-
+    on a long or detached run (no subscriber ever calls `take`), the buffer
+    accumulates every delta for the whole turn and grows without bound, driving
+    unbounded memory use / OOM.
+  minimal_trigger: >-
+    a run that emits many deltas with no `take`: after N pushes `len() == N` with
+    no cap, whereas the contract requires it to plateau at CAP (1024).
+  acceptable_match: >-
+    any finding stating that the delta buffer is now unbounded -- the per-delta
+    `push` has no size cap/eviction (the CAP/ring bound was removed), so it grows
+    without limit when not drained.
+  reject_if: >-
+    a finding that only prefers `Vec` vs `VecDeque` on style/perf grounds, or
+    notes the lock, without identifying that the bound/eviction is gone so the
+    buffer grows unboundedly.
+  catchability: >-
+    catchable from diff because the hunk deletes `const CAP` and the
+    `if pending.len() >= CAP { pop_front }` guard while keeping the unconditional
+    `push` -- the removed bound is right next to the retained append.

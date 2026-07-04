@@ -1,0 +1,19 @@
+Subject: [PATCH] runcontext: resolve task-spec artifact paths
+
+Adds `resolve(rel)` to turn a relative artifact path into the absolute path the
+agent reads/writes.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,4 +14,11 @@ impl RunContext {
+             session_cwd: session_cwd.into(),
+         }
+     }
++
++    /// Resolve a relative artifact path from the task-spec to an absolute path
++    /// the agent will read/write.
++    pub fn resolve(&self, rel: &str) -> PathBuf {
++        let base = std::env::current_dir().unwrap_or_default();
++        base.join(rel)
++    }
+ }

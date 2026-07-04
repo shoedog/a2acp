@@ -1,0 +1,33 @@
+seeded: true
+defects:
+- id: rs-06-d1
+  defect_class: off-by-one on a cursor/pagination bound
+  location: src/lib.rs:32
+  hunk_lines: 23-33
+  description: >-
+    `events_since` filters with `e.seq >= cursor`, but `cursor` is the seq of the
+    last event ALREADY delivered, so it should be strictly `e.seq > cursor`. The
+    `>=` re-includes the event at `seq == cursor`.
+  root_cause: >-
+    inclusive/exclusive boundary confusion -- treating the cursor as "start of the
+    unseen range" (`>=`) instead of "last seen, exclusive" (`>`).
+  bad_behavior: >-
+    on every reconnect the subscriber is re-sent the last event it already had,
+    breaking exactly-once delivery (a duplicate event / duplicated final frame on
+    each reattach).
+  minimal_trigger: >-
+    a log of seq 1,2,3; subscriber last saw seq 2 and reconnects with cursor=2;
+    `events_since(2)` returns events 2 and 3 instead of just 3.
+  acceptable_match: >-
+    any finding stating that `>=` re-delivers the event whose seq equals the
+    cursor (the already-seen last event) and that it should be `>` (exclusive of
+    the last-seen seq).
+  reject_if: >-
+    a finding that only says "pagination/cursor logic looks off" without
+    identifying the inclusive `>=` re-delivering the seq==cursor event (should be
+    exclusive `>`).
+  catchability: >-
+    catchable from diff because the sole comparison in the added filter reads
+    `e.seq >= cursor` while the adjacent doc comment states only strictly-newer
+    events should be replayed -- the inclusive operator contradicts the contract
+    in the same hunk.

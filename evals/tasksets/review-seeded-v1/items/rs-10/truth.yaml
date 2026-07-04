@@ -1,0 +1,35 @@
+seeded: true
+defects:
+- id: rs-10-d1
+  defect_class: stale-lock/double-release
+  location: src/lib.rs:38
+  hunk_lines: 33-40
+  description: >-
+    `complete` calls `self.release()` (incrementing `available`) and then drops
+    `lease` -- but `Lease`'s `Drop` impl ALSO calls `release()`. The same slot is
+    returned to the pool twice.
+  root_cause: >-
+    an explicit release added on top of the existing RAII release in
+    `Drop for Lease`; the lease is not consumed/forgotten, so both paths fire for
+    one slot (double release).
+  bad_behavior: >-
+    each `complete` bumps `available` by 2 for a single slot, so the pool reports
+    more free slots than exist and over-admits -- `checkout` succeeds past
+    capacity, exceeding the fixed warm-agent limit.
+  minimal_trigger: >-
+    `Pool::new(1)`, `checkout()` (available 1->0), then `complete(lease)`:
+    available becomes 2 instead of 1, permitting two concurrent leases from a
+    size-1 pool.
+  acceptable_match: >-
+    any finding stating that the slot is released twice -- `complete` calls
+    `release()` while `Lease::drop` also releases -- so `available` over-counts /
+    the pool over-admits (double free / double release).
+  reject_if: >-
+    a finding that only says "watch the atomic ordering" or "leases are tricky"
+    without identifying that `complete`'s explicit release duplicates the
+    Drop-based release for the same lease.
+  catchability: >-
+    catchable from diff+fixture because the added `complete` calls `self.release()`
+    and then drops `lease`, while `impl Drop for Lease` (adjacent in the same file,
+    its RAII "frees on drop" contract stated in context.md) also releases -- the
+    double release of one slot follows from the hunk plus the visible Drop impl.

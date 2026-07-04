@@ -1,0 +1,33 @@
+taskset: review-seeded-v1
+task_family: review
+items:
+- id: rs-01
+  seeded: true
+- id: rs-02
+  seeded: true
+- id: rs-03
+  seeded: true
+- id: rs-04
+  seeded: true
+- id: rs-05
+  seeded: true
+- id: rs-06
+  seeded: true
+- id: rs-07
+  seeded: true
+- id: rs-08
+  seeded: true
+- id: rs-09
+  seeded: true
+- id: rs-10
+  seeded: true
+- id: rs-11
+  seeded: true
+- id: rc-01
+  seeded: false
+- id: rc-02
+  seeded: false
+- id: rc-03
+  seeded: false
+- id: rc-04
+  seeded: false
