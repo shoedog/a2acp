@@ -32,6 +32,7 @@
 mod catalog_probe;
 mod config;
 mod containers;
+mod doctor;
 mod implement;
 mod implement_resume;
 mod merge;
@@ -102,6 +103,7 @@ SUBCOMMANDS:
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
   session             Warm session control.  status | release | cancel | clear | compact <contextId>
+  doctor              Read-only preflight: config, agent commands/runtimes, egress, verify/review, store, MCP.  [--config <f>] [--json]
 
 Run `a2a-bridge <subcommand> --help` for details. Quickstart + cwd/creds/concurrency notes: AGENTS.md.";
 
@@ -131,6 +133,23 @@ thing that scaffolds a config (neither form of `serve` writes one anymore).
   --config <path>  registry config defining the agent registry + [server]/[store]/[workflows]/etc.
                    (default: ./a2a-bridge.toml)";
 
+/// `doctor` has no dedicated `_cmd` in main.rs (it lives in `doctor.rs`), but per the W3-A convention
+/// (see `SERVE_USAGE`) its usage constant is defined here so `dispatcher_help` can hand it out uniformly.
+const DOCTOR_USAGE: &str = "\
+usage: a2a-bridge doctor [--config <path>] [--json]
+
+Read-only, advisory preflight: parses + validates the config, then reports on the things that most
+commonly break a first run — agent commands/runtimes, api_key_env, sandbox egress (network/image),
+[verify] and [review] infrastructure, the [store] path, MCP servers, the lsp_env containerized-MCP
+trap, and configured credential bind-mounts. Every external probe is bounded (a wedged runtime is
+reported, never hung on) and NOTHING is written to disk — doctor never spawns an agent turn, creates a
+container, or touches the network beyond a local `<runtime> network|image inspect`.
+
+  --config <path>  registry config to check (default: ./a2a-bridge.toml)
+  --json           emit a stable {check, status, detail, remedy} JSON array instead of the text table
+
+Exit code is 0 unless at least one check is `fail` (warnings alone exit 0).";
+
 const TASK_SPEC_USAGE: &str = "\
 usage: a2a-bridge task-spec schema [type]
        a2a-bridge task-spec template <type>
@@ -156,6 +175,7 @@ enum TopSubcommand {
     Mcp,
     TaskSpec,
     Prompt,
+    Doctor,
     Help,
     Serve,
     Unknown(String),
@@ -178,6 +198,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("mcp") => TopSubcommand::Mcp,
         Some("task-spec") => TopSubcommand::TaskSpec,
         Some("prompt") => TopSubcommand::Prompt,
+        Some("doctor") => TopSubcommand::Doctor,
         Some("help") | Some("--help") | Some("-h") => TopSubcommand::Help,
         Some("serve") | None => TopSubcommand::Serve,
         Some(other) => TopSubcommand::Unknown(other.to_string()),
@@ -192,6 +213,10 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
 /// so without this check `a2a-bridge init --help` would silently scaffold files instead of
 /// printing help. Nested forms (e.g. `task get --help`) are OUT of scope this wave — only the
 /// first post-subcommand arg is checked.
+///
+/// `doctor` (W3-B) is ALSO listed here even though `doctor_cmd`'s own parser checks `--help` too
+/// (belt-and-suspenders, matching the uniform "help is intercepted before any per-command work"
+/// contract this map exists for) — unlike `mcp`, which relies solely on its own internal check.
 fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static str> {
     match raw_args.get(2).map(|s| s.as_str()) {
         Some("--help") | Some("-h") => {}
@@ -204,6 +229,7 @@ fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static 
         TopSubcommand::Serve => Some(SERVE_USAGE),
         TopSubcommand::Merge => Some(merge::MERGE_USAGE),
         TopSubcommand::Init => Some(INIT_USAGE),
+        TopSubcommand::Doctor => Some(DOCTOR_USAGE),
         _ => None,
     }
 }
@@ -5750,6 +5776,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Mcp => return mcp_cmd(&raw_args[2..]).await,
         TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
         TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
+        TopSubcommand::Doctor => return doctor::doctor_cmd(&raw_args[2..]),
         TopSubcommand::Help => {
             println!("{TOP_USAGE}");
             return Ok(());
@@ -5760,7 +5787,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }
@@ -6655,6 +6682,28 @@ mod cli_tests {
                     "{word} {help} should print its usage and exit 0"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn dispatcher_help_covers_doctor() {
+        // W3-B: `doctor --help`/`-h` must be intercepted before `doctor_cmd`'s own parsing runs —
+        // exactly the same contract as the six W3-A subcommands above (see that test + the
+        // `dispatcher_help` doc comment for why `doctor` is listed even though its own parser
+        // also checks `--help` defensively).
+        assert!(DOCTOR_USAGE.starts_with("usage: a2a-bridge doctor"));
+        for help in ["--help", "-h"] {
+            let args = vec![
+                "a2a-bridge".to_string(),
+                "doctor".to_string(),
+                help.to_string(),
+            ];
+            let sub = parse_top_subcommand(&args);
+            assert_eq!(
+                dispatcher_help(&sub, &args),
+                Some(DOCTOR_USAGE),
+                "doctor {help} should print its usage and exit 0"
+            );
         }
     }
 
