@@ -252,13 +252,32 @@ use warm sessions). So slice 7 is NOT mechanical — it forces one of:
 also fights the InboundServer incremental-builder pattern vs `Coordinator`'s
 build-once shape).
 
-**Assessment:** the migration's SUBSTANTIVE goal — one unified lifecycle-state
-owner, A2A co-equal — is ALREADY achieved at slices 1–6: after slice 1 the adapter's
-state is Arc-*shared* with the Coordinator (no parallel *copies*, just two handles).
-Slice 7 only removes the redundant handles from the struct = cosmetic cleanup, not a
-behaviour/correctness change. Recommendation: land 1–6 as the functional completion,
-run the live-gates, and do slice 7 as an optional follow-up with the
-`session_manager`-optional decision made deliberately (task #25).
+**Assessment (reconciled — dual-lens, opus + Fable review 2026-07-05):** the
+migration's SUBSTANTIVE goal — one unified lifecycle-state owner, A2A co-equal — is
+ALREADY achieved at slices 1–6 (runtime state is Arc-*shared* since slice 1). Slice 7
+is runtime-cosmetic but **maintenance-substantive**: it deletes the eight live
+fallback dual-paths added in slices 2–5 (the "every lifecycle feature ships twice"
+surface = #10's whole justification) + the `with_*`-after-`with_coordinator` footgun,
+and makes one-owner structural instead of test-asserted.
+
+**Decision (both lenses agree):** do slice 7 via **(ii) constructor injection**
+(`InboundServer::from_coordinator(coord, route, auth, base_url, delegation, label)` +
+a test-support helper *function*) with **`session_manager` MANDATORY, always injected**
+(NOT `Option` — the Option is a test smell; the warm-less surface already exists below
+the Coordinator at `DetachedDeps`). Mechanic (i) rebuild-in-`with_*` is REJECTED — it
+causes a prod split-brain (`with_*` after `with_coordinator` rebuilds a different
+Coordinator than main's `coordinator.resume()` handle, `main.rs:6196`) and can't
+preserve the four map identities. Three refinements: (a) keep `allowed_cwd_root` as a
+**9th KEEP field** (don't wire the real root into the Coordinator in slice 7 — it adds
+a boot parse-failure + activates the Coordinator-side 2nd cwd validation whose
+equivalence holds only under root=None); (b) extract ONE `build_coordinator(cfg, …)`
+for serve + mcp (they've already diverged: mcp passes the parsed root, serve `None` —
+`main.rs:4828` vs `:6134`); (c) add a `session/status` golden-wire shape case BEFORE
+slice 7. Also: AUDIT (don't sweep) the 19 sm-less fixtures — mandatory-sm flips
+contextId-carrying Local sends cold→warm (`warm_local_dispatch`, `server.rs:586`; the
+golden-wire warm replays are the acute case). Sequencing: run live-gates → merge 1–6 →
+slice 7 on its OWN branch. Full analysis: Fable review appended to this session's
+record; [[coordinator-migration-10-design]].
 
 ## Verified
 - Full workspace suite green (**1431/0/12** after slices 5 & 6; 1430 after slice 4;
@@ -273,10 +292,34 @@ run the live-gates, and do slice 7 as an optional follow-up with the
 - SessionManager clock switch proven behavior-identical from source.
 
 ## Not verified (pending)
-- **Owner-run A2A LIVE-GATE for slice 1:** serve boots + a send/receive round-trips
-  (the in-process harness covers the router but not a real socket + real agent).
-- Slices 2–7 (batch RPCs → read/control-plane → detached submit+resume →
-  context-lifecycle → warm/cancel minimal → delete parallel fields).
+
+Slices 1–6 are CODE-COMPLETE + suite-verified (1431/0/12, clippy, golden-wire 15/15).
+The remaining merge blocker is the **four owner-run A2A live-gates** (`cargo test`
+cannot drive a real socket + real agent + restart). Slice 7 is deferred to its own
+branch, post-merge.
+
+### Owner live-gate checklist (run on `feat/coordinator-migration`)
+Build once: `cargo build --release` → `./target/release/a2a-bridge`. Use a config with
+a real agent (e.g. `examples/a2a-bridge.toml` or your `serve --config`). Each gate:
+
+1. **Slice 1 — boot + send/receive.** `a2a-bridge serve --config <cfg>` boots without
+   error; send one `message/send` (unary) and one `message/stream` and confirm a normal
+   reply. *Proves:* the Coordinator-first construction reorder + instance-shared store
+   work on a real socket + real agent.
+2. **Slice 4 — submit → restart → resume.** With a **file-backed** `[store]`: submit a
+   detached workflow (`RunWorkflow`/skill route) so a `Working` row persists; kill serve
+   mid-run; restart; confirm the task RESUMES from the store (not double-spawned, not
+   stuck Working). *Proves:* `coordinator.resume()` replacing `resume_working_tasks`.
+3. **Slice 5 — force-reset an in-flight warm turn.** Start a warm multi-turn context;
+   while a turn is RUNNING, `SessionClear` with `force:true`; confirm the running turn
+   aborts cleanly (not stranded) and the context is cleared with a bumped generation.
+   *Proves:* `coordinator.clear(force=true)` fires the warm abort token (Fable M5).
+4. **Slice 6 — warm multi-turn + cancel + delegation/fanout.** Multi-turn warm send on
+   one context; mid-turn `CancelTask` by wire id → the real warm session cancels; plus a
+   delegate + a fan-out round-trip. *Proves:* the warm/cancel arms are correct over the
+   shared state (adapter-resident, not delegated to `coordinator.prompt`).
+
+Record PASS/FAIL per gate in `evals/`/here. All four PASS ⇒ slices 1–6 mergeable.
 
 ## Out-of-scope failures
 - None. Every run showed 0 failures; nothing re-baselined or silently fixed.
