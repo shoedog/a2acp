@@ -4300,3 +4300,121 @@ async fn detached_submit_persists_session_cwd() {
         "record.session_cwd must equal the submitted a2a-bridge.cwd"
     );
 }
+
+// ============================================================================
+// #10 slice 2 — batch RPCs delegate through the Coordinator.
+//
+// A server built over a Coordinator (with a BatchRuntime) must route
+// RunBatch / BatchStatus / BatchList through `srv.coordinator()` and return the
+// SAME wire shapes. This exercises the `Some(coord)` branch the serve path
+// always takes after slice 1 — the fallback free-fn path is behaviourally
+// identical (same shared runtime + task_store), so the migration is invisible on
+// the wire; this test proves the coordinator path is wired and correct.
+// ============================================================================
+
+fn build_coordinator_batch_server() -> Arc<InboundServer> {
+    let registry = Arc::new(FakeRegistry {
+        replies: [
+            ("codex".to_string(), "CODEX_REVIEW".to_string()),
+            ("claude".to_string(), "CLAUDE_REVIEW".to_string()),
+            ("synth".to_string(), "SYNTH_FINAL".to_string()),
+        ]
+        .into(),
+    });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    let task_store: Arc<dyn bridge_core::task_store::TaskStore> = Arc::new(MemoryTaskStore::new());
+    let session_store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+    let sm = Arc::new(bridge_a2a_inbound::session_manager::SessionManager::new(
+        registry.clone() as Arc<dyn AgentRegistry>,
+        std::time::Duration::from_secs(60),
+    ));
+    let clock: Arc<dyn bridge_coordinator::clock::Clock> =
+        Arc::new(bridge_coordinator::clock::SystemClock);
+    let coord = Arc::new(bridge_coordinator::Coordinator::new(
+        sm,
+        Some(executor),
+        Arc::new(map),
+        task_store,
+        session_store,
+        Arc::new(AutoApprove) as Arc<dyn PolicyEngine>,
+        registry.clone() as Arc<dyn AgentRegistry>,
+        clock,
+        None,
+        Some(bridge_coordinator::BatchRuntime::new(4, 1)),
+        3,
+    ));
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_coordinator(coord),
+    )
+}
+
+#[tokio::test]
+async fn run_batch_rpc_delegates_through_coordinator() {
+    let srv = build_coordinator_batch_server();
+
+    // RunBatch through the Coordinator returns a batchId.
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            "RunBatch",
+            json!({
+                "workflow": "code-review",
+                "items": [
+                    { "item_id": "a", "input": "---\ntask-type: freeform\n---\nDIFF-A" },
+                    { "item_id": "b", "input": "---\ntask-type: freeform\n---\nDIFF-B" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = json_response(resp).await;
+    let batch_id = body["result"]["batchId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("RunBatch must return a batchId via the coordinator: {body}"))
+        .to_string();
+
+    // BatchStatus (also delegated) sees the same batch id + total item count.
+    let status = srv
+        .clone()
+        .router()
+        .oneshot(post_request("BatchStatus", json!({ "id": batch_id })))
+        .await
+        .unwrap();
+    let sbody = json_response(status).await;
+    assert_eq!(sbody["result"]["id"], batch_id, "{sbody}");
+    assert_eq!(sbody["result"]["total"], 2, "{sbody}");
+
+    // BatchList (also delegated) contains it.
+    let list = srv
+        .clone()
+        .router()
+        .oneshot(post_request("BatchList", json!({ "limit": 10 })))
+        .await
+        .unwrap();
+    let lbody = json_response(list).await;
+    let ids: Vec<String> = lbody["result"]["batches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ids.contains(&batch_id),
+        "BatchList must include {batch_id}: {lbody}"
+    );
+}

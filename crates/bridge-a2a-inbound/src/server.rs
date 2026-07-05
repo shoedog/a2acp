@@ -3399,16 +3399,22 @@ async fn run_batch_rpc(
         });
     }
 
-    match bridge_coordinator::batch::run_batch(
-        &bdeps,
-        bridge_coordinator::batch::BatchParams {
-            workflow: params.workflow,
-            concurrency: params.concurrency,
-            items,
-        },
-    )
-    .await
-    {
+    // #10 slice 2: run on the Coordinator's shared BatchRuntime. The per-item
+    // validation above (against the wire cwd-gate root) is PRESERVED; the
+    // Coordinator's re-validation with its own root is a no-op on the already-
+    // normalized absolute cwds (`validate_cwd_str(_, None, _)` just re-parses).
+    // Fall back to the free fn if no Coordinator is wired (test/legacy servers;
+    // `batch_deps` being Some already implies the serve path, which has one).
+    let bp = bridge_coordinator::batch::BatchParams {
+        workflow: params.workflow,
+        concurrency: params.concurrency,
+        items,
+    };
+    let result = match srv.coordinator() {
+        Some(coord) => coord.run_batch(bp).await,
+        None => bridge_coordinator::batch::run_batch(&bdeps, bp).await,
+    };
+    match result {
         Ok(bid) => jsonrpc_ok(id, json!({ "batchId": bid.as_str() })),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
@@ -3434,7 +3440,12 @@ async fn batch_status_rpc(
         Ok(bid) => bid,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    match bridge_coordinator::batch::batch_status(&bdeps, &bid).await {
+    // #10 slice 2: delegate to the Coordinator (same shared runtime + task_store).
+    let result = match srv.coordinator() {
+        Some(coord) => coord.batch_status(&bid).await,
+        None => bridge_coordinator::batch::batch_status(&bdeps, &bid).await,
+    };
+    match result {
         Ok(summary) => jsonrpc_ok(id, json!(summary)),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
@@ -3456,7 +3467,13 @@ async fn batch_list_rpc(
         Ok(p) => p,
         Err(_) => return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "invalid BatchList params"),
     };
-    match bridge_coordinator::batch::batch_list(&bdeps, params.limit.unwrap_or(50)).await {
+    // #10 slice 2: delegate to the Coordinator (same shared runtime + task_store).
+    let limit = params.limit.unwrap_or(50);
+    let result = match srv.coordinator() {
+        Some(coord) => coord.batch_list(limit).await,
+        None => bridge_coordinator::batch::batch_list(&bdeps, limit).await,
+    };
+    match result {
         Ok(batches) => jsonrpc_ok(id, json!({ "batches": batches })),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
@@ -3482,7 +3499,12 @@ async fn cancel_batch_rpc(
         Ok(bid) => bid,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    match bridge_coordinator::batch::cancel_batch(&bdeps, &bid).await {
+    // #10 slice 2: delegate to the Coordinator (same shared runtime + task_store).
+    let result = match srv.coordinator() {
+        Some(coord) => coord.cancel_batch(&bid).await,
+        None => bridge_coordinator::batch::cancel_batch(&bdeps, &bid).await,
+    };
+    match result {
         Ok(canceled) => jsonrpc_ok(id, json!({ "canceled": canceled })),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }

@@ -64,9 +64,44 @@ Behavior-preserving confirmed: no existing test changed.
   had; the real parsed root is wired at the slice that consumes it (batch/detached).
 - NO handler rerouted yet — the held `coordinator` is adopted, not dispatched to.
 
+### Slice 2 — batch RPCs delegate through the Coordinator
+```
+cargo test --workspace -j 1     → 1427 passed / 0 failed / 12 ignored
+cargo clippy -p bridge-a2a-inbound -p a2a-bridge -j 1  → clean
+```
+1427 = slice-1's 1426 + one new test.
+
+**Changes (server.rs):** the four batch handlers (`run_batch_rpc` / `batch_status_rpc`
+/ `batch_list_rpc` / `cancel_batch_rpc`) now delegate their terminal call to
+`srv.coordinator().{run_batch,batch_status,batch_list,cancel_batch}` when a
+Coordinator is present, falling back to the `bridge_coordinator::batch::*` free fn
+otherwise. The adapter WRAPPER is preserved verbatim: auth, the `batch_deps(&srv)`
+"batch not configured" guard (exact literal), and RunBatch's per-item validation
+(non-empty items, item_id default/empty/dup checks, `session_cwd` validation
+against the adapter's real cwd-gate root, `task_spec::validate_input`).
+
+**Behavior-preserving argument:** the Coordinator runs on the SAME shared
+BatchRuntime + shared detached-deps (task_store/executor/workflows/workflow_cancels/
+progress_hubs) adopted in slice 1. RunBatch's second cwd validation inside
+`batch::run_batch` runs against the Coordinator's root (`None` in slice 1), but the
+adapter's FIRST pass already enforced the real root's `is_under` check and stored a
+normalized absolute path — `validate_cwd_str(normalized, None, _)` just re-parses
+(no `is_under`), so the result is identical. Malformed cwds are still rejected by
+the adapter's first pass with the same error. In all current code `srv.batch.is_some()
+⟺ srv.coordinator().is_some()`, so the fallback is a defensive no-op path.
+
+**New test:** `run_batch_rpc_delegates_through_coordinator` (workflow_producer.rs)
+builds a server over a real Coordinator (with a `BatchRuntime::new(4,1)` + the
+review graph), issues RunBatch (2 items) → asserts a `batchId`; BatchStatus →
+same id + `total:2`; BatchList → contains it. Exercises the `Some(coord)` branch.
+
+**Deferred to slice 7:** the adapter still reads `srv.batch` (for the guard) and
+`srv.allowed_cwd_root` (for per-item validation); those fields + the real-root
+wiring into the Coordinator are the "delete parallel fields" slice's job.
+
 ## Verified
-- Full workspace suite green (**1426/0/12**) on the final tree; clippy clean;
-  golden-wire 15/15.
+- Full workspace suite green (**1427/0/12** after slice 2; 1426 after slice 1) on
+  the final tree; clippy clean; golden-wire 15/15.
 - Shared-Arc identity proven by `Arc::ptr_eq` across all 13 shared fields.
 - SessionManager clock switch proven behavior-identical from source.
 
