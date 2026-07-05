@@ -291,12 +291,13 @@ record; [[coordinator-migration-10-design]].
 - Shared-Arc identity proven by `Arc::ptr_eq` across all 13 shared fields.
 - SessionManager clock switch proven behavior-identical from source.
 
-## Not verified (pending)
+## Owner live-gates verified
 
 Slices 1–6 are CODE-COMPLETE + suite-verified (1431/0/12, clippy, golden-wire 15/15).
-The remaining merge blocker is the **four owner-run A2A live-gates** (`cargo test`
-cannot drive a real socket + real agent + restart). Slice 7 is deferred to its own
-branch, post-merge.
+The four owner-run A2A live-gates are now **PASS** on `feat/coordinator-migration`
+using a real socket, real `codex-acp` agent, file-backed store, restart/resume,
+warm force-clear, wire-id cancel, delegate, and fan-out. Slice 7 is deferred to
+its own branch, post-merge.
 
 ### Owner live-gate checklist (run on `feat/coordinator-migration`)
 Build once: `cargo build --release` → `./target/release/a2a-bridge`. Use a config with
@@ -311,18 +312,34 @@ a real agent (e.g. `examples/a2a-bridge.toml` or your `serve --config`). Each ga
      `a2a-bridge listening`. Validates config→registry→Coordinator-first construction→
      router→socket bind. **Send/receive half still owner-run** (needs a real ACP agent;
      the dummy `/bin/echo` can't complete a turn).
+   - **OWNER LIVE-GATE: PASS (2026-07-05).** Release binary served agent cards on
+     `127.0.0.1:8792`/`:8793`; unary `SendMessage` returned `TASK_STATE_COMPLETED`
+     with `PONG`; streaming `SendStreamingMessage` emitted working, artifact, and
+     completed SSE frames. See `evals/2026-07-05-coordinator-migration-livegate.md`.
 2. **Slice 4 — submit → restart → resume.** With a **file-backed** `[store]`: submit a
    detached workflow (`RunWorkflow`/skill route) so a `Working` row persists; kill serve
    mid-run; restart; confirm the task RESUMES from the store (not double-spawned, not
    stuck Working). *Proves:* `coordinator.resume()` replacing `resume_working_tasks`.
+   - **OWNER LIVE-GATE: PASS (2026-07-05).** Detached workflow task
+     `019f3488-6077-79d2-b15d-b23742e8933f` returned `TASK_STATE_WORKING`, `serve`
+     was killed mid-run, restart resumed from the file-backed store, and `tasks/get`
+     returned `TASK_STATE_COMPLETED` with `LIVEGATE_DELAY_DONE`; `tasks/list` showed
+     one completed `delay` row.
 3. **Slice 5 — force-reset an in-flight warm turn.** Start a warm multi-turn context;
    while a turn is RUNNING, `SessionClear` with `force:true`; confirm the running turn
    aborts cleanly (not stranded) and the context is cleared with a bumped generation.
    *Proves:* `coordinator.clear(force=true)` fires the warm abort token (Fable M5).
+   - **OWNER LIVE-GATE: PASS (2026-07-05).** Warm context `livegate-warm` was primed,
+     in-flight task `livegate-force-task` was force-cleared, `SessionClear` returned
+     `cleared:true,generation:1`, and the original turn settled as `TASK_STATE_CANCELED`.
 4. **Slice 6 — warm multi-turn + cancel + delegation/fanout.** Multi-turn warm send on
    one context; mid-turn `CancelTask` by wire id → the real warm session cancels; plus a
    delegate + a fan-out round-trip. *Proves:* the warm/cancel arms are correct over the
    shared state (adapter-resident, not delegated to `coordinator.prompt`).
+   - **OWNER LIVE-GATE: PASS (2026-07-05).** Warm context `livegate-cancel` was primed;
+     `CancelTask` by wire id `livegate-cancel-task` returned `TASK_STATE_CANCELED`, and
+     the original in-flight turn also settled as `TASK_STATE_CANCELED`. Delegate returned
+     `PONG`; fan-out returned separate `codex` and `peer` `PONG` artifacts and completed.
 
 Record PASS/FAIL per gate in `evals/`/here. All four PASS ⇒ slices 1–6 mergeable.
 
