@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot};
 use bridge_core::ids::AgentId;
+use bridge_controller::verify::VerifyConfig;
 
 /// Unified parse error covering TOML parse failures and missing env-var references.
 #[derive(Debug)]
@@ -678,15 +679,6 @@ pub struct VerifyToml {
     /// REMOVED — moved to `[[languages.verify]]`. Kept ONLY to reject legacy configs loudly
     /// (no deny_unknown_fields). `Option<toml::Value>` detects PRESENCE without reading any fields.
     pub commands: Option<toml::Value>,
-}
-
-/// Parsed `[verify]`: verify infrastructure + a validated egress policy.
-#[derive(Debug, Clone)]
-pub struct VerifyConfig {
-    pub runtime: Option<String>,
-    pub image: String,
-    pub cache: String,
-    pub egress: bridge_core::domain::EgressPolicy,
 }
 
 impl VerifyToml {

@@ -33,16 +33,14 @@ mod catalog_probe;
 mod config;
 mod containers;
 mod doctor;
-mod implement;
 mod implement_resume;
 mod merge;
 mod resilient;
 mod route;
 mod slice;
 mod tweak;
-mod verify;
 
-pub(crate) use bridge_controller::{review, turn};
+pub(crate) use bridge_controller::{implement, review, turn, verify};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1243,11 +1241,19 @@ fn resume_lang_arg(resolved_lang: &Option<String>) -> LangArg {
     }
 }
 
+/// The real runner: spawn the container, capture stdout+stderr combined, return the exit code.
+fn docker_runner(program: &str, argv: &[String]) -> std::io::Result<(i32, String)> {
+    let out = std::process::Command::new(program).args(argv).output()?;
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.code().unwrap_or(-1), combined))
+}
+
 /// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
 /// fails (a runner error becomes a failed result); a config error reduces to `ConfigError`.
 /// Returns `Skipped` immediately when `profile` is `None` (`--lang none`).
 fn run_verify_step(
-    verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    verify_cfg: &Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&bridge_core::profile::LanguageProfile>,
     clone_cwd: &bridge_core::SessionCwd,
     repo: &std::path::Path,
@@ -1280,7 +1286,7 @@ fn run_verify_step(
                 Some(profile),
                 clone_cwd,
                 &cache_vol,
-                &verify::docker_runner,
+                &docker_runner,
                 16 * 1024,
             );
             if let verify::VerifyOutcome::Ran(ref verdict) = outcome {
@@ -1299,7 +1305,7 @@ fn run_verify_step(
 /// in-container nav but never block the implement flow. Returns the cache name on success for later mounts.
 /// Returns `None` immediately when `profile` is `None` (`--lang none`).
 fn warm_lsp_deps_step(
-    verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    verify_cfg: &Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&bridge_core::profile::LanguageProfile>,
     repo: &std::path::Path,
     clone: &std::path::Path,
@@ -1356,7 +1362,7 @@ fn warm_lsp_deps_step(
         read_only,
     );
     eprintln!("[implement] lsp warm-deps: fetching deps into {cache_vol}");
-    match verify::docker_runner(&program, &argv) {
+    match docker_runner(&program, &argv) {
         Ok((0, _)) => {
             eprintln!("[implement] lsp warm-deps: ok ({cache_vol})");
             Some(cache_vol)
@@ -1644,7 +1650,7 @@ async fn run_review_step(
 /// The production `tweak::TweakEffects`: the real verify/review/fix turns. Borrows the loop's setup for its
 /// lifetime; `fix` is only called when `fix_graph` is `Some` (the loop guards with `fix_available`).
 struct ProdEffects<'a> {
-    verify_cfg: &'a Option<Result<config::VerifyConfig, config::ConfigError>>,
+    verify_cfg: &'a Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&'a bridge_core::profile::LanguageProfile>,
     review_cfg: &'a Option<Result<config::ReviewConfig, config::ConfigError>>,
     wf_map: &'a std::collections::HashMap<
@@ -1895,7 +1901,7 @@ async fn run_warm_loop(
     runner: &resilient::ResilientWarm,
     impl_session: &bridge_core::ids::SessionId,
     clone_cwd: &bridge_core::SessionCwd,
-    verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    verify_cfg: &Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&bridge_core::profile::LanguageProfile>,
     review_cfg: &Option<Result<config::ReviewConfig, config::ConfigError>>,
     wf_map: &std::collections::HashMap<

@@ -14,5 +14,9 @@
 //!
 //! Scaffold slice: intentionally empty; module moves follow.
 
+pub mod implement;
 pub mod review;
 pub mod turn;
+pub mod verify;
+
+pub use verify::VerifyConfig;

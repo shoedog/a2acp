@@ -13,23 +13,28 @@ updated at each slice's verification checkpoint; the whole-branch review
 
 ## Commands run + results
 
-### Full workspace suite — after slice 2 (stable tree)
+### Full workspace suite — after slice 3 (stable tree)
 ```
 cargo test --workspace -j 1
 ```
 **1424 passed; 0 failed; 12 ignored — across 60 test binaries.** (`-j 1` per the
 repo's known linker-OOM on heavy test builds.) Independently run by the
-orchestrator against the post-slice-2 tree, not taken on the implementor's word.
+orchestrator against the post-slice-3 tree — verified from scratch even though the
+implementor reported green (a stale IDE-diagnostic snapshot mid-edit had shown
+phantom errors; rustc against the final tree confirmed clean).
 
 ### Per-slice detail
 - **Slice 1 — scaffold (`c0be85d`):** `cargo build -p bridge-controller` clean;
   workspace member confirmed. Empty crate → build is complete verification.
-- **Slice 2 — move `turn` + `review`:** files moved as pure renames (zero content
-  diff); rewired via one crate-root re-export shim
-  (`pub(crate) use bridge_controller::{review, turn};`) + a one-line
-  `bridge-controller` path dep added to `bin/a2a-bridge/Cargo.toml`. The 28 moved
-  inline `review`/`turn` tests now run in `bridge-controller`; the bin's 325 tests
-  still pass. Whole workspace green (totals above).
+- **Slice 2 — move `turn` + `review` (`125e6b3`):** pure renames; one crate-root
+  re-export shim + a one-line `bridge-controller` path dep. Full suite 1424/0/12.
+- **Slice 3 — move `verify` (minus `docker_runner`) + `implement`; relocate
+  `VerifyConfig`:** `verify.rs`/`implement.rs` moved; `docker_runner` (5 impure
+  lines) extracted to `main.rs` bin-side; `VerifyConfig` struct relocated from
+  `config.rs` into the library's `verify.rs` (plain `Debug, Clone`, no serde);
+  `config.rs` keeps `VerifyToml::to_config` + `gate_verify_runtime` (logic
+  untouched, now resolving to the library type via a `use`); re-export extended to
+  `{review, turn, verify, implement}`. Full suite 1424/0/12; 0 behavior change.
 
 ## Verified
 - Full workspace test suite green (1424/0/12) on the post-slice-2 tree.
