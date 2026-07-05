@@ -1,81 +1,80 @@
-# VERIFICATION — bridge-controller extraction (#9)
+# VERIFICATION — Coordinator migration (#10)
 
-Branch: `feat/bridge-controller-extraction`.
+Branch: `feat/coordinator-migration`. Spec:
+`docs/superpowers/specs/2026-07-05-coordinator-migration.md` (v2, dual-reviewed).
 
-**This is a BEHAVIOR-PRESERVING refactor** (module extraction from the bin crate
-into `bridge-controller`). No new behavior is added or fixed, so the standard
-"add a test that FAILS on pre-change code, one negative/edge case per new path"
-discipline does not apply — there is no new path. The correctness gate is the
-inverse and stronger: **the entire pre-existing test suite passes UNCHANGED after
-every slice.** The existing tests ARE the behavior contract. This ledger is
-updated at each slice's verification checkpoint; the whole-branch review
-(opus 4.8 + codex xhigh) runs before merge.
+**This is a BEHAVIOR-PRESERVING migration** — `InboundServer` becomes a thin
+adapter over ONE `Arc<Coordinator>`, deleting its parallel lifecycle-state copies.
+No A2A wire change (golden-wire + a live gate must stay green). The correctness
+gate is the inverse-and-stronger one: **the entire pre-existing suite passes
+UNCHANGED after every slice**, plus new tests that PIN the shapes golden-wire does
+not encode (the slice-4/6 drift risks). This ledger updates at each slice.
+
+Baseline on `main` (post-#9): **1424 passed / 0 failed / 12 ignored**.
 
 ## Commands run + results
 
-### Full workspace suite — after slice 5 (stable tree)
+### Harness gap test (task #17) — pre-slice
 ```
-cargo test --workspace -j 1
+cargo test -p bridge-a2a-inbound --test workflow_producer warm_unary_cancel_by_wire_id_hits_real_session -j 1
 ```
-**1424 passed; 0 failed; 12 ignored — across 60 test binaries.** (`-j 1` per the
-repo's known linker-OOM on heavy test builds.) Independently run by the
-orchestrator against the post-slice-5 tree. Slices 3, 4, and 5 each drew alarming
-mid-edit IDE-diagnostic snapshots (phantom errors); in every case `cargo build`
-against the final tree was clean — rustc is authoritative, IDE snapshots are not.
-Verified from scratch each slice regardless of the implementor's report.
+Added `warm_unary_cancel_by_wire_id_hits_real_session` to `workflow_producer.rs`:
+a warm UNARY (Local, non-workflow) send held open by a gated backend, cancelled by
+its wire task-id mid-turn. Asserts `CancelTask` fires `backend.cancel` on the SAME
+session the turn runs under (`ctx-{ctx}-g{gen}`), with an explicit discrimination
+guard that this differs from the synthetic `session-{task}` store-miss fallback.
+This pins the behavior slice 6 would break if it delegated warm turns to
+`Coordinator::prompt` (synthetic id, hidden session). Golden-wire does NOT encode
+this shape. **Green.** Full `workflow_producer` file: 48/0/0 (was 47).
 
-### Per-slice detail
-- **Slice 1 — scaffold (`c0be85d`):** `cargo build -p bridge-controller` clean;
-  workspace member confirmed. Empty crate → build is complete verification.
-- **Slice 2 — move `turn` + `review` (`125e6b3`):** pure renames; one crate-root
-  re-export shim + a one-line `bridge-controller` path dep. Full suite 1424/0/12.
-- **Slice 3 — move `verify` (minus `docker_runner`) + `implement`; relocate
-  `VerifyConfig` (`4824b29`):** `docker_runner` (5 impure lines) extracted to
-  `main.rs`; `VerifyConfig` struct relocated `config.rs`→library `verify.rs`
-  (plain `Debug, Clone`, no serde); `config.rs` keeps `VerifyToml::to_config` +
-  `gate_verify_runtime` (logic untouched, resolving to the library type via a
-  `use`); re-export → `{review, turn, verify, implement}`. Full suite 1424/0/12.
-- **Slice 4 — move `tweak` + `implement_resume` + `resilient` (`4936cb9`):** three
-  wholesale pure renames; all `crate::…` refs became intra-library; straddling
-  trait impls stayed legal (`TweakEffects for ProdEffects` at bin; `CheckpointSink`/
-  `TurnRunner`/`WarmRebuild` impls intra-library). Full suite 1424/0/12.
-- **Slice 5 — `merge` split + relocate `MergeConfig`:** `merge.rs` moved wholesale;
-  `merge_cmd` + `MERGE_USAGE` + the `merge_usage_matches_the_actual_parser` test
-  extracted BACK to the bin (`main.rs`) — the CLI wrapper that parses args + the
-  `RegistryConfig` file root stays at the composition root, per Fable M4. Its one
-  internal call is qualified `merge::merge_clone`. `MergeConfig` struct relocated
-  `config.rs`→library `merge.rs` (co-located with `OperatorIdent`); `config.rs`
-  keeps `MergeToml::to_config` (resolving to the library type via a `use`).
-  re-export → `{implement, implement_resume, merge, resilient, review, tweak,
-  turn, verify}`. Verified the usage test now runs in the bin's `cli_tests` and
-  the 11 merge-logic tests in `bridge-controller`. Full suite 1424/0/12.
+### Slice 1 — one Coordinator; adapter adopts the shared-identity set
+```
+cargo test --workspace -j 1     → 1426 passed / 0 failed / 12 ignored
+cargo clippy -p bridge-coordinator -p bridge-a2a-inbound -p a2a-bridge -j 1  → clean
+cargo test -p bridge-a2a-inbound --test golden_wire -j 1   → 15/0/0
+```
+1426 = baseline 1424 + the two new tests (harness gap + shared-Arc identity).
+Behavior-preserving confirmed: no existing test changed.
 
-- **Slice 6 — tighten + final verification:** confirmed the Fable B1
-  invariant HELD — all four `verify_cfg` adapter fields still carry
-  `Option<Result<verify::VerifyConfig, config::ConfigError>>` and `run_verify_step`
-  still maps the full `None`/`Some(Err)`/`Some(Ok)` tri-state (no signature drift;
-  the gate-rejected-runtime → non-mergeable distinction is intact). Dropped the now
-  redundant `#[allow(dead_code)]` on the `pub NoopCheckpointSink`. `cargo clippy
-  --workspace` clean; full suite 1424/0/12.
+**Changes:**
+- `bridge-coordinator/src/coordinator.rs`: added `pub` shared-state accessors (D2 —
+  cross-crate, so `pub` not `pub(crate)`): `task_store` / `session_store` /
+  `registry` / `policy` / `executor` / `workflows` / `bindings` / `workflow_cancels`
+  / `workflow_runs` / `progress_hubs` / `permission_registry` / `batch` /
+  `allowed_cwd_root`. Each returns a clone of the owned Arc (identity preserved).
+- `bridge-a2a-inbound/src/server.rs`: `InboundServer` gains
+  `coordinator: Option<Arc<Coordinator>>` + `with_coordinator(coord)` builder that
+  re-points every shared field to the Coordinator's instance, + a `coordinator()`
+  accessor. New in-crate test `with_coordinator_shares_state_identity` asserts
+  `Arc::ptr_eq` across all 13 shared fields (the anti-split-brain guarantee).
+- `bin/a2a-bridge/src/main.rs` (serve path): build ONE `Coordinator` FIRST (D2)
+  with the ONE in-memory `store` instance-shared as `session_store` (D1) and ONE
+  `BatchRuntime` (B3); the SessionManager switches to `new_with_clock(SystemClock)`
+  sharing that clock — **behaviourally identical** (`SessionManager::new` already
+  delegates to `new_with_clock(SystemClock)`, verified). `InboundServer` adopts via
+  `with_coordinator`; the adapter keeps its `Option<String>` cwd-gate root.
+
+**Deliberately deferred (behavior-preserving choices):**
+- Boot resume STILL runs via `resume_working_tasks(&server, resume_cap)`;
+  `coordinator.resume()` is NOT called — exactly ONE resume path (the switch is
+  slice 4, per the double-resume hazard, Fable M4).
+- The Coordinator's `allowed_cwd_root` is passed `None` (INERT until a handler
+  delegates a cwd-gated op). Parsing `cfg.allowed_cwd_root` at boot would add a new
+  failure mode (`SessionCwd::parse` rejects empty/relative roots) that serve never
+  had; the real parsed root is wired at the slice that consumes it (batch/detached).
+- NO handler rerouted yet — the held `coordinator` is adopted, not dispatched to.
 
 ## Verified
-- **EXTRACTION COMPLETE.** The whole controller cluster (turn, review, verify,
-  implement, tweak, implement_resume, resilient, merge — minus `docker_runner` and
-  `merge_cmd`/`MERGE_USAGE`) plus `VerifyConfig`/`MergeConfig` now live in
-  `bridge-controller`; the bin keeps config parsing + the effects adapters + CLI
-  dispatch, wired through one crate-root re-export shim.
-- Full workspace test suite green (**1424 passed / 0 failed / 12 ignored**, 60 test
-  binaries) on the final tree; `cargo clippy --workspace` clean.
-- Behavior-preserving throughout: moved source is byte-identical (renames) or
-  namespace-only edits; no logic touched; adapter signatures unchanged (Fable B1).
-- Dependency set matches the dual-review corrections (`futures` added;
-  `tempfile`/`tokio-stream` dev-deps); no dependency cycle; no orphan-rule break.
+- Full workspace suite green (**1426/0/12**) on the final tree; clippy clean;
+  golden-wire 15/15.
+- Shared-Arc identity proven by `Arc::ptr_eq` across all 13 shared fields.
+- SessionManager clock switch proven behavior-identical from source.
 
 ## Not verified (pending)
-- Whole-branch review (opus 4.8 + codex xhigh) before merge, per the pipeline —
-  the next gate.
+- **Owner-run A2A LIVE-GATE for slice 1:** serve boots + a send/receive round-trips
+  (the in-process harness covers the router but not a real socket + real agent).
+- Slices 2–7 (batch RPCs → read/control-plane → detached submit+resume →
+  context-lifecycle → warm/cancel minimal → delete parallel fields).
 
 ## Out-of-scope failures
-- None. Every slice's full workspace suite showed 0 failures; nothing was
-  re-baselined or silently fixed. Slices 3/4/5 drew alarming mid-edit IDE
-  diagnostics that were all stale (rustc clean each time).
+- None. Every run showed 0 failures; nothing re-baselined or silently fixed.

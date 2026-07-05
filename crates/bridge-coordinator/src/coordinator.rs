@@ -165,6 +165,53 @@ impl Coordinator {
         self
     }
 
+    // ---- Shared-state accessors (#10 D2) ----
+    // The A2A adapter (`bridge-a2a-inbound`, a SEPARATE crate) adopts these SAME
+    // Arc instances so turn-lifecycle STATE has ONE owner. Because the adapter is
+    // cross-crate, these must be `pub` (not `pub(crate)`). Each returns a clone of
+    // the owned Arc — Arc identity is preserved, so a mutation on either surface is
+    // visible to both. Build the Coordinator FIRST, then the adapter adopts from it.
+
+    pub fn task_store(&self) -> Arc<dyn TaskStore> {
+        self.task_store.clone()
+    }
+    pub fn session_store(&self) -> Arc<dyn SessionStore> {
+        self.session_store.clone()
+    }
+    pub fn registry(&self) -> Arc<dyn AgentRegistry> {
+        self.registry.clone()
+    }
+    pub fn policy(&self) -> Arc<dyn PolicyEngine> {
+        self.policy.clone()
+    }
+    pub fn executor(&self) -> Option<Arc<WorkflowExecutor>> {
+        self.executor.clone()
+    }
+    pub fn workflows(&self) -> Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>> {
+        self.workflows.clone()
+    }
+    pub fn bindings(&self) -> Arc<Mutex<HashMap<TaskId, TaskBinding>>> {
+        self.bindings.clone()
+    }
+    pub fn workflow_cancels(&self) -> Arc<Mutex<HashMap<TaskId, CancellationToken>>> {
+        self.workflow_cancels.clone()
+    }
+    pub fn workflow_runs(&self) -> Arc<Mutex<HashMap<ContextId, CancellationToken>>> {
+        self.workflow_runs.clone()
+    }
+    pub fn progress_hubs(&self) -> Arc<Mutex<HashMap<TaskId, Arc<TaskProgressHub>>>> {
+        self.progress_hubs.clone()
+    }
+    pub fn permission_registry(&self) -> Option<Arc<PermissionRegistry>> {
+        self.permission_registry.clone()
+    }
+    pub fn batch(&self) -> Option<BatchRuntime> {
+        self.batch.clone()
+    }
+    pub fn allowed_cwd_root(&self) -> Option<SessionCwd> {
+        self.allowed_cwd_root.clone()
+    }
+
     /// Build the detached-workflow dependency view over the Coordinator's owned fields.
     fn detached_deps(&self) -> DetachedDeps {
         DetachedDeps {

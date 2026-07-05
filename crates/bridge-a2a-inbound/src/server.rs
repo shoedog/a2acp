@@ -162,6 +162,12 @@ pub struct InboundServer {
     /// empty → the card omits the `agent-models` extension (same as a fully-failed probe). Wired from
     /// `main`'s startup probe via [`InboundServer::with_model_catalog`].
     pub model_catalog: Arc<arc_swap::ArcSwap<bridge_core::catalog::ModelCatalog>>,
+    /// #10: the ONE `Coordinator` that owns turn-lifecycle STATE. `None` for tests
+    /// that build the adapter directly over fakes; `Some` in the serve path, where
+    /// the adapter adopts the Coordinator's SAME state instances via
+    /// [`InboundServer::with_coordinator`]. Held (not yet routed through) at slice 1
+    /// — later slices delegate stateless RPCs / batch / detached submit to it.
+    coordinator: Option<Arc<bridge_coordinator::Coordinator>>,
 }
 
 impl InboundServer {
@@ -202,6 +208,7 @@ impl InboundServer {
             model_catalog: Arc::new(arc_swap::ArcSwap::from_pointee(
                 bridge_core::catalog::ModelCatalog::new(),
             )),
+            coordinator: None,
         }
     }
 
@@ -274,6 +281,50 @@ impl InboundServer {
     ) -> Self {
         self.model_catalog = catalog;
         self
+    }
+
+    /// #10 slice 1: adopt the `Coordinator`'s shared turn-lifecycle STATE so A2A is
+    /// co-equal with CLI/MCP over ONE owner. Re-points every shared field to the
+    /// Coordinator's owned instance (Arc identity preserved), so a mutation on either
+    /// surface is visible to both — this is what kills the parallel-state divergence.
+    ///
+    /// Build the `Coordinator` FIRST, then call this. Adapter-only wire state is NOT
+    /// touched: `route`/`auth`/`base_url`/`delegation`/`local_source_label`/
+    /// `cancelled_peers`/`model_catalog`/`allowed_cwd_root` (the adapter keeps its
+    /// `Option<String>` cwd-gate root). No handler is rerouted here — later slices
+    /// delegate the pure-duplicate RPCs to the held `coordinator`.
+    ///
+    /// Pass the SAME `session_store`/`registry`/`policy` Arcs to both
+    /// `Coordinator::new` and `InboundServer::new`; this re-point makes the identity
+    /// explicit and covers the fields both constructors create internally (the four
+    /// maps + `executor`/`workflows`/`task_store`/`session_manager`/
+    /// `permission_registry`/`batch`).
+    #[must_use]
+    pub fn with_coordinator(mut self, coordinator: Arc<bridge_coordinator::Coordinator>) -> Self {
+        self.registry = coordinator.registry();
+        self.policy = coordinator.policy();
+        self.store = coordinator.session_store();
+        self.task_store = coordinator.task_store();
+        self.bindings = coordinator.bindings();
+        self.workflow_cancels = coordinator.workflow_cancels();
+        self.workflow_runs = coordinator.workflow_runs();
+        self.progress_hubs = coordinator.progress_hubs();
+        self.executor = coordinator.executor();
+        self.workflows = coordinator.workflows();
+        self.session_manager = Some(coordinator.session_manager.clone());
+        self.permission_registry = coordinator.permission_registry();
+        self.batch = coordinator.batch();
+        self.coordinator = Some(coordinator);
+        self
+    }
+
+    /// The adopted `Coordinator`, if this adapter was built over one (serve path).
+    /// `None` for adapters built directly over fakes. Later slices read this to
+    /// delegate stateless RPCs / batch / detached submit; exposed now so the
+    /// shared-identity test can assert Arc identity across the crate boundary.
+    #[doc(hidden)]
+    pub fn coordinator(&self) -> Option<&Arc<bridge_coordinator::Coordinator>> {
+        self.coordinator.as_ref()
     }
 
     /// Test-only: is a progress hub currently registered for `task`? Used by the
@@ -4647,6 +4698,109 @@ mod tests {
         assert!(
             backend.cancelled.load(Ordering::SeqCst),
             "cancel must reach the backend"
+        );
+    }
+
+    /// #10 slice 1: after `with_coordinator`, the adapter and the Coordinator MUST
+    /// share the SAME Arc instances for every turn-lifecycle state field — Arc
+    /// identity, not merely equal contents. This is the anti-split-brain guarantee:
+    /// a mutation on either surface is visible to both. Guards a future edit that
+    /// forgets a field or re-points it at a fresh Arc.
+    #[tokio::test]
+    async fn with_coordinator_shares_state_identity() {
+        let registry: Arc<dyn AgentRegistry> = FakeRegistry::single("kiro", FakeBackend::new());
+        let session_store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let policy: Arc<dyn PolicyEngine> = Arc::new(AutoApprove);
+        let task_store: Arc<dyn bridge_core::task_store::TaskStore> =
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+            registry.clone(),
+        ));
+        let perm = PermissionRegistry::new();
+        let clock: Arc<dyn bridge_coordinator::clock::Clock> =
+            Arc::new(bridge_coordinator::clock::SystemClock);
+
+        let coord = Arc::new(
+            bridge_coordinator::Coordinator::new(
+                sm,
+                Some(executor),
+                Arc::new(std::collections::HashMap::new()),
+                task_store,
+                session_store,
+                policy,
+                registry,
+                clock,
+                None,
+                None,
+                3,
+            )
+            .with_permission_registry(perm),
+        );
+
+        // Build the adapter over its OWN fakes, then adopt the coordinator; adoption
+        // must overwrite EVERY shared field with the coordinator's instance.
+        let srv = InboundServer::new(
+            FakeRegistry::single("kiro", FakeBackend::new()),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(AlwaysKiro),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        )
+        .with_coordinator(Arc::clone(&coord));
+
+        // The held handle is the same Arc<Coordinator>.
+        assert!(Arc::ptr_eq(srv.coordinator().unwrap(), &coord));
+
+        // The four maps (split-brain critical).
+        assert!(Arc::ptr_eq(&srv.bindings, &coord.bindings()), "bindings");
+        assert!(
+            Arc::ptr_eq(&srv.workflow_cancels, &coord.workflow_cancels()),
+            "workflow_cancels"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.workflow_runs, &coord.workflow_runs()),
+            "workflow_runs"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.progress_hubs, &coord.progress_hubs()),
+            "progress_hubs"
+        );
+
+        // Stores + ports.
+        assert!(
+            Arc::ptr_eq(&srv.store, &coord.session_store()),
+            "session_store"
+        );
+        assert!(Arc::ptr_eq(&srv.task_store, &coord.task_store()), "task_store");
+        assert!(Arc::ptr_eq(&srv.registry, &coord.registry()), "registry");
+        assert!(Arc::ptr_eq(&srv.policy, &coord.policy()), "policy");
+
+        // Session manager + Option-wrapped shared state.
+        assert!(
+            Arc::ptr_eq(srv.session_manager.as_ref().unwrap(), &coord.session_manager),
+            "session_manager"
+        );
+        assert!(
+            Arc::ptr_eq(
+                srv.executor.as_ref().unwrap(),
+                coord.executor().as_ref().unwrap()
+            ),
+            "executor"
+        );
+        assert!(Arc::ptr_eq(&srv.workflows, &coord.workflows()), "workflows");
+        assert!(
+            Arc::ptr_eq(
+                srv.permission_registry.as_ref().unwrap(),
+                coord.permission_registry().as_ref().unwrap()
+            ),
+            "permission_registry"
         );
     }
 
