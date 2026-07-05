@@ -1528,6 +1528,164 @@ async fn cancel_task_fires_workflow_token_stream_ends_canceled() {
     );
 }
 
+// ============================================================================
+// Warm UNARY (Local, non-workflow) cancel-by-wire-id — the #10 slice-6 hazard.
+//
+// A warm, non-workflow unary send maps the CLIENT task-id -> the REAL warm
+// session (server.rs `store.put(&routed.task, &dispatch.session)` before the
+// turn runs). An inbound `CancelTask` by that wire task-id must resolve that
+// mapping and cancel the SAME session the turn is running under.
+//
+// This pins the behavior that breaks if the warm turn is ever delegated to
+// `Coordinator::prompt` (which mints its own synthetic task-id and hides the
+// session): the wire-id -> session mapping would be lost and `CancelTask` would
+// fall back to a synthetic `session-{task}` no-op, leaving the real turn
+// running. The golden-wire suite does not encode this shape, so slice 6 could
+// silently drift it — this test is the guard.
+// ============================================================================
+
+/// Backend for the warm-unary cancel probe: records the session it is prompted
+/// with, blocks the turn open on a gate, and records every session it is asked
+/// to cancel. `prompt()` only resolves after the gate is released.
+struct WarmCancelProbeBackend {
+    gate: Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>,
+    prompt_session: Arc<std::sync::Mutex<Option<String>>>,
+    cancel_sessions: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentBackend for WarmCancelProbeBackend {
+    async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        // Record the real warm session, then park until released. The store has
+        // already mapped the wire task-id -> this session by the time we run.
+        *self.prompt_session.lock().unwrap() = Some(s.as_str().to_owned());
+        while !self.gate.0.load(std::sync::atomic::Ordering::Acquire) {
+            self.gate.1.notified().await;
+        }
+        let updates = vec![
+            Ok(Update::Text("WARM_DONE".to_string())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(updates)))
+    }
+    async fn cancel(&self, s: &SessionId) -> Result<(), BridgeError> {
+        self.cancel_sessions
+            .lock()
+            .unwrap()
+            .push(s.as_str().to_owned());
+        Ok(())
+    }
+}
+
+/// A warm unary `SendMessage` (Local codex, no skill) that is cancelled mid-turn
+/// by its wire task-id must invoke `backend.cancel` on the SAME session the turn
+/// is running under — proving the wire-id -> real-warm-session mapping and the
+/// `cancel_task` local arm that consumes it.
+#[tokio::test]
+async fn warm_unary_cancel_by_wire_id_hits_real_session() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let prompt_session = Arc::new(std::sync::Mutex::new(None));
+    let cancel_sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let backend: Arc<dyn AgentBackend> = Arc::new(WarmCancelProbeBackend {
+        gate: gate.clone(),
+        prompt_session: prompt_session.clone(),
+        cancel_sessions: cancel_sessions.clone(),
+    });
+    let backends: HashMap<String, Arc<dyn AgentBackend>> =
+        [("codex".to_string(), backend)].into();
+    let store = Arc::new(FakeStore::default());
+    let srv = build_server_per_agent_with_session_manager(store.clone(), backends);
+
+    const TASK_ID: &str = "warm-unary-cancel-1";
+    const CTX: &str = "ctx-warm-unary-cancel";
+
+    // Warm UNARY send (Local codex — no skill metadata), held open by the gate.
+    // The unary handler blocks until the turn completes, so drive it off-thread.
+    let send_srv = srv.clone();
+    let send = tokio::spawn(async move {
+        send_srv
+            .router()
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": TASK_ID,
+                    "message": {
+                        "contextId": CTX,
+                        "text": "---\ntask-type: freeform\n---\nPING"
+                    }
+                }),
+            ))
+            .await
+            .unwrap()
+    });
+
+    // The turn is in-flight (and the store mapping written) once the backend has
+    // recorded its real warm session id.
+    wait_for(
+        || prompt_session.lock().unwrap().is_some(),
+        "warm turn did not reach the backend",
+    )
+    .await;
+    let real_session = prompt_session.lock().unwrap().clone().unwrap();
+
+    // Discrimination guard: the real warm session (`ctx-{ctx}-g{gen}`) must NOT
+    // coincide with the synthetic `session-{task}` fallback the local cancel arm
+    // uses on a store miss — otherwise a delegated no-op could pass this test.
+    assert_ne!(
+        real_session,
+        format!("session-{TASK_ID}"),
+        "real warm session must differ from the synthetic cancel fallback"
+    );
+
+    // The wire task-id maps to the real warm session BEFORE the turn is cancelled.
+    let mapped = store
+        .session_for(&TaskId::parse(TASK_ID).unwrap())
+        .await
+        .unwrap()
+        .map(|s| s.as_str().to_owned());
+    assert_eq!(
+        mapped,
+        Some(real_session.clone()),
+        "wire task-id must map to the real warm session"
+    );
+
+    // CancelTask by the WIRE task-id must cancel that SAME real session.
+    let cancel_resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": TASK_ID }),
+        ))
+        .await
+        .unwrap();
+    let cancel_body = json_response(cancel_resp).await;
+    assert_eq!(
+        cancel_body["result"]["task"]["state"], "TASK_STATE_CANCELED",
+        "{cancel_body}"
+    );
+
+    assert!(
+        cancel_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == &real_session),
+        "CancelTask must cancel the REAL warm session {real_session:?}; got {:?}",
+        cancel_sessions.lock().unwrap()
+    );
+
+    // Release the turn so the spawned unary send completes cleanly.
+    release_gate(&gate);
+    let _ = send.await.unwrap();
+}
+
 /// **tasks/get canonical**: `GET_TASK` on a completed durable task must return a
 /// canonical `a2a::Task` with state `TASK_STATE_COMPLETED` and an artifact
 /// carrying the result payload.
