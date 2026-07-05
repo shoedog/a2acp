@@ -237,12 +237,38 @@ existing warm/cancel suite (`concurrent_same_context_workflow_handle_busy`,
 **OWNER LIVE-GATE PENDING (task #24):** warm multi-turn + mid-turn
 cancel-while-running (durable arm) + delegation/fanout round-trip.
 
+### Slice 7 — delete parallel DELEGATE fields (SCOPED; DEFERRED — see blocker)
+**Not started. Blocked on a design decision + the accumulated live-gates.**
+Measured blast radius: **44 `InboundServer::new` call sites** (43 coordinator-less
+test builders) + **~106 field reads** to repoint to `coordinator.<accessor>()`.
+
+**Blocker (found while scoping):** deleting the DELEGATE fields makes the
+`Coordinator` MANDATORY in `InboundServer`. But `Coordinator::new` REQUIRES a
+`session_manager`, while many builders (`build`, `build_delegate`, golden_wire, the
+bin e2e tests) construct an `InboundServer` with `session_manager: None` (they never
+use warm sessions). So slice 7 is NOT mechanical — it forces one of:
+(a) make `session_manager` optional in `Coordinator` (a Coordinator redesign), or
+(b) construct a real `SessionManager` in all ~43 coordinator-less builders (which
+also fights the InboundServer incremental-builder pattern vs `Coordinator`'s
+build-once shape).
+
+**Assessment:** the migration's SUBSTANTIVE goal — one unified lifecycle-state
+owner, A2A co-equal — is ALREADY achieved at slices 1–6: after slice 1 the adapter's
+state is Arc-*shared* with the Coordinator (no parallel *copies*, just two handles).
+Slice 7 only removes the redundant handles from the struct = cosmetic cleanup, not a
+behaviour/correctness change. Recommendation: land 1–6 as the functional completion,
+run the live-gates, and do slice 7 as an optional follow-up with the
+`session_manager`-optional decision made deliberately (task #25).
+
 ## Verified
 - Full workspace suite green (**1431/0/12** after slices 5 & 6; 1430 after slice 4;
   1428 after slice 3; 1427 after slice 2; 1426 after slice 1) on the final tree;
   clippy clean; golden-wire 15/15.
 - Slices 1–6 are STATE-sharing + delegation of the pure-duplicate/stateless RPCs;
   the warm/streaming/cancel wire paths stay adapter-resident over shared state.
+- The runtime lifecycle-state is UNIFIED as of slice 1 (Arc-shared, identity-proven);
+  slices 2–6 route the delegable handlers through the Coordinator. Slice 7 (struct
+  field deletion) is the remaining cosmetic cleanup, deferred per the blocker above.
 - Shared-Arc identity proven by `Arc::ptr_eq` across all 13 shared fields.
 - SessionManager clock switch proven behavior-identical from source.
 
