@@ -33,14 +33,11 @@ mod catalog_probe;
 mod config;
 mod containers;
 mod doctor;
-mod implement_resume;
 mod merge;
-mod resilient;
 mod route;
 mod slice;
-mod tweak;
 
-pub(crate) use bridge_controller::{implement, review, turn, verify};
+pub(crate) use bridge_controller::{implement, implement_resume, resilient, review, tweak, turn, verify};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

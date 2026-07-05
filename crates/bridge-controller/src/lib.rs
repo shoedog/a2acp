@@ -15,7 +15,10 @@
 //! Scaffold slice: intentionally empty; module moves follow.
 
 pub mod implement;
+pub mod implement_resume;
+pub mod resilient;
 pub mod review;
+pub mod tweak;
 pub mod turn;
 pub mod verify;
 

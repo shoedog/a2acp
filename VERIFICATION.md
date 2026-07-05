@@ -13,15 +13,17 @@ updated at each slice's verification checkpoint; the whole-branch review
 
 ## Commands run + results
 
-### Full workspace suite — after slice 3 (stable tree)
+### Full workspace suite — after slice 4 (stable tree)
 ```
 cargo test --workspace -j 1
 ```
 **1424 passed; 0 failed; 12 ignored — across 60 test binaries.** (`-j 1` per the
 repo's known linker-OOM on heavy test builds.) Independently run by the
-orchestrator against the post-slice-3 tree — verified from scratch even though the
-implementor reported green (a stale IDE-diagnostic snapshot mid-edit had shown
-phantom errors; rustc against the final tree confirmed clean).
+orchestrator against the post-slice-4 tree. Slices 3 and 4 both drew alarming
+mid-edit IDE-diagnostic snapshots (phantom `docker_runner`/`VerifyConfig`/
+`ImplementPhase` errors); in both cases `cargo build` against the final tree was
+clean — rustc is authoritative, IDE snapshots are not. Verified from scratch each
+slice regardless of the implementor's report.
 
 ### Per-slice detail
 - **Slice 1 — scaffold (`c0be85d`):** `cargo build -p bridge-controller` clean;
@@ -29,12 +31,17 @@ phantom errors; rustc against the final tree confirmed clean).
 - **Slice 2 — move `turn` + `review` (`125e6b3`):** pure renames; one crate-root
   re-export shim + a one-line `bridge-controller` path dep. Full suite 1424/0/12.
 - **Slice 3 — move `verify` (minus `docker_runner`) + `implement`; relocate
-  `VerifyConfig`:** `verify.rs`/`implement.rs` moved; `docker_runner` (5 impure
-  lines) extracted to `main.rs` bin-side; `VerifyConfig` struct relocated from
-  `config.rs` into the library's `verify.rs` (plain `Debug, Clone`, no serde);
-  `config.rs` keeps `VerifyToml::to_config` + `gate_verify_runtime` (logic
-  untouched, now resolving to the library type via a `use`); re-export extended to
-  `{review, turn, verify, implement}`. Full suite 1424/0/12; 0 behavior change.
+  `VerifyConfig` (`4824b29`):** `docker_runner` (5 impure lines) extracted to
+  `main.rs`; `VerifyConfig` struct relocated `config.rs`→library `verify.rs`
+  (plain `Debug, Clone`, no serde); `config.rs` keeps `VerifyToml::to_config` +
+  `gate_verify_runtime` (logic untouched, resolving to the library type via a
+  `use`); re-export → `{review, turn, verify, implement}`. Full suite 1424/0/12.
+- **Slice 4 — move `tweak` + `implement_resume` + `resilient`:** three wholesale
+  pure renames; all `crate::…` refs became intra-library; straddling trait impls
+  stayed legal (`TweakEffects for ProdEffects` at bin; `CheckpointSink`/
+  `TurnRunner`/`WarmRebuild` impls intra-library); re-export →
+  `{implement, implement_resume, resilient, review, tweak, turn, verify}`. The
+  `bridge-controller` lib test binary now holds 96 tests. Full suite 1424/0/12.
 
 ## Verified
 - Full workspace test suite green (1424/0/12) on the post-slice-2 tree.
