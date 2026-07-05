@@ -1,0 +1,15 @@
+I'll examine the actual source to confirm the `Lease` Drop behavior before finalizing.# Review: rs-10 — `Pool::complete`
+
+**BLOCKER — Double-free of the slot** (`src/lib.rs:36-39`, `complete`)
+`complete` calls `self.release()` (`available.fetch_add(1)`) and then `drop(lease)` — but `impl Drop for Lease` (`src/lib.rs:47-51`) *also* calls `self.pool.release()`. So one finished turn increments `available` **twice**. This directly violates the stated contract ("Each checked-out slot is returned exactly ONCE… nothing else should also free it"). WRONG, not a smell: input = one turn completing via `complete`; result = `available` over-counts by one every call.
+
+- **Consequence (invariant break):** the pool's core invariant — `available` never exceeds `size` — is destroyed. After N completions, `available == size + N`, so `checkout` admits more concurrent warm agents than the pool has slots. The whole point of the abstraction (bounded admission) silently fails; over-admission surfaces as too many live agents, resource exhaustion, or slots handed to two turns at once. The `fetch_sub(1) == 0` guard in `checkout` (line 22) also assumes the counter is truthful, so a corrupted count degrades the underflow protection too.
+
+- **Direction of fix:** `complete` should perform the return exactly once — either delete the explicit `self.release()` and let `drop(lease)` do the RAII return (`pub fn complete(&self, lease: Lease) { drop(lease); }`), or, better, delete `complete` entirely. It adds no behavior over letting the `Lease` drop naturally at end of scope; its only effect is to introduce a second, redundant free path.
+
+**MINOR — `complete` is a redundant seam that invites exactly this bug** (architecture)
+The abstraction already chose RAII (`Drop`) as the single, authoritative slot-return mechanism. Adding a second, imperative return path (`complete`) creates two ways to free one resource, and the two are trivially combinable into a double-free — which is what happened here. A manual `complete` also can't stop the compiler from *also* dropping the lease at scope end, so the two mechanisms are fundamentally non-exclusive. Prefer a single return seam: if an explicit "done" call is truly wanted for readability, it should consume the lease and rely solely on drop, never touch `release()` itself.
+
+**Note (pre-existing, not introduced by this diff):** `checkout` uses two separate atomic ops (`fetch_sub` then a compensating `fetch_add` on the underflow path, lines 22-24). Under contention this transiently drives `available` below its true value and can spuriously reject an admissible checkout, and pairing it with a `SeqCst` counter still doesn't make the take-or-reject atomic. Out of scope for this change, but the `complete` double-free compounds it — flagging so it isn't mistaken for correct baseline behavior.
+
+**Verdict:** BLOCKER — `complete` double-frees every completed turn's slot, breaking the pool's bounded-admission invariant; drop the explicit `release()` (or remove `complete`) so each slot is returned exactly once.

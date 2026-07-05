@@ -1,0 +1,5 @@
+I’ll stay within the read-only review contract: inspect the patch context and nearby call sites, then return only the prioritized findings.The working tree snapshot has the patched file already rather than a local diff, so I’m reading the fixture file and package context directly.There are no call sites in the fixture; the review is focused on the function’s stated contract and the crate’s compile/test surface. I’m checking the recorded patch context now for anything not present in the file.I’ve got enough context: one exported async function, no tests in the fixture, and a contract centered on select cancellation behavior. I’m doing the final line-number pass before writing the verdict.Findings: None.
+
+No WRONG correctness defects found in `src/lib.rs:16-35`. The implementation matches the stated contract: `Some(())` cancellation wins over ready deltas via `biased;`, dropped cancel sender disables only the cancel arm, and closed delta stream returns `Completed(acc)`.
+
+Verdict: No defects found; approve from a correctness lens.

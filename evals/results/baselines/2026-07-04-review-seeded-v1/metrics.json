@@ -1,0 +1,115 @@
+{
+  "per_cell": {
+    "duo": {
+      "pass": {
+        "k": 11,
+        "n": 15,
+        "rate": 0.7333333333333333,
+        "wilson_ci": [
+          0.4804956594401943,
+          0.8910254667430761
+        ],
+        "judge_errors": 0,
+        "call_failures": 0
+      },
+      "confusion": {
+        "tp": 11,
+        "fp": 4,
+        "tn": 0,
+        "fn": 0,
+        "n": 15,
+        "base_rate": 0.7333333333333333,
+        "defect_recall": {
+          "found": 11,
+          "total": 11,
+          "rate": 1.0
+        },
+        "false_findings_total": 32,
+        "false_findings_clean_total": 23,
+        "neutral_matched_total": 4
+      }
+    },
+    "codex-solo": {
+      "pass": {
+        "k": 13,
+        "n": 15,
+        "rate": 0.8666666666666667,
+        "wilson_ci": [
+          0.6211801716767764,
+          0.9626387408969346
+        ],
+        "judge_errors": 0,
+        "call_failures": 0
+      },
+      "confusion": {
+        "tp": 11,
+        "fp": 2,
+        "tn": 2,
+        "fn": 0,
+        "n": 15,
+        "base_rate": 0.7333333333333333,
+        "defect_recall": {
+          "found": 11,
+          "total": 11,
+          "rate": 1.0
+        },
+        "false_findings_total": 15,
+        "false_findings_clean_total": 2,
+        "neutral_matched_total": 0
+      }
+    },
+    "claude-solo": {
+      "pass": {
+        "k": 11,
+        "n": 15,
+        "rate": 0.7333333333333333,
+        "wilson_ci": [
+          0.4804956594401943,
+          0.8910254667430761
+        ],
+        "judge_errors": 0,
+        "call_failures": 0
+      },
+      "confusion": {
+        "tp": 11,
+        "fp": 4,
+        "tn": 0,
+        "fn": 0,
+        "n": 15,
+        "base_rate": 0.7333333333333333,
+        "defect_recall": {
+          "found": 11,
+          "total": 11,
+          "rate": 1.0
+        },
+        "false_findings_total": 29,
+        "false_findings_clean_total": 17,
+        "neutral_matched_total": 4
+      }
+    }
+  },
+  "flips": [
+    {
+      "cell_a": "duo",
+      "cell_b": "codex-solo",
+      "both_pass": 11,
+      "both_fail": 2,
+      "only_a": 0,
+      "only_b": 2,
+      "mcnemar_p": 0.5
+    },
+    {
+      "cell_a": "duo",
+      "cell_b": "claude-solo",
+      "both_pass": 11,
+      "both_fail": 4,
+      "only_a": 0,
+      "only_b": 0,
+      "mcnemar_p": 1.0
+    }
+  ],
+  "judge_errors": 0,
+  "call_failures": 0,
+  "taskset_id": "review-seeded-v1",
+  "n_items": 15
+}

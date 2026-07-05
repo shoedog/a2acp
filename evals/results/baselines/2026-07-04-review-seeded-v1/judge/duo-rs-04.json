@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-04-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 2,
+  "neutral_matched": 0,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "duo",
+  "item": "rs-04",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-04/truth.yaml",
+  "normalized_block": "Both lenses returned complete reviews; nothing to reconstruct. Merged findings below.\n\n# Merged Review: rs-04 \u2014 `SlotTable::evict`\n\n**BLOCKER \u2014 swallowed `persist_free` error, then unconditional `used -= 1` (`src/lib.rs:44-45`).**\n`let _ = self.persist_free(id)` discards the durable-free result, and `self.used -= 1` runs even when it returned `Err`. This is exactly the divergence the contract forbids: the durable ledger still marks the slot used while in-memory `used` counts it freed. Consequences (both reviewers, combined): at runtime admission over-subscribes (memory frees a slot the ledger still holds), and after a restart `used` is rebuilt from the ledger so the slot resurrects as permanently occupied \u2014 capacity is silently leaked. *Fix:* make `evict` fallible (`pub fn evict(&mut self, id: &str) -> Result<(), StoreError>`) and persist before mutating \u2014 `self.persist_free(id)?; self.used -= 1;` \u2014 so no caller-invisible error mode remains. (Claude's separate \"signature returns `()` gives no seam\" point is folded here: propagating the error *requires* the `Result` signature.)\n\n**BLOCKER \u2014 `used -= 1` with no membership guard underflows on unknown / already-evicted `id` (`src/lib.rs:43,45`).**\n`self.live.remove(id)` returns a discarded `bool`; on a fresh table or a double-evict it returns `false`, yet line 45 still subtracts from `used`. On `u32` this panics in debug or wraps to `u32::MAX` in release, after which `used >= capacity` holds forever and admission is permanently wedged; even short of that, `used` diverges from `live`. *Fix:* gate the whole body on membership and make evict idempotent \u2014 `if !self.live.contains(id) { return Ok(()); }` before persisting or decrementing.\n*Disagreement resolved:* Codex rates this BLOCKER, Claude MAJOR \u2014 **Codex is right**: it is a demonstrated WRONG (a normal double-evict / fresh-table call panics or wedges admission), not a mere risk.\n\n**MAJOR \u2014 non-atomic, wrong-ordered mutation of the three states (`src/lib.rs:43-45`).**\n`live.remove` runs *before* `persist_free`, and `live`/`used`/ledger are mutated with no rollback. Even after the error handling is fixed, removing from `live` first means a `persist_free` failure leaves the session gone from `live` while `used`/ledger still count it, breaking the documented `used == live.len()` invariant. *Fix:* order as guard \u2192 durable-free \u2192 in-memory: `if !self.live.contains(id) { return Ok(()); } self.persist_free(id)?; self.live.remove(id); self.used -= 1;` so a failed persist leaves all three states untouched.\n\n**MINOR (smell) \u2014 `admit`/`evict` durability asymmetry (`src/lib.rs:24-31` vs `41-46`).**\n`admit` never records the slot durably while `evict` frees it durably, so the two-sided \"stay in sync with the ledger\" invariant can't actually hold \u2014 only one edge writes. Not a demonstrated bug (and `persist_free` is a stub here), but the missing durable-admit seam is where the next real defect lands. *Fix:* give `admit` a matching fallible durable write using the same persist-before-mutate ordering.\n\n**Overall verdict: Reject \u2014 ship only after fixing both BLOCKERs (fallible, durable-first, idempotent `evict`); the MAJOR ordering fix falls out of the same rewrite, and the MINOR asymmetry is worth a follow-up.**",
+  "call_ok": true
+}

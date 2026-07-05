@@ -1,0 +1,14 @@
+{
+  "judge_error": false,
+  "item_pass": false,
+  "defects": [],
+  "false_findings": 1,
+  "neutral_matched": 0,
+  "call_failed": false,
+  "cell": "codex-solo",
+  "item": "rc-02",
+  "seeded": false,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rc-02/truth.yaml",
+  "normalized_block": "I\u2019ll keep this strictly read-only and anchor the review to `src/lib.rs` plus nearby callers/tests so any finding has a concrete failure path.`src/lib.rs` is very small: the new method does clone inside a scoped lock and awaits only after the guard is out of scope. I\u2019m checking the crate/test surface and history now for contracts that might make the `Option` or prompt snapshot semantics wrong.There are only two source files in this fixture and no test files. I\u2019m using history just to confirm whether there is any older behavior or caller contract hidden behind this minimal crate.- MINOR / SMELL - `src/lib.rs:34-42` adds concurrency-sensitive public behavior without any tests in the fixture. An implementation that held `prompts` across `run_turn().await` would violate the stated contract but would not be caught by the current test surface. Add an async test with a blocking/fake agent proving another session can access the map while one dispatch is in flight, plus a missing-id `None` case.\n\nVerdict: No WRONG correctness defects found in the diff; `dispatch` clones the prompt while locked and awaits only after the guard is dropped.",
+  "call_ok": true
+}

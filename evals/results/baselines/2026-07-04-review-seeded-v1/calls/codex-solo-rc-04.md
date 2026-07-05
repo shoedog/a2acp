@@ -1,0 +1,5 @@
+I’ll keep this read-only and anchored to the provided diff. I’m going to inspect the fixture around `src/lib.rs` and the local history/diff only enough to confirm caller context and exact line locations.The fixture is very small: just `Cargo.toml` and `src/lib.rs`. The working tree has no unstaged diff for `src/lib.rs`, so I’m reading the committed/current file and the surrounding git context for the reviewed artifact.I have the whole artifact now. The main correctness question is not compilation; it’s whether the API actually enforces the bounded “one result per node” contract it relies on, and how `collect()` behaves when producers violate or fail that contract.No findings.
+
+Under the stated contract, `nodes` is already validated at DAG load time, `nodes <= MAX_NODES`, and each node sends exactly one result. Given those preconditions, `Collector::collect()` receives at most `nodes` messages and returns after collecting that many, so the unbounded channel does not introduce an unbounded producer or queue-growth correctness issue.
+
+Verdict: no defects found under the provided contract.

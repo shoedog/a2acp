@@ -23,7 +23,9 @@ Each wave went through the same pipeline: I write the spec → **codex gpt-5.5 x
 
 **When the two review lenses conflict, read the primary evidence yourself — codex won every factual dispute.** Wave 1 (checkout lock codex found, opus cleared), Wave 2 (AGENTS staleness), Wave 3 (open-egress image advisory), M2 (dispatch-on-tag-ref BLOCKER). The dual-lens gate repeatedly caught bugs *I* would have merged, including in my own specs.
 
-## M3 — IN PROGRESS (branch `feat/m3-eval-harness`, NOT merged)
+## M3 — COMPLETE (merged `256d356`; baseline committed 2026-07-05)
+
+**STATUS 2026-07-05 — DONE (one owner action left: the C2 spot-check).** Infra merged to `main` (`256d356`). First measured baseline committed at `evals/results/baselines/2026-07-04-review-seeded-v1/` (full 45-run 3-cell matrix, kiro judge). **Headline result — seeded-defect recall = 11/11 = 1.000 in ALL three cells; the differentiator is PRECISION on clean twins, not recall:** duo (shipping shape) 23 false findings / item-pass 0.733 / TN 0; codex-solo 2 false findings / item-pass 0.867 / TN 2; claude-solo 17 false findings / 0.733 / TN 0. So the bridge catches every seeded bug but the duo/claude configs over-flag clean code, and the synth pass does NOT filter false positives (duo has the MOST). PROVISIONAL/n=15; awaiting owner C2 spot-check (`spotcheck.yaml`, fill `agree:` fields). One judge_error (codex-solo-rc-02, a clean item where the reviewer suggested tests) was resolved by a single standalone re-judge, folded + disclosed via the report's NOTE banner. **Blocker hit + fixed:** a concurrent Fable eval had set `~/.claude/settings.json` `"model"` to fable (bridge-blocklisted → every claude cell failed); reset to `opus` (owner-approved). See `memory/m3-fable-model-collision.md`. **NEXT = roadmap tail: #9 bin extraction, #10 Coordinator T9.**
 
 **Goal:** measure the bridge's review quality — the strategic bet the analysis said is unmeasured. Design: adopt the eval *science* from the owner's `~/code/prompts-skills-steering` (`eval_framework_v1-1.md`; 4 live-validated experiments), rebuild the *engineering* bridge-native.
 

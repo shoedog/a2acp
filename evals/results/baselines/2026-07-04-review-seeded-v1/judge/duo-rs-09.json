@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-09-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 0,
+  "neutral_matched": 0,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "duo",
+  "item": "rs-09",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-09/truth.yaml",
+  "normalized_block": "**Merged Review: rs-09 \u2014 `frame::encode`**\n\nBoth lenses (correctness/Codex, architecture/Claude) succeeded and agree on the core defect: the `as u16` cast silently truncates. They differ only on severity \u2014 Codex rated it MAJOR, Claude rated it BLOCKER. **Claude is right: this is a BLOCKER.** The failure is provably WRONG with a concrete, catastrophic outcome (permanent silent stream desync), which clears the bar for a blocker, not merely a risk.\n\n---\n\n**BLOCKER \u2014 `src/lib.rs:20` (with root cause at `src/lib.rs:4`): the length header cannot represent valid payloads, and the cast truncates them silently (WRONG).**\nThe contract admits payloads \"up to 1 MiB,\" but `pub len: u16` / the 2-byte big-endian header maxes out at 65,535 bytes. `let len = payload.len() as u16` reduces the length mod 65536, so it is lossy for exactly the admitted range: a 65,536-byte payload yields `len = 0`, and a 1 MiB payload also yields `len = 0`. The header then violates the stated invariant \"header MUST equal `payload.len()`\" \u2014 the reader consumes 0 bytes and parses the payload's first two bytes as the *next* frame's header, desyncing the stream permanently and corrupting every subsequent message.\nThis is one defect with a symptom and a structural root cause that **must be fixed together**: a checked cast alone would merely reject all valid payloads \u2265 64 KiB, because the header field itself is too narrow. **Fix:** widen `len` to `u32`, emit a 4-byte header in `to_bytes`, and update the reader's header parse in lockstep. This is a wire-format change \u2014 version/negotiate it if the reader is already deployed.\n\n**MAJOR \u2014 `src/lib.rs:19`: `encode` has no fallible seam, so oversize is unrepresentable rather than handled (design gap).**\nThe signature returns `Frame` unconditionally, so \"payload exceeds what the header can hold\" has nowhere to surface \u2014 the failure is pushed onto the wire instead of back to the caller. Even after widening to `u32`, the \"up to 1 MiB\" upper bound stays unenforced: nothing rejects a 2 MiB payload at the sender, so it becomes a desync discovered only at the receiver. **Fix:** make encoding fallible (`Result<Frame, EncodeError>`) and enforce the \u2264 max-payload cap here, rejecting at the boundary.\n\n**MINOR \u2014 `src/lib.rs:4-5`: `pub len` + `pub payload` let callers construct a Frame whose header lies (invariant unenforced by construction).**\nWith both fields public, the `len == payload.len()` invariant lives only in prose; any code can build `Frame { len: 5, payload: /* 100 bytes */ }`. **Fix:** make the fields private and force construction through the fallible `encode` (or a validating constructor) so the invariant is guaranteed by the type, not convention.\n\n**MINOR \u2014 no tests for `encode` boundary behavior.**\nMissing coverage lets the 65,536-byte and 1 MiB contract cases regress unnoticed. **Fix:** add tests for exact small payloads, `u16::MAX`, `u16::MAX + 1`, 1 MiB, and over-limit rejection.\n\n---\n\n**Verdict: REJECT \u2014 ship only after fixing the BLOCKER (widen the header to `u32` *and* remove the truncating cast, as one change) and adding the fallible/bounded encode seam (MAJOR); the two MINORs are worth folding in while touching this code.**",
+  "call_ok": true
+}

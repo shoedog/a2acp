@@ -1,0 +1,14 @@
+{
+  "workflow_id": "code-review-claude-solo",
+  "session_cwd": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-09/fixture",
+  "returncode": 0,
+  "timed_out": false,
+  "elapsed_s": 52.998,
+  "ok": true,
+  "stderr_tail": "[run-workflow] lsp warm: language detect skipped: Registry(\"detected rust but no [[languages]] id=\\\"rust\\\" profile; add one or pass --lang none\")\n[workflow] node reviewer started\n[workflow] node reviewer ok",
+  "out_path": "results/baselines/2026-07-04-review-seeded-v1/calls/claude-solo-rs-09.md",
+  "cell": "claude-solo",
+  "item": "rs-09",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-09/truth.yaml"
+}

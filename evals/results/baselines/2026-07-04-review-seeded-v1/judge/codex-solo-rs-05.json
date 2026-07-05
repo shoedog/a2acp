@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-05-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 1,
+  "neutral_matched": 0,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "codex-solo",
+  "item": "rs-05",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-05/truth.yaml",
+  "normalized_block": "I\u2019ll read the fixture around `Manager` and the relevant git context only, then stop at the review findings.The worktree doesn\u2019t show this patch as an uncommitted diff, so I\u2019m reading the fixture\u2019s current `src/lib.rs` and tests to ground the review against the artifact.There are only two fixture files and no tests in this item. I\u2019m checking the package metadata once, then I\u2019ll write the review without running anything.I have the relevant file context. I\u2019m grabbing exact line numbers for the cited findings now.1. **BLOCKER (WRONG)** `src/lib.rs:28-31` / `Manager::get_or_spawn`: the cache check and insert are split across two separate lock acquisitions, so two concurrent calls with the same missing `id` can both observe `contains_key(id) == false`, both call `spawn(id)`, and then race to insert. This violates the explicit \u201cat most ONE session ever spawned per id\u201d contract and can start duplicate real agent processes. Fix by making the per-id miss handling atomic: hold the cache lock through an `entry` insert, or store an in-flight placeholder/`OnceLock` so same-id callers wait on the same spawn.\n\n2. **MINOR (SMELL)** `src/lib.rs:28-31`: there is no concurrency regression test for the new contract. A test that synchronizes two same-id callers at the miss point and asserts `spawn_count() == 1` would fail against this implementation and prevent this race from shipping.\n\nVerdict: **Not mergeable; `get_or_spawn` does not satisfy the single-spawn concurrency contract.**",
+  "call_ok": true
+}

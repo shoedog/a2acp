@@ -1,0 +1,14 @@
+{
+  "workflow_id": "code-review-duo",
+  "session_cwd": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-04/fixture",
+  "returncode": 0,
+  "timed_out": false,
+  "elapsed_s": 119.995,
+  "ok": true,
+  "stderr_tail": "[run-workflow] lsp warm: language detect skipped: Registry(\"detected rust but no [[languages]] id=\\\"rust\\\" profile; add one or pass --lang none\")\n[workflow] node correctness started\n[workflow] node architecture started\n[workflow] node architecture ok\n[workflow] node correctness ok\n[workflow] node synth started\n[workflow] node synth ok",
+  "out_path": "results/baselines/2026-07-04-review-seeded-v1/calls/duo-rs-04.md",
+  "cell": "duo",
+  "item": "rs-04",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-04/truth.yaml"
+}
