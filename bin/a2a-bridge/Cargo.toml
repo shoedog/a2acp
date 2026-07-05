@@ -17,6 +17,7 @@ bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
 bridge-core = { path = "../../crates/bridge-core" }
+bridge-controller = { path = "../../crates/bridge-controller" }
 bridge-coordinator = { path = "../../crates/bridge-coordinator" }
 bridge-workflow = { path = "../../crates/bridge-workflow" }
 bridge-mcp = { path = "../../crates/bridge-mcp" }

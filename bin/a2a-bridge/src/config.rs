@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot};
 use bridge_core::ids::AgentId;
+use bridge_controller::merge::MergeConfig;
+use bridge_controller::verify::VerifyConfig;
 
 /// Unified parse error covering TOML parse failures and missing env-var references.
 #[derive(Debug)]
@@ -680,15 +682,6 @@ pub struct VerifyToml {
     pub commands: Option<toml::Value>,
 }
 
-/// Parsed `[verify]`: verify infrastructure + a validated egress policy.
-#[derive(Debug, Clone)]
-pub struct VerifyConfig {
-    pub runtime: Option<String>,
-    pub image: String,
-    pub cache: String,
-    pub egress: bridge_core::domain::EgressPolicy,
-}
-
 impl VerifyToml {
     pub fn to_config(&self) -> Result<VerifyConfig, ConfigError> {
         let egress = parse_egress_fields(&self.egress, &self.network, &self.proxy, &self.no_proxy)?;
@@ -958,13 +951,6 @@ pub struct MergeToml {
     pub target_ref: Option<String>,
     pub author_name: Option<String>,
     pub author_email: Option<String>,
-}
-
-/// Validated `[merge]` config.
-#[derive(Debug, Clone)]
-pub struct MergeConfig {
-    pub target_ref: Option<String>,
-    pub author: Option<crate::merge::OperatorIdent>,
 }
 
 impl MergeToml {

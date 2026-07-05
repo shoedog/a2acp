@@ -3,7 +3,14 @@
 //! it), aggregate a reported (non-gating) verdict for the operator hand-off. The Docker run is the only
 //! impure piece (`docker_runner`, live-gated); everything else is pure + unit-tested.
 //!
-use crate::config::VerifyConfig;
+/// Parsed `[verify]`: verify infrastructure + a validated egress policy.
+#[derive(Debug, Clone)]
+pub struct VerifyConfig {
+    pub runtime: Option<String>,
+    pub image: String,
+    pub cache: String,
+    pub egress: bridge_core::domain::EgressPolicy,
+}
 
 /// One command's outcome. `gate=false` commands are reported but never fail the verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,14 +193,6 @@ pub fn run_verify(
         }
     }
     VerifyOutcome::Ran(aggregate(results))
-}
-
-/// The real runner: spawn the container, capture stdout+stderr combined, return the exit code.
-pub fn docker_runner(program: &str, argv: &[String]) -> std::io::Result<(i32, String)> {
-    let out = std::process::Command::new(program).args(argv).output()?;
-    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&out.stderr));
-    Ok((out.status.code().unwrap_or(-1), combined))
 }
 
 #[cfg(test)]

@@ -33,16 +33,12 @@ mod catalog_probe;
 mod config;
 mod containers;
 mod doctor;
-mod implement;
-mod implement_resume;
-mod merge;
-mod resilient;
-mod review;
 mod route;
 mod slice;
-mod turn;
-mod tweak;
-mod verify;
+
+pub(crate) use bridge_controller::{
+    implement, implement_resume, merge, resilient, review, tweak, turn, verify,
+};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -227,7 +223,7 @@ fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static 
         TopSubcommand::Task => Some(TASK_USAGE),
         TopSubcommand::Session => Some(SESSION_USAGE),
         TopSubcommand::Serve => Some(SERVE_USAGE),
-        TopSubcommand::Merge => Some(merge::MERGE_USAGE),
+        TopSubcommand::Merge => Some(MERGE_USAGE),
         TopSubcommand::Init => Some(INIT_USAGE),
         TopSubcommand::Doctor => Some(DOCTOR_USAGE),
         _ => None,
@@ -1243,11 +1239,19 @@ fn resume_lang_arg(resolved_lang: &Option<String>) -> LangArg {
     }
 }
 
+/// The real runner: spawn the container, capture stdout+stderr combined, return the exit code.
+fn docker_runner(program: &str, argv: &[String]) -> std::io::Result<(i32, String)> {
+    let out = std::process::Command::new(program).args(argv).output()?;
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok((out.status.code().unwrap_or(-1), combined))
+}
+
 /// Run the B2b-2 verify once (total). `verify_cfg` was captured pre-snapshot. The verdict run itself never
 /// fails (a runner error becomes a failed result); a config error reduces to `ConfigError`.
 /// Returns `Skipped` immediately when `profile` is `None` (`--lang none`).
 fn run_verify_step(
-    verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    verify_cfg: &Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&bridge_core::profile::LanguageProfile>,
     clone_cwd: &bridge_core::SessionCwd,
     repo: &std::path::Path,
@@ -1280,7 +1284,7 @@ fn run_verify_step(
                 Some(profile),
                 clone_cwd,
                 &cache_vol,
-                &verify::docker_runner,
+                &docker_runner,
                 16 * 1024,
             );
             if let verify::VerifyOutcome::Ran(ref verdict) = outcome {
@@ -1299,7 +1303,7 @@ fn run_verify_step(
 /// in-container nav but never block the implement flow. Returns the cache name on success for later mounts.
 /// Returns `None` immediately when `profile` is `None` (`--lang none`).
 fn warm_lsp_deps_step(
-    verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    verify_cfg: &Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&bridge_core::profile::LanguageProfile>,
     repo: &std::path::Path,
     clone: &std::path::Path,
@@ -1356,7 +1360,7 @@ fn warm_lsp_deps_step(
         read_only,
     );
     eprintln!("[implement] lsp warm-deps: fetching deps into {cache_vol}");
-    match verify::docker_runner(&program, &argv) {
+    match docker_runner(&program, &argv) {
         Ok((0, _)) => {
             eprintln!("[implement] lsp warm-deps: ok ({cache_vol})");
             Some(cache_vol)
@@ -1644,7 +1648,7 @@ async fn run_review_step(
 /// The production `tweak::TweakEffects`: the real verify/review/fix turns. Borrows the loop's setup for its
 /// lifetime; `fix` is only called when `fix_graph` is `Some` (the loop guards with `fix_available`).
 struct ProdEffects<'a> {
-    verify_cfg: &'a Option<Result<config::VerifyConfig, config::ConfigError>>,
+    verify_cfg: &'a Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&'a bridge_core::profile::LanguageProfile>,
     review_cfg: &'a Option<Result<config::ReviewConfig, config::ConfigError>>,
     wf_map: &'a std::collections::HashMap<
@@ -1895,7 +1899,7 @@ async fn run_warm_loop(
     runner: &resilient::ResilientWarm,
     impl_session: &bridge_core::ids::SessionId,
     clone_cwd: &bridge_core::SessionCwd,
-    verify_cfg: &Option<Result<config::VerifyConfig, config::ConfigError>>,
+    verify_cfg: &Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&bridge_core::profile::LanguageProfile>,
     review_cfg: &Option<Result<config::ReviewConfig, config::ConfigError>>,
     wf_map: &std::collections::HashMap<
@@ -1970,7 +1974,7 @@ async fn run_warm_loop(
 fn merge_after_loop(
     merge_requested: bool,
     outcome_phase: implement_resume::ImplementPhase,
-    merge_cfg: Option<Result<config::MergeConfig, config::ConfigError>>,
+    merge_cfg: Option<Result<merge::MergeConfig, config::ConfigError>>,
     clone: &Path,
     root: &Path,
     onto: Option<&str>,
@@ -2652,6 +2656,72 @@ async fn implement_resume_cmd(
         &root,
         onto,
     )
+}
+
+/// Dispatcher-level `--help`/`-h` for `merge` is handled in `main.rs` (this constant is
+/// `pub` so the top-level dispatcher can print it) BEFORE `merge_cmd`'s own parser runs —
+/// its `--onto`/`--config`/`--force`-only loop would otherwise reject `--help` as an
+/// "unexpected arg".
+pub const MERGE_USAGE: &str = "\
+usage: a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--force]
+
+Land an Approved `implement` run's commit into its source_repo, re-authored to the operator,
+via `git commit-tree` + `git push --force-with-lease` (Mode A: fast-forward onto --onto).
+  <id>             the run id (the clone dir name under .a2a-implement/)
+  --config <path>  registry config providing allowed_cwd_root + [merge] (default: ./a2a-bridge.toml)
+  --onto <branch>  target branch to land onto (else [merge].target_ref, else the run's base_ref)
+  --force          also allow landing a LoopStopped (not Approved) run";
+
+/// `a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--force]`
+pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
+    let mut id: Option<String> = None;
+    let mut config_path = std::path::PathBuf::from(CONFIG_PATH);
+    let mut onto: Option<String> = None;
+    let mut force = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                i += 1;
+                config_path = args.get(i).ok_or("merge: --config needs a path")?.into();
+            }
+            "--onto" => {
+                i += 1;
+                onto = Some(args.get(i).ok_or("merge: --onto needs a branch")?.clone());
+            }
+            "--force" => force = true,
+            s if !s.starts_with('-') && id.is_none() => id = Some(s.to_string()),
+            s => return Err(format!("merge: unexpected arg {s:?}").into()),
+        }
+        i += 1;
+    }
+    let id =
+        id.ok_or("merge: missing <id> (usage: a2a-bridge merge <id> [--onto <branch>] [--force])")?;
+    let config_path = std::fs::canonicalize(&config_path)
+        .map_err(|e| format!("merge: config {}: {e}", config_path.display()))?;
+    let raw =
+        std::fs::read_to_string(&config_path).map_err(|e| format!("merge: read config: {e}"))?;
+    let cfg = config::RegistryConfig::parse(&raw)
+        .map_err(|e| format!("merge: config parse: {e}"))?;
+    let root = cfg
+        .allowed_cwd_root
+        .clone()
+        .ok_or("merge: config needs allowed_cwd_root")?;
+    let root = std::fs::canonicalize(&root)
+        .map_err(|e| format!("merge: allowed_cwd_root {root:?}: {e}"))?;
+    let mcfg = cfg
+        .merge
+        .as_ref()
+        .map(|m| m.to_config())
+        .transpose()
+        .map_err(|e| format!("merge: {e}"))?;
+    let clone =
+        implement_resume::resolve_clone(&root, &id).map_err(|e| format!("merge: {e}"))?;
+
+    let outcome = merge::merge_clone(mcfg.as_ref(), &clone, &root, onto.as_deref(), force);
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    std::process::exit(outcome.code());
 }
 
 /// Execute the `run-workflow` subcommand.
@@ -5766,7 +5836,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Batch => return batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Models => return models_cmd(&raw_args[2..]).await,
         TopSubcommand::Implement => return implement_cmd(&raw_args[2..]).await,
-        TopSubcommand::Merge => return merge::merge_cmd(&raw_args[2..]).await,
+        TopSubcommand::Merge => return merge_cmd(&raw_args[2..]).await,
         TopSubcommand::Containers => return containers_cmd(&raw_args[2..]),
         TopSubcommand::Submit => return submit_cmd(&raw_args[2..]).await,
         TopSubcommand::Task => return task_cmd(&raw_args[2..]).await,
@@ -6652,6 +6722,19 @@ mod cli_tests {
         assert!(serve_config_flag(&["--bogus".to_string()]).is_err()); // unknown flag
     }
 
+    #[test]
+    fn merge_usage_matches_the_actual_parser() {
+        // `merge_cmd`'s loop accepts exactly --config/--onto/--force plus a positional <id>;
+        // keep the usage constant honest against that, not a guess (W3-A).
+        assert!(MERGE_USAGE.starts_with("usage: a2a-bridge merge <id>"));
+        for flag in ["--config <path>", "--onto <branch>", "--force"] {
+            assert!(
+                MERGE_USAGE.contains(flag),
+                "missing {flag:?}: {MERGE_USAGE}"
+            );
+        }
+    }
+
     // ---- W3-A: dispatcher-level `--help`/`-h` + silent-config-write removal ----
 
     #[test]
@@ -6665,7 +6748,7 @@ mod cli_tests {
             ("task", TASK_USAGE),
             ("session", SESSION_USAGE),
             ("serve", SERVE_USAGE),
-            ("merge", merge::MERGE_USAGE),
+            ("merge", MERGE_USAGE),
             ("init", INIT_USAGE),
         ];
         for (word, expected) in cases {
