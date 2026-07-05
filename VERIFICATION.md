@@ -99,9 +99,39 @@ same id + `total:2`; BatchList → contains it. Exercises the `Some(coord)` bran
 `srv.allowed_cwd_root` (for per-item validation); those fields + the real-root
 wiring into the Coordinator are the "delete parallel fields" slice's job.
 
+### Slice 3 — read/control-plane → Coordinator
+```
+cargo test --workspace -j 1     → 1428 passed / 0 failed / 12 ignored
+cargo clippy -p bridge-a2a-inbound -j 1  → clean
+```
+1428 = slice-2's 1427 + one new test.
+
+**Changes (server.rs):**
+- `session_inject` → `coordinator.inject(req)` when a Coordinator is present (its
+  `session_manager` IS the shared `sm` — identity-proven), else the adapter's `sm`.
+  Order preserved (auth → sm-guard → parse → inject); only the terminal call swaps.
+- `session_permit` → `coordinator.permit(params)` when present (same shared
+  `PermissionRegistry`), else the inline `apply_permit`. `Result<bool>::unwrap_or(false)`
+  matches the inline bool (permit never errs).
+- **`session_status` NOT delegated** (spec): its wire DTO (`contextId`/`idleAgeMs`/
+  `windowFraction`/camelCase caps/`pendingPermissions`) is incompatible with
+  `SessionStatusDto`, and `sm.status` is already the shared source — zero dedup.
+- **`get_task`/`list_tasks` unchanged:** they already read `srv.task_store`, which
+  IS `coordinator.task_store()` after slice 1's adoption. The store-miss WORKING
+  heuristic is intact. Slice 7 repoints the field read when it deletes `srv.task_store`.
+
+**Behavior-preserving:** thin pass-throughs to the SAME shared instances (proven by
+`with_coordinator_shares_state_identity`). The existing inject/permit tests still
+cover the fallback path.
+
+**New test:** `inject_and_permit_delegate_through_coordinator` (server.rs) builds a
+warm coordinator-backed server, warms a context, then SessionInject (coordinator
+path) → `queued:1` + the SHARED `sm.pending_inject_count == 1`; SessionPermit
+(coordinator path) → `resolved:true` + the SHARED registry resolves the rendezvous.
+
 ## Verified
-- Full workspace suite green (**1427/0/12** after slice 2; 1426 after slice 1) on
-  the final tree; clippy clean; golden-wire 15/15.
+- Full workspace suite green (**1428/0/12** after slice 3; 1427 after slice 2;
+  1426 after slice 1) on the final tree; clippy clean; golden-wire 15/15.
 - Shared-Arc identity proven by `Arc::ptr_eq` across all 13 shared fields.
 - SessionManager clock switch proven behavior-identical from source.
 

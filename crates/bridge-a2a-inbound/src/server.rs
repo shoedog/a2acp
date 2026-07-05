@@ -3055,7 +3055,14 @@ async fn session_inject(
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
     let ctx = params.context.clone();
-    match sm.inject(params.into_request()).await {
+    // #10 slice 3: route inject through the Coordinator when present — its
+    // session_manager IS the shared `sm` (identity-proven), so this is the same
+    // call; the adapter path stays for coordinator-less servers.
+    let result = match srv.coordinator() {
+        Some(coord) => coord.inject(params.into_request()).await,
+        None => sm.inject(params.into_request()).await,
+    };
+    match result {
         Ok(queued) => jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "queued": queued })),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
@@ -3074,12 +3081,18 @@ async fn session_permit(
         Ok(p) => p,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    // A server without the interactive-permission registry has no pending rendezvous to resolve.
-    let resolved = srv
-        .permission_registry
-        .as_ref()
-        .map(|reg| apply_permit(reg, &params))
-        .unwrap_or(false);
+    // #10 slice 3: route permit through the Coordinator when present — same shared
+    // PermissionRegistry (identity-proven); the adapter path stays otherwise. A
+    // server without the interactive-permission registry has no pending rendezvous
+    // to resolve (both paths return false).
+    let resolved = match srv.coordinator() {
+        Some(coord) => coord.permit(params).await.unwrap_or(false),
+        None => srv
+            .permission_registry
+            .as_ref()
+            .map(|reg| apply_permit(reg, &params))
+            .unwrap_or(false),
+    };
     jsonrpc_ok(id, json!({ "resolved": resolved }))
 }
 
@@ -4824,6 +4837,131 @@ mod tests {
             ),
             "permission_registry"
         );
+    }
+
+    /// Warm, coordinator-backed server (same shape as
+    /// `warm_server_with_permission_registry`, but the sm + permission registry are
+    /// owned by a Coordinator the adapter adopts). Returns the SHARED sm + registry
+    /// so a test can observe the effects of coordinator-routed inject/permit.
+    fn warm_coordinator_server_with_permission_registry() -> (
+        Arc<InboundServer>,
+        Arc<crate::session_manager::SessionManager>,
+        Arc<bridge_core::permission::PermissionRegistry>,
+    ) {
+        let backend = WarmRecordingBackend::new();
+        let registry =
+            FakeRegistry::with_entries("a", vec![(bare_entry("a"), backend as Arc<dyn AgentBackend>)]);
+        let registry_dyn: Arc<dyn AgentRegistry> = registry;
+        let session_store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_dyn.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        let perm_registry = bridge_core::permission::PermissionRegistry::new();
+        let task_store: Arc<dyn bridge_core::task_store::TaskStore> =
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+            registry_dyn.clone(),
+        ));
+        let clock: Arc<dyn bridge_coordinator::clock::Clock> =
+            Arc::new(bridge_coordinator::clock::SystemClock);
+        let coord = Arc::new(
+            bridge_coordinator::Coordinator::new(
+                sm.clone(),
+                Some(executor),
+                Arc::new(std::collections::HashMap::new()),
+                task_store,
+                session_store.clone(),
+                Arc::new(AutoApprove) as Arc<dyn PolicyEngine>,
+                registry_dyn.clone(),
+                clock,
+                None,
+                None,
+                3,
+            )
+            .with_permission_registry(Arc::clone(&perm_registry)),
+        );
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_dyn,
+                session_store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_coordinator(coord),
+        );
+        (srv, sm, perm_registry)
+    }
+
+    /// #10 slice 3: SessionInject + SessionPermit route through the Coordinator and
+    /// land on the SAME shared session_manager / permission_registry (proven by
+    /// observing the shared handles after the coordinator-routed RPCs).
+    #[tokio::test]
+    async fn inject_and_permit_delegate_through_coordinator() {
+        let (srv, sm, perm_registry) = warm_coordinator_server_with_permission_registry();
+
+        // Warm the context (adapter path, unchanged) so inject has a live handle.
+        let ctx = ContextId::parse("c-coord-inject").unwrap();
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": {
+                    "contextId": "c-coord-inject",
+                    "text": "go",
+                    "metadata": { "a2a-bridge.agent": "a" }
+                }}),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        // SessionInject through the coordinator queues onto the shared sm.
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                "SessionInject",
+                json!({ "contextId": "c-coord-inject", "text": "queued" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["result"]["queued"], 1, "{v}");
+        assert_eq!(
+            sm.pending_inject_count(&ctx).await,
+            1,
+            "coordinator-routed inject must queue onto the shared session_manager"
+        );
+
+        // SessionPermit through the coordinator resolves on the shared registry.
+        let (rx, _guard) = register_pending_permission(&perm_registry, "c-coord-permit", "req-c");
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionPermit",
+                json!({
+                    "contextId": "c-coord-permit",
+                    "generation": 1,
+                    "op": "turn-1",
+                    "requestId": "req-c",
+                    "decision": { "decision": "approve", "optionId": "ok" }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["result"]["resolved"], true, "{v}");
+        assert!(matches!(
+            rx.await.unwrap(),
+            bridge_core::permission::PermissionResolution::Decided(_)
+        ));
     }
 
     #[tokio::test]
