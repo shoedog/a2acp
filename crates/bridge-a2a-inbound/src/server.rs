@@ -4887,13 +4887,19 @@ mod tests {
             Arc::ptr_eq(&srv.store, &coord.session_store()),
             "session_store"
         );
-        assert!(Arc::ptr_eq(&srv.task_store, &coord.task_store()), "task_store");
+        assert!(
+            Arc::ptr_eq(&srv.task_store, &coord.task_store()),
+            "task_store"
+        );
         assert!(Arc::ptr_eq(&srv.registry, &coord.registry()), "registry");
         assert!(Arc::ptr_eq(&srv.policy, &coord.policy()), "policy");
 
         // Session manager + Option-wrapped shared state.
         assert!(
-            Arc::ptr_eq(srv.session_manager.as_ref().unwrap(), &coord.session_manager),
+            Arc::ptr_eq(
+                srv.session_manager.as_ref().unwrap(),
+                &coord.session_manager
+            ),
             "session_manager"
         );
         assert!(
@@ -4923,8 +4929,10 @@ mod tests {
         Arc<bridge_core::permission::PermissionRegistry>,
     ) {
         let backend = WarmRecordingBackend::new();
-        let registry =
-            FakeRegistry::with_entries("a", vec![(bare_entry("a"), backend as Arc<dyn AgentBackend>)]);
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend as Arc<dyn AgentBackend>)],
+        );
         let registry_dyn: Arc<dyn AgentRegistry> = registry;
         let session_store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
         let sm = Arc::new(crate::session_manager::SessionManager::new(

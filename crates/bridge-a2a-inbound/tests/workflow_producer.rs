@@ -1597,8 +1597,7 @@ async fn warm_unary_cancel_by_wire_id_hits_real_session() {
         prompt_session: prompt_session.clone(),
         cancel_sessions: cancel_sessions.clone(),
     });
-    let backends: HashMap<String, Arc<dyn AgentBackend>> =
-        [("codex".to_string(), backend)].into();
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [("codex".to_string(), backend)].into();
     let store = Arc::new(FakeStore::default());
     let srv = build_server_per_agent_with_session_manager(store.clone(), backends);
 

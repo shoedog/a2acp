@@ -19,8 +19,8 @@ pub mod implement_resume;
 pub mod merge;
 pub mod resilient;
 pub mod review;
-pub mod tweak;
 pub mod turn;
+pub mod tweak;
 pub mod verify;
 
 pub use merge::{MergeConfig, OperatorIdent};

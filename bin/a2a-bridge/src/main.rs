@@ -37,7 +37,7 @@ mod route;
 mod slice;
 
 pub(crate) use bridge_controller::{
-    implement, implement_resume, merge, resilient, review, tweak, turn, verify,
+    implement, implement_resume, merge, resilient, review, turn, tweak, verify,
 };
 
 use std::collections::BTreeSet;
@@ -2701,8 +2701,8 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
         .map_err(|e| format!("merge: config {}: {e}", config_path.display()))?;
     let raw =
         std::fs::read_to_string(&config_path).map_err(|e| format!("merge: read config: {e}"))?;
-    let cfg = config::RegistryConfig::parse(&raw)
-        .map_err(|e| format!("merge: config parse: {e}"))?;
+    let cfg =
+        config::RegistryConfig::parse(&raw).map_err(|e| format!("merge: config parse: {e}"))?;
     let root = cfg
         .allowed_cwd_root
         .clone()
@@ -2715,8 +2715,7 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
         .map(|m| m.to_config())
         .transpose()
         .map_err(|e| format!("merge: {e}"))?;
-    let clone =
-        implement_resume::resolve_clone(&root, &id).map_err(|e| format!("merge: {e}"))?;
+    let clone = implement_resume::resolve_clone(&root, &id).map_err(|e| format!("merge: {e}"))?;
 
     let outcome = merge::merge_clone(mcfg.as_ref(), &clone, &root, onto.as_deref(), force);
     use std::io::Write;

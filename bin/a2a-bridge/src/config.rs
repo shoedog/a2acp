@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot};
-use bridge_core::ids::AgentId;
 use bridge_controller::merge::MergeConfig;
 use bridge_controller::verify::VerifyConfig;
+use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot};
+use bridge_core::ids::AgentId;
 
 /// Unified parse error covering TOML parse failures and missing env-var references.
 #[derive(Debug)]
