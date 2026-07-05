@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-04-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 1,
+  "neutral_matched": 0,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "claude-solo",
+  "item": "rs-04",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-04/truth.yaml",
+  "normalized_block": "I'll ground this review in the actual fixture before finalizing.## Review: rs-04 \u2014 `SlotTable::evict`\n\n**BLOCKER (WRONG) \u2014 `src/lib.rs:44` \u2014 discarded fallible durable write breaks the core invariant.** `let _ = self.persist_free(id);` swallows the `Err`, then `self.used -= 1` (line 45) runs unconditionally. This is exactly the scenario the contract forbids: when the ledger write fails the slot is *still marked used durably* (per the `persist_free` doc, line 33-35), yet in-memory `used` is decremented. In-memory now says \"free,\" the durable ledger says \"used.\" On restart the ledger is authoritative, so that slot is leaked permanently and effective capacity silently shrinks each time a free write fails. Fix: `self.persist_free(id)?` must be the commit point \u2014 only mutate in-memory state *after* it succeeds.\n\n**BLOCKER (WRONG) \u2014 `src/lib.rs:43,45` \u2014 unconditional decrement underflows on double-evict / unknown id.** `self.live.remove(id)` ignores its `bool` return, so `used -= 1` fires even when `id` was never admitted or was already evicted. Since `used` is `u32`, once it reaches 0 the subtraction underflows: debug builds panic, release builds wrap to `u32::MAX`. After a wrap, `admit`'s guard `used >= capacity` (line 25) is always true \u2192 total admission lockout. Fix: gate the whole body on `self.live.remove(id)` returning `true` (or `contains` first), making evict idempotent.\n\n**MAJOR (smell) \u2014 `src/lib.rs:42` \u2014 signature hides a fallible operation.** `evict` returns `()`, so a durable-free failure is structurally *unreportable* to the caller \u2014 the error swallowing at line 44 isn't an accident, it's forced by the API shape. There is no seam for the caller to retry, log, or refuse to consider the session gone. Fix: `pub fn evict(&mut self, id: &str) -> Result<(), StoreError>`.\n\n**MAJOR (smell) \u2014 `src/lib.rs:43-45` \u2014 three accountings mutated with no commit ordering.** `live`, `used`, and the durable ledger are updated in an order that commits the *in-memory* state before the *durable* one, and with no rollback. Worse, `live.remove` runs first, so on a persist failure the id is already gone from `live` \u2014 a retry can't even find the still-durably-used slot. The durable write is the only operation that can fail and must therefore be the commit boundary: check membership \u2192 `persist_free(id)?` \u2192 `live.remove(id)` \u2192 `used -= 1`. Note this makes `evict` the true mirror of `admit`, which correctly guards before touching in-memory state.\n\n**MINOR (absence check) \u2014 design \u2014 `admit` writes no ledger entry.** `admit` (line 24-31) updates `live`/`used` but never calls a `persist_*` counterpart, so the \"durable ledger that survives restarts\" is only written on free. Unless admission is persisted elsewhere, the ledger can't actually reconstruct `used` on restart \u2014 the invariant the diff is trying to protect isn't fully realizable. Out of scope for this diff, but the evict fix is only meaningful once admission is also durable.\n\n**Verdict: REJECT** \u2014 two blocking defects (error-swallowing ledger divergence and `u32` underflow lockout), both directly violating the stated consistency contract; evict must persist-then-commit and guard on actual membership.",
+  "call_ok": true
+}

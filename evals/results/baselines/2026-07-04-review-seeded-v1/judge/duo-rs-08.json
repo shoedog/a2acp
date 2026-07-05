@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-08-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 0,
+  "neutral_matched": 0,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "duo",
+  "item": "rs-08",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-08/truth.yaml",
+  "normalized_block": "**Merged Review: rs-08 \u2014 `Runner::checkpoint`**\n\nBoth lenses succeeded and agree on the core defect; findings de-duplicated below.\n\n**BLOCKER \u2014 Inverted write order marks a node complete without its output.** `src/lib.rs:23-24`. `checkpoint` calls `mark_complete(node).await` *before* `put_output(node, body).await`. This directly violates the stated durability contract (\"the two writes must be ordered so a drop between them can never leave a node marked complete without its output present\"). Concrete trigger: a turn cancelled at the `.await` on line 24 (future dropped after `mark_complete` durably commits, before `put_output` runs) \u2014 or a hard crash in that window \u2014 leaves the completion marker set with no stored output. On resume the node is treated as done (marker is the sole commit point), so it is skipped and never re-run, and a downstream node reads its stored output, which is absent/stale. **Fix:** swap the two writes \u2014 `put_output` first, then `mark_complete` \u2014 so a drop between them leaves output-present-but-not-complete, and resume safely re-runs the node. Add a focused test that drops/errors the future between the two awaits and asserts the \"complete-without-output\" state never persists. *(Both reviewers; Codex and Claude concur \u2014 no disagreement.)*\n\n**MAJOR \u2014 The commit-ordering invariant has no enforcing seam; it's an implicit call-order convention.** `src/lib.rs:22-26` + trait at `:8-13`. Correctness rests on three uncaptured facts: the ordering in `checkpoint`, resume using the marker as the sole commit point, and `put_output` being overwrite-safe. Nothing structural protects the ordering \u2014 a future refactor that reorders the two lines, or a `Checkpoints` impl that batches/reorders internally, silently reintroduces the torn state with no compile-time or test signal. **Fix:** hoist the two-phase protocol into the store as a single ordered/atomic `commit_node(node, body)` operation, or at minimum pin the rule (\"output before marker; marker is the commit\") in a trait doc-comment so one unit owns the invariant. *(Claude only \u2014 architecture lens.)*\n\n**MINOR \u2014 `put_output` re-run idempotency is a hidden, undocumented requirement.** `src/lib.rs:11-12`. Once the ordering is fixed, resume can re-run a node whose output was already partially persisted, so `put_output` MUST overwrite cleanly (not append, not error on an existing row). The trait states no such contract; an impl that errors on a duplicate key would break resume. **Fix:** document \"idempotent overwrite\" in the `put_output` trait contract. *(Claude only.)*\n\n**MINOR \u2014 The `Err` path shares the same torn-state failure mode.** `src/lib.rs:23-24`. Even without cancellation, if `mark_complete` succeeds and `put_output` returns `Err`, `checkpoint` returns `Err` with the marker committed and no output \u2014 the forbidden state again, and the caller cannot distinguish \"nothing written\" from \"half written.\" The ordering fix also resolves this (a failed `put_output` leaves nothing marked complete), which is further evidence the correct order is load-bearing, not stylistic. *(Claude only; reinforces Codex's blocker.)*\n\n**Verdict:** Reject \u2014 ship only after swapping the two writes (`put_output` before `mark_complete`) and covering the cancel/error interleaving with a focused test; address the MAJOR seam and MINOR trait-contract gaps to keep the invariant from silently regressing.",
+  "call_ok": true
+}

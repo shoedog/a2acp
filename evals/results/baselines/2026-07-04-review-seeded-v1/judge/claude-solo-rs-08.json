@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-08-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 2,
+  "neutral_matched": 0,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "claude-solo",
+  "item": "rs-08",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-08/truth.yaml",
+  "normalized_block": "**BLOCKER \u2014 `checkpoint` writes the two records in the wrong order (src/lib.rs:23-24).** The contract requires the ordering to guarantee that a cancel-drop *between* the two awaits can never leave a node marked complete without its output. This code does `mark_complete(node)` first, then `put_output(node, body)`. If the future is dropped at the await point on line 24 \u2014 after the \"complete\" marker is durably written but before the output is stored \u2014 resume treats the node as done (marker set) and downstream nodes read a missing/absent output. That is precisely the corrupt state the contract forbids. **Fix:** invert the two writes \u2014 persist the output *first* (`put_output`), then `mark_complete`. A drop between them then leaves output-present-but-not-complete, so resume simply re-runs the node (writing output again) \u2014 safe, provided the re-run is idempotent (see below). This is WRONG, not a smell: a concrete input (cancellation at line 24's await) yields a demonstrably incorrect resume.\n\n**MINOR (smell) \u2014 the safe ordering depends on an unstated idempotency invariant that isn't captured anywhere.** Even after inverting the writes, correctness of crash-resume rests on `put_output` (and `mark_complete`) being safely repeatable: a drop after `put_output` but before `mark_complete` means the node re-runs and re-writes its output, and any downstream that already consumed a partial read must tolerate the rewrite. Nothing in the `Checkpoints` trait doc (src/lib.rs:8-13) states that outputs are overwrite-idempotent or that a re-run produces the same body. **Direction:** document this invariant on the trait (writes must be idempotent / last-write-wins) so future `Checkpoints` implementors don't introduce append-style or dedup-keyed `put_output` semantics that reintroduce the hazard.\n\n**MINOR (smell) \u2014 no atomicity seam for the two-write \"checkpoint\" unit.** The design commits a node's completion via two independent round-trips with no transaction boundary, so durability of the pair is only ever eventual and ordering-dependent. The current fix (order + idempotency) is the correct lightweight approach for a two-write store, but if a future backing store gains transactions, the natural place to express \"these two writes commit together\" is absent. **Direction:** consider a single `commit_node(node, body)` method on the trait so stores that *can* be atomic express it, and stores that can't fall back to the ordered-write default \u2014 keeping the ordering invariant inside the store contract rather than relying on every caller of `checkpoint` (and every future call site) to preserve it.\n\n**Verdict: BLOCKER \u2014 the write ordering is inverted; a cancel between the two awaits marks a node complete with no output, corrupting crash-resume. Swap the two writes (output before marker).**",
+  "call_ok": true
+}

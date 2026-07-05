@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-09-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 1,
+  "neutral_matched": 0,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "codex-solo",
+  "item": "rs-09",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-09/truth.yaml",
+  "normalized_block": "I\u2019ll do a bounded read-only review anchored on the `Frame` code and its immediate tests/usages, then stop with findings only.The diff appears already applied in the fixture rather than showing as a working-tree diff, so I\u2019m reading the implementation and nearby project metadata directly.The relevant unit is very small: `Frame::to_bytes` writes `self.len` verbatim, while the new `encode` computes that field from `payload.len()`. I\u2019m checking only the immediate contract and package surface now.1. **BLOCKER WRONG** \u2014 [src/lib.rs](/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-09/fixture/src/lib.rs:20) `encode`: `payload.len() as u16` silently truncates lengths above `65_535`. For a `65_536` byte payload, `len` becomes `0`, so `to_bytes()` writes a zero-length header followed by 65,536 bytes; the reader consumes no payload and treats payload bytes as the next frame header, corrupting the stream. Fix by using a wire length field that can represent 1 MiB, or reject/chunk payloads above `u16::MAX` if the protocol is truly fixed at 2 bytes.\n\n2. **MINOR SMELL** \u2014 [src/lib.rs](/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-09/fixture/src/lib.rs:19) `encode`: there are no tests for the documented boundary cases. At minimum, add tests that `encode(vec![0; 65_535]).to_bytes()` has header `0xffff`, and that a `65_536` or 1 MiB payload is represented correctly or rejected according to the chosen protocol.\n\nVerdict: **do not merge**; `encode` violates the stated framing contract for supported payload sizes.",
+  "call_ok": true
+}

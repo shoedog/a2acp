@@ -1,0 +1,35 @@
+{
+  "bridge_git_sha": "256d3568b537b3f8d22e2968c5a6846f10f54ec1",
+  "bridge_help_head": "a2a-bridge \u2014 A2A\u2194ACP bridge + multi-agent workflow runner",
+  "bridge_bin": "/Users/wesleyjinks/code/a2a-bridge/target/release/a2a-bridge",
+  "bridge_config": "/Users/wesleyjinks/code/a2a-bridge/evals/configs/eval-agents.toml",
+  "taskset_id": "review-seeded-v1",
+  "cells": [
+    {
+      "id": "duo",
+      "workflow_id": "code-review-duo",
+      "authorship_agents": [
+        "codex",
+        "claude",
+        "claude"
+      ]
+    },
+    {
+      "id": "codex-solo",
+      "workflow_id": "code-review-codex-solo",
+      "authorship_agents": [
+        "codex"
+      ]
+    },
+    {
+      "id": "claude-solo",
+      "workflow_id": "code-review-claude-solo",
+      "authorship_agents": [
+        "claude"
+      ]
+    }
+  ],
+  "judge_agent_id": "kiro",
+  "allow_same_family_judge": false,
+  "started_at": "2026-07-05T05:48:04Z"
+}

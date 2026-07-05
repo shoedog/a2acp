@@ -1,0 +1,78 @@
+items:
+- cell: claude-solo
+  item: rc-02
+  seeded: false
+  found: []
+  false_findings: 3
+  item_pass: false
+  agree: null
+- cell: codex-solo
+  item: rc-04
+  seeded: false
+  found: []
+  false_findings: 0
+  item_pass: true
+  agree: null
+- cell: duo
+  item: rc-02
+  seeded: false
+  found: []
+  false_findings: 6
+  item_pass: false
+  agree: null
+- cell: claude-solo
+  item: rs-07
+  seeded: true
+  found:
+  - rs-07-d1
+  false_findings: 0
+  item_pass: true
+  agree: null
+- cell: codex-solo
+  item: rs-11
+  seeded: true
+  found:
+  - rs-11-d1
+  false_findings: 2
+  item_pass: true
+  agree: null
+- cell: duo
+  item: rs-10
+  seeded: true
+  found:
+  - rs-10-d1
+  false_findings: 0
+  item_pass: true
+  agree: null
+- cell: claude-solo
+  item: rs-06
+  seeded: true
+  found:
+  - rs-06-d1
+  false_findings: 0
+  item_pass: true
+  agree: null
+- cell: codex-solo
+  item: rs-07
+  seeded: true
+  found:
+  - rs-07-d1
+  false_findings: 1
+  item_pass: true
+  agree: null
+- cell: duo
+  item: rs-09
+  seeded: true
+  found:
+  - rs-09-d1
+  false_findings: 0
+  item_pass: true
+  agree: null
+- cell: claude-solo
+  item: rs-02
+  seeded: true
+  found:
+  - rs-02-d1
+  false_findings: 1
+  item_pass: true
+  agree: null

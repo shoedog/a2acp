@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-02-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 1,
+  "neutral_matched": 1,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "claude-solo",
+  "item": "rs-02",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-02/truth.yaml",
+  "normalized_block": "I confirmed the actual source. The diff's context omits the body of `validate()`, but the file shows it plainly.\n\n## Review: rs-02 \u2014 SandboxConfig mount overrides\n\n**BLOCKER \u2014 `validate()` never checks `overrides.extra_mounts`; the override layer bypasses the security gate.** Location: `validate()` at `src/lib.rs:27-37` iterates only `self.mounts`, while `effective_mounts()` (`:40-46`) unions in `overrides.extra_mounts`. The stated contract \u2014 \"every path `effective_mounts()` will bind-mount MUST pass `under_root`\" \u2014 is now violated. Concrete exploit: `SandboxConfig { allowed_root: \"/srv/agent\", mounts: [], overrides: Some(Overrides { extra_mounts: [Mount{host:\"/etc\"}] }) }` passes `validate()` and then `effective_mounts()` hands `/etc` to the bind-mount, i.e. a full sandbox escape via the exact feature this diff adds. Fix direction: `validate()` must cover the override mounts too.\n\n**MAJOR \u2014 the invariant is enforced by *duplicated* mount enumeration instead of a single seam, which is the structural cause of the BLOCKER and will recur.** `validate()` and `effective_mounts()` each independently list where mounts come from; the diff extended one and forgot the other. This is the classic \"two parallel lists that must be kept in sync by hand\" anti-pattern. Any future mount source (env-derived mounts, workspace auto-mounts, a second override tier) will re-open the same hole. Fix direction: make `effective_mounts()` the single source of truth and have `validate()` iterate `self.effective_mounts()` \u2014 then validation is automatically total over whatever gets mounted, and adding a mount source can't silently skip the check.\n\n**MINOR \u2014 `under_root` compares with `starts_with` and no canonicalization, so `..`/symlink traversal escapes even for base mounts.** Location: `under_root` at `src/lib.rs:22-24`. `Path::starts_with` is component-wise (good \u2014 `/srv/agentX` won't match `/srv/agent`), but a host path like `/srv/agent/../../etc` still starts with the `/srv/agent` components and passes, then resolves outside the root at mount time; symlinked mount targets slip through the same way. This is pre-existing, but the overrides feature widens the surface that relies on it. Fix direction: canonicalize (or reject `..` components / resolve symlinks) before the prefix check.\n\n**Verdict:** Reject \u2014 the overrides layer is bind-mounted but never validated, a direct sandbox-escape violation of the module's core invariant; the underlying cause is duplicated mount enumeration that should be collapsed to a single validated seam.",
+  "call_ok": true
+}

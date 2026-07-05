@@ -1,0 +1,20 @@
+I'll read the actual fixture to ground my review in the real code, not just the diff.I've read the full fixture (it's self-contained; the crate is `rc02-lock-scope-clone`). Here's my architecture-lens review.
+
+## Verdict-relevant baseline (correctness of the stated contract)
+
+The stated contract — *"the prompts map lock must NOT be held across the agent round-trip"* — **is satisfied**, and I want to state that plainly because the setup baits the opposite finding:
+
+- The guard `prompts` lives only inside the `{ … }` block (`src/lib.rs:38–41`). The clone happens under the lock (correct — you must copy before releasing), then the guard drops at the block's closing brace, *before* `run_turn(&prompt).await` at line 42. No lock is held across the `.await`.
+- The `?` early-return path (`prompts.get(id)?`, line 40) does **not** leak the lock. `?` desugars to a `return None` while `prompts` is still in scope, and Rust drops in-scope locals before the function returns — so the guard is released on the miss path too. This is **not WRONG**, and reporting a "lock held across await / lock leaked on early return" bug here would be a false positive.
+
+So: no correctness or safety defect introduced by the diff. The architecture concerns below are what a correctness-only pass misses.
+
+## Findings
+
+**MAJOR — Missing error seam; agent failures have nowhere to go.** `src/lib.rs:8` (`run_turn(&self, …) -> String`) and `:34` (`dispatch -> Option<String>`). The round-trip type is infallible `String`, and `dispatch`'s `Option` already spends its one bit on "session missing." The doc comment calls this a real, slow ACP round-trip — which in the real bridge *can* fail (crash, timeout, transport error). There is no channel to surface that: a failure must be smuggled into the returned `String` or panic. *Consequence:* the first time `run_turn` becomes `Result<String, E>`, both signatures change and every caller of `dispatch` breaks — the seam has to be recut under pressure. *Direction:* make `run_turn -> Result<String, E>` and `dispatch -> Result<Option<String>, E>` (or a purpose-built enum distinguishing NoSession / TurnFailed / Ok) now, while there's one caller.
+
+**MAJOR — Seam guards the map, not the session.** The lock protects the *HashMap*, but nothing enforces "at most one in-flight turn per session id." Two concurrent `dispatch("s1")` calls both clone the prompt, both drop the lock, and both drive `agent.run_turn` for the same session simultaneously. The fixture's `Agent` is a stateless unit struct so it can't show the defect, but the comment ("warm/slow ACP round-trip in the real bridge") and the project's warm-per-session model mean the real agent is per-session stateful — interleaved turns on one session would corrupt it. *Consequence:* the contract only promises *cross-session* concurrency, so this gap is silent until a caller (retry, double-submit, reattach) fires the same id twice. *Direction:* introduce a per-session turn guard (per-id lock/`OwnedMutexGuard` held across the round-trip, or an in-flight set) as an explicit invariant, separate from the map lock.
+
+**MINOR — Read-and-run with no prompt lifecycle.** `dispatch` clones but never consumes/removes the entry, and there's no versioning. A `set_prompt` racing after the clone means the turn runs a now-stale prompt with no record of which version executed, and the "stored prompt" can be re-dispatched indefinitely. This is an acceptable consequence of the lock-drop design, but the *policy* (one-shot vs. persistent prompts, last-writer-wins staleness) is undocumented and unowned. *Direction:* decide and encode whether prompts are one-shot (`remove` instead of `get`) or durable, so a future scheduler/retry doesn't inherit an ambiguous contract.
+
+**One-line verdict:** Lock scoping is correct and the baited "lock across await" bug does not exist; the real, correctness-pass-invisible risks are the absent error seam (`String`/`Option` can't carry agent failure) and the absent per-session turn invariant — fix both while there's a single caller.

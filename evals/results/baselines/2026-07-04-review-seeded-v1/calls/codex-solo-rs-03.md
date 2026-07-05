@@ -1,0 +1,5 @@
+1. **BLOCKER (WRONG)** [src/lib.rs:29-30](/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-03/fixture/src/lib.rs:29) `BridgeError::Upstream { .. }` formats `{self}`, which calls `Display` and includes `url` and `source` from lines 14-15. For `Upstream { url: "https://internal/api", source: "dns failed" }`, `client_message()` returns `upstream request failed: upstream https://internal/api failed: dns failed`, leaking exactly the internal detail the contract forbids. Fix by returning a stable generic string such as `"upstream request failed"` without using `self`.
+
+2. **MAJOR (SMELL)** [src/lib.rs:26](/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-03/fixture/src/lib.rs:26) The new client-facing `Upstream` path has no regression test covering redaction; this crate has no tests at all. Add a test constructing `Upstream` with an internal URL/source and asserting the exact generic client message plus non-containment of the URL/source.
+
+Verdict: **Do not merge; the new client message violates the stated wire-safety contract.**

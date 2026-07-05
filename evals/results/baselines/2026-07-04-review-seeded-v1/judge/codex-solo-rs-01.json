@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-01-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 1,
+  "neutral_matched": 0,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "codex-solo",
+  "item": "rs-01",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-01/truth.yaml",
+  "normalized_block": "I\u2019ll inspect the fixture and the reviewed file only, then I\u2019ll stop at the review verdict.The reviewed file already contains the patched implementation, and the repo is very small. I\u2019m checking for tests and any call sites so the finding is tied to actual behavior rather than speculation.I found only `src/lib.rs` in the fixture and no test files or call sites. The defect is confined to `dispatch`: the mutex guard remains live through the awaited agent call.1. **BLOCKER (WRONG)** \u2014 `src/lib.rs:45-48`, `SessionManager::dispatch`: the `sessions` mutex guard is held across `self.agent.run_turn(...).await`. When `dispatch(\"a\")` starts a slow turn, a concurrent `dispatch(\"b\")` or `open(\"b\")` blocks on the same map lock even though it targets another session, violating the contract that one slow turn must not block every session. Fix by limiting the map lock to existence lookup, dropping it before `await`, then reacquiring it to update `turns`, or by moving per-session mutable state behind a separate per-session lock.\n\n2. **MINOR (SMELL)** \u2014 missing regression coverage for the concurrency contract around `dispatch`. A test with a controllable/parked agent turn for session `a` should assert that opening or dispatching session `b` is not blocked while `a` is awaiting; this patched implementation would fail that test.\n\nVerdict: **Do not merge; the refactor directly violates the stated dispatch locking contract.**",
+  "call_ok": true
+}

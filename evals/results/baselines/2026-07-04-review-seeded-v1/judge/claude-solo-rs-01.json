@@ -1,0 +1,19 @@
+{
+  "item_pass": true,
+  "defects": [
+    {
+      "id": "rs-01-d1",
+      "found": true
+    }
+  ],
+  "false_findings": 0,
+  "neutral_matched": 0,
+  "judge_error": false,
+  "call_failed": false,
+  "cell": "claude-solo",
+  "item": "rs-01",
+  "seeded": true,
+  "truth_path": "/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-01/truth.yaml",
+  "normalized_block": "I'll ground this review in the actual fixture code, then analyze the diff line-by-line.Confirmed against `src/lib.rs`: `sessions` is a `tokio::sync::Mutex<HashMap<..>>`, and `dispatch` now holds its guard across the agent round-trip.\n\n---\n\n**BLOCKER \u2014 `src/lib.rs:45-49` \u2014 map lock held across `run_turn().await` (WRONG).**\n`let mut sessions = self.sessions.lock().await` (45) acquires the guard, and both that `MutexGuard` and the `&mut session` borrow into the map (46) stay alive across `self.agent.run_turn(id, prompt).await` (48). Because `tokio::sync::Mutex` keeps the guard held across the suspension point, every other concurrent `dispatch` \u2014 for *any* session id \u2014 blocks at line 45 for the full duration of the in-flight turn (the doc comment says \"many seconds\"). Concrete scenario: session A dispatches a slow turn; session B's dispatch cannot proceed until A's ACP round-trip completes. That is a global serialization of all sessions and a verbatim violation of the stated contract (\"the lock\u2026 must NOT be held across the agent round-trip, so one slow turn cannot block every other session\"). **Fix:** restore the two-phase structure the diff removed \u2014 capture what you need (or confirm existence) under the lock, drop the guard *before* `run_turn`, then re-lock briefly to bump `turns`.\n\n**MAJOR \u2014 same site \u2014 re-entrancy / liveness (WRONG under a plausible future).**\nThe lock scope now spans foreign code (`self.agent.run_turn`). `tokio::sync::Mutex` is not reentrant, so the moment the agent needs to call back into `SessionManager` (open a sub-session, read/update session state, register a child turn) the task self-deadlocks. Even absent re-entrancy, `open()` (line 32) contends on the same lock, so no new session can be created while *any* turn is in flight. The refactor has silently given the map lock a second responsibility \u2014 serializing turn execution \u2014 beyond \"protect the map.\"\n\n**MAJOR \u2014 missing seam (absence check, SMELL).**\nThe design needs the map's lifetime and a turn's lifetime to be independent; the diff collapsed the two locks that provided exactly that separation. The right unit of protection is per-session (a `Mutex`/`Arc` handle cloned out from under the map lock), so map integrity and turn concurrency don't share a critical section. Without that seam, this class of regression will keep recurring whenever someone \"simplifies\" the locking.\n\n**MINOR \u2014 `src/lib.rs:47` comment entrenches the bug (SMELL).**\n\"Run the turn while we hold the session so we can record it in place\" documents the lock-across-await as intentional. A future reviewer will read it as a deliberate, safe choice, making the regression stickier and harder to catch.\n\n**Design note (not a defect):** the old code had a benign gap \u2014 a session removed mid-turn made the post-turn `get_mut(id)?` return `None` and discard the reply. The new code closes that gap, which is likely what motivated the change, but it \"pays\" with the entire concurrency model. If that consistency actually matters, re-lock and handle the \"session vanished during turn\" case explicitly; don't hold the lock.\n\n**Verdict: REJECT \u2014 the refactor holds the sessions map `Mutex` across the agent round-trip, serializing all sessions (and risking re-entrant deadlock), which directly violates the module's stated non-blocking contract.**",
+  "call_ok": true
+}

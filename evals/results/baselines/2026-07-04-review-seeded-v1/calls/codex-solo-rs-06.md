@@ -1,0 +1,5 @@
+I’ll keep this read-only and anchored to the diff. I’m going to verify the surrounding `EventLog` code and any direct call expectations, then stop with the review findings.1. **BLOCKER WRONG** - [src/lib.rs](/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-06/fixture/src/lib.rs:31) `EventLog::events_since` replays the cursor event because it filters with `e.seq >= cursor`. With events `seq = [1, 2]` and `cursor = 1`, it returns `[1, 2]` instead of `[2]`, duplicating the already-delivered SSE event and violating the exact-once reconnect contract. Fix by using `e.seq > cursor`.
+
+2. **MINOR SMELL** - [src/lib.rs](/Users/wesleyjinks/code/a2a-bridge/evals/tasksets/review-seeded-v1/items/rs-06/fixture/src/lib.rs:28) there is no test covering the boundary that defines this API: cursor equal to an existing event sequence. Add a test where `events_since(1)` excludes seq `1`, plus edge cases like `cursor = 0` returns all events and `cursor >= last_seq` returns only strictly newer or empty.
+
+Verdict: do not merge; the core replay predicate is off by one and breaks the stated contract.
