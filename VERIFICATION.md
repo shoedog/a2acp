@@ -13,17 +13,16 @@ updated at each slice's verification checkpoint; the whole-branch review
 
 ## Commands run + results
 
-### Full workspace suite — after slice 4 (stable tree)
+### Full workspace suite — after slice 5 (stable tree)
 ```
 cargo test --workspace -j 1
 ```
 **1424 passed; 0 failed; 12 ignored — across 60 test binaries.** (`-j 1` per the
 repo's known linker-OOM on heavy test builds.) Independently run by the
-orchestrator against the post-slice-4 tree. Slices 3 and 4 both drew alarming
-mid-edit IDE-diagnostic snapshots (phantom `docker_runner`/`VerifyConfig`/
-`ImplementPhase` errors); in both cases `cargo build` against the final tree was
-clean — rustc is authoritative, IDE snapshots are not. Verified from scratch each
-slice regardless of the implementor's report.
+orchestrator against the post-slice-5 tree. Slices 3, 4, and 5 each drew alarming
+mid-edit IDE-diagnostic snapshots (phantom errors); in every case `cargo build`
+against the final tree was clean — rustc is authoritative, IDE snapshots are not.
+Verified from scratch each slice regardless of the implementor's report.
 
 ### Per-slice detail
 - **Slice 1 — scaffold (`c0be85d`):** `cargo build -p bridge-controller` clean;
@@ -36,12 +35,20 @@ slice regardless of the implementor's report.
   (plain `Debug, Clone`, no serde); `config.rs` keeps `VerifyToml::to_config` +
   `gate_verify_runtime` (logic untouched, resolving to the library type via a
   `use`); re-export → `{review, turn, verify, implement}`. Full suite 1424/0/12.
-- **Slice 4 — move `tweak` + `implement_resume` + `resilient`:** three wholesale
-  pure renames; all `crate::…` refs became intra-library; straddling trait impls
-  stayed legal (`TweakEffects for ProdEffects` at bin; `CheckpointSink`/
-  `TurnRunner`/`WarmRebuild` impls intra-library); re-export →
-  `{implement, implement_resume, resilient, review, tweak, turn, verify}`. The
-  `bridge-controller` lib test binary now holds 96 tests. Full suite 1424/0/12.
+- **Slice 4 — move `tweak` + `implement_resume` + `resilient` (`4936cb9`):** three
+  wholesale pure renames; all `crate::…` refs became intra-library; straddling
+  trait impls stayed legal (`TweakEffects for ProdEffects` at bin; `CheckpointSink`/
+  `TurnRunner`/`WarmRebuild` impls intra-library). Full suite 1424/0/12.
+- **Slice 5 — `merge` split + relocate `MergeConfig`:** `merge.rs` moved wholesale;
+  `merge_cmd` + `MERGE_USAGE` + the `merge_usage_matches_the_actual_parser` test
+  extracted BACK to the bin (`main.rs`) — the CLI wrapper that parses args + the
+  `RegistryConfig` file root stays at the composition root, per Fable M4. Its one
+  internal call is qualified `merge::merge_clone`. `MergeConfig` struct relocated
+  `config.rs`→library `merge.rs` (co-located with `OperatorIdent`); `config.rs`
+  keeps `MergeToml::to_config` (resolving to the library type via a `use`).
+  re-export → `{implement, implement_resume, merge, resilient, review, tweak,
+  turn, verify}`. Verified the usage test now runs in the bin's `cli_tests` and
+  the 11 merge-logic tests in `bridge-controller`. Full suite 1424/0/12.
 
 ## Verified
 - Full workspace test suite green (1424/0/12) on the post-slice-2 tree.

@@ -17,6 +17,13 @@ pub struct OperatorIdent {
     pub email: String,
 }
 
+/// Validated `[merge]` config.
+#[derive(Debug, Clone)]
+pub struct MergeConfig {
+    pub target_ref: Option<String>,
+    pub author: Option<OperatorIdent>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergePlan {
     /// Proceed to land on `target` (a SHORT branch name).
@@ -364,7 +371,7 @@ impl MergeOutcome {
 /// Shared core: validate, gate, preflight, re-author, push, reap. Prints user-facing lines itself.
 /// Both `merge_cmd` (after `resolve_clone`) and `implement --merge` (with a known clone) call this.
 pub fn merge_clone(
-    mcfg: Option<&crate::config::MergeConfig>,
+    mcfg: Option<&MergeConfig>,
     clone: &Path,
     root: &Path,
     onto: Option<&str>,
@@ -500,72 +507,6 @@ pub fn merge_clone(
     }
 }
 
-/// Dispatcher-level `--help`/`-h` for `merge` is handled in `main.rs` (this constant is
-/// `pub` so the top-level dispatcher can print it) BEFORE `merge_cmd`'s own parser runs —
-/// its `--onto`/`--config`/`--force`-only loop would otherwise reject `--help` as an
-/// "unexpected arg".
-pub const MERGE_USAGE: &str = "\
-usage: a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--force]
-
-Land an Approved `implement` run's commit into its source_repo, re-authored to the operator,
-via `git commit-tree` + `git push --force-with-lease` (Mode A: fast-forward onto --onto).
-  <id>             the run id (the clone dir name under .a2a-implement/)
-  --config <path>  registry config providing allowed_cwd_root + [merge] (default: ./a2a-bridge.toml)
-  --onto <branch>  target branch to land onto (else [merge].target_ref, else the run's base_ref)
-  --force          also allow landing a LoopStopped (not Approved) run";
-
-/// `a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--force]`
-pub async fn merge_cmd(args: &[String]) -> Result<(), crate::BoxError> {
-    let mut id: Option<String> = None;
-    let mut config_path = std::path::PathBuf::from(crate::CONFIG_PATH);
-    let mut onto: Option<String> = None;
-    let mut force = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" => {
-                i += 1;
-                config_path = args.get(i).ok_or("merge: --config needs a path")?.into();
-            }
-            "--onto" => {
-                i += 1;
-                onto = Some(args.get(i).ok_or("merge: --onto needs a branch")?.clone());
-            }
-            "--force" => force = true,
-            s if !s.starts_with('-') && id.is_none() => id = Some(s.to_string()),
-            s => return Err(format!("merge: unexpected arg {s:?}").into()),
-        }
-        i += 1;
-    }
-    let id =
-        id.ok_or("merge: missing <id> (usage: a2a-bridge merge <id> [--onto <branch>] [--force])")?;
-    let config_path = std::fs::canonicalize(&config_path)
-        .map_err(|e| format!("merge: config {}: {e}", config_path.display()))?;
-    let raw =
-        std::fs::read_to_string(&config_path).map_err(|e| format!("merge: read config: {e}"))?;
-    let cfg = crate::config::RegistryConfig::parse(&raw)
-        .map_err(|e| format!("merge: config parse: {e}"))?;
-    let root = cfg
-        .allowed_cwd_root
-        .clone()
-        .ok_or("merge: config needs allowed_cwd_root")?;
-    let root = std::fs::canonicalize(&root)
-        .map_err(|e| format!("merge: allowed_cwd_root {root:?}: {e}"))?;
-    let mcfg = cfg
-        .merge
-        .as_ref()
-        .map(|m| m.to_config())
-        .transpose()
-        .map_err(|e| format!("merge: {e}"))?;
-    let clone =
-        crate::implement_resume::resolve_clone(&root, &id).map_err(|e| format!("merge: {e}"))?;
-
-    let outcome = merge_clone(mcfg.as_ref(), &clone, &root, onto.as_deref(), force);
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-    std::process::exit(outcome.code());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,19 +514,6 @@ mod tests {
 
     fn ok(t: &str) -> Result<String, String> {
         Ok(t.to_string())
-    }
-
-    #[test]
-    fn merge_usage_matches_the_actual_parser() {
-        // `merge_cmd`'s loop accepts exactly --config/--onto/--force plus a positional <id>;
-        // keep the usage constant honest against that, not a guess (W3-A).
-        assert!(MERGE_USAGE.starts_with("usage: a2a-bridge merge <id>"));
-        for flag in ["--config <path>", "--onto <branch>", "--force"] {
-            assert!(
-                MERGE_USAGE.contains(flag),
-                "missing {flag:?}: {MERGE_USAGE}"
-            );
-        }
     }
 
     #[test]

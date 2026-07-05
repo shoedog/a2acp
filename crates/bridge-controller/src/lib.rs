@@ -16,10 +16,12 @@
 
 pub mod implement;
 pub mod implement_resume;
+pub mod merge;
 pub mod resilient;
 pub mod review;
 pub mod tweak;
 pub mod turn;
 pub mod verify;
 
+pub use merge::{MergeConfig, OperatorIdent};
 pub use verify::VerifyConfig;

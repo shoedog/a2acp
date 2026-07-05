@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot};
 use bridge_core::ids::AgentId;
+use bridge_controller::merge::MergeConfig;
 use bridge_controller::verify::VerifyConfig;
 
 /// Unified parse error covering TOML parse failures and missing env-var references.
@@ -950,13 +951,6 @@ pub struct MergeToml {
     pub target_ref: Option<String>,
     pub author_name: Option<String>,
     pub author_email: Option<String>,
-}
-
-/// Validated `[merge]` config.
-#[derive(Debug, Clone)]
-pub struct MergeConfig {
-    pub target_ref: Option<String>,
-    pub author: Option<crate::merge::OperatorIdent>,
 }
 
 impl MergeToml {
