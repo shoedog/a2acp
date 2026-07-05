@@ -162,7 +162,6 @@ pub trait CheckpointSink: Send {
 }
 
 /// A no-op sink for callers that do not persist checkpoint progress (used in tests + by non-persisting callers).
-#[allow(dead_code)]
 pub struct NoopCheckpointSink;
 
 impl CheckpointSink for NoopCheckpointSink {

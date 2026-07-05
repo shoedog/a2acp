@@ -50,19 +50,32 @@ Verified from scratch each slice regardless of the implementor's report.
   turn, verify}`. Verified the usage test now runs in the bin's `cli_tests` and
   the 11 merge-logic tests in `bridge-controller`. Full suite 1424/0/12.
 
+- **Slice 6 — tighten + final verification:** confirmed the Fable B1
+  invariant HELD — all four `verify_cfg` adapter fields still carry
+  `Option<Result<verify::VerifyConfig, config::ConfigError>>` and `run_verify_step`
+  still maps the full `None`/`Some(Err)`/`Some(Ok)` tri-state (no signature drift;
+  the gate-rejected-runtime → non-mergeable distinction is intact). Dropped the now
+  redundant `#[allow(dead_code)]` on the `pub NoopCheckpointSink`. `cargo clippy
+  --workspace` clean; full suite 1424/0/12.
+
 ## Verified
-- Full workspace test suite green (1424/0/12) on the post-slice-2 tree.
-- Slice 2 is a behavior-preserving move: source files are byte-identical renames;
-  the shim re-points every `crate::review::`/`crate::turn::` reference with zero
-  call-site edits; no logic touched.
-- Slice 1 scaffold builds; dependency set matches the dual-review corrections
-  (`futures` added; `tempfile`/`tokio-stream` dev-deps).
+- **EXTRACTION COMPLETE.** The whole controller cluster (turn, review, verify,
+  implement, tweak, implement_resume, resilient, merge — minus `docker_runner` and
+  `merge_cmd`/`MERGE_USAGE`) plus `VerifyConfig`/`MergeConfig` now live in
+  `bridge-controller`; the bin keeps config parsing + the effects adapters + CLI
+  dispatch, wired through one crate-root re-export shim.
+- Full workspace test suite green (**1424 passed / 0 failed / 12 ignored**, 60 test
+  binaries) on the final tree; `cargo clippy --workspace` clean.
+- Behavior-preserving throughout: moved source is byte-identical (renames) or
+  namespace-only edits; no logic touched; adapter signatures unchanged (Fable B1).
+- Dependency set matches the dual-review corrections (`futures` added;
+  `tempfile`/`tokio-stream` dev-deps); no dependency cycle; no orphan-rule break.
 
 ## Not verified (pending)
-- Slices 3–6 behavior preservation (each gated by the full suite before its
-  commit, recorded here).
-- Whole-branch review (opus 4.8 + codex xhigh) before merge, per the pipeline.
+- Whole-branch review (opus 4.8 + codex xhigh) before merge, per the pipeline —
+  the next gate.
 
 ## Out-of-scope failures
-- None. The full workspace suite showed 0 failures; nothing was re-baselined or
-  silently fixed.
+- None. Every slice's full workspace suite showed 0 failures; nothing was
+  re-baselined or silently fixed. Slices 3/4/5 drew alarming mid-edit IDE
+  diagnostics that were all stale (rustc clean each time).
