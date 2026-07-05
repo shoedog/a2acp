@@ -4418,3 +4418,43 @@ async fn run_batch_rpc_delegates_through_coordinator() {
         "BatchList must include {batch_id}: {lbody}"
     );
 }
+
+/// #10 slice 4: a unary workflow submit carrying VALID agent-config overrides must
+/// still SUCCEED through the Coordinator. The Workflow arm strips
+/// agent/model/effort/mode before `run_workflow` (which REJECTS them); forwarding an
+/// override would surface as `InvalidRequest` (inv 7 / Fable M1). Exercises the
+/// coordinator detached-submit delegation path.
+#[tokio::test]
+async fn unary_workflow_submit_delegates_and_strips_overrides() {
+    let srv = build_coordinator_batch_server();
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_MESSAGE,
+            json!({ "message": {
+                "text": "---\ntask-type: freeform\n---\nDIFF",
+                "metadata": {
+                    "a2a-bridge.skill": "code-review",
+                    "a2a-bridge.effort": "high",
+                    "a2a-bridge.model": "sonnet"
+                }
+            }}),
+        ))
+        .await
+        .unwrap();
+    let body = json_response(resp).await;
+    assert!(
+        body.get("error").is_none(),
+        "workflow submit with overrides must not be rejected (they are stripped): {body}"
+    );
+    let task = &body["result"]["task"];
+    let state = task["status"]["state"]
+        .as_str()
+        .or_else(|| task["state"].as_str());
+    assert_eq!(
+        state,
+        Some("TASK_STATE_WORKING"),
+        "detached submit must return a Working task via the coordinator: {body}"
+    );
+}

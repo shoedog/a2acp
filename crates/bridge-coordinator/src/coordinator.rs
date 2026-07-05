@@ -1602,6 +1602,45 @@ mod tests {
         }
     }
 
+    /// #10 slice 4: `coordinator.resume()` is the serve boot-resume entry point that
+    /// REPLACES the adapter's `resume_working_tasks`. It must scan the store and act on
+    /// each `Working` task. A crashed-mid-run task with no workflow snapshot is
+    /// unresumable → the resume scan finalizes it `Interrupted` (deterministic, no graph
+    /// execution). This covers the coordinator's resume dispatcher over the (shared) store.
+    #[tokio::test]
+    async fn resume_interrupts_unresumable_working_task() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let id = task("resume-no-snapshot");
+        fixture
+            .task_store
+            .create(&TaskRecord {
+                id: id.clone(),
+                workflow: "code-review".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+                input: String::new(),
+                workflow_spec_json: None, // unresumable: no snapshot to reconstruct the graph
+                resume_attempts: 0,
+                session_cwd: None,
+                batch_id: None,
+                item_id: None,
+            })
+            .await
+            .unwrap();
+
+        fixture.coordinator.resume().await;
+
+        let rec = fixture.task_store.get(&id).await.unwrap().unwrap();
+        assert_eq!(
+            rec.status,
+            TaskRecordStatus::Interrupted,
+            "coordinator.resume() must interrupt an unresumable working task"
+        );
+    }
+
     #[tokio::test]
     async fn status_context_xor_task_id() {
         let fixture = coordinator_fixture(Arc::new(HashMap::new()));

@@ -6144,8 +6144,8 @@ async fn main() -> Result<(), BoxError> {
     // `with_coordinator` re-points the shared-identity set onto the Coordinator's
     // instances; adapter-only wire state (route/auth/base_url/delegation/label/
     // model_catalog + the Option<String> cwd-gate root) stays adapter-resident.
-    // (Boot resume still runs via `resume_working_tasks` below — the switch to
-    // `coordinator.resume()` is slice 4, so exactly ONE resume path runs here.)
+    // Boot resume runs via `coordinator.resume()` below (slice 4) — exactly ONE
+    // resume path, over the SAME shared store the detached submits write to.
     let server = Arc::new(
         InboundServer::new(
             Arc::clone(&registry) as _,
@@ -6189,7 +6189,11 @@ async fn main() -> Result<(), BoxError> {
     // 8b. Resume in-flight detached workflows from their checkpoints BEFORE accepting
     //     new requests. Boot order: open store → build server → resume → bind listener.
     //     For the in-memory/no-path branch the store is always empty so this is a no-op.
-    bridge_a2a_inbound::server::resume_working_tasks(&server, resume_cap).await;
+    //     #10 slice 4: resume via the Coordinator (its resume() dispatches to the SAME
+    //     batch::resume_all / detached::resume_non_batch_tasks over the SHARED store +
+    //     BatchRuntime as the adapter's resume_working_tasks). This REPLACES the adapter
+    //     call — NEVER both, or a working task double-spawns two runners (Fable M4).
+    coordinator.resume().await;
 
     // 8c. Build the axum router (consumes one Arc ref; hold a clone above for resume).
     let router = server.router();

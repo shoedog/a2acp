@@ -129,9 +129,58 @@ warm coordinator-backed server, warms a context, then SessionInject (coordinator
 path) → `queued:1` + the SHARED `sm.pending_inject_count == 1`; SessionPermit
 (coordinator path) → `resolved:true` + the SHARED registry resolves the rendezvous.
 
+### Slice 4 — detached submit + boot resume → Coordinator (owner live-gate pending)
+```
+cargo test --workspace -j 1     → 1430 passed / 0 failed / 12 ignored
+cargo clippy -p bridge-a2a-inbound -p bridge-coordinator -p a2a-bridge -j 1  → clean
+```
+1430 = slice-3's 1428 + two new tests.
+
+**Changes:**
+- **server.rs (detached submit, unary Workflow arm):** delegates to
+  `coordinator.run_workflow(OpParams)` when a Coordinator is present — with
+  `agent/model/effort/mode` hardcoded `None` (inv 7 / Fable M1: the arm has ALWAYS
+  dropped overrides for workflows, and `run_workflow` REJECTS them; forwarding
+  would turn a today-succeeding `a2a-bridge.model` submit into `InvalidRequest`).
+  The Working `a2a::Task` response is reconstructed from the returned `TaskId`. The
+  existing inline arm stays verbatim as the coordinator-less fallback (tests).
+- **main.rs (boot resume):** `resume_working_tasks(&server, cap)` → `coordinator.resume()`,
+  REPLACING it (Fable M4 — never both, or a Working task double-spawns two runners).
+
+**Behavior-preserving argument (verified against source):**
+- *Submit:* the Coordinator submits over the SAME shared task_store / progress_hubs /
+  workflow_cancels / executor (slice 1) and encodes the spec via the SAME
+  `encode_workflow_spec` (s8 T9). cwd was already validated in `gate()` against the
+  adapter's real root; `run_workflow`'s re-validation (root `None`) is a no-op
+  re-parse of the already-normalized path; input re-validation (`validate_input`)
+  is the same check the gate already ran. Routed workflows always have a known
+  graph, so the unknown-wf branch (adapter finalizes Failed vs Coordinator
+  `InvalidRequest`) is unreachable via the router.
+- *Resume:* `coordinator.resume()` and `resume_working_tasks` BOTH branch on the
+  shared BatchRuntime and dispatch to the identical underlying fns —
+  `batch::resume_all` (batch configured) / `detached::resume_non_batch_tasks`
+  (else) — over the shared `detached_deps`. `resume_working_tasks` in `detached.rs`
+  is a one-line wrapper over `resume_non_batch_tasks`. `allowed_cwd_root` is used
+  ONLY in `run_batch`'s submit-time validation (batch.rs:92), never in any resume
+  path — so the Coordinator's `None` root is irrelevant to resume. Both use a
+  SystemClock. => drop-in equivalent.
+
+**New tests:**
+- `resume_interrupts_unresumable_working_task` (coordinator.rs): seeds a `Working`
+  task with no snapshot; `coordinator.resume()` scans the store and finalizes it
+  `Interrupted` — covers the serve boot-resume entry point deterministically.
+- `unary_workflow_submit_delegates_and_strips_overrides` (workflow_producer.rs):
+  a unary workflow submit carrying `a2a-bridge.effort/model` overrides still returns
+  a Working task via the Coordinator (not `InvalidRequest`) — proves the strip.
+
+**OWNER LIVE-GATE PENDING (task #22):** `cargo test` cannot cover a real
+boot→submit→restart→resume cycle. Owner must run: submit a detached workflow →
+restart serve → confirm it resumes from the durable store (cross-surface s8 T9).
+
 ## Verified
-- Full workspace suite green (**1428/0/12** after slice 3; 1427 after slice 2;
-  1426 after slice 1) on the final tree; clippy clean; golden-wire 15/15.
+- Full workspace suite green (**1430/0/12** after slice 4; 1428 after slice 3;
+  1427 after slice 2; 1426 after slice 1) on the final tree; clippy clean;
+  golden-wire 15/15.
 - Shared-Arc identity proven by `Arc::ptr_eq` across all 13 shared fields.
 - SessionManager clock switch proven behavior-identical from source.
 

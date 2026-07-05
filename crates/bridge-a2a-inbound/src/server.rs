@@ -2518,6 +2518,54 @@ async fn unary_message(
         // Detached submit: mint a unique id, persist Working, register the
         // cancel token, spawn the runner, and return a working Task NOW.
         RouteTarget::Workflow(ref wf_id) => {
+            // #10 slice 4: delegate the detached submit to the Coordinator when present.
+            // STRIP agent/model/effort/mode — the A2A Workflow arm has ALWAYS dropped
+            // them (AgentOverride is dropped for workflows) and `run_workflow` REJECTS
+            // them (inv 7 / Fable M1): forwarding them would turn a today-succeeding
+            // `a2a-bridge.model` submit into InvalidRequest. The Coordinator submits over
+            // the SAME shared task_store / progress_hubs / workflow_cancels / executor
+            // (slice 1) and encodes the spec via the SAME `encode_workflow_spec` (s8 T9),
+            // so the durable record + runner + cancel token are identical. cwd was
+            // already validated in `gate()` against the adapter's real root; the
+            // Coordinator's re-validation (root None) is a no-op re-parse. The inline arm
+            // below stays for coordinator-less servers (tests).
+            if let Some(coord) = srv.coordinator() {
+                let input: String = routed
+                    .parts
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let op = bridge_coordinator::params::OpParams {
+                    workflow: Some(wf_id.as_str().to_string()),
+                    skill: None,
+                    input,
+                    context: None,
+                    agent: None,
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    cwd: routed.session_cwd.as_ref().map(|c| c.as_str().to_string()),
+                };
+                return match coord.run_workflow(op).await {
+                    Ok(task) => {
+                        let working = a2a::Task {
+                            id: task.as_str().to_owned(),
+                            context_id: task.as_str().to_owned(),
+                            status: a2a::TaskStatus {
+                                state: a2a::TaskState::Working,
+                                message: None,
+                                timestamp: None,
+                            },
+                            artifacts: None,
+                            history: None,
+                            metadata: None,
+                        };
+                        jsonrpc_ok(id, json!({ "task": working }))
+                    }
+                    Err(e) => bridge_err_to_jsonrpc(id, &e),
+                };
+            }
             let task = new_detached_task_id();
             let now = crate::workflow_sink::now_ms();
             // Pre-join the input text so the persisted `input` is byte-identical to
