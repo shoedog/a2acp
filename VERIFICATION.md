@@ -177,10 +177,44 @@ cargo clippy -p bridge-a2a-inbound -p bridge-coordinator -p a2a-bridge -j 1  →
 boot→submit→restart→resume cycle. Owner must run: submit a detached workflow →
 restart serve → confirm it resumes from the durable store (cross-surface s8 T9).
 
+### Slice 5 — context-lifecycle → Coordinator (owner force-reset live-gate pending)
+```
+cargo test --workspace -j 1     → 1431 passed / 0 failed / 12 ignored
+cargo clippy -p bridge-a2a-inbound -p bridge-coordinator -p bridge-mcp -p a2a-bridge -j 1  → clean
+```
+1431 = slice-4's 1430 + one new test.
+
+**Changes:**
+- **coordinator.rs:** `clear(ctx)` → `clear(ctx, force: bool)` (was hardcoding
+  `false`); passes `force` to `clear_with_children`. `force = true` aborts an
+  in-flight warm turn instead of rejecting.
+- **bridge-mcp/server.rs:** the one `coord.clear(ctx)` caller → `coord.clear(ctx, false)`
+  (mcp SessionClear has no force flag → non-force clear, behaviour unchanged).
+- **server.rs `session_clear`:** early-return delegation to `coordinator.clear(ctx, force)`
+  when a Coordinator is present; the inline arm stays verbatim as the coordinator-less
+  fallback. Identical by construction: the Coordinator holds the SAME shared
+  `workflow_runs` busy-guard + `session_manager` (slice 1), same lock scope
+  (lock → busy-check → `clear_with_children(force)` → drop), same response mapping.
+- **`session_release`/`session_compact`/`session_cancel` NOT changed (D4):** they
+  already call `srv.session_manager` (= `coordinator.session_manager`) + the shared
+  `srv.workflow_runs` — i.e. they ALREADY operate on the Coordinator's instances.
+  There is no Coordinator method for them; slice 7 repoints the field *read* when it
+  deletes `srv.session_manager`. `session_compact`'s detached-task-so-a-dropped-caller-
+  can't-strand-`Compacting` guard is untouched.
+
+**New test:** `session_clear_delegates_through_coordinator` (server.rs): warm a
+context, then SessionClear `force:true` through the coordinator → `cleared:true` +
+a bumped generation on the shared session_manager.
+
+**OWNER LIVE-GATE PENDING (Fable M5, task #23):** `clear(force=true)` fires an
+in-flight warm turn's abort token (both biased selects) — `cargo test` can't drive a
+real mid-turn force-reset. Owner must run: force-reset a context WITH a warm turn
+in flight and confirm the turn aborts cleanly.
+
 ## Verified
-- Full workspace suite green (**1430/0/12** after slice 4; 1428 after slice 3;
-  1427 after slice 2; 1426 after slice 1) on the final tree; clippy clean;
-  golden-wire 15/15.
+- Full workspace suite green (**1431/0/12** after slice 5; 1430 after slice 4;
+  1428 after slice 3; 1427 after slice 2; 1426 after slice 1) on the final tree;
+  clippy clean; golden-wire 15/15.
 - Shared-Arc identity proven by `Arc::ptr_eq` across all 13 shared fields.
 - SessionManager clock switch proven behavior-identical from source.
 

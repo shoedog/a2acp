@@ -535,16 +535,19 @@ impl Coordinator {
         }
     }
 
-    /// Clear a warm context and its children, rejecting while a workflow run owns the context.
+    /// Clear a warm context and its children, rejecting while a workflow run owns the
+    /// context. `force = true` aborts an in-flight warm turn (fires its abort token)
+    /// instead of rejecting; `false` is the non-force clear (rejects a running turn).
     pub async fn clear(
         &self,
         ctx: ContextId,
+        force: bool,
     ) -> Result<crate::session_manager::ResetOutcome, BridgeError> {
         let runs = self.workflow_runs.lock().await;
         if runs.contains_key(&ctx) {
             return Err(BridgeError::HandleBusy);
         }
-        let result = self.session_manager.clear_with_children(&ctx, false).await;
+        let result = self.session_manager.clear_with_children(&ctx, force).await;
         drop(runs);
         result
     }
@@ -1748,7 +1751,7 @@ mod tests {
             .insert(c.clone(), CancellationToken::new());
 
         assert!(matches!(
-            fixture.coordinator.clear(c).await,
+            fixture.coordinator.clear(c, false).await,
             Err(BridgeError::HandleBusy)
         ));
     }

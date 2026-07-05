@@ -3178,6 +3178,32 @@ async fn session_clear(
     if let Err(e) = authorize_headers(&srv, &headers) {
         return bridge_err_to_jsonrpc(id, &e);
     }
+    // #10 slice 5: delegate to `coordinator.clear(force)` when present. The Coordinator
+    // holds the SAME shared workflow_runs busy-guard + session_manager (slice 1), so this
+    // is identical to the inline path — the busy-check + `clear_with_children(force)` run
+    // over the same instances under the same lock scope. `force = true` fires an in-flight
+    // warm turn's abort token (Fable M5: the force-reset owner live-gate lands at THIS
+    // slice). The inline arm below stays for coordinator-less servers (tests).
+    if let Some(coord) = srv.coordinator() {
+        let ctx = match context_id_arg(&params) {
+            Ok(c) => c,
+            Err(e) => return bridge_err_to_jsonrpc(id, &e),
+        };
+        let force = params
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return match coord.clear(ctx.clone(), force).await {
+            Ok(crate::session_manager::ResetOutcome::Cleared { generation }) => jsonrpc_ok(
+                id,
+                json!({ "contextId": ctx.as_str(), "cleared": true, "generation": generation }),
+            ),
+            Ok(crate::session_manager::ResetOutcome::NotFound) => {
+                bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound)
+            }
+            Err(e) => bridge_err_to_jsonrpc(id, &e),
+        };
+    }
     let Some(sm) = srv.session_manager.clone() else {
         return jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "no session manager");
     };
@@ -5010,6 +5036,46 @@ mod tests {
             rx.await.unwrap(),
             bridge_core::permission::PermissionResolution::Decided(_)
         ));
+    }
+
+    /// #10 slice 5: SessionClear (incl. `force = true`) routes through
+    /// `coordinator.clear(force)` and clears the SHARED session — cleared + a new
+    /// generation on the shared session_manager.
+    #[tokio::test]
+    async fn session_clear_delegates_through_coordinator() {
+        let (srv, _sm, _perm) = warm_coordinator_server_with_permission_registry();
+
+        // Warm a context (adapter path, unchanged).
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": {
+                    "contextId": "c-coord-clear",
+                    "text": "go",
+                    "metadata": { "a2a-bridge.agent": "a" }
+                }}),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        // SessionClear force=true through the coordinator → cleared + bumped generation.
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionClear",
+                json!({ "contextId": "c-coord-clear", "force": true }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["result"]["cleared"], true, "{v}");
+        assert!(
+            v["result"]["generation"].as_u64().is_some(),
+            "clear must report the new generation: {v}"
+        );
     }
 
     #[tokio::test]
