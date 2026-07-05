@@ -306,6 +306,11 @@ a real agent (e.g. `examples/a2a-bridge.toml` or your `serve --config`). Each ga
    error; send one `message/send` (unary) and one `message/stream` and confirm a normal
    reply. *Proves:* the Coordinator-first construction reorder + instance-shared store
    work on a real socket + real agent.
+   - **BOOT HALF: PASS (self-run smoke-test, 2026-07-05).** Booted `serve` over a
+     minimal real config → agent-card served over HTTP at `127.0.0.1:8791`; log
+     `a2a-bridge listening`. Validates config→registry→Coordinator-first construction→
+     router→socket bind. **Send/receive half still owner-run** (needs a real ACP agent;
+     the dummy `/bin/echo` can't complete a turn).
 2. **Slice 4 — submit → restart → resume.** With a **file-backed** `[store]`: submit a
    detached workflow (`RunWorkflow`/skill route) so a `Working` row persists; kill serve
    mid-run; restart; confirm the task RESUMES from the store (not double-spawned, not
