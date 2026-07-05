@@ -211,10 +211,38 @@ in-flight warm turn's abort token (both biased selects) — `cargo test` can't d
 real mid-turn force-reset. Owner must run: force-reset a context WITH a warm turn
 in flight and confirm the turn aborts cleanly.
 
+### Slice 6 — warm turn / cancel: MINIMAL delegation (NO CODE CHANGE)
+Slice 6 is a **confirmation slice**, by design (D3 + inv 5/8). The warm Local send
+arm (streaming AND unary) and every `cancel_task` arm (durable / delegation / fanout
+/ local) STAY adapter-resident — they carry A2A-wire semantics (client task-id, SSE,
+disconnect, terminal-echo, the get_task WORKING heuristic) that the MCP-shaped
+`Coordinator::prompt` / `Coordinator::cancel_task` do NOT model, and delegating would
+regress them (Fable B2 / codex: `prompt` mints a synthetic id and is collect-only;
+`cancel_task` sets `canceled` without `terminal_seq`).
+
+After slice 1 these handlers already operate on the SHARED `session_manager` /
+`workflow_cancels` / `workflow_runs` / `store` / `task_store` / `bindings` / `registry`,
+so nothing needs to delegate. Verified: `grep` confirms NO
+`coordinator.prompt`/`coordinator.cancel_task`/`continue_turn` call in server.rs — the
+arms read the shared `srv.*` fields directly.
+
+**Guarded by** `warm_unary_cancel_by_wire_id_hits_real_session` (the harness gap test
+added FIRST this session): a warm unary turn cancelled by wire task-id fires
+`backend.cancel` on the REAL warm session, not the synthetic `session-{task}` fallback
+— exactly the regression that delegating to `coordinator.prompt` would cause. Plus the
+existing warm/cancel suite (`concurrent_same_context_workflow_handle_busy`,
+`session_cancel_cancels_workflow_run`, `cancel_task_fires_workflow_token_stream_ends_canceled`,
+`cancel_task_propagates_to_backend`, fanout cancels) — all green.
+
+**OWNER LIVE-GATE PENDING (task #24):** warm multi-turn + mid-turn
+cancel-while-running (durable arm) + delegation/fanout round-trip.
+
 ## Verified
-- Full workspace suite green (**1431/0/12** after slice 5; 1430 after slice 4;
+- Full workspace suite green (**1431/0/12** after slices 5 & 6; 1430 after slice 4;
   1428 after slice 3; 1427 after slice 2; 1426 after slice 1) on the final tree;
   clippy clean; golden-wire 15/15.
+- Slices 1–6 are STATE-sharing + delegation of the pure-duplicate/stateless RPCs;
+  the warm/streaming/cancel wire paths stay adapter-resident over shared state.
 - Shared-Arc identity proven by `Arc::ptr_eq` across all 13 shared fields.
 - SessionManager clock switch proven behavior-identical from source.
 
