@@ -13,3 +13,6 @@
 //! `docs/superpowers/specs/2026-07-05-bridge-controller-extraction.md`.
 //!
 //! Scaffold slice: intentionally empty; module moves follow.
+
+pub mod review;
+pub mod turn;

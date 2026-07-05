@@ -37,12 +37,12 @@ mod implement;
 mod implement_resume;
 mod merge;
 mod resilient;
-mod review;
 mod route;
 mod slice;
-mod turn;
 mod tweak;
 mod verify;
+
+pub(crate) use bridge_controller::{review, turn};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

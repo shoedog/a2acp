@@ -15,6 +15,7 @@ dependencies = [
  "bridge-acp",
  "bridge-api",
  "bridge-container",
+ "bridge-controller",
  "bridge-coordinator",
  "bridge-core",
  "bridge-mcp",
@@ -510,6 +511,21 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "tracing",
+]
+
+[[package]]
+name = "bridge-controller"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "bridge-core",
+ "bridge-workflow",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
