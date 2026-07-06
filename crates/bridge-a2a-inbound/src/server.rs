@@ -4606,11 +4606,16 @@ mod tests {
         let task_store: Arc<dyn bridge_core::task_store::TaskStore> =
             Arc::new(bridge_core::task_store::MemoryTaskStore::new());
         let perm = PermissionRegistry::new();
+        // Build a real executor so the `executor()` forwarder identity is asserted
+        // (workflow dispatch reads it; a fresh-Arc repoint would silently diverge).
+        let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+            registry.clone(),
+        ));
         let coord = coordinator_over(
             registry,
             session_store,
             policy,
-            None,
+            Some(Arc::clone(&executor)),
             std::collections::HashMap::new(),
             task_store,
             Some(perm),
@@ -4665,6 +4670,13 @@ mod tests {
         assert!(
             Arc::ptr_eq(srv.workflows(), &coord.workflows()),
             "workflows"
+        );
+        assert!(
+            Arc::ptr_eq(
+                srv.executor().as_ref().unwrap(),
+                coord.executor().as_ref().unwrap()
+            ),
+            "executor"
         );
         assert!(
             Arc::ptr_eq(
