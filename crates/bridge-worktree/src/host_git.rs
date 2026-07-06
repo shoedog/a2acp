@@ -37,7 +37,9 @@ fn retryable_lock_error(err: &str) -> bool {
 }
 
 async fn cleanup_failed_add(repo: &str, wt: &str) {
-    let _ = std::fs::remove_dir_all(wt);
+    // B2: this runs on the async per-turn `configure_session` path; removing a full worktree checkout
+    // of a large repo is seconds of blocking I/O. `tokio::fs` offloads it (spawn_blocking internally).
+    let _ = tokio::fs::remove_dir_all(wt).await;
     let _ = run_git(&prune_argv(repo)).await;
 }
 
