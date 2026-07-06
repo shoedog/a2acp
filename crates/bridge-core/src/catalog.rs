@@ -20,9 +20,36 @@ pub struct AgentCaps {
 pub type ModelCatalog = BTreeMap<String, AgentCaps>;
 
 /// Model-id markers intentionally blocked by this bridge even if an agent advertises them.
+/// Blocked because these families have strict usage limits / short availability — the bridge
+/// must not let them be pinned, defaulted, or (the real hazard) silently inherited from a
+/// `~/.claude/settings.json` current-model into a bridge agent, which would burn the quota
+/// unintentionally. See ADR-0029.
 pub const BLOCKED_MODEL_MARKERS: &[&str] = &["fable"];
 
+/// Master switch (default OFF): setting `A2A_BRIDGE_ALLOW_FABLE=1` (or `true`) at process start
+/// unblocks fable-family ids for that invocation, so a deliberate `model = "fable"` pin /
+/// `a2a-bridge.model=fable` override works and fable is advertised in the catalog. With the switch
+/// OFF (the default), fable stays blocked EVERYWHERE — so it can never be used by accident; you have
+/// to intentionally enable it. Read once (cached); the guard is invocation-level, not per-request.
+fn fable_allowed() -> bool {
+    use std::sync::OnceLock;
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        std::env::var("A2A_BRIDGE_ALLOW_FABLE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 pub fn is_blocked_model_id(model: &str) -> bool {
+    is_blocked_model_id_gated(model, fable_allowed())
+}
+
+/// The pure block decision, parameterized on the master switch (so it is testable without env state).
+fn is_blocked_model_id_gated(model: &str, fable_allowed: bool) -> bool {
+    if fable_allowed {
+        return false;
+    }
     let model = model.to_ascii_lowercase();
     BLOCKED_MODEL_MARKERS
         .iter()
@@ -125,6 +152,20 @@ pub fn parse_ollama_models(body: &str) -> Result<AgentCaps, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fable_gate_blocks_by_default_and_allows_when_switched_on() {
+        // Default (switch OFF): fable-family ids are blocked (identity of raw + `[1m]` variants).
+        assert!(is_blocked_model_id_gated("claude-fable-5", false));
+        assert!(is_blocked_model_id_gated("claude-fable-5.1[1m]", false));
+        assert!(is_blocked_model_id_gated("FABLE", false));
+        // Non-fable models are never blocked, switch either way.
+        assert!(!is_blocked_model_id_gated("claude-sonnet-4.5", false));
+        assert!(!is_blocked_model_id_gated("claude-sonnet-4.5", true));
+        // Switch ON: fable-family ids are permitted (the deliberate A2A_BRIDGE_ALLOW_FABLE window).
+        assert!(!is_blocked_model_id_gated("claude-fable-5", true));
+        assert!(!is_blocked_model_id_gated("claude-fable-5.1[1m]", true));
+    }
 
     #[test]
     fn caps_default_is_empty() {
