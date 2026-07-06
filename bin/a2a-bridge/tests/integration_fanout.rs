@@ -253,10 +253,18 @@ fn build_fanout_server(peer_url: &str) -> axum::Router {
         std::time::Duration::from_secs(30),
     ));
 
-    let server = Arc::new(InboundServer::new(
-        common::single_agent_registry("kiro", backend),
-        store,
-        policy,
+    let server = Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
+            common::single_agent_registry("kiro", backend),
+            store,
+            policy,
+            None,
+            std::collections::HashMap::new(),
+            std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+        ),
         route,
         auth,
         "http://localhost:8080",

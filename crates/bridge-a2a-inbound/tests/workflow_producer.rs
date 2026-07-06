@@ -252,19 +252,24 @@ fn build_workflow_server() -> Arc<InboundServer> {
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
 
-    Arc::new(
-        InboundServer::new(
+    Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map),
-    )
+            Some(executor),
+            map,
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 fn build_workflow_server_with_task_store(
@@ -283,20 +288,24 @@ fn build_workflow_server_with_task_store(
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    Arc::new(
-        InboundServer::new(
+    Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_task_store(store),
-    )
+            Some(executor),
+            map,
+            store,
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 #[tokio::test]
@@ -661,19 +670,24 @@ fn build_server_per_agent(backends: HashMap<String, Arc<dyn AgentBackend>>) -> A
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
 
-    Arc::new(
-        InboundServer::new(
+    Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map),
-    )
+            Some(executor),
+            map,
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 fn build_server_per_agent_with_session_manager(
@@ -684,27 +698,31 @@ fn build_server_per_agent_with_session_manager(
     let executor = Arc::new(WorkflowExecutor::new(
         registry.clone() as Arc<dyn AgentRegistry>
     ));
-    let sm = Arc::new(bridge_a2a_inbound::session_manager::SessionManager::new(
-        registry.clone() as Arc<dyn AgentRegistry>,
-        std::time::Duration::from_secs(60),
-    ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
 
-    Arc::new(
-        InboundServer::new(
-            registry as Arc<dyn AgentRegistry>,
-            store,
-            Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_session_manager(sm),
-    )
+    // #10 slice 7: the SessionManager is MANDATORY and built by `coordinator_over`
+    // (a REAL SM over the fake registry). This puts every contextId-carrying Local
+    // send on the warm path.
+    let coord = bridge_a2a_inbound::server::coordinator_over(
+        registry as Arc<dyn AgentRegistry>,
+        store as Arc<dyn SessionStore>,
+        Arc::new(AutoApprove),
+        Some(executor),
+        map,
+        Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+        None,
+        None,
+        None,
+    );
+    Arc::new(InboundServer::from_coordinator(
+        coord,
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 fn workflow_stream_params(task: &str, ctx: &str) -> Value {
@@ -1980,20 +1998,24 @@ fn build_gated_workflow_server(
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    Arc::new(
-        InboundServer::new(
+    Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_task_store(store),
-    )
+            Some(executor),
+            map,
+            store,
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 #[tokio::test]
@@ -2136,20 +2158,24 @@ fn build_failing_synth_workflow_server(
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    Arc::new(
-        InboundServer::new(
+    Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_task_store(store),
-    )
+            Some(executor),
+            map,
+            store,
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 /// A backend whose `prompt()` panics. Because the executor wraps the `prompt()` call
@@ -2184,20 +2210,24 @@ fn build_panicking_workflow_server(
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    Arc::new(
-        InboundServer::new(
+    Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_task_store(store),
-    )
+            Some(executor),
+            map,
+            store,
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 /// **DoD-7 / T6 — panic finalizer (sequenced + hub cleanup)**: when the spawned runner
@@ -2897,13 +2927,16 @@ async fn detached_runner_sequenced_terminal_and_hub_cleanup() {
     );
 }
 
-/// **detached_unknown_workflow_reject_sets_terminal_seq (I6)**: a detached submit whose
-/// routed workflow id is NOT registered must finalize via the sequenced path — the
-/// resulting terminal task has a NON-NULL `terminal_seq`, and no hub is leaked (the
-/// reject happens pre-spawn, so no hub was ever inserted).
+/// **detached_unknown_workflow_rejected_pre_create (#10 slice 7)**: a detached submit
+/// whose routed workflow id is NOT registered now delegates to `Coordinator::run_workflow`
+/// (the ONE detached-submit path — the adapter's create-then-finalize-Failed fallback was
+/// deleted). `run_workflow` rejects an unknown workflow id with `InvalidRequest{workflow}`
+/// BEFORE it `create`s any durable row, so the wire gets a JSON-RPC error, NO task row is
+/// persisted, and no progress hub is leaked. (This is the behaviour the serve path — which
+/// has always had a Coordinator — already exhibited; slice 7 makes it the only path.)
 #[tokio::test]
-async fn detached_unknown_workflow_reject_sets_terminal_seq() {
-    use bridge_core::task_store::{MemoryTaskStore, TaskRecordStatus, TaskStore};
+async fn detached_unknown_workflow_rejected_pre_create() {
+    use bridge_core::task_store::{MemoryTaskStore, TaskStore};
     use std::sync::Arc;
 
     /// Routes `skill="code-review"` to a workflow id that is NOT registered on the
@@ -2929,20 +2962,24 @@ async fn detached_unknown_workflow_reject_sets_terminal_seq() {
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
-    let srv = Arc::new(
-        InboundServer::new(
+    let srv = Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(GhostWorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_task_store(store.clone()),
-    );
+            Some(executor),
+            map,
+            store.clone(),
+            None,
+            None,
+            None,
+        ),
+        Arc::new(GhostWorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ));
 
     let resp = srv
         .clone()
@@ -2957,31 +2994,25 @@ async fn detached_unknown_workflow_reject_sets_terminal_seq() {
         .await
         .unwrap();
     // Drain the response body so the handler fully runs.
-    let _ = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
 
-    // Exactly one row was created (the unknown-workflow path `create`s before reject).
+    // #10 slice 7: the Coordinator rejects the unknown workflow id with a JSON-RPC error
+    // (InvalidRequest{workflow}) BEFORE creating any durable row.
+    assert!(
+        v.get("error").is_some(),
+        "unknown workflow must reject with a JSON-RPC error: {v}"
+    );
+
+    // No durable row is persisted (the reject happens pre-create, so no task id is even
+    // minted — and therefore no progress hub can be inserted either).
     let rows = store.list(10).await.unwrap();
-    assert_eq!(rows.len(), 1, "one task row must have been created");
-    let rec = &rows[0];
-    assert_eq!(
-        rec.status,
-        TaskRecordStatus::Failed,
-        "unknown workflow → Failed; got {:?}",
-        rec.status
-    );
-
-    // I6: the terminal was written via the sequenced path → terminal_seq is non-NULL.
-    let snap = store.progress_snapshot(&rec.id).await.unwrap();
     assert!(
-        snap.terminal_seq.is_some(),
-        "unknown-workflow terminal must set terminal_seq (sequenced write)"
-    );
-    // No hub was ever inserted for this pre-spawn reject → none leaked.
-    assert!(
-        !srv.has_progress_hub_for_test(&rec.id).await,
-        "no hub may be registered for a pre-spawn reject"
+        rows.is_empty(),
+        "unknown workflow must not persist a task row; got {} row(s)",
+        rows.len()
     );
 }
 
@@ -3171,20 +3202,24 @@ fn build_recording_resume_server(
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    let srv = Arc::new(
-        InboundServer::new(
+    let srv = Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_task_store(store),
-    );
+            Some(executor),
+            map,
+            store,
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ));
     (srv, prompted)
 }
 
@@ -3727,20 +3762,24 @@ fn build_pending_resume_server(
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    let srv = Arc::new(
-        InboundServer::new(
+    let srv = Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_task_store(store),
-    );
+            Some(executor),
+            map,
+            store,
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ));
     (srv, codex_prompted)
 }
 
@@ -3918,19 +3957,24 @@ fn build_cwd_cap_server(
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    Arc::new(
-        InboundServer::new(
+    Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map),
-    )
+            Some(executor),
+            map,
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 /// STREAMING path: `message/stream` with `a2a-bridge.cwd="/req"` must cause every
@@ -4012,20 +4056,24 @@ async fn detached_workflow_threads_cwd_to_every_node() {
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    let srv: Arc<InboundServer> = Arc::new(
-        InboundServer::new(
+    let srv: Arc<InboundServer> = Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_task_store(store.clone()),
-    );
+            Some(executor),
+            map,
+            store.clone(),
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ));
 
     let resp = srv
         .router()
@@ -4110,20 +4158,24 @@ fn build_cwd_cap_resume_server(
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    Arc::new(
-        InboundServer::new(
+    Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_workflows(executor, map)
-        .with_task_store(store),
-    )
+            Some(executor),
+            map,
+            store,
+            None,
+            None,
+            None,
+        ),
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 /// **resume_restores_session_cwd**: a `Working` task persisted with
@@ -4325,40 +4377,25 @@ fn build_coordinator_batch_server() -> Arc<InboundServer> {
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    let task_store: Arc<dyn bridge_core::task_store::TaskStore> = Arc::new(MemoryTaskStore::new());
-    let session_store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
-    let sm = Arc::new(bridge_a2a_inbound::session_manager::SessionManager::new(
-        registry.clone() as Arc<dyn AgentRegistry>,
-        std::time::Duration::from_secs(60),
-    ));
-    let clock: Arc<dyn bridge_coordinator::clock::Clock> =
-        Arc::new(bridge_coordinator::clock::SystemClock);
-    let coord = Arc::new(bridge_coordinator::Coordinator::new(
-        sm,
+    let coord = bridge_a2a_inbound::server::coordinator_over(
+        registry as Arc<dyn AgentRegistry>,
+        Arc::new(FakeStore::default()) as Arc<dyn SessionStore>,
+        Arc::new(AutoApprove),
         Some(executor),
-        Arc::new(map),
-        task_store,
-        session_store,
-        Arc::new(AutoApprove) as Arc<dyn PolicyEngine>,
-        registry.clone() as Arc<dyn AgentRegistry>,
-        clock,
+        map,
+        Arc::new(MemoryTaskStore::new()),
+        None,
         None,
         Some(bridge_coordinator::BatchRuntime::new(4, 1)),
-        3,
-    ));
-    Arc::new(
-        InboundServer::new(
-            registry as Arc<dyn AgentRegistry>,
-            Arc::new(FakeStore::default()),
-            Arc::new(AutoApprove),
-            Arc::new(WorkflowRoute),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_coordinator(coord),
-    )
+    );
+    Arc::new(InboundServer::from_coordinator(
+        coord,
+        Arc::new(WorkflowRoute),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 #[tokio::test]
