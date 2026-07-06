@@ -123,13 +123,22 @@ async fn bridge_a_fanout_through_bridge_b_to_kiro() {
     );
     let store_b = Arc::new(SqliteStore::open_in_memory().expect("sqlite in-memory (B)"));
 
-    let server_b = Arc::new(InboundServer::new(
-        common::single_agent_registry("kiro", backend_b),
-        store_b,
-        Arc::new(AutoPolicy),
+    let server_b = Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
+            common::single_agent_registry("kiro", backend_b),
+            store_b,
+            Arc::new(AutoPolicy),
+            None,
+            std::collections::HashMap::new(),
+            std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+        ),
         Arc::new(AlwaysKiroRoute),
         Arc::new(AlwaysGrant),
-        "http://127.0.0.1:0", // placeholder; real URL built after bind
+        "http://127.0.0.1:0",
+        // placeholder; real URL built after bind
         Arc::new(StubDelegation),
         "kiro",
     ));
@@ -153,13 +162,22 @@ async fn bridge_a_fanout_through_bridge_b_to_kiro() {
         std::time::Duration::from_secs(120),
     ));
 
-    let server_a = Arc::new(InboundServer::new(
-        common::single_agent_registry("kiro", backend_a),
-        store_a,
-        Arc::new(AutoPolicy),
+    let server_a = Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
+            common::single_agent_registry("kiro", backend_a),
+            store_a,
+            Arc::new(AutoPolicy),
+            None,
+            std::collections::HashMap::new(),
+            std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+        ),
         Arc::new(FanoutSkillRoute),
         Arc::new(AlwaysGrant),
-        "http://127.0.0.1:0", // placeholder
+        "http://127.0.0.1:0",
+        // placeholder
         delegation_a,
         "kiro",
     ));

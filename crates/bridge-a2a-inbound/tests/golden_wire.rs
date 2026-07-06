@@ -325,21 +325,27 @@ fn build_server_ex(
         backends,
         default: AgentId::parse("codex").unwrap(),
     });
-    Arc::new(
-        InboundServer::new(
-            registry as Arc<dyn AgentRegistry>,
-            store as Arc<dyn SessionStore>,
-            Arc::new(AutoApprove),
-            Arc::new(AgentOrWorkflowRoute {
-                default: AgentId::parse("codex").unwrap(),
-            }),
-            Arc::new(AlwaysGrant),
-            "http://localhost:8080",
-            Arc::new(NoDelegation),
-            "codex",
-        )
-        .with_task_store(task_store),
-    )
+    let coord = bridge_a2a_inbound::server::coordinator_over(
+        registry as Arc<dyn AgentRegistry>,
+        store as Arc<dyn SessionStore>,
+        Arc::new(AutoApprove),
+        None,
+        HashMap::new(),
+        task_store,
+        None,
+        None,
+        None,
+    );
+    Arc::new(InboundServer::from_coordinator(
+        coord,
+        Arc::new(AgentOrWorkflowRoute {
+            default: AgentId::parse("codex").unwrap(),
+        }),
+        Arc::new(AlwaysGrant),
+        "http://localhost:8080",
+        Arc::new(NoDelegation),
+        "codex",
+    ))
 }
 
 fn build_server(backends: HashMap<String, Arc<dyn AgentBackend>>) -> Arc<InboundServer> {
@@ -1180,4 +1186,76 @@ async fn corpus_replay_send_message_cold_agent() {
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
     let live = json_response(resp).await;
     assert_replay_matches_shape(&request, &response, &live);
+}
+
+// ============================================================================
+// SessionStatus response shape (#10 slice 7, refinement (c)).
+// ============================================================================
+
+/// Freezes the SessionStatus wire shape — a hand-rolled DTO the A2A adapter still
+/// encodes directly (NOT one of the a2a::Task families the rest of this corpus
+/// covers). A warm context reports `contextId`/`state`/`agent`/`generation`/
+/// `idleAgeMs` FLAT on `result`, plus nested `capabilities` + `usage` objects and a
+/// `pendingPermissions` array (empty without an interactive-permission registry). The
+/// handler now routes through the shared `Coordinator`'s session_manager; this guards
+/// that the wire shape is unchanged.
+#[tokio::test]
+async fn session_status_response_shape_is_flat_dto() {
+    let srv = build_server(one_backend(
+        "codex",
+        Arc::new(FakeBackend {
+            reply: "PONG".into(),
+        }),
+    ));
+    // Warm a context so SessionStatus has a live handle to report.
+    let warm = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_MESSAGE,
+            json!({ "message": {
+                "contextId": "c-status-shape",
+                "text": "ping",
+                "metadata": { "a2a-bridge.agent": "codex" }
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(warm.status(), axum::http::StatusCode::OK);
+    let _ = json_response(warm).await;
+
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            "SessionStatus",
+            json!({ "contextId": "c-status-shape" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = json_response(resp).await;
+    let r = &body["result"];
+    assert_eq!(
+        r["contextId"], "c-status-shape",
+        "contextId is echoed flat on result: {body}"
+    );
+    assert!(r["state"].is_string(), "state is a flat string: {body}");
+    assert!(r["agent"].is_string(), "agent is a flat string: {body}");
+    assert!(
+        r["generation"].is_number(),
+        "generation is a flat number: {body}"
+    );
+    assert!(
+        r["idleAgeMs"].is_number(),
+        "idleAgeMs is a flat number: {body}"
+    );
+    assert!(
+        r["capabilities"].is_object(),
+        "capabilities is a nested object: {body}"
+    );
+    assert!(r["usage"].is_object(), "usage is a nested object: {body}");
+    assert!(
+        r["pendingPermissions"].is_array(),
+        "pendingPermissions is always an array: {body}"
+    );
 }

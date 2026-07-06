@@ -74,10 +74,18 @@ async fn real_kiro_round_trip_returns_pong() {
     let addr = listener.local_addr().expect("local_addr");
     let base_url = format!("http://{addr}");
 
-    let server = Arc::new(InboundServer::new(
-        common::single_agent_registry("kiro", backend),
-        store,
-        policy,
+    let server = Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
+            common::single_agent_registry("kiro", backend),
+            store,
+            policy,
+            None,
+            std::collections::HashMap::new(),
+            std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+        ),
         route,
         auth,
         base_url.clone(),

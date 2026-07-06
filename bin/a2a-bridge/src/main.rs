@@ -656,6 +656,48 @@ fn batch_runtime(
     }))
 }
 
+/// #10 slice 7 (refinement b): the ONE Coordinator construction shape, shared by the
+/// `serve` and `mcp` entry points. They differ ONLY in `allowed_cwd_root` — serve passes
+/// `None` (the wire cwd-gate stays on the adapter's `Option<String>` root; wiring the real
+/// root into the Coordinator is a deferred follow-up), mcp passes the parsed root — so that
+/// stays a parameter. Both wire the SAME session_manager / executor / stores / registry /
+/// policy / batch plus the interactive-permission registry.
+#[allow(clippy::too_many_arguments)]
+fn build_coordinator(
+    session_manager: Arc<bridge_coordinator::session_manager::SessionManager>,
+    executor: Arc<bridge_workflow::executor::WorkflowExecutor>,
+    wf_map: std::collections::HashMap<
+        bridge_core::ids::WorkflowId,
+        Arc<bridge_workflow::graph::WorkflowGraph>,
+    >,
+    task_store: Arc<dyn bridge_core::task_store::TaskStore>,
+    session_store: Arc<dyn bridge_core::ports::SessionStore>,
+    policy: Arc<dyn PolicyEngine>,
+    registry: Arc<dyn AgentRegistry>,
+    clock: Arc<dyn bridge_coordinator::clock::Clock>,
+    allowed_cwd_root: Option<bridge_core::session_cwd::SessionCwd>,
+    batch: Option<bridge_coordinator::BatchRuntime>,
+    resume_cap: u32,
+    perm_registry: Arc<PermissionRegistry>,
+) -> Arc<bridge_coordinator::Coordinator> {
+    Arc::new(
+        bridge_coordinator::Coordinator::new(
+            session_manager,
+            Some(executor),
+            Arc::new(wf_map),
+            task_store,
+            session_store,
+            policy,
+            registry,
+            clock,
+            allowed_cwd_root,
+            batch,
+            resume_cap,
+        )
+        .with_permission_registry(perm_registry),
+    )
+}
+
 fn validate_worktree_runtime_cfg(cfg: &RegistryConfig) -> Result<(), String> {
     let _ = worktree_runtime_parts(cfg)?;
     Ok(())
@@ -4829,21 +4871,19 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         .map_err(|e| format!("a2a-bridge mcp: invalid allowed_cwd_root: {e:?}"))?;
     let batch = batch_runtime(&cfg).map_err(|e| format!("a2a-bridge mcp: {e}"))?;
 
-    let coordinator = Arc::new(
-        bridge_coordinator::Coordinator::new(
-            session_manager,
-            Some(executor),
-            Arc::new(wf_map),
-            task_store,
-            session_store,
-            Arc::clone(&policy) as Arc<dyn PolicyEngine>,
-            Arc::clone(&registry) as Arc<dyn AgentRegistry>,
-            clock,
-            allowed_cwd_root,
-            batch,
-            resume_cap,
-        )
-        .with_permission_registry(Arc::clone(&perm_registry)),
+    let coordinator = build_coordinator(
+        session_manager,
+        executor,
+        wf_map,
+        task_store,
+        session_store,
+        Arc::clone(&policy) as Arc<dyn PolicyEngine>,
+        Arc::clone(&registry) as Arc<dyn AgentRegistry>,
+        clock,
+        allowed_cwd_root,
+        batch,
+        resume_cap,
+        Arc::clone(&perm_registry),
     );
 
     coordinator.resume().await;
@@ -6121,42 +6161,36 @@ async fn main() -> Result<(), BoxError> {
     // parsing the config string here would add a new boot-time failure mode
     // (`SessionCwd::parse` rejects empty/relative roots) that serve never had. The
     // real parsed root is wired at the slice that consumes it.
-    let coordinator = Arc::new(
-        bridge_coordinator::Coordinator::new(
-            session_manager,
-            Some(executor),
-            Arc::new(wf_map),
-            task_store,
-            Arc::clone(&session_store),
-            Arc::clone(&policy),
-            Arc::clone(&registry) as Arc<dyn AgentRegistry>,
-            clock,
-            None,
-            batch,
-            resume_cap,
-        )
-        .with_permission_registry(Arc::clone(&perm_registry)),
+    let coordinator = build_coordinator(
+        session_manager,
+        executor,
+        wf_map,
+        task_store,
+        Arc::clone(&session_store),
+        Arc::clone(&policy),
+        Arc::clone(&registry) as Arc<dyn AgentRegistry>,
+        clock,
+        None,
+        batch,
+        resume_cap,
+        Arc::clone(&perm_registry),
     );
 
-    // The inbound server holds the agent registry (3b): first-message LOCAL dispatch
-    // resolves the routed agent id, applies its effective config, and binds the task.
-    // `with_coordinator` re-points the shared-identity set onto the Coordinator's
-    // instances; adapter-only wire state (route/auth/base_url/delegation/label/
-    // model_catalog + the Option<String> cwd-gate root) stays adapter-resident.
-    // Boot resume runs via `coordinator.resume()` below (slice 4) — exactly ONE
-    // resume path, over the SAME shared store the detached submits write to.
+    // The inbound server is a thin adapter over the ONE Coordinator (#10 slice 7):
+    // the Coordinator owns the registry/policy/stores/session-manager/workflow maps/
+    // batch; the adapter keeps only wire state (route/auth/base_url/delegation/label/
+    // model_catalog + the Option<String> cwd-gate root). Boot resume runs via
+    // `coordinator.resume()` below (slice 4) — exactly ONE resume path, over the SAME
+    // shared store the detached submits write to.
     let server = Arc::new(
-        InboundServer::new(
-            Arc::clone(&registry) as _,
-            Arc::clone(&session_store),
-            Arc::clone(&policy),
+        InboundServer::from_coordinator(
+            Arc::clone(&coordinator),
             route,
             auth,
             base_url,
             delegation,
             default_label.clone(),
         )
-        .with_coordinator(Arc::clone(&coordinator))
         .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
         .with_model_catalog(Arc::clone(&model_catalog)),
     );

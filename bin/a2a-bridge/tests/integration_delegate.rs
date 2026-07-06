@@ -262,10 +262,18 @@ async fn delegate_skill_round_trips_through_peer() {
     let auth = Arc::new(AlwaysGrant);
     let backend = Arc::new(PanicBackend);
 
-    let server = Arc::new(InboundServer::new(
-        common::single_agent_registry("kiro", backend),
-        store,
-        policy,
+    let server = Arc::new(InboundServer::from_coordinator(
+        bridge_a2a_inbound::server::coordinator_over(
+            common::single_agent_registry("kiro", backend),
+            store,
+            policy,
+            None,
+            std::collections::HashMap::new(),
+            std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+        ),
         route,
         auth,
         "http://localhost:8080",

@@ -291,13 +291,12 @@ record; [[coordinator-migration-10-design]].
 - Shared-Arc identity proven by `Arc::ptr_eq` across all 13 shared fields.
 - SessionManager clock switch proven behavior-identical from source.
 
-## Owner live-gates verified
+## Not verified (pending)
 
 Slices 1–6 are CODE-COMPLETE + suite-verified (1431/0/12, clippy, golden-wire 15/15).
-The four owner-run A2A live-gates are now **PASS** on `feat/coordinator-migration`
-using a real socket, real `codex-acp` agent, file-backed store, restart/resume,
-warm force-clear, wire-id cancel, delegate, and fan-out. Slice 7 is deferred to
-its own branch, post-merge.
+The remaining merge blocker is the **four owner-run A2A live-gates** (`cargo test`
+cannot drive a real socket + real agent + restart). Slice 7 is deferred to its own
+branch, post-merge.
 
 ### Owner live-gate checklist (run on `feat/coordinator-migration`)
 Build once: `cargo build --release` → `./target/release/a2a-bridge`. Use a config with
@@ -312,36 +311,61 @@ a real agent (e.g. `examples/a2a-bridge.toml` or your `serve --config`). Each ga
      `a2a-bridge listening`. Validates config→registry→Coordinator-first construction→
      router→socket bind. **Send/receive half still owner-run** (needs a real ACP agent;
      the dummy `/bin/echo` can't complete a turn).
-   - **OWNER LIVE-GATE: PASS (2026-07-05).** Release binary served agent cards on
-     `127.0.0.1:8792`/`:8793`; unary `SendMessage` returned `TASK_STATE_COMPLETED`
-     with `PONG`; streaming `SendStreamingMessage` emitted working, artifact, and
-     completed SSE frames. See `evals/2026-07-05-coordinator-migration-livegate.md`.
 2. **Slice 4 — submit → restart → resume.** With a **file-backed** `[store]`: submit a
    detached workflow (`RunWorkflow`/skill route) so a `Working` row persists; kill serve
    mid-run; restart; confirm the task RESUMES from the store (not double-spawned, not
    stuck Working). *Proves:* `coordinator.resume()` replacing `resume_working_tasks`.
-   - **OWNER LIVE-GATE: PASS (2026-07-05).** Detached workflow task
-     `019f3488-6077-79d2-b15d-b23742e8933f` returned `TASK_STATE_WORKING`, `serve`
-     was killed mid-run, restart resumed from the file-backed store, and `tasks/get`
-     returned `TASK_STATE_COMPLETED` with `LIVEGATE_DELAY_DONE`; `tasks/list` showed
-     one completed `delay` row.
 3. **Slice 5 — force-reset an in-flight warm turn.** Start a warm multi-turn context;
    while a turn is RUNNING, `SessionClear` with `force:true`; confirm the running turn
    aborts cleanly (not stranded) and the context is cleared with a bumped generation.
    *Proves:* `coordinator.clear(force=true)` fires the warm abort token (Fable M5).
-   - **OWNER LIVE-GATE: PASS (2026-07-05).** Warm context `livegate-warm` was primed,
-     in-flight task `livegate-force-task` was force-cleared, `SessionClear` returned
-     `cleared:true,generation:1`, and the original turn settled as `TASK_STATE_CANCELED`.
 4. **Slice 6 — warm multi-turn + cancel + delegation/fanout.** Multi-turn warm send on
    one context; mid-turn `CancelTask` by wire id → the real warm session cancels; plus a
    delegate + a fan-out round-trip. *Proves:* the warm/cancel arms are correct over the
    shared state (adapter-resident, not delegated to `coordinator.prompt`).
-   - **OWNER LIVE-GATE: PASS (2026-07-05).** Warm context `livegate-cancel` was primed;
-     `CancelTask` by wire id `livegate-cancel-task` returned `TASK_STATE_CANCELED`, and
-     the original in-flight turn also settled as `TASK_STATE_CANCELED`. Delegate returned
-     `PONG`; fan-out returned separate `codex` and `peer` `PONG` artifacts and completed.
 
 Record PASS/FAIL per gate in `evals/`/here. All four PASS ⇒ slices 1–6 mergeable.
+
+## Slice 7 — delete the parallel DELEGATE fields (branch `feat/coordinator-migration-slice7`)
+
+```
+cargo build --workspace -j 1                                   → clean
+cargo test  --workspace -j 1                                   → 1432 passed / 0 failed / 12 ignored
+cargo clippy --workspace -j 1                                  → clean (no new warnings)
+cargo test -p bridge-a2a-inbound --test golden_wire -j 1       → 16/0/0
+```
+1432 = 1431 (slices 1–6 tree) + the new `session/status` golden-wire shape case (refinement c).
+
+**Changes (mechanic ii — constructor injection; `session_manager` MANDATORY):**
+- `bridge-a2a-inbound/src/server.rs`: deleted the 12 DELEGATE fields (registry, policy,
+  executor, workflows, task_store, session_manager, permission_registry, batch, bindings,
+  workflow_cancels, workflow_runs, progress_hubs); `coordinator` is now `Arc<Coordinator>`
+  (was `Option`). Added private forwarders named like the old fields (each reads the
+  Coordinator's owned instance via the `*_ref()` accessors / the `session_manager` pub
+  field). Deleted `new` + the 6 DELEGATE builders (`with_workflows`/`with_task_store`/
+  `with_session_manager`/`with_permission_registry`/`with_batch_runtime`/`with_coordinator`);
+  added `from_coordinator(coord, route, auth, base_url, delegation, label)`; kept
+  `with_allowed_cwd_root` + `with_model_catalog`. `coordinator()` now returns `&Arc<…>`.
+- Deleted the 8 slices-2–5 coordinator-less fallbacks (run/status/list/cancel batch, inject,
+  permit, detached-submit Workflow arm, session_clear) + the 6 `no session manager` guards;
+  every handler now calls the Coordinator (or its forwarders) unconditionally. Deleted the
+  now-dead local `new_detached_task_id` / `finalize_detached` / `spawn_detached_workflow`.
+- `main.rs`: serve path uses `from_coordinator`; extracted ONE `build_coordinator(…)` shared
+  by serve + mcp (refinement b — `allowed_cwd_root` stays a param: serve `None`, mcp parsed).
+- Test builders (server.rs inline, `workflow_producer.rs`, `golden_wire.rs`, bin e2e/integration)
+  rewritten to compose a Coordinator via the new `coordinator_over(…)` test helper (a REAL
+  `SessionManager` over the fake registry) + `from_coordinator`; a `coordinator_with_sm(…)`
+  test helper covers the fixtures that build the SM before the store (or observe it).
+
+**Test whose assertion changed (fixture-audit delta):**
+- `workflow_producer::detached_unknown_workflow_reject_sets_terminal_seq` →
+  renamed `detached_unknown_workflow_rejected_pre_create`. It asserted the DELETED
+  coordinator-less fallback's behaviour (unknown workflow ⇒ `create` a durable row then
+  finalize `Failed` via the sequenced path, terminal_seq set). The ONE path now is
+  `Coordinator::run_workflow`, which rejects an unknown workflow id with
+  `InvalidRequest{workflow}` BEFORE minting a task id / creating a row — the behaviour the
+  serve path (always Coordinator-backed) already had. Updated to assert: JSON-RPC error +
+  ZERO durable rows. No behavioural assertion weakened; the old code path no longer exists.
 
 ## Out-of-scope failures
 - None. Every run showed 0 failures; nothing re-baselined or silently fixed.

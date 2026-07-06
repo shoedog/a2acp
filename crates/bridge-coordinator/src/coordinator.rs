@@ -212,6 +212,45 @@ impl Coordinator {
         self.allowed_cwd_root.clone()
     }
 
+    // ---- By-reference accessors (#10 slice 7) ----
+    // The clone accessors above are for adoption/identity; the A2A adapter's handlers
+    // read these in-place (e.g. `bindings().lock().await`, `registry().resolve(...)`),
+    // where a cloned temporary would be dropped while borrowed. These borrow the owned
+    // Arc from the Coordinator the adapter holds behind its own `Arc<Coordinator>`.
+    pub fn registry_ref(&self) -> &Arc<dyn AgentRegistry> {
+        &self.registry
+    }
+    pub fn policy_ref(&self) -> &Arc<dyn PolicyEngine> {
+        &self.policy
+    }
+    pub fn task_store_ref(&self) -> &Arc<dyn TaskStore> {
+        &self.task_store
+    }
+    pub fn executor_ref(&self) -> &Option<Arc<WorkflowExecutor>> {
+        &self.executor
+    }
+    pub fn workflows_ref(&self) -> &Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>> {
+        &self.workflows
+    }
+    pub fn permission_registry_ref(&self) -> &Option<Arc<PermissionRegistry>> {
+        &self.permission_registry
+    }
+    pub fn batch_ref(&self) -> &Option<BatchRuntime> {
+        &self.batch
+    }
+    pub fn bindings_ref(&self) -> &Arc<Mutex<HashMap<TaskId, TaskBinding>>> {
+        &self.bindings
+    }
+    pub fn workflow_cancels_ref(&self) -> &Arc<Mutex<HashMap<TaskId, CancellationToken>>> {
+        &self.workflow_cancels
+    }
+    pub fn workflow_runs_ref(&self) -> &Arc<Mutex<HashMap<ContextId, CancellationToken>>> {
+        &self.workflow_runs
+    }
+    pub fn progress_hubs_ref(&self) -> &Arc<Mutex<HashMap<TaskId, Arc<TaskProgressHub>>>> {
+        &self.progress_hubs
+    }
+
     /// Build the detached-workflow dependency view over the Coordinator's owned fields.
     fn detached_deps(&self) -> DetachedDeps {
         DetachedDeps {
