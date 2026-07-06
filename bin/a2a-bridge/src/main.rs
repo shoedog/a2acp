@@ -500,6 +500,16 @@ fn rw_sweep_targets(
     targets
 }
 
+/// B2: run a blocking closure on tokio's blocking pool so it can't park a runtime worker. Used at the
+/// few call sites where genuinely-blocking work (a container-runtime CLI shell-out) runs on a LIVE
+/// async runtime — NOT for one-shot CLI commands or pre-bind boot sweeps, where a parked worker has no
+/// victim. The `.expect` restores normal panic-propagation (spawn_blocking turns a panic into a JoinError).
+async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(f)
+        .await
+        .expect("blocking task panicked")
+}
+
 /// Increment A before-first-use crash-orphan recovery (replaces the owner-name boot sweeps). For every
 /// owner THIS process can spawn (`:rw` ContainerRw ∪ `:ro` sandboxed Acp), [`classify_sweep`] inspects the
 /// owner's MANAGED containers and reaps ONLY the DEAD ones (same host + a FREE flock lease). A live
@@ -6032,7 +6042,14 @@ async fn main() -> Result<(), BoxError> {
             while let Some(snap) = watch.next().await {
                 // Increment A: recover crash-orphans for any owners a hot-reload introduces, BEFORE
                 // applying (idempotent; only DEAD same-host orphans are reaped, never a live run's).
-                recover_orphans(&snap, &recover_config, &recover_host);
+                // B2: recover_orphans shells out to the container runtime (blocking, potentially seconds
+                // against a wedged daemon) and runs on the LIVE serve runtime here — offload to the
+                // blocking pool so it can't park a tokio worker. Awaited INLINE to preserve the
+                // recover-before-apply ordering.
+                let snap_c = snap.clone();
+                let config_c = recover_config.clone();
+                let host_c = recover_host.clone();
+                run_blocking(move || recover_orphans(&snap_c, &config_c, &host_c)).await;
                 if let Err(e) = reg.apply(snap).await {
                     tracing::error!(error = ?e, "registry reconcile failed");
                 }
@@ -6243,6 +6260,33 @@ async fn main() -> Result<(), BoxError> {
 mod cli_tests {
     use super::*;
     use crate::turn::TurnRunner;
+
+    /// B2 (T-B1): `run_blocking` must run its closure OFF the runtime worker. On a current-thread
+    /// runtime (the `#[tokio::test]` default), a ticker on the single worker can only advance while
+    /// the blocking closure sleeps IF that closure is on the blocking pool; if it ran inline it would
+    /// stall the worker and the ticker couldn't tick. Direct proof the offload removes the block.
+    #[tokio::test]
+    async fn run_blocking_offloads_off_the_runtime_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_c = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                ticks_c.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // Block a thread for ~100ms; the current-thread worker is free to run the ticker only if this
+        // is on the blocking pool.
+        run_blocking(|| std::thread::sleep(std::time::Duration::from_millis(100))).await;
+        let during = ticks.load(Ordering::SeqCst);
+        assert!(
+            during >= 3,
+            "ticker must advance while run_blocking's closure sleeps on the blocking pool; got {during}"
+        );
+        ticker.abort();
+    }
 
     #[tokio::test]
     async fn drain_turn_outcomes() {
