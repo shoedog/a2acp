@@ -19,3 +19,4 @@ async-stream = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 tokio = { workspace = true }
+wiremock = "0.6"
