@@ -46,13 +46,13 @@ pub fn is_blocked_model_id(model: &str) -> bool {
 }
 
 /// The pure block decision, parameterized on the master switch (so it is testable without env state).
+/// The switch only lifts the `fable` marker — any OTHER marker added to `BLOCKED_MODEL_MARKERS`
+/// stays enforced regardless of the switch (codex review: don't disable the whole blocklist).
 fn is_blocked_model_id_gated(model: &str, fable_allowed: bool) -> bool {
-    if fable_allowed {
-        return false;
-    }
     let model = model.to_ascii_lowercase();
     BLOCKED_MODEL_MARKERS
         .iter()
+        .filter(|marker| !(fable_allowed && **marker == "fable"))
         .any(|marker| model.contains(marker))
 }
 

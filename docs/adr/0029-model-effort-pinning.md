@@ -164,3 +164,18 @@ prompt is sent. The same ids are filtered out of the usable model catalog so
 Agent Card and `models` output do not present them as valid override choices.
 The remaining Claude fallback shorthand is `opus -> default` when `opus` is not
 advertised.
+
+## Amendment (2026-07-06) — `A2A_BRIDGE_ALLOW_FABLE` master switch (default OFF)
+
+The fable block is now a **default-off master switch**. The block above is the
+default and unchanged: with the switch off, fable-family ids are blocked
+everywhere (pins, overrides, and — the real hazard — a `~/.claude/settings.json`
+current-model inherited into a bridge agent), so the strict-limits guard holds and
+fable can never be used by accident. Setting **`A2A_BRIDGE_ALLOW_FABLE=1`** (or
+`true`) in the serve/mcp process env lifts the block for that invocation only: a
+deliberate `model = "fable"` pin / per-request `a2a-bridge.model=fable` works and
+fable is advertised in the catalog. The switch is invocation-level (read once),
+lifts **only** the `fable` marker (any other `BLOCKED_MODEL_MARKERS` entry stays
+enforced), and defaults off — so using fable remains an intentional act. Rationale:
+fable has short availability / strict usage limits; the owner wants it usable
+deliberately without reintroducing accidental-burn vectors.
