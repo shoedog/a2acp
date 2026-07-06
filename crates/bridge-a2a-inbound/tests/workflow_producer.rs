@@ -1528,6 +1528,163 @@ async fn cancel_task_fires_workflow_token_stream_ends_canceled() {
     );
 }
 
+// ============================================================================
+// Warm UNARY (Local, non-workflow) cancel-by-wire-id — the #10 slice-6 hazard.
+//
+// A warm, non-workflow unary send maps the CLIENT task-id -> the REAL warm
+// session (server.rs `store.put(&routed.task, &dispatch.session)` before the
+// turn runs). An inbound `CancelTask` by that wire task-id must resolve that
+// mapping and cancel the SAME session the turn is running under.
+//
+// This pins the behavior that breaks if the warm turn is ever delegated to
+// `Coordinator::prompt` (which mints its own synthetic task-id and hides the
+// session): the wire-id -> session mapping would be lost and `CancelTask` would
+// fall back to a synthetic `session-{task}` no-op, leaving the real turn
+// running. The golden-wire suite does not encode this shape, so slice 6 could
+// silently drift it — this test is the guard.
+// ============================================================================
+
+/// Backend for the warm-unary cancel probe: records the session it is prompted
+/// with, blocks the turn open on a gate, and records every session it is asked
+/// to cancel. `prompt()` only resolves after the gate is released.
+struct WarmCancelProbeBackend {
+    gate: Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>,
+    prompt_session: Arc<std::sync::Mutex<Option<String>>>,
+    cancel_sessions: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentBackend for WarmCancelProbeBackend {
+    async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        // Record the real warm session, then park until released. The store has
+        // already mapped the wire task-id -> this session by the time we run.
+        *self.prompt_session.lock().unwrap() = Some(s.as_str().to_owned());
+        while !self.gate.0.load(std::sync::atomic::Ordering::Acquire) {
+            self.gate.1.notified().await;
+        }
+        let updates = vec![
+            Ok(Update::Text("WARM_DONE".to_string())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            }),
+        ];
+        Ok(Box::pin(tokio_stream::iter(updates)))
+    }
+    async fn cancel(&self, s: &SessionId) -> Result<(), BridgeError> {
+        self.cancel_sessions
+            .lock()
+            .unwrap()
+            .push(s.as_str().to_owned());
+        Ok(())
+    }
+}
+
+/// A warm unary `SendMessage` (Local codex, no skill) that is cancelled mid-turn
+/// by its wire task-id must invoke `backend.cancel` on the SAME session the turn
+/// is running under — proving the wire-id -> real-warm-session mapping and the
+/// `cancel_task` local arm that consumes it.
+#[tokio::test]
+async fn warm_unary_cancel_by_wire_id_hits_real_session() {
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let prompt_session = Arc::new(std::sync::Mutex::new(None));
+    let cancel_sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let backend: Arc<dyn AgentBackend> = Arc::new(WarmCancelProbeBackend {
+        gate: gate.clone(),
+        prompt_session: prompt_session.clone(),
+        cancel_sessions: cancel_sessions.clone(),
+    });
+    let backends: HashMap<String, Arc<dyn AgentBackend>> = [("codex".to_string(), backend)].into();
+    let store = Arc::new(FakeStore::default());
+    let srv = build_server_per_agent_with_session_manager(store.clone(), backends);
+
+    const TASK_ID: &str = "warm-unary-cancel-1";
+    const CTX: &str = "ctx-warm-unary-cancel";
+
+    // Warm UNARY send (Local codex — no skill metadata), held open by the gate.
+    // The unary handler blocks until the turn completes, so drive it off-thread.
+    let send_srv = srv.clone();
+    let send = tokio::spawn(async move {
+        send_srv
+            .router()
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": TASK_ID,
+                    "message": {
+                        "contextId": CTX,
+                        "text": "---\ntask-type: freeform\n---\nPING"
+                    }
+                }),
+            ))
+            .await
+            .unwrap()
+    });
+
+    // The turn is in-flight (and the store mapping written) once the backend has
+    // recorded its real warm session id.
+    wait_for(
+        || prompt_session.lock().unwrap().is_some(),
+        "warm turn did not reach the backend",
+    )
+    .await;
+    let real_session = prompt_session.lock().unwrap().clone().unwrap();
+
+    // Discrimination guard: the real warm session (`ctx-{ctx}-g{gen}`) must NOT
+    // coincide with the synthetic `session-{task}` fallback the local cancel arm
+    // uses on a store miss — otherwise a delegated no-op could pass this test.
+    assert_ne!(
+        real_session,
+        format!("session-{TASK_ID}"),
+        "real warm session must differ from the synthetic cancel fallback"
+    );
+
+    // The wire task-id maps to the real warm session BEFORE the turn is cancelled.
+    let mapped = store
+        .session_for(&TaskId::parse(TASK_ID).unwrap())
+        .await
+        .unwrap()
+        .map(|s| s.as_str().to_owned());
+    assert_eq!(
+        mapped,
+        Some(real_session.clone()),
+        "wire task-id must map to the real warm session"
+    );
+
+    // CancelTask by the WIRE task-id must cancel that SAME real session.
+    let cancel_resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::CANCEL_TASK,
+            json!({ "taskId": TASK_ID }),
+        ))
+        .await
+        .unwrap();
+    let cancel_body = json_response(cancel_resp).await;
+    assert_eq!(
+        cancel_body["result"]["task"]["state"], "TASK_STATE_CANCELED",
+        "{cancel_body}"
+    );
+
+    assert!(
+        cancel_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == &real_session),
+        "CancelTask must cancel the REAL warm session {real_session:?}; got {:?}",
+        cancel_sessions.lock().unwrap()
+    );
+
+    // Release the turn so the spawned unary send completes cleanly.
+    release_gate(&gate);
+    let _ = send.await.unwrap();
+}
+
 /// **tasks/get canonical**: `GET_TASK` on a completed durable task must return a
 /// canonical `a2a::Task` with state `TASK_STATE_COMPLETED` and an artifact
 /// carrying the result payload.
@@ -4140,5 +4297,163 @@ async fn detached_submit_persists_session_cwd() {
         rec.session_cwd.as_deref(),
         Some("/req"),
         "record.session_cwd must equal the submitted a2a-bridge.cwd"
+    );
+}
+
+// ============================================================================
+// #10 slice 2 — batch RPCs delegate through the Coordinator.
+//
+// A server built over a Coordinator (with a BatchRuntime) must route
+// RunBatch / BatchStatus / BatchList through `srv.coordinator()` and return the
+// SAME wire shapes. This exercises the `Some(coord)` branch the serve path
+// always takes after slice 1 — the fallback free-fn path is behaviourally
+// identical (same shared runtime + task_store), so the migration is invisible on
+// the wire; this test proves the coordinator path is wired and correct.
+// ============================================================================
+
+fn build_coordinator_batch_server() -> Arc<InboundServer> {
+    let registry = Arc::new(FakeRegistry {
+        replies: [
+            ("codex".to_string(), "CODEX_REVIEW".to_string()),
+            ("claude".to_string(), "CLAUDE_REVIEW".to_string()),
+            ("synth".to_string(), "SYNTH_FINAL".to_string()),
+        ]
+        .into(),
+    });
+    let executor = Arc::new(WorkflowExecutor::new(
+        registry.clone() as Arc<dyn AgentRegistry>
+    ));
+    let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
+    map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
+    let task_store: Arc<dyn bridge_core::task_store::TaskStore> = Arc::new(MemoryTaskStore::new());
+    let session_store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+    let sm = Arc::new(bridge_a2a_inbound::session_manager::SessionManager::new(
+        registry.clone() as Arc<dyn AgentRegistry>,
+        std::time::Duration::from_secs(60),
+    ));
+    let clock: Arc<dyn bridge_coordinator::clock::Clock> =
+        Arc::new(bridge_coordinator::clock::SystemClock);
+    let coord = Arc::new(bridge_coordinator::Coordinator::new(
+        sm,
+        Some(executor),
+        Arc::new(map),
+        task_store,
+        session_store,
+        Arc::new(AutoApprove) as Arc<dyn PolicyEngine>,
+        registry.clone() as Arc<dyn AgentRegistry>,
+        clock,
+        None,
+        Some(bridge_coordinator::BatchRuntime::new(4, 1)),
+        3,
+    ));
+    Arc::new(
+        InboundServer::new(
+            registry as Arc<dyn AgentRegistry>,
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(WorkflowRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "codex",
+        )
+        .with_coordinator(coord),
+    )
+}
+
+#[tokio::test]
+async fn run_batch_rpc_delegates_through_coordinator() {
+    let srv = build_coordinator_batch_server();
+
+    // RunBatch through the Coordinator returns a batchId.
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            "RunBatch",
+            json!({
+                "workflow": "code-review",
+                "items": [
+                    { "item_id": "a", "input": "---\ntask-type: freeform\n---\nDIFF-A" },
+                    { "item_id": "b", "input": "---\ntask-type: freeform\n---\nDIFF-B" }
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = json_response(resp).await;
+    let batch_id = body["result"]["batchId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("RunBatch must return a batchId via the coordinator: {body}"))
+        .to_string();
+
+    // BatchStatus (also delegated) sees the same batch id + total item count.
+    let status = srv
+        .clone()
+        .router()
+        .oneshot(post_request("BatchStatus", json!({ "id": batch_id })))
+        .await
+        .unwrap();
+    let sbody = json_response(status).await;
+    assert_eq!(sbody["result"]["id"], batch_id, "{sbody}");
+    assert_eq!(sbody["result"]["total"], 2, "{sbody}");
+
+    // BatchList (also delegated) contains it.
+    let list = srv
+        .clone()
+        .router()
+        .oneshot(post_request("BatchList", json!({ "limit": 10 })))
+        .await
+        .unwrap();
+    let lbody = json_response(list).await;
+    let ids: Vec<String> = lbody["result"]["batches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ids.contains(&batch_id),
+        "BatchList must include {batch_id}: {lbody}"
+    );
+}
+
+/// #10 slice 4: a unary workflow submit carrying VALID agent-config overrides must
+/// still SUCCEED through the Coordinator. The Workflow arm strips
+/// agent/model/effort/mode before `run_workflow` (which REJECTS them); forwarding an
+/// override would surface as `InvalidRequest` (inv 7 / Fable M1). Exercises the
+/// coordinator detached-submit delegation path.
+#[tokio::test]
+async fn unary_workflow_submit_delegates_and_strips_overrides() {
+    let srv = build_coordinator_batch_server();
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_MESSAGE,
+            json!({ "message": {
+                "text": "---\ntask-type: freeform\n---\nDIFF",
+                "metadata": {
+                    "a2a-bridge.skill": "code-review",
+                    "a2a-bridge.effort": "high",
+                    "a2a-bridge.model": "sonnet"
+                }
+            }}),
+        ))
+        .await
+        .unwrap();
+    let body = json_response(resp).await;
+    assert!(
+        body.get("error").is_none(),
+        "workflow submit with overrides must not be rejected (they are stripped): {body}"
+    );
+    let task = &body["result"]["task"];
+    let state = task["status"]["state"]
+        .as_str()
+        .or_else(|| task["state"].as_str());
+    assert_eq!(
+        state,
+        Some("TASK_STATE_WORKING"),
+        "detached submit must return a Working task via the coordinator: {body}"
     );
 }

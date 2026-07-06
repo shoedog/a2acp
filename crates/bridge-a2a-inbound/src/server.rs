@@ -162,6 +162,12 @@ pub struct InboundServer {
     /// empty → the card omits the `agent-models` extension (same as a fully-failed probe). Wired from
     /// `main`'s startup probe via [`InboundServer::with_model_catalog`].
     pub model_catalog: Arc<arc_swap::ArcSwap<bridge_core::catalog::ModelCatalog>>,
+    /// #10: the ONE `Coordinator` that owns turn-lifecycle STATE. `None` for tests
+    /// that build the adapter directly over fakes; `Some` in the serve path, where
+    /// the adapter adopts the Coordinator's SAME state instances via
+    /// [`InboundServer::with_coordinator`]. Held (not yet routed through) at slice 1
+    /// — later slices delegate stateless RPCs / batch / detached submit to it.
+    coordinator: Option<Arc<bridge_coordinator::Coordinator>>,
 }
 
 impl InboundServer {
@@ -202,6 +208,7 @@ impl InboundServer {
             model_catalog: Arc::new(arc_swap::ArcSwap::from_pointee(
                 bridge_core::catalog::ModelCatalog::new(),
             )),
+            coordinator: None,
         }
     }
 
@@ -274,6 +281,50 @@ impl InboundServer {
     ) -> Self {
         self.model_catalog = catalog;
         self
+    }
+
+    /// #10 slice 1: adopt the `Coordinator`'s shared turn-lifecycle STATE so A2A is
+    /// co-equal with CLI/MCP over ONE owner. Re-points every shared field to the
+    /// Coordinator's owned instance (Arc identity preserved), so a mutation on either
+    /// surface is visible to both — this is what kills the parallel-state divergence.
+    ///
+    /// Build the `Coordinator` FIRST, then call this. Adapter-only wire state is NOT
+    /// touched: `route`/`auth`/`base_url`/`delegation`/`local_source_label`/
+    /// `cancelled_peers`/`model_catalog`/`allowed_cwd_root` (the adapter keeps its
+    /// `Option<String>` cwd-gate root). No handler is rerouted here — later slices
+    /// delegate the pure-duplicate RPCs to the held `coordinator`.
+    ///
+    /// Pass the SAME `session_store`/`registry`/`policy` Arcs to both
+    /// `Coordinator::new` and `InboundServer::new`; this re-point makes the identity
+    /// explicit and covers the fields both constructors create internally (the four
+    /// maps + `executor`/`workflows`/`task_store`/`session_manager`/
+    /// `permission_registry`/`batch`).
+    #[must_use]
+    pub fn with_coordinator(mut self, coordinator: Arc<bridge_coordinator::Coordinator>) -> Self {
+        self.registry = coordinator.registry();
+        self.policy = coordinator.policy();
+        self.store = coordinator.session_store();
+        self.task_store = coordinator.task_store();
+        self.bindings = coordinator.bindings();
+        self.workflow_cancels = coordinator.workflow_cancels();
+        self.workflow_runs = coordinator.workflow_runs();
+        self.progress_hubs = coordinator.progress_hubs();
+        self.executor = coordinator.executor();
+        self.workflows = coordinator.workflows();
+        self.session_manager = Some(coordinator.session_manager.clone());
+        self.permission_registry = coordinator.permission_registry();
+        self.batch = coordinator.batch();
+        self.coordinator = Some(coordinator);
+        self
+    }
+
+    /// The adopted `Coordinator`, if this adapter was built over one (serve path).
+    /// `None` for adapters built directly over fakes. Later slices read this to
+    /// delegate stateless RPCs / batch / detached submit; exposed now so the
+    /// shared-identity test can assert Arc identity across the crate boundary.
+    #[doc(hidden)]
+    pub fn coordinator(&self) -> Option<&Arc<bridge_coordinator::Coordinator>> {
+        self.coordinator.as_ref()
     }
 
     /// Test-only: is a progress hub currently registered for `task`? Used by the
@@ -2467,6 +2518,54 @@ async fn unary_message(
         // Detached submit: mint a unique id, persist Working, register the
         // cancel token, spawn the runner, and return a working Task NOW.
         RouteTarget::Workflow(ref wf_id) => {
+            // #10 slice 4: delegate the detached submit to the Coordinator when present.
+            // STRIP agent/model/effort/mode — the A2A Workflow arm has ALWAYS dropped
+            // them (AgentOverride is dropped for workflows) and `run_workflow` REJECTS
+            // them (inv 7 / Fable M1): forwarding them would turn a today-succeeding
+            // `a2a-bridge.model` submit into InvalidRequest. The Coordinator submits over
+            // the SAME shared task_store / progress_hubs / workflow_cancels / executor
+            // (slice 1) and encodes the spec via the SAME `encode_workflow_spec` (s8 T9),
+            // so the durable record + runner + cancel token are identical. cwd was
+            // already validated in `gate()` against the adapter's real root; the
+            // Coordinator's re-validation (root None) is a no-op re-parse. The inline arm
+            // below stays for coordinator-less servers (tests).
+            if let Some(coord) = srv.coordinator() {
+                let input: String = routed
+                    .parts
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let op = bridge_coordinator::params::OpParams {
+                    workflow: Some(wf_id.as_str().to_string()),
+                    skill: None,
+                    input,
+                    context: None,
+                    agent: None,
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    cwd: routed.session_cwd.as_ref().map(|c| c.as_str().to_string()),
+                };
+                return match coord.run_workflow(op).await {
+                    Ok(task) => {
+                        let working = a2a::Task {
+                            id: task.as_str().to_owned(),
+                            context_id: task.as_str().to_owned(),
+                            status: a2a::TaskStatus {
+                                state: a2a::TaskState::Working,
+                                message: None,
+                                timestamp: None,
+                            },
+                            artifacts: None,
+                            history: None,
+                            metadata: None,
+                        };
+                        jsonrpc_ok(id, json!({ "task": working }))
+                    }
+                    Err(e) => bridge_err_to_jsonrpc(id, &e),
+                };
+            }
             let task = new_detached_task_id();
             let now = crate::workflow_sink::now_ms();
             // Pre-join the input text so the persisted `input` is byte-identical to
@@ -3004,7 +3103,14 @@ async fn session_inject(
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
     let ctx = params.context.clone();
-    match sm.inject(params.into_request()).await {
+    // #10 slice 3: route inject through the Coordinator when present — its
+    // session_manager IS the shared `sm` (identity-proven), so this is the same
+    // call; the adapter path stays for coordinator-less servers.
+    let result = match srv.coordinator() {
+        Some(coord) => coord.inject(params.into_request()).await,
+        None => sm.inject(params.into_request()).await,
+    };
+    match result {
         Ok(queued) => jsonrpc_ok(id, json!({ "contextId": ctx.as_str(), "queued": queued })),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
@@ -3023,12 +3129,18 @@ async fn session_permit(
         Ok(p) => p,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    // A server without the interactive-permission registry has no pending rendezvous to resolve.
-    let resolved = srv
-        .permission_registry
-        .as_ref()
-        .map(|reg| apply_permit(reg, &params))
-        .unwrap_or(false);
+    // #10 slice 3: route permit through the Coordinator when present — same shared
+    // PermissionRegistry (identity-proven); the adapter path stays otherwise. A
+    // server without the interactive-permission registry has no pending rendezvous
+    // to resolve (both paths return false).
+    let resolved = match srv.coordinator() {
+        Some(coord) => coord.permit(params).await.unwrap_or(false),
+        None => srv
+            .permission_registry
+            .as_ref()
+            .map(|reg| apply_permit(reg, &params))
+            .unwrap_or(false),
+    };
     jsonrpc_ok(id, json!({ "resolved": resolved }))
 }
 
@@ -3065,6 +3177,32 @@ async fn session_clear(
 ) -> Response {
     if let Err(e) = authorize_headers(&srv, &headers) {
         return bridge_err_to_jsonrpc(id, &e);
+    }
+    // #10 slice 5: delegate to `coordinator.clear(force)` when present. The Coordinator
+    // holds the SAME shared workflow_runs busy-guard + session_manager (slice 1), so this
+    // is identical to the inline path — the busy-check + `clear_with_children(force)` run
+    // over the same instances under the same lock scope. `force = true` fires an in-flight
+    // warm turn's abort token (Fable M5: the force-reset owner live-gate lands at THIS
+    // slice). The inline arm below stays for coordinator-less servers (tests).
+    if let Some(coord) = srv.coordinator() {
+        let ctx = match context_id_arg(&params) {
+            Ok(c) => c,
+            Err(e) => return bridge_err_to_jsonrpc(id, &e),
+        };
+        let force = params
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return match coord.clear(ctx.clone(), force).await {
+            Ok(crate::session_manager::ResetOutcome::Cleared { generation }) => jsonrpc_ok(
+                id,
+                json!({ "contextId": ctx.as_str(), "cleared": true, "generation": generation }),
+            ),
+            Ok(crate::session_manager::ResetOutcome::NotFound) => {
+                bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound)
+            }
+            Err(e) => bridge_err_to_jsonrpc(id, &e),
+        };
     }
     let Some(sm) = srv.session_manager.clone() else {
         return jsonrpc_err(id, JSONRPC_METHOD_NOT_FOUND, "no session manager");
@@ -3348,16 +3486,22 @@ async fn run_batch_rpc(
         });
     }
 
-    match bridge_coordinator::batch::run_batch(
-        &bdeps,
-        bridge_coordinator::batch::BatchParams {
-            workflow: params.workflow,
-            concurrency: params.concurrency,
-            items,
-        },
-    )
-    .await
-    {
+    // #10 slice 2: run on the Coordinator's shared BatchRuntime. The per-item
+    // validation above (against the wire cwd-gate root) is PRESERVED; the
+    // Coordinator's re-validation with its own root is a no-op on the already-
+    // normalized absolute cwds (`validate_cwd_str(_, None, _)` just re-parses).
+    // Fall back to the free fn if no Coordinator is wired (test/legacy servers;
+    // `batch_deps` being Some already implies the serve path, which has one).
+    let bp = bridge_coordinator::batch::BatchParams {
+        workflow: params.workflow,
+        concurrency: params.concurrency,
+        items,
+    };
+    let result = match srv.coordinator() {
+        Some(coord) => coord.run_batch(bp).await,
+        None => bridge_coordinator::batch::run_batch(&bdeps, bp).await,
+    };
+    match result {
         Ok(bid) => jsonrpc_ok(id, json!({ "batchId": bid.as_str() })),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
@@ -3383,7 +3527,12 @@ async fn batch_status_rpc(
         Ok(bid) => bid,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    match bridge_coordinator::batch::batch_status(&bdeps, &bid).await {
+    // #10 slice 2: delegate to the Coordinator (same shared runtime + task_store).
+    let result = match srv.coordinator() {
+        Some(coord) => coord.batch_status(&bid).await,
+        None => bridge_coordinator::batch::batch_status(&bdeps, &bid).await,
+    };
+    match result {
         Ok(summary) => jsonrpc_ok(id, json!(summary)),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
@@ -3405,7 +3554,13 @@ async fn batch_list_rpc(
         Ok(p) => p,
         Err(_) => return jsonrpc_err(id, JSONRPC_INVALID_REQUEST, "invalid BatchList params"),
     };
-    match bridge_coordinator::batch::batch_list(&bdeps, params.limit.unwrap_or(50)).await {
+    // #10 slice 2: delegate to the Coordinator (same shared runtime + task_store).
+    let limit = params.limit.unwrap_or(50);
+    let result = match srv.coordinator() {
+        Some(coord) => coord.batch_list(limit).await,
+        None => bridge_coordinator::batch::batch_list(&bdeps, limit).await,
+    };
+    match result {
         Ok(batches) => jsonrpc_ok(id, json!({ "batches": batches })),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
@@ -3431,7 +3586,12 @@ async fn cancel_batch_rpc(
         Ok(bid) => bid,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    match bridge_coordinator::batch::cancel_batch(&bdeps, &bid).await {
+    // #10 slice 2: delegate to the Coordinator (same shared runtime + task_store).
+    let result = match srv.coordinator() {
+        Some(coord) => coord.cancel_batch(&bid).await,
+        None => bridge_coordinator::batch::cancel_batch(&bdeps, &bid).await,
+    };
+    match result {
         Ok(canceled) => jsonrpc_ok(id, json!({ "canceled": canceled })),
         Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
@@ -4647,6 +4807,282 @@ mod tests {
         assert!(
             backend.cancelled.load(Ordering::SeqCst),
             "cancel must reach the backend"
+        );
+    }
+
+    /// #10 slice 1: after `with_coordinator`, the adapter and the Coordinator MUST
+    /// share the SAME Arc instances for every turn-lifecycle state field — Arc
+    /// identity, not merely equal contents. This is the anti-split-brain guarantee:
+    /// a mutation on either surface is visible to both. Guards a future edit that
+    /// forgets a field or re-points it at a fresh Arc.
+    #[tokio::test]
+    async fn with_coordinator_shares_state_identity() {
+        let registry: Arc<dyn AgentRegistry> = FakeRegistry::single("kiro", FakeBackend::new());
+        let session_store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let policy: Arc<dyn PolicyEngine> = Arc::new(AutoApprove);
+        let task_store: Arc<dyn bridge_core::task_store::TaskStore> =
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+            registry.clone(),
+        ));
+        let perm = PermissionRegistry::new();
+        let clock: Arc<dyn bridge_coordinator::clock::Clock> =
+            Arc::new(bridge_coordinator::clock::SystemClock);
+
+        let coord = Arc::new(
+            bridge_coordinator::Coordinator::new(
+                sm,
+                Some(executor),
+                Arc::new(std::collections::HashMap::new()),
+                task_store,
+                session_store,
+                policy,
+                registry,
+                clock,
+                None,
+                None,
+                3,
+            )
+            .with_permission_registry(perm),
+        );
+
+        // Build the adapter over its OWN fakes, then adopt the coordinator; adoption
+        // must overwrite EVERY shared field with the coordinator's instance.
+        let srv = InboundServer::new(
+            FakeRegistry::single("kiro", FakeBackend::new()),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            Arc::new(AlwaysKiro),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        )
+        .with_coordinator(Arc::clone(&coord));
+
+        // The held handle is the same Arc<Coordinator>.
+        assert!(Arc::ptr_eq(srv.coordinator().unwrap(), &coord));
+
+        // The four maps (split-brain critical).
+        assert!(Arc::ptr_eq(&srv.bindings, &coord.bindings()), "bindings");
+        assert!(
+            Arc::ptr_eq(&srv.workflow_cancels, &coord.workflow_cancels()),
+            "workflow_cancels"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.workflow_runs, &coord.workflow_runs()),
+            "workflow_runs"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.progress_hubs, &coord.progress_hubs()),
+            "progress_hubs"
+        );
+
+        // Stores + ports.
+        assert!(
+            Arc::ptr_eq(&srv.store, &coord.session_store()),
+            "session_store"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.task_store, &coord.task_store()),
+            "task_store"
+        );
+        assert!(Arc::ptr_eq(&srv.registry, &coord.registry()), "registry");
+        assert!(Arc::ptr_eq(&srv.policy, &coord.policy()), "policy");
+
+        // Session manager + Option-wrapped shared state.
+        assert!(
+            Arc::ptr_eq(
+                srv.session_manager.as_ref().unwrap(),
+                &coord.session_manager
+            ),
+            "session_manager"
+        );
+        assert!(
+            Arc::ptr_eq(
+                srv.executor.as_ref().unwrap(),
+                coord.executor().as_ref().unwrap()
+            ),
+            "executor"
+        );
+        assert!(Arc::ptr_eq(&srv.workflows, &coord.workflows()), "workflows");
+        assert!(
+            Arc::ptr_eq(
+                srv.permission_registry.as_ref().unwrap(),
+                coord.permission_registry().as_ref().unwrap()
+            ),
+            "permission_registry"
+        );
+    }
+
+    /// Warm, coordinator-backed server (same shape as
+    /// `warm_server_with_permission_registry`, but the sm + permission registry are
+    /// owned by a Coordinator the adapter adopts). Returns the SHARED sm + registry
+    /// so a test can observe the effects of coordinator-routed inject/permit.
+    fn warm_coordinator_server_with_permission_registry() -> (
+        Arc<InboundServer>,
+        Arc<crate::session_manager::SessionManager>,
+        Arc<bridge_core::permission::PermissionRegistry>,
+    ) {
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend as Arc<dyn AgentBackend>)],
+        );
+        let registry_dyn: Arc<dyn AgentRegistry> = registry;
+        let session_store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry_dyn.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        let perm_registry = bridge_core::permission::PermissionRegistry::new();
+        let task_store: Arc<dyn bridge_core::task_store::TaskStore> =
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+            registry_dyn.clone(),
+        ));
+        let clock: Arc<dyn bridge_coordinator::clock::Clock> =
+            Arc::new(bridge_coordinator::clock::SystemClock);
+        let coord = Arc::new(
+            bridge_coordinator::Coordinator::new(
+                sm.clone(),
+                Some(executor),
+                Arc::new(std::collections::HashMap::new()),
+                task_store,
+                session_store.clone(),
+                Arc::new(AutoApprove) as Arc<dyn PolicyEngine>,
+                registry_dyn.clone(),
+                clock,
+                None,
+                None,
+                3,
+            )
+            .with_permission_registry(Arc::clone(&perm_registry)),
+        );
+        let srv = Arc::new(
+            InboundServer::new(
+                registry_dyn,
+                session_store,
+                Arc::new(AutoApprove),
+                Arc::new(RegistryRoute {
+                    default: AgentId::parse("a").unwrap(),
+                }),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "a",
+            )
+            .with_coordinator(coord),
+        );
+        (srv, sm, perm_registry)
+    }
+
+    /// #10 slice 3: SessionInject + SessionPermit route through the Coordinator and
+    /// land on the SAME shared session_manager / permission_registry (proven by
+    /// observing the shared handles after the coordinator-routed RPCs).
+    #[tokio::test]
+    async fn inject_and_permit_delegate_through_coordinator() {
+        let (srv, sm, perm_registry) = warm_coordinator_server_with_permission_registry();
+
+        // Warm the context (adapter path, unchanged) so inject has a live handle.
+        let ctx = ContextId::parse("c-coord-inject").unwrap();
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": {
+                    "contextId": "c-coord-inject",
+                    "text": "go",
+                    "metadata": { "a2a-bridge.agent": "a" }
+                }}),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        // SessionInject through the coordinator queues onto the shared sm.
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                "SessionInject",
+                json!({ "contextId": "c-coord-inject", "text": "queued" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["result"]["queued"], 1, "{v}");
+        assert_eq!(
+            sm.pending_inject_count(&ctx).await,
+            1,
+            "coordinator-routed inject must queue onto the shared session_manager"
+        );
+
+        // SessionPermit through the coordinator resolves on the shared registry.
+        let (rx, _guard) = register_pending_permission(&perm_registry, "c-coord-permit", "req-c");
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionPermit",
+                json!({
+                    "contextId": "c-coord-permit",
+                    "generation": 1,
+                    "op": "turn-1",
+                    "requestId": "req-c",
+                    "decision": { "decision": "approve", "optionId": "ok" }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["result"]["resolved"], true, "{v}");
+        assert!(matches!(
+            rx.await.unwrap(),
+            bridge_core::permission::PermissionResolution::Decided(_)
+        ));
+    }
+
+    /// #10 slice 5: SessionClear (incl. `force = true`) routes through
+    /// `coordinator.clear(force)` and clears the SHARED session — cleared + a new
+    /// generation on the shared session_manager.
+    #[tokio::test]
+    async fn session_clear_delegates_through_coordinator() {
+        let (srv, _sm, _perm) = warm_coordinator_server_with_permission_registry();
+
+        // Warm a context (adapter path, unchanged).
+        let resp = router(srv.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": {
+                    "contextId": "c-coord-clear",
+                    "text": "go",
+                    "metadata": { "a2a-bridge.agent": "a" }
+                }}),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = body_string(resp).await;
+
+        // SessionClear force=true through the coordinator → cleared + bumped generation.
+        let resp = router(srv)
+            .oneshot(post_request(
+                "SessionClear",
+                json!({ "contextId": "c-coord-clear", "force": true }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["result"]["cleared"], true, "{v}");
+        assert!(
+            v["result"]["generation"].as_u64().is_some(),
+            "clear must report the new generation: {v}"
         );
     }
 

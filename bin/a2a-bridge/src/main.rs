@@ -37,7 +37,7 @@ mod route;
 mod slice;
 
 pub(crate) use bridge_controller::{
-    implement, implement_resume, merge, resilient, review, tweak, turn, verify,
+    implement, implement_resume, merge, resilient, review, turn, tweak, verify,
 };
 
 use std::collections::BTreeSet;
@@ -2701,8 +2701,8 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
         .map_err(|e| format!("merge: config {}: {e}", config_path.display()))?;
     let raw =
         std::fs::read_to_string(&config_path).map_err(|e| format!("merge: read config: {e}"))?;
-    let cfg = config::RegistryConfig::parse(&raw)
-        .map_err(|e| format!("merge: config parse: {e}"))?;
+    let cfg =
+        config::RegistryConfig::parse(&raw).map_err(|e| format!("merge: config parse: {e}"))?;
     let root = cfg
         .allowed_cwd_root
         .clone()
@@ -2715,8 +2715,7 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
         .map(|m| m.to_config())
         .transpose()
         .map_err(|e| format!("merge: {e}"))?;
-    let clone =
-        implement_resume::resolve_clone(&root, &id).map_err(|e| format!("merge: {e}"))?;
+    let clone = implement_resume::resolve_clone(&root, &id).map_err(|e| format!("merge: {e}"))?;
 
     let outcome = merge::merge_clone(mcfg.as_ref(), &clone, &root, onto.as_deref(), force);
     use std::io::Write;
@@ -6076,12 +6075,18 @@ async fn main() -> Result<(), BoxError> {
     ));
 
     // Slice 0 warm sessions: share the live registry with the SessionManager and reap idle handles.
+    // #10 slice 1: the SessionManager and the Coordinator (built below) share ONE clock.
+    // SystemClock is behaviourally identical to `SessionManager::new`'s internal default,
+    // but making it explicit lets both owners of turn-lifecycle state read one time source.
+    let clock: Arc<dyn bridge_coordinator::clock::Clock> =
+        Arc::new(bridge_coordinator::clock::SystemClock);
     let warm_ttl = cfg.server.warm_idle_ttl_secs;
     let registry_for_sessions: Arc<dyn AgentRegistry> = registry.clone();
     let session_manager = Arc::new(
-        bridge_a2a_inbound::session_manager::SessionManager::new(
+        bridge_a2a_inbound::session_manager::SessionManager::new_with_clock(
             registry_for_sessions,
             Duration::from_secs(warm_ttl),
+            clock.clone(),
         )
         .with_permission_registry(Arc::clone(&perm_registry))
         .with_warn_fraction(cfg.server.warm_usage_warn_fraction)
@@ -6101,29 +6106,58 @@ async fn main() -> Result<(), BoxError> {
         });
     }
 
-    // 8. Construct the inbound server.
-    //    InboundServer::new(registry, store, policy, route, auth, base_url, delegation, local_source_label)
+    // 8. Build the ONE Coordinator (#10 slice 1), then construct the inbound server
+    //    ADOPTING its shared turn-lifecycle STATE. The Coordinator owns the state;
+    //    A2A becomes a co-equal adapter over the SAME instances (no parallel copies).
+    //    D1: the ONE in-memory `store` is instance-shared as the Coordinator's
+    //    session_store (NOT a second store, NOT file-backed). B3: ONE BatchRuntime.
+    let base_url = format!("http://{}", cfg.server.addr);
+    let session_store: Arc<dyn bridge_core::ports::SessionStore> = store;
+    let batch = batch_runtime(&cfg)?;
+    // #10 slice 1: the Coordinator's `allowed_cwd_root` is INERT until a handler
+    // delegates a cwd-gated op (batch/detached submit — a later slice). Passing
+    // `None` now keeps boot behavior-preserving: the A2A wire cwd-gate still runs
+    // off the adapter's `Option<String>` root (`with_allowed_cwd_root` below), and
+    // parsing the config string here would add a new boot-time failure mode
+    // (`SessionCwd::parse` rejects empty/relative roots) that serve never had. The
+    // real parsed root is wired at the slice that consumes it.
+    let coordinator = Arc::new(
+        bridge_coordinator::Coordinator::new(
+            session_manager,
+            Some(executor),
+            Arc::new(wf_map),
+            task_store,
+            Arc::clone(&session_store),
+            Arc::clone(&policy),
+            Arc::clone(&registry) as Arc<dyn AgentRegistry>,
+            clock,
+            None,
+            batch,
+            resume_cap,
+        )
+        .with_permission_registry(Arc::clone(&perm_registry)),
+    );
+
     // The inbound server holds the agent registry (3b): first-message LOCAL dispatch
     // resolves the routed agent id, applies its effective config, and binds the task.
-    let base_url = format!("http://{}", cfg.server.addr);
-    let batch = batch_runtime(&cfg)?;
+    // `with_coordinator` re-points the shared-identity set onto the Coordinator's
+    // instances; adapter-only wire state (route/auth/base_url/delegation/label/
+    // model_catalog + the Option<String> cwd-gate root) stays adapter-resident.
+    // Boot resume runs via `coordinator.resume()` below (slice 4) — exactly ONE
+    // resume path, over the SAME shared store the detached submits write to.
     let server = Arc::new(
         InboundServer::new(
             Arc::clone(&registry) as _,
-            store,
-            policy,
+            Arc::clone(&session_store),
+            Arc::clone(&policy),
             route,
             auth,
             base_url,
             delegation,
             default_label.clone(),
         )
-        .with_workflows(executor, wf_map.clone())
-        .with_task_store(task_store)
-        .with_session_manager(session_manager)
-        .with_permission_registry(Arc::clone(&perm_registry))
+        .with_coordinator(Arc::clone(&coordinator))
         .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
-        .with_batch_runtime(batch)
         .with_model_catalog(Arc::clone(&model_catalog)),
     );
 
@@ -6154,7 +6188,11 @@ async fn main() -> Result<(), BoxError> {
     // 8b. Resume in-flight detached workflows from their checkpoints BEFORE accepting
     //     new requests. Boot order: open store → build server → resume → bind listener.
     //     For the in-memory/no-path branch the store is always empty so this is a no-op.
-    bridge_a2a_inbound::server::resume_working_tasks(&server, resume_cap).await;
+    //     #10 slice 4: resume via the Coordinator (its resume() dispatches to the SAME
+    //     batch::resume_all / detached::resume_non_batch_tasks over the SHARED store +
+    //     BatchRuntime as the adapter's resume_working_tasks). This REPLACES the adapter
+    //     call — NEVER both, or a working task double-spawns two runners (Fable M4).
+    coordinator.resume().await;
 
     // 8c. Build the axum router (consumes one Arc ref; hold a clone above for resume).
     let router = server.router();

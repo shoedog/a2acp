@@ -117,7 +117,8 @@ async fn dispatch(id: &Value, params: &Value, coord: &Coordinator) -> Value {
             Err(e) => Err(e),
         },
         "clear" => match parse_ctx(&args) {
-            Ok(ctx) => coord.clear(ctx).await.map(|out| match out {
+            // mcp SessionClear has no force flag → non-force clear (force = false).
+            Ok(ctx) => coord.clear(ctx, false).await.map(|out| match out {
                 ResetOutcome::Cleared { generation } => json!({ "generation": generation }),
                 ResetOutcome::NotFound => json!({ "not_found": true }),
             }),
