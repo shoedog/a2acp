@@ -1,6 +1,10 @@
 //! bridge-a2a-outbound — outbound A2A DelegationPort (Increment 2.5).
 
 pub mod client;
+pub mod sse;
+
+pub use client::{A2aClient, ClientError, SendOpts, StreamingReply, TaskIdMode};
+pub use sse::{sse_events, SseError, SseEvent, SseStream};
 
 #[cfg(test)]
 pub(crate) mod testpeer;
@@ -9,8 +13,6 @@ use bridge_core::domain::{AuthContext, Part, PeerTaskId};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::TaskId;
 use bridge_core::ports::{Delegation, DelegationPort};
-
-use client::A2aClient;
 
 /// Real outbound A2A delegation: opens an SSE stream to a remote peer
 /// and returns `Delegation{events, peer_task}`. Implements `DelegationPort`.

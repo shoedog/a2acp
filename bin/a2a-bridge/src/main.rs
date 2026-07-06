@@ -46,7 +46,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bridge_a2a_inbound::server::InboundServer;
-use bridge_a2a_outbound::{PeerDelegation, StubDelegation};
+use bridge_a2a_outbound::{
+    A2aClient, ClientError, PeerDelegation, SendOpts, StreamingReply, StubDelegation, TaskIdMode,
+};
 use bridge_core::domain::AgentEntry;
 use bridge_core::error::BridgeError;
 use bridge_core::permission::PermissionRegistry;
@@ -2779,38 +2781,6 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
 /// Loads the config, resolves the workflow graph, runs the executor,
 /// prints NodeStarted/NodeFinished to stderr and the terminal output to stdout
 /// (or `--out <file>`).
-fn build_run_workflow_streaming_request(
-    workflow_id: &str,
-    input: &str,
-    context: &str,
-    session_cwd: Option<&str>,
-) -> serde_json::Value {
-    let mut metadata = serde_json::Map::new();
-    metadata.insert("a2a-bridge.skill".to_string(), workflow_id.into());
-    if let Some(cwd) = session_cwd {
-        metadata.insert("a2a-bridge.cwd".to_string(), cwd.into());
-    }
-
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": a2a::methods::SEND_STREAMING_MESSAGE,
-        "params": {
-            "message": {
-                "contextId": context,
-                "taskId": a2a::new_task_id(),
-                "metadata": metadata,
-                "parts": [
-                    {
-                        "kind": "text",
-                        "text": input
-                    }
-                ]
-            }
-        }
-    })
-}
-
 fn collect_artifact_text(artifact: &a2a::Artifact) -> String {
     artifact
         .parts
@@ -2837,96 +2807,79 @@ async fn run_workflow_serve_client(
     context: &str,
     session_cwd: Option<&str>,
 ) -> Result<(), BoxError> {
-    let body = build_run_workflow_streaming_request(workflow_id, input, context, session_cwd);
-    let resp = reqwest::Client::new()
-        .post(url)
-        .header(a2a::SVC_PARAM_VERSION, a2a::VERSION)
-        .json(&body)
-        .send()
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("a2a-bridge.skill".to_string(), workflow_id.into());
+    if let Some(cwd) = session_cwd {
+        metadata.insert("a2a-bridge.cwd".to_string(), cwd.into());
+    }
+
+    // Client-side taskId minting is load-bearing: the server otherwise
+    // synthesises the constant stub `task-1`, which collides concurrent
+    // `--serve` runs in the durable store.
+    let opts = SendOpts {
+        context_id: Some(context.to_string()),
+        task_id: TaskIdMode::Mint,
+        metadata: Some(metadata),
+    };
+    let parts = [bridge_core::domain::Part { text: input.into() }];
+
+    let reply = A2aClient::loopback(url)
+        .send_streaming_with(&parts, opts)
         .await
         .map_err(|e| {
             format!("cannot reach serve at {url} — is `a2a-bridge serve` running? ({e})")
         })?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        eprintln!("error: HTTP {status}\n{text}");
-        return Err(format!("run-workflow --serve: server returned {status}").into());
-    }
-
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    if content_type
-        .split(';')
-        .any(|part| part.trim().eq_ignore_ascii_case("application/json"))
-    {
-        let text = resp.text().await.unwrap_or_default();
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+    let mut stream = match reply {
+        // The server declined to stream and answered with a unary JSON body.
+        StreamingReply::Json(v) => {
             if let Some(err) = v.get("error") {
                 return Err(format!("run-workflow --serve failed: {err}").into());
             }
+            return Err("run-workflow --serve: expected SSE response, got JSON response".into());
         }
-        return Err("run-workflow --serve: expected SSE response, got JSON response".into());
-    }
+        StreamingReply::Events(stream) => stream,
+    };
 
     use futures::StreamExt;
-    let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
     let mut output = String::new();
     let mut terminal: Option<a2a::TaskState> = None;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("run-workflow --serve: stream error: {e}"))?;
-        let text = String::from_utf8_lossy(&chunk);
-        buf.push_str(&text);
-
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].trim_end_matches('\r').to_string();
-            buf.drain(..=pos);
-
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let payload = data.trim_start();
-            let response: a2a::StreamResponse = serde_json::from_str(payload)
-                .map_err(|e| format!("run-workflow --serve: bad SSE data frame: {e}"))?;
-            match response {
-                a2a::StreamResponse::ArtifactUpdate(update) => {
-                    output.push_str(&collect_artifact_text(&update.artifact));
-                }
-                a2a::StreamResponse::StatusUpdate(update) => {
-                    eprintln!("[workflow] status {:?}", update.status.state);
-                    if let Some(message) = &update.status.message {
-                        let text = message_text(message);
-                        if !text.is_empty() {
-                            eprintln!("{text}");
-                        }
-                    }
-                    if update.status.message.is_none()
-                        && matches!(
-                            update.status.state,
-                            a2a::TaskState::Completed
-                                | a2a::TaskState::Failed
-                                | a2a::TaskState::Canceled
-                        )
-                    {
-                        terminal = Some(update.status.state);
-                    }
-                }
-                a2a::StreamResponse::Message(message) => {
-                    let text = message_text(&message);
+    while let Some(event) = stream.next().await {
+        let event = event.map_err(|e| format!("run-workflow --serve: stream error: {e}"))?;
+        let response: a2a::StreamResponse = serde_json::from_str(&event.data)
+            .map_err(|e| format!("run-workflow --serve: bad SSE data frame: {e}"))?;
+        match response {
+            a2a::StreamResponse::ArtifactUpdate(update) => {
+                output.push_str(&collect_artifact_text(&update.artifact));
+            }
+            a2a::StreamResponse::StatusUpdate(update) => {
+                eprintln!("[workflow] status {:?}", update.status.state);
+                if let Some(message) = &update.status.message {
+                    let text = message_text(message);
                     if !text.is_empty() {
                         eprintln!("{text}");
                     }
                 }
-                a2a::StreamResponse::Task(task) => {
-                    eprintln!("[workflow] task state {:?}", task.status.state);
+                if update.status.message.is_none()
+                    && matches!(
+                        update.status.state,
+                        a2a::TaskState::Completed
+                            | a2a::TaskState::Failed
+                            | a2a::TaskState::Canceled
+                    )
+                {
+                    terminal = Some(update.status.state);
                 }
+            }
+            a2a::StreamResponse::Message(message) => {
+                let text = message_text(&message);
+                if !text.is_empty() {
+                    eprintln!("{text}");
+                }
+            }
+            a2a::StreamResponse::Task(task) => {
+                eprintln!("[workflow] task state {:?}", task.status.state);
             }
         }
     }
@@ -3340,31 +3293,32 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(|s| s.as_str())
 }
 
+/// Generic loopback JSON-RPC call against a running `serve`.
+///
+/// Delegates transport to `A2aClient::loopback(url).rpc(...)` (no Authorization,
+/// no total timeout) and maps `ClientError` back to the exact user-facing
+/// strings. Result-shape interpretation (`v["result"]`, `v["error"]`) stays in
+/// the individual callers.
 async fn rpc_call(
     url: &str,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, BoxError> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params
-    });
-    let resp = reqwest::Client::new()
-        .post(url)
-        .header(a2a::SVC_PARAM_VERSION, a2a::VERSION)
-        .json(&body)
-        .send()
+    A2aClient::loopback(url)
+        .rpc(method, params)
         .await
-        .map_err(|e| {
-            format!("cannot reach serve at {url} — is `a2a-bridge serve` running? ({e})")
-        })?;
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("bad response: {e}"))?;
-    Ok(v)
+        .map_err(|e| -> BoxError {
+            match e {
+                ClientError::Transport(_) => {
+                    format!("cannot reach serve at {url} — is `a2a-bridge serve` running? ({e})")
+                        .into()
+                }
+                ClientError::Decode(_) => format!("bad response: {e}").into(),
+                // rpc() parses the body regardless of status, so a Status error is only a
+                // non-JSON non-success body (e.g. a 500 HTML page). Surface it verbatim.
+                ClientError::Status { .. } => e.to_string().into(),
+            }
+        })
 }
 
 const RUN_BATCH_USAGE: &str = "\
@@ -3996,56 +3950,37 @@ fn build_session_permit_rpc(
 /// request and streams the SSE response, printing each `data:` line to stdout.
 /// Tracks the last `id:` value seen and prints a resume hint on stream close.
 async fn task_watch_cmd(url: &str, id: &str, from: Option<i64>) -> Result<(), BoxError> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "SubscribeToTask",
-        "params": { "id": id }
-    });
+    let reply = A2aClient::loopback(url)
+        .subscribe_sse(
+            a2a::methods::SUBSCRIBE_TO_TASK,
+            serde_json::json!({ "id": id }),
+            from.map(|cursor| cursor.to_string()),
+        )
+        .await
+        .map_err(|e| {
+            format!("cannot reach serve at {url} — is `a2a-bridge serve` running? ({e})")
+        })?;
 
-    let mut req = reqwest::Client::new()
-        .post(url)
-        .header(a2a::SVC_PARAM_VERSION, a2a::VERSION)
-        .json(&body);
-    if let Some(cursor) = from {
-        req = req.header("Last-Event-ID", cursor.to_string());
-    }
+    let mut stream = match reply {
+        StreamingReply::Events(stream) => stream,
+        // The server declined to stream and answered with a unary JSON body.
+        StreamingReply::Json(v) => {
+            if let Some(err) = v.get("error") {
+                return Err(format!("task watch failed: {err}").into());
+            }
+            return Err("task watch: expected SSE response, got JSON response".into());
+        }
+    };
 
-    let resp = req.send().await.map_err(|e| {
-        format!("cannot reach serve at {url} — is `a2a-bridge serve` running? ({e})")
-    })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        eprintln!("error: HTTP {status}\n{text}");
-        return Err(format!("task watch: server returned {status}").into());
-    }
-
-    // Stream the SSE response: accumulate bytes, split on newlines, handle
-    // `id:` and `data:` lines; ignore blank lines and comments.
+    // Print each event's data payload; track the last `id:` for the resume hint.
     use futures::StreamExt;
-    let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
     let mut last_id: Option<String> = None;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("task watch: stream error: {e}"))?;
-        let text = String::from_utf8_lossy(&chunk);
-        buf.push_str(&text);
-
-        // Process all complete lines (ending with '\n') in the buffer.
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].trim_end_matches('\r').to_string();
-            buf.drain(..=pos);
-
-            if let Some(data) = line.strip_prefix("data:") {
-                let payload = data.trim_start();
-                println!("{payload}");
-            } else if let Some(seq) = line.strip_prefix("id:") {
-                last_id = Some(seq.trim_start().to_string());
-            }
-            // Blank lines and comment lines (`:`) are silently ignored.
+    while let Some(event) = stream.next().await {
+        let event = event.map_err(|e| format!("task watch: stream error: {e}"))?;
+        println!("{}", event.data);
+        if let Some(seq) = event.id {
+            last_id = Some(seq);
         }
     }
 
@@ -8355,27 +8290,74 @@ The command prints schemas, templates, and validates input.
         );
     }
 
-    #[test]
-    fn serve_client_builds_streaming_message() {
-        let req =
-            super::build_run_workflow_streaming_request("wf", "hello", "C", Some("/work/repo"));
-        assert_eq!(req["method"], a2a::methods::SEND_STREAMING_MESSAGE);
-        let message = &req["params"]["message"];
+    /// Drive `run_workflow_serve_client` against a wiremock `serve` that returns
+    /// a completed SSE stream, and capture the request it POSTs. Returns
+    /// `(authorization_present, a2a_version_header, body)`.
+    async fn capture_streaming_request(
+        context: &str,
+        session_cwd: Option<&str>,
+    ) -> (bool, Option<String>, serde_json::Value) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stream_response_sse(terminal_update(
+                        a2a::TaskState::Completed,
+                    ))),
+            )
+            .mount(&server)
+            .await;
+        super::run_workflow_serve_client("wf", "hello", None, &server.uri(), context, session_cwd)
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let req = &reqs[0];
+        let auth_present = req.headers.get("authorization").is_some();
+        let version = req
+            .headers
+            .get("a2a-version")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        (auth_present, version, body)
+    }
+
+    #[tokio::test]
+    async fn serve_client_builds_streaming_message() {
+        let (auth_present, version, body) =
+            capture_streaming_request("C", Some("/work/repo")).await;
+        // Headers: A2A-Version present, Authorization ABSENT (loopback).
+        assert_eq!(version.as_deref(), Some("1.0"), "A2A-Version header");
+        assert!(!auth_present, "loopback must send no Authorization header");
+        // Envelope + message shape (G-C1 allowed delta).
+        assert_eq!(body["method"], a2a::methods::SEND_STREAMING_MESSAGE);
+        let message = &body["params"]["message"];
         assert_eq!(message["contextId"], "C");
         assert!(
             message["taskId"].as_str().is_some_and(|s| !s.is_empty()),
-            "taskId missing from {req}"
+            "taskId missing from {body}"
         );
         assert_eq!(message["metadata"]["a2a-bridge.skill"], "wf");
         assert_eq!(message["metadata"]["a2a-bridge.cwd"], "/work/repo");
-        assert_eq!(message["parts"][0]["kind"], "text");
         assert_eq!(message["parts"][0]["text"], "hello");
+        // Allowed-delta additions: messageId + role "ROLE_USER".
+        assert!(
+            message["messageId"].as_str().is_some_and(|s| !s.is_empty()),
+            "messageId missing from {message}"
+        );
+        assert_eq!(message["role"], "ROLE_USER");
+        // parts[0] loses `kind: text` (server is lenient).
+        assert!(
+            message["parts"][0].get("kind").is_none(),
+            "parts[0].kind must be absent, got {message}"
+        );
     }
 
-    #[test]
-    fn serve_client_requests_have_distinct_task_ids() {
-        let first = super::build_run_workflow_streaming_request("wf", "hello", "C", None);
-        let second = super::build_run_workflow_streaming_request("wf", "hello", "C", None);
+    #[tokio::test]
+    async fn serve_client_requests_have_distinct_task_ids() {
+        let (_a, _v, first) = capture_streaming_request("C", None).await;
+        let (_a2, _v2, second) = capture_streaming_request("C", None).await;
         assert_ne!(
             first["params"]["message"]["taskId"],
             second["params"]["message"]["taskId"]
@@ -8514,6 +8496,133 @@ The command prints schemas, templates, and validates input.
             .unwrap_err()
             .to_string();
         assert!(err.contains("HandleBusy"), "unexpected error: {err}");
+    }
+
+    // ---- T-C3: run-workflow --serve terminal/artifact/frame characterization ----
+
+    /// A `StatusUpdate(Completed)` that still carries a `message` — under the
+    /// CLI's `message.is_none()` gate this is NOT terminal.
+    fn completed_with_message(text: &str) -> a2a::StreamResponse {
+        a2a::StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+            task_id: "task-1".to_string(),
+            context_id: "C".to_string(),
+            status: a2a::TaskStatus {
+                state: a2a::TaskState::Completed,
+                message: Some(a2a::Message::new(
+                    a2a::Role::User,
+                    vec![a2a::Part::text(text)],
+                )),
+                timestamp: None,
+            },
+            metadata: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn run_workflow_serve_concatenates_artifacts_in_arrival_order() {
+        // (a) "A" + "B" + Completed → output "AB".
+        let body = format!(
+            "{}{}{}",
+            stream_response_sse(artifact_update("A")),
+            stream_response_sse(artifact_update("B")),
+            stream_response_sse(terminal_update(a2a::TaskState::Completed)),
+        );
+        let (output, result) = run_workflow_with_fake_serve(body).await.unwrap();
+        assert!(result.is_ok(), "unexpected error: {result:?}");
+        assert_eq!(output, "AB");
+    }
+
+    #[tokio::test]
+    async fn run_workflow_serve_artifact_then_eof_without_terminal_errors() {
+        // (b) artifact + EOF with no terminal status → hard error.
+        let body = stream_response_sse(artifact_update("partial"));
+        let (_output, result) = run_workflow_with_fake_serve(body).await.unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("stream ended without terminal status"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_workflow_serve_completed_with_message_is_not_terminal() {
+        // (c) Completed WITH a message → not terminal (message.is_none() gate),
+        // so the stream ends without a recorded terminal status — same as (b).
+        let body = stream_response_sse(completed_with_message("still working"));
+        let (_output, result) = run_workflow_with_fake_serve(body).await.unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("stream ended without terminal status"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_workflow_serve_bad_frame_is_hard_error() {
+        // (d) undecodable SSE `data:` payload → hard error, preserved verbatim.
+        let body = "data: this is not valid json\n\n".to_string();
+        let (_output, result) = run_workflow_with_fake_serve(body).await.unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("bad SSE data frame"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ---- §6#2: `task watch --from` transport (Last-Event-ID + typed method) ----
+
+    async fn task_watch_capture(id: &str, from: Option<i64>) -> serde_json::Value {
+        let server = wiremock::MockServer::start().await;
+        // One SSE event carrying an `id:` line so the resume path is exercised.
+        let frame = format!(
+            "id: 7\ndata: {}\n\n",
+            serde_json::to_string(&terminal_update(a2a::TaskState::Completed)).unwrap()
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(frame),
+            )
+            .mount(&server)
+            .await;
+        super::task_watch_cmd(&server.uri(), id, from)
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let req = &reqs[0];
+        let last_event_id = req
+            .headers
+            .get("last-event-id")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        serde_json::json!({
+            "last_event_id": last_event_id,
+            "method": body["method"],
+            "params": body["params"],
+        })
+    }
+
+    #[tokio::test]
+    async fn task_watch_sends_last_event_id_when_from_set() {
+        let captured = task_watch_capture("task-1", Some(7)).await;
+        assert_eq!(
+            captured["last_event_id"], "7",
+            "Last-Event-ID must be sent when --from is set"
+        );
+        // Uses the typed method constant, not a hardcoded "SubscribeToTask".
+        assert_eq!(captured["method"], a2a::methods::SUBSCRIBE_TO_TASK);
+        assert_eq!(captured["params"]["id"], "task-1");
+    }
+
+    #[tokio::test]
+    async fn task_watch_omits_last_event_id_without_from() {
+        let captured = task_watch_capture("task-1", None).await;
+        assert!(
+            captured["last_event_id"].is_null(),
+            "Last-Event-ID must be absent without --from, got {captured}"
+        );
     }
 
     // ---- T10: `models` subcommand arg-parsing ----
