@@ -4,6 +4,9 @@
 use crate::{domain::*, error::BridgeError, ids::*};
 use futures::Stream;
 use std::pin::Pin;
+use std::time::Duration;
+
+use crate::orch::UsageSnapshot;
 
 // Bring new domain types into scope for the registry/config-source traits.
 use crate::domain::{AgentEntry, RegistrySnapshot};
@@ -173,6 +176,147 @@ pub trait PolicyEngine: Send + Sync {
 /// Sync auth middleware — validates an inbound request.
 pub trait AuthMiddleware: Send + Sync {
     fn authorize(&self, req: &InboundRequest) -> Result<AuthContext, BridgeError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceParent {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub flags: u8,
+}
+
+impl TraceParent {
+    pub fn parse_header_value(raw: &str) -> Option<Self> {
+        let mut parts = raw.split('-');
+        let version = parts.next()?;
+        let trace = parts.next()?;
+        let span = parts.next()?;
+        let flags = parts.next()?;
+        let is_lower_hex = |part: &str| {
+            part.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        };
+        if parts.next().is_some()
+            || version != "00"
+            || trace.len() != 32
+            || span.len() != 16
+            || flags.len() != 2
+            || !is_lower_hex(trace)
+            || !is_lower_hex(span)
+            || !is_lower_hex(flags)
+        {
+            return None;
+        }
+        let mut trace_id = [0_u8; 16];
+        let mut span_id = [0_u8; 8];
+        for i in 0..16 {
+            trace_id[i] = u8::from_str_radix(&trace[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        for i in 0..8 {
+            span_id[i] = u8::from_str_radix(&span[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        if trace_id.iter().all(|b| *b == 0) || span_id.iter().all(|b| *b == 0) {
+            return None;
+        }
+        Some(Self {
+            trace_id,
+            span_id,
+            flags: u8::from_str_radix(flags, 16).ok()?,
+        })
+    }
+
+    pub fn to_header_value(&self) -> String {
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        }
+        format!(
+            "00-{}-{}-{:02x}",
+            hex(&self.trace_id),
+            hex(&self.span_id),
+            self.flags
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnContext {
+    pub turn_id: TurnId,
+    pub session_id: ContextId,
+    pub task_id: Option<TaskId>,
+    pub workflow: Option<String>,
+    pub node: Option<String>,
+    pub attempt: u32,
+    pub agent: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub mode: Option<String>,
+    pub prompt_id: Option<String>,
+    pub traceparent: Option<TraceParent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    AgentCrashed,
+    TimedOut,
+    Overloaded,
+    Config,
+    Transport,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Success,
+    Failed(FailureClass),
+    Canceled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageFinalization {
+    TurnFinal,
+    TaskFinal,
+    Partial,
+}
+
+#[derive(Debug)]
+pub enum ObsEvent<'a> {
+    TaskStarted {
+        ctx: &'a TurnContext,
+    },
+    TaskFinished {
+        ctx: &'a TurnContext,
+        outcome: &'a TurnOutcome,
+    },
+    NodeStarted {
+        ctx: &'a TurnContext,
+    },
+    NodeFinished {
+        ctx: &'a TurnContext,
+        outcome: &'a TurnOutcome,
+    },
+    TurnStarted {
+        ctx: &'a TurnContext,
+    },
+    TurnFinished {
+        ctx: &'a TurnContext,
+        latency: Duration,
+        ttft: Option<Duration>,
+        outcome: &'a TurnOutcome,
+    },
+    QueueChanged {
+        in_flight: u64,
+        queued: u64,
+        wait: Option<Duration>,
+    },
+    UsageFinalized {
+        ctx: &'a TurnContext,
+        usage: &'a UsageSnapshot,
+        fin: UsageFinalization,
+    },
+}
+
+pub trait Observer: Send + Sync {
+    fn record(&self, e: &ObsEvent<'_>);
 }
 
 // ─── Registry / config-source ports (Increment 3b §4.5) ──────────────────────

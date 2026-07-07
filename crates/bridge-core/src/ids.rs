@@ -34,6 +34,7 @@ id_newtype!(SessionHandleId);
 id_newtype!(SessionHandleRef);
 id_newtype!(OperationId);
 id_newtype!(ContextId);
+id_newtype!(TurnId);
 id_newtype!(SourceId);
 
 /// A warm session's context generation. Hand-written (the `id_newtype!` macros are

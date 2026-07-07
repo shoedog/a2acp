@@ -6,5 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bridge-core = { path = "../bridge-core" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
