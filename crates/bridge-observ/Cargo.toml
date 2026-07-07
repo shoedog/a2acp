@@ -7,5 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 bridge-core = { path = "../bridge-core" }
+prometheus.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
