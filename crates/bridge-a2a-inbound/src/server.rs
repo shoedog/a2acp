@@ -318,6 +318,16 @@ impl InboundServer {
         //     must happen BEFORE task/session ids are derived so a malformed request
         //     is rejected before any state is created.
         let session_cwd = session_cwd_from_params(params, self.allowed_cwd_root.as_deref())?;
+        let traceparent = headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .and_then(bridge_core::ports::TraceParent::parse_header_value);
+        let prompt_id = params
+            .get("message")
+            .and_then(|m| m.get("metadata"))
+            .and_then(|md| md.get("a2a-bridge.prompt_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         // 4. Derive task/session ids from params (best-effort; v1 stubs allowed).
         let task = task_id_from_params(params)?;
@@ -332,6 +342,8 @@ impl InboundServer {
             // Per-request overrides ride along so LOCAL dispatch can compute the
             // effective config (entry defaults layered with these) before the prompt.
             overrides: task_meta.overrides,
+            traceparent,
+            prompt_id,
             context_id,
             session_cwd,
         })
@@ -372,6 +384,8 @@ struct RoutedCall {
     /// [`effective_config`] before `configure_session`. The selected `AgentId`
     /// itself is carried by `target` (`RouteTarget::Local(id)`).
     overrides: Option<AgentOverride>,
+    traceparent: Option<bridge_core::ports::TraceParent>,
+    prompt_id: Option<String>,
     /// A2A contextId for warm continuation (Slice 0). Honored only on the Local route. None = legacy.
     #[allow(dead_code)]
     context_id: Option<ContextId>,
@@ -408,18 +422,18 @@ fn local_agent_id(srv: &InboundServer, target: &RouteTarget) -> AgentId {
 async fn resolve_configure_bind(
     srv: &InboundServer,
     agent_id: &AgentId,
-    task: &TaskId,
-    session: &SessionId,
+    routed: &RoutedCall,
     overrides: Option<&AgentOverride>,
     session_cwd: Option<SessionCwd>,
 ) -> Result<LocalDispatch, BridgeError> {
+    let session = &routed.session;
     // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
     // route/resolve/recompute. Re-stash the bound effective config with the per-request
     // cwd (harmless idempotent overwrite; it only affects a not-yet-minted session,
     // never retroactively re-configures a live one), then prompt the bound backend.
     {
         let bindings = srv.bindings().lock().await;
-        if let Some(binding) = bindings.get(task) {
+        if let Some(binding) = bindings.get(&routed.task) {
             let backend = binding.backend.clone();
             let eff = binding.eff.clone();
             drop(bindings);
@@ -427,7 +441,7 @@ async fn resolve_configure_bind(
                 .configure_session(
                     session,
                     &SessionSpec {
-                        config: eff,
+                        config: eff.clone(),
                         cwd: session_cwd,
                     },
                 )
@@ -442,12 +456,22 @@ async fn resolve_configure_bind(
                 warm_guard: None,
                 // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
                 abort: tokio_util::sync::CancellationToken::new(),
+                obs_ctx: obs_ctx_for_dispatch(
+                    routed,
+                    agent_id,
+                    eff.model.clone(),
+                    eff.effort.map(effort_to_string),
+                    eff.mode.clone(),
+                ),
             });
         }
     }
     // First message: resolve, configure, bind, and hand back an eviction guard.
     let resolved = srv.registry().resolve(agent_id).await?;
     let eff = effective_config(&resolved.entry, overrides);
+    let obs_model = eff.model.clone();
+    let obs_effort = eff.effort;
+    let obs_mode = eff.mode.clone();
     resolved
         .backend
         .configure_session(
@@ -460,7 +484,7 @@ async fn resolve_configure_bind(
         .await?;
     let backend = resolved.backend.clone();
     srv.bindings().lock().await.insert(
-        task.clone(),
+        routed.task.clone(),
         TaskBinding {
             backend: backend.clone(),
             eff,
@@ -469,7 +493,7 @@ async fn resolve_configure_bind(
     );
     let guard = BindingGuard {
         bindings: srv.bindings().clone(),
-        task: task.clone(),
+        task: routed.task.clone(),
         backend: backend.clone(),
         session: session.clone(),
     };
@@ -481,9 +505,62 @@ async fn resolve_configure_bind(
         turn_meta: None,
         guard: Some(guard),
         warm_guard: None,
+        obs_ctx: obs_ctx_for_dispatch(
+            routed,
+            agent_id,
+            obs_model,
+            obs_effort.map(effort_to_string),
+            obs_mode,
+        ),
         // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
         abort: tokio_util::sync::CancellationToken::new(),
     })
+}
+
+fn mint_turn_id() -> bridge_core::ids::TurnId {
+    bridge_core::ids::TurnId::parse(format!("turn-{}", a2a::new_task_id()))
+        .expect("a2a task id is non-empty")
+}
+
+fn effort_to_string(effort: bridge_core::domain::Effort) -> String {
+    match effort {
+        bridge_core::domain::Effort::Minimal => "minimal".to_string(),
+        bridge_core::domain::Effort::Low => "low".to_string(),
+        bridge_core::domain::Effort::Medium => "medium".to_string(),
+        bridge_core::domain::Effort::High => "high".to_string(),
+        bridge_core::domain::Effort::Xhigh => "xhigh".to_string(),
+        bridge_core::domain::Effort::Max => "max".to_string(),
+    }
+}
+
+fn routed_session_context_id(routed: &RoutedCall) -> ContextId {
+    routed
+        .context_id
+        .clone()
+        .unwrap_or_else(|| ContextId::parse(routed.task.as_str()).expect("task id is non-empty"))
+}
+
+fn obs_ctx_for_dispatch(
+    routed: &RoutedCall,
+    agent: &AgentId,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<String>,
+) -> bridge_core::ports::TurnContext {
+    bridge_core::ports::TurnContext {
+        turn_id: mint_turn_id(),
+        session_id: routed_session_context_id(routed),
+        task_id: Some(routed.task.clone()),
+        workflow: None,
+        node: None,
+        attempt: 0,
+        agent: agent.as_str().to_string(),
+        model,
+        effort,
+        mode,
+        prompt_id: routed.prompt_id.clone(),
+        traceparent: routed.traceparent.clone(),
+    }
 }
 
 /// Slice 0 warm path. Returns None when the request carries no contextId (caller uses
@@ -530,6 +607,13 @@ async fn warm_local_dispatch(
                 }),
                 // Warm: the handle's per-turn abort token — a force-reset cancels it (cancel-tokens F2).
                 abort: turn.abort,
+                obs_ctx: obs_ctx_for_dispatch(
+                    routed,
+                    &turn.agent,
+                    turn.model.clone(),
+                    turn.effort.clone(),
+                    turn.mode.clone(),
+                ),
             }))
         }
         Err(e) => Some(Err(e)),
@@ -785,8 +869,7 @@ async fn stream_message(
                     resolve_configure_bind(
                         &srv,
                         &agent_id,
-                        &routed.task,
-                        &routed.session,
+                        &routed,
                         routed.overrides.as_ref(),
                         routed.session_cwd.clone(),
                     )
@@ -1382,6 +1465,7 @@ fn spawn_local_producer(
 ) {
     let store = srv.store.clone();
     let policy = srv.policy().clone();
+    let observer = srv.coordinator().observer();
     let task = routed.task;
     let session = dispatch.session.clone();
     let parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
@@ -1390,6 +1474,7 @@ fn spawn_local_producer(
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
     let warm = dispatch.warm_guard;
+    let obs_ctx = dispatch.obs_ctx.clone();
     // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
     let abort = dispatch.abort;
 
@@ -1397,6 +1482,10 @@ fn spawn_local_producer(
         // Hold the guard for the whole producer; dropped on every return path below.
         let _guard = guard;
         let warm = warm;
+        let started = std::time::Instant::now();
+        let mut ttft = None;
+        let mut last_usage: Option<bridge_core::orch::UsageSnapshot> = None;
+        observer.record(&bridge_core::ports::ObsEvent::TurnStarted { ctx: &obs_ctx });
 
         if let Some(meta) = turn_meta {
             backend.configure_turn(&session, meta).await;
@@ -1431,11 +1520,39 @@ fn spawn_local_producer(
                     if !translator_terminal {
                         let _ = tx.send(Ok(Event::terminal(TaskOutcome::Canceled))).await;
                     }
+                    let outcome = bridge_core::ports::TurnOutcome::Canceled;
+                    observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
+                        ctx: &obs_ctx,
+                        latency: started.elapsed(),
+                        ttft,
+                        outcome: &outcome,
+                    });
+                    if let Some(usage) = &last_usage {
+                        observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                            ctx: &obs_ctx,
+                            usage,
+                            fin: bridge_core::ports::UsageFinalization::TurnFinal,
+                        });
+                    }
                     return;
                 }
                 _ = tx.closed() => {
                     // Receiver gone (client disconnected) — stop driving; the `_guard`
                     // Drop evicts the binding/lease/stash on this early return.
+                    let outcome = bridge_core::ports::TurnOutcome::Canceled;
+                    observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
+                        ctx: &obs_ctx,
+                        latency: started.elapsed(),
+                        ttft,
+                        outcome: &outcome,
+                    });
+                    if let Some(usage) = &last_usage {
+                        observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                            ctx: &obs_ctx,
+                            usage,
+                            fin: bridge_core::ports::UsageFinalization::TurnFinal,
+                        });
+                    }
                     return;
                 }
                 maybe = events.next() => match maybe {
@@ -1446,12 +1563,18 @@ fn spawn_local_producer(
             // Slice 2: usage is telemetry — record it on the warm handle, never forward to SSE.
             if let Ok(e) = &ev {
                 if e.kind() == &EventKind::Usage {
-                    if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
-                        w.sm.record_usage(&w.ctx, w.generation, &w.op, snap.clone())
-                            .await;
+                    if let Some(snap) = e.usage_snapshot() {
+                        last_usage = Some(snap.clone());
+                        if let Some(w) = warm.as_ref() {
+                            w.sm.record_usage(&w.ctx, w.generation, &w.op, snap.clone())
+                                .await;
+                        }
                     }
                     continue;
                 }
+            }
+            if ttft.is_none() {
+                ttft = Some(started.elapsed());
             }
             // Track whether the stream ended with an error.
             if ev.is_err() {
@@ -1481,6 +1604,26 @@ fn spawn_local_producer(
                 TaskOutcome::Completed
             };
             let _ = tx.send(Ok(Event::terminal(outcome))).await;
+        }
+        let outcome = if translator_terminal {
+            bridge_core::ports::TurnOutcome::Canceled
+        } else if errored {
+            bridge_core::ports::TurnOutcome::Failed(bridge_core::ports::FailureClass::Other)
+        } else {
+            bridge_core::ports::TurnOutcome::Success
+        };
+        observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
+            ctx: &obs_ctx,
+            latency: started.elapsed(),
+            ttft,
+            outcome: &outcome,
+        });
+        if let Some(usage) = &last_usage {
+            observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                ctx: &obs_ctx,
+                usage,
+                fin: bridge_core::ports::UsageFinalization::TurnFinal,
+            });
         }
         // `_guard` drops here too (clean exit) → eviction. Channel closes on drop ->
         // SSE stream terminates after the terminal flush.
@@ -2313,8 +2456,7 @@ async fn unary_message(
                     resolve_configure_bind(
                         &srv,
                         agent_id,
-                        &routed.task,
-                        &routed.session,
+                        &routed,
                         routed.overrides.as_ref(),
                         routed.session_cwd.clone(),
                     )
@@ -3624,6 +3766,7 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
     use bridge_core::domain::RouteTarget;
     use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot, SessionSpec};
     use bridge_core::domain::{
@@ -4267,6 +4410,88 @@ mod tests {
         );
         Arc::new(InboundServer::from_coordinator(
             coord,
+            Arc::new(AlwaysKiro),
+            auth,
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ))
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RecordedObsEvent {
+        Start(bridge_core::ports::TurnContext),
+        Finish {
+            ctx: bridge_core::ports::TurnContext,
+            outcome: bridge_core::ports::TurnOutcome,
+        },
+        UsageFinalized {
+            ctx: bridge_core::ports::TurnContext,
+        },
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(std::sync::Mutex<Vec<RecordedObsEvent>>);
+
+    impl RecordingObserver {
+        fn snapshot(&self) -> Vec<RecordedObsEvent> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl bridge_core::ports::Observer for RecordingObserver {
+        fn record(&self, e: &bridge_core::ports::ObsEvent<'_>) {
+            let mut out = self.0.lock().unwrap();
+            match e {
+                bridge_core::ports::ObsEvent::TurnStarted { ctx } => {
+                    out.push(RecordedObsEvent::Start((*ctx).clone()))
+                }
+                bridge_core::ports::ObsEvent::TurnFinished { ctx, outcome, .. } => {
+                    out.push(RecordedObsEvent::Finish {
+                        ctx: (*ctx).clone(),
+                        outcome: (*outcome).clone(),
+                    })
+                }
+                bridge_core::ports::ObsEvent::UsageFinalized { ctx, .. } => {
+                    out.push(RecordedObsEvent::UsageFinalized {
+                        ctx: (*ctx).clone(),
+                    })
+                }
+                bridge_core::ports::ObsEvent::TaskStarted { .. }
+                | bridge_core::ports::ObsEvent::TaskFinished { .. }
+                | bridge_core::ports::ObsEvent::NodeStarted { .. }
+                | bridge_core::ports::ObsEvent::NodeFinished { .. }
+                | bridge_core::ports::ObsEvent::QueueChanged { .. } => {}
+            }
+        }
+    }
+
+    fn build_with_observer(
+        backend: Arc<dyn AgentBackend>,
+        auth: Arc<dyn AuthMiddleware>,
+        observer: Arc<dyn bridge_core::ports::Observer>,
+    ) -> Arc<InboundServer> {
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let registry: Arc<dyn AgentRegistry> = FakeRegistry::single("kiro", backend.clone());
+        let coord = bridge_coordinator::Coordinator::new(
+            Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            )),
+            None,
+            Arc::new(std::collections::HashMap::new()),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            store,
+            Arc::new(AutoApprove),
+            registry,
+            Arc::new(bridge_coordinator::clock::SystemClock),
+            None,
+            None,
+            observer,
+            3,
+        );
+        Arc::new(InboundServer::from_coordinator(
+            Arc::new(coord),
             Arc::new(AlwaysKiro),
             auth,
             "http://localhost:8080",
@@ -5307,6 +5532,40 @@ mod tests {
                 field: "contextId is not supported for this route"
             })
         ));
+    }
+
+    #[test]
+    fn gate_parses_valid_traceparent_and_prompt_id() {
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let params = json!({
+            "message": {
+                "text": "hello",
+                "metadata": {
+                    "a2a-bridge.prompt_id": "eval/prompt-a"
+                }
+            }
+        });
+        let routed = srv.gate(&headers, &params).unwrap();
+        assert_eq!(routed.prompt_id.as_deref(), Some("eval/prompt-a"));
+        assert_eq!(
+            routed.traceparent.unwrap().to_header_value(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+    }
+
+    #[test]
+    fn gate_ignores_malformed_traceparent() {
+        let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static("bad"));
+        let params = json!({"message": {"text": "hello"}});
+        let routed = srv.gate(&headers, &params).unwrap();
+        assert_eq!(routed.traceparent, None);
     }
 
     // ---- Task 9: task_meta_from_params reads agent + overrides ----
@@ -7257,6 +7516,20 @@ mod tests {
             turn_meta: None,
             guard: None,
             warm_guard: None,
+            obs_ctx: bridge_core::ports::TurnContext {
+                turn_id: bridge_core::ids::TurnId::parse("turn-pre-cancel").unwrap(),
+                session_id: ContextId::parse("streaming-pre-cancel").unwrap(),
+                task_id: Some(TaskId::parse("task-streaming-pre-cancel").unwrap()),
+                workflow: None,
+                node: None,
+                attempt: 0,
+                agent: "a".to_string(),
+                model: None,
+                effort: None,
+                mode: None,
+                prompt_id: None,
+                traceparent: None,
+            },
             abort,
         };
         let routed = RoutedCall {
@@ -7266,6 +7539,8 @@ mod tests {
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
+            traceparent: None,
+            prompt_id: None,
             context_id: Some(ContextId::parse("streaming-pre-cancel").unwrap()),
             session_cwd: None,
         };
@@ -7283,6 +7558,96 @@ mod tests {
             rx.recv().await.is_none(),
             "producer should close after the canceled terminal"
         );
+    }
+
+    #[tokio::test]
+    async fn local_producer_disconnect_records_canceled_with_usage_finalized() {
+        let observer = std::sync::Arc::new(RecordingObserver::default());
+        let backend = std::sync::Arc::new(UsageThenIdleBackend);
+        let srv = build_with_observer(
+            backend.clone(),
+            Arc::new(AlwaysGrant),
+            observer.clone() as Arc<dyn bridge_core::ports::Observer>,
+        );
+        let abort = tokio_util::sync::CancellationToken::new();
+        let dispatch = LocalDispatch {
+            backend: backend.clone() as Arc<dyn AgentBackend>,
+            session: SessionId::parse("ctx-streaming-disconnect-g0").unwrap(),
+            seed: None,
+            injects: Vec::new(),
+            turn_meta: None,
+            guard: None,
+            warm_guard: None,
+            obs_ctx: bridge_core::ports::TurnContext {
+                turn_id: bridge_core::ids::TurnId::parse("turn-streaming-disconnect").unwrap(),
+                session_id: ContextId::parse("streaming-disconnect").unwrap(),
+                task_id: Some(TaskId::parse("task-streaming-disconnect").unwrap()),
+                workflow: None,
+                node: None,
+                attempt: 0,
+                agent: "a".to_string(),
+                model: None,
+                effort: None,
+                mode: None,
+                prompt_id: None,
+                traceparent: None,
+            },
+            abort,
+        };
+        let routed = RoutedCall {
+            task: TaskId::parse("task-streaming-disconnect").unwrap(),
+            session: SessionId::parse("session-task-streaming-disconnect").unwrap(),
+            parts: vec![Part { text: "hi".into() }],
+            target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: Some(ContextId::parse("streaming-disconnect").unwrap()),
+            session_cwd: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        spawn_local_producer(&srv, routed, dispatch, tx);
+
+        wait_until(|| {
+            matches!(
+                observer.snapshot().first(),
+                Some(RecordedObsEvent::Start(_))
+            )
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        drop(rx);
+
+        wait_until(|| {
+            let events = observer.snapshot();
+            matches!(
+                events.as_slice(),
+                [
+                    RecordedObsEvent::Start(_),
+                    RecordedObsEvent::Finish { .. },
+                    RecordedObsEvent::UsageFinalized { .. }
+                ]
+            )
+        })
+        .await;
+
+        let events = observer.snapshot();
+        assert_eq!(
+            events.len(),
+            3,
+            "disconnect should emit exactly three relevant events"
+        );
+        assert!(matches!(events[0], RecordedObsEvent::Start(_)));
+        assert!(matches!(
+            events[1],
+            RecordedObsEvent::Finish {
+                outcome: bridge_core::ports::TurnOutcome::Canceled,
+                ..
+            }
+        ));
+        assert!(matches!(events[2], RecordedObsEvent::UsageFinalized { .. }));
     }
 
     #[tokio::test]
@@ -7465,6 +7830,33 @@ mod tests {
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct UsageThenIdleBackend;
+
+    #[async_trait::async_trait]
+    impl AgentBackend for UsageThenIdleBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let usage = Ok(Update::Usage(UsageSnapshot {
+                used: Some(123),
+                size: Some(1000),
+                cost: None,
+                terminal: None,
+                at_ms: 0,
+            }));
+            Ok(Box::pin(async_stream::stream! {
+                yield usage;
+                futures::future::pending::<()>().await;
+            }))
         }
 
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
