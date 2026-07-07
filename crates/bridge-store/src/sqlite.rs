@@ -161,7 +161,37 @@ impl SqliteStore {
                 event_json TEXT NOT NULL,
                 PRIMARY KEY (task_id, seq),
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS turn_log (
+                turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                task_id TEXT,
+                workflow TEXT,
+                node TEXT,
+                attempt INTEGER NOT NULL,
+                agent TEXT NOT NULL,
+                model TEXT,
+                effort TEXT,
+                mode TEXT,
+                prompt_id TEXT,
+                started_ms INTEGER,
+                completed_ms INTEGER,
+                latency_ms INTEGER,
+                ttft_ms INTEGER,
+                outcome TEXT,
+                failure_class TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                thought_tokens INTEGER,
+                cached_read_tokens INTEGER,
+                cached_write_tokens INTEGER,
+                cost_amount REAL,
+                cost_currency TEXT,
+                traceparent TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_turn_log_completed ON turn_log(completed_ms);
+            CREATE INDEX IF NOT EXISTS idx_turn_log_task ON turn_log(task_id, node);
+            CREATE INDEX IF NOT EXISTS idx_turn_log_eval ON turn_log(prompt_id, model, effort);",
         )
         .map_err(|_| BridgeError::StoreFailure)?;
         migrate_tasks_columns(&conn).map_err(|_| BridgeError::StoreFailure)
@@ -227,6 +257,15 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     }
 
     Ok(())
+}
+
+fn traceparent_to_string(tp: &Option<bridge_core::ports::TraceParent>) -> Option<String> {
+    tp.as_ref().map(|t| t.to_header_value())
+}
+
+fn traceparent_from_string(raw: Option<String>) -> Option<bridge_core::ports::TraceParent> {
+    raw.as_deref()
+        .and_then(bridge_core::ports::TraceParent::parse_header_value)
 }
 
 fn insert_journal_event(
@@ -667,6 +706,151 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             out.push(row_to_task(row)?);
         }
         Ok(out)
+    }
+
+    async fn upsert_turn_finished(
+        &self,
+        row: &bridge_core::task_store::TurnLogFinished,
+    ) -> Result<(), BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let (outcome, failure_class) =
+            bridge_core::task_store::turn_log_outcome_strings(&row.outcome);
+        conn.execute(
+            "INSERT INTO turn_log(
+                turn_id, session_id, task_id, workflow, node, attempt, agent, model, effort, mode,
+                prompt_id, started_ms, completed_ms, latency_ms, ttft_ms, outcome, failure_class,
+                traceparent
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(turn_id) DO UPDATE SET
+                session_id=excluded.session_id,
+                task_id=excluded.task_id,
+                workflow=excluded.workflow,
+                node=excluded.node,
+                attempt=excluded.attempt,
+                agent=excluded.agent,
+                model=excluded.model,
+                effort=excluded.effort,
+                mode=excluded.mode,
+                prompt_id=excluded.prompt_id,
+                started_ms=excluded.started_ms,
+                completed_ms=excluded.completed_ms,
+                latency_ms=excluded.latency_ms,
+                ttft_ms=excluded.ttft_ms,
+                outcome=excluded.outcome,
+                failure_class=excluded.failure_class,
+                traceparent=excluded.traceparent",
+            rusqlite::params![
+                row.ctx.turn_id.as_str(),
+                row.ctx.session_id.as_str(),
+                row.ctx.task_id.as_ref().map(|t| t.as_str()),
+                row.ctx.workflow,
+                row.ctx.node,
+                row.ctx.attempt as i64,
+                row.ctx.agent,
+                row.ctx.model,
+                row.ctx.effort,
+                row.ctx.mode,
+                row.ctx.prompt_id,
+                row.started_ms,
+                row.completed_ms,
+                row.latency.as_millis() as i64,
+                row.ttft.map(|d| d.as_millis() as i64),
+                outcome,
+                failure_class,
+                traceparent_to_string(&row.ctx.traceparent),
+            ],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(())
+    }
+
+    async fn update_turn_usage(
+        &self,
+        row: &bridge_core::task_store::TurnLogUsage,
+    ) -> Result<(), BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let term = row.usage.terminal.as_ref();
+        let cost = row.usage.cost.as_ref();
+        let n = conn
+            .execute(
+                "UPDATE turn_log SET
+                    input_tokens=COALESCE(?2, input_tokens),
+                    output_tokens=COALESCE(?3, output_tokens),
+                    thought_tokens=COALESCE(?4, thought_tokens),
+                    cached_read_tokens=COALESCE(?5, cached_read_tokens),
+                    cached_write_tokens=COALESCE(?6, cached_write_tokens),
+                    cost_amount=COALESCE(?7, cost_amount),
+                    cost_currency=COALESCE(?8, cost_currency)
+                 WHERE turn_id=?1",
+                rusqlite::params![
+                    row.ctx.turn_id.as_str(),
+                    term.map(|t| t.input_tokens as i64),
+                    term.map(|t| t.output_tokens as i64),
+                    term.and_then(|t| t.thought_tokens).map(|v| v as i64),
+                    term.and_then(|t| t.cached_read_tokens).map(|v| v as i64),
+                    term.and_then(|t| t.cached_write_tokens).map(|v| v as i64),
+                    cost.map(|c| c.amount),
+                    cost.map(|c| c.currency.as_str()),
+                ],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if n == 0 {
+            return Err(BridgeError::StoreFailure);
+        }
+        Ok(())
+    }
+
+    async fn turn_log_rows(&self) -> Result<Vec<bridge_core::task_store::TurnLogRow>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT turn_id, session_id, task_id, workflow, node, attempt, agent, model, effort, mode,
+                        prompt_id, started_ms, completed_ms, latency_ms, ttft_ms, outcome, failure_class,
+                        input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens,
+                        cost_amount, cost_currency, traceparent
+                 FROM turn_log ORDER BY turn_id",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(bridge_core::task_store::TurnLogRow {
+                    turn_id: bridge_core::ids::TurnId::parse(row.get::<_, String>(0)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    session_id: bridge_core::ids::ContextId::parse(row.get::<_, String>(1)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    task_id: row
+                        .get::<_, Option<String>>(2)?
+                        .map(bridge_core::ids::TaskId::parse)
+                        .transpose()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    workflow: row.get(3)?,
+                    node: row.get(4)?,
+                    attempt: row.get::<_, i64>(5)? as u32,
+                    agent: row.get(6)?,
+                    model: row.get(7)?,
+                    effort: row.get(8)?,
+                    mode: row.get(9)?,
+                    prompt_id: row.get(10)?,
+                    started_ms: row.get(11)?,
+                    completed_ms: row.get(12)?,
+                    latency_ms: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                    ttft_ms: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+                    outcome: row.get(15)?,
+                    failure_class: row.get(16)?,
+                    input_tokens: row.get::<_, Option<i64>>(17)?.map(|v| v as u64),
+                    output_tokens: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
+                    thought_tokens: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
+                    cached_read_tokens: row.get::<_, Option<i64>>(20)?.map(|v| v as u64),
+                    cached_write_tokens: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
+                    cost_amount: row.get(22)?,
+                    cost_currency: row.get(23)?,
+                    traceparent: traceparent_from_string(row.get(24)?),
+                })
+            })
+            .map_err(|_| BridgeError::StoreFailure)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(rows)
     }
 
     async fn create_batch(
@@ -1373,10 +1557,12 @@ fn row_to_batch(row: &rusqlite::Row) -> Result<bridge_core::task_store::BatchRec
 mod tests {
     use super::*;
     use bridge_core::domain::{PeerTaskId, PendingKind, PendingRequest};
-    use bridge_core::ids::{BatchId, SessionId, TaskId};
-    use bridge_core::ports::SessionStore;
+    use bridge_core::ids::{BatchId, ContextId, SessionId, TaskId, TurnId};
+    use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
+    use bridge_core::ports::{FailureClass, SessionStore, TraceParent, TurnContext, TurnOutcome};
     use bridge_core::task_store::{
         BatchRecord, BatchStatus, ChildClaim, TaskRecord, TaskRecordStatus, TaskStore,
+        TurnLogFinished, TurnLogUsage,
     };
 
     fn trec(id: &str, ms: i64) -> TaskRecord {
@@ -1394,6 +1580,25 @@ mod tests {
             session_cwd: None,
             batch_id: None,
             item_id: None,
+        }
+    }
+
+    fn ctx(turn: &str, attempt: u32) -> TurnContext {
+        TurnContext {
+            turn_id: TurnId::parse(turn).unwrap(),
+            session_id: ContextId::parse("ctx-1").unwrap(),
+            task_id: Some(TaskId::parse("task-1").unwrap()),
+            workflow: Some("code-review".to_string()),
+            node: Some("reviewer".to_string()),
+            attempt,
+            agent: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            effort: Some("high".to_string()),
+            mode: Some("default".to_string()),
+            prompt_id: Some("prompt/eval".to_string()),
+            traceparent: TraceParent::parse_header_value(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            ),
         }
     }
 
@@ -2039,6 +2244,166 @@ mod tests {
     #[tokio::test]
     async fn memory_rich_event() {
         rich_event_journals(bridge_core::task_store::MemoryTaskStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_turn_log_upserts_finished_then_usage_and_keeps_attempts_separate() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = TurnLogFinished {
+            ctx: ctx("turn-a", 0),
+            started_ms: 100,
+            completed_ms: 250,
+            latency: std::time::Duration::from_millis(150),
+            ttft: Some(std::time::Duration::from_millis(12)),
+            outcome: TurnOutcome::Failed(FailureClass::TimedOut),
+        };
+        store.upsert_turn_finished(&first).await.unwrap();
+        store
+            .update_turn_usage(&TurnLogUsage {
+                ctx: first.ctx.clone(),
+                usage: UsageSnapshot {
+                    used: Some(50),
+                    size: Some(1000),
+                    cost: Some(UsageCost {
+                        amount: 0.42,
+                        currency: "USD".to_string(),
+                    }),
+                    terminal: Some(TerminalUsage {
+                        total_tokens: 12,
+                        input_tokens: 5,
+                        output_tokens: 7,
+                        thought_tokens: Some(1),
+                        cached_read_tokens: Some(2),
+                        cached_write_tokens: Some(3),
+                    }),
+                    at_ms: 251,
+                },
+            })
+            .await
+            .unwrap();
+
+        let retry = TurnLogFinished {
+            ctx: ctx("turn-b", 1),
+            started_ms: 300,
+            completed_ms: 450,
+            latency: std::time::Duration::from_millis(150),
+            ttft: None,
+            outcome: TurnOutcome::Success,
+        };
+        store.upsert_turn_finished(&retry).await.unwrap();
+
+        let rows = store.turn_log_rows().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let row = rows
+            .iter()
+            .find(|r| r.turn_id.as_str() == "turn-a")
+            .unwrap();
+        assert_eq!(row.session_id.as_str(), "ctx-1");
+        assert_eq!(row.task_id.as_ref().unwrap().as_str(), "task-1");
+        assert_eq!(row.workflow.as_deref(), Some("code-review"));
+        assert_eq!(row.node.as_deref(), Some("reviewer"));
+        assert_eq!(row.attempt, 0);
+        assert_eq!(row.outcome.as_deref(), Some("failed"));
+        assert_eq!(row.failure_class.as_deref(), Some("timed_out"));
+        assert_eq!(row.input_tokens, Some(5));
+        assert_eq!(row.output_tokens, Some(7));
+        assert_eq!(row.thought_tokens, Some(1));
+        assert_eq!(row.cached_read_tokens, Some(2));
+        assert_eq!(row.cached_write_tokens, Some(3));
+        assert_eq!(row.cost_amount, Some(0.42));
+        assert_eq!(row.cost_currency.as_deref(), Some("USD"));
+        assert_eq!(
+            row.traceparent.as_ref().unwrap().to_header_value(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+        assert!(rows
+            .iter()
+            .any(|r| r.turn_id.as_str() == "turn-b" && r.attempt == 1));
+    }
+
+    #[tokio::test]
+    async fn sqlite_update_turn_usage_partial_updates_keep_existing_values() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let base = TurnLogFinished {
+            ctx: ctx("turn-merge", 0),
+            started_ms: 100,
+            completed_ms: 200,
+            latency: std::time::Duration::from_millis(100),
+            ttft: Some(std::time::Duration::from_millis(10)),
+            outcome: TurnOutcome::Success,
+        };
+        store.upsert_turn_finished(&base).await.unwrap();
+
+        store
+            .update_turn_usage(&TurnLogUsage {
+                ctx: base.ctx.clone(),
+                usage: UsageSnapshot {
+                    used: None,
+                    size: None,
+                    cost: None,
+                    terminal: Some(TerminalUsage {
+                        total_tokens: 12,
+                        input_tokens: 6,
+                        output_tokens: 6,
+                        thought_tokens: Some(2),
+                        cached_read_tokens: Some(0),
+                        cached_write_tokens: None,
+                    }),
+                    at_ms: 205,
+                },
+            })
+            .await
+            .unwrap();
+
+        store
+            .update_turn_usage(&TurnLogUsage {
+                ctx: base.ctx.clone(),
+                usage: UsageSnapshot {
+                    used: None,
+                    size: None,
+                    cost: Some(UsageCost {
+                        amount: 1.23,
+                        currency: "USD".to_string(),
+                    }),
+                    terminal: None,
+                    at_ms: 210,
+                },
+            })
+            .await
+            .unwrap();
+
+        let row = store
+            .turn_log_rows()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.turn_id.as_str() == "turn-merge")
+            .unwrap();
+        assert_eq!(row.input_tokens, Some(6));
+        assert_eq!(row.output_tokens, Some(6));
+        assert_eq!(row.thought_tokens, Some(2));
+        assert_eq!(row.cached_read_tokens, Some(0));
+        assert_eq!(row.cost_amount, Some(1.23));
+        assert_eq!(row.cost_currency.as_deref(), Some("USD"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_update_turn_usage_unknown_turn_returns_error() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let err = store
+            .update_turn_usage(&TurnLogUsage {
+                ctx: ctx("missing-turn", 0),
+                usage: UsageSnapshot {
+                    used: None,
+                    size: None,
+                    cost: None,
+                    terminal: None,
+                    at_ms: 0,
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::StoreFailure));
     }
 
     #[tokio::test]
