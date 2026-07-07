@@ -417,6 +417,8 @@ impl Coordinator {
         let started = Instant::now();
         let mut ttft = None;
         let mut last_usage: Option<UsageSnapshot> = None;
+        let shared_usage: Arc<std::sync::Mutex<Option<UsageSnapshot>>> =
+            Arc::new(std::sync::Mutex::new(None));
         self.observer
             .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
         let mut finish_guard = TurnFinishGuard {
@@ -427,6 +429,7 @@ impl Coordinator {
             op: turn.op.clone(),
             started,
             armed: true,
+            usage: shared_usage.clone(),
         };
 
         let parts = assemble_turn_parts(
@@ -478,6 +481,8 @@ impl Coordinator {
                 Ok(e) if e.kind() == &EventKind::Usage => {
                     if let Some(snap) = e.usage_snapshot() {
                         last_usage = Some(snap.clone());
+                        *shared_usage.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(snap.clone());
                         self.session_manager
                             .record_usage(&ctx, turn.generation, &turn.op, snap.clone())
                             .await;
@@ -745,6 +750,7 @@ struct TurnFinishGuard {
     op: OperationId,
     started: Instant,
     armed: bool,
+    usage: Arc<std::sync::Mutex<Option<UsageSnapshot>>>,
 }
 
 impl TurnFinishGuard {
@@ -770,6 +776,14 @@ impl Drop for TurnFinishGuard {
             ttft: None,
             outcome: &TurnOutcome::Canceled,
         });
+        let usage = self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(u) = usage {
+            observer.record(&ObsEvent::UsageFinalized {
+                ctx: &ctx,
+                usage: &u,
+                fin: UsageFinalization::TurnFinal,
+            });
+        }
         tokio::spawn(async move {
             sm.finish_turn(&ctx.session_id, generation, &op).await;
         });
@@ -1860,6 +1874,169 @@ mod tests {
             assert_eq!(starts[0].effort.as_deref(), Some("high"));
             assert_eq!(starts[0].mode.as_deref(), Some("default"));
             assert_eq!(finishes[0].1, TurnOutcome::Success);
+        }
+
+        /// Backend that yields a Usage update then blocks forever (pending), so the
+        /// guard fires mid-turn with captured usage.
+        struct UsageThenIdleBackend {
+            usage: UsageSnapshot,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentBackend for UsageThenIdleBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                let usage = self.usage.clone();
+                // Yield the usage update then block forever so the future must be dropped.
+                let once = futures::stream::once(async move { Ok(Update::Usage(usage)) });
+                let pending = futures::stream::pending::<Result<Update, BridgeError>>();
+                Ok(Box::pin(once.chain(pending)))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn collect_turn_dropped_with_usage_emits_canceled_and_usage_finalized() {
+            let usage_snap = UsageSnapshot {
+                used: Some(5),
+                size: Some(100),
+                cost: None,
+                terminal: Some(TerminalUsage {
+                    total_tokens: 5,
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    thought_tokens: None,
+                    cached_read_tokens: None,
+                    cached_write_tokens: None,
+                }),
+                at_ms: 0,
+            };
+            let observer = Arc::new(RecordingObserver::default());
+            let backend = Arc::new(UsageThenIdleBackend {
+                usage: usage_snap.clone(),
+            });
+            let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+                backend: backend as Arc<dyn AgentBackend>,
+            });
+            let sm = Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            ));
+            let task_store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+            let session_store: Arc<dyn bridge_core::ports::SessionStore> =
+                Arc::new(super::FakeSessionStore::default());
+            let coord = Arc::new(Coordinator::new(
+                sm,
+                None,
+                Arc::new(std::collections::HashMap::new()),
+                task_store,
+                session_store,
+                Arc::new(super::AllowPolicy),
+                registry,
+                Arc::new(crate::clock::SystemClock),
+                None,
+                None,
+                observer.clone(),
+                3,
+            ));
+
+            let ctx_id = ContextId::parse("ctx-drop-usage").unwrap();
+            let turn = coord
+                .session_manager
+                .checkout_turn(&ctx_id, AgentId::parse("codex").unwrap(), None, None)
+                .await
+                .unwrap();
+
+            let c2 = coord.clone();
+            let handle = tokio::spawn(async move {
+                let _ = c2.collect_turn(ctx_id, turn, "hi".into()).await;
+            });
+
+            // Wait for TurnStarted + Usage to be processed (usage update is recorded
+            // in shared_usage before the translator yields the next event).
+            for _ in 0..1000 {
+                if observer
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, RecordedObsEvent::Start(_)))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            // Sleep briefly to let the Usage update propagate into shared_usage before abort.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            handle.abort();
+            let _ = handle.await;
+
+            // Wait for TurnFinished to appear.
+            for _ in 0..1000 {
+                if observer
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, RecordedObsEvent::Finish { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            let events = observer.0.lock().unwrap().clone();
+            let starts = events
+                .iter()
+                .filter(|e| matches!(e, RecordedObsEvent::Start(_)))
+                .count();
+            let finishes: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    RecordedObsEvent::Finish { outcome, .. } => Some(outcome.clone()),
+                    _ => None,
+                })
+                .collect();
+            let usages = events
+                .iter()
+                .filter(|e| matches!(e, RecordedObsEvent::UsageFinalized { .. }))
+                .count();
+
+            assert_eq!(starts, 1, "expected 1 TurnStarted");
+            assert_eq!(
+                finishes.len(),
+                1,
+                "expected 1 TurnFinished; got: {events:?}"
+            );
+            assert_eq!(
+                finishes[0],
+                TurnOutcome::Canceled,
+                "outcome must be Canceled"
+            );
+            assert_eq!(
+                usages, 1,
+                "guard must emit UsageFinalized for captured usage; got: {events:?}"
+            );
+
+            // Order: TurnFinished before UsageFinalized.
+            let finish_pos = events
+                .iter()
+                .position(|e| matches!(e, RecordedObsEvent::Finish { .. }))
+                .expect("finish event");
+            let usage_pos = events
+                .iter()
+                .position(|e| matches!(e, RecordedObsEvent::UsageFinalized { .. }))
+                .expect("usage event");
+            assert!(
+                finish_pos < usage_pos,
+                "TurnFinished must precede UsageFinalized"
+            );
         }
 
         #[tokio::test]

@@ -143,11 +143,14 @@ impl TurnDedupe {
         lock.1.insert(turn_id.as_str().to_string())
     }
 
-    pub fn seed(&self, turn_id: &bridge_core::ids::TurnId) {
+    pub fn seed_finished(&self, turn_id: &bridge_core::ids::TurnId) {
         let mut lock = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        let id = turn_id.as_str().to_string();
-        lock.0.insert(id.clone());
-        lock.1.insert(id);
+        lock.0.insert(turn_id.as_str().to_string());
+    }
+
+    pub fn seed_usage(&self, turn_id: &bridge_core::ids::TurnId) {
+        let mut lock = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        lock.1.insert(turn_id.as_str().to_string());
     }
 }
 
@@ -493,7 +496,16 @@ impl PrometheusObserver {
                 _ => {}
             }
 
-            self.dedupe.seed(&row.turn_id);
+            let has_usage = row.cost_amount.is_some()
+                || row.input_tokens.is_some()
+                || row.output_tokens.is_some()
+                || row.thought_tokens.is_some()
+                || row.cached_read_tokens.is_some()
+                || row.cached_write_tokens.is_some();
+            self.dedupe.seed_finished(&row.turn_id);
+            if has_usage {
+                self.dedupe.seed_usage(&row.turn_id);
+            }
         }
     }
 
@@ -614,7 +626,31 @@ fn outcome_label(outcome: &TurnOutcome) -> &'static str {
 }
 
 fn valid_iso4217(code: &str) -> bool {
-    code.len() == 3 && code.as_bytes().iter().all(u8::is_ascii_uppercase)
+    // Best-effort membership in the active ISO 4217 alphabetic codes (~2025 snapshot).
+    // Format-only validation is insufficient — well-formed but fake codes like ZZZ would
+    // silently sum into cost totals; the acceptance criteria requires a real membership
+    // check. This is NOT a real-time mirror of the SIX List One register: the goal is to
+    // reject non-currency garbage, not to track transitional edits (e.g. the XCG/ANG
+    // Caribbean-guilder swap or euro-adoption retirements). Every currency any bridged
+    // agent realistically bills in (USD and the major set) is present; the long tail is a
+    // documented follow-up. Keep sorted (binary_search).
+    const CODES: &[&str] = &[
+        "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT",
+        "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BOV", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD",
+        "CAD", "CDF", "CHE", "CHF", "CHW", "CLF", "CLP", "CNY", "COP", "COU", "CRC", "CUP", "CVE",
+        "CZK", "DJF", "DKK", "DOP", "DZD", "EGP", "ERN", "ETB", "EUR", "FJD", "FKP", "GBP", "GEL",
+        "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD", "HKD", "HNL", "HTG", "HUF", "IDR", "ILS", "INR",
+        "IQD", "IRR", "ISK", "JMD", "JOD", "JPY", "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD",
+        "KYD", "KZT", "LAK", "LBP", "LKR", "LRD", "LSL", "LYD", "MAD", "MDL", "MGA", "MKD", "MMK",
+        "MNT", "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MXV", "MYR", "MZN", "NAD", "NGN", "NIO",
+        "NOK", "NPR", "NZD", "OMR", "PAB", "PEN", "PGK", "PHP", "PKR", "PLN", "PYG", "QAR", "RON",
+        "RSD", "RUB", "RWF", "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD",
+        "SSP", "STN", "SVC", "SYP", "SZL", "THB", "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD",
+        "TZS", "UAH", "UGX", "USD", "USN", "UYI", "UYU", "UYW", "UZS", "VED", "VES", "VND", "VUV",
+        "WST", "XAF", "XAG", "XAU", "XBA", "XBB", "XBC", "XBD", "XCD", "XDR", "XOF", "XPD", "XPF",
+        "XPT", "XSU", "XTS", "XUA", "XXX", "YER", "ZAR", "ZMW", "ZWG",
+    ];
+    CODES.binary_search(&code).is_ok()
 }
 
 #[cfg(test)]
@@ -985,6 +1021,24 @@ mod rebuild_tests {
             .dedupe()
             .mark_usage(&TurnId::parse("turn-boot").unwrap()));
     }
+
+    #[test]
+    fn seed_finished_without_usage_does_not_suppress_replayed_usage_finalized() {
+        let dedupe = TurnDedupe::default();
+        let turn_id = TurnId::parse("turn-partial").unwrap();
+        // Seed only finished (no usage on the row — crashed between finished-write and usage-write).
+        dedupe.seed_finished(&turn_id);
+        // mark_finished returns false (already seeded) — duplicate TurnFinished suppressed.
+        assert!(
+            !dedupe.mark_finished(&turn_id),
+            "TurnFinished must be suppressed for a seeded turn"
+        );
+        // mark_usage returns true (NOT seeded) — replayed UsageFinalized IS delivered.
+        assert!(
+            dedupe.mark_usage(&turn_id),
+            "UsageFinalized must NOT be suppressed for a finished-only seeded turn"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1133,6 +1187,24 @@ mod prometheus_tests {
             fin: UsageFinalization::TurnFinal,
         });
 
+        // ZZZ is well-formed (3 uppercase ASCII) but not a real ISO-4217 code.
+        let zzz_currency = UsageSnapshot {
+            cost: Some(UsageCost {
+                amount: 50.0,
+                currency: "ZZZ".to_string(),
+            }),
+            terminal: None,
+            used: None,
+            size: None,
+            at_ms: 128,
+        };
+        let c6 = ctx("turn-6", "codex", Some("gpt-5.5"), Some("high"));
+        observer.record(&ObsEvent::UsageFinalized {
+            ctx: &c6,
+            usage: &zzz_currency,
+            fin: UsageFinalization::TurnFinal,
+        });
+
         let out = observer.endpoint().render().unwrap();
         assert!(out.contains("bridge_turns_total{agent=\"codex\",effort=\"high\",model=\"gpt-5.5\",outcome=\"success\"} 1"));
         assert!(
@@ -1148,11 +1220,13 @@ mod prometheus_tests {
         assert!(out.contains(
             "bridge_turn_cost_total{agent=\"codex\",currency=\"ARS\",model=\"gpt-5.5\"} 1.5"
         ));
-        assert!(out.contains("bridge_turn_cost_dropped_total{agent=\"codex\"} 3"));
+        // 3 invalid from before + ZZZ = 4 dropped
+        assert!(out.contains("bridge_turn_cost_dropped_total{agent=\"codex\"} 4"));
         assert!(out.contains("bridge_turn_tokens_total{agent=\"codex\",kind=\"input\"} 3"));
         assert!(!out.contains("currency=\"us\""));
         assert!(!out.contains("currency=\"\""));
         assert!(!out.contains("currency=\"dollars\""));
+        assert!(!out.contains("currency=\"ZZZ\""));
     }
 
     #[test]

@@ -1641,7 +1641,20 @@ fn spawn_local_producer(
             // If the receiver is gone (client disconnected) stop driving. The
             // `_guard` Drop still evicts the binding/lease/stash on this early return.
             if tx.send(ev).await.is_err() {
-                // Receiver gone — skip the terminal frame (client disconnected).
+                // Receiver gone — emit exactly one TurnFinished(Canceled) then return.
+                observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
+                    ctx: &obs_ctx,
+                    latency: started.elapsed(),
+                    ttft,
+                    outcome: &bridge_core::ports::TurnOutcome::Canceled,
+                });
+                if let Some(usage) = &last_usage {
+                    observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                        ctx: &obs_ctx,
+                        usage,
+                        fin: bridge_core::ports::UsageFinalization::TurnFinal,
+                    });
+                }
                 return;
             }
         }
@@ -7778,6 +7791,134 @@ mod tests {
             }
         ));
         assert!(matches!(events[2], RecordedObsEvent::UsageFinalized { .. }));
+    }
+
+    /// Backend that immediately yields many Text events then Done, designed to saturate
+    /// a small-capacity channel so that `tx.send(ev).await` fails when the receiver is
+    /// dropped while a send is in-flight.
+    struct BurstTextBackend {
+        count: usize,
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for BurstTextBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let count = self.count;
+            Ok(Box::pin(async_stream::stream! {
+                for i in 0..count {
+                    yield Ok(Update::Text(format!("chunk-{i}")));
+                }
+                yield Ok(Update::Done { stop_reason: "end_turn".into() });
+            }))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn local_producer_send_error_emits_exactly_one_turn_finished_canceled() {
+        // Use a burst backend and a 1-capacity channel so that the producer stalls on
+        // tx.send when the channel is full. Dropping rx while the send is in-flight
+        // exercises the tx.send().is_err() return path (Fix 3).
+        let observer = std::sync::Arc::new(RecordingObserver::default());
+        let backend = std::sync::Arc::new(BurstTextBackend { count: 64 });
+        let srv = build_with_observer(
+            backend.clone() as Arc<dyn AgentBackend>,
+            Arc::new(AlwaysGrant),
+            observer.clone() as Arc<dyn bridge_core::ports::Observer>,
+        );
+        let abort = tokio_util::sync::CancellationToken::new();
+        let obs_ctx = bridge_core::ports::TurnContext {
+            turn_id: bridge_core::ids::TurnId::parse("turn-send-err").unwrap(),
+            session_id: ContextId::parse("send-err").unwrap(),
+            task_id: Some(TaskId::parse("task-send-err").unwrap()),
+            workflow: None,
+            node: None,
+            attempt: 0,
+            agent: "kiro".to_string(),
+            model: None,
+            effort: None,
+            mode: None,
+            prompt_id: None,
+            traceparent: None,
+        };
+        let dispatch = LocalDispatch {
+            backend: backend.clone() as Arc<dyn AgentBackend>,
+            session: SessionId::parse("send-err-g0").unwrap(),
+            seed: None,
+            injects: Vec::new(),
+            turn_meta: None,
+            guard: None,
+            warm_guard: None,
+            obs_ctx,
+            abort,
+        };
+        let routed = RoutedCall {
+            task: TaskId::parse("task-send-err").unwrap(),
+            session: SessionId::parse("session-send-err").unwrap(),
+            parts: vec![Part { text: "hi".into() }],
+            target: RouteTarget::Local(AgentId::parse("kiro").unwrap()),
+            auth: AuthContext::new(bridge_core::ids::CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: Some(ContextId::parse("send-err").unwrap()),
+            session_cwd: None,
+        };
+        // Capacity=1: first tx.send succeeds, second blocks → dropping rx makes it fail.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+        spawn_local_producer(&srv, routed, dispatch, tx);
+
+        // Wait for TurnStarted so the producer is running, then drop the receiver.
+        wait_until(|| {
+            matches!(
+                observer.snapshot().first(),
+                Some(RecordedObsEvent::Start(_))
+            )
+        })
+        .await;
+        drop(rx);
+
+        // Wait for exactly one TurnFinished(Canceled) to appear (from any exit path).
+        wait_until(|| {
+            observer.snapshot().iter().any(|e| {
+                matches!(
+                    e,
+                    RecordedObsEvent::Finish {
+                        outcome: bridge_core::ports::TurnOutcome::Canceled,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+
+        let events = observer.snapshot();
+        let finish_count = events
+            .iter()
+            .filter(|e| matches!(e, RecordedObsEvent::Finish { .. }))
+            .count();
+        assert_eq!(
+            finish_count, 1,
+            "exactly one TurnFinished must be emitted; got: {finish_count}"
+        );
+        assert!(
+            matches!(
+                events
+                    .iter()
+                    .find(|e| matches!(e, RecordedObsEvent::Finish { .. })),
+                Some(RecordedObsEvent::Finish {
+                    outcome: bridge_core::ports::TurnOutcome::Canceled,
+                    ..
+                })
+            ),
+            "TurnFinished outcome must be Canceled"
+        );
     }
 
     #[tokio::test]

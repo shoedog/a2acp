@@ -515,6 +515,7 @@ async fn resumed_child_future(
             Ok(c) => WorkflowRunContext {
                 session_cwd: Some(c),
                 make_rich_sink: None,
+                observer: deps.detached.observer.clone(),
                 ..WorkflowRunContext::default()
             },
             Err(_) => {
@@ -532,7 +533,10 @@ async fn resumed_child_future(
                 return None;
             }
         },
-        None => WorkflowRunContext::default(),
+        None => WorkflowRunContext {
+            observer: deps.detached.observer.clone(),
+            ..WorkflowRunContext::default()
+        },
     };
 
     let hub = Arc::new(TaskProgressHub::new());
@@ -864,6 +868,7 @@ pub async fn run_admission(
                         WorkflowRunContext {
                             session_cwd,
                             make_rich_sink: None,
+                            observer: deps.detached.observer.clone(),
                             ..WorkflowRunContext::default()
                         },
                         hub,

@@ -400,6 +400,12 @@ impl WorkflowExecutor {
                 NodeTurnExit::Normal if ok => TurnOutcome::Success,
                 NodeTurnExit::Normal => TurnOutcome::Failed(FailureClass::Other),
             };
+            ctx.observer.record(&ObsEvent::TurnFinished {
+                ctx: &obs_ctx,
+                latency: turn_start.elapsed(),
+                ttft: ttft_val,
+                outcome: &node_outcome,
+            });
             if let Some(u) = &last_usage {
                 ctx.observer.record(&ObsEvent::UsageFinalized {
                     ctx: &obs_ctx,
@@ -407,12 +413,6 @@ impl WorkflowExecutor {
                     fin: UsageFinalization::TurnFinal,
                 });
             }
-            ctx.observer.record(&ObsEvent::TurnFinished {
-                ctx: &obs_ctx,
-                latency: turn_start.elapsed(),
-                ttft: ttft_val,
-                outcome: &node_outcome,
-            });
             ctx.observer.record(&ObsEvent::NodeFinished {
                 ctx: &obs_ctx,
                 outcome: &node_outcome,
@@ -726,24 +726,12 @@ impl WorkflowExecutor {
                 match outcome {
                     Attempt::Canceled { marker, usage } => {
                         if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
-                            if let Some(u) = &usage {
-                                ctx.observer.record(&ObsEvent::UsageFinalized {
-                                    ctx: obs_ctx,
-                                    usage: u,
-                                    fin: UsageFinalization::TurnFinal,
-                                });
-                            }
                             ctx.observer.record(&ObsEvent::TurnFinished {
                                 ctx: obs_ctx,
                                 latency: start.elapsed(),
                                 ttft: None,
                                 outcome: &TurnOutcome::Canceled,
                             });
-                        }
-                        break 'node_loop (marker, false, usage, TurnOutcome::Canceled);
-                    }
-                    Attempt::Ok { text, usage } => {
-                        if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
                             if let Some(u) = &usage {
                                 ctx.observer.record(&ObsEvent::UsageFinalized {
                                     ctx: obs_ctx,
@@ -751,12 +739,24 @@ impl WorkflowExecutor {
                                     fin: UsageFinalization::TurnFinal,
                                 });
                             }
+                        }
+                        break 'node_loop (marker, false, usage, TurnOutcome::Canceled);
+                    }
+                    Attempt::Ok { text, usage } => {
+                        if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
                             ctx.observer.record(&ObsEvent::TurnFinished {
                                 ctx: obs_ctx,
                                 latency: start.elapsed(),
                                 ttft: ttft_val,
                                 outcome: &TurnOutcome::Success,
                             });
+                            if let Some(u) = &usage {
+                                ctx.observer.record(&ObsEvent::UsageFinalized {
+                                    ctx: obs_ctx,
+                                    usage: u,
+                                    fin: UsageFinalization::TurnFinal,
+                                });
+                            }
                         }
                         break 'node_loop (text, true, usage, TurnOutcome::Success);
                     }
@@ -767,6 +767,12 @@ impl WorkflowExecutor {
                     } => {
                         let fail_out = TurnOutcome::Failed(failure_class);
                         if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
+                            ctx.observer.record(&ObsEvent::TurnFinished {
+                                ctx: obs_ctx,
+                                latency: start.elapsed(),
+                                ttft: ttft_val,
+                                outcome: &fail_out,
+                            });
                             if let Some(u) = &usage {
                                 ctx.observer.record(&ObsEvent::UsageFinalized {
                                     ctx: obs_ctx,
@@ -774,12 +780,6 @@ impl WorkflowExecutor {
                                     fin: UsageFinalization::TurnFinal,
                                 });
                             }
-                            ctx.observer.record(&ObsEvent::TurnFinished {
-                                ctx: obs_ctx,
-                                latency: start.elapsed(),
-                                ttft: ttft_val,
-                                outcome: &fail_out,
-                            });
                         }
                         break 'node_loop (text, false, usage, fail_out);
                     }
@@ -788,6 +788,12 @@ impl WorkflowExecutor {
                         let fail_class = classify_failure(&err);
                         let fail_out = TurnOutcome::Failed(fail_class);
                         if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
+                            ctx.observer.record(&ObsEvent::TurnFinished {
+                                ctx: obs_ctx,
+                                latency: start.elapsed(),
+                                ttft: None,
+                                outcome: &fail_out,
+                            });
                             if let Some(u) = &usage {
                                 ctx.observer.record(&ObsEvent::UsageFinalized {
                                     ctx: obs_ctx,
@@ -795,12 +801,6 @@ impl WorkflowExecutor {
                                     fin: UsageFinalization::TurnFinal,
                                 });
                             }
-                            ctx.observer.record(&ObsEvent::TurnFinished {
-                                ctx: obs_ctx,
-                                latency: start.elapsed(),
-                                ttft: None,
-                                outcome: &fail_out,
-                            });
                         }
                         if should_retry_after_attempt {
                             self.registry.invalidate(&node.agent).await;
@@ -4098,8 +4098,8 @@ mod observability_tests {
             vec![
                 "node_started",
                 "turn_started",
-                "usage",
                 "turn_finished",
+                "usage",
                 "node_finished"
             ]
         );
@@ -4597,6 +4597,99 @@ mod observability_tests {
                 Some(DetailedEvt::NodeFinished(TurnOutcome::Success))
             ),
             "expected final NodeFinished(Success); events: {evs:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test 5: TurnFinished emitted BEFORE UsageFinalized on both warm and cold paths
+    // ---------------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct OrderRec(Mutex<Vec<&'static str>>);
+    impl Observer for OrderRec {
+        fn record(&self, e: &ObsEvent<'_>) {
+            let tag = match e {
+                ObsEvent::TurnFinished { .. } => "turn_finished",
+                ObsEvent::UsageFinalized { .. } => "usage_finalized",
+                _ => return,
+            };
+            self.0.lock().unwrap().push(tag);
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_finished_emitted_before_usage_finalized_cold_path() {
+        let rec = Arc::new(OrderRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-order-cold".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+        let tags = rec.0.lock().unwrap().clone();
+        assert_eq!(
+            tags,
+            vec!["turn_finished", "usage_finalized"],
+            "TurnFinished must precede UsageFinalized; got: {tags:?}"
+        );
+    }
+
+    struct UsageDispatcher;
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for UsageDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            Ok(NodeTurn {
+                backend: Arc::new(UsageBackend),
+                session: SessionId::parse("warm-usage-sess").unwrap(),
+                seed: None,
+                cleanup: Box::new(NoopCleanup),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_finished_emitted_before_usage_finalized_warm_path() {
+        let rec = Arc::new(OrderRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
+        let mut stream = exec.run_with_context_and_dispatcher(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-order-warm".into(),
+            CancellationToken::new(),
+            ctx,
+            Arc::new(UsageDispatcher),
+        );
+        while stream.next().await.is_some() {}
+        let tags = rec.0.lock().unwrap().clone();
+        assert_eq!(
+            tags,
+            vec!["turn_finished", "usage_finalized"],
+            "TurnFinished must precede UsageFinalized on warm path; got: {tags:?}"
         );
     }
 }
