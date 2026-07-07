@@ -58,6 +58,10 @@ impl DedupObserver {
             dedupe: Arc::new(TurnDedupe::default()),
         }
     }
+
+    pub fn new_with_dedupe(inner: Arc<dyn Observer>, dedupe: Arc<TurnDedupe>) -> Self {
+        Self { inner, dedupe }
+    }
 }
 
 impl Observer for DedupObserver {
@@ -313,6 +317,7 @@ impl MetricsEndpoint {
 pub struct PrometheusObserver {
     registry: Registry,
     vocab: LabelVocabulary,
+    dedupe: Arc<TurnDedupe>,
     turns_total: CounterVec,
     turn_duration: HistogramVec,
     turn_ttft: HistogramVec,
@@ -391,6 +396,7 @@ impl PrometheusObserver {
         Ok(Self {
             registry,
             vocab,
+            dedupe: Arc::new(TurnDedupe::default()),
             turns_total,
             turn_duration,
             turn_ttft,
@@ -412,6 +418,83 @@ impl PrometheusObserver {
 
     pub fn drop_counter(&self) -> DropCounter {
         DropCounter::new(self.dropped_total.clone())
+    }
+
+    pub fn dedupe(&self) -> Arc<TurnDedupe> {
+        Arc::clone(&self.dedupe)
+    }
+
+    pub fn rebuild_from_turn_log(&self, rows: &[bridge_core::task_store::TurnLogRow]) {
+        for row in rows {
+            let ctx = bridge_core::ports::TurnContext {
+                turn_id: row.turn_id.clone(),
+                session_id: row.session_id.clone(),
+                task_id: row.task_id.clone(),
+                workflow: row.workflow.clone(),
+                node: row.node.clone(),
+                attempt: row.attempt,
+                agent: row.agent.clone(),
+                model: row.model.clone(),
+                effort: row.effort.clone(),
+                mode: row.mode.clone(),
+                prompt_id: row.prompt_id.clone(),
+                traceparent: row.traceparent.clone(),
+            };
+            let outcome = match row.outcome.as_deref() {
+                Some("success") => TurnOutcome::Success,
+                Some("canceled") => TurnOutcome::Canceled,
+                Some("failed") => TurnOutcome::Failed(match row.failure_class.as_deref() {
+                    Some("agent_crashed") => FailureClass::AgentCrashed,
+                    Some("timed_out") => FailureClass::TimedOut,
+                    Some("overloaded") => FailureClass::Overloaded,
+                    Some("config") => FailureClass::Config,
+                    Some("transport") => FailureClass::Transport,
+                    _ => FailureClass::Other,
+                }),
+                _ => continue,
+            };
+
+            let (agent, model, effort) = self.labels(&ctx);
+            self.turns_total
+                .with_label_values(&[&agent, &model, &effort, outcome_label(&outcome)])
+                .inc();
+            if let Some(ms) = row.latency_ms {
+                self.turn_duration
+                    .with_label_values(&[&agent, &model])
+                    .observe(ms as f64 / 1000.0);
+            }
+            if let Some(ms) = row.ttft_ms {
+                self.turn_ttft
+                    .with_label_values(&[&agent])
+                    .observe(ms as f64 / 1000.0);
+            }
+
+            for (kind, value) in [
+                ("input", row.input_tokens),
+                ("output", row.output_tokens),
+                ("thought", row.thought_tokens),
+                ("cached_read", row.cached_read_tokens),
+                ("cached_write", row.cached_write_tokens),
+            ] {
+                if let Some(value) = value.filter(|v| *v > 0) {
+                    self.tokens_total
+                        .with_label_values(&[&agent, kind])
+                        .inc_by(value);
+                }
+            }
+
+            match (&row.cost_amount, &row.cost_currency) {
+                (Some(amount), Some(currency)) if valid_iso4217(currency) => {
+                    self.cost_total
+                        .with_label_values(&[&agent, &model, currency])
+                        .inc_by(amount.max(0.0));
+                }
+                (Some(_), _) => self.cost_dropped.with_label_values(&[&agent]).inc(),
+                _ => {}
+            }
+
+            self.dedupe.seed(&row.turn_id);
+        }
     }
 
     fn labels(&self, ctx: &TurnContext) -> (String, String, String) {
@@ -848,6 +931,59 @@ mod turn_log_observer_tests {
         let rows = store.turn_log_rows().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].turn_id.as_str(), "turn-log-flush-capacity-1");
+    }
+}
+
+#[cfg(test)]
+mod rebuild_tests {
+    use super::*;
+    use bridge_core::ids::{ContextId, TurnId};
+    use bridge_core::task_store::TurnLogRow;
+
+    #[test]
+    fn rebuild_from_turn_log_populates_counters_and_seeds_dedupe() {
+        let prom = PrometheusObserver::new(LabelVocabulary {
+            agents: ["codex".to_string()].into_iter().collect(),
+            models: ["gpt-5.5".to_string()].into_iter().collect(),
+            efforts: ["high".to_string()].into_iter().collect(),
+        })
+        .unwrap();
+        prom.rebuild_from_turn_log(&[TurnLogRow {
+            turn_id: TurnId::parse("turn-boot").unwrap(),
+            session_id: ContextId::parse("ctx-boot").unwrap(),
+            task_id: None,
+            workflow: None,
+            node: None,
+            attempt: 0,
+            agent: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            effort: Some("high".to_string()),
+            mode: None,
+            prompt_id: Some("prompt-a".to_string()),
+            started_ms: Some(0),
+            completed_ms: Some(1000),
+            latency_ms: Some(1000),
+            ttft_ms: Some(100),
+            outcome: Some("success".to_string()),
+            failure_class: None,
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            thought_tokens: None,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
+            cost_amount: Some(0.5),
+            cost_currency: Some("USD".to_string()),
+            traceparent: None,
+        }]);
+
+        let out = prom.endpoint().render().unwrap();
+        assert!(out.contains("bridge_turns_total{agent=\"codex\",effort=\"high\",model=\"gpt-5.5\",outcome=\"success\"} 1"));
+        assert!(out.contains(
+            "bridge_turn_cost_total{agent=\"codex\",currency=\"USD\",model=\"gpt-5.5\"} 0.5"
+        ));
+        assert!(!prom
+            .dedupe()
+            .mark_usage(&TurnId::parse("turn-boot").unwrap()));
     }
 }
 

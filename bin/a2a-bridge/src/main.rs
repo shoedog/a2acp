@@ -67,6 +67,17 @@ const CONFIG_PATH: &str = "a2a-bridge.toml";
 const DEFAULT_ARTIFACT_ALLOWLIST_PATH: &str = ".github/workflow-artifact-allowlist.txt";
 const DISPOSABLE_ARTIFACT_DEST: &str = "/tmp (or /private/tmp on macOS)";
 
+fn effort_to_string(effort: &bridge_core::domain::Effort) -> String {
+    match effort {
+        bridge_core::domain::Effort::Minimal => "minimal".to_string(),
+        bridge_core::domain::Effort::Low => "low".to_string(),
+        bridge_core::domain::Effort::Medium => "medium".to_string(),
+        bridge_core::domain::Effort::High => "high".to_string(),
+        bridge_core::domain::Effort::Xhigh => "xhigh".to_string(),
+        bridge_core::domain::Effort::Max => "max".to_string(),
+    }
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Top-level usage, printed by `a2a-bridge help|--help|-h`. The detailed flags live in each subcommand's
@@ -662,12 +673,13 @@ fn resolve_worktree_runtime_cfg(
 
 fn batch_runtime(
     cfg: &RegistryConfig,
+    observer: Arc<dyn bridge_core::ports::Observer>,
 ) -> Result<Option<bridge_coordinator::BatchRuntime>, config::ConfigError> {
     Ok(cfg.batch_config()?.map(|batch| {
         bridge_coordinator::BatchRuntime::new(
             batch.max_concurrent,
             batch.default_concurrency,
-            Arc::new(bridge_observ::NoopObserver),
+            observer,
         )
     }))
 }
@@ -693,6 +705,7 @@ fn build_coordinator(
     clock: Arc<dyn bridge_coordinator::clock::Clock>,
     allowed_cwd_root: Option<bridge_core::session_cwd::SessionCwd>,
     batch: Option<bridge_coordinator::BatchRuntime>,
+    observer: Arc<dyn bridge_core::ports::Observer>,
     resume_cap: u32,
     perm_registry: Arc<PermissionRegistry>,
 ) -> Arc<bridge_coordinator::Coordinator> {
@@ -708,7 +721,7 @@ fn build_coordinator(
             clock,
             allowed_cwd_root,
             batch,
-            Arc::new(bridge_observ::NoopObserver),
+            observer,
             resume_cap,
         )
         .with_permission_registry(perm_registry),
@@ -4813,13 +4826,16 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         }
     };
 
+    cfg.metrics_config()?;
     let allowed_cwd_root = cfg
         .allowed_cwd_root
         .as_deref()
         .map(bridge_core::session_cwd::SessionCwd::parse)
         .transpose()
         .map_err(|e| format!("a2a-bridge mcp: invalid allowed_cwd_root: {e:?}"))?;
-    let batch = batch_runtime(&cfg).map_err(|e| format!("a2a-bridge mcp: {e}"))?;
+    let observer: Arc<dyn bridge_core::ports::Observer> = Arc::new(bridge_observ::NoopObserver);
+    let batch =
+        batch_runtime(&cfg, Arc::clone(&observer)).map_err(|e| format!("a2a-bridge mcp: {e}"))?;
 
     let coordinator = build_coordinator(
         session_manager,
@@ -4832,6 +4848,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         clock,
         allowed_cwd_root,
         batch,
+        observer,
         resume_cap,
         Arc::clone(&perm_registry),
     );
@@ -5057,7 +5074,8 @@ fn validate_config_file(
             .map_err(|e| format!("language profiles: {e}"))?;
     }
     validate_worktree_runtime_cfg(&cfg).map_err(|e| e.to_string())?;
-    batch_runtime(&cfg).map_err(|e| e.to_string())?;
+    cfg.metrics_config().map_err(|e| e.to_string())?;
+    batch_runtime(&cfg, Arc::new(bridge_observ::NoopObserver)).map_err(|e| e.to_string())?;
     let agent_count = cfg.agents.len();
     let prompt_count = cfg.prompts.len();
     let workflow_count = workflows.len();
@@ -6062,6 +6080,75 @@ async fn main() -> Result<(), BoxError> {
             None => std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
         };
 
+    let metrics_cfg = cfg.metrics_config()?;
+    let prometheus_observer = if metrics_cfg.enabled && metrics_cfg.prometheus {
+        let vocab = bridge_observ::LabelVocabulary {
+            agents: probe_entries
+                .iter()
+                .map(|(agent, _)| agent.as_str().to_string())
+                .collect(),
+            models: probe_entries
+                .iter()
+                .filter_map(|(_, entry)| entry.model.clone())
+                .collect(),
+            efforts: probe_entries
+                .iter()
+                .filter_map(|(_, entry)| entry.effort.as_ref().map(effort_to_string))
+                .collect(),
+        };
+        Some(Arc::new(bridge_observ::PrometheusObserver::new(vocab)?))
+    } else {
+        None
+    };
+
+    if let Some(prom) = &prometheus_observer {
+        let rows = task_store.turn_log_rows().await.unwrap_or_else(|e| {
+            tracing::warn!(error = ?e, "turn_log rebuild skipped");
+            Vec::new()
+        });
+        prom.rebuild_from_turn_log(&rows);
+    }
+
+    let dedupe = if metrics_cfg.enabled {
+        prometheus_observer
+            .as_ref()
+            .map(|p| p.dedupe())
+            .unwrap_or_else(|| Arc::new(bridge_observ::TurnDedupe::default()))
+    } else {
+        Arc::new(bridge_observ::TurnDedupe::default())
+    };
+
+    let observer: Arc<dyn bridge_core::ports::Observer> = if !metrics_cfg.enabled {
+        Arc::new(bridge_observ::NoopObserver)
+    } else {
+        let mut sinks: Vec<Arc<dyn bridge_core::ports::Observer>> = Vec::new();
+        if let Some(prom) = &prometheus_observer {
+            sinks.push(prom.clone());
+        }
+        if metrics_cfg.turn_log {
+            let dropped = prometheus_observer
+                .as_ref()
+                .map(|p| p.drop_counter())
+                .unwrap_or_else(bridge_observ::DropCounter::disabled);
+            sinks.push(Arc::new(bridge_observ::TurnLogObserver::new(
+                task_store.clone(),
+                dropped,
+                1024,
+                Arc::new(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64
+                }),
+            )));
+        }
+
+        Arc::new(bridge_observ::DedupObserver::new_with_dedupe(
+            Arc::new(bridge_observ::FanoutObserver::new(sinks)),
+            dedupe,
+        ))
+    };
+
     // 7b. advertise-models: probe each agent's advertised model/effort/mode catalog HOST-SIDE before the
     //     first card is served (bounded + degrade-per-agent; spec §5). Held behind an `ArcSwap` the card
     //     reads lock-free; a `SIGHUP` handler (below) re-probes and atomically swaps it. The advertised
@@ -6110,7 +6197,7 @@ async fn main() -> Result<(), BoxError> {
     //    session_store (NOT a second store, NOT file-backed). B3: ONE BatchRuntime.
     let base_url = format!("http://{}", cfg.server.addr);
     let session_store: Arc<dyn bridge_core::ports::SessionStore> = store;
-    let batch = batch_runtime(&cfg)?;
+    let batch = batch_runtime(&cfg, Arc::clone(&observer))?;
     // #10 slice 1: the Coordinator's `allowed_cwd_root` is INERT until a handler
     // delegates a cwd-gated op (batch/detached submit — a later slice). Passing
     // `None` now keeps boot behavior-preserving: the A2A wire cwd-gate still runs
@@ -6129,6 +6216,7 @@ async fn main() -> Result<(), BoxError> {
         clock,
         None,
         batch,
+        Arc::clone(&observer),
         resume_cap,
         Arc::clone(&perm_registry),
     );
@@ -6149,7 +6237,8 @@ async fn main() -> Result<(), BoxError> {
             default_label.clone(),
         )
         .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
-        .with_model_catalog(Arc::clone(&model_catalog)),
+        .with_model_catalog(Arc::clone(&model_catalog))
+        .with_metrics_endpoint(prometheus_observer.as_ref().map(|p| p.endpoint())),
     );
 
     // 8a. SIGHUP → re-probe the model catalog and atomically swap it (no background timer; owner decision).
