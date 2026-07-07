@@ -40,7 +40,7 @@ A single **event enum** recorded through one observer port; adapters interpret. 
 pub struct TraceParent { pub trace_id: [u8; 16], pub span_id: [u8; 8], pub flags: u8 }
 
 pub struct TurnContext {
-    pub turn_id: TurnId,               // globally-unique random 128-bit (not session-monotonic)
+    pub turn_id: TurnId,               // globally-unique random 128-bit; a NEW id per attempt (a retry mints a fresh turn_id)
     pub session_id: ContextId,
     pub task_id: Option<TaskId>,
     pub workflow: Option<String>,
@@ -99,13 +99,19 @@ A new SQLite table `turn_log` in the existing store DB, one row per finished tur
 
 | column | source |
 |---|---|
-| `turn_id` (PK), `session_id`, `task_id?`, `workflow?`, `node?`, `attempt` | `TurnContext` |
+| `turn_id` (PK — one per attempt), `session_id`, `task_id?`, `workflow?`, `node?`, `attempt` | `TurnContext` |
 | `agent`, `model?`, `effort?`, `mode?`, `prompt_id?` | `TurnContext` (eval dims) |
 | `started_ms`, `latency_ms`, `ttft_ms?`, `outcome`, `failure_class?` | `TurnFinished` |
 | `input_tokens`, `output_tokens`, `thought/cached_*`, `cost_amount?`, `cost_currency?` | `UsageFinalized` |
 | `traceparent?` | `TurnContext` |
 
-Serves all three purposes the reviewers required: **debugging** (warm turns are now drillable — a `turn_id` resolves to a row even with no journal), **eval** (`SELECT … GROUP BY prompt_id, model, effort` yields per-prompt/model precision/cost — the joined tuple finally persists somewhere), and **restart-safe counters** (rebuild on boot from this table with dedupe on `turn_id`).
+**Key discipline (codex v2 fix):** because a retry mints a **new** `turn_id`, `turn_id` alone is the PK **and** the idempotency key — `attempt` is a grouping *column* (retries of one logical node share `(session_id, task_id, node)` and differ by `attempt`), never part of the dedupe key. This stores each paid attempt as its own row (no overwrite/undercount when attempt 1 times out after spending tokens and attempt 2 succeeds).
+
+**Write isolation (codex v2 fix — observability must never affect a turn):** `Observer::record()` is non-blocking. `TurnLogObserver` clones the fields it needs and hands them to a **bounded async writer**; the SQLite insert happens off the turn's critical path. On writer-queue-full or insert failure it **drops** and increments `bridge_observer_dropped_total{sink}` — it must never block, retry inline, or panic the agent turn. The `busy_timeout` WAL pragmas (Wave 1) apply.
+
+**Row assembly (codex v2 fix):** `TurnFinished` **upserts** the row by `turn_id` (creating it with latency/outcome); `UsageFinalized` upserts the usage columns onto the same `turn_id`. Both fire deterministically in that order at the one usage boundary, so a row is never partial from ordering; if `UsageFinalized` is absent (a turn with no usage), the row persists with null cost/tokens.
+
+Serves all three purposes the reviewers required: **debugging** (warm turns are now drillable — a `turn_id` resolves to a row even with no journal), **eval** (`SELECT … GROUP BY prompt_id, model, effort` yields per-prompt/model precision/cost — the joined tuple finally persists somewhere), and **restart-safe counters** (rebuild on boot from this table, deduped on `turn_id`).
 
 ### §1.2 Metric catalog
 
@@ -117,19 +123,25 @@ Serves all three purposes the reviewers required: **debugging** (warm turns are 
 | `bridge_turns_in_flight` | gauge | — |
 | `bridge_queue_depth` | gauge | — |
 | `bridge_queue_wait_seconds` | histogram | — |
-| `bridge_turn_cost_total` | counter | `agent`, `model`, `currency` |
+| `bridge_turn_cost_total` | counter | `agent`, `model`, `currency` (validated ISO-4217) |
+| `bridge_turn_cost_dropped_total` | counter | `agent` (costs with missing/invalid currency) |
 | `bridge_turn_tokens_total` | counter | `agent`, `kind` (input/output/thought/cached_read/cached_write) |
+| `bridge_observer_dropped_total` | counter | `sink` (turn-log writes dropped on queue-full/failure) |
 
-Cost/token counters are **per-turn** (renamed from `task_cost` — they count real spend on every finalized turn incl. warm inline), **idempotency-keyed** `(session_id, turn_id, attempt)`, and **rebuilt from `turn_log` on boot** (dedupe by key) so a restart doesn't lose history or double-count on replay. Every label whose value is user/config-defined (`agent`, `model`, `effort`, `workflow`, `currency`, `kind`, `outcome`) is normalized against a bounded vocabulary; unknown → `"other"`. Ids/`prompt_id`/`traceparent` are turn-log-only, never labels.
+Cost/token counters are **per-turn** (renamed from `task_cost` — they count real spend on every finalized turn incl. warm inline), **idempotency-keyed on `turn_id`** (globally unique, one per attempt), and **rebuilt from `turn_log` on boot** (dedupe by `turn_id`) so a restart doesn't lose history or double-count on replay. Labels whose value is user/config-defined (`agent`, `model`, `effort`, `workflow`, `kind`, `outcome`) are normalized against a bounded vocabulary; unknown → `"other"`.
+
+**Currency is NOT normalized to `"other"` (codex v2 fix):** money units are not fungible, so summing unknown currencies under one label is meaningless. `bridge_turn_cost_total{currency}` keeps the **validated ISO-4217 code**; a cost with a missing/invalid currency is **not** added to the cost counter — it increments `bridge_turn_cost_dropped_total{agent}` instead (and the raw amount still lands in the `turn_log` row for audit). Ids/`prompt_id`/`traceparent` are turn-log-only, never labels.
 
 ### §1.3 Hook points (exactly-once, explicit taxonomy)
 
-**Drive-path taxonomy** — enumerate and hook every one; tests prove exactly-once `TurnStarted`/`TurnFinished` per turn on each:
-1. warm inline A2A send, 2. detached task turn, 3. workflow-node turn, 4. `implement` turn, 5. `review` turn, 6. `batch` fan-out child turn.
+**Enforcement over enumeration (codex v2 fix):** exactly-once is guaranteed structurally — **every** agent turn is driven through the one shared usage boundary (`coordinator.rs:356–423`, which already records usage for all turn types), and emission lives there, so no path can drive an agent without emitting. A **contract test** asserts no agent-client turn bypasses the boundary. The enumerated paths below are the test matrix, not the guarantee:
+1. warm inline A2A send, 2. detached task turn, 3. workflow-node turn, 4. `implement` turn, 5. `review` turn, 6. `batch` fan-out child turn, 7. compact/keep-warm summarization turn, 8. watchdog-injected turn, 9. MCP service-API turn. (Any turn that reaches the agent client and is not one of these MUST still route through the boundary — the contract test is the backstop.)
 
-- **Turn latency/outcome/ttft:** at the shared usage boundary (`coordinator.rs:356–423`), stamp `Instant` at entry, capture `ttft` at first streamed event, map result → `TurnOutcome` on exit.
-- **Usage/cost:** emit `UsageFinalized{ fin }` at the same boundary for **all** turn types. `fin = TurnFinal` on every finished turn (drives the per-turn cost/token counters + a turn-log row, idempotency-keyed). `TaskFinal`/`Partial` are informational for adapters (e.g. a future OTLP task span). **Count every finalized turn attempt** (real spend), keyed so a crash-resume replay of the same `(session_id,turn_id,attempt)` is deduped.
+- **Turn latency/outcome/ttft:** at the shared usage boundary, stamp `Instant` at entry, capture `ttft` at first streamed event, map result → `TurnOutcome` on exit.
+- **Usage/cost:** emit `UsageFinalized{ fin }` at the same boundary for **all** turn types. `fin = TurnFinal` on every finished turn (drives the per-turn cost/token counters + a turn-log upsert). `TaskFinal`/`Partial` are informational for adapters (e.g. a future OTLP task span). **Count every finalized turn attempt** (real spend).
+- **One shared dedupe gate (codex v2 fix):** counter increments AND the turn-log insert consult a single in-memory `seen: Set<TurnId>` (seeded at boot from `turn_log`). Only a **first-seen** `turn_id` updates counters and writes a row — so both a live crash-resume replay and a boot rebuild are deduped by the same gate, and Prometheus can never increment for a `turn_id` the log rejects as duplicate.
 - **Queue:** an RAII guard with an explicit state machine `Waiting → Admitted → Released`. `Drop` in `Waiting` decrements the waiter count (cancellation mid-`acquire_owned().await` can't leak `bridge_queue_depth`); `Waiting→Admitted` atomically `waiter--,in_flight++`; `Drop` in `Admitted` decrements `in_flight` (normal release AND cancellation). `bridge_queue_wait_seconds` observed `Waiting→Admitted`.
+- **traceparent source (codex v2 fix):** the inbound A2A adapter (`bridge-a2a-inbound`) parses+validates a W3C `traceparent` header off the request and sets `TurnContext.traceparent`; it propagates to child contexts (workflow nodes inherit the parent's). Absent/invalid header → `None` (never fabricated). No consumer in slice 1 (the field is persisted to `turn_log`); the future OTLP adapter reads it. Tested: valid header round-trips to the row; malformed → `None`.
 
 ### §1.4 Config (slice 1 only)
 
@@ -143,22 +155,26 @@ turn_log  = true             # persist the per-turn record table (enables eval +
 
 ### §1.5 Testing (slice 1)
 
-- Adapter units: `PrometheusObserver` exposition per instrument (counter/histogram bucket+`_sum`+`_count`/gauge); label normalization → `"other"`; `TurnLogObserver` writes the expected row per turn; `NoopObserver` no-op; `FanoutObserver` forwards to N.
-- Port-contract (`RecordingObserver`): exactly-once `TurnStarted`/`TurnFinished` with correct outcome on success/`Failed(class)`/cancel **on each of the six drive paths**; `UsageFinalized` at the boundary with correct `fin`.
+- Adapter units: `PrometheusObserver` exposition per instrument (counter/histogram bucket+`_sum`+`_count`/gauge); label normalization → `"other"`; `TurnLogObserver` writes the expected row per turn (upsert order `TurnFinished` then `UsageFinalized`); `NoopObserver` no-op; `FanoutObserver` forwards to N.
+- Port-contract (`RecordingObserver`): exactly-once `TurnStarted`/`TurnFinished` with correct outcome on success/`Failed(class)`/cancel **on each drive path**; `UsageFinalized` at the boundary with correct `fin`; a **bypass contract test** — no agent-client turn reaches the agent without passing the boundary/observer.
 - Cancellation: cancel mid-`acquire` → `bridge_queue_depth` returns to baseline (RAII state machine).
-- Idempotency: replay a terminal transition (simulated resume) → cost/token counters do **not** double.
-- Restart: boot with a populated `turn_log` + empty in-memory counters → counters rebuilt, no double-count.
+- Idempotency: replay a terminal transition (simulated resume) → the shared dedupe gate rejects the duplicate `turn_id`; cost/token counters do **not** double; a retry (**new** `turn_id`, `attempt=1`) after a token-spending attempt-0 timeout records **both** rows and both spends.
+- Restart: boot with a populated `turn_log` + empty in-memory counters → counters rebuilt, dedupe set seeded, no double-count.
+- Isolation: a failing/locked turn-log write → the turn still **succeeds**; `bridge_observer_dropped_total` increments (record() never blocks/panics the turn).
+- Currency: an unknown/invalid currency cost → excluded from `bridge_turn_cost_total`, counted in `bridge_turn_cost_dropped_total`, raw amount still in the `turn_log` row.
+- traceparent: valid inbound header → row carries it + child node inherits; malformed → `None`.
 - HTTP: `/metrics` exposition when enabled; 404 disabled / no-prom-exporter; 401 no bearer.
 
 ### §1.6 Acceptance (slice 1)
 
 1. `Observer`/`ObsEvent` in `bridge-core`, `prometheus`-free; adapters in `bridge-observ`; domain has no Prometheus reference.
 2. `/metrics` returns valid exposition covering §1.2 after a workflow run; disabled/no-exporter → 404; no bearer → 401.
-3. Turn counters/histograms increment exactly once per turn across all six drive paths (tested).
+3. Turn counters/histograms increment exactly once per turn across every drive path; a bypass contract test proves no agent turn skips the observer.
 4. `bridge_queue_depth` cancellation-safe (tested); `bridge_queue_wait_seconds` records wait.
-5. `bridge_turn_cost_total` covers warm inline turns, dedupes across simulated resume, rebuilds from `turn_log` on restart (tested).
-6. `turn_log` row per finished turn with the eval columns; an eval query over `prompt_id`×`model` returns per-group cost/outcome.
-7. fmt+clippy+full suite green.
+5. `bridge_turn_cost_total` covers warm inline turns, dedupes a replayed `turn_id` via the shared gate, records both a timed-out attempt-0 and its retry, rebuilds from `turn_log` on restart, and never sums unknown currencies (tested).
+6. A failing turn-log write never fails the turn (`bridge_observer_dropped_total` increments; tested).
+7. `turn_log` row per finished turn with the eval columns; an eval query over `prompt_id`×`model` returns per-group cost/outcome.
+8. fmt+clippy+full suite green.
 
 ---
 
