@@ -585,6 +585,7 @@ version = "0.2.0"
 dependencies = [
  "bridge-core",
  "prometheus",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

@@ -4,6 +4,7 @@ use bridge_core::orch::{TerminalUsage, UsageSnapshot};
 use bridge_core::ports::{
     FailureClass, ObsEvent, Observer, TurnContext, TurnOutcome, UsageFinalization,
 };
+use bridge_core::task_store::{TaskStore, TurnLogFinished, TurnLogUsage};
 use prometheus::{
     CounterVec, Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry,
     TextEncoder,
@@ -13,6 +14,7 @@ use std::{
     panic,
     sync::{Arc, Mutex},
 };
+use tokio::sync::{mpsc, oneshot};
 
 /// Fallback no-op implementation, useful where observability is disabled.
 pub struct NoopObserver;
@@ -61,8 +63,13 @@ impl DedupObserver {
 impl Observer for DedupObserver {
     fn record(&self, e: &ObsEvent<'_>) {
         match e {
-            ObsEvent::TurnFinished { ctx, .. } | ObsEvent::UsageFinalized { ctx, .. } => {
+            ObsEvent::TurnFinished { ctx, .. } => {
                 if !self.dedupe.mark_finished(&ctx.turn_id) {
+                    return;
+                }
+            }
+            ObsEvent::UsageFinalized { ctx, .. } => {
+                if !self.dedupe.mark_usage(&ctx.turn_id) {
                     return;
                 }
             }
@@ -118,29 +125,25 @@ pub struct LabelVocabulary {
 
 #[derive(Default)]
 pub struct TurnDedupe {
-    seen: Mutex<HashSet<String>>,
+    seen: Mutex<(HashSet<String>, HashSet<String>)>,
 }
 
 impl TurnDedupe {
     pub fn mark_finished(&self, turn_id: &bridge_core::ids::TurnId) -> bool {
-        self.seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(turn_id.as_str().to_string())
+        let mut lock = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        lock.0.insert(turn_id.as_str().to_string())
     }
 
     pub fn mark_usage(&self, turn_id: &bridge_core::ids::TurnId) -> bool {
-        self.seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(turn_id.as_str().to_string())
+        let mut lock = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        lock.1.insert(turn_id.as_str().to_string())
     }
 
     pub fn seed(&self, turn_id: &bridge_core::ids::TurnId) {
-        self.seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(turn_id.as_str().to_string());
+        let mut lock = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let id = turn_id.as_str().to_string();
+        lock.0.insert(id.clone());
+        lock.1.insert(id);
     }
 }
 
@@ -175,6 +178,122 @@ fn normalize_sink_label(sink: &str) -> &str {
         "turnlog" => "turn_log",
         "prometheus" => "prometheus",
         _ => "other",
+    }
+}
+
+type NowMs = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+enum TurnLogCommand {
+    Finished(TurnLogFinished),
+    Usage(TurnLogUsage),
+    Flush(oneshot::Sender<()>),
+}
+
+pub struct TurnLogObserver {
+    tx: Option<mpsc::Sender<TurnLogCommand>>,
+    dropped: DropCounter,
+    now_ms: NowMs,
+}
+
+impl TurnLogObserver {
+    pub fn new(
+        store: Arc<dyn TaskStore>,
+        dropped: DropCounter,
+        capacity: usize,
+        now_ms: NowMs,
+    ) -> Self {
+        if capacity == 0 {
+            return Self {
+                tx: None,
+                dropped,
+                now_ms,
+            };
+        }
+        let (tx, mut rx) = mpsc::channel(capacity);
+        let dropped_for_task = dropped.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    TurnLogCommand::Finished(row) => {
+                        if store.upsert_turn_finished(&row).await.is_err() {
+                            dropped_for_task.observe("turn_log");
+                        }
+                    }
+                    TurnLogCommand::Usage(row) => {
+                        if store.update_turn_usage(&row).await.is_err() {
+                            dropped_for_task.observe("turn_log");
+                        }
+                    }
+                    TurnLogCommand::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        Self {
+            tx: Some(tx),
+            dropped,
+            now_ms,
+        }
+    }
+
+    pub async fn flush(&self) {
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        if tx.send(TurnLogCommand::Flush(done_tx)).await.is_ok() {
+            let _ = done_rx.await;
+        }
+    }
+
+    fn try_send(&self, cmd: TurnLogCommand) {
+        let Some(tx) = &self.tx else {
+            self.dropped.observe("turn_log");
+            return;
+        };
+        if tx.try_send(cmd).is_err() {
+            self.dropped.observe("turn_log");
+        }
+    }
+}
+
+impl Observer for TurnLogObserver {
+    fn record(&self, e: &ObsEvent<'_>) {
+        match e {
+            ObsEvent::TurnFinished {
+                ctx,
+                latency,
+                ttft,
+                outcome,
+            } => {
+                let completed_ms = (self.now_ms)();
+                let latency_ms = latency.as_millis() as i64;
+                self.try_send(TurnLogCommand::Finished(TurnLogFinished {
+                    ctx: (*ctx).clone(),
+                    started_ms: completed_ms.saturating_sub(latency_ms),
+                    completed_ms,
+                    latency: *latency,
+                    ttft: *ttft,
+                    outcome: (*outcome).clone(),
+                }));
+            }
+            ObsEvent::UsageFinalized { ctx, usage, fin } => {
+                if *fin != UsageFinalization::TurnFinal {
+                    return;
+                }
+                self.try_send(TurnLogCommand::Usage(TurnLogUsage {
+                    ctx: (*ctx).clone(),
+                    usage: (*usage).clone(),
+                }));
+            }
+            ObsEvent::TaskStarted { .. }
+            | ObsEvent::TaskFinished { .. }
+            | ObsEvent::NodeStarted { .. }
+            | ObsEvent::NodeFinished { .. }
+            | ObsEvent::TurnStarted { .. }
+            | ObsEvent::QueueChanged { .. } => {}
+        }
     }
 }
 
@@ -419,7 +538,8 @@ fn valid_iso4217(code: &str) -> bool {
 mod obs_port_tests {
     use super::*;
     use bridge_core::ids::{ContextId, TurnId};
-    use bridge_core::ports::{TraceParent, TurnContext, TurnOutcome};
+    use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
+    use bridge_core::ports::{TraceParent, TurnContext, TurnOutcome, UsageFinalization};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -514,23 +634,30 @@ mod obs_port_tests {
     }
 
     #[test]
-    fn dedup_observer_forwards_turn_events_once_across_fanout_sinks() {
+    fn dedup_observer_forwards_turn_finished_and_usage_finalized_once() {
         struct RecordingSink {
-            count: AtomicUsize,
+            turn_events: AtomicUsize,
+            usage_events: AtomicUsize,
         }
         impl Observer for RecordingSink {
             fn record(&self, _e: &ObsEvent<'_>) {
-                self.count.fetch_add(1, Ordering::SeqCst);
+                match _e {
+                    ObsEvent::TurnFinished { .. } => {
+                        self.turn_events.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ObsEvent::UsageFinalized { .. } => {
+                        self.usage_events.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
             }
         }
 
         let first = Arc::new(RecordingSink {
-            count: AtomicUsize::new(0),
+            turn_events: AtomicUsize::new(0),
+            usage_events: AtomicUsize::new(0),
         });
-        let second = Arc::new(RecordingSink {
-            count: AtomicUsize::new(0),
-        });
-        let fanout = FanoutObserver::new(vec![second.clone(), first.clone()]);
+        let fanout = FanoutObserver::new(vec![first.clone()]);
         let observer = DedupObserver::new(Arc::new(fanout));
         let outcome = TurnOutcome::Success;
 
@@ -555,12 +682,39 @@ mod obs_port_tests {
             ttft: Some(Duration::from_millis(5)),
             outcome: &outcome,
         };
+        let usage = UsageSnapshot {
+            used: Some(1),
+            size: Some(1),
+            cost: Some(UsageCost {
+                amount: 0.25,
+                currency: "USD".to_string(),
+            }),
+            terminal: Some(TerminalUsage {
+                total_tokens: 3,
+                input_tokens: 1,
+                output_tokens: 2,
+                thought_tokens: None,
+                cached_read_tokens: None,
+                cached_write_tokens: None,
+            }),
+            at_ms: 0,
+        };
 
         observer.record(&event);
+        observer.record(&ObsEvent::UsageFinalized {
+            ctx: &ctx,
+            usage: &usage,
+            fin: UsageFinalization::TurnFinal,
+        });
         observer.record(&event);
+        observer.record(&ObsEvent::UsageFinalized {
+            ctx: &ctx,
+            usage: &usage,
+            fin: UsageFinalization::TurnFinal,
+        });
 
-        assert_eq!(first.count.load(Ordering::SeqCst), 1);
-        assert_eq!(second.count.load(Ordering::SeqCst), 1);
+        assert_eq!(first.turn_events.load(Ordering::SeqCst), 1);
+        assert_eq!(first.usage_events.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -573,6 +727,127 @@ mod obs_port_tests {
         let out = observer.endpoint().render().unwrap();
         assert!(out.contains("bridge_observer_dropped_total{sink=\"turn_log\"} 1"));
         assert!(out.contains("bridge_observer_dropped_total{sink=\"other\"} 1"));
+    }
+}
+
+#[cfg(test)]
+mod turn_log_observer_tests {
+    use super::*;
+    use bridge_core::ids::{ContextId, TurnId};
+    use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
+    use bridge_core::ports::{ObsEvent, Observer, TurnContext, TurnOutcome, UsageFinalization};
+    use bridge_core::task_store::{MemoryTaskStore, TaskStore};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn ctx(turn: &str) -> TurnContext {
+        TurnContext {
+            turn_id: TurnId::parse(turn).unwrap(),
+            session_id: ContextId::parse("ctx-log").unwrap(),
+            task_id: None,
+            workflow: None,
+            node: None,
+            attempt: 0,
+            agent: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            effort: Some("high".to_string()),
+            mode: None,
+            prompt_id: Some("prompt/log".to_string()),
+            traceparent: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_log_observer_writes_finished_then_usage_off_path() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let observer = TurnLogObserver::new(
+            store.clone(),
+            DropCounter::disabled(),
+            8,
+            Arc::new(|| 10_000),
+        );
+        let c = ctx("turn-log-1");
+        let outcome = TurnOutcome::Success;
+        observer.record(&ObsEvent::TurnFinished {
+            ctx: &c,
+            latency: Duration::from_millis(250),
+            ttft: Some(Duration::from_millis(50)),
+            outcome: &outcome,
+        });
+        let usage = UsageSnapshot {
+            used: Some(1),
+            size: Some(2),
+            cost: Some(UsageCost {
+                amount: 0.12,
+                currency: "USD".to_string(),
+            }),
+            terminal: Some(TerminalUsage {
+                total_tokens: 3,
+                input_tokens: 1,
+                output_tokens: 2,
+                thought_tokens: None,
+                cached_read_tokens: None,
+                cached_write_tokens: None,
+            }),
+            at_ms: 10_001,
+        };
+        observer.record(&ObsEvent::UsageFinalized {
+            ctx: &c,
+            usage: &usage,
+            fin: UsageFinalization::TurnFinal,
+        });
+        observer.flush().await;
+
+        let rows = store.turn_log_rows().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn_id.as_str(), "turn-log-1");
+        assert_eq!(rows[0].started_ms, Some(9_750));
+        assert_eq!(rows[0].completed_ms, Some(10_000));
+        assert_eq!(rows[0].latency_ms, Some(250));
+        assert_eq!(rows[0].ttft_ms, Some(50));
+        assert_eq!(rows[0].input_tokens, Some(1));
+        assert_eq!(rows[0].cost_currency.as_deref(), Some("USD"));
+    }
+
+    #[tokio::test]
+    async fn turn_log_observer_drops_when_queue_full_without_blocking() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let prom = PrometheusObserver::new(LabelVocabulary::default()).unwrap();
+        let observer = TurnLogObserver::new(store, prom.drop_counter(), 0, Arc::new(|| 1));
+        let c = ctx("turn-log-drop");
+        let outcome = TurnOutcome::Success;
+        observer.record(&ObsEvent::TurnFinished {
+            ctx: &c,
+            latency: Duration::from_millis(1),
+            ttft: None,
+            outcome: &outcome,
+        });
+        let out = prom.endpoint().render().unwrap();
+        assert!(out.contains("bridge_observer_dropped_total{sink=\"turn_log\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn turn_log_observer_flush_waits_for_barrier_on_full_queue() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let observer = TurnLogObserver::new(
+            store.clone(),
+            DropCounter::disabled(),
+            1,
+            Arc::new(|| 10_000),
+        );
+        let c = ctx("turn-log-flush-capacity-1");
+        let outcome = TurnOutcome::Success;
+        observer.record(&ObsEvent::TurnFinished {
+            ctx: &c,
+            latency: Duration::from_millis(250),
+            ttft: None,
+            outcome: &outcome,
+        });
+        observer.flush().await;
+
+        let rows = store.turn_log_rows().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn_id.as_str(), "turn-log-flush-capacity-1");
     }
 }
 
