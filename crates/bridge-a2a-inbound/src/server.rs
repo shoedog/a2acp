@@ -112,6 +112,8 @@ pub struct InboundServer {
     /// empty → the card omits the `agent-models` extension (same as a fully-failed probe). Wired from
     /// `main`'s startup probe via [`InboundServer::with_model_catalog`].
     pub model_catalog: Arc<arc_swap::ArcSwap<bridge_core::catalog::ModelCatalog>>,
+    /// Optional endpoint used by `GET /metrics` for Prometheus exposition.
+    metrics_endpoint: Option<bridge_observ::MetricsEndpoint>,
     /// #10: the ONE `Coordinator` that owns turn-lifecycle STATE. MANDATORY (slice 7):
     /// A2A is a co-equal adapter over the SAME state instances the CLI/MCP surfaces
     /// use. Every shared-state read routes through the forwarders below, which borrow
@@ -150,6 +152,7 @@ impl InboundServer {
             model_catalog: Arc::new(arc_swap::ArcSwap::from_pointee(
                 bridge_core::catalog::ModelCatalog::new(),
             )),
+            metrics_endpoint: None,
             coordinator,
         }
     }
@@ -173,6 +176,17 @@ impl InboundServer {
         catalog: Arc<arc_swap::ArcSwap<bridge_core::catalog::ModelCatalog>>,
     ) -> Self {
         self.model_catalog = catalog;
+        self
+    }
+
+    /// Optional Prometheus metrics route endpoint. Set `Some(...)` to mount
+    /// `GET /metrics` with bearer-token auth and 200/401 semantics.
+    #[must_use]
+    pub fn with_metrics_endpoint(
+        mut self,
+        endpoint: Option<bridge_observ::MetricsEndpoint>,
+    ) -> Self {
+        self.metrics_endpoint = endpoint;
         self
     }
 
@@ -249,10 +263,15 @@ impl InboundServer {
 
     /// Build the axum router, mounting the Agent Card and JSON-RPC endpoint.
     pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
+        let router = Router::new()
             .route("/.well-known/agent-card.json", get(serve_card))
-            .route("/", post(jsonrpc))
-            .with_state(self)
+            .route("/", post(jsonrpc));
+        let router = if self.metrics_endpoint.is_some() {
+            router.route("/metrics", get(metrics))
+        } else {
+            router
+        };
+        router.with_state(self)
     }
 
     // ---- pipeline helpers (shared by streaming + unary paths) ----
@@ -765,6 +784,38 @@ async fn serve_card(State(srv): State<Arc<InboundServer>>) -> Response {
     let mcp = srv.registry().mcp_advertisement();
     let catalog = srv.model_catalog.load();
     Json(agent_card(&srv.base_url, &workflow_ids, &mcp, &catalog)).into_response()
+}
+
+async fn metrics(State(srv): State<Arc<InboundServer>>, headers: HeaderMap) -> Response {
+    let Some(endpoint) = srv.metrics_endpoint.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if srv
+        .auth
+        .authorize(&InboundRequest::with_token(&token))
+        .is_err()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    match endpoint.render() {
+        Ok(body) => (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4",
+            )],
+            body,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "metrics exposition failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// `POST /` -> the JSON-RPC dispatch surface.
@@ -4557,6 +4608,79 @@ mod tests {
             .header(SVC_PARAM_VERSION, version)
             .body(jsonrpc_body(method, params))
             .unwrap()
+    }
+
+    mod metrics_route_tests {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        #[tokio::test]
+        async fn metrics_route_404_when_no_endpoint() {
+            let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn metrics_route_requires_bearer_when_enabled() {
+            let srv = Arc::new(
+                Arc::into_inner(build(FakeBackend::new(), Arc::new(AlwaysGrant)))
+                    .expect("build should return unique Arc")
+                    .with_metrics_endpoint(Some(
+                        bridge_observ::PrometheusObserver::new(
+                            bridge_observ::LabelVocabulary::default(),
+                        )
+                        .unwrap()
+                        .endpoint(),
+                    )),
+            );
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn metrics_route_returns_text_exposition_when_enabled_and_authorized() {
+            let srv = Arc::new(
+                Arc::into_inner(build(FakeBackend::new(), Arc::new(AlwaysGrant)))
+                    .expect("build should return unique Arc")
+                    .with_metrics_endpoint(Some(
+                        bridge_observ::PrometheusObserver::new(
+                            bridge_observ::LabelVocabulary::default(),
+                        )
+                        .unwrap()
+                        .endpoint(),
+                    )),
+            );
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .header("authorization", "Bearer test")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
     }
 
     async fn body_string(resp: Response) -> String {
