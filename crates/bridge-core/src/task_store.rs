@@ -3,7 +3,8 @@
 //! responsibility. Timestamps are passed IN — the core forbids `Date::now`.
 
 use crate::error::BridgeError;
-use crate::ids::{BatchId, NodeId, OperationId, TaskId};
+use crate::ids::{BatchId, ContextId, NodeId, OperationId, TaskId, TurnId};
+use std::time::Duration;
 
 /// Durable status of a detached task. `Interrupted` is distinct from `Failed`
 /// (a crash mid-run, swept on the next boot) so triage can tell them apart; the
@@ -108,6 +109,22 @@ pub fn terminal_status_from_record(s: &TaskRecordStatus) -> crate::orch::Termina
     }
 }
 
+pub fn turn_log_outcome_strings(
+    outcome: &crate::ports::TurnOutcome,
+) -> (&'static str, Option<&'static str>) {
+    use crate::ports::{FailureClass, TurnOutcome};
+    match outcome {
+        TurnOutcome::Success => ("success", None),
+        TurnOutcome::Canceled => ("canceled", None),
+        TurnOutcome::Failed(FailureClass::AgentCrashed) => ("failed", Some("agent_crashed")),
+        TurnOutcome::Failed(FailureClass::TimedOut) => ("failed", Some("timed_out")),
+        TurnOutcome::Failed(FailureClass::Overloaded) => ("failed", Some("overloaded")),
+        TurnOutcome::Failed(FailureClass::Config) => ("failed", Some("config")),
+        TurnOutcome::Failed(FailureClass::Transport) => ("failed", Some("transport")),
+        TurnOutcome::Failed(FailureClass::Other) => ("failed", Some("other")),
+    }
+}
+
 /// One durable task row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskRecord {
@@ -132,6 +149,51 @@ pub struct TaskRecord {
     pub session_cwd: Option<String>,
     pub batch_id: Option<crate::ids::BatchId>,
     pub item_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TurnLogFinished {
+    pub ctx: crate::ports::TurnContext,
+    pub started_ms: i64,
+    pub completed_ms: i64,
+    pub latency: Duration,
+    pub ttft: Option<Duration>,
+    pub outcome: crate::ports::TurnOutcome,
+}
+
+#[derive(Clone, Debug)]
+pub struct TurnLogUsage {
+    pub ctx: crate::ports::TurnContext,
+    pub usage: crate::orch::UsageSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurnLogRow {
+    pub turn_id: TurnId,
+    pub session_id: ContextId,
+    pub task_id: Option<TaskId>,
+    pub workflow: Option<String>,
+    pub node: Option<String>,
+    pub attempt: u32,
+    pub agent: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub mode: Option<String>,
+    pub prompt_id: Option<String>,
+    pub started_ms: Option<i64>,
+    pub completed_ms: Option<i64>,
+    pub latency_ms: Option<u64>,
+    pub ttft_ms: Option<u64>,
+    pub outcome: Option<String>,
+    pub failure_class: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub thought_tokens: Option<u64>,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_write_tokens: Option<u64>,
+    pub cost_amount: Option<f64>,
+    pub cost_currency: Option<String>,
+    pub traceparent: Option<crate::ports::TraceParent>,
 }
 
 /// Outcome of a `claim_resume_attempt` call.
@@ -198,6 +260,18 @@ pub trait TaskStore: Send + Sync {
     ) -> Result<ResumeClaim, BridgeError>;
     /// Return all rows whose status is `Working` (for the boot-time resume scan).
     async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError>;
+
+    async fn upsert_turn_finished(&self, _row: &TurnLogFinished) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn update_turn_usage(&self, _row: &TurnLogUsage) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn turn_log_rows(&self) -> Result<Vec<TurnLogRow>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
 
     async fn create_batch(&self, _rec: &BatchRecord) -> Result<(), BridgeError> {
         Err(BridgeError::StoreFailure)
@@ -447,6 +521,7 @@ pub struct MemoryTaskStore {
     terminal_seqs: Mutex<HashMap<String, i64>>,
     /// In-progress node starts. Key: (task_id, node_id) → (seq, ts).
     starts: Mutex<HashMap<(String, String), (i64, i64)>>,
+    turn_log: Mutex<HashMap<String, TurnLogRow>>,
     /// Per-task durable orchestration journal rows. Key: task_id.
     journals: Mutex<HashMap<String, Vec<(i64, crate::orch::OrchEvent)>>>,
 }
@@ -462,6 +537,7 @@ impl MemoryTaskStore {
             seq_counters: Mutex::new(HashMap::new()),
             terminal_seqs: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
+            turn_log: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
         }
     }
@@ -604,6 +680,72 @@ impl TaskStore for MemoryTaskStore {
             .filter(|r| r.status == TaskRecordStatus::Working)
             .cloned()
             .collect())
+    }
+
+    async fn upsert_turn_finished(&self, row: &TurnLogFinished) -> Result<(), BridgeError> {
+        let mut g = self.turn_log.lock().unwrap();
+        let entry = g
+            .entry(row.ctx.turn_id.as_str().to_string())
+            .or_insert_with(|| TurnLogRow {
+                turn_id: row.ctx.turn_id.clone(),
+                session_id: row.ctx.session_id.clone(),
+                task_id: row.ctx.task_id.clone(),
+                workflow: row.ctx.workflow.clone(),
+                node: row.ctx.node.clone(),
+                attempt: row.ctx.attempt,
+                agent: row.ctx.agent.clone(),
+                model: row.ctx.model.clone(),
+                effort: row.ctx.effort.clone(),
+                mode: row.ctx.mode.clone(),
+                prompt_id: row.ctx.prompt_id.clone(),
+                started_ms: None,
+                completed_ms: None,
+                latency_ms: None,
+                ttft_ms: None,
+                outcome: None,
+                failure_class: None,
+                input_tokens: None,
+                output_tokens: None,
+                thought_tokens: None,
+                cached_read_tokens: None,
+                cached_write_tokens: None,
+                cost_amount: None,
+                cost_currency: None,
+                traceparent: row.ctx.traceparent.clone(),
+            });
+        entry.started_ms = Some(row.started_ms);
+        entry.completed_ms = Some(row.completed_ms);
+        entry.latency_ms = Some(row.latency.as_millis() as u64);
+        entry.ttft_ms = row.ttft.map(|d| d.as_millis() as u64);
+        let (outcome, failure_class) = turn_log_outcome_strings(&row.outcome);
+        entry.outcome = Some(outcome.to_string());
+        entry.failure_class = failure_class.map(str::to_string);
+        Ok(())
+    }
+
+    async fn update_turn_usage(&self, row: &TurnLogUsage) -> Result<(), BridgeError> {
+        let mut g = self.turn_log.lock().unwrap();
+        let entry = g
+            .get_mut(row.ctx.turn_id.as_str())
+            .ok_or(BridgeError::StoreFailure)?;
+        if let Some(term) = row.usage.terminal.as_ref() {
+            entry.input_tokens = Some(term.input_tokens);
+            entry.output_tokens = Some(term.output_tokens);
+            entry.thought_tokens = term.thought_tokens;
+            entry.cached_read_tokens = term.cached_read_tokens;
+            entry.cached_write_tokens = term.cached_write_tokens;
+        }
+        if let Some(cost) = row.usage.cost.as_ref() {
+            entry.cost_amount = Some(cost.amount);
+            entry.cost_currency = Some(cost.currency.clone());
+        }
+        Ok(())
+    }
+
+    async fn turn_log_rows(&self) -> Result<Vec<TurnLogRow>, BridgeError> {
+        let mut rows: Vec<_> = self.turn_log.lock().unwrap().values().cloned().collect();
+        rows.sort_by(|a, b| a.turn_id.as_str().cmp(b.turn_id.as_str()));
+        Ok(rows)
     }
 
     async fn create_batch(&self, rec: &BatchRecord) -> Result<(), BridgeError> {

@@ -7,7 +7,9 @@ use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::orch::UsageSnapshot;
 use bridge_core::ports::{
-    AgentBackend, AgentRegistry, RichEventSinkFactory, Update, STOP_REASON_CANCELLED,
+    classify_failure, AgentBackend, AgentRegistry, FailureClass, ObsEvent, Observer,
+    RichEventSinkFactory, TurnContext, TurnOutcome, Update, UsageFinalization,
+    STOP_REASON_CANCELLED,
 };
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
@@ -19,10 +21,27 @@ use tokio_util::sync::CancellationToken;
 /// Per-request context forwarded opaquely through the executor to each node's
 /// `configure_session` call. The scheduler/topo logic MUST NOT read this — it
 /// is only consumed at the `SessionSpec` build site in `run_node`.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct WorkflowRunContext {
     pub session_cwd: Option<SessionCwd>,
     pub make_rich_sink: Option<Arc<dyn RichEventSinkFactory>>,
+    pub observer: Arc<dyn Observer>,
+    pub parent_traceparent: Option<bridge_core::ports::TraceParent>,
+    pub task_id: Option<bridge_core::ids::TaskId>,
+    pub prompt_id: Option<String>,
+}
+
+impl Default for WorkflowRunContext {
+    fn default() -> Self {
+        Self {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: Arc::new(bridge_observ::NoopObserver),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        }
+    }
 }
 
 pub enum NodeTurnExit {
@@ -199,6 +218,41 @@ pub enum WorkflowEvent {
 pub type WorkflowStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<WorkflowEvent, BridgeError>> + Send>>;
 
+#[allow(clippy::too_many_arguments)]
+fn node_turn_context(
+    wf_id: &str,
+    node: &WorkflowNode,
+    run_id: &str,
+    ctx: &WorkflowRunContext,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<String>,
+    attempt: u32,
+) -> TurnContext {
+    TurnContext {
+        turn_id: bridge_core::ids::TurnId::parse(format!(
+            "turn-{run_id}-{node_id}-{attempt}",
+            node_id = node.id.as_str()
+        ))
+        .unwrap_or_else(|_| {
+            bridge_core::ids::TurnId::parse("turn-fallback").expect("fallback is valid")
+        }),
+        session_id: bridge_core::ids::ContextId::parse(run_id).unwrap_or_else(|_| {
+            bridge_core::ids::ContextId::parse("workflow-fallback").expect("fallback is valid")
+        }),
+        task_id: ctx.task_id.clone(),
+        workflow: Some(wf_id.to_string()),
+        node: Some(node.id.as_str().to_string()),
+        attempt,
+        agent: node.agent.as_str().to_string(),
+        model,
+        effort,
+        mode,
+        prompt_id: ctx.prompt_id.clone(),
+        traceparent: ctx.parent_traceparent.clone(),
+    }
+}
+
 impl WorkflowExecutor {
     pub fn new(registry: Arc<dyn AgentRegistry>) -> Self {
         Self { registry }
@@ -222,18 +276,31 @@ impl WorkflowExecutor {
         }
         if let Some(d) = dispatcher {
             let rendered = render(&node.prompt_template, vars);
+            // Emit NodeStarted before checkout (analogous to the cold path emitting before resolve).
+            let obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 1);
+            ctx.observer
+                .record(&ObsEvent::NodeStarted { ctx: &obs_ctx });
             let turn = match d.checkout(wf_id, node, run_id, ctx).await {
                 Ok(t) => t,
                 Err(e) => {
+                    let fail_out = TurnOutcome::Failed(classify_failure(&e));
+                    ctx.observer.record(&ObsEvent::NodeFinished {
+                        ctx: &obs_ctx,
+                        outcome: &fail_out,
+                    });
                     return (
                         format!("[node {} failed: {:?}]", node.id.as_str(), e),
                         false,
                         None,
-                    )
+                    );
                 }
             };
             if cancel.is_cancelled() {
                 turn.cleanup.on_exit(NodeTurnExit::Normal).await;
+                ctx.observer.record(&ObsEvent::NodeFinished {
+                    ctx: &obs_ctx,
+                    outcome: &TurnOutcome::Canceled,
+                });
                 return (format!("[node {} canceled]", node.id.as_str()), false, None);
             }
 
@@ -247,17 +314,41 @@ impl WorkflowExecutor {
                 );
             }
 
+            ctx.observer
+                .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
+            let turn_start = std::time::Instant::now();
+            let mut ttft_val: Option<std::time::Duration> = None;
+
             let mut stream = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     turn.cleanup.on_exit(NodeTurnExit::Canceled).await;
+                    ctx.observer.record(&ObsEvent::TurnFinished {
+                        ctx: &obs_ctx,
+                        latency: turn_start.elapsed(),
+                        ttft: None,
+                        outcome: &TurnOutcome::Canceled,
+                    });
+                    ctx.observer.record(&ObsEvent::NodeFinished {
+                        ctx: &obs_ctx,
+                        outcome: &TurnOutcome::Canceled,
+                    });
                     return (format!("[node {} canceled]", node.id.as_str()), false, None);
                 }
                 s = turn.backend.prompt(&turn.session, parts) => match s {
                     Ok(s) => s,
                     Err(e) => {
                         let text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
+                        let fail_out = TurnOutcome::Failed(classify_failure(&e));
                         turn.cleanup.on_exit(NodeTurnExit::Error(e)).await;
+                        ctx.observer.record(&ObsEvent::TurnFinished {
+                            ctx: &obs_ctx,
+                            latency: turn_start.elapsed(),
+                            ttft: None,
+                            outcome: &fail_out,
+                        });
+                        ctx.observer
+                            .record(&ObsEvent::NodeFinished { ctx: &obs_ctx, outcome: &fail_out });
                         return (text, false, None);
                     }
                 },
@@ -274,7 +365,12 @@ impl WorkflowExecutor {
                         break NodeTurnExit::Canceled;
                     }
                     item = stream.next() => match item {
-                        Some(Ok(Update::Text(t))) => text.push_str(&t),
+                        Some(Ok(Update::Text(t))) => {
+                            if ttft_val.is_none() && !t.is_empty() {
+                                ttft_val = Some(turn_start.elapsed());
+                            }
+                            text.push_str(&t);
+                        }
                         Some(Ok(Update::Permission(_))) => {}
                         Some(Ok(Update::Usage(mut u))) => {
                             if let Some(previous) = &last_usage {
@@ -298,6 +394,29 @@ impl WorkflowExecutor {
             // Keep whatever usage the agent reported, even if the turn then errored or was
             // cancelled — the tokens were really consumed and belong in the durable footprint.
             // `last_usage` is already `None` when no `Update::Usage` was ever observed.
+            let node_outcome = match &exit {
+                NodeTurnExit::Canceled => TurnOutcome::Canceled,
+                NodeTurnExit::Error(e) => TurnOutcome::Failed(classify_failure(e)),
+                NodeTurnExit::Normal if ok => TurnOutcome::Success,
+                NodeTurnExit::Normal => TurnOutcome::Failed(FailureClass::Other),
+            };
+            ctx.observer.record(&ObsEvent::TurnFinished {
+                ctx: &obs_ctx,
+                latency: turn_start.elapsed(),
+                ttft: ttft_val,
+                outcome: &node_outcome,
+            });
+            if let Some(u) = &last_usage {
+                ctx.observer.record(&ObsEvent::UsageFinalized {
+                    ctx: &obs_ctx,
+                    usage: u,
+                    fin: UsageFinalization::TurnFinal,
+                });
+            }
+            ctx.observer.record(&ObsEvent::NodeFinished {
+                ctx: &obs_ctx,
+                outcome: &node_outcome,
+            });
             turn.cleanup.on_exit(exit).await;
             return (text, ok, last_usage);
         }
@@ -330,6 +449,7 @@ impl WorkflowExecutor {
             Fatal {
                 text: String,
                 usage: Option<UsageSnapshot>,
+                failure_class: FailureClass,
             },
             Transient {
                 err: BridgeError,
@@ -339,256 +459,393 @@ impl WorkflowExecutor {
 
         let attempts = node.retry.as_ref().map(|r| r.attempts()).unwrap_or(1);
         let retry_enabled = node.retry.is_some();
-        for attempt in 1..=attempts {
-            if cancel.is_cancelled() {
-                return (format!("[node {} canceled]", node.id.as_str()), false, None);
-            }
 
-            let should_retry_after_attempt = attempt < attempts;
-            let outcome = 'attempt: {
-                // resolve, with cancel
-                let resolved = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        break 'attempt Attempt::Canceled {
-                            marker: format!("[node {} canceled]", node.id.as_str()),
-                            usage: None,
-                        };
-                    }
-                    r = self.registry.resolve(&node.agent) => match r {
-                        Ok(r) => r,
-                        Err(e) => {
-                            if retry_enabled && e.is_transient() {
-                                break 'attempt Attempt::Transient { err: e, usage: None };
-                            }
-                            break 'attempt Attempt::Fatal {
-                                text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
+        // Emit NodeStarted exactly once before the retry loop.
+        let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0);
+        ctx.observer
+            .record(&ObsEvent::NodeStarted { ctx: &node_obs_ctx });
+
+        let (final_text, final_ok, final_usage, final_node_outcome) = 'node_loop: {
+            for attempt in 1..=attempts {
+                if cancel.is_cancelled() {
+                    break 'node_loop (
+                        format!("[node {} canceled]", node.id.as_str()),
+                        false,
+                        None,
+                        TurnOutcome::Canceled,
+                    );
+                }
+
+                let should_retry_after_attempt = attempt < attempts;
+                let mut obs_ctx_opt: Option<TurnContext> = None;
+                let mut turn_started: Option<std::time::Instant> = None;
+                let mut ttft_val: Option<std::time::Duration> = None;
+                let outcome = 'attempt: {
+                    // resolve, with cancel
+                    let resolved = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            break 'attempt Attempt::Canceled {
+                                marker: format!("[node {} canceled]", node.id.as_str()),
                                 usage: None,
                             };
                         }
-                    },
-                };
-                let eff = effective_config(&resolved.entry, None);
-                if let Err(e) = resolved
-                    .backend
-                    .configure_session(
-                        &session,
-                        &SessionSpec {
-                            config: eff,
-                            cwd: ctx.session_cwd.clone(),
+                        r = self.registry.resolve(&node.agent) => match r {
+                            Ok(r) => r,
+                            Err(e) => {
+                                if retry_enabled && e.is_transient() {
+                                    break 'attempt Attempt::Transient { err: e, usage: None };
+                                }
+                                break 'attempt Attempt::Fatal {
+                                    text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                                    usage: None,
+                                    failure_class: classify_failure(&e),
+                                };
+                            }
                         },
-                    )
-                    .await
-                {
-                    if retry_enabled && e.is_transient() {
-                        if should_retry_after_attempt {
-                            resolved.backend.release_session(&session).await;
-                        } else {
-                            resolved.backend.forget_session(&session).await;
+                    };
+                    let obs_ctx_here = node_turn_context(
+                        wf_id,
+                        node,
+                        run_id,
+                        ctx,
+                        resolved.entry.model.clone(),
+                        resolved
+                            .entry
+                            .effort
+                            .as_ref()
+                            .map(|e| format!("{e:?}").to_ascii_lowercase()),
+                        resolved.entry.mode.clone(),
+                        attempt,
+                    );
+                    // NodeStarted was emitted before the loop; only emit TurnStarted here.
+                    ctx.observer
+                        .record(&ObsEvent::TurnStarted { ctx: &obs_ctx_here });
+                    obs_ctx_opt = Some(obs_ctx_here);
+                    turn_started = Some(std::time::Instant::now());
+                    let eff = effective_config(&resolved.entry, None);
+                    if let Err(e) = resolved
+                        .backend
+                        .configure_session(
+                            &session,
+                            &SessionSpec {
+                                config: eff,
+                                cwd: ctx.session_cwd.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        if retry_enabled && e.is_transient() {
+                            if should_retry_after_attempt {
+                                resolved.backend.release_session(&session).await;
+                            } else {
+                                resolved.backend.forget_session(&session).await;
+                            }
+                            break 'attempt Attempt::Transient {
+                                err: e,
+                                usage: None,
+                            };
                         }
-                        break 'attempt Attempt::Transient {
-                            err: e,
+                        resolved.backend.forget_session(&session).await;
+                        break 'attempt Attempt::Fatal {
+                            text: format!("[node {} failed: configure {:?}]", node.id.as_str(), e),
                             usage: None,
+                            failure_class: classify_failure(&e),
                         };
                     }
-                    resolved.backend.forget_session(&session).await;
-                    break 'attempt Attempt::Fatal {
-                        text: format!("[node {} failed: configure {:?}]", node.id.as_str(), e),
-                        usage: None,
-                    };
-                }
-                if cancel.is_cancelled() {
-                    resolved.backend.forget_session(&session).await;
-                    break 'attempt Attempt::Canceled {
-                        marker: format!("[node {} canceled]", node.id.as_str()),
-                        usage: None,
-                    };
-                }
-                // prompt, with cancel
-                let rich_sink;
-                let mut stream = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
+                    if cancel.is_cancelled() {
                         resolved.backend.forget_session(&session).await;
                         break 'attempt Attempt::Canceled {
                             marker: format!("[node {} canceled]", node.id.as_str()),
                             usage: None,
                         };
                     }
-                    s = async {
-                        let sink = ctx.make_rich_sink.as_ref().map(|factory| factory.make(&node.id));
-                        let parts = vec![Part { text: rendered.clone() }];
-                        let stream = match &sink {
-                            Some(sink) => resolved.backend.prompt_observed(&session, parts, sink.clone()).await,
-                            None => resolved.backend.prompt(&session, parts).await,
-                        };
-                        (sink, stream)
-                    } => match s {
-                        (sink, Ok(s)) => {
-                            rich_sink = sink;
-                            s
-                        }
-                        (sink, Err(e)) => {
-                            if let Some(sink) = &sink {
-                                if let Err(flush_err) = sink.flush().await {
-                                    eprintln!(
-                                        "rich sink flush failed after prompt error for node {}: {:?}",
-                                        node.id.as_str(),
-                                        flush_err
-                                    );
-                                }
-                            }
-                            if retry_enabled && e.is_transient() {
-                                if should_retry_after_attempt {
-                                    resolved.backend.release_session(&session).await;
-                                } else {
-                                    resolved.backend.forget_session(&session).await;
-                                }
-                                break 'attempt Attempt::Transient { err: e, usage: None };
-                            }
-                            resolved.backend.forget_session(&session).await;
-                            break 'attempt Attempt::Fatal {
-                                text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
-                                usage: None,
-                            };
-                        }
-                    },
-                };
-                let mut text = String::new();
-                let mut ok = true;
-                let mut canceled_during_drain = false;
-                let mut last_usage: Option<UsageSnapshot> = None;
-                let mut err: Option<BridgeError> = None;
-                loop {
-                    tokio::select! {
+                    // prompt, with cancel
+                    let rich_sink;
+                    let mut stream = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
-                            let _ = resolved.backend.cancel(&session).await;
-                            canceled_during_drain = true;
-                            ok = false;
-                            text = format!("[node {} canceled]", node.id.as_str());
-                            break;
-                        }
-                        item = stream.next() => match item {
-                            Some(Ok(Update::Text(t))) => text.push_str(&t),
-                            Some(Ok(Update::Permission(_))) => {} // safe: backends resolve permission internally
-                            Some(Ok(Update::Usage(mut u))) => {
-                                if let Some(previous) = &last_usage {
-                                    u.merge_missing_from(previous);
-                                }
-                                last_usage = Some(u);
-                            }
-                            Some(Ok(Update::Done { stop_reason })) => {
-                                if stop_reason == STOP_REASON_CANCELLED { ok = false; }
-                                break;
-                            }
-                            Some(Err(e)) => {
-                                ok = false;
-                                text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
-                                err = Some(e);
-                                break;
-                            }
-                            None => break,
-                        }
-                    }
-                }
-                // Keep whatever usage the agent reported, even on error/cancel (see the warm path):
-                // `last_usage` is `None` only when no `Update::Usage` was ever observed.
-                let mut usage = last_usage;
-                if let Some(sink) = &rich_sink {
-                    if let Err(e) = sink.flush().await {
-                        if !ok {
-                            let exit = if canceled_during_drain {
-                                "node cancellation"
-                            } else {
-                                "node failure"
-                            };
-                            eprintln!(
-                                "rich sink flush failed after {exit} for node {}: {:?}",
-                                node.id.as_str(),
-                                e
-                            );
-                            usage = None;
-                        } else {
                             resolved.backend.forget_session(&session).await;
-                            break 'attempt Attempt::Fatal {
-                                text: format!(
-                                    "[node {} rich-flush failed: {:?}]",
-                                    node.id.as_str(),
-                                    e
-                                ),
+                            break 'attempt Attempt::Canceled {
+                                marker: format!("[node {} canceled]", node.id.as_str()),
                                 usage: None,
                             };
                         }
-                    }
-                }
-                if canceled_during_drain {
-                    resolved.backend.forget_session(&session).await;
-                    break 'attempt Attempt::Canceled {
-                        marker: text,
-                        usage,
+                        s = async {
+                            let sink = ctx.make_rich_sink.as_ref().map(|factory| factory.make(&node.id));
+                            let parts = vec![Part { text: rendered.clone() }];
+                            let stream = match &sink {
+                                Some(sink) => resolved.backend.prompt_observed(&session, parts, sink.clone()).await,
+                                None => resolved.backend.prompt(&session, parts).await,
+                            };
+                            (sink, stream)
+                        } => match s {
+                            (sink, Ok(s)) => {
+                                rich_sink = sink;
+                                s
+                            }
+                            (sink, Err(e)) => {
+                                if let Some(sink) = &sink {
+                                    if let Err(flush_err) = sink.flush().await {
+                                        eprintln!(
+                                            "rich sink flush failed after prompt error for node {}: {:?}",
+                                            node.id.as_str(),
+                                            flush_err
+                                        );
+                                    }
+                                }
+                                if retry_enabled && e.is_transient() {
+                                    if should_retry_after_attempt {
+                                        resolved.backend.release_session(&session).await;
+                                    } else {
+                                        resolved.backend.forget_session(&session).await;
+                                    }
+                                    break 'attempt Attempt::Transient { err: e, usage: None };
+                                }
+                                resolved.backend.forget_session(&session).await;
+                                break 'attempt Attempt::Fatal {
+                                    text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                                    usage: None,
+                                    failure_class: classify_failure(&e),
+                                };
+                            }
+                        },
                     };
-                }
-                if let Some(e) = err {
-                    if retry_enabled && e.is_transient() {
-                        if should_retry_after_attempt {
-                            resolved.backend.release_session(&session).await;
-                        } else {
-                            resolved.backend.forget_session(&session).await;
-                        }
-                        break 'attempt Attempt::Transient { err: e, usage };
-                    }
-                    resolved.backend.forget_session(&session).await;
-                    break 'attempt Attempt::Fatal { text, usage };
-                }
-                resolved.backend.forget_session(&session).await;
-                if ok {
-                    Attempt::Ok { text, usage }
-                } else {
-                    Attempt::Fatal { text, usage }
-                }
-            };
-
-            match outcome {
-                Attempt::Canceled { marker, usage } => return (marker, false, usage),
-                Attempt::Ok { text, usage } => return (text, true, usage),
-                Attempt::Fatal { text, usage } => return (text, false, usage),
-                Attempt::Transient { err, usage } => {
-                    let err_for_log = err.clone();
-                    if should_retry_after_attempt {
-                        self.registry.invalidate(&node.agent).await;
-                        tracing::warn!(
-                            node = node.id.as_str(),
-                            attempt,
-                            error = ?err_for_log,
-                            "node retry"
-                        );
-                        let retry = node.retry.as_ref().expect("retry attempts require policy");
+                    let mut text = String::new();
+                    let mut ok = true;
+                    let mut canceled_during_drain = false;
+                    let mut last_usage: Option<UsageSnapshot> = None;
+                    let mut err: Option<BridgeError> = None;
+                    loop {
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => {
-                                return (
-                                    format!("[node {} canceled]", node.id.as_str()),
-                                    false,
-                                    None,
-                                );
+                                let _ = resolved.backend.cancel(&session).await;
+                                canceled_during_drain = true;
+                                ok = false;
+                                text = format!("[node {} canceled]", node.id.as_str());
+                                break;
                             }
-                            _ = tokio::time::sleep(retry.backoff_for(attempt)) => {}
+                            item = stream.next() => match item {
+                                Some(Ok(Update::Text(t))) => {
+                                    if ttft_val.is_none() && !t.is_empty() {
+                                        if let Some(start) = turn_started {
+                                            ttft_val = Some(start.elapsed());
+                                        }
+                                    }
+                                    text.push_str(&t);
+                                }
+                                Some(Ok(Update::Permission(_))) => {} // safe: backends resolve permission internally
+                                Some(Ok(Update::Usage(mut u))) => {
+                                    if let Some(previous) = &last_usage {
+                                        u.merge_missing_from(previous);
+                                    }
+                                    last_usage = Some(u);
+                                }
+                                Some(Ok(Update::Done { stop_reason })) => {
+                                    if stop_reason == STOP_REASON_CANCELLED { ok = false; }
+                                    break;
+                                }
+                                Some(Err(e)) => {
+                                    ok = false;
+                                    text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
+                                    err = Some(e);
+                                    break;
+                                }
+                                None => break,
+                            }
                         }
-                        continue;
                     }
-                    return (
-                        format!(
-                            "[node {} failed after {attempts} attempts: {err:?}]",
-                            node.id.as_str()
-                        ),
-                        false,
+                    // Keep whatever usage the agent reported, even on error/cancel (see the warm path):
+                    // `last_usage` is `None` only when no `Update::Usage` was ever observed.
+                    let mut usage = last_usage;
+                    if let Some(sink) = &rich_sink {
+                        if let Err(e) = sink.flush().await {
+                            if !ok {
+                                let exit = if canceled_during_drain {
+                                    "node cancellation"
+                                } else {
+                                    "node failure"
+                                };
+                                eprintln!(
+                                    "rich sink flush failed after {exit} for node {}: {:?}",
+                                    node.id.as_str(),
+                                    e
+                                );
+                                usage = None;
+                            } else {
+                                resolved.backend.forget_session(&session).await;
+                                break 'attempt Attempt::Fatal {
+                                    text: format!(
+                                        "[node {} rich-flush failed: {:?}]",
+                                        node.id.as_str(),
+                                        e
+                                    ),
+                                    usage: None,
+                                    failure_class: FailureClass::Other,
+                                };
+                            }
+                        }
+                    }
+                    if canceled_during_drain {
+                        resolved.backend.forget_session(&session).await;
+                        break 'attempt Attempt::Canceled {
+                            marker: text,
+                            usage,
+                        };
+                    }
+                    if let Some(e) = err {
+                        if retry_enabled && e.is_transient() {
+                            if should_retry_after_attempt {
+                                resolved.backend.release_session(&session).await;
+                            } else {
+                                resolved.backend.forget_session(&session).await;
+                            }
+                            break 'attempt Attempt::Transient { err: e, usage };
+                        }
+                        let fc = classify_failure(&e);
+                        resolved.backend.forget_session(&session).await;
+                        break 'attempt Attempt::Fatal {
+                            text,
+                            usage,
+                            failure_class: fc,
+                        };
+                    }
+                    resolved.backend.forget_session(&session).await;
+                    if ok {
+                        Attempt::Ok { text, usage }
+                    } else {
+                        Attempt::Fatal {
+                            text,
+                            usage,
+                            failure_class: FailureClass::Other,
+                        }
+                    }
+                };
+
+                match outcome {
+                    Attempt::Canceled { marker, usage } => {
+                        if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
+                            ctx.observer.record(&ObsEvent::TurnFinished {
+                                ctx: obs_ctx,
+                                latency: start.elapsed(),
+                                ttft: None,
+                                outcome: &TurnOutcome::Canceled,
+                            });
+                            if let Some(u) = &usage {
+                                ctx.observer.record(&ObsEvent::UsageFinalized {
+                                    ctx: obs_ctx,
+                                    usage: u,
+                                    fin: UsageFinalization::TurnFinal,
+                                });
+                            }
+                        }
+                        break 'node_loop (marker, false, usage, TurnOutcome::Canceled);
+                    }
+                    Attempt::Ok { text, usage } => {
+                        if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
+                            ctx.observer.record(&ObsEvent::TurnFinished {
+                                ctx: obs_ctx,
+                                latency: start.elapsed(),
+                                ttft: ttft_val,
+                                outcome: &TurnOutcome::Success,
+                            });
+                            if let Some(u) = &usage {
+                                ctx.observer.record(&ObsEvent::UsageFinalized {
+                                    ctx: obs_ctx,
+                                    usage: u,
+                                    fin: UsageFinalization::TurnFinal,
+                                });
+                            }
+                        }
+                        break 'node_loop (text, true, usage, TurnOutcome::Success);
+                    }
+                    Attempt::Fatal {
+                        text,
                         usage,
-                    );
+                        failure_class,
+                    } => {
+                        let fail_out = TurnOutcome::Failed(failure_class);
+                        if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
+                            ctx.observer.record(&ObsEvent::TurnFinished {
+                                ctx: obs_ctx,
+                                latency: start.elapsed(),
+                                ttft: ttft_val,
+                                outcome: &fail_out,
+                            });
+                            if let Some(u) = &usage {
+                                ctx.observer.record(&ObsEvent::UsageFinalized {
+                                    ctx: obs_ctx,
+                                    usage: u,
+                                    fin: UsageFinalization::TurnFinal,
+                                });
+                            }
+                        }
+                        break 'node_loop (text, false, usage, fail_out);
+                    }
+                    Attempt::Transient { err, usage } => {
+                        let err_for_log = err.clone();
+                        let fail_class = classify_failure(&err);
+                        let fail_out = TurnOutcome::Failed(fail_class);
+                        if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
+                            ctx.observer.record(&ObsEvent::TurnFinished {
+                                ctx: obs_ctx,
+                                latency: start.elapsed(),
+                                ttft: None,
+                                outcome: &fail_out,
+                            });
+                            if let Some(u) = &usage {
+                                ctx.observer.record(&ObsEvent::UsageFinalized {
+                                    ctx: obs_ctx,
+                                    usage: u,
+                                    fin: UsageFinalization::TurnFinal,
+                                });
+                            }
+                        }
+                        if should_retry_after_attempt {
+                            self.registry.invalidate(&node.agent).await;
+                            tracing::warn!(
+                                node = node.id.as_str(),
+                                attempt,
+                                error = ?err_for_log,
+                                "node retry"
+                            );
+                            let retry = node.retry.as_ref().expect("retry attempts require policy");
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    break 'node_loop (
+                                        format!("[node {} canceled]", node.id.as_str()),
+                                        false,
+                                        None,
+                                        TurnOutcome::Canceled,
+                                    );
+                                }
+                                _ = tokio::time::sleep(retry.backoff_for(attempt)) => {}
+                            }
+                            continue;
+                        }
+                        break 'node_loop (
+                            format!(
+                                "[node {} failed after {attempts} attempts: {err:?}]",
+                                node.id.as_str()
+                            ),
+                            false,
+                            usage,
+                            fail_out,
+                        );
+                    }
                 }
             }
-        }
-        unreachable!("retry attempts are always at least one")
+            unreachable!("retry attempts are always at least one")
+        };
+
+        // Emit NodeFinished exactly once after the retry loop.
+        ctx.observer.record(&ObsEvent::NodeFinished {
+            ctx: &node_obs_ctx,
+            outcome: &final_node_outcome,
+        });
+        (final_text, final_ok, final_usage)
     }
 
     /// Run a workflow from scratch (no prior checkpoints).
@@ -3542,6 +3799,7 @@ mod tests {
         let ctx = WorkflowRunContext {
             session_cwd: Some(SessionCwd::parse("/req").unwrap()),
             make_rich_sink: None,
+            ..WorkflowRunContext::default()
         };
         let _evs: Vec<_> = ex
             .run_from_with_context(
@@ -3604,6 +3862,7 @@ mod tests {
         let ctx = WorkflowRunContext {
             session_cwd: Some(SessionCwd::parse("/req2").unwrap()),
             make_rich_sink: None,
+            ..WorkflowRunContext::default()
         };
         let _evs: Vec<_> = ex
             .run_with_context(
@@ -3687,6 +3946,750 @@ mod tests {
         assert!(
             matches!(err, BridgeError::ConfigInvalid { reason } if reason.contains("closed under inputs")),
             "expected ConfigInvalid about closure, got: {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+    use crate::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
+    use bridge_core::domain::Part;
+    use bridge_core::error::BridgeError;
+    use bridge_core::ids::{AgentId, SessionId};
+    use bridge_core::orch::UsageSnapshot;
+    use bridge_core::ports::{
+        AgentBackend, AgentRegistry, BackendStream, FailureClass, Lease, ObsEvent, Observer,
+        Resolved, TurnOutcome, Update,
+    };
+    use futures::StreamExt;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Default)]
+    struct Rec(Mutex<Vec<&'static str>>);
+    impl Observer for Rec {
+        fn record(&self, e: &ObsEvent<'_>) {
+            let tag = match e {
+                ObsEvent::NodeStarted { .. } => "node_started",
+                ObsEvent::TurnStarted { .. } => "turn_started",
+                ObsEvent::UsageFinalized { .. } => "usage",
+                ObsEvent::TurnFinished { .. } => "turn_finished",
+                ObsEvent::NodeFinished { .. } => "node_finished",
+                _ => return,
+            };
+            self.0.lock().unwrap().push(tag);
+        }
+    }
+
+    struct UsageBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for UsageBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, bridge_core::error::BridgeError> {
+            let updates = vec![
+                Ok(Update::Usage(UsageSnapshot {
+                    used: Some(1),
+                    size: Some(100),
+                    cost: None,
+                    terminal: None,
+                    at_ms: 0,
+                })),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), bridge_core::error::BridgeError> {
+            Ok(())
+        }
+    }
+    struct NoopLease2;
+    impl Lease for NoopLease2 {}
+    struct UsageRegistry;
+    #[async_trait::async_trait]
+    impl AgentRegistry for UsageRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, bridge_core::error::BridgeError> {
+            use bridge_core::domain::{AgentEntry, AgentKind};
+            Ok(Resolved {
+                entry: Arc::new(AgentEntry {
+                    id: id.clone(),
+                    cmd: Some("x".into()),
+                    base_url: None,
+                    api_key_env: None,
+                    args: vec![],
+                    kind: AgentKind::Acp,
+                    model_provider: None,
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    cwd: None,
+                    session_cwd: None,
+                    sandbox: None,
+                    watchdog: None,
+                    auth_method: None,
+                    name: None,
+                    description: None,
+                    tags: vec![],
+                    version: None,
+                    mcp: vec![],
+                    mcp_delivery: Default::default(),
+                    extensions: Default::default(),
+                }),
+                backend: Arc::new(UsageBackend),
+                lease: Box::new(NoopLease2),
+            })
+        }
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+        async fn apply(
+            &self,
+            _: bridge_core::domain::RegistrySnapshot,
+        ) -> Result<(), bridge_core::error::BridgeError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_node_emits_lifecycle_around_usage() {
+        let rec = Arc::new(Rec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: Some("prompt/workflow".to_string()),
+        };
+        let graph = Arc::new(WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("wf").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: bridge_core::ids::NodeId::parse("n").unwrap(),
+                agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".to_string(),
+                inputs: vec![],
+                retry: None,
+            }],
+            panel: None,
+        });
+        let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
+        let mut stream = exec.run_with_context(
+            graph,
+            "input".into(),
+            "task-1".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+        let tags = rec.0.lock().unwrap().clone();
+        assert_eq!(
+            tags,
+            vec![
+                "node_started",
+                "turn_started",
+                "turn_finished",
+                "usage",
+                "node_finished"
+            ]
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Helpers shared by the remaining tests
+    // ---------------------------------------------------------------------------
+
+    /// Detailed recording observer: captures per-event structs so tests can
+    /// inspect outcome and ttft values, not just tag order.
+    #[derive(Default, Clone)]
+    struct DetailedRec {
+        events: Arc<Mutex<Vec<DetailedEvt>>>,
+    }
+    #[derive(Debug, Clone)]
+    enum DetailedEvt {
+        NodeStarted,
+        TurnStarted,
+        TurnFinished {
+            outcome: TurnOutcome,
+            ttft: Option<std::time::Duration>,
+        },
+        NodeFinished(TurnOutcome),
+    }
+    impl Observer for DetailedRec {
+        fn record(&self, e: &ObsEvent<'_>) {
+            let ev = match e {
+                ObsEvent::NodeStarted { .. } => DetailedEvt::NodeStarted,
+                ObsEvent::TurnStarted { .. } => DetailedEvt::TurnStarted,
+                ObsEvent::TurnFinished { outcome, ttft, .. } => DetailedEvt::TurnFinished {
+                    outcome: (*outcome).clone(),
+                    ttft: *ttft,
+                },
+                ObsEvent::NodeFinished { outcome, .. } => {
+                    DetailedEvt::NodeFinished((*outcome).clone())
+                }
+                _ => return,
+            };
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
+    /// A no-op `NodeTurnCleanup` for warm-path tests.
+    struct NoopCleanup;
+    #[async_trait::async_trait]
+    impl NodeTurnCleanup for NoopCleanup {
+        async fn on_exit(self: Box<Self>, _: NodeTurnExit) {}
+    }
+
+    /// Backend that emits `Update::Text(text)` then `Update::Done`.
+    struct TextBackend(String);
+    #[async_trait::async_trait]
+    impl AgentBackend for TextBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let t = self.0.clone();
+            let updates = vec![
+                Ok(Update::Text(t)),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct TextLease;
+    impl Lease for TextLease {}
+
+    fn make_single_node_graph() -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("wf").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: bridge_core::ids::NodeId::parse("n").unwrap(),
+                agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".to_string(),
+                inputs: vec![],
+                retry: None,
+            }],
+            panel: None,
+        })
+    }
+
+    fn make_retry_node_graph(policy: RetryPolicy) -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("wf").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: bridge_core::ids::NodeId::parse("n").unwrap(),
+                agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".to_string(),
+                inputs: vec![],
+                retry: Some(policy),
+            }],
+            panel: None,
+        })
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test 1: warm dispatcher path emits full ordered lifecycle
+    // ---------------------------------------------------------------------------
+
+    struct TextDispatcher(String);
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for TextDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            Ok(NodeTurn {
+                backend: Arc::new(TextBackend(self.0.clone())),
+                session: SessionId::parse("warm-sess").unwrap(),
+                seed: None,
+                cleanup: Box::new(NoopCleanup),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_path_emits_full_lifecycle() {
+        let rec = Arc::new(DetailedRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
+        let mut stream = exec.run_with_context_and_dispatcher(
+            make_single_node_graph(),
+            "inp".into(),
+            "run1".into(),
+            CancellationToken::new(),
+            ctx,
+            Arc::new(TextDispatcher("hello".into())),
+        );
+        while stream.next().await.is_some() {}
+
+        let evs = rec.events.lock().unwrap().clone();
+        assert_eq!(evs.len(), 4, "expected 4 lifecycle events, got: {evs:?}");
+        assert!(matches!(evs[0], DetailedEvt::NodeStarted), "evs[0]={evs:?}");
+        assert!(matches!(evs[1], DetailedEvt::TurnStarted), "evs[1]={evs:?}");
+        assert!(
+            matches!(
+                evs[2],
+                DetailedEvt::TurnFinished {
+                    outcome: TurnOutcome::Success,
+                    ..
+                }
+            ),
+            "evs[2]={evs:?}"
+        );
+        assert!(
+            matches!(evs[3], DetailedEvt::NodeFinished(TurnOutcome::Success)),
+            "evs[3]={evs:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test 2: cold path TurnFinished.ttft is Some when text is emitted
+    // ---------------------------------------------------------------------------
+
+    struct TextRegistry;
+    #[async_trait::async_trait]
+    impl AgentRegistry for TextRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            use bridge_core::domain::{AgentEntry, AgentKind};
+            Ok(Resolved {
+                entry: Arc::new(AgentEntry {
+                    id: id.clone(),
+                    cmd: Some("x".into()),
+                    base_url: None,
+                    api_key_env: None,
+                    args: vec![],
+                    kind: AgentKind::Acp,
+                    model_provider: None,
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    cwd: None,
+                    session_cwd: None,
+                    sandbox: None,
+                    watchdog: None,
+                    auth_method: None,
+                    name: None,
+                    description: None,
+                    tags: vec![],
+                    version: None,
+                    mcp: vec![],
+                    mcp_delivery: Default::default(),
+                    extensions: Default::default(),
+                }),
+                backend: Arc::new(TextBackend("hello".into())),
+                lease: Box::new(TextLease),
+            })
+        }
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+        async fn apply(&self, _: bridge_core::domain::RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_path_ttft_some_when_text_emitted() {
+        let rec = Arc::new(DetailedRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(TextRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run2".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+
+        let evs = rec.events.lock().unwrap().clone();
+        let turn_finished = evs
+            .iter()
+            .find(|e| matches!(e, DetailedEvt::TurnFinished { .. }));
+        let ttft = match turn_finished {
+            Some(DetailedEvt::TurnFinished { ttft, .. }) => *ttft,
+            _ => panic!("no TurnFinished event found in {evs:?}"),
+        };
+        assert!(
+            ttft.is_some(),
+            "expected ttft=Some(..) when backend emits text, got None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test 3: fatal AgentTimedOut → TurnFinished outcome = Failed(TimedOut)
+    // ---------------------------------------------------------------------------
+
+    struct TimedOutBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for TimedOutBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Err(BridgeError::AgentTimedOut)
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct TimedOutRegistry;
+    #[async_trait::async_trait]
+    impl AgentRegistry for TimedOutRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            use bridge_core::domain::{AgentEntry, AgentKind};
+            Ok(Resolved {
+                entry: Arc::new(AgentEntry {
+                    id: id.clone(),
+                    cmd: Some("x".into()),
+                    base_url: None,
+                    api_key_env: None,
+                    args: vec![],
+                    kind: AgentKind::Acp,
+                    model_provider: None,
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    cwd: None,
+                    session_cwd: None,
+                    sandbox: None,
+                    watchdog: None,
+                    auth_method: None,
+                    name: None,
+                    description: None,
+                    tags: vec![],
+                    version: None,
+                    mcp: vec![],
+                    mcp_delivery: Default::default(),
+                    extensions: Default::default(),
+                }),
+                backend: Arc::new(TimedOutBackend),
+                lease: Box::new(NoopLease2),
+            })
+        }
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+        async fn apply(&self, _: bridge_core::domain::RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn fatal_timedout_produces_failed_timed_out_class() {
+        let rec = Arc::new(DetailedRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        // No retry → AgentTimedOut is fatal on the only attempt.
+        let exec = WorkflowExecutor::new(Arc::new(TimedOutRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run3".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+
+        let evs = rec.events.lock().unwrap().clone();
+        let turn_finished = evs
+            .iter()
+            .find(|e| matches!(e, DetailedEvt::TurnFinished { .. }));
+        match turn_finished {
+            Some(DetailedEvt::TurnFinished {
+                outcome: TurnOutcome::Failed(FailureClass::TimedOut),
+                ..
+            }) => {}
+            other => panic!("expected TurnFinished(Failed(TimedOut)), got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test 4: retry path — exactly 1 NodeStarted / 1 NodeFinished, 2 each TurnStarted / TurnFinished
+    // ---------------------------------------------------------------------------
+
+    /// Backend that fails with AgentTimedOut (transient) on the first `prompt` call,
+    /// then succeeds with a text response on subsequent calls.
+    struct FailOnceThenTextBackend {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl AgentBackend for FailOnceThenTextBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Err(BridgeError::AgentTimedOut);
+            }
+            let updates = vec![
+                Ok(Update::Text("ok".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ];
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct FailOnceThenTextRegistry {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRegistry for FailOnceThenTextRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            use bridge_core::domain::{AgentEntry, AgentKind};
+            Ok(Resolved {
+                entry: Arc::new(AgentEntry {
+                    id: id.clone(),
+                    cmd: Some("x".into()),
+                    base_url: None,
+                    api_key_env: None,
+                    args: vec![],
+                    kind: AgentKind::Acp,
+                    model_provider: None,
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    cwd: None,
+                    session_cwd: None,
+                    sandbox: None,
+                    watchdog: None,
+                    auth_method: None,
+                    name: None,
+                    description: None,
+                    tags: vec![],
+                    version: None,
+                    mcp: vec![],
+                    mcp_delivery: Default::default(),
+                    extensions: Default::default(),
+                }),
+                backend: Arc::new(FailOnceThenTextBackend {
+                    calls: self.calls.clone(),
+                }),
+                lease: Box::new(NoopLease2),
+            })
+        }
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+        async fn apply(&self, _: bridge_core::domain::RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_emits_node_started_once_node_finished_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rec = Arc::new(DetailedRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(FailOnceThenTextRegistry { calls }));
+        // 2 attempts, 0ms backoff so the test doesn't sleep.
+        let graph = make_retry_node_graph(RetryPolicy {
+            max_attempts: 2,
+            backoff_ms: 0,
+            backoff_cap_ms: Some(0),
+        });
+        let mut stream = exec.run_with_context(
+            graph,
+            "inp".into(),
+            "run4".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+
+        let evs = rec.events.lock().unwrap().clone();
+        let node_started = evs
+            .iter()
+            .filter(|e| matches!(e, DetailedEvt::NodeStarted))
+            .count();
+        let node_finished = evs
+            .iter()
+            .filter(|e| matches!(e, DetailedEvt::NodeFinished(..)))
+            .count();
+        let turn_started = evs
+            .iter()
+            .filter(|e| matches!(e, DetailedEvt::TurnStarted))
+            .count();
+        let turn_finished = evs
+            .iter()
+            .filter(|e| matches!(e, DetailedEvt::TurnFinished { .. }))
+            .count();
+
+        assert_eq!(node_started, 1, "expected 1 NodeStarted; events: {evs:?}");
+        assert_eq!(node_finished, 1, "expected 1 NodeFinished; events: {evs:?}");
+        assert_eq!(
+            turn_started, 2,
+            "expected 2 TurnStarted (one per attempt); events: {evs:?}"
+        );
+        assert_eq!(
+            turn_finished, 2,
+            "expected 2 TurnFinished (one per attempt); events: {evs:?}"
+        );
+        // Final node outcome should be success (second attempt succeeded).
+        assert!(
+            matches!(
+                evs.last(),
+                Some(DetailedEvt::NodeFinished(TurnOutcome::Success))
+            ),
+            "expected final NodeFinished(Success); events: {evs:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test 5: TurnFinished emitted BEFORE UsageFinalized on both warm and cold paths
+    // ---------------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct OrderRec(Mutex<Vec<&'static str>>);
+    impl Observer for OrderRec {
+        fn record(&self, e: &ObsEvent<'_>) {
+            let tag = match e {
+                ObsEvent::TurnFinished { .. } => "turn_finished",
+                ObsEvent::UsageFinalized { .. } => "usage_finalized",
+                _ => return,
+            };
+            self.0.lock().unwrap().push(tag);
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_finished_emitted_before_usage_finalized_cold_path() {
+        let rec = Arc::new(OrderRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-order-cold".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+        let tags = rec.0.lock().unwrap().clone();
+        assert_eq!(
+            tags,
+            vec!["turn_finished", "usage_finalized"],
+            "TurnFinished must precede UsageFinalized; got: {tags:?}"
+        );
+    }
+
+    struct UsageDispatcher;
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for UsageDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            Ok(NodeTurn {
+                backend: Arc::new(UsageBackend),
+                session: SessionId::parse("warm-usage-sess").unwrap(),
+                seed: None,
+                cleanup: Box::new(NoopCleanup),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_finished_emitted_before_usage_finalized_warm_path() {
+        let rec = Arc::new(OrderRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
+        let mut stream = exec.run_with_context_and_dispatcher(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-order-warm".into(),
+            CancellationToken::new(),
+            ctx,
+            Arc::new(UsageDispatcher),
+        );
+        while stream.next().await.is_some() {}
+        let tags = rec.0.lock().unwrap().clone();
+        assert_eq!(
+            tags,
+            vec!["turn_finished", "usage_finalized"],
+            "TurnFinished must precede UsageFinalized on warm path; got: {tags:?}"
         );
     }
 }

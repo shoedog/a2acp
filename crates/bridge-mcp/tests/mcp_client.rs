@@ -263,6 +263,7 @@ fn fixture() -> Fixture {
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
             None,
+            Arc::new(bridge_observ::NoopObserver),
             3,
         )
         .with_permission_registry(perm_registry.clone()),

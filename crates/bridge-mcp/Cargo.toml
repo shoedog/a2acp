@@ -15,5 +15,6 @@ tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 async-trait.workspace = true
 bridge-coordinator = { path = "../bridge-coordinator", features = ["test-clock"] }
 bridge-workflow = { path = "../bridge-workflow" }
+bridge-observ = { path = "../bridge-observ" }
 tokio-stream.workspace = true
 tokio-test = "0.4"

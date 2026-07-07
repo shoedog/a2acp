@@ -1,13 +1,18 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
+use a2a;
 use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{BatchId, ContextId, OperationId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
-use bridge_core::ports::{AgentRegistry, PolicyEngine, SessionStore};
+use bridge_core::ports::{
+    classify_failure, AgentRegistry, FailureClass, ObsEvent, Observer, PolicyEngine, SessionStore,
+    TurnContext, TurnOutcome, UsageFinalization,
+};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{BatchSummary, TaskRecord, TaskRecordStatus, TaskStore};
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
@@ -63,6 +68,15 @@ pub struct TurnOutput {
     pub context: ContextId,
 }
 
+#[cfg(test)]
+#[derive(Default, Clone)]
+struct NoopObserver;
+
+#[cfg(test)]
+impl Observer for NoopObserver {
+    fn record(&self, _e: &ObsEvent<'_>) {}
+}
+
 impl From<&crate::session_manager::SessionStatusInfo> for SessionStatusDto {
     fn from(info: &crate::session_manager::SessionStatusInfo) -> Self {
         Self {
@@ -108,6 +122,7 @@ pub struct Coordinator {
     clock: Arc<dyn Clock>,
     allowed_cwd_root: Option<SessionCwd>,
     batch: Option<BatchRuntime>,
+    observer: Arc<dyn Observer>,
     resume_attempt_cap: u32,
 }
 
@@ -137,6 +152,7 @@ impl Coordinator {
         clock: Arc<dyn Clock>,
         allowed_cwd_root: Option<SessionCwd>,
         batch: Option<BatchRuntime>,
+        observer: Arc<dyn Observer>,
         resume_attempt_cap: u32,
     ) -> Self {
         Self {
@@ -155,6 +171,7 @@ impl Coordinator {
             clock,
             allowed_cwd_root,
             batch,
+            observer,
             resume_attempt_cap,
         }
     }
@@ -208,6 +225,9 @@ impl Coordinator {
     pub fn batch(&self) -> Option<BatchRuntime> {
         self.batch.clone()
     }
+    pub fn observer(&self) -> Arc<dyn Observer> {
+        self.observer.clone()
+    }
     pub fn allowed_cwd_root(&self) -> Option<SessionCwd> {
         self.allowed_cwd_root.clone()
     }
@@ -260,6 +280,7 @@ impl Coordinator {
             workflow_cancels: self.workflow_cancels.clone(),
             progress_hubs: self.progress_hubs.clone(),
             clock: self.clock.clone(),
+            observer: self.observer.clone(),
         }
     }
 
@@ -353,6 +374,32 @@ impl Coordinator {
             .unwrap_or(false))
     }
 
+    fn new_turn_id() -> bridge_core::ids::TurnId {
+        bridge_core::ids::TurnId::parse(format!("turn-{}", a2a::new_task_id()))
+            .expect("a2a task id is non-empty")
+    }
+
+    fn turn_context_for_warm(
+        ctx: &ContextId,
+        task: Option<TaskId>,
+        turn: &crate::session_manager::WarmTurn,
+    ) -> TurnContext {
+        TurnContext {
+            turn_id: Self::new_turn_id(),
+            session_id: ctx.clone(),
+            task_id: task,
+            workflow: None,
+            node: None,
+            attempt: 0,
+            agent: turn.agent.as_str().to_string(),
+            model: turn.model.clone(),
+            effort: turn.effort.clone(),
+            mode: turn.mode.clone(),
+            prompt_id: None,
+            traceparent: None,
+        }
+    }
+
     /// Drive ONE warm turn to completion and collect it into a `TurnOutput`. Records usage as a side
     /// effect (excluded from output) and returns the handle to Idle on EVERY exit — synchronously on the
     /// normal/error path (so a sequential `continue` observes Idle deterministically), and via the drop
@@ -365,12 +412,24 @@ impl Coordinator {
         turn: crate::session_manager::WarmTurn,
         input: String,
     ) -> Result<TurnOutput, BridgeError> {
+        let task = self.mint_prompt_task_id();
+        let obs_ctx = Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn);
+        let started = Instant::now();
+        let mut ttft = None;
+        let mut last_usage: Option<UsageSnapshot> = None;
+        let shared_usage: Arc<std::sync::Mutex<Option<UsageSnapshot>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        self.observer
+            .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
         let mut finish_guard = TurnFinishGuard {
+            observer: self.observer.clone(),
             sm: self.session_manager.clone(),
-            ctx: ctx.clone(),
+            ctx: obs_ctx.clone(),
             generation: turn.generation,
             op: turn.op.clone(),
+            started,
             armed: true,
+            usage: shared_usage.clone(),
         };
 
         let parts = assemble_turn_parts(
@@ -390,7 +449,6 @@ impl Coordinator {
             )
             .await;
 
-        let task = self.mint_prompt_task_id();
         let translator = Translator::new();
         let mut events = translator.run(
             turn.backend.as_ref(),
@@ -411,14 +469,20 @@ impl Coordinator {
                     aborted = true;
                     break;
                 }
-                maybe = events.next() => match maybe {
+            maybe = events.next() => match maybe {
                     Some(ev) => ev,
                     None => break,
                 },
             };
+            if ttft.is_none() {
+                ttft = Some(started.elapsed());
+            }
             match &ev {
                 Ok(e) if e.kind() == &EventKind::Usage => {
                     if let Some(snap) = e.usage_snapshot() {
+                        last_usage = Some(snap.clone());
+                        *shared_usage.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(snap.clone());
                         self.session_manager
                             .record_usage(&ctx, turn.generation, &turn.op, snap.clone())
                             .await;
@@ -443,6 +507,20 @@ impl Coordinator {
         finish_guard.disarm();
 
         if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
+            let outcome = TurnOutcome::Failed(classify_failure(e));
+            self.observer.record(&ObsEvent::TurnFinished {
+                ctx: &obs_ctx,
+                latency: started.elapsed(),
+                ttft,
+                outcome: &outcome,
+            });
+            if let Some(usage) = &last_usage {
+                self.observer.record(&ObsEvent::UsageFinalized {
+                    ctx: &obs_ctx,
+                    usage,
+                    fin: UsageFinalization::TurnFinal,
+                });
+            }
             return Err(e.clone());
         }
         let events: Vec<Event> = collected.into_iter().filter_map(Result::ok).collect();
@@ -466,6 +544,34 @@ impl Coordinator {
             Some(TaskOutcome::Completed) | None => "completed",
         }
         .to_string();
+
+        let outcome = events
+            .iter()
+            .rev()
+            .find_map(|e| {
+                (e.kind() == &EventKind::Terminal)
+                    .then(|| e.outcome())
+                    .flatten()
+            })
+            .map(|outcome| match outcome {
+                TaskOutcome::Completed => TurnOutcome::Success,
+                TaskOutcome::Failed => TurnOutcome::Failed(FailureClass::Other),
+                TaskOutcome::Canceled => TurnOutcome::Canceled,
+            })
+            .unwrap_or(TurnOutcome::Success);
+        self.observer.record(&ObsEvent::TurnFinished {
+            ctx: &obs_ctx,
+            latency: started.elapsed(),
+            ttft,
+            outcome: &outcome,
+        });
+        if let Some(usage) = &last_usage {
+            self.observer.record(&ObsEvent::UsageFinalized {
+                ctx: &obs_ctx,
+                usage,
+                fin: UsageFinalization::TurnFinal,
+            });
+        }
 
         Ok(TurnOutput {
             text: out_text,
@@ -536,6 +642,8 @@ impl Coordinator {
             WorkflowRunContext {
                 session_cwd,
                 make_rich_sink: None,
+                observer: self.observer.clone(),
+                ..WorkflowRunContext::default()
             },
             hub,
         ));
@@ -635,11 +743,14 @@ impl Coordinator {
 /// future is cancelled mid-drain. Mirrors the A2A unary path's `WarmTurnGuard` (the spawn-in-Drop
 /// pattern), kept local to the Coordinator because here it's disarmed after a synchronous finish.
 struct TurnFinishGuard {
+    observer: Arc<dyn Observer>,
     sm: Arc<crate::session_manager::SessionManager>,
-    ctx: ContextId,
+    ctx: TurnContext,
     generation: bridge_core::ids::SessionGeneration,
     op: OperationId,
+    started: Instant,
     armed: bool,
+    usage: Arc<std::sync::Mutex<Option<UsageSnapshot>>>,
 }
 
 impl TurnFinishGuard {
@@ -657,8 +768,24 @@ impl Drop for TurnFinishGuard {
         let ctx = self.ctx.clone();
         let generation = self.generation;
         let op = self.op.clone();
+        let observer = self.observer.clone();
+        let started = self.started;
+        observer.record(&ObsEvent::TurnFinished {
+            ctx: &ctx,
+            latency: started.elapsed(),
+            ttft: None,
+            outcome: &TurnOutcome::Canceled,
+        });
+        let usage = self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(u) = usage {
+            observer.record(&ObsEvent::UsageFinalized {
+                ctx: &ctx,
+                usage: &u,
+                fin: UsageFinalization::TurnFinal,
+            });
+        }
         tokio::spawn(async move {
-            sm.finish_turn(&ctx, generation, &op).await;
+            sm.finish_turn(&ctx.session_id, generation, &op).await;
         });
     }
 }
@@ -1029,6 +1156,7 @@ mod tests {
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
             None,
+            Arc::new(NoopObserver),
             3,
         );
 
@@ -1115,6 +1243,7 @@ mod tests {
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
             None,
+            Arc::new(NoopObserver),
             3,
         );
         Fixture {
@@ -1178,6 +1307,7 @@ mod tests {
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
             None,
+            Arc::new(NoopObserver),
             3,
         )
     }
@@ -1504,12 +1634,521 @@ mod tests {
             seed: None,
             injects: Vec::new(),
             abort,
+            agent: AgentId::parse("codex").unwrap(),
+            model: Some("gpt-5.5".into()),
+            effort: Some("high".into()),
+            mode: Some("default".into()),
         };
         let out = coordinator
             .collect_turn(ctx("ctx-abort"), turn, "hi".into())
             .await
             .unwrap();
         assert_eq!(out.stop_reason, "cancelled");
+    }
+
+    #[cfg(test)]
+    mod observability_boundary_tests {
+        use super::*;
+        use bridge_core::domain::{AgentEntry, AgentKind, Effort, Part};
+        use bridge_core::ids::{AgentId, ContextId, SessionId};
+        use bridge_core::orch::{TerminalUsage, UsageSnapshot};
+        use bridge_core::ports::{
+            AgentBackend, AgentRegistry, BackendStream, Lease, ObsEvent, Observer, Resolved,
+            TurnContext, TurnOutcome, Update,
+        };
+        use bridge_core::task_store::{MemoryTaskStore, TaskStore};
+        use futures::stream;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Debug)]
+        enum RecordedObsEvent {
+            Start(TurnContext),
+            Finish {
+                ctx: TurnContext,
+                outcome: TurnOutcome,
+            },
+            UsageFinalized {
+                ctx: TurnContext,
+            },
+        }
+
+        #[derive(Default)]
+        struct RecordingObserver(Mutex<Vec<RecordedObsEvent>>);
+
+        impl Observer for RecordingObserver {
+            fn record(&self, e: &ObsEvent<'_>) {
+                let mut g = self.0.lock().unwrap();
+                match e {
+                    ObsEvent::TurnStarted { ctx } => {
+                        g.push(RecordedObsEvent::Start((*ctx).clone()))
+                    }
+                    ObsEvent::TurnFinished { ctx, outcome, .. } => {
+                        g.push(RecordedObsEvent::Finish {
+                            ctx: (*ctx).clone(),
+                            outcome: (*outcome).clone(),
+                        })
+                    }
+                    ObsEvent::UsageFinalized { ctx, .. } => {
+                        g.push(RecordedObsEvent::UsageFinalized {
+                            ctx: (*ctx).clone(),
+                        })
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        struct NoopLease;
+        impl Lease for NoopLease {}
+
+        struct FakeRegistry {
+            backend: Arc<dyn AgentBackend>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentRegistry for FakeRegistry {
+            async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+                Ok(Resolved {
+                    entry: Arc::new(AgentEntry {
+                        id: AgentId::parse("codex").unwrap(),
+                        cmd: Some("fake".to_string()),
+                        base_url: None,
+                        api_key_env: None,
+                        args: vec![],
+                        kind: AgentKind::Acp,
+                        model_provider: None,
+                        model: Some("gpt-5.5".to_string()),
+                        effort: Some(Effort::High),
+                        mode: Some("default".to_string()),
+                        cwd: None,
+                        session_cwd: None,
+                        sandbox: None,
+                        watchdog: None,
+                        mcp: vec![],
+                        mcp_delivery: Default::default(),
+                        auth_method: None,
+                        name: None,
+                        description: None,
+                        tags: vec![],
+                        version: None,
+                        extensions: Default::default(),
+                    }),
+                    backend: self.backend.clone(),
+                    lease: Box::new(NoopLease),
+                })
+            }
+            fn default_id(&self) -> AgentId {
+                AgentId::parse("codex").unwrap()
+            }
+            async fn apply(
+                &self,
+                _snapshot: bridge_core::domain::RegistrySnapshot,
+            ) -> Result<(), BridgeError> {
+                Ok(())
+            }
+            fn list(&self) -> Vec<AgentId> {
+                vec![self.default_id()]
+            }
+        }
+
+        struct UsageBackend;
+
+        #[async_trait::async_trait]
+        impl AgentBackend for UsageBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(Update::Usage(UsageSnapshot {
+                        used: Some(3),
+                        size: Some(10),
+                        cost: None,
+                        terminal: Some(TerminalUsage {
+                            total_tokens: 5,
+                            input_tokens: 2,
+                            output_tokens: 3,
+                            thought_tokens: None,
+                            cached_read_tokens: None,
+                            cached_write_tokens: None,
+                        }),
+                        at_ms: 0,
+                    })),
+                    Ok(bridge_core::ports::Update::Text("hello".to_string())),
+                    Ok(bridge_core::ports::Update::Done {
+                        stop_reason: "end_turn".to_string(),
+                    }),
+                ])))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn coordinator_collect_turn_emits_started_finished_and_usage_once() {
+            let observer = Arc::new(RecordingObserver::default());
+            let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+                backend: Arc::new(UsageBackend),
+            });
+            let sm = Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            ));
+            let task_store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+            let session_store: Arc<dyn bridge_core::ports::SessionStore> =
+                Arc::new(super::FakeSessionStore::default());
+            let coord = Coordinator::new(
+                sm,
+                None,
+                Arc::new(std::collections::HashMap::new()),
+                task_store,
+                session_store,
+                Arc::new(super::AllowPolicy),
+                registry,
+                Arc::new(crate::clock::SystemClock),
+                None,
+                None,
+                observer.clone(),
+                3,
+            );
+
+            let out = coord
+                .prompt(OpParams {
+                    input: "hi".to_string(),
+                    context: Some(ContextId::parse("ctx-obs").unwrap()),
+                    agent: Some(AgentId::parse("codex").unwrap()),
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    cwd: None,
+                    workflow: None,
+                    skill: None,
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(out.text, "hello");
+            let events = observer.0.lock().unwrap().clone();
+            let starts: Vec<TurnContext> = events
+                .iter()
+                .filter_map(|event| match event {
+                    RecordedObsEvent::Start(ctx) => Some(ctx.clone()),
+                    _ => None,
+                })
+                .collect();
+            let finishes: Vec<(TurnContext, TurnOutcome)> = events
+                .iter()
+                .filter_map(|event| match event {
+                    RecordedObsEvent::Finish { ctx, outcome } => {
+                        Some((ctx.clone(), outcome.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let usages: Vec<TurnContext> = events
+                .iter()
+                .filter_map(|event| match event {
+                    RecordedObsEvent::UsageFinalized { ctx, .. } => Some(ctx.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(starts.len(), 1);
+            assert_eq!(finishes.len(), 1);
+            assert_eq!(usages.len(), 1);
+            assert_eq!(starts[0].turn_id, finishes[0].0.turn_id);
+            assert_eq!(starts[0].turn_id, usages[0].turn_id);
+            let start_idx = events
+                .iter()
+                .position(|e| matches!(e, RecordedObsEvent::Start(_)))
+                .expect("start event");
+            let finish_idx = events
+                .iter()
+                .position(|e| matches!(e, RecordedObsEvent::Finish { .. }))
+                .expect("finish event");
+            assert!(start_idx < finish_idx);
+            assert_eq!(starts[0].agent, "codex");
+            assert_eq!(starts[0].model.as_deref(), Some("gpt-5.5"));
+            assert_eq!(starts[0].effort.as_deref(), Some("high"));
+            assert_eq!(starts[0].mode.as_deref(), Some("default"));
+            assert_eq!(finishes[0].1, TurnOutcome::Success);
+        }
+
+        /// Backend that yields a Usage update then blocks forever (pending), so the
+        /// guard fires mid-turn with captured usage.
+        struct UsageThenIdleBackend {
+            usage: UsageSnapshot,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentBackend for UsageThenIdleBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                let usage = self.usage.clone();
+                // Yield the usage update then block forever so the future must be dropped.
+                let once = futures::stream::once(async move { Ok(Update::Usage(usage)) });
+                let pending = futures::stream::pending::<Result<Update, BridgeError>>();
+                Ok(Box::pin(once.chain(pending)))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn collect_turn_dropped_with_usage_emits_canceled_and_usage_finalized() {
+            let usage_snap = UsageSnapshot {
+                used: Some(5),
+                size: Some(100),
+                cost: None,
+                terminal: Some(TerminalUsage {
+                    total_tokens: 5,
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    thought_tokens: None,
+                    cached_read_tokens: None,
+                    cached_write_tokens: None,
+                }),
+                at_ms: 0,
+            };
+            let observer = Arc::new(RecordingObserver::default());
+            let backend = Arc::new(UsageThenIdleBackend {
+                usage: usage_snap.clone(),
+            });
+            let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+                backend: backend as Arc<dyn AgentBackend>,
+            });
+            let sm = Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            ));
+            let task_store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+            let session_store: Arc<dyn bridge_core::ports::SessionStore> =
+                Arc::new(super::FakeSessionStore::default());
+            let coord = Arc::new(Coordinator::new(
+                sm,
+                None,
+                Arc::new(std::collections::HashMap::new()),
+                task_store,
+                session_store,
+                Arc::new(super::AllowPolicy),
+                registry,
+                Arc::new(crate::clock::SystemClock),
+                None,
+                None,
+                observer.clone(),
+                3,
+            ));
+
+            let ctx_id = ContextId::parse("ctx-drop-usage").unwrap();
+            let turn = coord
+                .session_manager
+                .checkout_turn(&ctx_id, AgentId::parse("codex").unwrap(), None, None)
+                .await
+                .unwrap();
+
+            let c2 = coord.clone();
+            let handle = tokio::spawn(async move {
+                let _ = c2.collect_turn(ctx_id, turn, "hi".into()).await;
+            });
+
+            // Wait for TurnStarted + Usage to be processed (usage update is recorded
+            // in shared_usage before the translator yields the next event).
+            for _ in 0..1000 {
+                if observer
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, RecordedObsEvent::Start(_)))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            // Sleep briefly to let the Usage update propagate into shared_usage before abort.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            handle.abort();
+            let _ = handle.await;
+
+            // Wait for TurnFinished to appear.
+            for _ in 0..1000 {
+                if observer
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, RecordedObsEvent::Finish { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            let events = observer.0.lock().unwrap().clone();
+            let starts = events
+                .iter()
+                .filter(|e| matches!(e, RecordedObsEvent::Start(_)))
+                .count();
+            let finishes: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    RecordedObsEvent::Finish { outcome, .. } => Some(outcome.clone()),
+                    _ => None,
+                })
+                .collect();
+            let usages = events
+                .iter()
+                .filter(|e| matches!(e, RecordedObsEvent::UsageFinalized { .. }))
+                .count();
+
+            assert_eq!(starts, 1, "expected 1 TurnStarted");
+            assert_eq!(
+                finishes.len(),
+                1,
+                "expected 1 TurnFinished; got: {events:?}"
+            );
+            assert_eq!(
+                finishes[0],
+                TurnOutcome::Canceled,
+                "outcome must be Canceled"
+            );
+            assert_eq!(
+                usages, 1,
+                "guard must emit UsageFinalized for captured usage; got: {events:?}"
+            );
+
+            // Order: TurnFinished before UsageFinalized.
+            let finish_pos = events
+                .iter()
+                .position(|e| matches!(e, RecordedObsEvent::Finish { .. }))
+                .expect("finish event");
+            let usage_pos = events
+                .iter()
+                .position(|e| matches!(e, RecordedObsEvent::UsageFinalized { .. }))
+                .expect("usage event");
+            assert!(
+                finish_pos < usage_pos,
+                "TurnFinished must precede UsageFinalized"
+            );
+        }
+
+        #[tokio::test]
+        async fn collect_turn_dropped_emit_canceled_without_usage_finalized() {
+            let observer = Arc::new(RecordingObserver::default());
+            let backend = Arc::new(FakeBackend::new(Some(Arc::new(tokio::sync::Notify::new()))));
+            let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry { backend });
+            let sm = Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            ));
+            let task_store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+            let session_store: Arc<dyn bridge_core::ports::SessionStore> =
+                Arc::new(super::FakeSessionStore::default());
+            let coord = Arc::new(Coordinator::new(
+                sm,
+                None,
+                Arc::new(std::collections::HashMap::new()),
+                task_store,
+                session_store,
+                Arc::new(super::AllowPolicy),
+                registry,
+                Arc::new(crate::clock::SystemClock),
+                None,
+                None,
+                observer.clone(),
+                3,
+            ));
+
+            let ctx = ContextId::parse("ctx-obs-drop").unwrap();
+            let turn = coord
+                .session_manager
+                .checkout_turn(&ctx, AgentId::parse("codex").unwrap(), None, None)
+                .await
+                .unwrap();
+
+            let c2 = coord.clone();
+            let handle = tokio::spawn(async move {
+                let _ = c2.collect_turn(ctx, turn, "hi".into()).await;
+            });
+
+            for _ in 0..1000 {
+                if observer
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event, RecordedObsEvent::Start(_)))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            handle.abort();
+            let _ = handle.await;
+
+            for _ in 0..1000 {
+                if observer
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event, RecordedObsEvent::Finish { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let events = observer.0.lock().unwrap().clone();
+            let starts: Vec<TurnContext> = events
+                .iter()
+                .filter_map(|event| match event {
+                    RecordedObsEvent::Start(ctx) => Some(ctx.clone()),
+                    _ => None,
+                })
+                .collect();
+            let finishes: Vec<(TurnContext, TurnOutcome)> = events
+                .iter()
+                .filter_map(|event| match event {
+                    RecordedObsEvent::Finish { ctx, outcome } => {
+                        Some((ctx.clone(), outcome.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let usages: Vec<TurnContext> = events
+                .iter()
+                .filter_map(|event| match event {
+                    RecordedObsEvent::UsageFinalized { ctx, .. } => Some(ctx.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            assert_eq!(starts.len(), 1);
+            assert_eq!(finishes.len(), 1);
+            assert_eq!(starts[0].turn_id, finishes[0].0.turn_id);
+            assert_eq!(finishes[0].1, TurnOutcome::Canceled);
+            assert_eq!(usages.len(), 0);
+            let start_idx = events
+                .iter()
+                .position(|e| matches!(e, RecordedObsEvent::Start(_)))
+                .expect("start event");
+            let finish_idx = events
+                .iter()
+                .position(|e| matches!(e, RecordedObsEvent::Finish { .. }))
+                .expect("finish event");
+            assert!(start_idx < finish_idx);
+            assert_eq!(starts[0].agent, "codex");
+            assert_eq!(starts[0].model.as_deref(), Some("gpt-5.5"));
+            assert_eq!(starts[0].effort.as_deref(), Some("high"));
+            assert_eq!(starts[0].mode.as_deref(), Some("default"));
+        }
     }
 
     #[tokio::test]
@@ -1527,6 +2166,10 @@ mod tests {
             seed: None,
             injects: Vec::new(),
             abort: CancellationToken::new(),
+            agent: AgentId::parse("codex").unwrap(),
+            model: Some("gpt-5.5".into()),
+            effort: Some("high".into()),
+            mode: Some("default".into()),
         };
 
         let out = coordinator

@@ -86,6 +86,8 @@ pub struct LocalDispatch {
     /// (a force-reset cancels it → the producer's biased select aborts before re-minting the released
     /// session). For a cold-bind dispatch it is a fresh, never-cancelled token (no warm handle to race).
     pub abort: tokio_util::sync::CancellationToken,
+    /// Per-turn observability context carried to observer sinks.
+    pub obs_ctx: bridge_core::ports::TurnContext,
 }
 
 /// Drops the warm turn back to Idle on producer exit (mirrors BindingGuard::Drop's spawn pattern).

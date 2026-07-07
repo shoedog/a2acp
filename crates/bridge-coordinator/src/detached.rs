@@ -261,6 +261,7 @@ pub struct DetachedDeps {
     pub workflow_cancels: Arc<Mutex<HashMap<TaskId, CancellationToken>>>,
     pub progress_hubs: Arc<Mutex<HashMap<TaskId, Arc<TaskProgressHub>>>>,
     pub clock: Arc<dyn crate::clock::Clock>,
+    pub observer: Arc<dyn bridge_core::ports::Observer>,
 }
 
 /// Detached progress sink: persists each event via the sequenced store methods
@@ -1100,6 +1101,7 @@ mod sink_tests {
                 op,
                 hub: hub.clone(),
             })),
+            ..WorkflowRunContext::default()
         };
         let stream = executor.run_from_with_context(
             graph,
@@ -1335,7 +1337,10 @@ pub async fn spawn_detached_workflow_for_test(
         run_id,
         token,
         HashMap::new(),
-        WorkflowRunContext::default(),
+        WorkflowRunContext {
+            observer: deps.observer.clone(),
+            ..WorkflowRunContext::default()
+        },
         hub,
     )
 }
@@ -1372,7 +1377,10 @@ pub async fn spawn_detached_workflow_with_token_for_test(
         run_id,
         token,
         HashMap::new(),
-        WorkflowRunContext::default(),
+        WorkflowRunContext {
+            observer: deps.observer.clone(),
+            ..WorkflowRunContext::default()
+        },
         hub,
     )
 }
@@ -1600,6 +1608,8 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                     Ok(c) => bridge_workflow::executor::WorkflowRunContext {
                         session_cwd: Some(c),
                         make_rich_sink: None,
+                        observer: deps.observer.clone(),
+                        ..bridge_workflow::executor::WorkflowRunContext::default()
                     },
                     Err(_) => {
                         let _ = finalize_detached(
@@ -1619,7 +1629,10 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                         return;
                     }
                 },
-                None => bridge_workflow::executor::WorkflowRunContext::default(),
+                None => bridge_workflow::executor::WorkflowRunContext {
+                    observer: deps.observer.clone(),
+                    ..bridge_workflow::executor::WorkflowRunContext::default()
+                },
             };
             // Insert the progress hub BEFORE spawning (mirrors the fresh-submit
             // path) so a reattach subscriber can find it.
@@ -1688,7 +1701,9 @@ mod resume_tests {
     use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
     use bridge_core::ids::{AgentId, NodeId, OperationId, SessionId, WorkflowId};
     use bridge_core::orch::UsageSnapshot;
-    use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
+    use bridge_core::ports::{
+        AgentBackend, AgentRegistry, BackendStream, Lease, ObsEvent, Observer, Resolved, Update,
+    };
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
     use bridge_workflow::executor::WorkflowExecutor;
     use bridge_workflow::graph::{PanelConfig, RetryPolicy, WorkflowGraph, WorkflowNode};
@@ -1697,6 +1712,12 @@ mod resume_tests {
 
     struct NoopLease;
     impl Lease for NoopLease {}
+
+    #[derive(Clone)]
+    struct NoopObserver;
+    impl Observer for NoopObserver {
+        fn record(&self, _: &ObsEvent<'_>) {}
+    }
 
     #[derive(Default)]
     struct PromptRec {
@@ -1913,6 +1934,7 @@ mod resume_tests {
             workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
             progress_hubs: Arc::new(Mutex::new(HashMap::new())),
             clock: Arc::new(ManualClock::new(100)),
+            observer: Arc::new(NoopObserver),
         };
 
         resume_working_tasks(&deps, 1).await;
@@ -1975,6 +1997,7 @@ mod resume_tests {
             workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
             progress_hubs: Arc::new(Mutex::new(HashMap::new())),
             clock: Arc::new(ManualClock::new(100)),
+            observer: Arc::new(NoopObserver),
         };
 
         resume_working_tasks(&deps, 1).await;

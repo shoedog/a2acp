@@ -88,6 +88,34 @@ fn default_timeout_secs() -> u64 {
     60
 }
 
+fn default_metrics_exporters() -> Vec<String> {
+    vec!["prometheus".to_string()]
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MetricsToml {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_exporters")]
+    pub exporters: Vec<String>,
+    #[serde(default = "default_true")]
+    pub turn_log: bool,
+}
+
+impl Default for MetricsToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            exporters: default_metrics_exporters(),
+            turn_log: true,
+        }
+    }
+}
+
 /// Expand `${VAR_NAME}` placeholders in `s` using `std::env::var`.
 /// Returns `Err(ConfigError::MissingEnvVar)` if any referenced variable is unset.
 fn expand_env(s: &str) -> Result<String, ConfigError> {
@@ -164,6 +192,8 @@ pub struct RegistryConfig {
     /// factory captures this config once, and hot-reload does not re-read it.
     #[serde(default)]
     pub worktrees: Option<WorktreesToml>,
+    #[serde(default)]
+    pub metrics: MetricsToml,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -177,6 +207,13 @@ pub struct BatchToml {
 pub struct BatchConfig {
     pub max_concurrent: u32,
     pub default_concurrency: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub prometheus: bool,
+    pub turn_log: bool,
 }
 
 /// Host worktree isolation config. Changes require a serve restart because the spawn
@@ -1076,6 +1113,21 @@ impl RegistryConfig {
         }))
     }
 
+    pub fn metrics_config(&self) -> Result<MetricsConfig, ConfigError> {
+        for exporter in &self.metrics.exporters {
+            if exporter != "prometheus" {
+                return Err(ConfigError::Registry(format!(
+                    "unsupported [metrics].exporters value {exporter:?}"
+                )));
+            }
+        }
+        Ok(MetricsConfig {
+            enabled: self.metrics.enabled,
+            prometheus: self.metrics.exporters.iter().any(|e| e == "prometheus"),
+            turn_log: self.metrics.turn_log,
+        })
+    }
+
     pub fn language_profiles(
         &self,
     ) -> Result<Vec<bridge_core::profile::LanguageProfile>, ConfigError> {
@@ -1625,6 +1677,33 @@ impl bridge_core::ports::ConfigSource for FileConfigSource {
         });
 
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+}
+
+#[cfg(test)]
+mod metrics_config_tests {
+    use super::*;
+
+    #[test]
+    fn metrics_defaults_off_with_prometheus_exporter_and_turn_log_true() {
+        let cfg = RegistryConfig::parse(
+            "default = \"codex\"\n[server]\naddr = \"127.0.0.1:0\"\n[[agents]]\nid = \"codex\"\ncmd = \"codex\"",
+        )
+        .unwrap();
+        let metrics = cfg.metrics_config().unwrap();
+        assert!(!metrics.enabled);
+        assert!(metrics.prometheus);
+        assert!(metrics.turn_log);
+    }
+
+    #[test]
+    fn metrics_rejects_unknown_exporter() {
+        let cfg = RegistryConfig::parse(
+            "default = \"codex\"\n[server]\naddr = \"127.0.0.1:0\"\n[metrics]\nenabled = true\nexporters = [\"prometheus\", \"otel\"]\n[[agents]]\nid = \"codex\"\ncmd = \"codex\"",
+        )
+        .unwrap();
+        let err = cfg.metrics_config().unwrap_err().to_string();
+        assert!(err.contains("unsupported [metrics].exporters"));
     }
 }
 

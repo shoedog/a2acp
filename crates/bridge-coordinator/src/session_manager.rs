@@ -114,6 +114,10 @@ pub struct WarmTurn {
     pub abort: CancellationToken,
     pub seed: Option<String>,
     pub injects: Vec<QueuedInject>,
+    pub agent: AgentId,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -327,6 +331,33 @@ impl SessionManager {
         }
     }
 
+    fn warm_turn_from_handle(
+        h: &mut WarmHandle,
+        usage_warning: Option<UsageWarning>,
+        op: OperationId,
+        abort: CancellationToken,
+    ) -> WarmTurn {
+        WarmTurn {
+            backend: h.backend.clone(),
+            session: h.backend_session.clone(),
+            usage_warning,
+            generation: h.generation,
+            op,
+            abort,
+            seed: h.pending_seed.take(),
+            injects: std::mem::take(&mut h.pending_injects),
+            agent: h.agent.clone(),
+            model: h.fingerprint.config.model.clone(),
+            effort: h
+                .fingerprint
+                .config
+                .effort
+                .as_ref()
+                .map(|effort| format!("{effort:?}").to_ascii_lowercase()),
+            mode: h.fingerprint.config.mode.clone(),
+        }
+    }
+
     fn eval_warn(&self, u: &UsageSnapshot) -> Option<UsageWarning> {
         let thr = self.warn_fraction?;
         match (u.used, u.size) {
@@ -422,14 +453,9 @@ impl SessionManager {
         let seed = h.pending_seed.take();
         let injects = std::mem::take(&mut h.pending_injects);
         Ok(WarmTurn {
-            backend: h.backend.clone(),
-            session: h.backend_session.clone(),
-            usage_warning,
-            generation: h.generation,
-            op,
-            abort,
             seed,
             injects,
+            ..Self::warm_turn_from_handle(h, usage_warning, op, abort)
         })
     }
 
@@ -513,14 +539,9 @@ impl SessionManager {
                 let injects = std::mem::take(&mut h.pending_injects);
                 return (
                     Ok(WarmTurn {
-                        backend: h.backend.clone(),
-                        session: h.backend_session.clone(),
-                        usage_warning,
-                        generation: h.generation,
-                        op,
-                        abort,
                         seed,
                         injects,
+                        ..Self::warm_turn_from_handle(h, usage_warning, op, abort)
                     }),
                     Vec::new(),
                 );
@@ -609,14 +630,9 @@ impl SessionManager {
                 let injects = std::mem::take(&mut h.pending_injects);
                 return (
                     Ok(WarmTurn {
-                        backend: h.backend.clone(),
-                        session: h.backend_session.clone(),
-                        usage_warning,
-                        generation: h.generation,
-                        op,
-                        abort,
                         seed,
                         injects,
+                        ..Self::warm_turn_from_handle(h, usage_warning, op, abort)
                     }),
                     Vec::new(),
                 );
@@ -784,14 +800,9 @@ impl SessionManager {
                 let injects = std::mem::take(&mut h.pending_injects);
                 (
                     Ok(WarmTurn {
-                        backend: h.backend.clone(),
-                        session: h.backend_session.clone(),
-                        usage_warning: None,
-                        generation: h.generation,
-                        op,
-                        abort,
                         seed,
                         injects,
+                        ..Self::warm_turn_from_handle(h, None, op, abort)
                     }),
                     Vec::new(),
                 )
