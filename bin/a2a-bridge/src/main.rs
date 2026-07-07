@@ -704,6 +704,7 @@ fn build_coordinator(
             clock,
             allowed_cwd_root,
             batch,
+            Arc::new(bridge_observ::NoopObserver),
             resume_cap,
         )
         .with_permission_registry(perm_registry),

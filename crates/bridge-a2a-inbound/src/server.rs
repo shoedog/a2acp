@@ -2097,6 +2097,7 @@ pub fn coordinator_over(
         clock,
         allowed_cwd_root,
         batch,
+        Arc::new(bridge_observ::NoopObserver),
         3,
     );
     let coord = match permission_registry {
@@ -4249,6 +4250,7 @@ mod tests {
             Arc::new(bridge_coordinator::clock::SystemClock),
             None,
             None,
+            Arc::new(bridge_observ::NoopObserver),
             3,
         );
         match perm {
