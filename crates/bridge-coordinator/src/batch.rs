@@ -515,6 +515,7 @@ async fn resumed_child_future(
             Ok(c) => WorkflowRunContext {
                 session_cwd: Some(c),
                 make_rich_sink: None,
+                ..WorkflowRunContext::default()
             },
             Err(_) => {
                 let _ = finalize_detached(
@@ -863,6 +864,7 @@ pub async fn run_admission(
                         WorkflowRunContext {
                             session_cwd,
                             make_rich_sink: None,
+                            ..WorkflowRunContext::default()
                         },
                         hub,
                     );
@@ -1238,6 +1240,7 @@ mod tests {
                 workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
                 progress_hubs: Arc::new(Mutex::new(HashMap::new())),
                 clock: Arc::new(ManualClock::new(100)),
+                observer: Arc::new(NoopObserver),
             },
             runtime: BatchRuntime::new(max, max, Arc::new(NoopObserver)),
             allowed_cwd_root: None,

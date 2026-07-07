@@ -264,6 +264,22 @@ pub enum FailureClass {
     Other,
 }
 
+/// Classify a `BridgeError` into a `FailureClass` for observability metrics.
+pub fn classify_failure(e: &BridgeError) -> FailureClass {
+    match e {
+        BridgeError::AgentCrashed { .. } => FailureClass::AgentCrashed,
+        BridgeError::AgentTimedOut | BridgeError::CancelTimeout => FailureClass::TimedOut,
+        BridgeError::AgentOverloaded => FailureClass::Overloaded,
+        BridgeError::ConfigMismatch { .. }
+        | BridgeError::ConfigReseedRequired { .. }
+        | BridgeError::ConfigInvalid { .. }
+        | BridgeError::UnknownAgent { .. }
+        | BridgeError::ModelNotAvailable => FailureClass::Config,
+        BridgeError::FrameError | BridgeError::UpstreamA2aError => FailureClass::Transport,
+        _ => FailureClass::Other,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnOutcome {
     Success,

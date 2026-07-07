@@ -1678,6 +1678,7 @@ async fn run_review_step(
     let ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
         make_rich_sink: None,
+        ..bridge_workflow::executor::WorkflowRunContext::default()
     };
     let token = tokio_util::sync::CancellationToken::new();
     let stream = executor.run_with_context(
@@ -3111,6 +3112,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             bridge_workflow::executor::WorkflowRunContext {
                 session_cwd: Some(cwd),
                 make_rich_sink: None,
+                ..bridge_workflow::executor::WorkflowRunContext::default()
             }
         }
         None => bridge_workflow::executor::WorkflowRunContext::default(),

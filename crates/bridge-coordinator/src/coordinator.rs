@@ -10,8 +10,8 @@ use bridge_core::ids::{BatchId, ContextId, OperationId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{
-    AgentRegistry, FailureClass, ObsEvent, Observer, PolicyEngine, SessionStore, TurnContext,
-    TurnOutcome, UsageFinalization,
+    classify_failure, AgentRegistry, FailureClass, ObsEvent, Observer, PolicyEngine, SessionStore,
+    TurnContext, TurnOutcome, UsageFinalization,
 };
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{BatchSummary, TaskRecord, TaskRecordStatus, TaskStore};
@@ -280,6 +280,7 @@ impl Coordinator {
             workflow_cancels: self.workflow_cancels.clone(),
             progress_hubs: self.progress_hubs.clone(),
             clock: self.clock.clone(),
+            observer: self.observer.clone(),
         }
     }
 
@@ -371,21 +372,6 @@ impl Coordinator {
             .as_ref()
             .map(|reg| apply_permit(reg, &p))
             .unwrap_or(false))
-    }
-
-    fn classify_error(e: &BridgeError) -> FailureClass {
-        match e {
-            BridgeError::AgentCrashed { .. } => FailureClass::AgentCrashed,
-            BridgeError::AgentTimedOut | BridgeError::CancelTimeout => FailureClass::TimedOut,
-            BridgeError::AgentOverloaded => FailureClass::Overloaded,
-            BridgeError::ConfigMismatch { .. }
-            | BridgeError::ConfigReseedRequired { .. }
-            | BridgeError::ConfigInvalid { .. }
-            | BridgeError::UnknownAgent { .. }
-            | BridgeError::ModelNotAvailable => FailureClass::Config,
-            BridgeError::FrameError | BridgeError::UpstreamA2aError => FailureClass::Transport,
-            _ => FailureClass::Other,
-        }
     }
 
     fn new_turn_id() -> bridge_core::ids::TurnId {
@@ -516,7 +502,7 @@ impl Coordinator {
         finish_guard.disarm();
 
         if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
-            let outcome = TurnOutcome::Failed(Self::classify_error(e));
+            let outcome = TurnOutcome::Failed(classify_failure(e));
             self.observer.record(&ObsEvent::TurnFinished {
                 ctx: &obs_ctx,
                 latency: started.elapsed(),
@@ -651,6 +637,8 @@ impl Coordinator {
             WorkflowRunContext {
                 session_cwd,
                 make_rich_sink: None,
+                observer: self.observer.clone(),
+                ..WorkflowRunContext::default()
             },
             hub,
         ));

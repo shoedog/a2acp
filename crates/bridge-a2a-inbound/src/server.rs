@@ -2179,6 +2179,10 @@ fn spawn_workflow_producer(
             let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
                 session_cwd: routed.session_cwd.clone(),
                 make_rich_sink: None,
+                observer: srv.coordinator().observer(),
+                parent_traceparent: routed.traceparent.clone(),
+                task_id: Some(routed.task.clone()),
+                prompt_id: routed.prompt_id.clone(),
             };
             let stream = match &workflow_token {
                 Some((c, _)) => executor.run_with_context_and_dispatcher(
@@ -2234,6 +2238,7 @@ fn detached_deps(srv: &Arc<InboundServer>) -> bridge_coordinator::detached::Deta
         workflow_cancels: srv.workflow_cancels().clone(),
         progress_hubs: srv.progress_hubs().clone(),
         clock: Arc::new(bridge_coordinator::clock::SystemClock),
+        observer: srv.coordinator().observer(),
     }
 }
 
@@ -7486,6 +7491,7 @@ mod tests {
         let ctx = WorkflowRunContext {
             session_cwd: Some(cwd.clone()),
             make_rich_sink: None,
+            ..WorkflowRunContext::default()
         };
 
         let turn = dispatcher

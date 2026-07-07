@@ -639,6 +639,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bridge-core",
+ "bridge-observ",
  "futures",
  "serde",
  "serde_json",
