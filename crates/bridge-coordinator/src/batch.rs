@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{BatchId, TaskId, WorkflowId};
+use bridge_core::ports::{ObsEvent, Observer};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{
     BatchItem, BatchRecord, BatchStatus, BatchSummary, ChildClaim, ResumeClaim, TaskRecord,
@@ -12,6 +14,7 @@ use bridge_workflow::executor::WorkflowRunContext;
 use bridge_workflow::graph::WorkflowGraph;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use serde_json::json;
+use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -26,18 +29,121 @@ pub struct BatchRuntime {
     pub semaphore: Arc<Semaphore>,
     pub default_concurrency: u32,
     pub max_concurrent: u32,
+    pub observer: Arc<dyn Observer>,
+    queue_counts: Arc<StdMutex<QueueCounts>>,
     pub batch_cancels: Arc<Mutex<HashMap<BatchId, CancellationToken>>>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct QueueCounts {
+    queued: u64,
+    in_flight: u64,
+}
+
+enum QueueState {
+    Waiting,
+    Admitted,
+    Released,
+}
+
+pub struct QueueAdmissionGuard {
+    observer: Arc<dyn Observer>,
+    queue_counts: Arc<StdMutex<QueueCounts>>,
+    started: Instant,
+    state: QueueState,
+}
+
 impl BatchRuntime {
-    pub fn new(max_concurrent: u32, default_concurrency: u32) -> Self {
+    pub fn new(max_concurrent: u32, default_concurrency: u32, observer: Arc<dyn Observer>) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent as usize)),
             default_concurrency,
             max_concurrent,
+            observer,
+            queue_counts: Arc::new(StdMutex::new(QueueCounts::default())),
             batch_cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    pub fn new_noop(max_concurrent: u32, default_concurrency: u32) -> Self {
+        Self::new(max_concurrent, default_concurrency, Arc::new(NoopObserver))
+    }
+}
+
+impl QueueAdmissionGuard {
+    pub fn waiting(runtime: &BatchRuntime) -> Self {
+        let mut counts = runtime.queue_counts.lock().unwrap();
+        counts.queued += 1;
+        let queued = counts.queued;
+        let in_flight = counts.in_flight;
+        runtime.observer.record(&ObsEvent::QueueChanged {
+            in_flight,
+            queued,
+            wait: None,
+        });
+
+        Self {
+            observer: runtime.observer.clone(),
+            queue_counts: runtime.queue_counts.clone(),
+            started: Instant::now(),
+            state: QueueState::Waiting,
+        }
+    }
+
+    pub fn admitted(&mut self) {
+        if matches!(self.state, QueueState::Waiting) {
+            let mut counts = self.queue_counts.lock().unwrap();
+            counts.queued = counts.queued.saturating_sub(1);
+            counts.in_flight = counts.in_flight.saturating_add(1);
+            let queued = counts.queued;
+            let in_flight = counts.in_flight;
+            self.state = QueueState::Admitted;
+            self.observer.record(&ObsEvent::QueueChanged {
+                in_flight,
+                queued,
+                wait: Some(self.started.elapsed()),
+            });
+        }
+    }
+}
+
+impl Drop for QueueAdmissionGuard {
+    fn drop(&mut self) {
+        match self.state {
+            QueueState::Waiting => {
+                let mut counts = self.queue_counts.lock().unwrap();
+                counts.queued = counts.queued.saturating_sub(1);
+                let queued = counts.queued;
+                let in_flight = counts.in_flight;
+                self.state = QueueState::Released;
+                self.observer.record(&ObsEvent::QueueChanged {
+                    in_flight,
+                    queued,
+                    wait: None,
+                });
+            }
+            QueueState::Admitted => {
+                let mut counts = self.queue_counts.lock().unwrap();
+                counts.in_flight = counts.in_flight.saturating_sub(1);
+                let in_flight = counts.in_flight;
+                let queued = counts.queued;
+                self.state = QueueState::Released;
+                self.observer.record(&ObsEvent::QueueChanged {
+                    in_flight,
+                    queued,
+                    wait: None,
+                });
+            }
+            QueueState::Released => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NoopObserver;
+
+impl Observer for NoopObserver {
+    fn record(&self, _e: &ObsEvent<'_>) {}
 }
 
 #[derive(Clone)]
@@ -590,6 +696,8 @@ pub async fn run_admission(
             && (!to_resume.is_empty() || !pending.is_empty())
             && !token.is_cancelled()
         {
+            let mut queue_guard = QueueAdmissionGuard::waiting(&deps.runtime);
+
             // Acquire a shared permit, but KEEP DRAINING `inflight` while we wait. Each
             // in-flight child's completion future OWNS its permit and only releases it when
             // polled; if we blocked solely on `acquire_owned()` here, a batch whose
@@ -613,6 +721,8 @@ pub async fn run_admission(
                 }
             };
 
+            queue_guard.admitted();
+
             // Resume an existing Working child first (its row already exists; re-run from
             // checkpoints). The permit is owned by the returned future, or dropped inside
             // `resumed_child_future` on a terminal/exhausted short-circuit — so acquiring the
@@ -623,7 +733,11 @@ pub async fn run_admission(
                     resumed_child_future(&deps, &child, cap, permit).await
                 {
                     live.insert(task, ctok);
-                    inflight.push(fut);
+                    let queue_guard = queue_guard;
+                    inflight.push(Box::pin(async move {
+                        let _queue_guard = queue_guard;
+                        fut.await
+                    }));
                 }
                 to_resume.pop_front();
                 continue;
@@ -753,8 +867,10 @@ pub async fn run_admission(
                         hub,
                     );
                     live.insert(task.clone(), ctok);
+                    let queue_guard = queue_guard;
                     inflight.push(Box::pin(async move {
                         let _permit = permit;
+                        let _queue_guard = queue_guard;
                         let _ = h.await;
                         task
                     }));
@@ -906,7 +1022,9 @@ mod tests {
     use bridge_core::{
         domain::{AgentEntry, AgentKind, Part, RegistrySnapshot},
         ids::{AgentId, BatchId, NodeId, SessionId, TaskId, WorkflowId},
-        ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update},
+        ports::{
+            AgentBackend, AgentRegistry, BackendStream, Lease, ObsEvent, Observer, Resolved, Update,
+        },
         task_store::{
             BatchItem, BatchRecord, BatchStatus, MemoryTaskStore, TaskRecord, TaskRecordStatus,
             TaskStore,
@@ -916,7 +1034,7 @@ mod tests {
     use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
-    use tokio::sync::{Notify, Semaphore as TokioSemaphore};
+    use tokio::sync::{Barrier, Notify, Semaphore as TokioSemaphore};
 
     fn br(status: BatchStatus, total: u32) -> BatchRecord {
         BatchRecord {
@@ -1121,7 +1239,7 @@ mod tests {
                 progress_hubs: Arc::new(Mutex::new(HashMap::new())),
                 clock: Arc::new(ManualClock::new(100)),
             },
-            runtime: BatchRuntime::new(max, max),
+            runtime: BatchRuntime::new(max, max, Arc::new(NoopObserver)),
             allowed_cwd_root: None,
         };
         (deps, store)
@@ -1880,5 +1998,121 @@ mod tests {
             is_settleable(&summarize_batch(&rec, &kids)),
             Some(BatchStatus::Canceled)
         );
+    }
+
+    #[derive(Default)]
+    struct QueueRecorder(std::sync::Mutex<Vec<(u64, u64, bool)>>);
+
+    impl Observer for QueueRecorder {
+        fn record(&self, e: &ObsEvent<'_>) {
+            if let ObsEvent::QueueChanged {
+                in_flight,
+                queued,
+                wait,
+            } = e
+            {
+                self.0.lock().expect("queue recorder mutex poisoned").push((
+                    *in_flight,
+                    *queued,
+                    wait.is_some(),
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_guard_drop_restores_queue_depth_on_cancel() {
+        let observer = Arc::new(QueueRecorder::default());
+        let runtime = BatchRuntime::new(0, 1, observer.clone());
+        {
+            let _guard = QueueAdmissionGuard::waiting(&runtime);
+        }
+        let events = observer.0.lock().unwrap().clone();
+        assert_eq!(events, vec![(0, 1, false), (0, 0, false)]);
+    }
+
+    #[tokio::test]
+    async fn admitted_guard_observes_wait_and_releases_inflight_on_drop() {
+        let observer = Arc::new(QueueRecorder::default());
+        let runtime = BatchRuntime::new(1, 1, observer.clone());
+        {
+            let mut guard = QueueAdmissionGuard::waiting(&runtime);
+            guard.admitted();
+        }
+        let events = observer.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], (0, 1, false));
+        assert_eq!(events[1].0, 1);
+        assert_eq!(events[1].1, 0);
+        assert!(events[1].2);
+        assert_eq!(events[2], (0, 0, false));
+    }
+
+    #[tokio::test]
+    async fn concurrent_queue_guard_transitions_are_ordered_and_final_state_matches() {
+        let observer = Arc::new(QueueRecorder::default());
+        let runtime = BatchRuntime::new(2, 1, observer.clone());
+        let rounds = 250usize;
+        let admit_sync = Arc::new(Barrier::new(2));
+        let drop_sync = Arc::new(Barrier::new(2));
+
+        let p1 = {
+            let runtime = runtime.clone();
+            let admit_sync = admit_sync.clone();
+            let drop_sync = drop_sync.clone();
+            tokio::spawn(async move {
+                for _ in 0..rounds {
+                    let mut guard = QueueAdmissionGuard::waiting(&runtime);
+                    admit_sync.wait().await;
+                    guard.admitted();
+                    tokio::task::yield_now().await;
+                    drop_sync.wait().await;
+                    drop(guard);
+                }
+            })
+        };
+        let p2 = {
+            let runtime = runtime.clone();
+            let admit_sync = admit_sync.clone();
+            let drop_sync = drop_sync.clone();
+            tokio::spawn(async move {
+                for _ in 0..rounds {
+                    let mut guard = QueueAdmissionGuard::waiting(&runtime);
+                    admit_sync.wait().await;
+                    guard.admitted();
+                    tokio::task::yield_now().await;
+                    drop_sync.wait().await;
+                    drop(guard);
+                }
+            })
+        };
+
+        p1.await.unwrap();
+        p2.await.unwrap();
+
+        let events = observer.0.lock().unwrap().clone();
+        assert_eq!(events.len(), rounds * 6);
+        assert_eq!(
+            events.iter().filter(|(_, _, wait)| *wait).count(),
+            rounds * 2
+        );
+
+        for (in_flight, queued, _) in &events {
+            assert!(*in_flight <= 2, "in_flight must stay bounded");
+            assert!(*queued <= 2, "queued must stay bounded");
+            assert!(*in_flight + *queued <= 2);
+            assert!((*in_flight, *queued) != (1, 2));
+        }
+
+        let last = events
+            .last()
+            .expect("queue recorder should have final emission");
+        let counts = runtime
+            .queue_counts
+            .lock()
+            .expect("queue count mutex should not be poisoned");
+        assert_eq!(last, &(0, 0, false));
+        assert_eq!((counts.queued, counts.in_flight), (0, 0));
+        assert_eq!((last.0, last.1), (counts.in_flight, counts.queued));
     }
 }

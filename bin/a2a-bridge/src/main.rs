@@ -664,7 +664,11 @@ fn batch_runtime(
     cfg: &RegistryConfig,
 ) -> Result<Option<bridge_coordinator::BatchRuntime>, config::ConfigError> {
     Ok(cfg.batch_config()?.map(|batch| {
-        bridge_coordinator::BatchRuntime::new(batch.max_concurrent, batch.default_concurrency)
+        bridge_coordinator::BatchRuntime::new(
+            batch.max_concurrent,
+            batch.default_concurrency,
+            Arc::new(bridge_observ::NoopObserver),
+        )
     }))
 }
 

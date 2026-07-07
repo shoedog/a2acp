@@ -4386,7 +4386,11 @@ fn build_coordinator_batch_server() -> Arc<InboundServer> {
         Arc::new(MemoryTaskStore::new()),
         None,
         None,
-        Some(bridge_coordinator::BatchRuntime::new(4, 1)),
+        Some(bridge_coordinator::BatchRuntime::new(
+            4,
+            1,
+            Arc::new(bridge_observ::NoopObserver),
+        )),
     );
     Arc::new(InboundServer::from_coordinator(
         coord,
