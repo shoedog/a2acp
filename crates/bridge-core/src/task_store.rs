@@ -196,6 +196,50 @@ pub struct TurnLogRow {
     pub traceparent: Option<crate::ports::TraceParent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeArtifactMeta {
+    pub node: NodeId,
+    pub finished: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeCheckpointOutput {
+    Found {
+        output: String,
+        ok: bool,
+        usage: Option<crate::orch::UsageSnapshot>,
+        bytes: u64,
+    },
+    TooLarge {
+        bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskUsageAgg {
+    pub rows: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thought_tokens: Option<u64>,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_write_tokens: Option<u64>,
+    pub cost: Option<crate::orch::UsageCost>,
+    pub at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JournalRead {
+    Body {
+        jsonl: String,
+        events: u64,
+        bytes: u64,
+    },
+    TooLarge {
+        events: u64,
+        bytes: u64,
+    },
+}
+
 /// Outcome of a `claim_resume_attempt` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeClaim {
@@ -270,6 +314,54 @@ pub trait TaskStore: Send + Sync {
     }
 
     async fn turn_log_rows(&self) -> Result<Vec<TurnLogRow>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn turn_log_row(&self, _turn_id: &TurnId) -> Result<Option<TurnLogRow>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn turn_log_rows_for_task(
+        &self,
+        _task: &TaskId,
+        _limit: usize,
+    ) -> Result<Vec<TurnLogRow>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn turn_log_usage_for_task(
+        &self,
+        _task: &TaskId,
+    ) -> Result<Option<TaskUsageAgg>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn latest_turn_log_row_for_session(
+        &self,
+        _session: &ContextId,
+    ) -> Result<Option<TurnLogRow>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn journal_jsonl_bounded(
+        &self,
+        _task: &TaskId,
+        _max_events: usize,
+        _max_bytes: usize,
+    ) -> Result<JournalRead, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn node_checkpoint_nodes(&self, _task: &TaskId) -> Result<Vec<NodeId>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn node_checkpoint_output(
+        &self,
+        _task: &TaskId,
+        _node: &NodeId,
+        _max_bytes: usize,
+    ) -> Result<Option<NodeCheckpointOutput>, BridgeError> {
         Err(BridgeError::StoreFailure)
     }
 
@@ -748,6 +840,207 @@ impl TaskStore for MemoryTaskStore {
         Ok(rows)
     }
 
+    async fn turn_log_row(&self, turn_id: &TurnId) -> Result<Option<TurnLogRow>, BridgeError> {
+        Ok(self.turn_log.lock().unwrap().get(turn_id.as_str()).cloned())
+    }
+
+    async fn turn_log_rows_for_task(
+        &self,
+        task: &TaskId,
+        limit: usize,
+    ) -> Result<Vec<TurnLogRow>, BridgeError> {
+        let mut rows: Vec<_> = self
+            .turn_log
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|row| row.task_id.as_ref().map(|t| t.as_str()) == Some(task.as_str()))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.completed_ms
+                .unwrap_or(i64::MAX)
+                .cmp(&b.completed_ms.unwrap_or(i64::MAX))
+                .then_with(|| a.turn_id.as_str().cmp(b.turn_id.as_str()))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    async fn turn_log_usage_for_task(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<TaskUsageAgg>, BridgeError> {
+        let rows: Vec<_> = self
+            .turn_log
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|row| row.task_id.as_ref().map(|t| t.as_str()) == Some(task.as_str()))
+            .cloned()
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let mut input_tokens = 0_u64;
+        let mut output_tokens = 0_u64;
+        let mut thought_tokens = None::<u64>;
+        let mut cached_read_tokens = None::<u64>;
+        let mut cached_write_tokens = None::<u64>;
+        let mut cost_amount = None::<f64>;
+        let mut currencies = std::collections::HashSet::new();
+        let mut at_ms = 0_i64;
+
+        for row in &rows {
+            input_tokens += row.input_tokens.unwrap_or(0);
+            output_tokens += row.output_tokens.unwrap_or(0);
+            if let Some(v) = row.thought_tokens {
+                thought_tokens = Some(thought_tokens.unwrap_or(0) + v);
+            }
+            if let Some(v) = row.cached_read_tokens {
+                cached_read_tokens = Some(cached_read_tokens.unwrap_or(0) + v);
+            }
+            if let Some(v) = row.cached_write_tokens {
+                cached_write_tokens = Some(cached_write_tokens.unwrap_or(0) + v);
+            }
+            if let (Some(amount), Some(currency)) = (row.cost_amount, row.cost_currency.as_ref()) {
+                cost_amount = Some(cost_amount.unwrap_or(0.0) + amount);
+                currencies.insert(currency.clone());
+            }
+            if let Some(ms) = row.completed_ms {
+                at_ms = at_ms.max(ms);
+            }
+        }
+
+        let cost = if currencies.len() == 1 {
+            cost_amount.map(|amount| crate::orch::UsageCost {
+                amount,
+                currency: currencies.into_iter().next().unwrap(),
+            })
+        } else {
+            None
+        };
+
+        Ok(Some(TaskUsageAgg {
+            rows: rows.len() as u64,
+            input_tokens,
+            output_tokens,
+            thought_tokens,
+            cached_read_tokens,
+            cached_write_tokens,
+            cost,
+            at_ms,
+        }))
+    }
+
+    async fn latest_turn_log_row_for_session(
+        &self,
+        session: &ContextId,
+    ) -> Result<Option<TurnLogRow>, BridgeError> {
+        let rows = self.turn_log.lock().unwrap();
+        Ok(rows
+            .values()
+            .filter(|row| row.session_id.as_str() == session.as_str())
+            .max_by(|a, b| {
+                a.completed_ms
+                    .unwrap_or(i64::MIN)
+                    .cmp(&b.completed_ms.unwrap_or(i64::MIN))
+                    .then_with(|| a.turn_id.as_str().cmp(b.turn_id.as_str()))
+            })
+            .cloned())
+    }
+
+    async fn journal_jsonl_bounded(
+        &self,
+        task: &TaskId,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<JournalRead, BridgeError> {
+        let events = self
+            .journals
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .cloned()
+            .unwrap_or_default();
+
+        // Preflight (mirrors the SQLite COUNT/SUM): compute the event count and total
+        // JSONL byte size WITHOUT retaining the assembled body, so an over-limit journal
+        // is rejected as `TooLarge` before we ever build the response string.
+        let events_count = events.len() as u64;
+        let mut bytes = 0_u64;
+        for (_seq, event) in &events {
+            let line = serde_json::to_string(event).map_err(|_| BridgeError::StoreFailure)?;
+            bytes += line.len() as u64 + 1;
+        }
+
+        if events.len() > max_events || bytes as usize > max_bytes {
+            return Ok(JournalRead::TooLarge {
+                events: events_count,
+                bytes,
+            });
+        }
+
+        // Under both caps: assemble the bounded body (≤ max_bytes).
+        let mut jsonl = String::with_capacity(bytes as usize);
+        for (_seq, event) in &events {
+            let line = serde_json::to_string(event).map_err(|_| BridgeError::StoreFailure)?;
+            jsonl.push_str(&line);
+            jsonl.push('\n');
+        }
+        Ok(JournalRead::Body {
+            jsonl,
+            events: events_count,
+            bytes,
+        })
+    }
+
+    async fn node_checkpoint_nodes(&self, task: &TaskId) -> Result<Vec<NodeId>, BridgeError> {
+        let g = self.checkpoints.lock().unwrap();
+        let mut rows = Vec::new();
+        for ((tid, nid), (_output, _ok, ts, seq, _usage)) in g.iter() {
+            if tid == task.as_str() {
+                rows.push((
+                    *seq,
+                    *ts,
+                    NodeId::parse(nid).map_err(|_| BridgeError::StoreFailure)?,
+                ));
+            }
+        }
+        rows.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.as_str().cmp(b.2.as_str()))
+        });
+        Ok(rows.into_iter().map(|(_seq, _ts, node)| node).collect())
+    }
+
+    async fn node_checkpoint_output(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        max_bytes: usize,
+    ) -> Result<Option<NodeCheckpointOutput>, BridgeError> {
+        let g = self.checkpoints.lock().unwrap();
+        let Some((output, ok, _ts, _seq, usage)) =
+            g.get(&(task.as_str().to_string(), node.as_str().to_string()))
+        else {
+            return Ok(None);
+        };
+        let bytes = output.len() as u64;
+        if bytes as usize > max_bytes {
+            return Ok(Some(NodeCheckpointOutput::TooLarge { bytes }));
+        }
+        Ok(Some(NodeCheckpointOutput::Found {
+            output: output.clone(),
+            ok: *ok,
+            usage: usage.clone(),
+            bytes,
+        }))
+    }
+
     async fn create_batch(&self, rec: &BatchRecord) -> Result<(), BridgeError> {
         let mut g = self.batches.lock().unwrap();
         if g.contains_key(&rec.id) {
@@ -1182,8 +1475,77 @@ impl TaskStore for MemoryTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{BatchId, NodeId, OperationId};
-    use crate::orch::{OrchEvent, OrchEventKind, UsageSnapshot, ORCH_V};
+    use crate::ids::{BatchId, ContextId, NodeId, OperationId, TurnId};
+    use crate::orch::{OrchEvent, OrchEventKind, TerminalUsage, UsageCost, UsageSnapshot, ORCH_V};
+    use crate::ports::{TraceParent, TurnContext, TurnOutcome};
+    use std::time::Duration;
+
+    fn turn_ctx(turn: &str, session: &str, task: Option<&str>, attempt: u32) -> TurnContext {
+        TurnContext {
+            turn_id: TurnId::parse(turn).unwrap(),
+            session_id: ContextId::parse(session).unwrap(),
+            task_id: task.map(|t| TaskId::parse(t).unwrap()),
+            workflow: Some("code-review".to_string()),
+            node: Some("reviewer".to_string()),
+            attempt,
+            agent: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+            effort: Some("high".to_string()),
+            mode: Some("default".to_string()),
+            prompt_id: Some("prompt/eval".to_string()),
+            traceparent: TraceParent::parse_header_value(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_finished_turn(
+        store: &MemoryTaskStore,
+        turn: &str,
+        session: &str,
+        task: Option<&str>,
+        completed_ms: i64,
+        input: u64,
+        output: u64,
+        cost: Option<(&str, f64)>,
+    ) {
+        let ctx = turn_ctx(turn, session, task, 0);
+        store
+            .upsert_turn_finished(&TurnLogFinished {
+                ctx: ctx.clone(),
+                started_ms: completed_ms - 10,
+                completed_ms,
+                latency: Duration::from_millis(10),
+                ttft: None,
+                outcome: TurnOutcome::Success,
+            })
+            .await
+            .unwrap();
+        store
+            .update_turn_usage(&TurnLogUsage {
+                ctx,
+                usage: UsageSnapshot {
+                    used: None,
+                    size: None,
+                    cost: cost.map(|(currency, amount)| UsageCost {
+                        amount,
+                        currency: currency.to_string(),
+                    }),
+                    terminal: Some(TerminalUsage {
+                        total_tokens: input + output + 999,
+                        input_tokens: input,
+                        output_tokens: output,
+                        thought_tokens: Some(3),
+                        cached_read_tokens: None,
+                        cached_write_tokens: Some(5),
+                    }),
+                    at_ms: completed_ms,
+                },
+            })
+            .await
+            .unwrap();
+    }
 
     fn rec(id: &str, ms: i64) -> TaskRecord {
         TaskRecord {
@@ -1748,6 +2110,274 @@ mod tests {
         assert!(fi.complete_from_birth);
         assert_eq!(fi.events.len(), 2);
         assert_eq!(fi.scalars.cut_seq, 2);
+    }
+
+    #[tokio::test]
+    async fn memory_turn_log_row_lookup() {
+        let store = MemoryTaskStore::new();
+        write_finished_turn(
+            &store,
+            "turn-a",
+            "ctx-a",
+            Some("task-a"),
+            20,
+            2,
+            4,
+            Some(("USD", 0.25)),
+        )
+        .await;
+
+        let found = store
+            .turn_log_row(&TurnId::parse("turn-a").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.turn_id.as_str(), "turn-a");
+        assert_eq!(found.task_id.as_ref().unwrap().as_str(), "task-a");
+        assert_eq!(
+            found.traceparent.unwrap().to_header_value(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+
+        assert!(store
+            .turn_log_row(&TurnId::parse("missing").unwrap())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_turn_log_rows_for_task_orders_and_limits() {
+        let store = MemoryTaskStore::new();
+        write_finished_turn(&store, "turn-c", "ctx-a", Some("task-a"), 30, 1, 1, None).await;
+        write_finished_turn(&store, "turn-a", "ctx-a", Some("task-a"), 10, 1, 1, None).await;
+        write_finished_turn(&store, "turn-b", "ctx-a", Some("task-a"), 20, 1, 1, None).await;
+        write_finished_turn(&store, "turn-x", "ctx-a", Some("task-x"), 5, 1, 1, None).await;
+
+        let rows = store
+            .turn_log_rows_for_task(&TaskId::parse("task-a").unwrap(), 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|r| r.turn_id.as_str()).collect::<Vec<_>>(),
+            vec!["turn-a", "turn-b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_turn_log_usage_for_task_is_unbounded_and_single_currency() {
+        let store = MemoryTaskStore::new();
+        write_finished_turn(
+            &store,
+            "turn-1",
+            "ctx-a",
+            Some("task-a"),
+            10,
+            2,
+            3,
+            Some(("USD", 0.10)),
+        )
+        .await;
+        write_finished_turn(
+            &store,
+            "turn-2",
+            "ctx-a",
+            Some("task-a"),
+            20,
+            5,
+            7,
+            Some(("USD", 0.20)),
+        )
+        .await;
+        write_finished_turn(
+            &store,
+            "turn-3",
+            "ctx-a",
+            Some("task-a"),
+            30,
+            11,
+            13,
+            Some(("USD", 0.30)),
+        )
+        .await;
+
+        let agg = store
+            .turn_log_usage_for_task(&TaskId::parse("task-a").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let cost = agg.cost.as_ref().cloned().unwrap_or(UsageCost {
+            amount: 0.0,
+            currency: String::new(),
+        });
+
+        assert_eq!(agg.rows, 3);
+        assert_eq!(agg.input_tokens, 18);
+        assert_eq!(agg.output_tokens, 23);
+        assert_eq!(agg.thought_tokens, Some(9));
+        assert_eq!(agg.cached_read_tokens, None);
+        assert_eq!(agg.cached_write_tokens, Some(15));
+        assert_eq!(cost.currency, "USD");
+        assert!((cost.amount - 0.60).abs() < 0.000_001);
+        assert_eq!(agg.at_ms, 30);
+    }
+
+    #[tokio::test]
+    async fn memory_turn_log_usage_for_task_omits_mixed_currency_cost() {
+        let store = MemoryTaskStore::new();
+        write_finished_turn(
+            &store,
+            "turn-1",
+            "ctx-a",
+            Some("task-a"),
+            10,
+            2,
+            3,
+            Some(("USD", 0.10)),
+        )
+        .await;
+        write_finished_turn(
+            &store,
+            "turn-2",
+            "ctx-a",
+            Some("task-a"),
+            20,
+            5,
+            7,
+            Some(("EUR", 0.20)),
+        )
+        .await;
+
+        let agg = store
+            .turn_log_usage_for_task(&TaskId::parse("task-a").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(agg.input_tokens, 7);
+        assert_eq!(agg.output_tokens, 10);
+        assert!(agg.cost.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_latest_turn_log_row_for_session_returns_latest() {
+        let store = MemoryTaskStore::new();
+        write_finished_turn(&store, "turn-old", "ctx-a", None, 10, 1, 1, None).await;
+        write_finished_turn(&store, "turn-new", "ctx-a", None, 20, 1, 1, None).await;
+        write_finished_turn(&store, "turn-other", "ctx-b", None, 30, 1, 1, None).await;
+
+        let row = store
+            .latest_turn_log_row_for_session(&ContextId::parse("ctx-a").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(row.turn_id.as_str(), "turn-new");
+    }
+
+    #[tokio::test]
+    async fn memory_journal_jsonl_bounded_body_counts_and_limits() {
+        let store = MemoryTaskStore::new();
+        let task = TaskId::parse("task-a").unwrap();
+        let op = OperationId::parse("op-a").unwrap();
+        store.create(&rec("task-a", 1)).await.unwrap();
+        store
+            .record_event_sequenced(
+                &task,
+                &op,
+                10,
+                OrchEventKind::Progress { text: "one".into() },
+            )
+            .await
+            .unwrap();
+        store
+            .record_event_sequenced(
+                &task,
+                &op,
+                11,
+                OrchEventKind::Progress { text: "two".into() },
+            )
+            .await
+            .unwrap();
+
+        let body = store
+            .journal_jsonl_bounded(&task, 10, 10_000)
+            .await
+            .unwrap();
+
+        match body {
+            JournalRead::Body {
+                jsonl,
+                events,
+                bytes,
+            } => {
+                assert_eq!(events, 2);
+                assert_eq!(bytes as usize, jsonl.len());
+                assert_eq!(jsonl.lines().count(), 2);
+                assert!(jsonl.ends_with('\n'));
+            }
+            JournalRead::TooLarge { .. } => panic!("journal should fit"),
+        }
+
+        assert!(matches!(
+            store.journal_jsonl_bounded(&task, 1, 10_000).await.unwrap(),
+            JournalRead::TooLarge { events: 2, .. }
+        ));
+        assert!(matches!(
+            store.journal_jsonl_bounded(&task, 10, 1).await.unwrap(),
+            JournalRead::TooLarge { events: 2, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_node_checkpoint_nodes_and_output_are_bounded() {
+        let store = MemoryTaskStore::new();
+        let task = TaskId::parse("task-a").unwrap();
+        store.create(&rec("task-a", 1)).await.unwrap();
+        store
+            .put_node_checkpoint(
+                &task,
+                &NodeId::parse("node-b").unwrap(),
+                "large-output",
+                true,
+                10,
+            )
+            .await
+            .unwrap();
+        store
+            .put_node_checkpoint(&task, &NodeId::parse("node-a").unwrap(), "small", false, 11)
+            .await
+            .unwrap();
+
+        let nodes = store.node_checkpoint_nodes(&task).await.unwrap();
+        assert_eq!(
+            nodes.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+            vec!["node-b", "node-a"]
+        );
+
+        let output = store
+            .node_checkpoint_output(&task, &NodeId::parse("node-a").unwrap(), 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output,
+            NodeCheckpointOutput::Found {
+                output: "small".into(),
+                ok: false,
+                usage: None,
+                bytes: 5
+            }
+        );
+
+        assert_eq!(
+            store
+                .node_checkpoint_output(&task, &NodeId::parse("node-b").unwrap(), 3)
+                .await
+                .unwrap(),
+            Some(NodeCheckpointOutput::TooLarge { bytes: 12 })
+        );
     }
 
     #[tokio::test]
