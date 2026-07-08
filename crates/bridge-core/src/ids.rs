@@ -54,7 +54,17 @@ impl SessionGeneration {
 
 macro_rules! id_newtype_strict {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+        #[derive(
+            Clone,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name(String);
         impl $name {
             /// Validated id: non-empty and `[a-z0-9_-]+` only. Stricter than the plain
