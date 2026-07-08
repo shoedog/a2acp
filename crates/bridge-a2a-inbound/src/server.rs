@@ -23,8 +23,8 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Path, State},
+    http::{header, HeaderMap, StatusCode},
     response::sse::{Event as SseEvent, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -294,6 +294,7 @@ impl InboundServer {
     pub fn router(self: Arc<Self>) -> Router {
         let router = Router::new()
             .route("/.well-known/agent-card.json", get(serve_card))
+            .route("/turns/:turn_id", get(turn_row))
             .route("/", post(jsonrpc));
         let router = if self.metrics_endpoint.is_some() {
             router.route("/metrics", get(metrics))
@@ -813,6 +814,197 @@ async fn serve_card(State(srv): State<Arc<InboundServer>>) -> Response {
     let mcp = srv.registry().mcp_advertisement();
     let catalog = srv.model_catalog.load();
     Json(agent_card(&srv.base_url, &workflow_ids, &mcp, &catalog)).into_response()
+}
+
+fn unauthorized_bearer_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+    )
+        .into_response()
+}
+
+fn trace_json_response(status: StatusCode, body: serde_json::Value) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn trace_empty_response(status: StatusCode) -> Response {
+    // Keep the header invariant uniform across ALL trace responses (success and
+    // error/disabled/empty), so no trace path is ever served without nosniff.
+    let mut response = status.into_response();
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn trace_error_response(status: StatusCode) -> Response {
+    trace_empty_response(status)
+}
+
+fn trace_authorize(
+    srv: &InboundServer,
+    headers: &HeaderMap,
+) -> Result<bridge_core::domain::AuthContext, Box<Response>> {
+    if !srv.trace_config.enabled {
+        return Err(Box::new(trace_error_response(StatusCode::NOT_FOUND)));
+    }
+    let Some(token) = bearer_token(headers) else {
+        return Err(Box::new(unauthorized_bearer_response()));
+    };
+    srv.auth
+        .authorize(&InboundRequest::with_token(&token))
+        .map_err(|_| Box::new(unauthorized_bearer_response()))
+}
+
+fn audit_trace_fetch(
+    caller: &str,
+    route: &'static str,
+    task_id: Option<&str>,
+    turn_id: Option<&str>,
+    node: Option<&str>,
+    status: StatusCode,
+    bytes: usize,
+) {
+    tracing::info!(
+        caller = caller,
+        route = route,
+        task_id = task_id,
+        turn_id = turn_id,
+        node = node,
+        status = status.as_u16(),
+        bytes = bytes as u64,
+        "trace_fetch"
+    );
+}
+
+#[derive(serde::Serialize)]
+struct TurnLogRowDto {
+    turn_id: String,
+    session_id: String,
+    task_id: Option<String>,
+    workflow: Option<String>,
+    node: Option<String>,
+    attempt: u32,
+    agent: String,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<String>,
+    prompt_id: Option<String>,
+    started_ms: Option<i64>,
+    completed_ms: Option<i64>,
+    latency_ms: Option<u64>,
+    ttft_ms: Option<u64>,
+    outcome: Option<String>,
+    failure_class: Option<String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    thought_tokens: Option<u64>,
+    cached_read_tokens: Option<u64>,
+    cached_write_tokens: Option<u64>,
+    cost_amount: Option<f64>,
+    cost_currency: Option<String>,
+    traceparent: Option<String>,
+}
+
+impl From<bridge_core::task_store::TurnLogRow> for TurnLogRowDto {
+    fn from(row: bridge_core::task_store::TurnLogRow) -> Self {
+        Self {
+            turn_id: row.turn_id.as_str().to_string(),
+            session_id: row.session_id.as_str().to_string(),
+            task_id: row.task_id.map(|t| t.as_str().to_string()),
+            workflow: row.workflow,
+            node: row.node,
+            attempt: row.attempt,
+            agent: row.agent,
+            model: row.model,
+            effort: row.effort,
+            mode: row.mode,
+            prompt_id: row.prompt_id,
+            started_ms: row.started_ms,
+            completed_ms: row.completed_ms,
+            latency_ms: row.latency_ms,
+            ttft_ms: row.ttft_ms,
+            outcome: row.outcome,
+            failure_class: row.failure_class,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            thought_tokens: row.thought_tokens,
+            cached_read_tokens: row.cached_read_tokens,
+            cached_write_tokens: row.cached_write_tokens,
+            cost_amount: row.cost_amount,
+            cost_currency: row.cost_currency,
+            traceparent: row.traceparent.map(|tp| tp.to_header_value()),
+        }
+    }
+}
+
+async fn turn_row(
+    State(srv): State<Arc<InboundServer>>,
+    Path(turn_id_raw): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let mut caller = "unauthenticated".to_string();
+    let response = match trace_authorize(&srv, &headers) {
+        Ok(auth) => {
+            caller = auth.caller_id().as_str().to_string();
+            let turn_id = match bridge_core::ids::TurnId::parse(turn_id_raw.clone()) {
+                Ok(id) => id,
+                Err(_) => {
+                    let response = trace_error_response(StatusCode::NOT_FOUND);
+                    audit_trace_fetch(
+                        &caller,
+                        "turn_row",
+                        None,
+                        Some(&turn_id_raw),
+                        None,
+                        StatusCode::NOT_FOUND,
+                        0,
+                    );
+                    return response;
+                }
+            };
+            match srv.task_store().turn_log_row(&turn_id).await {
+                Ok(Some(row)) => {
+                    let body = serde_json::to_value(TurnLogRowDto::from(row))
+                        .unwrap_or_else(|_| serde_json::json!({ "error": "serialization failed" }));
+                    let bytes = serde_json::to_vec(&body).map(|b| b.len()).unwrap_or(0);
+                    let response = trace_json_response(StatusCode::OK, body);
+                    audit_trace_fetch(
+                        &caller,
+                        "turn_row",
+                        None,
+                        Some(turn_id.as_str()),
+                        None,
+                        StatusCode::OK,
+                        bytes,
+                    );
+                    return response;
+                }
+                Ok(None) => trace_error_response(StatusCode::NOT_FOUND),
+                Err(_) => trace_error_response(StatusCode::INTERNAL_SERVER_ERROR),
+            }
+        }
+        Err(response) => *response,
+    };
+
+    let status = response.status();
+    audit_trace_fetch(
+        &caller,
+        "turn_row",
+        None,
+        Some(&turn_id_raw),
+        None,
+        status,
+        0,
+    );
+    response
 }
 
 async fn metrics(State(srv): State<Arc<InboundServer>>, headers: HeaderMap) -> Response {
@@ -4738,6 +4930,254 @@ mod tests {
             assert_eq!(cfg.journal_max_events, 100_000);
             assert_eq!(cfg.artifact_max_bytes, 4_194_304);
             assert_eq!(cfg.max_task_turns, 512);
+        }
+    }
+
+    mod trace_turn_route_tests {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use bridge_core::ids::{ContextId, TaskId};
+        use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
+        use bridge_core::ports::{TraceParent, TurnContext, TurnOutcome};
+        use bridge_core::task_store::{MemoryTaskStore, TaskStore, TurnLogFinished, TurnLogUsage};
+        use std::time::Duration;
+
+        fn build_with_task_store_and_trace(
+            task_store: Arc<MemoryTaskStore>,
+            auth: Arc<dyn AuthMiddleware>,
+            trace_config: TraceHttpConfig,
+        ) -> Arc<InboundServer> {
+            let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+            let backend = FakeBackend::new();
+            let registry: Arc<dyn AgentRegistry> = FakeRegistry::single("kiro", backend);
+            let task_store_dyn: Arc<dyn TaskStore> = task_store;
+            let coord = bridge_coordinator::Coordinator::new(
+                Arc::new(crate::session_manager::SessionManager::new(
+                    registry.clone(),
+                    std::time::Duration::from_secs(60),
+                )),
+                None,
+                Arc::new(std::collections::HashMap::new()),
+                task_store_dyn,
+                store,
+                Arc::new(AutoApprove),
+                registry,
+                Arc::new(bridge_coordinator::clock::SystemClock),
+                None,
+                None,
+                Arc::new(bridge_observ::NoopObserver),
+                3,
+            )
+            .with_trace_refs_config(trace_config.enabled, trace_config.max_task_turns);
+            Arc::new(
+                InboundServer::from_coordinator(
+                    Arc::new(coord),
+                    Arc::new(AlwaysKiro),
+                    auth,
+                    "http://localhost:8080",
+                    Arc::new(NoDelegation),
+                    "kiro",
+                )
+                .with_trace_http_config(trace_config),
+            )
+        }
+
+        fn trace_cfg(enabled: bool) -> TraceHttpConfig {
+            TraceHttpConfig {
+                enabled,
+                journal_max_bytes: 1024,
+                journal_max_events: 16,
+                artifact_max_bytes: 1024,
+                max_task_turns: 4,
+            }
+        }
+
+        async fn seed_turn(
+            store: &MemoryTaskStore,
+            turn_id: &str,
+            session_id: &str,
+            task_id: Option<&str>,
+        ) {
+            let ctx = TurnContext {
+                turn_id: bridge_core::ids::TurnId::parse(turn_id).unwrap(),
+                session_id: ContextId::parse(session_id).unwrap(),
+                task_id: task_id.map(|t| TaskId::parse(t).unwrap()),
+                workflow: Some("code-review".into()),
+                node: Some("reviewer".into()),
+                attempt: 2,
+                agent: "codex".into(),
+                model: Some("gpt-5.5".into()),
+                effort: Some("high".into()),
+                mode: Some("default".into()),
+                prompt_id: Some("prompt/eval".into()),
+                traceparent: TraceParent::parse_header_value(
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                ),
+            };
+            store
+                .upsert_turn_finished(&TurnLogFinished {
+                    ctx: ctx.clone(),
+                    started_ms: 90,
+                    completed_ms: 100,
+                    latency: Duration::from_millis(10),
+                    ttft: Some(Duration::from_millis(3)),
+                    outcome: TurnOutcome::Success,
+                })
+                .await
+                .unwrap();
+            store
+                .update_turn_usage(&TurnLogUsage {
+                    ctx,
+                    usage: UsageSnapshot {
+                        used: None,
+                        size: None,
+                        cost: Some(UsageCost {
+                            amount: 0.42,
+                            currency: "USD".into(),
+                        }),
+                        terminal: Some(TerminalUsage {
+                            total_tokens: 99,
+                            input_tokens: 7,
+                            output_tokens: 11,
+                            thought_tokens: None,
+                            cached_read_tokens: None,
+                            cached_write_tokens: None,
+                        }),
+                        at_ms: 100,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn trace_routes_404_when_disabled_even_without_bearer() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(false));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn trace_routes_require_bearer_when_enabled() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::WWW_AUTHENTICATE)
+                    .unwrap(),
+                "Bearer"
+            );
+        }
+
+        #[tokio::test]
+        async fn trace_routes_reject_bad_bearer() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let srv = build_with_task_store_and_trace(store, Arc::new(RejectAuth), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .header("authorization", "Bearer bad")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn turn_route_returns_json_turn_log_row() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-a", "ctx-a", Some("task-a")).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                "application/json"
+            );
+            let body = body_string(resp).await;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["turn_id"], "turn-a");
+            assert_eq!(value["task_id"], "task-a");
+            assert_eq!(value["input_tokens"], 7);
+            assert_eq!(value["cost_currency"], "USD");
+            assert_eq!(
+                value["traceparent"],
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_route_returns_warm_turn_row() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-warm", "ctx-warm", None).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-warm")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["turn_id"], "turn-warm");
+            assert!(value["task_id"].is_null());
         }
     }
 
