@@ -714,6 +714,8 @@ fn build_coordinator(
     batch: Option<bridge_coordinator::BatchRuntime>,
     observer: Arc<dyn bridge_core::ports::Observer>,
     resume_cap: u32,
+    trace_refs_enabled: bool,
+    max_task_turns: usize,
     perm_registry: Arc<PermissionRegistry>,
 ) -> Arc<bridge_coordinator::Coordinator> {
     Arc::new(
@@ -731,6 +733,7 @@ fn build_coordinator(
             observer,
             resume_cap,
         )
+        .with_trace_refs_config(trace_refs_enabled, max_task_turns)
         .with_permission_registry(perm_registry),
     )
 }
@@ -4859,6 +4862,8 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         batch,
         observer,
         resume_cap,
+        false,
+        512,
         Arc::clone(&perm_registry),
     );
 
@@ -6230,6 +6235,8 @@ async fn main() -> Result<(), BoxError> {
         batch,
         Arc::clone(&observer),
         resume_cap,
+        traces_cfg.enabled,
+        traces_cfg.max_task_turns,
         Arc::clone(&perm_registry),
     );
 
