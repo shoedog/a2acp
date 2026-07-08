@@ -843,15 +843,23 @@ fn trace_json_response(status: StatusCode, body: serde_json::Value) -> Response 
     response
 }
 
-fn trace_too_large_response(kind: &'static str, bytes: u64, events: Option<u64>) -> Response {
-    trace_json_response(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        serde_json::json!({
-            "error": "trace payload too large",
-            "kind": kind,
-            "bytes": bytes,
-            "events": events,
-        }),
+/// Returns the 413 response AND its serialized JSON body length, so the audit line
+/// records the real response size rather than 0.
+fn trace_too_large_response(
+    kind: &'static str,
+    bytes: u64,
+    events: Option<u64>,
+) -> (Response, usize) {
+    let body = serde_json::json!({
+        "error": "trace payload too large",
+        "kind": kind,
+        "bytes": bytes,
+        "events": events,
+    });
+    let body_len = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
+    (
+        trace_json_response(StatusCode::PAYLOAD_TOO_LARGE, body),
+        body_len,
     )
 }
 
@@ -1169,7 +1177,7 @@ async fn task_journal_jsonl(
             response
         }
         Ok(bridge_core::task_store::JournalRead::TooLarge { events, bytes }) => {
-            let response = trace_too_large_response("journal", bytes, Some(events));
+            let (response, body_len) = trace_too_large_response("journal", bytes, Some(events));
             audit_trace_fetch(
                 &caller,
                 "task_journal_jsonl",
@@ -1177,7 +1185,7 @@ async fn task_journal_jsonl(
                 None,
                 None,
                 StatusCode::PAYLOAD_TOO_LARGE,
-                0,
+                body_len,
             );
             response
         }
@@ -1338,7 +1346,7 @@ async fn task_artifact(
             response
         }
         Ok(Some(bridge_core::task_store::NodeCheckpointOutput::TooLarge { bytes })) => {
-            let response = trace_too_large_response("artifact", bytes, None);
+            let (response, body_len) = trace_too_large_response("artifact", bytes, None);
             audit_trace_fetch(
                 &caller,
                 "task_artifact",
@@ -1346,7 +1354,7 @@ async fn task_artifact(
                 None,
                 Some(node.as_str()),
                 StatusCode::PAYLOAD_TOO_LARGE,
-                0,
+                body_len,
             );
             response
         }
@@ -6284,10 +6292,13 @@ mod tests {
                 .json()
                 .with_writer(move || SharedLogWriter(writer_logs.clone()))
                 .finish();
-            // Scoped to THIS test thread (current-thread runtime) — a process-global
-            // subscriber can contaminate later tests or silently fail to install if
-            // another test set the global default first.
-            let _guard = tracing::subscriber::set_default(subscriber);
+            // MUST be set_global_default, not the thread-local set_default: the many other
+            // trace-route tests call `audit_trace_fetch` with no subscriber, which caches the
+            // `trace_fetch` callsite's interest as disabled process-wide. Only setting a GLOBAL
+            // default rebuilds that interest cache; a thread-local set_default leaves the callsite
+            // cached-off and the event is never captured under parallel test execution.
+            // This test is the sole global-subscriber setter in the crate, so first-call-wins holds.
+            let _global_default = tracing::subscriber::set_global_default(subscriber);
 
             let ok = router(srv.clone())
                 .oneshot(
