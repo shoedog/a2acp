@@ -684,6 +684,13 @@ fn batch_runtime(
     }))
 }
 
+fn turn_log_observer_enabled(
+    metrics_cfg: &config::MetricsConfig,
+    traces_cfg: &config::TracesConfig,
+) -> bool {
+    traces_cfg.enabled || (metrics_cfg.enabled && metrics_cfg.turn_log)
+}
+
 /// #10 slice 7 (refinement b): the ONE Coordinator construction shape, shared by the
 /// `serve` and `mcp` entry points. They differ ONLY in `allowed_cwd_root` — serve passes
 /// `None` (the wire cwd-gate stays on the adapter's `Option<String>` root; wiring the real
@@ -6083,6 +6090,7 @@ async fn main() -> Result<(), BoxError> {
         };
 
     let metrics_cfg = cfg.metrics_config()?;
+    let traces_cfg = cfg.traces_config()?;
     let prometheus_observer = if metrics_cfg.enabled && metrics_cfg.prometheus {
         let vocab = bridge_observ::LabelVocabulary {
             agents: probe_entries
@@ -6120,36 +6128,38 @@ async fn main() -> Result<(), BoxError> {
         Arc::new(bridge_observ::TurnDedupe::default())
     };
 
-    let observer: Arc<dyn bridge_core::ports::Observer> = if !metrics_cfg.enabled {
-        Arc::new(bridge_observ::NoopObserver)
-    } else {
-        let mut sinks: Vec<Arc<dyn bridge_core::ports::Observer>> = Vec::new();
-        if let Some(prom) = &prometheus_observer {
-            sinks.push(prom.clone());
-        }
-        if metrics_cfg.turn_log {
-            let dropped = prometheus_observer
-                .as_ref()
-                .map(|p| p.drop_counter())
-                .unwrap_or_else(bridge_observ::DropCounter::disabled);
-            sinks.push(Arc::new(bridge_observ::TurnLogObserver::new(
-                task_store.clone(),
-                dropped,
-                1024,
-                Arc::new(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as i64
-                }),
-            )));
-        }
+    let install_turn_log = turn_log_observer_enabled(&metrics_cfg, &traces_cfg);
+    let observer: Arc<dyn bridge_core::ports::Observer> =
+        if !metrics_cfg.enabled && !install_turn_log {
+            Arc::new(bridge_observ::NoopObserver)
+        } else {
+            let mut sinks: Vec<Arc<dyn bridge_core::ports::Observer>> = Vec::new();
+            if let Some(prom) = &prometheus_observer {
+                sinks.push(prom.clone());
+            }
+            if install_turn_log {
+                let dropped = prometheus_observer
+                    .as_ref()
+                    .map(|p| p.drop_counter())
+                    .unwrap_or_else(bridge_observ::DropCounter::disabled);
+                sinks.push(Arc::new(bridge_observ::TurnLogObserver::new(
+                    task_store.clone(),
+                    dropped,
+                    1024,
+                    Arc::new(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64
+                    }),
+                )));
+            }
 
-        Arc::new(bridge_observ::DedupObserver::new_with_dedupe(
-            Arc::new(bridge_observ::FanoutObserver::new(sinks)),
-            dedupe,
-        ))
-    };
+            Arc::new(bridge_observ::DedupObserver::new_with_dedupe(
+                Arc::new(bridge_observ::FanoutObserver::new(sinks)),
+                dedupe,
+            ))
+        };
 
     // 7b. advertise-models: probe each agent's advertised model/effort/mode catalog HOST-SIDE before the
     //     first card is served (bounded + degrade-per-agent; spec §5). Held behind an `ArcSwap` the card
@@ -6240,6 +6250,13 @@ async fn main() -> Result<(), BoxError> {
         )
         .with_allowed_cwd_root(cfg.allowed_cwd_root.clone())
         .with_model_catalog(Arc::clone(&model_catalog))
+        .with_trace_http_config(bridge_a2a_inbound::server::TraceHttpConfig {
+            enabled: traces_cfg.enabled,
+            journal_max_bytes: traces_cfg.journal_max_bytes,
+            journal_max_events: traces_cfg.journal_max_events,
+            artifact_max_bytes: traces_cfg.artifact_max_bytes,
+            max_task_turns: traces_cfg.max_task_turns,
+        })
         .with_metrics_endpoint(prometheus_observer.as_ref().map(|p| p.endpoint())),
     );
 
@@ -6291,6 +6308,60 @@ async fn main() -> Result<(), BoxError> {
 mod cli_tests {
     use super::*;
     use crate::turn::TurnRunner;
+
+    #[test]
+    fn turn_log_observer_enabled_for_traces_even_without_metrics() {
+        let metrics = config::MetricsConfig {
+            enabled: false,
+            prometheus: false,
+            turn_log: false,
+        };
+        let traces = config::TracesConfig {
+            enabled: true,
+            journal_max_bytes: 16,
+            journal_max_events: 16,
+            artifact_max_bytes: 16,
+            max_task_turns: 2,
+        };
+
+        assert!(turn_log_observer_enabled(&metrics, &traces));
+    }
+
+    #[test]
+    fn turn_log_observer_enabled_for_metrics_turn_log_without_traces() {
+        let metrics = config::MetricsConfig {
+            enabled: true,
+            prometheus: true,
+            turn_log: true,
+        };
+        let traces = config::TracesConfig {
+            enabled: false,
+            journal_max_bytes: 16,
+            journal_max_events: 16,
+            artifact_max_bytes: 16,
+            max_task_turns: 2,
+        };
+
+        assert!(turn_log_observer_enabled(&metrics, &traces));
+    }
+
+    #[test]
+    fn turn_log_observer_disabled_when_neither_surface_needs_rows() {
+        let metrics = config::MetricsConfig {
+            enabled: true,
+            prometheus: true,
+            turn_log: false,
+        };
+        let traces = config::TracesConfig {
+            enabled: false,
+            journal_max_bytes: 16,
+            journal_max_events: 16,
+            artifact_max_bytes: 16,
+            max_task_turns: 2,
+        };
+
+        assert!(!turn_log_observer_enabled(&metrics, &traces));
+    }
 
     /// B2 (T-B1): `run_blocking` must run its closure OFF the runtime worker. On a current-thread
     /// runtime (the `#[tokio::test]` default), a ticker on the single worker can only advance while

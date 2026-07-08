@@ -116,6 +116,57 @@ impl Default for MetricsToml {
     }
 }
 
+fn default_journal_max_bytes() -> usize {
+    16_777_216
+}
+
+fn default_journal_max_events() -> usize {
+    100_000
+}
+
+fn default_artifact_max_bytes() -> usize {
+    4_194_304
+}
+
+fn default_max_task_turns() -> usize {
+    512
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TracesToml {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_journal_max_bytes")]
+    pub journal_max_bytes: usize,
+    #[serde(default = "default_journal_max_events")]
+    pub journal_max_events: usize,
+    #[serde(default = "default_artifact_max_bytes")]
+    pub artifact_max_bytes: usize,
+    #[serde(default = "default_max_task_turns")]
+    pub max_task_turns: usize,
+}
+
+impl Default for TracesToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            journal_max_bytes: default_journal_max_bytes(),
+            journal_max_events: default_journal_max_events(),
+            artifact_max_bytes: default_artifact_max_bytes(),
+            max_task_turns: default_max_task_turns(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracesConfig {
+    pub enabled: bool,
+    pub journal_max_bytes: usize,
+    pub journal_max_events: usize,
+    pub artifact_max_bytes: usize,
+    pub max_task_turns: usize,
+}
+
 /// Expand `${VAR_NAME}` placeholders in `s` using `std::env::var`.
 /// Returns `Err(ConfigError::MissingEnvVar)` if any referenced variable is unset.
 fn expand_env(s: &str) -> Result<String, ConfigError> {
@@ -194,6 +245,8 @@ pub struct RegistryConfig {
     pub worktrees: Option<WorktreesToml>,
     #[serde(default)]
     pub metrics: MetricsToml,
+    #[serde(default)]
+    pub traces: TracesToml,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1128,6 +1181,30 @@ impl RegistryConfig {
         })
     }
 
+    pub fn traces_config(&self) -> Result<TracesConfig, ConfigError> {
+        let limits = [
+            ("journal_max_bytes", self.traces.journal_max_bytes),
+            ("journal_max_events", self.traces.journal_max_events),
+            ("artifact_max_bytes", self.traces.artifact_max_bytes),
+            ("max_task_turns", self.traces.max_task_turns),
+        ];
+        for (name, value) in limits {
+            if value == 0 {
+                return Err(ConfigError::Registry(format!(
+                    "[traces].{name} must be > 0"
+                )));
+            }
+        }
+
+        Ok(TracesConfig {
+            enabled: self.traces.enabled,
+            journal_max_bytes: self.traces.journal_max_bytes,
+            journal_max_events: self.traces.journal_max_events,
+            artifact_max_bytes: self.traces.artifact_max_bytes,
+            max_task_turns: self.traces.max_task_turns,
+        })
+    }
+
     pub fn language_profiles(
         &self,
     ) -> Result<Vec<bridge_core::profile::LanguageProfile>, ConfigError> {
@@ -1704,6 +1781,67 @@ mod metrics_config_tests {
         .unwrap();
         let err = cfg.metrics_config().unwrap_err().to_string();
         assert!(err.contains("unsupported [metrics].exporters"));
+    }
+}
+
+#[cfg(test)]
+mod traces_config_tests {
+    use super::*;
+
+    const BASE: &str = r#"
+default = "codex"
+[server]
+addr = "127.0.0.1:0"
+[[agents]]
+id = "codex"
+cmd = "codex"
+"#;
+
+    #[test]
+    fn traces_config_defaults_disabled() {
+        let cfg = RegistryConfig::parse(BASE).unwrap();
+        let traces = cfg.traces_config().unwrap();
+
+        assert!(!traces.enabled);
+        assert_eq!(traces.journal_max_bytes, 16_777_216);
+        assert_eq!(traces.journal_max_events, 100_000);
+        assert_eq!(traces.artifact_max_bytes, 4_194_304);
+        assert_eq!(traces.max_task_turns, 512);
+    }
+
+    #[test]
+    fn traces_config_rejects_zero_limits() {
+        for key in [
+            "journal_max_bytes",
+            "journal_max_events",
+            "artifact_max_bytes",
+            "max_task_turns",
+        ] {
+            let raw = format!("{BASE}\n[traces]\nenabled = true\n{key} = 0\n");
+            let err = RegistryConfig::parse(&raw)
+                .unwrap()
+                .traces_config()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("[traces]") && err.contains(key) && err.contains("> 0"),
+                "unexpected error for {key}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn traces_config_independent_from_metrics() {
+        let raw = format!(
+            "{BASE}\n[metrics]\nenabled = false\nturn_log = false\n[traces]\nenabled = true\n"
+        );
+        let cfg = RegistryConfig::parse(&raw).unwrap();
+        let metrics = cfg.metrics_config().unwrap();
+        let traces = cfg.traces_config().unwrap();
+
+        assert!(!metrics.enabled);
+        assert!(!metrics.turn_log);
+        assert!(traces.enabled);
     }
 }
 

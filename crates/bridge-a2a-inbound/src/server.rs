@@ -73,6 +73,27 @@ const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error.
 const JSONRPC_INTERNAL: i32 = -32603;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceHttpConfig {
+    pub enabled: bool,
+    pub journal_max_bytes: usize,
+    pub journal_max_events: usize,
+    pub artifact_max_bytes: usize,
+    pub max_task_turns: usize,
+}
+
+impl Default for TraceHttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            journal_max_bytes: 16_777_216,
+            journal_max_events: 100_000,
+            artifact_max_bytes: 4_194_304,
+            max_task_turns: 512,
+        }
+    }
+}
+
 /// The inbound A2A server. A thin adapter over the ONE [`Coordinator`], which owns
 /// all turn-lifecycle STATE (registry / policy / stores / session-manager / workflow
 /// maps / batch). This struct keeps only the ADAPTER-resident wire state (route/auth/
@@ -114,6 +135,7 @@ pub struct InboundServer {
     pub model_catalog: Arc<arc_swap::ArcSwap<bridge_core::catalog::ModelCatalog>>,
     /// Optional endpoint used by `GET /metrics` for Prometheus exposition.
     metrics_endpoint: Option<bridge_observ::MetricsEndpoint>,
+    trace_config: TraceHttpConfig,
     /// #10: the ONE `Coordinator` that owns turn-lifecycle STATE. MANDATORY (slice 7):
     /// A2A is a co-equal adapter over the SAME state instances the CLI/MCP surfaces
     /// use. Every shared-state read routes through the forwarders below, which borrow
@@ -153,6 +175,7 @@ impl InboundServer {
                 bridge_core::catalog::ModelCatalog::new(),
             )),
             metrics_endpoint: None,
+            trace_config: TraceHttpConfig::default(),
             coordinator,
         }
     }
@@ -187,6 +210,12 @@ impl InboundServer {
         endpoint: Option<bridge_observ::MetricsEndpoint>,
     ) -> Self {
         self.metrics_endpoint = endpoint;
+        self
+    }
+
+    #[must_use]
+    pub fn with_trace_http_config(mut self, config: TraceHttpConfig) -> Self {
+        self.trace_config = config;
         self
     }
 
@@ -4698,6 +4727,17 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[test]
+        fn trace_http_config_defaults_disabled() {
+            let cfg = TraceHttpConfig::default();
+
+            assert!(!cfg.enabled);
+            assert_eq!(cfg.journal_max_bytes, 16_777_216);
+            assert_eq!(cfg.journal_max_events, 100_000);
+            assert_eq!(cfg.artifact_max_bytes, 4_194_304);
+            assert_eq!(cfg.max_task_turns, 512);
         }
     }
 
