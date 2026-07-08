@@ -55,6 +55,7 @@ use bridge_workflow::executor::{
 };
 use bridge_workflow::graph::WorkflowNode;
 
+use bridge_coordinator::coordinator::StatusDto;
 use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
 use bridge_coordinator::params::{validate_cwd_str, InjectParams, PermitParams};
 use bridge_coordinator::turn_parts::assemble_turn_parts;
@@ -3645,15 +3646,13 @@ async fn session_status(
     if let Err(e) = authorize_headers(&srv, &headers) {
         return bridge_err_to_jsonrpc(id, &e);
     }
-    let sm = srv.session_manager().clone();
     let ctx = match context_id_arg(&params) {
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    match sm.status(&ctx).await {
-        Some(s) => jsonrpc_ok(
-            id,
-            json!({
+    match srv.coordinator().status(Some(ctx.clone()), None).await {
+        Ok(StatusDto::Session(s)) => {
+            let mut result = json!({
                 "contextId": ctx.as_str(),
                 "state": s.state,
                 "agent": s.agent,
@@ -3669,7 +3668,13 @@ async fn session_status(
                 "usage": {
                     "used": s.usage.used,
                     "size": s.usage.size,
-                    "windowFraction": s.window_fraction(),
+                    "windowFraction": srv
+                        .coordinator()
+                        .session_manager
+                        .status(&ctx)
+                        .await
+                        .and_then(|info| info.window_fraction())
+                        .unwrap_or(0.0),
                     "overThreshold": s.over_threshold,
                     "cost": s.usage.cost.as_ref().map(|c| serde_json::json!({
                         "amount": c.amount, "currency": c.currency
@@ -3680,9 +3685,16 @@ async fn session_status(
                     .as_ref()
                     .map(|r| r.pending(&ctx))
                     .unwrap_or_default(),
-            }),
-        ),
-        None => bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound),
+            });
+            if let Some(trace) = s.trace {
+                result["trace"] = serde_json::to_value(trace).expect("TraceRefs serializes");
+            }
+            jsonrpc_ok(id, result)
+        }
+        Ok(StatusDto::Task(_)) => {
+            bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "contextId" })
+        }
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
 }
 
@@ -5313,6 +5325,7 @@ mod tests {
             MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinished, TurnLogUsage,
         };
         use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+        use std::io::Write;
         use std::time::Duration;
 
         fn build_with_task_store_and_trace(
@@ -5973,6 +5986,340 @@ mod tests {
                 .unwrap();
 
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn task_status_includes_usage_and_trace_refs() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-status").unwrap();
+            store
+                .create(&working_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            seed_turn(&store, "turn-status", "ctx-status", Some(task.as_str())).await;
+            store
+                .put_node_checkpoint(
+                    &task,
+                    &NodeId::parse("reviewer").unwrap(),
+                    "artifact",
+                    true,
+                    10,
+                )
+                .await
+                .unwrap();
+
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+            let status = srv.coordinator().status(None, Some(task)).await.unwrap();
+
+            match status {
+                StatusDto::Task(dto) => {
+                    assert!(dto.usage.is_some());
+                    let trace = dto.trace.unwrap();
+                    assert_eq!(trace.journal.unwrap(), "/tasks/task-status/journal.jsonl");
+                    assert_eq!(trace.turns.unwrap(), vec!["/turns/turn-status"]);
+                    assert_eq!(
+                        trace.artifacts.unwrap().get("reviewer").unwrap(),
+                        "/tasks/task-status/artifacts/reviewer"
+                    );
+                }
+                StatusDto::Session(_) => panic!("expected task status"),
+            }
+        }
+
+        #[tokio::test]
+        async fn task_status_usage_present_when_traces_disabled() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-status-no-trace").unwrap();
+            store
+                .create(&working_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            seed_turn(
+                &store,
+                "turn-status-no-trace",
+                "ctx-status",
+                Some(task.as_str()),
+            )
+            .await;
+
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(false));
+            let status = srv.coordinator().status(None, Some(task)).await.unwrap();
+
+            match status {
+                StatusDto::Task(dto) => {
+                    assert!(dto.usage.is_some());
+                    assert!(dto.trace.is_none());
+                }
+                StatusDto::Session(_) => panic!("expected task status"),
+            }
+        }
+
+        #[tokio::test]
+        async fn usage_uncapped_beyond_max_task_turns() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-uncapped").unwrap();
+            store
+                .create(&working_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            for i in 0..5 {
+                seed_turn(
+                    &store,
+                    &format!("turn-uncapped-{i}"),
+                    "ctx-uncapped",
+                    Some(task.as_str()),
+                )
+                .await;
+            }
+
+            let mut cfg = trace_cfg(true);
+            cfg.max_task_turns = 2;
+            let srv = build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), cfg);
+            let status = srv.coordinator().status(None, Some(task)).await.unwrap();
+
+            match status {
+                StatusDto::Task(dto) => {
+                    assert_eq!(dto.trace.unwrap().turns.unwrap().len(), 2);
+                    assert_eq!(dto.usage.unwrap().terminal.unwrap().input_tokens, 35);
+                }
+                StatusDto::Session(_) => panic!("expected task status"),
+            }
+        }
+
+        async fn ensure_idle_session(srv: &Arc<InboundServer>, ctx: &ContextId) {
+            for _ in 0..50 {
+                if matches!(
+                    srv.coordinator()
+                        .session_manager
+                        .status(ctx)
+                        .await
+                        .as_ref()
+                        .map(|s| s.state),
+                    Some("idle")
+                ) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn warm_session_for_trace(srv: &Arc<InboundServer>, ctx: &ContextId) {
+            let _ = router(srv.clone())
+                .oneshot(post_request(
+                    methods::SEND_MESSAGE,
+                    json!({
+                        "message": {
+                            "contextId": ctx.as_str(),
+                            "text": "warm turn",
+                            "metadata": { "a2a-bridge.agent": "kiro" }
+                        }
+                    }),
+                    "1.0",
+                ))
+                .await
+                .unwrap();
+            ensure_idle_session(srv, ctx).await;
+        }
+
+        #[tokio::test]
+        async fn session_status_includes_latest_warm_turn_trace_ref() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-warm-latest", "ctx-warm-status", None).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+            let ctx = ContextId::parse("ctx-warm-status").unwrap();
+
+            warm_session_for_trace(&srv, &ctx).await;
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/")
+                        .header("content-type", "application/json")
+                        .header(SVC_PARAM_VERSION, A2A_PINNED_VERSION)
+                        .header("authorization", "Bearer ok")
+                        .body(jsonrpc_body(
+                            "SessionStatus",
+                            json!({ "contextId": "ctx-warm-status" }),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["result"]["trace"]["turn"], "/turns/turn-warm-latest");
+        }
+
+        #[tokio::test]
+        async fn session_status_omits_trace_when_traces_disabled() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-warm-disabled", "ctx-warm-disabled", None).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(false));
+            let ctx = ContextId::parse("ctx-warm-disabled").unwrap();
+
+            warm_session_for_trace(&srv, &ctx).await;
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/")
+                        .header("content-type", "application/json")
+                        .header(SVC_PARAM_VERSION, A2A_PINNED_VERSION)
+                        .header("authorization", "Bearer ok")
+                        .body(jsonrpc_body(
+                            "SessionStatus",
+                            json!({ "contextId": "ctx-warm-disabled" }),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(value["result"].get("trace").is_none());
+        }
+
+        #[tokio::test]
+        async fn metrics_and_traces_independent() {
+            let store = Arc::new(MemoryTaskStore::new());
+
+            let metrics_only = Arc::new(
+                Arc::into_inner(build_with_task_store_and_trace(
+                    store.clone(),
+                    Arc::new(AlwaysGrant),
+                    trace_cfg(false),
+                ))
+                .expect("unique server arc")
+                .with_metrics_endpoint(Some(
+                    bridge_observ::PrometheusObserver::new(
+                        bridge_observ::LabelVocabulary::default(),
+                    )
+                    .unwrap()
+                    .endpoint(),
+                )),
+            );
+
+            let metrics_resp = router(metrics_only.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(metrics_resp.status(), StatusCode::UNAUTHORIZED);
+
+            let trace_resp = router(metrics_only)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(trace_resp.status(), StatusCode::NOT_FOUND);
+
+            let traces_only =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+            let trace_resp = router(traces_only.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(trace_resp.status(), StatusCode::UNAUTHORIZED);
+
+            let metrics_resp = router(traces_only)
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(metrics_resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[derive(Clone)]
+        struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for SharedLogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn trace_routes_audit_success_and_failure() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-audit", "ctx-audit", Some("task-audit")).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer_logs = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::level_filters::LevelFilter::TRACE)
+                .json()
+                .with_writer(move || SharedLogWriter(writer_logs.clone()))
+                .finish();
+            // Scoped to THIS test thread (current-thread runtime) — a process-global
+            // subscriber can contaminate later tests or silently fail to install if
+            // another test set the global default first.
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let ok = router(srv.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-audit")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+
+            let missing = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/missing-audit")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+            let log_text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+            assert!(log_text.contains("\"message\":\"trace_fetch\""));
+            assert!(log_text.contains("\"route\":\"turn_row\""));
+            assert!(log_text.contains("\"turn_id\":\"turn-audit\""));
+            assert!(log_text.contains("\"status\":200"));
+            assert!(log_text.contains("\"status\":404"));
+            assert!(!log_text.contains("Bearer ok"));
         }
 
         #[tokio::test]
