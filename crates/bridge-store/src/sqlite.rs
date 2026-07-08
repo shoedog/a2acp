@@ -1547,6 +1547,141 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         })
     }
 
+    async fn journal_jsonl_bounded(
+        &self,
+        task: &TaskId,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<bridge_core::task_store::JournalRead, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| BridgeError::StoreFailure)?;
+
+        let (events, bytes): (i64, i64) = tx
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(event_json AS BLOB))+1),0)
+                 FROM task_journal WHERE task_id=?1",
+                rusqlite::params![task.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+
+        if events as usize > max_events || bytes as usize > max_bytes {
+            tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+            return Ok(bridge_core::task_store::JournalRead::TooLarge {
+                events: events as u64,
+                bytes: bytes as u64,
+            });
+        }
+
+        let jsonl = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT seq, event_json FROM task_journal
+                 WHERE task_id=?1 ORDER BY seq",
+                )
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut rows = stmt
+                .query(rusqlite::params![task.as_str()])
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut out = String::with_capacity(bytes as usize);
+            while let Some(row) = rows.next().map_err(|_| BridgeError::StoreFailure)? {
+                let event_json: String = row.get(1).map_err(|_| BridgeError::StoreFailure)?;
+                out.push_str(&event_json);
+                out.push('\n');
+            }
+            out
+        };
+
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+        Ok(bridge_core::task_store::JournalRead::Body {
+            jsonl,
+            events: events as u64,
+            bytes: bytes as u64,
+        })
+    }
+
+    async fn node_checkpoint_nodes(&self, task: &TaskId) -> Result<Vec<NodeId>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT node_id FROM task_node_checkpoints
+                 WHERE task_id=?1 ORDER BY COALESCE(seq, 0), ts, node_id",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+
+        let nodes = stmt
+            .query_map(rusqlite::params![task.as_str()], |row| {
+                let raw: String = row.get(0)?;
+                NodeId::parse(raw).map_err(|_| rusqlite::Error::InvalidQuery)
+            })
+            .map_err(|_| BridgeError::StoreFailure)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| BridgeError::StoreFailure)?;
+
+        Ok(nodes)
+    }
+
+    async fn node_checkpoint_output(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        max_bytes: usize,
+    ) -> Result<Option<bridge_core::task_store::NodeCheckpointOutput>, BridgeError> {
+        // Saturate to i64::MAX: SQLite binds i64, and `max_bytes as i64` would wrap a huge
+        // configured cap (usize near/above i64::MAX) to a negative value, making the
+        // `<= ?3` gate reject every artifact. `[traces].artifact_max_bytes` only rejects 0.
+        let max_bytes_i64 = i64::try_from(max_bytes).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT
+                (CASE WHEN length(CAST(output AS BLOB)) <= ?3 THEN output END),
+                ok,
+                usage_json,
+                length(CAST(output AS BLOB))
+             FROM task_node_checkpoints
+             WHERE task_id=?1 AND node_id=?2",
+                rusqlite::params![task.as_str(), node.as_str(), max_bytes_i64],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| BridgeError::StoreFailure)?;
+
+        let Some((output, ok, usage_json, bytes)) = row else {
+            return Ok(None);
+        };
+
+        if output.is_none() {
+            return Ok(Some(
+                bridge_core::task_store::NodeCheckpointOutput::TooLarge {
+                    bytes: bytes as u64,
+                },
+            ));
+        }
+
+        let usage = usage_json
+            .as_deref()
+            .map(serde_json::from_str::<bridge_core::orch::UsageSnapshot>)
+            .transpose()
+            .map_err(|_| BridgeError::StoreFailure)?;
+
+        Ok(Some(bridge_core::task_store::NodeCheckpointOutput::Found {
+            output: output.unwrap(),
+            ok: ok != 0,
+            usage,
+            bytes: bytes as u64,
+        }))
+    }
+
     async fn progress_snapshot(
         &self,
         task: &TaskId,
@@ -2448,6 +2583,220 @@ mod tests {
     #[tokio::test]
     async fn memory_rich_event() {
         rich_event_journals(bridge_core::task_store::MemoryTaskStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_jsonl_bounded_body_and_counts() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let task = TaskId::parse("task-journal").unwrap();
+        let op = OperationId::parse("op-journal").unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+
+        store
+            .record_event_sequenced(
+                &task,
+                &op,
+                10,
+                bridge_core::orch::OrchEventKind::Progress { text: "one".into() },
+            )
+            .await
+            .unwrap();
+        store
+            .record_event_sequenced(
+                &task,
+                &op,
+                11,
+                bridge_core::orch::OrchEventKind::Progress { text: "two".into() },
+            )
+            .await
+            .unwrap();
+
+        let read = store
+            .journal_jsonl_bounded(&task, 10, 10_000)
+            .await
+            .unwrap();
+
+        match read {
+            bridge_core::task_store::JournalRead::Body {
+                jsonl,
+                events,
+                bytes,
+            } => {
+                assert_eq!(events, 2);
+                assert_eq!(bytes as usize, jsonl.len());
+                assert!(jsonl.ends_with('\n'));
+                let parsed = jsonl
+                    .lines()
+                    .map(|line| serde_json::from_str::<bridge_core::orch::OrchEvent>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(parsed.len(), 2);
+                assert_eq!(parsed[0].seq, 1);
+                assert_eq!(parsed[1].seq, 2);
+            }
+            other => panic!("expected body, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_jsonl_bounded_too_large_over_events() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let task = TaskId::parse("task-journal").unwrap();
+        let op = OperationId::parse("op-journal").unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+        store
+            .record_event_sequenced(
+                &task,
+                &op,
+                10,
+                bridge_core::orch::OrchEventKind::Progress { text: "one".into() },
+            )
+            .await
+            .unwrap();
+        store
+            .record_event_sequenced(
+                &task,
+                &op,
+                11,
+                bridge_core::orch::OrchEventKind::Progress { text: "two".into() },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.journal_jsonl_bounded(&task, 1, 10_000).await.unwrap(),
+            bridge_core::task_store::JournalRead::TooLarge { events: 2, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_jsonl_bounded_too_large_over_bytes() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let task = TaskId::parse("task-journal").unwrap();
+        let op = OperationId::parse("op-journal").unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+        store
+            .record_event_sequenced(
+                &task,
+                &op,
+                10,
+                bridge_core::orch::OrchEventKind::Progress { text: "one".into() },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.journal_jsonl_bounded(&task, 10, 1).await.unwrap(),
+            bridge_core::task_store::JournalRead::TooLarge { events: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_node_checkpoint_nodes_metadata_only() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let task = TaskId::parse("task-artifact").unwrap();
+        let op = OperationId::parse("op-artifact").unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+
+        store
+            .put_node_checkpoint(
+                &task,
+                &NodeId::parse("legacy").unwrap(),
+                "legacy output",
+                true,
+                10,
+            )
+            .await
+            .unwrap();
+        store
+            .put_node_checkpoint_sequenced(
+                &task,
+                &NodeId::parse("later").unwrap(),
+                &op,
+                "later output",
+                true,
+                11,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let nodes = store.node_checkpoint_nodes(&task).await.unwrap();
+
+        assert_eq!(
+            nodes.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+            vec!["legacy", "later"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_node_checkpoint_output_too_large_single_statement() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let task = TaskId::parse("task-artifact").unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+        store
+            .put_node_checkpoint(&task, &NodeId::parse("node-a").unwrap(), "abcdef", true, 10)
+            .await
+            .unwrap();
+
+        let found = store
+            .node_checkpoint_output(&task, &NodeId::parse("node-a").unwrap(), 6)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found,
+            bridge_core::task_store::NodeCheckpointOutput::Found {
+                output: "abcdef".into(),
+                ok: true,
+                usage: None,
+                bytes: 6
+            }
+        );
+
+        let too_large = store
+            .node_checkpoint_output(&task, &NodeId::parse("node-a").unwrap(), 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            too_large,
+            bridge_core::task_store::NodeCheckpointOutput::TooLarge { bytes: 6 }
+        );
+
+        assert!(store
+            .node_checkpoint_output(&task, &NodeId::parse("missing").unwrap(), 5)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_node_checkpoint_output_huge_cap_does_not_wrap_negative() {
+        // Regression: `max_bytes as i64` would wrap usize::MAX to -1, making the
+        // `<= ?3` gate reject every artifact. Saturating to i64::MAX keeps small
+        // outputs `Found` even under an absurd (config-reachable) cap.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let task = TaskId::parse("task-artifact-huge").unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+        store
+            .put_node_checkpoint(&task, &NodeId::parse("node-a").unwrap(), "a", true, 10)
+            .await
+            .unwrap();
+
+        let found = store
+            .node_checkpoint_output(&task, &NodeId::parse("node-a").unwrap(), usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found,
+            bridge_core::task_store::NodeCheckpointOutput::Found {
+                output: "a".into(),
+                ok: true,
+                usage: None,
+                bytes: 1
+            }
+        );
     }
 
     #[tokio::test]
