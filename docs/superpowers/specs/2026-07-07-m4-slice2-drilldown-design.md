@@ -411,6 +411,14 @@ OTLP exporter; metrics/drill-down UI; list/search routes for turns/journals/arti
 transcript/content redaction; multi-user ACLs/quotas/tenancy; filesystem-backed artifacts; retention
 or tombstone schema (Slice 3); HTTP range / partial responses; a separate bind port for trace routes.
 
+**Surfacing task-level `usage`/`trace` on the A2A `tasks/get` (`GetTask`) response** — deferred by
+owner decision (see Review provenance / whole-branch review). Slice 2 adds the fields to
+`TaskStatusDto` (the contract the spec requires) and surfaces the **session** trace ref via the
+JSON-RPC `SessionStatus` handler; **task** drill-down is reachable via the `/tasks/{id}/journal.jsonl`
+and `/tasks/{id}/artifacts/{node}` routes (a serve client already holds the task id). Wiring the A2A
+`tasks/get` response to carry usage/trace metadata would change the public A2A wire shape (golden-wire
+tripwire) and is a clean **fast-follow**, not part of this slice.
+
 ## Review provenance
 
 - **Architect:** gpt-5.5 (xhigh), read-only against the live branch; every load-bearing anchor
@@ -438,3 +446,13 @@ or tombstone schema (Slice 3); HTTP range / partial responses; a separate bind p
   folded two re-review SMELLs: percent-encode ref segments, and specify
   `terminal.total_tokens = Σinput + Σoutput` (turn_log has no per-turn total column). Verdict after
   fixes: the sole must-fix and both nits are resolved.
+- **Whole-branch review (post-implementation):** gpt-5.5 (xhigh) over the full branch — REVISE,
+  3 WRONG. **Fixed:** (1) the audit test failed under parallel test execution (a per-task fold to a
+  thread-local `set_default` left the `trace_fetch` tracing callsite cached-off; reverted to
+  `set_global_default`, which rebuilds the interest cache); (2) 413 responses audited `bytes=0`
+  despite a nonempty JSON error body (`trace_too_large_response` now returns the body length).
+  **Deferred by owner decision:** (3) A2A `tasks/get` does not surface task usage/trace — recorded as
+  a non-goal above (task drill-down is via the routes + `SessionStatus`; a `GetTask`-metadata wiring
+  is a fast-follow that would change the A2A wire shape). Independently re-verified the whole branch:
+  cross-store (memory/SQLite) behavior aligned for ordering/limits/TooLarge/unbounded usage; `turn_log`
+  single-source reconciliation holds; fmt+clippy+full-suite+`cargo deny` green.
