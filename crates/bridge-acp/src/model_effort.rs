@@ -8,7 +8,7 @@ use bridge_core::catalog::{is_blocked_model_id, AgentCaps};
 use bridge_core::domain::Effort;
 
 /// Static shorthand to advertised-id map, applied before validation.
-pub const MODEL_ALIASES: &[(&str, &str)] = &[("opus", "default")];
+pub const MODEL_ALIASES: &[(&str, &str)] = &[("opus", "default"), ("gpt-5-6-sol", "gpt-5.6-sol")];
 
 pub fn apply_alias(want: &str) -> &str {
     MODEL_ALIASES
@@ -447,6 +447,26 @@ mod tests {
         assert_eq!(
             resolve_model(Some("gpt-5.5"), &["gpt-5.5".to_string()]).unwrap(),
             ModelDecision::Apply("gpt-5.5".into())
+        );
+    }
+
+    #[test]
+    fn hyphenated_gpt_5_6_sol_alias_maps_to_canonical_id() {
+        assert_eq!(
+            resolve_model(Some("gpt-5-6-sol"), &["gpt-5.6-sol".to_string()]).unwrap(),
+            ModelDecision::Apply("gpt-5.6-sol".into())
+        );
+    }
+
+    #[test]
+    fn raw_advertised_hyphenated_gpt_5_6_sol_wins_over_alias() {
+        assert_eq!(
+            resolve_model(
+                Some("gpt-5-6-sol"),
+                &["gpt-5-6-sol".to_string(), "gpt-5.6-sol".to_string()]
+            )
+            .unwrap(),
+            ModelDecision::Apply("gpt-5-6-sol".into())
         );
     }
 
