@@ -22,9 +22,10 @@
 //   cargo test -p a2a-bridge --test e2e_acp_codex -- --ignored --nocapture
 //
 // Prereqs:
-//   * `codex-acp` on PATH (install per its README; e.g. `cargo install codex-acp`
-//     or the project's distribution). Verify it speaks ACP: `codex-acp` should
-//     start an ACP server on stdio.
+//   * Current `codex-acp` on PATH (`npm install -g @agentclientprotocol/codex-acp`).
+//     Do not use the deprecated `@zed-industries/codex-acp` package: its embedded
+//     Codex runtime can be too old for newly advertised models. Verify the installed
+//     command starts an ACP server on stdio.
 //   * For the round-trip test: codex authenticated (a valid login / API key) so
 //     the handshake's `authenticate` succeeds and a real model call can run.
 //   * For the auth-failure test: codex must NOT be authenticated (no valid

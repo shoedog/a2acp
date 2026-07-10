@@ -40,6 +40,17 @@ Pick one:
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
+Codex agents also require the current ACP adapter on `PATH`:
+
+```bash
+npm install -g @agentclientprotocol/codex-acp
+```
+
+The deprecated `@zed-industries/codex-acp` package embeds an older Codex runtime and can advertise
+models that the service then rejects as requiring a newer Codex version. Use the canonical model id
+`gpt-5.6-sol`; the bridge also accepts the common `gpt-5-6-sol` spelling as an alias when the
+canonical id is advertised.
+
 ## Quickstart (5 minutes)
 
 ```bash
