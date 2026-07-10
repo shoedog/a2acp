@@ -23,8 +23,8 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Path, State},
+    http::{header, HeaderMap, StatusCode},
     response::sse::{Event as SseEvent, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -55,6 +55,7 @@ use bridge_workflow::executor::{
 };
 use bridge_workflow::graph::WorkflowNode;
 
+use bridge_coordinator::coordinator::StatusDto;
 use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
 use bridge_coordinator::params::{validate_cwd_str, InjectParams, PermitParams};
 use bridge_coordinator::turn_parts::assemble_turn_parts;
@@ -72,6 +73,27 @@ const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
 const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error.
 const JSONRPC_INTERNAL: i32 = -32603;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceHttpConfig {
+    pub enabled: bool,
+    pub journal_max_bytes: usize,
+    pub journal_max_events: usize,
+    pub artifact_max_bytes: usize,
+    pub max_task_turns: usize,
+}
+
+impl Default for TraceHttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            journal_max_bytes: 16_777_216,
+            journal_max_events: 100_000,
+            artifact_max_bytes: 4_194_304,
+            max_task_turns: 512,
+        }
+    }
+}
 
 /// The inbound A2A server. A thin adapter over the ONE [`Coordinator`], which owns
 /// all turn-lifecycle STATE (registry / policy / stores / session-manager / workflow
@@ -114,6 +136,7 @@ pub struct InboundServer {
     pub model_catalog: Arc<arc_swap::ArcSwap<bridge_core::catalog::ModelCatalog>>,
     /// Optional endpoint used by `GET /metrics` for Prometheus exposition.
     metrics_endpoint: Option<bridge_observ::MetricsEndpoint>,
+    trace_config: TraceHttpConfig,
     /// #10: the ONE `Coordinator` that owns turn-lifecycle STATE. MANDATORY (slice 7):
     /// A2A is a co-equal adapter over the SAME state instances the CLI/MCP surfaces
     /// use. Every shared-state read routes through the forwarders below, which borrow
@@ -153,6 +176,7 @@ impl InboundServer {
                 bridge_core::catalog::ModelCatalog::new(),
             )),
             metrics_endpoint: None,
+            trace_config: TraceHttpConfig::default(),
             coordinator,
         }
     }
@@ -187,6 +211,12 @@ impl InboundServer {
         endpoint: Option<bridge_observ::MetricsEndpoint>,
     ) -> Self {
         self.metrics_endpoint = endpoint;
+        self
+    }
+
+    #[must_use]
+    pub fn with_trace_http_config(mut self, config: TraceHttpConfig) -> Self {
+        self.trace_config = config;
         self
     }
 
@@ -265,6 +295,9 @@ impl InboundServer {
     pub fn router(self: Arc<Self>) -> Router {
         let router = Router::new()
             .route("/.well-known/agent-card.json", get(serve_card))
+            .route("/turns/:turn_id", get(turn_row))
+            .route("/tasks/:id/journal.jsonl", get(task_journal_jsonl))
+            .route("/tasks/:id/artifacts/:node", get(task_artifact))
             .route("/", post(jsonrpc));
         let router = if self.metrics_endpoint.is_some() {
             router.route("/metrics", get(metrics))
@@ -784,6 +817,572 @@ async fn serve_card(State(srv): State<Arc<InboundServer>>) -> Response {
     let mcp = srv.registry().mcp_advertisement();
     let catalog = srv.model_catalog.load();
     Json(agent_card(&srv.base_url, &workflow_ids, &mcp, &catalog)).into_response()
+}
+
+fn unauthorized_bearer_response() -> Response {
+    // Trace-only (both callers are in `trace_authorize`). Keep the trace header invariant
+    // uniform: 401s carry nosniff too, alongside WWW-Authenticate.
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn trace_json_response(status: StatusCode, body: serde_json::Value) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+/// Returns the 413 response AND its serialized JSON body length, so the audit line
+/// records the real response size rather than 0.
+fn trace_too_large_response(
+    kind: &'static str,
+    bytes: u64,
+    events: Option<u64>,
+) -> (Response, usize) {
+    let body = serde_json::json!({
+        "error": "trace payload too large",
+        "kind": kind,
+        "bytes": bytes,
+        "events": events,
+    });
+    let body_len = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
+    (
+        trace_json_response(StatusCode::PAYLOAD_TOO_LARGE, body),
+        body_len,
+    )
+}
+
+fn trace_ndjson_response(body: String) -> Response {
+    let len = body.len().to_string();
+    let mut response = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson"),
+            (header::CONTENT_LENGTH, len.as_str()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(&len).unwrap(),
+    );
+    response
+}
+
+fn trace_text_response(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn trace_empty_response(status: StatusCode) -> Response {
+    // Keep the header invariant uniform across ALL trace responses (success and
+    // error/disabled/empty), so no trace path is ever served without nosniff.
+    let mut response = status.into_response();
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn trace_error_response(status: StatusCode) -> Response {
+    trace_empty_response(status)
+}
+
+fn trace_authorize(
+    srv: &InboundServer,
+    headers: &HeaderMap,
+) -> Result<bridge_core::domain::AuthContext, Box<Response>> {
+    if !srv.trace_config.enabled {
+        return Err(Box::new(trace_error_response(StatusCode::NOT_FOUND)));
+    }
+    let Some(token) = bearer_token(headers) else {
+        return Err(Box::new(unauthorized_bearer_response()));
+    };
+    srv.auth
+        .authorize(&InboundRequest::with_token(&token))
+        .map_err(|_| Box::new(unauthorized_bearer_response()))
+}
+
+fn audit_trace_fetch(
+    caller: &str,
+    route: &'static str,
+    task_id: Option<&str>,
+    turn_id: Option<&str>,
+    node: Option<&str>,
+    status: StatusCode,
+    bytes: usize,
+) {
+    tracing::info!(
+        caller = caller,
+        route = route,
+        task_id = task_id,
+        turn_id = turn_id,
+        node = node,
+        status = status.as_u16(),
+        bytes = bytes as u64,
+        "trace_fetch"
+    );
+}
+
+#[derive(serde::Serialize)]
+struct TurnLogRowDto {
+    turn_id: String,
+    session_id: String,
+    task_id: Option<String>,
+    workflow: Option<String>,
+    node: Option<String>,
+    attempt: u32,
+    agent: String,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<String>,
+    prompt_id: Option<String>,
+    started_ms: Option<i64>,
+    completed_ms: Option<i64>,
+    latency_ms: Option<u64>,
+    ttft_ms: Option<u64>,
+    outcome: Option<String>,
+    failure_class: Option<String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    thought_tokens: Option<u64>,
+    cached_read_tokens: Option<u64>,
+    cached_write_tokens: Option<u64>,
+    cost_amount: Option<f64>,
+    cost_currency: Option<String>,
+    traceparent: Option<String>,
+}
+
+impl From<bridge_core::task_store::TurnLogRow> for TurnLogRowDto {
+    fn from(row: bridge_core::task_store::TurnLogRow) -> Self {
+        Self {
+            turn_id: row.turn_id.as_str().to_string(),
+            session_id: row.session_id.as_str().to_string(),
+            task_id: row.task_id.map(|t| t.as_str().to_string()),
+            workflow: row.workflow,
+            node: row.node,
+            attempt: row.attempt,
+            agent: row.agent,
+            model: row.model,
+            effort: row.effort,
+            mode: row.mode,
+            prompt_id: row.prompt_id,
+            started_ms: row.started_ms,
+            completed_ms: row.completed_ms,
+            latency_ms: row.latency_ms,
+            ttft_ms: row.ttft_ms,
+            outcome: row.outcome,
+            failure_class: row.failure_class,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            thought_tokens: row.thought_tokens,
+            cached_read_tokens: row.cached_read_tokens,
+            cached_write_tokens: row.cached_write_tokens,
+            cost_amount: row.cost_amount,
+            cost_currency: row.cost_currency,
+            traceparent: row.traceparent.map(|tp| tp.to_header_value()),
+        }
+    }
+}
+
+async fn turn_row(
+    State(srv): State<Arc<InboundServer>>,
+    Path(turn_id_raw): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let mut caller = "unauthenticated".to_string();
+    let response = match trace_authorize(&srv, &headers) {
+        Ok(auth) => {
+            caller = auth.caller_id().as_str().to_string();
+            let turn_id = match bridge_core::ids::TurnId::parse(turn_id_raw.clone()) {
+                Ok(id) => id,
+                Err(_) => {
+                    let response = trace_error_response(StatusCode::NOT_FOUND);
+                    audit_trace_fetch(
+                        &caller,
+                        "turn_row",
+                        None,
+                        Some(&turn_id_raw),
+                        None,
+                        StatusCode::NOT_FOUND,
+                        0,
+                    );
+                    return response;
+                }
+            };
+            match srv.task_store().turn_log_row(&turn_id).await {
+                Ok(Some(row)) => {
+                    let body = serde_json::to_value(TurnLogRowDto::from(row))
+                        .unwrap_or_else(|_| serde_json::json!({ "error": "serialization failed" }));
+                    let bytes = serde_json::to_vec(&body).map(|b| b.len()).unwrap_or(0);
+                    let response = trace_json_response(StatusCode::OK, body);
+                    audit_trace_fetch(
+                        &caller,
+                        "turn_row",
+                        None,
+                        Some(turn_id.as_str()),
+                        None,
+                        StatusCode::OK,
+                        bytes,
+                    );
+                    return response;
+                }
+                Ok(None) => trace_error_response(StatusCode::NOT_FOUND),
+                Err(_) => trace_error_response(StatusCode::INTERNAL_SERVER_ERROR),
+            }
+        }
+        Err(response) => *response,
+    };
+
+    let status = response.status();
+    audit_trace_fetch(
+        &caller,
+        "turn_row",
+        None,
+        Some(&turn_id_raw),
+        None,
+        status,
+        0,
+    );
+    response
+}
+
+async fn task_journal_jsonl(
+    State(srv): State<Arc<InboundServer>>,
+    Path(task_id_raw): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let mut caller = "unauthenticated".to_string();
+    let _auth = match trace_authorize(&srv, &headers) {
+        Ok(auth) => {
+            caller = auth.caller_id().as_str().to_string();
+            auth
+        }
+        Err(response) => {
+            let status = response.status();
+            audit_trace_fetch(
+                &caller,
+                "task_journal_jsonl",
+                Some(&task_id_raw),
+                None,
+                None,
+                status,
+                0,
+            );
+            return *response;
+        }
+    };
+
+    let task_id = match TaskId::parse(task_id_raw.clone()) {
+        Ok(id) => id,
+        Err(_) => {
+            audit_trace_fetch(
+                &caller,
+                "task_journal_jsonl",
+                Some(&task_id_raw),
+                None,
+                None,
+                StatusCode::NOT_FOUND,
+                0,
+            );
+            return trace_empty_response(StatusCode::NOT_FOUND);
+        }
+    };
+
+    let rec = match srv.task_store().get(&task_id).await {
+        Ok(Some(rec)) => rec,
+        Ok(None) => {
+            audit_trace_fetch(
+                &caller,
+                "task_journal_jsonl",
+                Some(task_id.as_str()),
+                None,
+                None,
+                StatusCode::NOT_FOUND,
+                0,
+            );
+            return trace_empty_response(StatusCode::NOT_FOUND);
+        }
+        Err(_) => {
+            audit_trace_fetch(
+                &caller,
+                "task_journal_jsonl",
+                Some(task_id.as_str()),
+                None,
+                None,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                0,
+            );
+            return trace_empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    match srv
+        .task_store()
+        .journal_jsonl_bounded(
+            &task_id,
+            srv.trace_config.journal_max_events,
+            srv.trace_config.journal_max_bytes,
+        )
+        .await
+    {
+        Ok(bridge_core::task_store::JournalRead::Body {
+            jsonl,
+            events,
+            bytes,
+        }) => {
+            if events == 0 && rec.status.is_terminal() {
+                audit_trace_fetch(
+                    &caller,
+                    "task_journal_jsonl",
+                    Some(task_id.as_str()),
+                    None,
+                    None,
+                    StatusCode::NOT_FOUND,
+                    0,
+                );
+                return trace_empty_response(StatusCode::NOT_FOUND);
+            }
+            let response = trace_ndjson_response(jsonl);
+            audit_trace_fetch(
+                &caller,
+                "task_journal_jsonl",
+                Some(task_id.as_str()),
+                None,
+                None,
+                StatusCode::OK,
+                bytes as usize,
+            );
+            response
+        }
+        Ok(bridge_core::task_store::JournalRead::TooLarge { events, bytes }) => {
+            let (response, body_len) = trace_too_large_response("journal", bytes, Some(events));
+            audit_trace_fetch(
+                &caller,
+                "task_journal_jsonl",
+                Some(task_id.as_str()),
+                None,
+                None,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                body_len,
+            );
+            response
+        }
+        Err(_) => {
+            audit_trace_fetch(
+                &caller,
+                "task_journal_jsonl",
+                Some(task_id.as_str()),
+                None,
+                None,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                0,
+            );
+            trace_empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn task_artifact(
+    State(srv): State<Arc<InboundServer>>,
+    Path((task_id_raw, node_raw)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let mut caller = "unauthenticated".to_string();
+    let _auth = match trace_authorize(&srv, &headers) {
+        Ok(auth) => {
+            caller = auth.caller_id().as_str().to_string();
+            auth
+        }
+        Err(response) => {
+            let status = response.status();
+            audit_trace_fetch(
+                &caller,
+                "task_artifact",
+                Some(&task_id_raw),
+                None,
+                Some(&node_raw),
+                status,
+                0,
+            );
+            return *response;
+        }
+    };
+
+    let task_id = match TaskId::parse(task_id_raw.clone()) {
+        Ok(id) => id,
+        Err(_) => {
+            audit_trace_fetch(
+                &caller,
+                "task_artifact",
+                Some(&task_id_raw),
+                None,
+                Some(&node_raw),
+                StatusCode::NOT_FOUND,
+                0,
+            );
+            return trace_empty_response(StatusCode::NOT_FOUND);
+        }
+    };
+    let node = match bridge_core::ids::NodeId::parse(node_raw.clone()) {
+        Ok(node) => node,
+        Err(_) => {
+            audit_trace_fetch(
+                &caller,
+                "task_artifact",
+                Some(task_id.as_str()),
+                None,
+                Some(&node_raw),
+                StatusCode::NOT_FOUND,
+                0,
+            );
+            return trace_empty_response(StatusCode::NOT_FOUND);
+        }
+    };
+
+    let rec = match srv.task_store().get(&task_id).await {
+        Ok(Some(rec)) => rec,
+        Ok(None) => {
+            audit_trace_fetch(
+                &caller,
+                "task_artifact",
+                Some(task_id.as_str()),
+                None,
+                Some(node.as_str()),
+                StatusCode::NOT_FOUND,
+                0,
+            );
+            return trace_empty_response(StatusCode::NOT_FOUND);
+        }
+        Err(_) => {
+            audit_trace_fetch(
+                &caller,
+                "task_artifact",
+                Some(task_id.as_str()),
+                None,
+                Some(node.as_str()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                0,
+            );
+            return trace_empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    let allowed = if let Some(spec_json) = rec.workflow_spec_json.as_deref() {
+        match bridge_coordinator::detached::workflow_spec_node_ids(spec_json) {
+            Ok(nodes) => nodes.contains(&node),
+            Err(_) => false,
+        }
+    } else {
+        match srv.task_store().node_checkpoint_nodes(&task_id).await {
+            Ok(nodes) => nodes.iter().any(|candidate| candidate == &node),
+            Err(_) => {
+                audit_trace_fetch(
+                    &caller,
+                    "task_artifact",
+                    Some(task_id.as_str()),
+                    None,
+                    Some(node.as_str()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    0,
+                );
+                return trace_empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    };
+
+    if !allowed {
+        audit_trace_fetch(
+            &caller,
+            "task_artifact",
+            Some(task_id.as_str()),
+            None,
+            Some(node.as_str()),
+            StatusCode::NOT_FOUND,
+            0,
+        );
+        return trace_empty_response(StatusCode::NOT_FOUND);
+    }
+
+    match srv
+        .task_store()
+        .node_checkpoint_output(&task_id, &node, srv.trace_config.artifact_max_bytes)
+        .await
+    {
+        Ok(Some(bridge_core::task_store::NodeCheckpointOutput::Found {
+            output, bytes, ..
+        })) => {
+            let response = trace_text_response(output);
+            audit_trace_fetch(
+                &caller,
+                "task_artifact",
+                Some(task_id.as_str()),
+                None,
+                Some(node.as_str()),
+                StatusCode::OK,
+                bytes as usize,
+            );
+            response
+        }
+        Ok(Some(bridge_core::task_store::NodeCheckpointOutput::TooLarge { bytes })) => {
+            let (response, body_len) = trace_too_large_response("artifact", bytes, None);
+            audit_trace_fetch(
+                &caller,
+                "task_artifact",
+                Some(task_id.as_str()),
+                None,
+                Some(node.as_str()),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                body_len,
+            );
+            response
+        }
+        Ok(None) => {
+            audit_trace_fetch(
+                &caller,
+                "task_artifact",
+                Some(task_id.as_str()),
+                None,
+                Some(node.as_str()),
+                StatusCode::NOT_FOUND,
+                0,
+            );
+            trace_empty_response(StatusCode::NOT_FOUND)
+        }
+        Err(_) => {
+            audit_trace_fetch(
+                &caller,
+                "task_artifact",
+                Some(task_id.as_str()),
+                None,
+                Some(node.as_str()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                0,
+            );
+            trace_empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 async fn metrics(State(srv): State<Arc<InboundServer>>, headers: HeaderMap) -> Response {
@@ -3055,15 +3654,13 @@ async fn session_status(
     if let Err(e) = authorize_headers(&srv, &headers) {
         return bridge_err_to_jsonrpc(id, &e);
     }
-    let sm = srv.session_manager().clone();
     let ctx = match context_id_arg(&params) {
         Ok(c) => c,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
-    match sm.status(&ctx).await {
-        Some(s) => jsonrpc_ok(
-            id,
-            json!({
+    match srv.coordinator().status(Some(ctx.clone()), None).await {
+        Ok(StatusDto::Session(s)) => {
+            let mut result = json!({
                 "contextId": ctx.as_str(),
                 "state": s.state,
                 "agent": s.agent,
@@ -3079,7 +3676,13 @@ async fn session_status(
                 "usage": {
                     "used": s.usage.used,
                     "size": s.usage.size,
-                    "windowFraction": s.window_fraction(),
+                    "windowFraction": srv
+                        .coordinator()
+                        .session_manager
+                        .status(&ctx)
+                        .await
+                        .and_then(|info| info.window_fraction())
+                        .unwrap_or(0.0),
                     "overThreshold": s.over_threshold,
                     "cost": s.usage.cost.as_ref().map(|c| serde_json::json!({
                         "amount": c.amount, "currency": c.currency
@@ -3090,9 +3693,16 @@ async fn session_status(
                     .as_ref()
                     .map(|r| r.pending(&ctx))
                     .unwrap_or_default(),
-            }),
-        ),
-        None => bridge_err_to_jsonrpc(id, &BridgeError::SessionNotFound),
+            });
+            if let Some(trace) = s.trace {
+                result["trace"] = serde_json::to_value(trace).expect("TraceRefs serializes");
+            }
+            jsonrpc_ok(id, result)
+        }
+        Ok(StatusDto::Task(_)) => {
+            bridge_err_to_jsonrpc(id, &BridgeError::InvalidRequest { field: "contextId" })
+        }
+        Err(e) => bridge_err_to_jsonrpc(id, &e),
     }
 }
 
@@ -4698,6 +5308,1049 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[test]
+        fn trace_http_config_defaults_disabled() {
+            let cfg = TraceHttpConfig::default();
+
+            assert!(!cfg.enabled);
+            assert_eq!(cfg.journal_max_bytes, 16_777_216);
+            assert_eq!(cfg.journal_max_events, 100_000);
+            assert_eq!(cfg.artifact_max_bytes, 4_194_304);
+            assert_eq!(cfg.max_task_turns, 512);
+        }
+    }
+
+    mod trace_turn_route_tests {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use bridge_core::ids::{AgentId, ContextId, NodeId, OperationId, TaskId, WorkflowId};
+        use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
+        use bridge_core::ports::{TraceParent, TurnContext, TurnOutcome};
+        use bridge_core::task_store::{
+            MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinished, TurnLogUsage,
+        };
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+        use std::io::Write;
+        use std::time::Duration;
+
+        fn build_with_task_store_and_trace(
+            task_store: Arc<MemoryTaskStore>,
+            auth: Arc<dyn AuthMiddleware>,
+            trace_config: TraceHttpConfig,
+        ) -> Arc<InboundServer> {
+            let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+            let backend = FakeBackend::new();
+            let registry: Arc<dyn AgentRegistry> = FakeRegistry::single("kiro", backend);
+            let task_store_dyn: Arc<dyn TaskStore> = task_store;
+            let coord = bridge_coordinator::Coordinator::new(
+                Arc::new(crate::session_manager::SessionManager::new(
+                    registry.clone(),
+                    std::time::Duration::from_secs(60),
+                )),
+                None,
+                Arc::new(std::collections::HashMap::new()),
+                task_store_dyn,
+                store,
+                Arc::new(AutoApprove),
+                registry,
+                Arc::new(bridge_coordinator::clock::SystemClock),
+                None,
+                None,
+                Arc::new(bridge_observ::NoopObserver),
+                3,
+            )
+            .with_trace_refs_config(trace_config.enabled, trace_config.max_task_turns);
+            Arc::new(
+                InboundServer::from_coordinator(
+                    Arc::new(coord),
+                    Arc::new(AlwaysKiro),
+                    auth,
+                    "http://localhost:8080",
+                    Arc::new(NoDelegation),
+                    "kiro",
+                )
+                .with_trace_http_config(trace_config),
+            )
+        }
+
+        fn trace_cfg(enabled: bool) -> TraceHttpConfig {
+            TraceHttpConfig {
+                enabled,
+                journal_max_bytes: 1024,
+                journal_max_events: 16,
+                artifact_max_bytes: 1024,
+                max_task_turns: 4,
+            }
+        }
+
+        fn working_task_record(id: &str, workflow_spec_json: Option<String>) -> TaskRecord {
+            TaskRecord {
+                id: TaskId::parse(id).unwrap(),
+                workflow: "code-review".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+                input: "input".into(),
+                workflow_spec_json,
+                resume_attempts: 0,
+                session_cwd: None,
+                batch_id: None,
+                item_id: None,
+            }
+        }
+
+        fn completed_task_record(id: &str, workflow_spec_json: Option<String>) -> TaskRecord {
+            let mut rec = working_task_record(id, workflow_spec_json);
+            rec.status = TaskRecordStatus::Completed;
+            rec.result = Some("done".into());
+            rec.updated_ms = 2;
+            rec
+        }
+
+        fn two_node_spec() -> String {
+            let graph = WorkflowGraph {
+                id: WorkflowId::parse("code-review").unwrap(),
+                nodes: vec![
+                    WorkflowNode {
+                        id: NodeId::parse("reviewer").unwrap(),
+                        agent: AgentId::parse("codex").unwrap(),
+                        prompt_template: "{{input}}".into(),
+                        inputs: Vec::new(),
+                        retry: None,
+                    },
+                    WorkflowNode {
+                        id: NodeId::parse("synth").unwrap(),
+                        agent: AgentId::parse("codex").unwrap(),
+                        prompt_template: "{{reviewer}}".into(),
+                        inputs: vec![NodeId::parse("reviewer").unwrap()],
+                        retry: None,
+                    },
+                ],
+                panel: None,
+            };
+            bridge_coordinator::detached::encode_workflow_spec(&graph)
+        }
+
+        async fn seed_turn(
+            store: &MemoryTaskStore,
+            turn_id: &str,
+            session_id: &str,
+            task_id: Option<&str>,
+        ) {
+            let ctx = TurnContext {
+                turn_id: bridge_core::ids::TurnId::parse(turn_id).unwrap(),
+                session_id: ContextId::parse(session_id).unwrap(),
+                task_id: task_id.map(|t| TaskId::parse(t).unwrap()),
+                workflow: Some("code-review".into()),
+                node: Some("reviewer".into()),
+                attempt: 2,
+                agent: "codex".into(),
+                model: Some("gpt-5.5".into()),
+                effort: Some("high".into()),
+                mode: Some("default".into()),
+                prompt_id: Some("prompt/eval".into()),
+                traceparent: TraceParent::parse_header_value(
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                ),
+            };
+            store
+                .upsert_turn_finished(&TurnLogFinished {
+                    ctx: ctx.clone(),
+                    started_ms: 90,
+                    completed_ms: 100,
+                    latency: Duration::from_millis(10),
+                    ttft: Some(Duration::from_millis(3)),
+                    outcome: TurnOutcome::Success,
+                })
+                .await
+                .unwrap();
+            store
+                .update_turn_usage(&TurnLogUsage {
+                    ctx,
+                    usage: UsageSnapshot {
+                        used: None,
+                        size: None,
+                        cost: Some(UsageCost {
+                            amount: 0.42,
+                            currency: "USD".into(),
+                        }),
+                        terminal: Some(TerminalUsage {
+                            total_tokens: 99,
+                            input_tokens: 7,
+                            output_tokens: 11,
+                            thought_tokens: None,
+                            cached_read_tokens: None,
+                            cached_write_tokens: None,
+                        }),
+                        at_ms: 100,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn trace_routes_404_when_disabled_even_without_bearer() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(false));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn trace_routes_require_bearer_when_enabled() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::WWW_AUTHENTICATE)
+                    .unwrap(),
+                "Bearer"
+            );
+            // Header invariant holds on the 401 path too.
+            assert_eq!(
+                resp.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+        }
+
+        #[tokio::test]
+        async fn trace_routes_reject_bad_bearer() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let srv = build_with_task_store_and_trace(store, Arc::new(RejectAuth), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .header("authorization", "Bearer bad")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn turn_route_returns_json_turn_log_row() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-a", "ctx-a", Some("task-a")).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                "application/json"
+            );
+            let body = body_string(resp).await;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["turn_id"], "turn-a");
+            assert_eq!(value["task_id"], "task-a");
+            assert_eq!(value["input_tokens"], 7);
+            assert_eq!(value["cost_currency"], "USD");
+            assert_eq!(
+                value["traceparent"],
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_route_returns_warm_turn_row() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-warm", "ctx-warm", None).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-warm")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["turn_id"], "turn-warm");
+            assert!(value["task_id"].is_null());
+        }
+
+        #[tokio::test]
+        async fn journal_route_returns_ndjson_with_content_length() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-journal").unwrap();
+            let op = OperationId::parse("op-journal").unwrap();
+            store
+                .create(&working_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            store
+                .record_event_sequenced(
+                    &task,
+                    &op,
+                    10,
+                    bridge_core::orch::OrchEventKind::Progress { text: "one".into() },
+                )
+                .await
+                .unwrap();
+
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-journal/journal.jsonl")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                "application/x-ndjson"
+            );
+            assert_eq!(
+                resp.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+            assert!(resp
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .is_some());
+            let body = body_string(resp).await;
+            assert_eq!(body.lines().count(), 1);
+            assert!(body.ends_with('\n'));
+        }
+
+        #[tokio::test]
+        async fn journal_route_empty_working_task_200() {
+            let store = Arc::new(MemoryTaskStore::new());
+            store
+                .create(&working_task_record(
+                    "task-empty-working",
+                    Some(two_node_spec()),
+                ))
+                .await
+                .unwrap();
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-empty-working/journal.jsonl")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_string(resp).await, "");
+        }
+
+        #[tokio::test]
+        async fn journal_route_terminal_empty_journal_404() {
+            let store = Arc::new(MemoryTaskStore::new());
+            store
+                .create(&completed_task_record(
+                    "task-empty-terminal",
+                    Some(two_node_spec()),
+                ))
+                .await
+                .unwrap();
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-empty-terminal/journal.jsonl")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn journal_route_413_over_byte_limit() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-large-journal").unwrap();
+            let op = OperationId::parse("op-journal").unwrap();
+            store
+                .create(&working_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            store
+                .record_event_sequenced(
+                    &task,
+                    &op,
+                    10,
+                    bridge_core::orch::OrchEventKind::Progress {
+                        text: "large".repeat(64),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let mut cfg = trace_cfg(true);
+            cfg.journal_max_bytes = 8;
+            let srv = build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), cfg);
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-large-journal/journal.jsonl")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                "application/json"
+            );
+        }
+
+        #[tokio::test]
+        async fn journal_route_413_over_event_limit() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-many-journal").unwrap();
+            let op = OperationId::parse("op-journal").unwrap();
+            store
+                .create(&working_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            for message in ["one", "two"] {
+                store
+                    .record_event_sequenced(
+                        &task,
+                        &op,
+                        10,
+                        bridge_core::orch::OrchEventKind::Progress {
+                            text: message.into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let mut cfg = trace_cfg(true);
+            cfg.journal_max_events = 1;
+            let srv = build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), cfg);
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-many-journal/journal.jsonl")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[tokio::test]
+        async fn artifact_route_returns_plain_text_nosniff() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-artifact").unwrap();
+            store
+                .create(&completed_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            store
+                .put_node_checkpoint(
+                    &task,
+                    &NodeId::parse("reviewer").unwrap(),
+                    "artifact text",
+                    true,
+                    10,
+                )
+                .await
+                .unwrap();
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-artifact/artifacts/reviewer")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                "text/plain; charset=utf-8"
+            );
+            assert_eq!(
+                resp.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+            assert_eq!(body_string(resp).await, "artifact text");
+        }
+
+        #[tokio::test]
+        async fn artifact_route_validates_node_against_snapshot() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-artifact").unwrap();
+            store
+                .create(&completed_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            store
+                .put_node_checkpoint(
+                    &task,
+                    &NodeId::parse("reviewer").unwrap(),
+                    "artifact text",
+                    true,
+                    10,
+                )
+                .await
+                .unwrap();
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-artifact/artifacts/not-in-snapshot")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn artifact_route_404_for_known_unfinished_node() {
+            let store = Arc::new(MemoryTaskStore::new());
+            store
+                .create(&working_task_record(
+                    "task-unfinished",
+                    Some(two_node_spec()),
+                ))
+                .await
+                .unwrap();
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-unfinished/artifacts/reviewer")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn artifact_route_413_when_output_too_large() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-large-artifact").unwrap();
+            store
+                .create(&completed_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            store
+                .put_node_checkpoint(
+                    &task,
+                    &NodeId::parse("reviewer").unwrap(),
+                    "abcdef",
+                    true,
+                    10,
+                )
+                .await
+                .unwrap();
+
+            let mut cfg = trace_cfg(true);
+            cfg.artifact_max_bytes = 5;
+            let srv = build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), cfg);
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-large-artifact/artifacts/reviewer")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[tokio::test]
+        async fn node_id_invalid_maps_to_404() {
+            let store = Arc::new(MemoryTaskStore::new());
+            store
+                .create(&working_task_record(
+                    "task-invalid-node",
+                    Some(two_node_spec()),
+                ))
+                .await
+                .unwrap();
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            // Single-segment invalid node id ("BAD" — uppercase fails the [a-z0-9_-]+
+            // grammar): this reaches the handler and exercises the NodeId::parse rejection
+            // branch, unlike a `../secret` segment which would fail route matching instead.
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/task-invalid-node/artifacts/BAD")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn task_status_includes_usage_and_trace_refs() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-status").unwrap();
+            store
+                .create(&working_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            seed_turn(&store, "turn-status", "ctx-status", Some(task.as_str())).await;
+            store
+                .put_node_checkpoint(
+                    &task,
+                    &NodeId::parse("reviewer").unwrap(),
+                    "artifact",
+                    true,
+                    10,
+                )
+                .await
+                .unwrap();
+
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+            let status = srv.coordinator().status(None, Some(task)).await.unwrap();
+
+            match status {
+                StatusDto::Task(dto) => {
+                    assert!(dto.usage.is_some());
+                    let trace = dto.trace.unwrap();
+                    assert_eq!(trace.journal.unwrap(), "/tasks/task-status/journal.jsonl");
+                    assert_eq!(trace.turns.unwrap(), vec!["/turns/turn-status"]);
+                    assert_eq!(
+                        trace.artifacts.unwrap().get("reviewer").unwrap(),
+                        "/tasks/task-status/artifacts/reviewer"
+                    );
+                }
+                StatusDto::Session(_) => panic!("expected task status"),
+            }
+        }
+
+        #[tokio::test]
+        async fn task_status_usage_present_when_traces_disabled() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-status-no-trace").unwrap();
+            store
+                .create(&working_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            seed_turn(
+                &store,
+                "turn-status-no-trace",
+                "ctx-status",
+                Some(task.as_str()),
+            )
+            .await;
+
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(false));
+            let status = srv.coordinator().status(None, Some(task)).await.unwrap();
+
+            match status {
+                StatusDto::Task(dto) => {
+                    assert!(dto.usage.is_some());
+                    assert!(dto.trace.is_none());
+                }
+                StatusDto::Session(_) => panic!("expected task status"),
+            }
+        }
+
+        #[tokio::test]
+        async fn usage_uncapped_beyond_max_task_turns() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let task = TaskId::parse("task-uncapped").unwrap();
+            store
+                .create(&working_task_record(task.as_str(), Some(two_node_spec())))
+                .await
+                .unwrap();
+            for i in 0..5 {
+                seed_turn(
+                    &store,
+                    &format!("turn-uncapped-{i}"),
+                    "ctx-uncapped",
+                    Some(task.as_str()),
+                )
+                .await;
+            }
+
+            let mut cfg = trace_cfg(true);
+            cfg.max_task_turns = 2;
+            let srv = build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), cfg);
+            let status = srv.coordinator().status(None, Some(task)).await.unwrap();
+
+            match status {
+                StatusDto::Task(dto) => {
+                    assert_eq!(dto.trace.unwrap().turns.unwrap().len(), 2);
+                    assert_eq!(dto.usage.unwrap().terminal.unwrap().input_tokens, 35);
+                }
+                StatusDto::Session(_) => panic!("expected task status"),
+            }
+        }
+
+        async fn ensure_idle_session(srv: &Arc<InboundServer>, ctx: &ContextId) {
+            for _ in 0..50 {
+                if matches!(
+                    srv.coordinator()
+                        .session_manager
+                        .status(ctx)
+                        .await
+                        .as_ref()
+                        .map(|s| s.state),
+                    Some("idle")
+                ) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn warm_session_for_trace(srv: &Arc<InboundServer>, ctx: &ContextId) {
+            let _ = router(srv.clone())
+                .oneshot(post_request(
+                    methods::SEND_MESSAGE,
+                    json!({
+                        "message": {
+                            "contextId": ctx.as_str(),
+                            "text": "warm turn",
+                            "metadata": { "a2a-bridge.agent": "kiro" }
+                        }
+                    }),
+                    "1.0",
+                ))
+                .await
+                .unwrap();
+            ensure_idle_session(srv, ctx).await;
+        }
+
+        #[tokio::test]
+        async fn session_status_includes_latest_warm_turn_trace_ref() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-warm-latest", "ctx-warm-status", None).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+            let ctx = ContextId::parse("ctx-warm-status").unwrap();
+
+            warm_session_for_trace(&srv, &ctx).await;
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/")
+                        .header("content-type", "application/json")
+                        .header(SVC_PARAM_VERSION, A2A_PINNED_VERSION)
+                        .header("authorization", "Bearer ok")
+                        .body(jsonrpc_body(
+                            "SessionStatus",
+                            json!({ "contextId": "ctx-warm-status" }),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["result"]["trace"]["turn"], "/turns/turn-warm-latest");
+        }
+
+        #[tokio::test]
+        async fn session_status_omits_trace_when_traces_disabled() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-warm-disabled", "ctx-warm-disabled", None).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(false));
+            let ctx = ContextId::parse("ctx-warm-disabled").unwrap();
+
+            warm_session_for_trace(&srv, &ctx).await;
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/")
+                        .header("content-type", "application/json")
+                        .header(SVC_PARAM_VERSION, A2A_PINNED_VERSION)
+                        .header("authorization", "Bearer ok")
+                        .body(jsonrpc_body(
+                            "SessionStatus",
+                            json!({ "contextId": "ctx-warm-disabled" }),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(value["result"].get("trace").is_none());
+        }
+
+        #[tokio::test]
+        async fn metrics_and_traces_independent() {
+            let store = Arc::new(MemoryTaskStore::new());
+
+            let metrics_only = Arc::new(
+                Arc::into_inner(build_with_task_store_and_trace(
+                    store.clone(),
+                    Arc::new(AlwaysGrant),
+                    trace_cfg(false),
+                ))
+                .expect("unique server arc")
+                .with_metrics_endpoint(Some(
+                    bridge_observ::PrometheusObserver::new(
+                        bridge_observ::LabelVocabulary::default(),
+                    )
+                    .unwrap()
+                    .endpoint(),
+                )),
+            );
+
+            let metrics_resp = router(metrics_only.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(metrics_resp.status(), StatusCode::UNAUTHORIZED);
+
+            let trace_resp = router(metrics_only)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(trace_resp.status(), StatusCode::NOT_FOUND);
+
+            let traces_only =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+            let trace_resp = router(traces_only.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(trace_resp.status(), StatusCode::UNAUTHORIZED);
+
+            let metrics_resp = router(traces_only)
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(metrics_resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[derive(Clone)]
+        struct SharedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for SharedLogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn trace_routes_audit_success_and_failure() {
+            let store = Arc::new(MemoryTaskStore::new());
+            seed_turn(&store, "turn-audit", "ctx-audit", Some("task-audit")).await;
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer_logs = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::level_filters::LevelFilter::TRACE)
+                .json()
+                .with_writer(move || SharedLogWriter(writer_logs.clone()))
+                .finish();
+            // MUST be set_global_default, not the thread-local set_default: the many other
+            // trace-route tests call `audit_trace_fetch` with no subscriber, which caches the
+            // `trace_fetch` callsite's interest as disabled process-wide. Only setting a GLOBAL
+            // default rebuilds that interest cache; a thread-local set_default leaves the callsite
+            // cached-off and the event is never captured under parallel test execution.
+            // This test is the sole global-subscriber setter in the crate, so first-call-wins holds.
+            let _global_default = tracing::subscriber::set_global_default(subscriber);
+
+            let ok = router(srv.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/turn-audit")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+
+            let missing = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/turns/missing-audit")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+            let log_text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+            assert!(log_text.contains("\"message\":\"trace_fetch\""));
+            assert!(log_text.contains("\"route\":\"turn_row\""));
+            assert!(log_text.contains("\"turn_id\":\"turn-audit\""));
+            assert!(log_text.contains("\"status\":200"));
+            assert!(log_text.contains("\"status\":404"));
+            assert!(!log_text.contains("Bearer ok"));
+        }
+
+        #[tokio::test]
+        async fn trace_ref_after_purge_returns_404() {
+            let store = Arc::new(MemoryTaskStore::new());
+            let srv =
+                build_with_task_store_and_trace(store, Arc::new(AlwaysGrant), trace_cfg(true));
+
+            let resp = router(srv)
+                .oneshot(
+                    Request::builder()
+                        .uri("/tasks/purged-task/journal.jsonl")
+                        .header("authorization", "Bearer ok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         }
     }
 

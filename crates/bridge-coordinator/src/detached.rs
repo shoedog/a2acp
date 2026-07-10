@@ -1415,6 +1415,27 @@ pub fn encode_workflow_spec(graph: &bridge_workflow::graph::WorkflowGraph) -> St
     serde_json::json!({ "v": SUPPORTED_SNAPSHOT_VERSION, "graph": graph }).to_string()
 }
 
+pub fn workflow_spec_node_ids(
+    spec_json: &str,
+) -> Result<std::collections::BTreeSet<bridge_core::ids::NodeId>, bridge_core::error::BridgeError> {
+    let env: WorkflowSpecEnvelope = serde_json::from_str(spec_json)
+        .map_err(|_| bridge_core::error::BridgeError::StoreFailure)?;
+    if env.v != SUPPORTED_SNAPSHOT_VERSION {
+        return Err(bridge_core::error::BridgeError::StoreFailure);
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for node in env.graph.nodes {
+        // A node id that fails the strict grammar means the STORED snapshot is corrupt
+        // (not a client error) — classify as StoreFailure, consistent with the JSON/version
+        // failures above (and so a route surfaces it as 500, not 400).
+        ids.insert(
+            bridge_core::ids::NodeId::parse(node.id.as_str())
+                .map_err(|_| bridge_core::error::BridgeError::StoreFailure)?,
+        );
+    }
+    Ok(ids)
+}
+
 /// Boot-time crash-resume scan (W3b Task 10a). Replaces the W3a behavior of sweeping
 /// every `Working` row to `Interrupted`: instead, for each `Working` task this either
 /// (a) **short-circuits** it to terminal if its terminal node already has a checkpoint
@@ -2068,6 +2089,53 @@ mod frame_tests {
         assert_eq!(env.v, SUPPORTED_SNAPSHOT_VERSION);
         assert_eq!(env.graph.id.as_str(), "code-review");
         assert_eq!(env.graph.nodes.len(), 1);
+    }
+
+    #[test]
+    fn workflow_spec_node_ids_reads_persisted_snapshot() {
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+        let graph = WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: bridge_core::ids::NodeId::parse("reviewer").unwrap(),
+                    agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: Vec::new(),
+                    retry: None,
+                },
+                WorkflowNode {
+                    id: bridge_core::ids::NodeId::parse("synth").unwrap(),
+                    agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
+                    prompt_template: "{{reviewer}}".into(),
+                    inputs: vec![bridge_core::ids::NodeId::parse("reviewer").unwrap()],
+                    retry: None,
+                },
+            ],
+            panel: None,
+        };
+        let json = encode_workflow_spec(&graph);
+
+        let nodes = workflow_spec_node_ids(&json).unwrap();
+
+        assert_eq!(
+            nodes.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+            vec!["reviewer", "synth"]
+        );
+    }
+
+    #[test]
+    fn workflow_spec_node_ids_rejects_bad_snapshot() {
+        // A corrupt stored snapshot (bad node id, unknown version, non-JSON) is a
+        // StoreFailure, never a client InvalidRequest.
+        assert!(matches!(
+            workflow_spec_node_ids(
+                r#"{"v":1,"graph":{"id":"w","nodes":[{"id":"BAD","agent":"codex","prompt_template":"","inputs":[]}]}}"#
+            ),
+            Err(bridge_core::error::BridgeError::StoreFailure)
+        ));
+        assert!(workflow_spec_node_ids(r#"{"v":999,"graph":{"id":"w","nodes":[]}}"#).is_err());
+        assert!(workflow_spec_node_ids("not json").is_err());
     }
 
     #[tokio::test]

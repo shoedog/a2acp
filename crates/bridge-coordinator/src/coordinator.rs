@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -7,7 +7,7 @@ use a2a;
 use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{BatchId, ContextId, OperationId, TaskId, WorkflowId};
-use bridge_core::orch::{AgentSessionCaps, UsageSnapshot};
+use bridge_core::orch::{AgentSessionCaps, TerminalUsage, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{
     classify_failure, AgentRegistry, FailureClass, ObsEvent, Observer, PolicyEngine, SessionStore,
@@ -41,6 +41,53 @@ pub enum StatusDto {
     Task(TaskStatusDto),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TraceRefs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<BTreeMap<String, String>>,
+}
+
+fn percent_encode_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(b));
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+fn turn_ref(turn_id: &bridge_core::ids::TurnId) -> String {
+    format!("/turns/{}", percent_encode_segment(turn_id.as_str()))
+}
+
+fn journal_ref(task_id: &TaskId) -> String {
+    format!(
+        "/tasks/{}/journal.jsonl",
+        percent_encode_segment(task_id.as_str())
+    )
+}
+
+fn artifact_ref(task_id: &TaskId, node: &bridge_core::ids::NodeId) -> String {
+    format!(
+        "/tasks/{}/artifacts/{}",
+        percent_encode_segment(task_id.as_str()),
+        percent_encode_segment(node.as_str())
+    )
+}
+
 #[derive(serde::Serialize)]
 pub struct SessionStatusDto {
     pub state: &'static str,
@@ -50,6 +97,8 @@ pub struct SessionStatusDto {
     pub capabilities: AgentSessionCaps,
     pub usage: UsageSnapshot,
     pub over_threshold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<TraceRefs>,
 }
 
 #[derive(serde::Serialize)]
@@ -60,6 +109,10 @@ pub struct TaskStatusDto {
     pub result: Option<String>,
     pub error: Option<String>,
     pub updated_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<TraceRefs>,
 }
 
 pub struct TurnOutput {
@@ -87,6 +140,7 @@ impl From<&crate::session_manager::SessionStatusInfo> for SessionStatusDto {
             capabilities: info.capabilities.clone(),
             usage: info.usage.clone(),
             over_threshold: info.over_threshold,
+            trace: None,
         }
     }
 }
@@ -100,6 +154,8 @@ impl From<&TaskRecord> for TaskStatusDto {
             result: rec.result.clone(),
             error: rec.error.clone(),
             updated_ms: rec.updated_ms,
+            usage: None,
+            trace: None,
         }
     }
 }
@@ -124,6 +180,8 @@ pub struct Coordinator {
     batch: Option<BatchRuntime>,
     observer: Arc<dyn Observer>,
     resume_attempt_cap: u32,
+    trace_refs_enabled: bool,
+    max_task_turns: usize,
 }
 
 pub fn apply_permit(reg: &PermissionRegistry, p: &PermitParams) -> bool {
@@ -173,7 +231,16 @@ impl Coordinator {
             batch,
             observer,
             resume_attempt_cap,
+            trace_refs_enabled: false,
+            max_task_turns: 512,
         }
+    }
+
+    #[must_use]
+    pub fn with_trace_refs_config(mut self, enabled: bool, max_task_turns: usize) -> Self {
+        self.trace_refs_enabled = enabled;
+        self.max_task_turns = max_task_turns;
+        self
     }
 
     #[must_use]
@@ -669,7 +736,9 @@ impl Coordinator {
                     .status(&c)
                     .await
                     .ok_or(BridgeError::SessionNotFound)?;
-                Ok(StatusDto::Session(SessionStatusDto::from(&info)))
+                Ok(StatusDto::Session(
+                    self.session_status_dto(&c, &info).await?,
+                ))
             }
             (None, Some(t)) => {
                 let rec = self
@@ -677,9 +746,84 @@ impl Coordinator {
                     .get(&t)
                     .await?
                     .ok_or(BridgeError::TaskNotFound)?;
-                Ok(StatusDto::Task(TaskStatusDto::from(&rec)))
+                Ok(StatusDto::Task(self.task_status_dto(&rec).await?))
             }
         }
+    }
+
+    async fn session_status_dto(
+        &self,
+        ctx: &ContextId,
+        info: &crate::session_manager::SessionStatusInfo,
+    ) -> Result<SessionStatusDto, BridgeError> {
+        let mut dto = SessionStatusDto::from(info);
+        if self.trace_refs_enabled {
+            if let Some(row) = self.task_store.latest_turn_log_row_for_session(ctx).await? {
+                dto.trace = Some(TraceRefs {
+                    turn: Some(turn_ref(&row.turn_id)),
+                    ..TraceRefs::default()
+                });
+            }
+        }
+        Ok(dto)
+    }
+
+    async fn task_status_dto(&self, rec: &TaskRecord) -> Result<TaskStatusDto, BridgeError> {
+        let mut dto = TaskStatusDto::from(rec);
+
+        if let Some(agg) = self.task_store.turn_log_usage_for_task(&rec.id).await? {
+            dto.usage = Some(UsageSnapshot {
+                used: None,
+                size: None,
+                cost: agg.cost,
+                terminal: Some(TerminalUsage {
+                    total_tokens: agg.input_tokens + agg.output_tokens,
+                    input_tokens: agg.input_tokens,
+                    output_tokens: agg.output_tokens,
+                    thought_tokens: agg.thought_tokens,
+                    cached_read_tokens: agg.cached_read_tokens,
+                    cached_write_tokens: agg.cached_write_tokens,
+                }),
+                at_ms: if agg.at_ms == 0 {
+                    rec.updated_ms
+                } else {
+                    agg.at_ms
+                },
+            });
+        }
+
+        if self.trace_refs_enabled {
+            let turn_rows = self
+                .task_store
+                .turn_log_rows_for_task(&rec.id, self.max_task_turns)
+                .await?;
+            let turns = if turn_rows.is_empty() {
+                None
+            } else {
+                Some(turn_rows.iter().map(|row| turn_ref(&row.turn_id)).collect())
+            };
+
+            let nodes = self.task_store.node_checkpoint_nodes(&rec.id).await?;
+            let artifacts = if nodes.is_empty() {
+                None
+            } else {
+                Some(
+                    nodes
+                        .iter()
+                        .map(|node| (node.as_str().to_string(), artifact_ref(&rec.id, node)))
+                        .collect::<BTreeMap<_, _>>(),
+                )
+            };
+
+            dto.trace = Some(TraceRefs {
+                turn: None,
+                turns,
+                journal: Some(journal_ref(&rec.id)),
+                artifacts,
+            });
+        }
+
+        Ok(dto)
     }
 
     /// Clear a warm context and its children, rejecting while a workflow run owns the
@@ -802,9 +946,13 @@ mod tests {
     };
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, ContextId, NodeId, SessionId};
-    use bridge_core::orch::UsageSnapshot;
-    use bridge_core::ports::{AgentBackend, BackendStream, Lease, Resolved, Update};
-    use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus};
+    use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
+    use bridge_core::ports::{
+        AgentBackend, BackendStream, Lease, Resolved, TurnContext, TurnOutcome, Update,
+    };
+    use bridge_core::task_store::{
+        MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinished, TurnLogUsage,
+    };
     use bridge_workflow::graph::WorkflowNode;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
@@ -2352,6 +2500,342 @@ mod tests {
         let value = serde_json::to_value(dto).unwrap();
         assert_eq!(value["kind"], "task");
         assert_eq!(value["status"], "working");
+    }
+
+    #[test]
+    fn trace_refs_skip_absent_fields() {
+        let value = serde_json::to_value(TraceRefs::default()).unwrap();
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn task_status_dto_omits_usage_trace_when_none() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let id = task("task-no-rows");
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+
+        let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
+
+        match dto {
+            StatusDto::Task(task) => {
+                let value = serde_json::to_value(task).unwrap();
+                assert!(value.get("usage").is_none());
+                assert!(value.get("trace").is_none());
+            }
+            StatusDto::Session(_) => panic!("expected task status"),
+        }
+    }
+
+    fn dto_turn_ctx(
+        turn: &str,
+        task: &str,
+        completed_ms: i64,
+    ) -> (TurnContext, TurnLogFinished, TurnLogUsage) {
+        let ctx = TurnContext {
+            turn_id: bridge_core::ids::TurnId::parse(turn).unwrap(),
+            session_id: ContextId::parse("ctx-dto").unwrap(),
+            task_id: Some(TaskId::parse(task).unwrap()),
+            workflow: Some("code-review".into()),
+            node: Some("reviewer".into()),
+            attempt: 0,
+            agent: "codex".into(),
+            model: Some("gpt-5.5".into()),
+            effort: Some("high".into()),
+            mode: None,
+            prompt_id: Some("prompt/eval".into()),
+            traceparent: None,
+        };
+        let finished = TurnLogFinished {
+            ctx: ctx.clone(),
+            started_ms: completed_ms - 10,
+            completed_ms,
+            latency: Duration::from_millis(10),
+            ttft: None,
+            outcome: TurnOutcome::Success,
+        };
+        let usage = TurnLogUsage {
+            ctx: ctx.clone(),
+            usage: UsageSnapshot {
+                used: Some(999),
+                size: Some(1000),
+                cost: Some(UsageCost {
+                    amount: 0.50,
+                    currency: "USD".into(),
+                }),
+                terminal: Some(TerminalUsage {
+                    total_tokens: 9999,
+                    input_tokens: 7,
+                    output_tokens: 11,
+                    thought_tokens: Some(3),
+                    cached_read_tokens: Some(5),
+                    cached_write_tokens: None,
+                }),
+                at_ms: completed_ms,
+            },
+        };
+        (ctx, finished, usage)
+    }
+
+    #[tokio::test]
+    async fn task_usage_aggregates_from_turn_log_single_currency() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let id = task("task-usage");
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+
+        for (turn, completed_ms) in [("turn-a", 10), ("turn-b", 20)] {
+            let (_ctx, finished, usage) = dto_turn_ctx(turn, id.as_str(), completed_ms);
+            fixture
+                .task_store
+                .upsert_turn_finished(&finished)
+                .await
+                .unwrap();
+            fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        }
+
+        let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
+
+        match dto {
+            StatusDto::Task(task) => {
+                let usage = task.usage.unwrap();
+                assert_eq!(usage.used, None);
+                assert_eq!(usage.size, None);
+                assert_eq!(usage.cost.as_ref().unwrap().currency, "USD");
+                assert!((usage.cost.as_ref().unwrap().amount - 1.0).abs() < 0.000_001);
+                let terminal = usage.terminal.unwrap();
+                assert_eq!(terminal.input_tokens, 14);
+                assert_eq!(terminal.output_tokens, 22);
+                assert_eq!(terminal.thought_tokens, Some(6));
+                assert_eq!(terminal.cached_read_tokens, Some(10));
+                assert_eq!(terminal.cached_write_tokens, None);
+                assert_eq!(usage.at_ms, 20);
+            }
+            StatusDto::Session(_) => panic!("expected task status"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_usage_omits_cost_for_mixed_currencies() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let id = task("task-mixed");
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+
+        let (_ctx, finished, usage) = dto_turn_ctx("turn-usd", id.as_str(), 10);
+        fixture
+            .task_store
+            .upsert_turn_finished(&finished)
+            .await
+            .unwrap();
+        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+
+        let (_ctx, finished, mut usage2) = dto_turn_ctx("turn-eur", id.as_str(), 20);
+        usage2.usage.cost = Some(UsageCost {
+            amount: 0.25,
+            currency: "EUR".into(),
+        });
+        fixture
+            .task_store
+            .upsert_turn_finished(&finished)
+            .await
+            .unwrap();
+        fixture.task_store.update_turn_usage(&usage2).await.unwrap();
+
+        let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
+
+        match dto {
+            StatusDto::Task(task) => {
+                let usage = task.usage.unwrap();
+                assert!(usage.cost.is_none());
+                assert_eq!(usage.terminal.unwrap().input_tokens, 14);
+            }
+            StatusDto::Session(_) => panic!("expected task status"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_usage_terminal_total_tokens_is_input_plus_output() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let id = task("task-total");
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+
+        let (_ctx, finished, usage) = dto_turn_ctx("turn-total", id.as_str(), 10);
+        fixture
+            .task_store
+            .upsert_turn_finished(&finished)
+            .await
+            .unwrap();
+        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+
+        let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
+
+        match dto {
+            StatusDto::Task(task) => {
+                let terminal = task.usage.unwrap().terminal.unwrap();
+                assert_eq!(terminal.input_tokens, 7);
+                assert_eq!(terminal.output_tokens, 11);
+                assert_eq!(terminal.total_tokens, 18);
+            }
+            StatusDto::Session(_) => panic!("expected task status"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_ref_segments_are_percent_encoded() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let coordinator = fixture.coordinator.with_trace_refs_config(true, 4);
+        let id = TaskId::parse("task/with?chars").unwrap();
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+
+        let (_ctx, finished, usage) = dto_turn_ctx("turn/with#chars", id.as_str(), 10);
+        fixture
+            .task_store
+            .upsert_turn_finished(&finished)
+            .await
+            .unwrap();
+        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+
+        let dto = coordinator.status(None, Some(id)).await.unwrap();
+
+        match dto {
+            StatusDto::Task(task) => {
+                let trace = task.trace.unwrap();
+                assert_eq!(
+                    trace.journal.unwrap(),
+                    "/tasks/task%2Fwith%3Fchars/journal.jsonl"
+                );
+                assert_eq!(trace.turns.unwrap(), vec!["/turns/turn%2Fwith%23chars"]);
+            }
+            StatusDto::Session(_) => panic!("expected task status"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_trace_turn_refs_are_capped_but_usage_is_not() {
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let coordinator = fixture.coordinator.with_trace_refs_config(true, 2);
+        let id = task("task-capped");
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+
+        for i in 0..3 {
+            let (_ctx, finished, usage) = dto_turn_ctx(&format!("turn-{i}"), id.as_str(), 10 + i);
+            fixture
+                .task_store
+                .upsert_turn_finished(&finished)
+                .await
+                .unwrap();
+            fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        }
+
+        let dto = coordinator.status(None, Some(id)).await.unwrap();
+
+        match dto {
+            StatusDto::Task(task) => {
+                assert_eq!(task.trace.unwrap().turns.unwrap().len(), 2);
+                assert_eq!(task.usage.unwrap().terminal.unwrap().input_tokens, 21);
+            }
+            StatusDto::Session(_) => panic!("expected task status"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_status_includes_latest_warm_turn_trace_ref() {
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend: Arc::new(FakeBackend::new(None)),
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let session_manager = Arc::new(SessionManager::new_with_clock(
+            registry.clone(),
+            Duration::from_secs(60),
+            clock.clone(),
+        ));
+        let task_store = Arc::new(MemoryTaskStore::new());
+        let task_store_dyn: Arc<dyn TaskStore> = task_store.clone();
+        let session_store: Arc<dyn SessionStore> = Arc::new(FakeSessionStore::default());
+        let coordinator = Coordinator::new(
+            session_manager.clone(),
+            None,
+            Arc::new(HashMap::new()),
+            task_store_dyn,
+            session_store,
+            Arc::new(AllowPolicy),
+            registry,
+            clock,
+            Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
+            Arc::new(NoopObserver),
+            3,
+        )
+        .with_trace_refs_config(true, 4);
+
+        let ctx = ContextId::parse("ctx-warm").unwrap();
+        let turn = bridge_core::ids::TurnId::parse("turn-warm-latest").unwrap();
+        let turn_ctx = TurnContext {
+            turn_id: turn.clone(),
+            session_id: ctx.clone(),
+            task_id: None,
+            workflow: None,
+            node: None,
+            attempt: 0,
+            agent: "codex".into(),
+            model: None,
+            effort: None,
+            mode: None,
+            prompt_id: None,
+            traceparent: None,
+        };
+        task_store
+            .upsert_turn_finished(&TurnLogFinished {
+                ctx: turn_ctx,
+                started_ms: 10,
+                completed_ms: 20,
+                latency: Duration::from_millis(10),
+                ttft: None,
+                outcome: TurnOutcome::Success,
+            })
+            .await
+            .unwrap();
+
+        let _ = session_manager
+            .checkout_turn(&ctx, AgentId::parse("codex").unwrap(), None, None)
+            .await
+            .unwrap();
+
+        let dto = coordinator.status(Some(ctx), None).await.unwrap();
+
+        match dto {
+            StatusDto::Session(session) => {
+                assert_eq!(
+                    session.trace.unwrap().turn.unwrap(),
+                    "/turns/turn-warm-latest"
+                );
+            }
+            StatusDto::Task(_) => panic!("expected session status"),
+        }
     }
 
     #[tokio::test]
