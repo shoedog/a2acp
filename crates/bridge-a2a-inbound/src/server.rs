@@ -5324,7 +5324,8 @@ mod tests {
         use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
         use bridge_core::ports::{TraceParent, TurnContext, TurnOutcome};
         use bridge_core::task_store::{
-            MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinished, TurnLogUsage,
+            MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinalized,
+            TurnLogFinished, TurnUsageFinalization,
         };
         use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
         use std::io::Write;
@@ -5466,9 +5467,9 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .update_turn_usage(&TurnLogUsage {
+                .finalize_turn_usage(&TurnLogFinalized {
                     ctx,
-                    usage: UsageSnapshot {
+                    finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                         used: None,
                         size: None,
                         cost: Some(UsageCost {
@@ -5484,7 +5485,7 @@ mod tests {
                             cached_write_tokens: None,
                         }),
                         at_ms: 100,
-                    },
+                    }),
                 })
                 .await
                 .unwrap();

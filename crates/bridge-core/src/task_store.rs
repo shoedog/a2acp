@@ -189,12 +189,6 @@ pub struct TurnLogFinished {
 }
 
 #[derive(Clone, Debug)]
-pub struct TurnLogUsage {
-    pub ctx: crate::ports::TurnContext,
-    pub usage: crate::orch::UsageSnapshot,
-}
-
-#[derive(Clone, Debug)]
 pub struct TurnLogFinalized {
     pub ctx: crate::ports::TurnContext,
     pub finalization: TurnUsageFinalization,
@@ -352,14 +346,6 @@ pub trait TaskStore: Send + Sync {
 
     async fn finalize_turn_usage(&self, _row: &TurnLogFinalized) -> Result<(), BridgeError> {
         Err(BridgeError::StoreFailure)
-    }
-
-    async fn update_turn_usage(&self, row: &TurnLogUsage) -> Result<(), BridgeError> {
-        self.finalize_turn_usage(&TurnLogFinalized {
-            ctx: row.ctx.clone(),
-            finalization: TurnUsageFinalization::Usage(row.usage.clone()),
-        })
-        .await
     }
 
     async fn turn_log_rows(&self) -> Result<Vec<TurnLogRow>, BridgeError> {
@@ -1667,9 +1653,9 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx,
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: None,
                     size: None,
                     cost: cost.map(|(currency, amount)| UsageCost {
@@ -1685,7 +1671,7 @@ mod tests {
                         cached_write_tokens: Some(5),
                     }),
                     at_ms: completed_ms,
-                },
+                }),
             })
             .await
             .unwrap();
@@ -1780,7 +1766,10 @@ mod tests {
     async fn usage_finalized_some_updates_usage_and_barrier_atomically() {
         let store = MemoryTaskStore::with_clock(Arc::new(|| 12_345));
         let ctx = turn_ctx("turn-final-usage", "ctx-final-usage", None, 0);
-        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+        store
+            .upsert_turn_finished(&finished_row(ctx.clone(), 200))
+            .await
+            .unwrap();
 
         store
             .finalize_turn_usage(&TurnLogFinalized {
@@ -1806,7 +1795,10 @@ mod tests {
     async fn usage_finalization_uses_persistence_time_not_old_event_time() {
         let store = MemoryTaskStore::with_clock(Arc::new(|| 86_400_001));
         let ctx = turn_ctx("turn-persist-time", "ctx-persist-time", None, 0);
-        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+        store
+            .upsert_turn_finished(&finished_row(ctx.clone(), 200))
+            .await
+            .unwrap();
 
         store
             .finalize_turn_usage(&TurnLogFinalized {
@@ -1825,7 +1817,10 @@ mod tests {
     async fn usage_finalized_none_sets_no_usage_barrier() {
         let store = MemoryTaskStore::with_clock(Arc::new(|| 12_346));
         let ctx = turn_ctx("turn-final-none", "ctx-final-none", None, 0);
-        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+        store
+            .upsert_turn_finished(&finished_row(ctx.clone(), 200))
+            .await
+            .unwrap();
 
         store
             .finalize_turn_usage(&TurnLogFinalized {
@@ -1846,7 +1841,10 @@ mod tests {
     async fn usage_finalization_invalid_clock_uses_never_eligible_timestamp() {
         let store = MemoryTaskStore::with_clock(Arc::new(|| 0));
         let ctx = turn_ctx("turn-final-zero", "ctx-final-zero", None, 0);
-        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+        store
+            .upsert_turn_finished(&finished_row(ctx.clone(), 200))
+            .await
+            .unwrap();
 
         store
             .finalize_turn_usage(&TurnLogFinalized {
@@ -1865,14 +1863,14 @@ mod tests {
     async fn no_usage_finalization_rejects_existing_usage_columns() {
         let store = MemoryTaskStore::with_clock(Arc::new(|| 12_347));
         let ctx = turn_ctx("turn-final-contradict", "ctx-final-contradict", None, 0);
-        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
         store
-            .finalize_turn_usage(&TurnLogFinalized {
-                ctx: ctx.clone(),
-                finalization: TurnUsageFinalization::Usage(usage_snapshot(1, 2, 1)),
-            })
+            .upsert_turn_finished(&finished_row(ctx.clone(), 200))
             .await
             .unwrap();
+        {
+            let mut rows = store.turn_log.lock().unwrap();
+            rows.get_mut(ctx.turn_id.as_str()).unwrap().input_tokens = Some(1);
+        }
 
         assert!(store
             .finalize_turn_usage(&TurnLogFinalized {
@@ -1882,8 +1880,9 @@ mod tests {
             .await
             .is_err());
         let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
-        assert_eq!(row.usage_finalized_ms, Some(12_347));
-        assert_eq!(row.usage_finalization_kind, "usage");
+        assert_eq!(row.input_tokens, Some(1));
+        assert_eq!(row.usage_finalized_ms, None);
+        assert_eq!(row.usage_finalization_kind, "pending");
     }
 
     #[tokio::test]
@@ -1900,7 +1899,10 @@ mod tests {
             .await
             .unwrap();
 
-        store.upsert_turn_finished(&finished_row(ctx.clone(), 250)).await.unwrap();
+        store
+            .upsert_turn_finished(&finished_row(ctx.clone(), 250))
+            .await
+            .unwrap();
         let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
         assert_eq!(row.usage_finalized_ms, Some(12_348));
         assert_eq!(row.usage_finalization_kind, "no_usage");
@@ -1911,9 +1913,17 @@ mod tests {
         let store = MemoryTaskStore::with_clock(Arc::new(|| 50_000));
         let task = TaskId::parse("task-recency-finish").unwrap();
         store.create(&rec(task.as_str(), 1)).await.unwrap();
-        let ctx = turn_ctx("turn-recency-finish", "ctx-recency-finish", Some(task.as_str()), 0);
+        let ctx = turn_ctx(
+            "turn-recency-finish",
+            "ctx-recency-finish",
+            Some(task.as_str()),
+            0,
+        );
 
-        store.upsert_turn_finished(&finished_row(ctx, 200)).await.unwrap();
+        store
+            .upsert_turn_finished(&finished_row(ctx, 200))
+            .await
+            .unwrap();
 
         let row = store.get(&task).await.unwrap().unwrap();
         assert_eq!(row.last_artifact_ms, Some(50_000));
@@ -1928,8 +1938,16 @@ mod tests {
         });
         let task = TaskId::parse("task-recency-finalize").unwrap();
         store.create(&rec(task.as_str(), 1)).await.unwrap();
-        let ctx = turn_ctx("turn-recency-finalize", "ctx-recency-finalize", Some(task.as_str()), 0);
-        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+        let ctx = turn_ctx(
+            "turn-recency-finalize",
+            "ctx-recency-finalize",
+            Some(task.as_str()),
+            0,
+        );
+        store
+            .upsert_turn_finished(&finished_row(ctx.clone(), 200))
+            .await
+            .unwrap();
         clock.store(70_000, Ordering::SeqCst);
 
         store

@@ -1762,6 +1762,26 @@ mod resume_tests {
         ))
     }
 
+    fn make_task_record(id: &str) -> TaskRecord {
+        TaskRecord {
+            id: TaskId::parse(id).unwrap(),
+            workflow: "code-review".into(),
+            status: TaskRecordStatus::Working,
+            result: None,
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+            last_artifact_ms: None,
+            input: "DIFF".into(),
+            workflow_spec_json: None,
+            resume_attempts: 0,
+            session_cwd: None,
+            batch_id: None,
+            item_id: None,
+            artifacts_purged_at: None,
+        }
+    }
+
     async fn wait_turn_rows_for_task(
         store: &Arc<dyn TaskStore>,
         task: &TaskId,

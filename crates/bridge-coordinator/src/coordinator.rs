@@ -948,7 +948,8 @@ mod tests {
         AgentBackend, BackendStream, Lease, Resolved, TurnContext, TurnOutcome, Update,
     };
     use bridge_core::task_store::{
-        MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinished, TurnLogUsage,
+        MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinalized,
+        TurnLogFinished, TurnUsageFinalization,
     };
     use bridge_workflow::graph::WorkflowNode;
     use std::sync::Mutex as StdMutex;
@@ -2544,7 +2545,7 @@ mod tests {
         turn: &str,
         task: &str,
         completed_ms: i64,
-    ) -> (TurnContext, TurnLogFinished, TurnLogUsage) {
+    ) -> (TurnContext, TurnLogFinished, TurnLogFinalized) {
         let ctx = TurnContext {
             turn_id: bridge_core::ids::TurnId::parse(turn).unwrap(),
             session_id: ContextId::parse("ctx-dto").unwrap(),
@@ -2567,9 +2568,9 @@ mod tests {
             ttft: None,
             outcome: TurnOutcome::Success,
         };
-        let usage = TurnLogUsage {
+        let usage = TurnLogFinalized {
             ctx: ctx.clone(),
-            usage: UsageSnapshot {
+            finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                 used: Some(999),
                 size: Some(1000),
                 cost: Some(UsageCost {
@@ -2585,7 +2586,7 @@ mod tests {
                     cached_write_tokens: None,
                 }),
                 at_ms: completed_ms,
-            },
+            }),
         };
         (ctx, finished, usage)
     }
@@ -2607,7 +2608,11 @@ mod tests {
                 .upsert_turn_finished(&finished)
                 .await
                 .unwrap();
-            fixture.task_store.update_turn_usage(&usage).await.unwrap();
+            fixture
+                .task_store
+                .finalize_turn_usage(&usage)
+                .await
+                .unwrap();
         }
 
         let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
@@ -2647,10 +2652,17 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage)
+            .await
+            .unwrap();
 
         let (_ctx, finished, mut usage2) = dto_turn_ctx("turn-eur", id.as_str(), 20);
-        usage2.usage.cost = Some(UsageCost {
+        let TurnUsageFinalization::Usage(snapshot) = &mut usage2.finalization else {
+            unreachable!("dto helper always creates usage finalization")
+        };
+        snapshot.cost = Some(UsageCost {
             amount: 0.25,
             currency: "EUR".into(),
         });
@@ -2659,7 +2671,11 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage2).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage2)
+            .await
+            .unwrap();
 
         let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
 
@@ -2689,7 +2705,11 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage)
+            .await
+            .unwrap();
 
         let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
 
@@ -2721,7 +2741,11 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage)
+            .await
+            .unwrap();
 
         let dto = coordinator.status(None, Some(id)).await.unwrap();
 
@@ -2756,7 +2780,11 @@ mod tests {
                 .upsert_turn_finished(&finished)
                 .await
                 .unwrap();
-            fixture.task_store.update_turn_usage(&usage).await.unwrap();
+            fixture
+                .task_store
+                .finalize_turn_usage(&usage)
+                .await
+                .unwrap();
         }
 
         let dto = coordinator.status(None, Some(id)).await.unwrap();

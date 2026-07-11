@@ -380,6 +380,13 @@ fn bump_last_artifact_sql(
     .map_err(|_| BridgeError::StoreFailure)
 }
 
+fn immediate_transaction(
+    conn: &rusqlite::Connection,
+) -> Result<rusqlite::Transaction<'_>, BridgeError> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| BridgeError::StoreFailure)
+}
+
 fn batch_status_as_str(status: bridge_core::task_store::BatchStatus) -> &'static str {
     use bridge_core::task_store::BatchStatus;
     match status {
@@ -713,9 +720,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         ts: i64,
     ) -> Result<(), BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         let artifact_ms = durable_retention_ms((self.now_ms)());
         if bump_last_artifact_sql(&tx, task, artifact_ms)? == 0 {
             return Err(BridgeError::StoreFailure);
@@ -775,10 +780,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     ) -> Result<bridge_core::task_store::ResumeClaim, BridgeError> {
         use bridge_core::task_store::ResumeClaim;
         let conn = self.conn.lock().unwrap();
-        // unchecked_transaction takes &self — safe to use through the MutexGuard.
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        // `new_unchecked` takes `&Connection`; the enclosing mutex serializes transactions.
+        let tx = immediate_transaction(&conn)?;
         let current: Option<i64> = tx
             .query_row(
                 "SELECT resume_attempts FROM tasks WHERE id=?1",
@@ -827,9 +830,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         row: &bridge_core::task_store::TurnLogFinished,
     ) -> Result<(), BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         let artifact_ms = durable_retention_ms((self.now_ms)());
         if let Some(task) = row.ctx.task_id.as_ref() {
             let _ = bump_last_artifact_sql(&tx, task, artifact_ms)?;
@@ -893,9 +894,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         use bridge_core::task_store::TurnUsageFinalization;
 
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         let persistence_ms = durable_retention_ms((self.now_ms)());
         let (expected_kind, n) = match &row.finalization {
             TurnUsageFinalization::Usage(usage) => {
@@ -1380,9 +1379,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         ts: i64,
     ) -> Result<i64, BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         // Allocate seq by bumping last_event_seq.
         let n = tx
             .execute(
@@ -1446,9 +1443,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .transpose()
             .map_err(|_| BridgeError::StoreFailure)?;
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         // Allocate seq.
         let n = tx
             .execute(
@@ -1522,9 +1517,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         ts: i64,
     ) -> Result<i64, BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         // Allocate seq.
         let n = tx
             .execute(
@@ -1592,9 +1585,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         kind: bridge_core::orch::OrchEventKind,
     ) -> Result<i64, BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         let n = tx
             .execute(
                 "UPDATE tasks SET
@@ -1664,9 +1655,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     ) -> Result<bridge_core::task_store::JournalFoldInputs, BridgeError> {
         use bridge_core::task_store::{JournalFoldInputs, JournalScalars, TaskRecordStatus};
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         let (status_s, result, error, terminal_seq, cut_seq, complete_from_birth): (
             String,
             Option<String>,
@@ -1735,9 +1724,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         max_bytes: usize,
     ) -> Result<bridge_core::task_store::JournalRead, BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
 
         let (events, bytes): (i64, i64) = tx
             .query_row(
@@ -1870,9 +1857,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         use bridge_core::task_store::TaskProgressSnapshot;
         let conn = self.conn.lock().unwrap();
         // Use a transaction for a consistent read so cut_seq is exact.
-        let tx = conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         // Read task row: status, result, error, terminal_seq, last_event_seq.
         let (status_s, result, error, terminal_seq, cut_seq): (
             String,
@@ -2023,11 +2008,21 @@ mod tests {
     use bridge_core::ports::{FailureClass, SessionStore, TraceParent, TurnContext, TurnOutcome};
     use bridge_core::task_store::{
         BatchRecord, BatchStatus, ChildClaim, MemoryTaskStore, TaskRecord, TaskRecordStatus,
-        TaskStore, TurnLogFinalized, TurnLogFinished, TurnLogUsage, TurnUsageFinalization,
+        TaskStore, TurnLogFinalized, TurnLogFinished, TurnUsageFinalization,
         RETENTION_NEVER_ELIGIBLE_MS,
     };
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Arc;
+
+    type LegacyTurnColumns = (
+        Option<i64>,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+    );
 
     fn trec(id: &str, ms: i64) -> TaskRecord {
         TaskRecord {
@@ -2138,9 +2133,9 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx,
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: None,
                     size: None,
                     cost: cost.map(|(currency, amount)| UsageCost {
@@ -2156,7 +2151,7 @@ mod tests {
                         cached_write_tokens: None,
                     }),
                     at_ms: completed_ms,
-                },
+                }),
             })
             .await
             .unwrap();
@@ -2302,13 +2297,14 @@ mod tests {
             .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
             .await
             .unwrap();
-        store
-            .finalize_turn_usage(&TurnLogFinalized {
-                ctx: ctx.clone(),
-                finalization: TurnUsageFinalization::Usage(sqlite_usage(1, 2, 1)),
-            })
-            .await
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE turn_log SET input_tokens=1 WHERE turn_id=?1",
+                rusqlite::params![ctx.turn_id.as_str()],
+            )
             .unwrap();
+        }
 
         assert!(store
             .finalize_turn_usage(&TurnLogFinalized {
@@ -2318,8 +2314,9 @@ mod tests {
             .await
             .is_err());
         let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
-        assert_eq!(row.usage_finalized_ms, Some(12_347));
-        assert_eq!(row.usage_finalization_kind, "usage");
+        assert_eq!(row.input_tokens, Some(1));
+        assert_eq!(row.usage_finalized_ms, None);
+        assert_eq!(row.usage_finalization_kind, "pending");
     }
 
     #[tokio::test]
@@ -2402,51 +2399,326 @@ mod tests {
         assert_eq!(row.last_artifact_ms, Some(70_000));
     }
 
+    async fn finish_for_finalization<S: TaskStore + ?Sized>(store: &S, ctx: &TurnContext) {
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
+            .await
+            .unwrap();
+    }
+
+    async fn parity_turn_row(
+        memory: &MemoryTaskStore,
+        sqlite: &SqliteStore,
+        turn: &TurnId,
+    ) -> bridge_core::task_store::TurnLogRow {
+        let memory_row = memory.turn_log_row(turn).await.unwrap().unwrap();
+        let sqlite_row = sqlite.turn_log_row(turn).await.unwrap().unwrap();
+        assert_eq!(memory_row, sqlite_row);
+        memory_row
+    }
+
+    async fn finalize_both(
+        memory: &MemoryTaskStore,
+        sqlite: &SqliteStore,
+        row: &TurnLogFinalized,
+    ) -> (Result<(), BridgeError>, Result<(), BridgeError>) {
+        (
+            memory.finalize_turn_usage(row).await,
+            sqlite.finalize_turn_usage(row).await,
+        )
+    }
+
     #[tokio::test]
     async fn memory_finalization_matches_sqlite() {
-        let memory = MemoryTaskStore::with_clock(Arc::new(|| 88_000));
-        let sqlite = SqliteStore::open_in_memory_with_clock(Arc::new(|| 88_000)).unwrap();
-        let mem_ctx = ctx_for("mem-final-parity", "ctx-final-parity", "task-1", 0);
-        let sql_ctx = ctx_for("sql-final-parity", "ctx-final-parity", "task-1", 0);
+        let clock = Arc::new(AtomicI64::new(88_000));
+        let memory = MemoryTaskStore::with_clock({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        });
+        let sqlite = SqliteStore::open_in_memory_with_clock({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        })
+        .unwrap();
 
-        memory
-            .upsert_turn_finished(&sqlite_finished(mem_ctx.clone(), 200))
+        // Usage finalization persists all usage fields at storage time, not event time.
+        let usage_ctx = ctx_for("parity-usage", "ctx-final-parity", "task-1", 0);
+        finish_for_finalization(&memory, &usage_ctx).await;
+        finish_for_finalization(&sqlite, &usage_ctx).await;
+        let usage = TurnLogFinalized {
+            ctx: usage_ctx.clone(),
+            finalization: TurnUsageFinalization::Usage(sqlite_usage(3, 4, 1)),
+        };
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &usage).await;
+        assert!(memory_result.is_ok() && sqlite_result.is_ok());
+        let first_usage_row = parity_turn_row(&memory, &sqlite, &usage_ctx.turn_id).await;
+        assert_eq!(first_usage_row.input_tokens, Some(3));
+        assert_eq!(first_usage_row.output_tokens, Some(4));
+        assert_eq!(first_usage_row.usage_finalized_ms, Some(88_000));
+        assert_ne!(first_usage_row.usage_finalized_ms, Some(1));
+        assert_eq!(first_usage_row.usage_finalization_kind, "usage");
+
+        // A same-kind duplicate is idempotent: later storage time and payload do not overwrite.
+        clock.store(88_100, Ordering::SeqCst);
+        let duplicate_usage = TurnLogFinalized {
+            ctx: usage_ctx.clone(),
+            finalization: TurnUsageFinalization::Usage(sqlite_usage(30, 40, 2)),
+        };
+        let (memory_result, sqlite_result) =
+            finalize_both(&memory, &sqlite, &duplicate_usage).await;
+        assert!(memory_result.is_ok() && sqlite_result.is_ok());
+        let duplicate_usage_row = parity_turn_row(&memory, &sqlite, &usage_ctx.turn_id).await;
+        assert_eq!(duplicate_usage_row, first_usage_row);
+
+        // A contradictory finalization kind is rejected without changing the stored usage row.
+        let contradictory = TurnLogFinalized {
+            ctx: usage_ctx.clone(),
+            finalization: TurnUsageFinalization::NoUsage,
+        };
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &contradictory).await;
+        assert!(memory_result.is_err() && sqlite_result.is_err());
+        assert_eq!(
+            parity_turn_row(&memory, &sqlite, &usage_ctx.turn_id).await,
+            first_usage_row
+        );
+
+        // Explicit no-usage and its duplicate have the same barrier semantics.
+        clock.store(89_000, Ordering::SeqCst);
+        let no_usage_ctx = ctx_for("parity-no-usage", "ctx-final-parity", "task-1", 0);
+        finish_for_finalization(&memory, &no_usage_ctx).await;
+        finish_for_finalization(&sqlite, &no_usage_ctx).await;
+        let no_usage = TurnLogFinalized {
+            ctx: no_usage_ctx.clone(),
+            finalization: TurnUsageFinalization::NoUsage,
+        };
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &no_usage).await;
+        assert!(memory_result.is_ok() && sqlite_result.is_ok());
+        let first_no_usage_row = parity_turn_row(&memory, &sqlite, &no_usage_ctx.turn_id).await;
+        assert_eq!(first_no_usage_row.input_tokens, None);
+        assert_eq!(first_no_usage_row.cost_amount, None);
+        assert_eq!(first_no_usage_row.usage_finalized_ms, Some(89_000));
+        assert_eq!(first_no_usage_row.usage_finalization_kind, "no_usage");
+
+        clock.store(89_100, Ordering::SeqCst);
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &no_usage).await;
+        assert!(memory_result.is_ok() && sqlite_result.is_ok());
+        assert_eq!(
+            parity_turn_row(&memory, &sqlite, &no_usage_ctx.turn_id).await,
+            first_no_usage_row
+        );
+
+        // Unknown turns fail identically and do not synthesize rows.
+        let unknown_ctx = ctx_for("parity-unknown", "ctx-final-parity", "task-1", 0);
+        let unknown = TurnLogFinalized {
+            ctx: unknown_ctx.clone(),
+            finalization: TurnUsageFinalization::NoUsage,
+        };
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &unknown).await;
+        assert!(memory_result.is_err() && sqlite_result.is_err());
+        assert!(memory
+            .turn_log_row(&unknown_ctx.turn_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(sqlite
+            .turn_log_row(&unknown_ctx.turn_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // An invalid zero clock and the explicit sentinel both fail closed to the sentinel.
+        for (turn, clock_value) in [
+            ("parity-invalid-clock", 0),
+            ("parity-sentinel-clock", RETENTION_NEVER_ELIGIBLE_MS),
+        ] {
+            clock.store(clock_value, Ordering::SeqCst);
+            let ctx = ctx_for(turn, "ctx-final-parity", "task-1", 0);
+            finish_for_finalization(&memory, &ctx).await;
+            finish_for_finalization(&sqlite, &ctx).await;
+            let finalized = TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            };
+            let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &finalized).await;
+            assert!(memory_result.is_ok() && sqlite_result.is_ok());
+            let row = parity_turn_row(&memory, &sqlite, &ctx.turn_id).await;
+            assert_eq!(row.usage_finalized_ms, Some(RETENTION_NEVER_ELIGIBLE_MS));
+            assert_ne!(row.usage_finalized_ms, Some(0));
+            assert_eq!(row.usage_finalization_kind, "no_usage");
+        }
+    }
+
+    async fn assert_task_recency<S: TaskStore + ?Sized>(
+        store: &S,
+        task: &TaskId,
+        expected_ms: i64,
+    ) {
+        assert_eq!(
+            store.get(task).await.unwrap().unwrap().last_artifact_ms,
+            Some(expected_ms),
+            "unexpected storage-authored recency for {}",
+            task.as_str()
+        );
+    }
+
+    async fn assert_all_seven_writer_recencies<S: TaskStore + ?Sized>(
+        store: &S,
+        clock: &Arc<AtomicI64>,
+    ) {
+        const STALE_CALLER_MS: i64 = 1;
+
+        let checkpoint_task = TaskId::parse("recency-legacy-checkpoint").unwrap();
+        store
+            .create(&trec(checkpoint_task.as_str(), STALE_CALLER_MS))
             .await
             .unwrap();
-        sqlite
-            .upsert_turn_finished(&sqlite_finished(sql_ctx.clone(), 200))
+        clock.store(100_001, Ordering::SeqCst);
+        store
+            .put_node_checkpoint(
+                &checkpoint_task,
+                &bridge_core::ids::NodeId::parse("legacy-node").unwrap(),
+                "checkpoint",
+                true,
+                STALE_CALLER_MS,
+            )
             .await
             .unwrap();
-        memory
+        assert_task_recency(store, &checkpoint_task, 100_001).await;
+
+        let start_task = TaskId::parse("recency-node-start").unwrap();
+        store
+            .create(&trec(start_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_002, Ordering::SeqCst);
+        store
+            .record_node_started(
+                &start_task,
+                &bridge_core::ids::NodeId::parse("started-node").unwrap(),
+                &OperationId::parse("op-recency-node-start").unwrap(),
+                STALE_CALLER_MS,
+            )
+            .await
+            .unwrap();
+        assert_task_recency(store, &start_task, 100_002).await;
+
+        let sequenced_checkpoint_task = TaskId::parse("recency-sequenced-checkpoint").unwrap();
+        store
+            .create(&trec(sequenced_checkpoint_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_003, Ordering::SeqCst);
+        store
+            .put_node_checkpoint_sequenced(
+                &sequenced_checkpoint_task,
+                &bridge_core::ids::NodeId::parse("sequenced-node").unwrap(),
+                &OperationId::parse("op-recency-sequenced-checkpoint").unwrap(),
+                "checkpoint",
+                true,
+                STALE_CALLER_MS,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_task_recency(store, &sequenced_checkpoint_task, 100_003).await;
+
+        let terminal_task = TaskId::parse("recency-terminal").unwrap();
+        store
+            .create(&trec(terminal_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_004, Ordering::SeqCst);
+        store
+            .set_terminal_sequenced(
+                &terminal_task,
+                &OperationId::parse("op-recency-terminal").unwrap(),
+                TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                STALE_CALLER_MS,
+            )
+            .await
+            .unwrap();
+        assert_task_recency(store, &terminal_task, 100_004).await;
+
+        let rich_event_task = TaskId::parse("recency-rich-event").unwrap();
+        store
+            .create(&trec(rich_event_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_005, Ordering::SeqCst);
+        store
+            .record_event_sequenced(
+                &rich_event_task,
+                &OperationId::parse("op-recency-rich-event").unwrap(),
+                STALE_CALLER_MS,
+                bridge_core::orch::OrchEventKind::Plan { entries: vec![] },
+            )
+            .await
+            .unwrap();
+        assert_task_recency(store, &rich_event_task, 100_005).await;
+
+        let finished_task = TaskId::parse("recency-turn-finished").unwrap();
+        store
+            .create(&trec(finished_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        let finished_ctx = ctx_for(
+            "recency-turn-finished-row",
+            "ctx-recency-writers",
+            finished_task.as_str(),
+            0,
+        );
+        clock.store(100_006, Ordering::SeqCst);
+        store
+            .upsert_turn_finished(&sqlite_finished(finished_ctx, STALE_CALLER_MS))
+            .await
+            .unwrap();
+        assert_task_recency(store, &finished_task, 100_006).await;
+
+        let finalized_task = TaskId::parse("recency-turn-finalized").unwrap();
+        store
+            .create(&trec(finalized_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        let finalized_ctx = ctx_for(
+            "recency-turn-finalized-row",
+            "ctx-recency-writers",
+            finalized_task.as_str(),
+            0,
+        );
+        clock.store(100_006, Ordering::SeqCst);
+        store
+            .upsert_turn_finished(&sqlite_finished(finalized_ctx.clone(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_007, Ordering::SeqCst);
+        store
             .finalize_turn_usage(&TurnLogFinalized {
-                ctx: mem_ctx.clone(),
-                finalization: TurnUsageFinalization::Usage(sqlite_usage(3, 4, 1)),
+                ctx: finalized_ctx,
+                finalization: TurnUsageFinalization::Usage(sqlite_usage(1, 2, STALE_CALLER_MS)),
             })
             .await
             .unwrap();
-        sqlite
-            .finalize_turn_usage(&TurnLogFinalized {
-                ctx: sql_ctx.clone(),
-                finalization: TurnUsageFinalization::Usage(sqlite_usage(3, 4, 1)),
-            })
-            .await
-            .unwrap();
+        assert_task_recency(store, &finalized_task, 100_007).await;
+    }
 
-        let mem = memory
-            .turn_log_row(&mem_ctx.turn_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let sql = sqlite
-            .turn_log_row(&sql_ctx.turn_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(mem.input_tokens, sql.input_tokens);
-        assert_eq!(mem.output_tokens, sql.output_tokens);
-        assert_eq!(mem.cost_amount, sql.cost_amount);
-        assert_eq!(mem.usage_finalized_ms, sql.usage_finalized_ms);
-        assert_eq!(mem.usage_finalization_kind, sql.usage_finalization_kind);
+    #[tokio::test]
+    async fn storage_authored_recency_covers_all_seven_writer_families() {
+        let memory_clock = Arc::new(AtomicI64::new(0));
+        let memory = MemoryTaskStore::with_clock({
+            let clock = Arc::clone(&memory_clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        });
+        assert_all_seven_writer_recencies(&memory, &memory_clock).await;
+
+        let sqlite_clock = Arc::new(AtomicI64::new(0));
+        let sqlite = SqliteStore::open_in_memory_with_clock({
+            let clock = Arc::clone(&sqlite_clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        })
+        .unwrap();
+        assert_all_seven_writer_recencies(&sqlite, &sqlite_clock).await;
     }
 
     #[tokio::test]
@@ -2524,15 +2796,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(task_cols, (None, None));
-        let turn: (
-            Option<i64>,
-            String,
-            Option<i64>,
-            Option<i64>,
-            Option<f64>,
-            Option<String>,
-            Option<String>,
-        ) = conn
+        let turn: LegacyTurnColumns = conn
             .query_row(
                 "SELECT usage_finalized_ms, usage_finalization_kind, input_tokens, output_tokens,
                         cost_amount, cost_currency, task_id
@@ -3408,9 +3672,9 @@ mod tests {
         };
         store.upsert_turn_finished(&first).await.unwrap();
         store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx: first.ctx.clone(),
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: Some(50),
                     size: Some(1000),
                     cost: Some(UsageCost {
@@ -3426,7 +3690,7 @@ mod tests {
                         cached_write_tokens: Some(3),
                     }),
                     at_ms: 251,
-                },
+                }),
             })
             .await
             .unwrap();
@@ -3471,10 +3735,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_update_turn_usage_delegates_to_finalization_barrier() {
+    async fn sqlite_duplicate_usage_finalization_is_idempotent() {
         let store = SqliteStore::open_in_memory().unwrap();
         let base = TurnLogFinished {
-            ctx: ctx("turn-merge", 0),
+            ctx: ctx("turn-duplicate-finalization", 0),
             started_ms: 100,
             completed_ms: 200,
             latency: std::time::Duration::from_millis(100),
@@ -3484,12 +3748,15 @@ mod tests {
         store.upsert_turn_finished(&base).await.unwrap();
 
         store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx: base.ctx.clone(),
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: None,
                     size: None,
-                    cost: None,
+                    cost: Some(UsageCost {
+                        amount: 1.23,
+                        currency: "USD".to_string(),
+                    }),
                     terminal: Some(TerminalUsage {
                         total_tokens: 12,
                         input_tokens: 6,
@@ -3499,24 +3766,31 @@ mod tests {
                         cached_write_tokens: None,
                     }),
                     at_ms: 205,
-                },
+                }),
             })
             .await
             .unwrap();
 
         store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx: base.ctx.clone(),
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: None,
                     size: None,
                     cost: Some(UsageCost {
-                        amount: 1.23,
-                        currency: "USD".to_string(),
+                        amount: 9.99,
+                        currency: "EUR".to_string(),
                     }),
-                    terminal: None,
+                    terminal: Some(TerminalUsage {
+                        total_tokens: 200,
+                        input_tokens: 100,
+                        output_tokens: 100,
+                        thought_tokens: None,
+                        cached_read_tokens: None,
+                        cached_write_tokens: None,
+                    }),
                     at_ms: 210,
-                },
+                }),
             })
             .await
             .unwrap();
@@ -3526,14 +3800,14 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|r| r.turn_id.as_str() == "turn-merge")
+            .find(|r| r.turn_id.as_str() == "turn-duplicate-finalization")
             .unwrap();
         assert_eq!(row.input_tokens, Some(6));
         assert_eq!(row.output_tokens, Some(6));
         assert_eq!(row.thought_tokens, Some(2));
         assert_eq!(row.cached_read_tokens, Some(0));
-        assert_eq!(row.cost_amount, None);
-        assert_eq!(row.cost_currency, None);
+        assert_eq!(row.cost_amount, Some(1.23));
+        assert_eq!(row.cost_currency.as_deref(), Some("USD"));
         assert!(row.usage_finalized_ms.is_some());
         assert_eq!(row.usage_finalization_kind, "usage");
     }
@@ -3732,18 +4006,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_update_turn_usage_unknown_turn_returns_error() {
+    async fn sqlite_finalize_turn_usage_unknown_turn_returns_error() {
         let store = SqliteStore::open_in_memory().unwrap();
         let err = store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx: ctx("missing-turn", 0),
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: None,
                     size: None,
                     cost: None,
                     terminal: None,
                     at_ms: 0,
-                },
+                }),
             })
             .await
             .unwrap_err();

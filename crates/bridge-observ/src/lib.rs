@@ -1127,7 +1127,7 @@ mod rebuild_tests {
         let mut row = rebuild_row("turn-no-usage");
         row.usage_finalized_ms = Some(2_000);
         row.usage_finalization_kind = "no_usage".to_string();
-        prom.rebuild_from_turn_log(&[row.clone()]);
+        prom.rebuild_from_turn_log(std::slice::from_ref(&row));
 
         assert!(!prom.dedupe().mark_usage(&row.turn_id));
         let out = prom.endpoint().render().unwrap();
@@ -1139,7 +1139,7 @@ mod rebuild_tests {
     fn prometheus_rebuild_keeps_pending_finalization_replayable() {
         let prom = PrometheusObserver::new(LabelVocabulary::default()).unwrap();
         let row = rebuild_row("turn-pending-finalization");
-        prom.rebuild_from_turn_log(&[row.clone()]);
+        prom.rebuild_from_turn_log(std::slice::from_ref(&row));
 
         assert!(!prom.dedupe().mark_finished(&row.turn_id));
         assert!(prom.dedupe().mark_usage(&row.turn_id));
@@ -1151,7 +1151,7 @@ mod rebuild_tests {
         let mut row = rebuild_row("turn-sentinel-finalization");
         row.usage_finalized_ms = Some(bridge_core::task_store::RETENTION_NEVER_ELIGIBLE_MS);
         row.usage_finalization_kind = "no_usage".to_string();
-        prom.rebuild_from_turn_log(&[row.clone()]);
+        prom.rebuild_from_turn_log(std::slice::from_ref(&row));
 
         assert!(!prom.dedupe().mark_usage(&row.turn_id));
         assert_eq!(
