@@ -4670,32 +4670,8 @@ mod observability_tests {
     #[async_trait::async_trait]
     impl AgentRegistry for NoUsageIdleRegistry {
         async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
-            use bridge_core::domain::{AgentEntry, AgentKind};
             Ok(Resolved {
-                entry: Arc::new(AgentEntry {
-                    id: id.clone(),
-                    cmd: Some("x".into()),
-                    base_url: None,
-                    api_key_env: None,
-                    args: vec![],
-                    kind: AgentKind::Acp,
-                    model_provider: None,
-                    model: None,
-                    effort: None,
-                    mode: None,
-                    cwd: None,
-                    session_cwd: None,
-                    sandbox: None,
-                    watchdog: None,
-                    auth_method: None,
-                    name: None,
-                    description: None,
-                    tags: vec![],
-                    version: None,
-                    mcp: vec![],
-                    mcp_delivery: Default::default(),
-                    extensions: Default::default(),
-                }),
+                entry: Arc::new(super::tests::minimal_entry(id)),
                 backend: Arc::new(NoUsageIdleBackend),
                 lease: Box::new(NoopLease2),
             })
