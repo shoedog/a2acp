@@ -1,5 +1,10 @@
 # Superpowers Artifacts
 
+For current priorities and operating instructions, use the
+[`docs` index](../README.md) and the
+[`a2a-bridge-operator` skill](../../skills/a2a-bridge-operator/SKILL.md). Files here are design and
+review provenance, not the live compatibility matrix.
+
 `docs/superpowers/` keeps durable a2a-bridge design history: final specs, final
 plans, ADR support notes, and selected handoffs that remain useful for future
 bridge work.

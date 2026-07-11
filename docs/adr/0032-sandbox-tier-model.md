@@ -101,3 +101,27 @@ verbatim from the shipped configs (`a2a-bridge.workflows.toml` for the Tier 0/1 
 `a2a-bridge.containerized.toml` for the Tier 1 read-only args and the Tier 2/3 `[agents.sandbox]`
 blocks) — nothing invented. It is a parse-level reference, not a runnable `serve` config (no
 workflows/prompts): `a2a-bridge validate --config examples/a2a-bridge.tiers.toml`.
+
+## Operational clarification (2026-07-11) — degraded containers and host fallback
+
+For **trusted own-repo read-only** work, Tier 0/1 host execution is a normal operating mode, not an
+emergency security bypass. Containerized Tier 2 is opt-in defense-in-depth for this content class.
+When container infrastructure is degraded, an operator may explicitly rerun the work through an
+eligible host entry after confirming the input is trusted own-repo content.
+
+This does not permit a silent runtime downgrade:
+
+- Third-party or otherwise untrusted content still requires Tier 2 and fails closed when container
+  isolation is unavailable.
+- Write-capable `implement` work still requires Tier 3, including on an operator-owned repo. A host
+  write fallback would change this ADR's safety decision and requires a separate owner-approved ADR.
+- A generic agent/model/prompt failure is not proof that the container boundary is degraded. Fallback
+  is eligible only for classified infrastructure failures such as runtime, image, network, mount, or
+  container credential setup.
+- Once a prompt may have been accepted, the bridge must not replay it automatically on the host; doing
+  so can duplicate cost or side effects. An operator must make the retry decision with the first
+  attempt's phase and terminal state visible.
+
+A future automated fallback policy must therefore be explicit in config/request state, carry a trusted
+content classification, name the permitted host target, emit an audit event explaining the downgrade,
+and default to disabled. The current bridge does not implement that automatic policy.

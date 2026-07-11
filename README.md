@@ -8,6 +8,12 @@ server running. Remote A2A callers — or the CLI — resolve the target agent(s
 runtime-mutable registry, drive them over **ACP** (the Agent Client Protocol, JSON-RPC/stdio)
 via a conformant SDK client, and get results back over SSE or as workflow output.
 
+> **Agents and operators:** start with the
+> [`a2a-bridge-operator` skill](skills/a2a-bridge-operator/SKILL.md) and the
+> [documentation index](docs/README.md). Current agent/model evidence is in
+> [`docs/compatibility.md`](docs/compatibility.md); current priorities are in
+> [`docs/roadmap.md`](docs/roadmap.md).
+
 ## What this is
 
 a2a-bridge is a **reference implementation**: a working, opinionated answer to "how do you
@@ -89,6 +95,7 @@ containers) see [AGENTS.md](AGENTS.md); for running your own multi-agent bridge 
 | `models` | List each configured agent's advertised models/effort/modes (probed live). `[--config <f>] [--agent <id>] [--json]` |
 | `init` | Scaffold `a2a-bridge.toml` + prompts for the given agents. `--agents codex,claude [--dir <d>] [--force]` |
 | `validate` | Validate config schema, registry, workflow DAGs, and prompt refs — or `--repo-hygiene` (this repo's own workflow-artifact hygiene gate) |
+| `doctor` | Run a bounded, read-only preflight for config, commands/runtimes, egress, credentials, store, verify/review, and MCP/LSP. `[--config <f>] [--json]` |
 | `serve` | Run the A2A server. `[--config <path>]` |
 | `mcp` | Serve the MCP protocol over stdio, backed by the same `Coordinator` service API. `[--config <path>] [--store <path>]` |
 | `task-spec` | Inspect/scaffold/validate typed task-spec inputs: `schema` \| `template <type>` \| `input <file>` |
