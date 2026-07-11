@@ -1,0 +1,4 @@
+interface:
+  display_name: "A2A Bridge Operator"
+  short_description: "Run and diagnose A2A bridge workflows"
+  default_prompt: "Use $a2a-bridge-operator to validate this bridge setup and isolate any agent, model, or container failure."

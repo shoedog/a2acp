@@ -1,5 +1,9 @@
 # Onboarding — running the a2a-bridge with your own agents
 
+> **Agent/operator preflight:** use the
+> [`a2a-bridge-operator` skill](../skills/a2a-bridge-operator/SKILL.md) and check the current
+> [`compatibility matrix`](compatibility.md) before spending a live agent turn.
+
 The bridge is an A2A↔ACP server: it fronts one or more agent CLIs (kiro, codex,
 claude) — or an OpenAI-compatible HTTP backend — behind the A2A protocol, and can
 run multi-agent **review workflows**. This guide gets an external project from zero

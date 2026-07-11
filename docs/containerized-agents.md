@@ -160,8 +160,17 @@ backend, not `api.openai.com`); **kiro `cognito-identity.us-east-1.amazonaws.com
 
 ## 7. Fallbacks & caveats
 
-- **claude-only fallback:** if any agent's in-box auth / egress won't close, drop it and run
-  claude-only containerized (claude is the proven baseline, ADR-0013).
+- **Trusted own-repo read-only fallback:** Tier 0/1 host entries are a first-class mode for trusted
+  review/design work (ADR-0032); Tier 2 is opt-in defense-in-depth for that content class. If container
+  infrastructure is degraded, explicitly select an eligible host entry after confirming trust. The
+  bridge does not silently downgrade or automatically replay a prompt.
+- **No fallback for untrusted or write-capable work:** third-party/untrusted reads require Tier 2, and
+  every `implement`/write path requires Tier 3 even for an owned repo. Both fail closed if the
+  container boundary is unavailable.
+- **claude-only container fallback:** if another agent's in-box auth/egress will not close, a
+  Claude-only container config remains an option only when that exact adapter/image/model row is
+  currently `PASS` in [`compatibility.md`](compatibility.md). Do not infer it from ADR-0013's historical
+  baseline.
 - **ollama cloud is host-direct egress** — a cloud `base_url` (ollama.com) is the **bridge** calling
   out (non-process), so it bypasses the container proxy. Safe, but note it; local ollama has no remote
   egress at all.
