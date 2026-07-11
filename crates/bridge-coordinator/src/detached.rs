@@ -613,12 +613,14 @@ mod sink_tests {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         }
     }
 
@@ -735,12 +737,14 @@ mod sink_tests {
                 error: None,
                 created_ms: 1,
                 updated_ms: 1,
+                last_artifact_ms: None,
                 input: "DIFF".into(),
                 workflow_spec_json: None,
                 resume_attempts: 0,
                 session_cwd: None,
                 batch_id: None,
                 item_id: None,
+                artifacts_purged_at: None,
             })
             .await
             .unwrap();
@@ -1634,6 +1638,7 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                 Some(s) => match bridge_core::SessionCwd::parse(s) {
                     Ok(c) => bridge_workflow::executor::WorkflowRunContext {
                         session_cwd: Some(c),
+                        task_id: Some(task.clone()),
                         make_rich_sink: None,
                         observer: deps.observer.clone(),
                         ..bridge_workflow::executor::WorkflowRunContext::default()
@@ -1657,6 +1662,7 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                     }
                 },
                 None => bridge_workflow::executor::WorkflowRunContext {
+                    task_id: Some(task.clone()),
                     observer: deps.observer.clone(),
                     ..bridge_workflow::executor::WorkflowRunContext::default()
                 },
@@ -1732,6 +1738,7 @@ mod resume_tests {
         AgentBackend, AgentRegistry, BackendStream, Lease, ObsEvent, Observer, Resolved, Update,
     };
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use bridge_observ::{DropCounter, TurnLogObserver};
     use bridge_workflow::executor::WorkflowExecutor;
     use bridge_workflow::graph::{PanelConfig, RetryPolicy, WorkflowGraph, WorkflowNode};
     use std::collections::{BTreeMap, HashMap};
@@ -1744,6 +1751,34 @@ mod resume_tests {
     struct NoopObserver;
     impl Observer for NoopObserver {
         fn record(&self, _: &ObsEvent<'_>) {}
+    }
+
+    fn turn_log_observer(store: Arc<dyn TaskStore>) -> Arc<TurnLogObserver> {
+        Arc::new(TurnLogObserver::new(
+            store,
+            DropCounter::disabled(),
+            64,
+            Arc::new(|| 1_000),
+        ))
+    }
+
+    async fn wait_turn_rows_for_task(
+        store: &Arc<dyn TaskStore>,
+        task: &TaskId,
+    ) -> Vec<bridge_core::task_store::TurnLogRow> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rows = store.turn_log_rows_for_task(task, 16).await.unwrap();
+            if !rows.is_empty() {
+                return rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for turn_log rows for {}",
+                task.as_str()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[derive(Default)]
@@ -1884,6 +1919,121 @@ mod resume_tests {
         })
     }
 
+    fn detached_deps_with_observer(
+        store: Arc<dyn TaskStore>,
+        observer: Arc<dyn Observer>,
+        graph: Arc<WorkflowGraph>,
+    ) -> DetachedDeps {
+        let synth = Arc::new(PromptRec::default());
+        DetachedDeps {
+            task_store: store,
+            executor: Some(Arc::new(WorkflowExecutor::new(Arc::new(
+                RecordingRegistry { synth },
+            )))),
+            workflows: Arc::new(HashMap::from([(graph.id.clone(), graph)])),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+            observer,
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_detached_workflow_overwrites_ctx_task_id() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let turnlog = turn_log_observer(store.clone());
+        let graph = single_retry_graph();
+        let deps = detached_deps_with_observer(store.clone(), turnlog.clone(), graph.clone());
+
+        let cases = vec![
+            ("t-overwrite-missing", None),
+            (
+                "t-overwrite-conflict",
+                Some(TaskId::parse("t-wrong-owner").unwrap()),
+            ),
+        ];
+        for (task_raw, supplied_task_id) in cases {
+            let task = TaskId::parse(task_raw).unwrap();
+            store.create(&make_task_record(task_raw)).await.unwrap();
+            let hub = Arc::new(TaskProgressHub::new());
+            deps.progress_hubs
+                .lock()
+                .await
+                .insert(task.clone(), hub.clone());
+            let handle = spawn_detached_workflow(
+                &deps,
+                task.clone(),
+                "DIFF".into(),
+                graph.clone(),
+                task.as_str().to_string(),
+                CancellationToken::new(),
+                HashMap::new(),
+                WorkflowRunContext {
+                    task_id: supplied_task_id,
+                    observer: turnlog.clone(),
+                    ..WorkflowRunContext::default()
+                },
+                hub,
+            );
+            handle.await.unwrap();
+            turnlog.flush().await;
+
+            let rows = wait_turn_rows_for_task(&store, &task).await;
+            assert!(
+                rows.iter()
+                    .all(|row| row.task_id.as_ref().map(|id| id.as_str()) == Some(task.as_str())),
+                "detached runner must persist authoritative task_id for {task_raw}: {rows:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_fresh_turn_persists_task_id() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let turnlog = turn_log_observer(store.clone());
+        let graph = single_retry_graph();
+        let deps = detached_deps_with_observer(store.clone(), turnlog.clone(), graph.clone());
+        let task = TaskId::parse("t-detached-fresh-owner").unwrap();
+        store
+            .create(&make_task_record(task.as_str()))
+            .await
+            .unwrap();
+
+        let handle = spawn_detached_workflow_for_test(
+            &deps,
+            task.clone(),
+            vec!["DIFF".into()],
+            graph.id.clone(),
+        )
+        .await;
+        handle.await.unwrap();
+        turnlog.flush().await;
+
+        let rows = wait_turn_rows_for_task(&store, &task).await;
+        assert!(rows.iter().all(|row| row.task_id == Some(task.clone())));
+    }
+
+    #[tokio::test]
+    async fn detached_resume_turn_persists_task_id() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let turnlog = turn_log_observer(store.clone());
+        let graph = single_retry_graph();
+        let deps = detached_deps_with_observer(store.clone(), turnlog.clone(), graph.clone());
+        let task = TaskId::parse("t-detached-resume-owner").unwrap();
+        store
+            .create(&TaskRecord {
+                workflow_spec_json: Some(encode_workflow_spec(&graph)),
+                ..make_task_record(task.as_str())
+            })
+            .await
+            .unwrap();
+
+        resume_working_tasks(&deps, 1).await;
+
+        let rows = wait_turn_rows_for_task(&store, &task).await;
+        assert!(rows.iter().all(|row| row.task_id == Some(task.clone())));
+    }
+
     #[tokio::test]
     async fn resume_working_task_synth_sees_checkpointed_member_usage() {
         let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
@@ -1898,12 +2048,14 @@ mod resume_tests {
                 error: None,
                 created_ms: 1,
                 updated_ms: 1,
+                last_artifact_ms: None,
                 input: "DIFF".into(),
                 workflow_spec_json: Some(encode_workflow_spec(&graph)),
                 resume_attempts: 0,
                 session_cwd: None,
                 batch_id: None,
                 item_id: None,
+                artifacts_purged_at: None,
             })
             .await
             .unwrap();
@@ -2003,12 +2155,14 @@ mod resume_tests {
                 error: None,
                 created_ms: 1,
                 updated_ms: 1,
+                last_artifact_ms: None,
                 input: "DIFF".into(),
                 workflow_spec_json: Some(encode_workflow_spec(&graph)),
                 resume_attempts: 0,
                 session_cwd: None,
                 batch_id: None,
                 item_id: None,
+                artifacts_purged_at: None,
             })
             .await
             .unwrap();

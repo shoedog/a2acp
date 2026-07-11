@@ -4,7 +4,32 @@
 
 use crate::error::BridgeError;
 use crate::ids::{BatchId, ContextId, NodeId, OperationId, TaskId, TurnId};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const RETENTION_NEVER_ELIGIBLE_MS: i64 = i64::MAX;
+
+pub type PersistenceClock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+pub fn system_wall_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(RETENTION_NEVER_ELIGIBLE_MS)
+}
+
+pub fn valid_retention_wall_ms(ms: i64) -> bool {
+    ms > 0 && ms < RETENTION_NEVER_ELIGIBLE_MS
+}
+
+pub fn durable_retention_ms(ms: i64) -> i64 {
+    if valid_retention_wall_ms(ms) {
+        ms
+    } else {
+        RETENTION_NEVER_ELIGIBLE_MS
+    }
+}
 
 /// Durable status of a detached task. `Interrupted` is distinct from `Failed`
 /// (a crash mid-run, swept on the next boot) so triage can tell them apart; the
@@ -135,6 +160,7 @@ pub struct TaskRecord {
     pub error: Option<String>,
     pub created_ms: i64,
     pub updated_ms: i64,
+    pub last_artifact_ms: Option<i64>,
     /// The raw input text submitted with this task (needed for crash-resume replay).
     pub input: String,
     /// JSON-serialized workflow spec snapshot at submit time (crash-resume needs the
@@ -149,6 +175,7 @@ pub struct TaskRecord {
     pub session_cwd: Option<String>,
     pub batch_id: Option<crate::ids::BatchId>,
     pub item_id: Option<String>,
+    pub artifacts_purged_at: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +192,18 @@ pub struct TurnLogFinished {
 pub struct TurnLogUsage {
     pub ctx: crate::ports::TurnContext,
     pub usage: crate::orch::UsageSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub struct TurnLogFinalized {
+    pub ctx: crate::ports::TurnContext,
+    pub finalization: TurnUsageFinalization,
+}
+
+#[derive(Clone, Debug)]
+pub enum TurnUsageFinalization {
+    Usage(crate::orch::UsageSnapshot),
+    NoUsage,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -194,6 +233,8 @@ pub struct TurnLogRow {
     pub cost_amount: Option<f64>,
     pub cost_currency: Option<String>,
     pub traceparent: Option<crate::ports::TraceParent>,
+    pub usage_finalized_ms: Option<i64>,
+    pub usage_finalization_kind: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,8 +350,16 @@ pub trait TaskStore: Send + Sync {
         Err(BridgeError::StoreFailure)
     }
 
-    async fn update_turn_usage(&self, _row: &TurnLogUsage) -> Result<(), BridgeError> {
+    async fn finalize_turn_usage(&self, _row: &TurnLogFinalized) -> Result<(), BridgeError> {
         Err(BridgeError::StoreFailure)
+    }
+
+    async fn update_turn_usage(&self, row: &TurnLogUsage) -> Result<(), BridgeError> {
+        self.finalize_turn_usage(&TurnLogFinalized {
+            ctx: row.ctx.clone(),
+            finalization: TurnUsageFinalization::Usage(row.usage.clone()),
+        })
+        .await
     }
 
     async fn turn_log_rows(&self) -> Result<Vec<TurnLogRow>, BridgeError> {
@@ -597,9 +646,10 @@ type CheckpointValue = (String, bool, i64, i64, Option<crate::orch::UsageSnapsho
 /// In-memory `TaskStore` (the default when no DB path is configured). Production
 /// use, not just a test fake — lives in `bridge-core` so `bridge-a2a-inbound`
 /// can default to it WITHOUT depending on `bridge-store`.
-#[derive(Default)]
 pub struct MemoryTaskStore {
+    now_ms: PersistenceClock,
     /// Coarse guard for Memory fold-input consistency across the split maps.
+    /// Writers that touch both `inner` and `turn_log` must hold this before either map.
     journal_fold_guard: Mutex<()>,
     inner: Mutex<HashMap<String, TaskRecord>>,
     batches: Mutex<HashMap<BatchId, BatchRecord>>,
@@ -618,9 +668,20 @@ pub struct MemoryTaskStore {
     journals: Mutex<HashMap<String, Vec<(i64, crate::orch::OrchEvent)>>>,
 }
 
+impl Default for MemoryTaskStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryTaskStore {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(system_wall_now_ms))
+    }
+
+    pub fn with_clock(now_ms: PersistenceClock) -> Self {
         Self {
+            now_ms,
             journal_fold_guard: Mutex::new(()),
             inner: Mutex::new(HashMap::new()),
             batches: Mutex::new(HashMap::new()),
@@ -631,6 +692,20 @@ impl MemoryTaskStore {
             starts: Mutex::new(HashMap::new()),
             turn_log: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn retention_now_ms(&self) -> i64 {
+        durable_retention_ms((self.now_ms)())
+    }
+
+    fn bump_last_artifact(row: &mut TaskRecord, artifact_ms: i64) {
+        if row
+            .last_artifact_ms
+            .map(|existing| existing < artifact_ms)
+            .unwrap_or(true)
+        {
+            row.last_artifact_ms = Some(artifact_ms);
         }
     }
 
@@ -673,7 +748,7 @@ impl TaskStore for MemoryTaskStore {
         row.status = status;
         row.result = result.map(|s| s.to_string());
         row.error = error.map(|s| s.to_string());
-        row.updated_ms = updated_ms;
+        row.updated_ms = durable_retention_ms(updated_ms);
         Ok(())
     }
     async fn get(&self, id: &TaskId) -> Result<Option<TaskRecord>, BridgeError> {
@@ -694,7 +769,7 @@ impl TaskStore for MemoryTaskStore {
             if row.status == TaskRecordStatus::Working {
                 row.status = TaskRecordStatus::Interrupted;
                 row.error = Some("interrupted (serve restarted)".into());
-                row.updated_ms = updated_ms;
+                row.updated_ms = durable_retention_ms(updated_ms);
                 n += 1;
             }
         }
@@ -706,7 +781,7 @@ impl TaskStore for MemoryTaskStore {
         match g.get_mut(id.as_str()) {
             Some(row) if row.status == TaskRecordStatus::Working => {
                 row.status = TaskRecordStatus::Canceled;
-                row.updated_ms = updated_ms;
+                row.updated_ms = durable_retention_ms(updated_ms);
                 Ok(true)
             }
             _ => Ok(false), // missing or already terminal — do not clobber
@@ -720,17 +795,19 @@ impl TaskStore for MemoryTaskStore {
         ok: bool,
         ts: i64,
     ) -> Result<(), BridgeError> {
-        // The task must exist — matches the SQLite FK (foreign_keys=ON) contract.
-        {
-            let inner = self.inner.lock().unwrap();
-            if !inner.contains_key(task.as_str()) {
-                return Err(BridgeError::StoreFailure);
-            }
-        } // drop inner guard before locking checkpoints to avoid lock-order deadlock
-        let mut g = self.checkpoints.lock().unwrap();
+        let _guard = self.journal_fold_guard.lock().unwrap();
         let key = (task.as_str().to_string(), node.as_str().to_string());
+        let mut g = self.checkpoints.lock().unwrap();
         if g.contains_key(&key) {
             return Err(BridgeError::StoreFailure);
+        }
+        let artifact_ms = self.retention_now_ms();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            Self::bump_last_artifact(row, artifact_ms);
         }
         g.insert(key, (output.to_string(), ok, ts, 0, None));
         Ok(())
@@ -761,7 +838,7 @@ impl TaskStore for MemoryTaskStore {
             return Ok(ResumeClaim::Exhausted);
         }
         row.resume_attempts += 1;
-        row.updated_ms = now_ms; // last_resume_ms is folded into updated_ms for the in-memory store; the SQLite store has the dedicated column.
+        row.updated_ms = durable_retention_ms(now_ms); // last_resume_ms is folded into updated_ms for the in-memory store; the SQLite store has the dedicated column.
         Ok(ResumeClaim::Resumable {
             attempt: row.resume_attempts,
         })
@@ -775,6 +852,14 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn upsert_turn_finished(&self, row: &TurnLogFinished) -> Result<(), BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let artifact_ms = self.retention_now_ms();
+        if let Some(task) = row.ctx.task_id.as_ref() {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(task_row) = inner.get_mut(task.as_str()) {
+                Self::bump_last_artifact(task_row, artifact_ms);
+            }
+        }
         let mut g = self.turn_log.lock().unwrap();
         let entry = g
             .entry(row.ctx.turn_id.as_str().to_string())
@@ -804,7 +889,20 @@ impl TaskStore for MemoryTaskStore {
                 cost_amount: None,
                 cost_currency: None,
                 traceparent: row.ctx.traceparent.clone(),
+                usage_finalized_ms: None,
+                usage_finalization_kind: "pending".to_string(),
             });
+        entry.session_id = row.ctx.session_id.clone();
+        entry.task_id = row.ctx.task_id.clone();
+        entry.workflow = row.ctx.workflow.clone();
+        entry.node = row.ctx.node.clone();
+        entry.attempt = row.ctx.attempt;
+        entry.agent = row.ctx.agent.clone();
+        entry.model = row.ctx.model.clone();
+        entry.effort = row.ctx.effort.clone();
+        entry.mode = row.ctx.mode.clone();
+        entry.prompt_id = row.ctx.prompt_id.clone();
+        entry.traceparent = row.ctx.traceparent.clone();
         entry.started_ms = Some(row.started_ms);
         entry.completed_ms = Some(row.completed_ms);
         entry.latency_ms = Some(row.latency.as_millis() as u64);
@@ -815,21 +913,62 @@ impl TaskStore for MemoryTaskStore {
         Ok(())
     }
 
-    async fn update_turn_usage(&self, row: &TurnLogUsage) -> Result<(), BridgeError> {
+    async fn finalize_turn_usage(&self, row: &TurnLogFinalized) -> Result<(), BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let persistence_ms = self.retention_now_ms();
         let mut g = self.turn_log.lock().unwrap();
         let entry = g
             .get_mut(row.ctx.turn_id.as_str())
             .ok_or(BridgeError::StoreFailure)?;
-        if let Some(term) = row.usage.terminal.as_ref() {
-            entry.input_tokens = Some(term.input_tokens);
-            entry.output_tokens = Some(term.output_tokens);
-            entry.thought_tokens = term.thought_tokens;
-            entry.cached_read_tokens = term.cached_read_tokens;
-            entry.cached_write_tokens = term.cached_write_tokens;
+        if entry.completed_ms.is_none() {
+            return Err(BridgeError::StoreFailure);
         }
-        if let Some(cost) = row.usage.cost.as_ref() {
-            entry.cost_amount = Some(cost.amount);
-            entry.cost_currency = Some(cost.currency.clone());
+        if entry.usage_finalized_ms.is_some() {
+            let expected = match &row.finalization {
+                TurnUsageFinalization::Usage(_) => "usage",
+                TurnUsageFinalization::NoUsage => "no_usage",
+            };
+            return if entry.usage_finalization_kind == expected {
+                Ok(())
+            } else {
+                Err(BridgeError::StoreFailure)
+            };
+        }
+        match &row.finalization {
+            TurnUsageFinalization::Usage(usage) => {
+                if let Some(term) = usage.terminal.as_ref() {
+                    entry.input_tokens = Some(term.input_tokens);
+                    entry.output_tokens = Some(term.output_tokens);
+                    entry.thought_tokens = term.thought_tokens;
+                    entry.cached_read_tokens = term.cached_read_tokens;
+                    entry.cached_write_tokens = term.cached_write_tokens;
+                }
+                if let Some(cost) = usage.cost.as_ref() {
+                    entry.cost_amount = Some(cost.amount);
+                    entry.cost_currency = Some(cost.currency.clone());
+                }
+                entry.usage_finalization_kind = "usage".to_string();
+            }
+            TurnUsageFinalization::NoUsage => {
+                let has_usage = entry.input_tokens.is_some()
+                    || entry.output_tokens.is_some()
+                    || entry.thought_tokens.is_some()
+                    || entry.cached_read_tokens.is_some()
+                    || entry.cached_write_tokens.is_some()
+                    || entry.cost_amount.is_some()
+                    || entry.cost_currency.is_some();
+                if has_usage {
+                    return Err(BridgeError::StoreFailure);
+                }
+                entry.usage_finalization_kind = "no_usage".to_string();
+            }
+        }
+        entry.usage_finalized_ms = Some(persistence_ms);
+        if let Some(task) = entry.task_id.as_ref() {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(task_row) = inner.get_mut(task.as_str()) {
+                Self::bump_last_artifact(task_row, persistence_ms);
+            }
         }
         Ok(())
     }
@@ -1113,7 +1252,7 @@ impl TaskStore for MemoryTaskStore {
         match g.get_mut(id) {
             Some(row) if row.status == BatchStatus::Working => {
                 row.status = BatchStatus::Canceling;
-                row.updated_ms = ts;
+                row.updated_ms = durable_retention_ms(ts);
                 Ok(true)
             }
             _ => Ok(false),
@@ -1131,7 +1270,7 @@ impl TaskStore for MemoryTaskStore {
         match g.get_mut(id) {
             Some(row) if row.status == expect => {
                 row.status = new;
-                row.updated_ms = ts;
+                row.updated_ms = durable_retention_ms(ts);
                 Ok(true)
             }
             _ => Ok(false),
@@ -1150,7 +1289,7 @@ impl TaskStore for MemoryTaskStore {
             Some(row) if row.status == expect => {
                 row.status = BatchStatus::Failed;
                 row.error = Some(error.to_string());
-                row.updated_ms = ts;
+                row.updated_ms = durable_retention_ms(ts);
                 Ok(true)
             }
             _ => Ok(false),
@@ -1165,12 +1304,13 @@ impl TaskStore for MemoryTaskStore {
         ts: i64,
     ) -> Result<i64, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
-        // Task must exist.
+        let artifact_ms = self.retention_now_ms();
         {
-            let inner = self.inner.lock().unwrap();
-            if !inner.contains_key(task.as_str()) {
-                return Err(BridgeError::StoreFailure);
-            }
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            Self::bump_last_artifact(row, artifact_ms);
         }
         let seq = self.next_seq(task.as_str());
         let mut g = self.starts.lock().unwrap();
@@ -1209,19 +1349,20 @@ impl TaskStore for MemoryTaskStore {
         usage: Option<&crate::orch::UsageSnapshot>,
     ) -> Result<i64, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
-        // Task must exist.
-        {
-            let inner = self.inner.lock().unwrap();
-            if !inner.contains_key(task.as_str()) {
-                return Err(BridgeError::StoreFailure);
-            }
-        }
         let key = (task.as_str().to_string(), node.as_str().to_string());
         {
             let g = self.checkpoints.lock().unwrap();
             if g.contains_key(&key) {
                 return Err(BridgeError::StoreFailure);
             }
+        }
+        let artifact_ms = self.retention_now_ms();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            Self::bump_last_artifact(row, artifact_ms);
         }
         let seq = self.next_seq(task.as_str());
         // Remove start row for this node (it is no longer in progress).
@@ -1264,14 +1405,13 @@ impl TaskStore for MemoryTaskStore {
         ts: i64,
     ) -> Result<i64, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
-        // Task must exist — check BEFORE allocating a seq (mirrors record_node_started /
-        // put_node_checkpoint_sequenced order to avoid leaking a counter increment on
-        // a non-existent task).
+        let artifact_ms = self.retention_now_ms();
         {
-            let inner = self.inner.lock().unwrap();
-            if !inner.contains_key(task.as_str()) {
-                return Err(BridgeError::StoreFailure);
-            }
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            Self::bump_last_artifact(row, artifact_ms);
         }
         let seq = self.next_seq(task.as_str());
         {
@@ -1280,7 +1420,7 @@ impl TaskStore for MemoryTaskStore {
             row.status = status;
             row.result = result.map(|s| s.to_string());
             row.error = error.map(|s| s.to_string());
-            row.updated_ms = ts;
+            row.updated_ms = durable_retention_ms(ts);
         }
         // Record the terminal seq.
         {
@@ -1321,11 +1461,13 @@ impl TaskStore for MemoryTaskStore {
         kind: crate::orch::OrchEventKind,
     ) -> Result<i64, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
+        let artifact_ms = self.retention_now_ms();
         {
-            let inner = self.inner.lock().unwrap();
-            if !inner.contains_key(task.as_str()) {
-                return Err(BridgeError::StoreFailure);
-            }
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            Self::bump_last_artifact(row, artifact_ms);
         }
         let seq = self.next_seq(task.as_str());
         let event = crate::orch::OrchEvent {
@@ -1478,6 +1620,8 @@ mod tests {
     use crate::ids::{BatchId, ContextId, NodeId, OperationId, TurnId};
     use crate::orch::{OrchEvent, OrchEventKind, TerminalUsage, UsageCost, UsageSnapshot, ORCH_V};
     use crate::ports::{TraceParent, TurnContext, TurnOutcome};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn turn_ctx(turn: &str, session: &str, task: Option<&str>, attempt: u32) -> TurnContext {
@@ -1547,6 +1691,37 @@ mod tests {
             .unwrap();
     }
 
+    fn usage_snapshot(input: u64, output: u64, at_ms: i64) -> UsageSnapshot {
+        UsageSnapshot {
+            used: None,
+            size: None,
+            cost: Some(UsageCost {
+                amount: 0.42,
+                currency: "USD".to_string(),
+            }),
+            terminal: Some(TerminalUsage {
+                total_tokens: input + output,
+                input_tokens: input,
+                output_tokens: output,
+                thought_tokens: Some(1),
+                cached_read_tokens: Some(2),
+                cached_write_tokens: Some(3),
+            }),
+            at_ms,
+        }
+    }
+
+    fn finished_row(ctx: TurnContext, completed_ms: i64) -> TurnLogFinished {
+        TurnLogFinished {
+            ctx,
+            started_ms: completed_ms - 10,
+            completed_ms,
+            latency: Duration::from_millis(10),
+            ttft: None,
+            outcome: TurnOutcome::Success,
+        }
+    }
+
     fn rec(id: &str, ms: i64) -> TaskRecord {
         TaskRecord {
             id: TaskId::parse(id).unwrap(),
@@ -1556,12 +1731,14 @@ mod tests {
             error: None,
             created_ms: ms,
             updated_ms: ms,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         }
     }
 
@@ -1588,13 +1765,183 @@ mod tests {
             error: None,
             created_ms: 0,
             updated_ms: 0,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some(r#"{"v":1,"nodes":[]}"#.into()),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: Some(bid.clone()),
             item_id: Some(item.to_string()),
+            artifacts_purged_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn usage_finalized_some_updates_usage_and_barrier_atomically() {
+        let store = MemoryTaskStore::with_clock(Arc::new(|| 12_345));
+        let ctx = turn_ctx("turn-final-usage", "ctx-final-usage", None, 0);
+        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::Usage(usage_snapshot(5, 7, 1)),
+            })
+            .await
+            .unwrap();
+
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.input_tokens, Some(5));
+        assert_eq!(row.output_tokens, Some(7));
+        assert_eq!(row.thought_tokens, Some(1));
+        assert_eq!(row.cached_read_tokens, Some(2));
+        assert_eq!(row.cached_write_tokens, Some(3));
+        assert_eq!(row.cost_amount, Some(0.42));
+        assert_eq!(row.cost_currency.as_deref(), Some("USD"));
+        assert_eq!(row.usage_finalized_ms, Some(12_345));
+        assert_eq!(row.usage_finalization_kind, "usage");
+    }
+
+    #[tokio::test]
+    async fn usage_finalization_uses_persistence_time_not_old_event_time() {
+        let store = MemoryTaskStore::with_clock(Arc::new(|| 86_400_001));
+        let ctx = turn_ctx("turn-persist-time", "ctx-persist-time", None, 0);
+        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::Usage(usage_snapshot(5, 7, 1)),
+            })
+            .await
+            .unwrap();
+
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.usage_finalized_ms, Some(86_400_001));
+        assert_ne!(row.usage_finalized_ms, Some(1));
+    }
+
+    #[tokio::test]
+    async fn usage_finalized_none_sets_no_usage_barrier() {
+        let store = MemoryTaskStore::with_clock(Arc::new(|| 12_346));
+        let ctx = turn_ctx("turn-final-none", "ctx-final-none", None, 0);
+        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .unwrap();
+
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.input_tokens, None);
+        assert_eq!(row.cost_amount, None);
+        assert_eq!(row.usage_finalized_ms, Some(12_346));
+        assert_eq!(row.usage_finalization_kind, "no_usage");
+    }
+
+    #[tokio::test]
+    async fn usage_finalization_invalid_clock_uses_never_eligible_timestamp() {
+        let store = MemoryTaskStore::with_clock(Arc::new(|| 0));
+        let ctx = turn_ctx("turn-final-zero", "ctx-final-zero", None, 0);
+        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .unwrap();
+
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.usage_finalized_ms, Some(RETENTION_NEVER_ELIGIBLE_MS));
+        assert_ne!(row.usage_finalized_ms, Some(0));
+    }
+
+    #[tokio::test]
+    async fn no_usage_finalization_rejects_existing_usage_columns() {
+        let store = MemoryTaskStore::with_clock(Arc::new(|| 12_347));
+        let ctx = turn_ctx("turn-final-contradict", "ctx-final-contradict", None, 0);
+        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::Usage(usage_snapshot(1, 2, 1)),
+            })
+            .await
+            .unwrap();
+
+        assert!(store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .is_err());
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.usage_finalized_ms, Some(12_347));
+        assert_eq!(row.usage_finalization_kind, "usage");
+    }
+
+    #[tokio::test]
+    async fn turn_finished_upsert_does_not_clear_finalization() {
+        let store = MemoryTaskStore::with_clock(Arc::new(|| 12_348));
+        let ctx = turn_ctx("turn-final-replay", "ctx-final-replay", None, 0);
+        let first = finished_row(ctx.clone(), 200);
+        store.upsert_turn_finished(&first).await.unwrap();
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .unwrap();
+
+        store.upsert_turn_finished(&finished_row(ctx.clone(), 250)).await.unwrap();
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.usage_finalized_ms, Some(12_348));
+        assert_eq!(row.usage_finalization_kind, "no_usage");
+    }
+
+    #[tokio::test]
+    async fn turn_finished_task_linked_bumps_artifact_recency() {
+        let store = MemoryTaskStore::with_clock(Arc::new(|| 50_000));
+        let task = TaskId::parse("task-recency-finish").unwrap();
+        store.create(&rec(task.as_str(), 1)).await.unwrap();
+        let ctx = turn_ctx("turn-recency-finish", "ctx-recency-finish", Some(task.as_str()), 0);
+
+        store.upsert_turn_finished(&finished_row(ctx, 200)).await.unwrap();
+
+        let row = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(row.last_artifact_ms, Some(50_000));
+    }
+
+    #[tokio::test]
+    async fn finalize_turn_usage_task_linked_bumps_artifact_recency() {
+        let clock = Arc::new(AtomicI64::new(60_000));
+        let store = MemoryTaskStore::with_clock({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        });
+        let task = TaskId::parse("task-recency-finalize").unwrap();
+        store.create(&rec(task.as_str(), 1)).await.unwrap();
+        let ctx = turn_ctx("turn-recency-finalize", "ctx-recency-finalize", Some(task.as_str()), 0);
+        store.upsert_turn_finished(&finished_row(ctx.clone(), 200)).await.unwrap();
+        clock.store(70_000, Ordering::SeqCst);
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx,
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .unwrap();
+
+        let row = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(row.last_artifact_ms, Some(70_000));
     }
 
     #[test]
@@ -1889,12 +2236,14 @@ mod tests {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some("{\"v\":1}".into()),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -2393,12 +2742,14 @@ mod tests {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: Some("/req".to_string()),
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();

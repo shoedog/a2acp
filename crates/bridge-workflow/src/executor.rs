@@ -406,13 +406,11 @@ impl WorkflowExecutor {
                 ttft: ttft_val,
                 outcome: &node_outcome,
             });
-            if let Some(u) = &last_usage {
-                ctx.observer.record(&ObsEvent::UsageFinalized {
-                    ctx: &obs_ctx,
-                    usage: u,
-                    fin: UsageFinalization::TurnFinal,
-                });
-            }
+            ctx.observer.record(&ObsEvent::UsageFinalized {
+                ctx: &obs_ctx,
+                usage: last_usage.as_ref(),
+                fin: UsageFinalization::TurnFinal,
+            });
             ctx.observer.record(&ObsEvent::NodeFinished {
                 ctx: &obs_ctx,
                 outcome: &node_outcome,
@@ -732,13 +730,11 @@ impl WorkflowExecutor {
                                 ttft: None,
                                 outcome: &TurnOutcome::Canceled,
                             });
-                            if let Some(u) = &usage {
-                                ctx.observer.record(&ObsEvent::UsageFinalized {
-                                    ctx: obs_ctx,
-                                    usage: u,
-                                    fin: UsageFinalization::TurnFinal,
-                                });
-                            }
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: obs_ctx,
+                                usage: usage.as_ref(),
+                                fin: UsageFinalization::TurnFinal,
+                            });
                         }
                         break 'node_loop (marker, false, usage, TurnOutcome::Canceled);
                     }
@@ -750,13 +746,11 @@ impl WorkflowExecutor {
                                 ttft: ttft_val,
                                 outcome: &TurnOutcome::Success,
                             });
-                            if let Some(u) = &usage {
-                                ctx.observer.record(&ObsEvent::UsageFinalized {
-                                    ctx: obs_ctx,
-                                    usage: u,
-                                    fin: UsageFinalization::TurnFinal,
-                                });
-                            }
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: obs_ctx,
+                                usage: usage.as_ref(),
+                                fin: UsageFinalization::TurnFinal,
+                            });
                         }
                         break 'node_loop (text, true, usage, TurnOutcome::Success);
                     }
@@ -773,13 +767,11 @@ impl WorkflowExecutor {
                                 ttft: ttft_val,
                                 outcome: &fail_out,
                             });
-                            if let Some(u) = &usage {
-                                ctx.observer.record(&ObsEvent::UsageFinalized {
-                                    ctx: obs_ctx,
-                                    usage: u,
-                                    fin: UsageFinalization::TurnFinal,
-                                });
-                            }
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: obs_ctx,
+                                usage: usage.as_ref(),
+                                fin: UsageFinalization::TurnFinal,
+                            });
                         }
                         break 'node_loop (text, false, usage, fail_out);
                     }
@@ -794,13 +786,11 @@ impl WorkflowExecutor {
                                 ttft: None,
                                 outcome: &fail_out,
                             });
-                            if let Some(u) = &usage {
-                                ctx.observer.record(&ObsEvent::UsageFinalized {
-                                    ctx: obs_ctx,
-                                    usage: u,
-                                    fin: UsageFinalization::TurnFinal,
-                                });
-                            }
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: obs_ctx,
+                                usage: usage.as_ref(),
+                                fin: UsageFinalization::TurnFinal,
+                            });
                         }
                         if should_retry_after_attempt {
                             self.registry.invalidate(&node.agent).await;
@@ -4615,6 +4605,188 @@ mod observability_tests {
             };
             self.0.lock().unwrap().push(tag);
         }
+    }
+
+    #[derive(Default)]
+    struct UsageFinalRec(Mutex<Vec<bool>>);
+    impl Observer for UsageFinalRec {
+        fn record(&self, e: &ObsEvent<'_>) {
+            if let ObsEvent::UsageFinalized { usage, fin, .. } = e {
+                if *fin == UsageFinalization::TurnFinal {
+                    self.0.lock().unwrap().push(usage.is_some());
+                }
+            }
+        }
+    }
+
+    struct NoUsageIdleBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for NoUsageIdleBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(futures::stream::pending::<
+                Result<Update, BridgeError>,
+            >()))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct NoUsageIdleRegistry;
+    #[async_trait::async_trait]
+    impl AgentRegistry for NoUsageIdleRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            use bridge_core::domain::{AgentEntry, AgentKind};
+            Ok(Resolved {
+                entry: Arc::new(AgentEntry {
+                    id: id.clone(),
+                    cmd: Some("x".into()),
+                    base_url: None,
+                    api_key_env: None,
+                    args: vec![],
+                    kind: AgentKind::Acp,
+                    model_provider: None,
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    cwd: None,
+                    session_cwd: None,
+                    sandbox: None,
+                    watchdog: None,
+                    auth_method: None,
+                    name: None,
+                    description: None,
+                    tags: vec![],
+                    version: None,
+                    mcp: vec![],
+                    mcp_delivery: Default::default(),
+                    extensions: Default::default(),
+                }),
+                backend: Arc::new(NoUsageIdleBackend),
+                lease: Box::new(NoopLease2),
+            })
+        }
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+        async fn apply(&self, _: bridge_core::domain::RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    #[derive(Default)]
+    struct StartAndUsageFinalRec {
+        started: AtomicUsize,
+        usages: Mutex<Vec<bool>>,
+    }
+    impl Observer for StartAndUsageFinalRec {
+        fn record(&self, e: &ObsEvent<'_>) {
+            match e {
+                ObsEvent::TurnStarted { .. } => {
+                    self.started.fetch_add(1, Ordering::SeqCst);
+                }
+                ObsEvent::UsageFinalized { usage, fin, .. }
+                    if *fin == UsageFinalization::TurnFinal =>
+                {
+                    self.usages.lock().unwrap().push(usage.is_some());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_success_without_usage_emits_explicit_no_usage() {
+        let rec = Arc::new(UsageFinalRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(TextRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-no-usage-success".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+
+        let events = rec.0.lock().unwrap().clone();
+        assert_eq!(events, vec![false]);
+    }
+
+    #[tokio::test]
+    async fn workflow_failure_without_usage_emits_explicit_no_usage() {
+        let rec = Arc::new(UsageFinalRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(TimedOutRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-no-usage-failure".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+
+        let events = rec.0.lock().unwrap().clone();
+        assert_eq!(events, vec![false]);
+    }
+
+    #[tokio::test]
+    async fn workflow_cancel_without_usage_emits_explicit_no_usage() {
+        let rec = Arc::new(StartAndUsageFinalRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let token = CancellationToken::new();
+        let exec = WorkflowExecutor::new(Arc::new(NoUsageIdleRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-no-usage-cancel".into(),
+            token.clone(),
+            ctx,
+        );
+        let drain = tokio::spawn(async move { while stream.next().await.is_some() {} });
+
+        for _ in 0..1000 {
+            if rec.started.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(rec.started.load(Ordering::SeqCst), 1);
+        token.cancel();
+        drain.await.unwrap();
+
+        let events = rec.usages.lock().unwrap().clone();
+        assert_eq!(events, vec![false]);
     }
 
     #[tokio::test]

@@ -514,6 +514,7 @@ async fn resumed_child_future(
         Some(s) => match SessionCwd::parse(s) {
             Ok(c) => WorkflowRunContext {
                 session_cwd: Some(c),
+                task_id: Some(task.clone()),
                 make_rich_sink: None,
                 observer: deps.detached.observer.clone(),
                 ..WorkflowRunContext::default()
@@ -534,6 +535,7 @@ async fn resumed_child_future(
             }
         },
         None => WorkflowRunContext {
+            task_id: Some(task.clone()),
             observer: deps.detached.observer.clone(),
             ..WorkflowRunContext::default()
         },
@@ -803,12 +805,14 @@ pub async fn run_admission(
                 error: None,
                 created_ms: now,
                 updated_ms: now,
+                last_artifact_ms: None,
                 input: item.input.clone(),
                 workflow_spec_json: Some(encode_workflow_spec(&graph)),
                 resume_attempts: 0,
                 session_cwd: session_cwd.as_ref().map(|c| c.as_str().to_string()),
                 batch_id: Some(bid.clone()),
                 item_id: Some(item.item_id.clone()),
+                artifacts_purged_at: None,
             };
 
             match deps
@@ -867,6 +871,7 @@ pub async fn run_admission(
                         HashMap::new(),
                         WorkflowRunContext {
                             session_cwd,
+                            task_id: Some(task.clone()),
                             make_rich_sink: None,
                             observer: deps.detached.observer.clone(),
                             ..WorkflowRunContext::default()
@@ -1037,6 +1042,7 @@ mod tests {
             TaskStore,
         },
     };
+    use bridge_observ::{DropCounter, TurnLogObserver};
     use bridge_workflow::executor::WorkflowExecutor;
     use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1066,12 +1072,14 @@ mod tests {
             error: None,
             created_ms: 10,
             updated_ms: 10,
+            last_artifact_ms: None,
             input: format!("input-{item}"),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: Some(BatchId::parse("batch-1").unwrap()),
             item_id: Some(item.into()),
+            artifacts_purged_at: None,
         }
     }
 
@@ -1253,6 +1261,36 @@ mod tests {
         (deps, store)
     }
 
+    fn batch_deps_with_turnlog(
+        max: u32,
+        gate: Arc<Gate>,
+    ) -> (BatchDeps, Arc<dyn TaskStore>, Arc<TurnLogObserver>) {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let turnlog = Arc::new(TurnLogObserver::new(
+            store.clone(),
+            DropCounter::disabled(),
+            64,
+            Arc::new(|| 1_000),
+        ));
+        let graph = test_graph();
+        let deps = BatchDeps {
+            detached: DetachedDeps {
+                task_store: store.clone(),
+                executor: Some(Arc::new(WorkflowExecutor::new(Arc::new(GatedRegistry {
+                    gate,
+                })))),
+                workflows: Arc::new(HashMap::from([(graph.id.clone(), graph)])),
+                workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+                progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+                clock: Arc::new(ManualClock::new(100)),
+                observer: turnlog.clone(),
+            },
+            runtime: BatchRuntime::new(max, max, Arc::new(NoopObserver)),
+            allowed_cwd_root: None,
+        };
+        (deps, store, turnlog)
+    }
+
     fn items(n: usize) -> Vec<BatchItem> {
         (0..n)
             .map(|i| BatchItem {
@@ -1301,12 +1339,14 @@ mod tests {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: format!("input {item_id}"),
             workflow_spec_json: snapshot.then(|| encode_workflow_spec(&test_graph())),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: Some(batch.clone()),
             item_id: Some(item_id.into()),
+            artifacts_purged_at: None,
         }
     }
 
@@ -1328,6 +1368,92 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    async fn wait_turn_rows_for_task(
+        store: &Arc<dyn TaskStore>,
+        task: &TaskId,
+    ) -> Vec<bridge_core::task_store::TurnLogRow> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let rows = store.turn_log_rows_for_task(task, 16).await.unwrap();
+            if !rows.is_empty() {
+                return rows;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for turn_log rows for {}",
+                task.as_str()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_child_turn_persists_task_id() {
+        let gate = Gate::new(None);
+        let (deps, store, turnlog) = batch_deps_with_turnlog(1, gate.clone());
+        let bid = BatchId::parse("batch-child-owner").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-child-owner",
+                BatchStatus::Working,
+                1,
+                1,
+            ))
+            .await
+            .unwrap();
+
+        resume_batches(&deps, 3).await;
+        gate.wait_calls(1).await;
+        gate.release(1);
+        wait_batch_status(&store, &bid, BatchStatus::Completed).await;
+        turnlog.flush().await;
+
+        let children = store.batch_children(&bid).await.unwrap();
+        assert_eq!(children.len(), 1);
+        let child_task = children[0].id.clone();
+        let rows = wait_turn_rows_for_task(&store, &child_task).await;
+        assert!(rows
+            .iter()
+            .all(|row| row.task_id == Some(child_task.clone())));
+    }
+
+    #[tokio::test]
+    async fn batch_resume_turn_persists_task_id() {
+        let gate = Gate::new(None);
+        let (deps, store, turnlog) = batch_deps_with_turnlog(1, gate.clone());
+        let bid = BatchId::parse("batch-resume-owner").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-resume-owner",
+                BatchStatus::Working,
+                1,
+                1,
+            ))
+            .await
+            .unwrap();
+        store
+            .create(&batch_child(
+                &bid,
+                "item-0",
+                TaskRecordStatus::Working,
+                true,
+            ))
+            .await
+            .unwrap();
+
+        resume_batches(&deps, 3).await;
+        gate.wait_calls(1).await;
+        gate.release(1);
+        wait_batch_status(&store, &bid, BatchStatus::Completed).await;
+        turnlog.flush().await;
+
+        let child_task = TaskId::parse("task-batch-resume-owner-item-0").unwrap();
+        let rows = wait_turn_rows_for_task(&store, &child_task).await;
+        assert!(rows
+            .iter()
+            .all(|row| row.task_id == Some(child_task.clone())));
     }
 
     #[tokio::test]
@@ -1928,12 +2054,14 @@ mod tests {
                 error: None,
                 created_ms: 1,
                 updated_ms: 1,
+                last_artifact_ms: None,
                 input: "input item-0".into(),
                 workflow_spec_json: Some(encode_workflow_spec(&test_graph())),
                 resume_attempts: 0,
                 session_cwd: None,
                 batch_id: Some(bid.clone()),
                 item_id: Some("item-0".into()),
+                artifacts_purged_at: None,
             })
             .await
             .unwrap();
