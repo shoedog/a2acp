@@ -1255,6 +1255,12 @@ pub fn spawn_detached_workflow(
             op,
             hub: hub.clone(),
         }));
+        // M4 Slice 3a: the detached runner is the authoritative owner of every workflow
+        // turn it emits. Overwrite any caller-supplied (or missing) task_id so detached /
+        // batch / resume turn_log rows are always linked to the real task, never NULL or a
+        // stale value. This is the central safety boundary; caller-side fixes are defense in
+        // depth. Must sit after sink construction and before any turn can be emitted.
+        ctx.task_id = Some(task.clone());
         let stream = executor.run_from_with_context(graph, input, run_id, token, seed, ctx);
         // The DetachedProgressSink OWNS the sequenced terminal write: on a clean drain it
         // has already written `set_terminal_sequenced` AND published the Terminal frame.
