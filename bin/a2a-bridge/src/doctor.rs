@@ -3,8 +3,9 @@
 // Contract (spec docs/superpowers/specs/2026-07-03-wave-3-cli-wire.md §W3-B): parse + validate the
 // config, then report on the things that most commonly break a first run (agent commands/runtimes,
 // api_key_env, sandbox egress, [verify]/[review] infra, the [store] path, MCP servers, the lsp_env
-// containerized-MCP-env trap, and configured credential bind-mounts) as `ok | warn | fail` rows with a
-// one-line remedy. ZERO filesystem writes, no live egress, no agent/container spawns — every external
+// containerized-MCP-env trap, configured credential bind-mounts, and Fable prerequisites) as
+// `ok | warn | fail` rows with a one-line remedy. ZERO filesystem writes, no live egress, no
+// agent/container spawns — every external
 // probe is bounded so a wedged runtime is reported, never hung on.
 //
 // ARCHITECTURE: `run_checks` is a PURE core over already-loaded, plain data (`LoadedConfig`) and a small
@@ -127,7 +128,12 @@ pub trait RuntimeProbes {
     /// the spec's adversarial review).
     fn path_stat(&self, path: &Path) -> PathStat;
     /// Whether `name` is set (present, regardless of value) in the current process environment.
-    fn env_var_set(&self, name: &str) -> bool;
+    fn env_var_set(&self, name: &str) -> bool {
+        self.env_var_value(name).is_some()
+    }
+    /// The exact value of `name`, when present. Used only for explicit boolean execution/model gates;
+    /// secret-bearing values are never rendered.
+    fn env_var_value(&self, name: &str) -> Option<String>;
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -221,8 +227,8 @@ impl RuntimeProbes for RealProbes {
     fn path_stat(&self, path: &Path) -> PathStat {
         path_stat_impl(path)
     }
-    fn env_var_set(&self, name: &str) -> bool {
-        std::env::var(name).is_ok()
+    fn env_var_value(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
     }
 }
 
@@ -400,7 +406,7 @@ fn load_config(config_path: &Path) -> LoadedConfig {
 // run_checks — the pure core.
 // ---------------------------------------------------------------------------
 
-/// Run all 9 doctor checks against an already-loaded config. PURE: every side-effecting operation goes
+/// Run all doctor checks against an already-loaded config. PURE: every side-effecting operation goes
 /// through `probes`; nothing here reads a file, spawns a process, or writes anything.
 pub fn run_checks(cfg: &LoadedConfig, probes: &dyn RuntimeProbes) -> Vec<CheckResult> {
     let mut out = Vec::new();
@@ -438,6 +444,7 @@ pub fn run_checks(cfg: &LoadedConfig, probes: &dyn RuntimeProbes) -> Vec<CheckRe
     check_lsp_env(&cfg.languages, &mut out); // check 7 (lsp_env lint half)
     check_review_slice_cmd(&cfg.review, probes, &mut out); // check 8
     check_creds(snapshot, probes, &mut out); // check 9
+    check_fable_prerequisites(snapshot, probes, &mut out); // check 10
 
     out
 }
@@ -871,9 +878,10 @@ fn is_bind_mount_host(host_seg: &str) -> bool {
     host_seg.starts_with('/') || host_seg.starts_with('~')
 }
 
-/// Check 9 — creds: configured bind-mount cred sources (the sandbox's `volumes`, e.g. a mounted
-/// `.credentials.json`/`auth.json`) exist as host files; named volumes are skipped (informational — not
-/// a host path). STATIC only (no freshness/expiry check — cut per review as TOCTOU/mutating-adjacent).
+/// Check 9 — configured bind-mount sources (the sandbox's `volumes`, e.g. mounted credentials or an
+/// isolated settings file) exist as host files; named volumes are skipped (informational — not a host
+/// path). The `creds:*` check-name prefix is retained for output compatibility with the original check.
+/// STATIC only (no freshness/expiry check — cut per review as TOCTOU/mutating-adjacent).
 /// NOTE: item 9's "env vars named by config are set" clause is the SAME fact as check 3's
 /// `api_key_env` check (the only config surface naming an env var) — folded there, not duplicated here.
 fn check_creds(
@@ -907,9 +915,84 @@ fn check_creds(
                 out.push(CheckResult::fail(
                     check,
                     format!("bind-mount source {host_path:?} does not exist"),
-                    format!("create/copy the credential file at {host_path:?} for agent {id} (see docs/containerized-agents.md)"),
+                    format!("create the bind-mount source at {host_path:?} for agent {id} (see docs/containerized-agents.md)"),
                 ));
             }
+        }
+    }
+}
+
+fn env_flag_enabled(probes: &dyn RuntimeProbes, name: &str) -> bool {
+    probes
+        .env_var_value(name)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn is_fable_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("fable")
+}
+
+fn is_claude_acp_cmd(cmd: Option<&str>) -> bool {
+    cmd.and_then(|cmd| Path::new(cmd).file_name())
+        .and_then(|name| name.to_str())
+        == Some("claude-agent-acp")
+}
+
+fn has_container_mount_destination(volumes: &[String], destination: &str) -> bool {
+    volumes.iter().any(|volume| {
+        volume
+            .split(':')
+            .nth(1)
+            .is_some_and(|mounted_at| mounted_at == destination)
+    })
+}
+
+/// Check 10 — Fable is intentionally invocation-gated, and claude-agent-acp's isolated reader
+/// environment needs a minimal settings file to advertise a Fable model before the bridge can select
+/// it. These are deterministic config/environment prerequisites, so report them before a paid turn.
+fn check_fable_prerequisites(
+    snapshot: &RegistrySnapshot,
+    probes: &dyn RuntimeProbes,
+    out: &mut Vec<CheckResult>,
+) {
+    for entry in &snapshot.entries {
+        let Some(model) = entry.model.as_deref().filter(|model| is_fable_model(model)) else {
+            continue;
+        };
+        let id = entry.id.as_str();
+        let opt_in_check = format!("model:{id}:fable-opt-in");
+        if env_flag_enabled(probes, "A2A_BRIDGE_ALLOW_FABLE") {
+            out.push(CheckResult::ok(
+                opt_in_check,
+                format!("agent {id:?} deliberately enables configured model {model:?}"),
+            ));
+        } else {
+            out.push(CheckResult::fail(
+                opt_in_check,
+                format!("agent {id:?} configures Fable model {model:?}, but A2A_BRIDGE_ALLOW_FABLE is not 1/true for this process"),
+                "start the deliberate run with `A2A_BRIDGE_ALLOW_FABLE=1 a2a-bridge ...`, or configure a non-Fable model",
+            ));
+        }
+
+        let Some(sandbox) = &entry.sandbox else {
+            continue;
+        };
+        if !is_claude_acp_cmd(entry.cmd.as_deref()) {
+            continue;
+        }
+        let settings_check = format!("model:{id}:fable-container-settings");
+        const SETTINGS_DEST: &str = "/root/.claude/settings.json";
+        if has_container_mount_destination(&sandbox.volumes, SETTINGS_DEST) {
+            out.push(CheckResult::ok(
+                settings_check,
+                format!("isolated Claude settings are mounted at {SETTINGS_DEST}"),
+            ));
+        } else {
+            out.push(CheckResult::warn(
+                settings_check,
+                "containerized claude-agent-acp may omit Fable from session/new when only .credentials.json is mounted",
+                format!("mount a minimal pinned model/effort settings file at {SETTINGS_DEST} (see deploy/containers/claude-fable-settings.json and docs/containerized-agents.md)"),
+            ));
         }
     }
 }
@@ -1114,7 +1197,7 @@ mod tests {
         responsive_runtimes: HashSet<String>,
         networks: HashSet<String>,
         images: HashSet<String>,
-        env_vars: HashSet<String>,
+        env_vars: HashMap<String, String>,
         paths: HashMap<PathBuf, PathStat>,
         /// Records every runtime-executing probe call (`runtime_responds`/`network_exists`/
         /// `image_exists`) so tests can assert a config-named runtime binary was never actually invoked
@@ -1143,7 +1226,11 @@ mod tests {
             self
         }
         fn allow_env(mut self, e: &str) -> Self {
-            self.env_vars.insert(e.to_string());
+            self.env_vars.insert(e.to_string(), "1".to_string());
+            self
+        }
+        fn with_env(mut self, name: &str, value: &str) -> Self {
+            self.env_vars.insert(name.to_string(), value.to_string());
             self
         }
         fn with_path(mut self, p: &str, st: PathStat) -> Self {
@@ -1201,7 +1288,10 @@ mod tests {
             self.paths.get(path).copied().unwrap_or(PathStat::ABSENT)
         }
         fn env_var_set(&self, name: &str) -> bool {
-            self.env_vars.contains(name)
+            self.env_vars.contains_key(name)
+        }
+        fn env_var_value(&self, name: &str) -> Option<String> {
+            self.env_vars.get(name).cloned()
         }
     }
 
@@ -1793,6 +1883,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_noncredential_bind_mount_uses_generic_remedy() {
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec!["/cfg/settings.json:/root/.claude/settings.json:ro".to_string()],
+        ));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest");
+        let results = run_checks(&cfg, &probes);
+        let row = find(&results, "creds:claude:0");
+        assert_eq!(row.status, CheckStatus::Fail);
+        assert!(row.remedy.contains("bind-mount source"), "{}", row.remedy);
+        assert!(!row.remedy.contains("credential"), "{}", row.remedy);
+    }
+
+    #[test]
     fn named_volume_is_skipped_not_a_host_path() {
         let mut kiro = acp_entry("kiro", "kiro-cli");
         kiro.sandbox = Some(locked_sandbox(
@@ -1809,6 +1919,96 @@ mod tests {
         let row = find(&results, "creds:kiro:0");
         assert_eq!(row.status, CheckStatus::Ok);
         assert!(row.detail.contains("not a host path"), "{}", row.detail);
+    }
+
+    // ---- check 10: explicit Fable prerequisites ----
+
+    #[test]
+    fn fable_without_true_opt_in_fails() {
+        for probes in [
+            FakeProbes::new().allow_path("claude-agent-acp"),
+            FakeProbes::new()
+                .allow_path("claude-agent-acp")
+                .with_env("A2A_BRIDGE_ALLOW_FABLE", "0"),
+        ] {
+            let mut claude = acp_entry("claude", "claude-agent-acp");
+            claude.model = Some("claude-fable-5[1m]".to_string());
+            let cfg = base_loaded(snapshot("claude", vec![claude], vec!["claude-agent-acp"]));
+            let results = run_checks(&cfg, &probes);
+            let row = find(&results, "model:claude:fable-opt-in");
+            assert_eq!(row.status, CheckStatus::Fail);
+            assert!(row.remedy.contains("A2A_BRIDGE_ALLOW_FABLE=1"));
+        }
+    }
+
+    #[test]
+    fn host_fable_with_true_opt_in_is_ok() {
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.model = Some("CLAUDE-FABLE-5[1M]".to_string());
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["claude-agent-acp"]));
+        let probes = FakeProbes::new()
+            .allow_path("claude-agent-acp")
+            .with_env("A2A_BRIDGE_ALLOW_FABLE", "true");
+        let results = run_checks(&cfg, &probes);
+        assert_eq!(
+            find(&results, "model:claude:fable-opt-in").status,
+            CheckStatus::Ok
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| r.check != "model:claude:fable-container-settings"),
+            "host agents do not need a container settings mount"
+        );
+    }
+
+    #[test]
+    fn container_fable_without_settings_mount_warns() {
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.model = Some("claude-fable-5[1m]".to_string());
+        claude.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec!["/creds/.credentials.json:/root/.claude/.credentials.json".to_string()],
+        ));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest")
+            .with_file("/creds/.credentials.json")
+            .with_env("A2A_BRIDGE_ALLOW_FABLE", "1");
+        let results = run_checks(&cfg, &probes);
+        let row = find(&results, "model:claude:fable-container-settings");
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(row.remedy.contains("/root/.claude/settings.json"));
+    }
+
+    #[test]
+    fn container_fable_with_settings_mount_is_ok() {
+        let mut claude = acp_entry("claude", "/usr/local/bin/claude-agent-acp");
+        claude.model = Some("claude-fable-5[1m]".to_string());
+        claude.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec!["/creds/settings.json:/root/.claude/settings.json:ro".to_string()],
+        ));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest")
+            .with_file("/creds/settings.json")
+            .with_env("A2A_BRIDGE_ALLOW_FABLE", "TRUE");
+        let results = run_checks(&cfg, &probes);
+        assert_eq!(
+            find(&results, "model:claude:fable-opt-in").status,
+            CheckStatus::Ok
+        );
+        assert_eq!(
+            find(&results, "model:claude:fable-container-settings").status,
+            CheckStatus::Ok
+        );
     }
 
     // ---- end-to-end: all-ok config ----

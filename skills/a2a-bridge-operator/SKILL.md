@@ -46,6 +46,12 @@ a2a-bridge doctor --config /path/to/a2a-bridge.toml
 a2a-bridge models --config /path/to/a2a-bridge.toml --json
 ```
 
+When an agent runtime launches the command, distinguish its managed sandbox from approved host
+execution. A sandboxed ACP failure does not prove that the computer lacks DNS, egress, or authentication;
+repeat the exact minimal control through approved host execution before changing credentials, packages,
+or bridge code. Do not use `CODEX_SANDBOX_NETWORK_DISABLED` alone as proof: approved host commands may
+inherit the marker even though they have working egress.
+
 Then scaffold a typed input and name the target repository explicitly:
 
 ```bash
@@ -62,6 +68,10 @@ from `models`. The bridge accepts documented aliases only after capability disco
 Fable-family models are intentionally blocked by default. A deliberate Fable run must set
 `A2A_BRIDGE_ALLOW_FABLE=1` on the bridge process and pin an advertised Fable ID. The environment gate is
 read once per process. Keep the first prompt minimal because it consumes limited model capacity.
+Containerized `claude-agent-acp` also needs an isolated settings mount that pins the same model/effort;
+credential-only isolation may omit Fable from `session/new`. Use
+[`../../deploy/containers/claude-fable-settings.json`](../../deploy/containers/claude-fable-settings.json)
+at `/root/.claude/settings.json:ro`; never mount the full host Claude settings or state directory.
 
 ## Capture provenance before diagnosing
 
@@ -73,6 +83,8 @@ Record all of the following in the hypothesis/probe/result log:
 - fully resolved embedded/transitive agent CLI version and authentication mode;
 - raw advertised current model, requested model, effort, and mode;
 - exact config path and whether the agent is cold, warm, or resumed.
+- the actual execution mode (managed sandbox or approved host), separately from the computer's host
+  egress/auth state; inherited environment markers alone are not proof of effective restrictions.
 
 Do not use a bare package name as evidence. Multiple Node prefixes can put different adapters on
 `PATH`; inspect the package manifest behind the resolved executable.
@@ -97,6 +109,9 @@ Test the narrowest failing path in this order:
 Use controls that change one boundary at a time:
 
 - Direct agent CLI succeeds, ACP fails: investigate the ACP adapter or its embedded SDK/runtime.
+- A direct CLI launched through approved host execution succeeds while ACP launched inside a managed
+  sandbox fails: repeat the exact ACP control outside that sandbox and inspect explicit network markers
+  before changing auth, packages, or bridge code.
 - ACP harness succeeds, bridge fails: investigate bridge sequencing, config mapping, or error handling.
 - Host succeeds, container fails: compare image package pins, credentials, architecture, egress, and
   pre-authentication.

@@ -9,7 +9,7 @@
 
 - [`roadmap.md`](roadmap.md) — priority order and the pause/resume boundary.
 - [`bridge-reliability.md`](bridge-reliability.md) — active reliability program and exit gates.
-- [`compatibility.md`](compatibility.md) — dated host/container/model evidence and open incidents.
+- [`compatibility.md`](compatibility.md) — dated host/container/model evidence and incident dispositions.
 - [`m4-observability-roadmap.md`](m4-observability-roadmap.md) — M4 Slice 3b, reserved 3c, and the
   Slice 1/2 deferred-item ledger.
 

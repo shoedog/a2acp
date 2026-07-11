@@ -2,8 +2,8 @@
 
 > **Start here:** read the
 > [`a2a-bridge-operator` skill](skills/a2a-bridge-operator/SKILL.md) before running or diagnosing an
-> agent workflow. Check [`docs/compatibility.md`](docs/compatibility.md) for tested versions and open
-> incidents; do not infer host support from a container result or vice versa.
+> agent workflow. Check [`docs/compatibility.md`](docs/compatibility.md) for tested versions and incident
+> dispositions; do not infer host support from a container result or vice versa.
 
 `a2a-bridge` is an A2A↔ACP bridge **and** a multi-agent workflow runner. You can use it as a **tool** to run
 clean-room **design**, **code/spec/plan review**, or autonomous **implement** passes against *any* repo —
@@ -145,6 +145,11 @@ a2a-bridge containers reap  --config … --force a2a-rw-<owner>-<run>-0         
 - **Creds (containerized agents):** WRITABLE single-file copies in `~/.config/a2a-creds/{claude,codex}` —
   `cp ~/.codex/auth.json ~/.config/a2a-creds/codex/auth.json`, likewise claude (its OAuth token expires
   ~hourly, so re-copy if a claude node starts failing). See `docs/containerized-agents.md`.
+- **Live model execution:** run `a2a-bridge doctor` first. A managed agent sandbox can lack DNS while
+  approved host execution and computer-level auth remain healthy; repeat the exact minimal control via
+  approved host execution before changing auth or packages. Do not trust an inherited network marker
+  alone. Fable additionally requires `A2A_BRIDGE_ALLOW_FABLE=1`; a Fable reader must mount
+  `deploy/containers/claude-fable-settings.json` at `/root/.claude/settings.json:ro` alongside creds.
 - **Concurrency:** concurrent containerized runs are **safe with one shared config** — same repo twice or
   different repos at once. Each run stamps a unique `a2a.run` id into its container names (no clash) and
   holds an OS `flock` lease that marks it alive, so a peer's before-first-use recovery reaps only **crashed**

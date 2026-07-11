@@ -19,8 +19,8 @@ The bridge has recently paid the compatibility tax repeatedly:
 - a new Codex model exposed both model-ID and stale-adapter drift on the host;
 - the same model then failed in the shipped container for a different reason—redundant interactive
   authentication in a pre-authenticated, browserless image;
-- Fable currently succeeds through the direct Claude CLI but fails through the tested host ACP/bridge
-  path, while the host and reader image use different `claude-agent-acp` versions;
+- the Fable incident initially looked like adapter/model drift, but R1 proved the historical failure was
+  a no-DNS managed execution sandbox and found a separate reader-settings prerequisite;
 - adapter packages, embedded agent CLIs, Rust protocol crates, and model catalogs change on different
   cadences.
 

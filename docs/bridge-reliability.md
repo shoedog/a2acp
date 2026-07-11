@@ -58,7 +58,7 @@ host and container entries but no automatic fallback policy.
 
 Exit: a new agent can find the correct runbook and current incident status without searching handoffs.
 
-### R1 — isolate and disposition Fable
+### R1 — isolate and disposition Fable (**complete 2026-07-11**)
 
 - Reproduce the same minimal prompt through host `claude-agent-acp` 0.44.0 and 0.55.0.
 - Run a non-Fable Claude control through each adapter.
@@ -69,6 +69,12 @@ Exit: a new agent can find the correct runbook and current incident status witho
 
 Exit: Fable has a reproducible root cause and a tested disposition; no environment is inferred from
 another environment's result.
+
+Disposition: both 0.44.0 and 0.55.0 pass matched Fable/Sonnet host ACP and bridge controls when run
+outside the managed no-egress sandbox. Reader-image 0.55.0 passes with isolated credentials plus the
+pinned minimal Fable settings mount. The historical failure was DNS-disabled execution, not adapter
+drift; see the [R1 evidence](superpowers/2026-07-11-fable-r1-disposition.md). `doctor` now reports a
+missing Fable opt-in and missing reader settings prerequisite before a paid turn.
 
 ### R2 — provenance and phase-specific diagnostics
 
@@ -120,12 +126,13 @@ Exit: a release cannot claim an agent path that was not tested from its distribu
 
 ## Immediate queue
 
-1. Run the Fable adapter-version A/B from R1.
-2. Design the phase vocabulary and container-degradation classification before adding fallback logic.
-3. Specify the explicit trusted-host fallback contract; keep automatic fallback disabled until reviewed.
-4. Add provenance to `doctor --json` and a separate bounded live-smoke command.
+1. Design the R2 phase vocabulary and container-degradation classification before adding fallback logic.
+2. Specify the explicit trusted-host fallback contract; keep automatic fallback disabled until reviewed.
+3. Add resolved executable/package/image provenance to `doctor --json` and a separate bounded live-smoke
+   command.
+4. Preserve adapter stderr and the deepest prompt error in the task journal.
 5. Make the reader image reproducible, then establish pinned and floating host/container lanes.
-6. Make the new matrix a release checklist gate.
+6. Make the compatibility matrix a release checklist gate.
 
 ## Guardrails
 
@@ -142,7 +149,7 @@ Exit: a release cannot claim an agent path that was not tested from its distribu
 
 Bridge reliability can stop being the sole P0 when:
 
-1. Fable is fixed or explicitly unsupported with current evidence.
+1. Fable is fixed or explicitly unsupported with current evidence. **Satisfied by R1 on 2026-07-11.**
 2. Every supported agent has a dated pinned host/container result or an explicit environment non-goal.
 3. Minimal phase-specific smokes run on schedule and on compatibility-changing PRs.
 4. Failures retain their phase and original cause.

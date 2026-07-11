@@ -51,6 +51,37 @@ mount breaks refresh):
   chmod -R u+rw ~/.config/a2a-creds
   ```
 
+  **Fable-specific settings mount.** The credential copy is sufficient for normal Claude models, but
+  `claude-agent-acp` 0.55.0 did not advertise Fable from a credential-only reader home. A deliberate
+  Fable reader must also mount the checked-in minimal model/effort settings file:
+
+  ```toml
+  [[agents]]
+  id = "claude-fable-reader"
+  cmd = "claude-agent-acp"
+  pre_authenticated = true
+  model = "claude-fable-5[1m]"
+  effort = "xhigh"
+
+  [agents.sandbox]
+  image = "a2a-agent-reader:latest"
+  mount = "/absolute/path/to/code"
+  access = "ro"
+  egress = "locked"
+  network = "a2a-egress-internal"
+  proxy = "http://a2a-egress-proxy:8888"
+  volumes = [
+    "/absolute/path/to/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json",
+    "/absolute/path/to/a2a-bridge/deploy/containers/claude-fable-settings.json:/root/.claude/settings.json:ro",
+  ]
+  ```
+
+  Start that bridge process with `A2A_BRIDGE_ALLOW_FABLE=1`. The template is intentionally limited to
+  `model` and `effortLevel`; do not mount or copy the full host `~/.claude/settings.json`,
+  `~/.claude.json`, hooks, permissions, project history, or account caches. Run
+  `A2A_BRIDGE_ALLOW_FABLE=1 a2a-bridge doctor` before the live turn; it reports a missing opt-in or
+  settings mount.
+
 The shipped container configs pair these mounted files with `pre_authenticated = true`. That setting is
 required for browserless ChatGPT-auth containers: it reuses the mounted login instead of invoking
 codex-acp's advertised browser-login action. Do not also set `auth_method` on the same agent.
@@ -164,6 +195,11 @@ backend, not `api.openai.com`); **kiro `cognito-identity.us-east-1.amazonaws.com
   review/design work (ADR-0032); Tier 2 is opt-in defense-in-depth for that content class. If container
   infrastructure is degraded, explicitly select an eligible host entry after confirming trust. The
   bridge does not silently downgrade or automatically replay a prompt.
+- **Managed-agent execution is not the host:** an ACP process launched inside a managed agent sandbox
+  can fail DNS even while the computer is online and authenticated. Repeat the exact control through
+  approved host execution; do not rotate credentials or change adapters based only on the sandboxed
+  failure. An inherited `CODEX_SANDBOX_NETWORK_DISABLED` value is not sufficient evidence because
+  approved host commands may retain it.
 - **No fallback for untrusted or write-capable work:** third-party/untrusted reads require Tier 2, and
   every `implement`/write path requires Tier 3 even for an owned repo. Both fail closed if the
   container boundary is unavailable.
