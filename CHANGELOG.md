@@ -7,6 +7,8 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-10
+
 ### Fixed
 
 - Containerized and already-logged-in Codex agents can declare `pre_authenticated = true`, preventing
