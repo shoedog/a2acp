@@ -3,6 +3,7 @@ default = "codex"
 [[agents]]
 id = "codex"
 cmd = "codex-acp"
+pre_authenticated = true
 
 [[agents]]
 id = "claude"

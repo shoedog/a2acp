@@ -13,17 +13,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # binary — the LINUX build resolves here, not the host's macOS one.
 RUN npm install -g \
       @agentclientprotocol/claude-agent-acp@0.55.0 \
-      @agentclientprotocol/codex-acp@1.1.0
+      @agentclientprotocol/codex-acp@1.1.2
 
 # kiro-cli: install the LINUX build (the host's macOS binary can't run in this Linux image). Official
 # zip method (https://kiro.dev/docs/cli/installation/#with-a-zip-file); arch-aware so it works whether
-# Docker Desktop runs amd64 or arm64 (Apple Silicon -> arm64). node:24-slim is bookworm/glibc 2.36
-# (>= 2.34 required). install.sh drops the binary under ~/.local/bin (root -> /root/.local/bin).
-# </dev/null keeps install.sh non-interactive during the build (no hang on a prompt).
+# Docker Desktop runs amd64 or arm64 (Apple Silicon -> arm64). Use the MUSL build: kiro-cli's current
+# GNU `latest` requires glibc 2.39, but node:24-slim is bookworm/glibc 2.36 — the GNU build now fails at
+# install.sh ("built for a GNU system with glibc 2.39 or newer, try the musl version"). The musl build is
+# statically linked (no glibc dep) and runs on the bookworm base. install.sh drops the binary under
+# ~/.local/bin (root -> /root/.local/bin). </dev/null keeps install.sh non-interactive during the build.
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
-      amd64) url="https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux.zip" ;; \
-      arm64) url="https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-aarch64-linux.zip" ;; \
+      amd64) url="https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux-musl.zip" ;; \
+      arm64) url="https://desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-aarch64-linux-musl.zip" ;; \
       *) echo "unsupported arch" >&2; exit 1 ;; \
     esac; \
     curl --proto '=https' --tlsv1.2 -sSf "$url" -o /tmp/kirocli.zip; \

@@ -1044,6 +1044,7 @@ mod tests {
             mcp: vec![],
             mcp_delivery: Default::default(),
             auth_method: None,
+            pre_authenticated: false,
             name: None,
             description: None,
             tags: vec![],

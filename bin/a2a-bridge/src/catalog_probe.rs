@@ -121,6 +121,7 @@ async fn probe_acp_host(entry: &AgentEntry, cwd: &Path) -> Result<AgentCaps, Str
         model: None,
         mode: None,
         auth_method: entry.auth_method.clone(),
+        pre_authenticated: entry.pre_authenticated,
         container: None,
         mcp: Vec::new(),
         ..AcpConfig::default()
@@ -184,6 +185,7 @@ mod tests {
             sandbox: None,
             watchdog: None,
             auth_method: None,
+            pre_authenticated: false,
             name: None,
             description: None,
             tags: vec![],

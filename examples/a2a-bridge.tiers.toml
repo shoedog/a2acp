@@ -30,6 +30,7 @@ cmd = "claude-agent-acp"
 [[agents]]
 id   = "tier1-codex-ro"
 cmd  = "codex-acp"
+pre_authenticated = true
 args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
 
 # Tier 2 — approved for: any content an adversary could have authored (third-party PRs, dependencies,
@@ -66,6 +67,7 @@ proxy   = "http://a2a-egress-proxy:8888"
 id     = "tier3-impl"
 kind   = "container_rw"
 cmd    = "codex-acp"
+pre_authenticated = true
 args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
 [agents.sandbox]
 image   = "a2a-toolchain:latest"

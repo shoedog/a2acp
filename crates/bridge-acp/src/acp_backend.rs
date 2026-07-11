@@ -84,7 +84,8 @@ const PERMISSION_VIEW_CAP: usize = 4096;
 /// `mode` drives a HARD `session/set_mode` after each `session/new` (a rejected
 /// mode fails session setup); `model` validates and applies the advertised model
 /// config option (a bad pin fails session setup).
-/// `auth_method` optionally pins which advertised auth method `connect` uses.
+/// `auth_method` optionally pins which advertised auth method `connect` uses;
+/// `pre_authenticated` skips that request when credentials are already ambient.
 #[derive(Debug, Clone)]
 pub struct AcpConfig {
     /// Registry id of the agent this config belongs to, used in operator-facing diagnostics.
@@ -99,6 +100,10 @@ pub struct AcpConfig {
     /// prefers ChatGPT-style methods (`chat-gpt`, then legacy `chatgpt`) and
     /// otherwise uses the first method the agent advertised at `initialize` (if any).
     pub auth_method: Option<String>,
+    /// Skip the ACP `authenticate` request because the launched agent already has
+    /// ambient credentials (for example, a mounted Codex `auth.json`). Mutually
+    /// exclusive with `auth_method`.
+    pub pre_authenticated: bool,
     /// Bound on the `initialize` handshake (transport connect + response).
     /// Defaults to [`DEFAULT_HANDSHAKE_TIMEOUT`]; on elapse `connect`/`spawn`
     /// return `BridgeError::AgentCrashed` rather than hanging. Task 6 surfaces
@@ -149,6 +154,7 @@ impl Default for AcpConfig {
             model: None,
             mode: None,
             auth_method: None,
+            pre_authenticated: false,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             cancel_grace: DEFAULT_CANCEL_GRACE,
             container: None,
@@ -948,6 +954,11 @@ impl AcpBackend {
         transport: impl ConnectTo<Client> + 'static,
         config: AcpConfig,
     ) -> Result<Self, BridgeError> {
+        if config.pre_authenticated && config.auth_method.is_some() {
+            return Err(BridgeError::config_invalid(
+                "pre_authenticated=true cannot be combined with auth_method",
+            ));
+        }
         let (cx_tx, cx_rx) = oneshot::channel::<ConnectionTo<Agent>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -1122,6 +1133,7 @@ impl AcpBackend {
         // forever. A closed transport EOFs cleanly (the `map_err` arms); a true
         // hang on either step is caught by the outer timeout.
         let auth_method_cfg = config.auth_method.clone();
+        let pre_authenticated = config.pre_authenticated;
         let handshake = async move {
             let cx = cx_rx.await.map_err(|_| {
                 BridgeError::agent_crashed(
@@ -1141,53 +1153,47 @@ impl AcpBackend {
 
             // ── authenticate ──────────────────────────────────────────────────
             //
-            // Lifecycle order: initialize → authenticate → (later) session/new. The
-            // `initialize` response lists the auth methods the agent supports. If it
-            // advertised NONE (and none is configured), the agent needs no
-            // client-driven auth, so we SKIP. Otherwise attempt `authenticate` ONCE
-            // with either the configured method id or a stable default preference:
-            // ChatGPT-style auth (`chat-gpt` / `chatgpt`) when advertised, else the
-            // first advertised method. API-key auth should be forced explicitly with
-            // `auth_method`: the bridge host cannot reliably infer whether an
-            // in-container agent has the matching API-key environment.
-            //
-            // POLICY for an already-authenticated agent (the T9 gated e2e validates
-            // against real codex): codex with an existing login may still advertise
-            // methods but not actually require a fresh auth — and may either accept a
-            // redundant `authenticate` (success → fine) or REJECT it. We cannot
-            // distinguish "wrong credentials" from "redundant auth" from the wire, so
-            // we choose the pragmatic, least-surprising policy: attempt ONCE; treat a
-            // SUCCESS (or no advertised methods) as authenticated; a definitive Err
-            // is FATAL and surfaces `AgentNotAuthenticated`. This matches the
-            // spec-intended flow (authenticate before sessions) while keeping the
-            // bound tight. (If a future real agent is found to reject redundant auth,
-            // revisit toward a softer policy.)
-            if let Some(m) = auth_method_cfg.as_deref() {
-                // I4: a configured auth_method that the agent did NOT advertise
-                // is a likely operator misconfiguration. We still ATTEMPT it
-                // (the agent is authoritative — it may accept an unlisted id),
-                // but WARN naming the configured value and the advertised list so
-                // an opaque `AgentNotAuthenticated` can be diagnosed.
-                let advertised: Vec<String> = resp
-                    .auth_methods
-                    .iter()
-                    .map(|a| a.id().0.to_string())
-                    .collect();
-                if !advertised.iter().any(|a| a == m) {
-                    tracing::warn!(
-                        configured_auth_method = %m,
-                        advertised = ?advertised,
-                        "configured auth_method is not among the methods the agent \
-                         advertised; attempting anyway (agent is authoritative)"
-                    );
+            // Lifecycle order is initialize → optional authenticate → (later)
+            // session/new. A pre-authenticated agent already has ambient credentials,
+            // so advertised methods are retained for diagnostics but no auth action is
+            // invoked. Otherwise, no advertised methods means no client-driven auth;
+            // with methods present we attempt exactly once using the configured id or
+            // the stable default preference below. A definitive error is fatal and
+            // surfaces `AgentNotAuthenticated`.
+            if !pre_authenticated {
+                if let Some(m) = auth_method_cfg.as_deref() {
+                    // I4: a configured auth_method that the agent did NOT advertise
+                    // is a likely operator misconfiguration. We still ATTEMPT it
+                    // (the agent is authoritative — it may accept an unlisted id),
+                    // but WARN naming the configured value and the advertised list so
+                    // an opaque `AgentNotAuthenticated` can be diagnosed.
+                    let advertised: Vec<String> = resp
+                        .auth_methods
+                        .iter()
+                        .map(|a| a.id().0.to_string())
+                        .collect();
+                    if !advertised.iter().any(|a| a == m) {
+                        tracing::warn!(
+                            configured_auth_method = %m,
+                            advertised = ?advertised,
+                            "configured auth_method is not among the methods the agent \
+                             advertised; attempting anyway (agent is authoritative)"
+                        );
+                    }
                 }
-            }
-            let chosen = Self::choose_auth_method(auth_method_cfg.as_deref(), &resp.auth_methods);
-            if let Some(method_id) = chosen {
-                cx.send_request(AuthenticateRequest::new(method_id))
-                    .block_task()
-                    .await
-                    .map_err(|_| BridgeError::AgentNotAuthenticated)?;
+                let chosen =
+                    Self::choose_auth_method(auth_method_cfg.as_deref(), &resp.auth_methods);
+                if let Some(method_id) = chosen {
+                    cx.send_request(AuthenticateRequest::new(method_id))
+                        .block_task()
+                        .await
+                        .map_err(|_| BridgeError::AgentNotAuthenticated)?;
+                }
+            } else {
+                tracing::debug!(
+                    advertised_auth_methods = resp.auth_methods.len(),
+                    "skipping authenticate for pre-authenticated agent"
+                );
             }
 
             Ok::<_, BridgeError>((cx, resp))
@@ -5776,6 +5782,42 @@ mod tests {
         assert_eq!(rec.authenticates.lock().await.as_slice(), &["oauth"]);
         // And the backend captured the advertised method.
         assert_eq!(be.auth_methods().map(<[_]>::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn pre_authenticated_skips_advertised_auth_method() {
+        let rec = Recorder::new("agent-sess-PREAUTH");
+        rec.advertise_auth_method("chat-gpt").await;
+        let cfg = AcpConfig {
+            pre_authenticated: true,
+            ..test_config()
+        };
+
+        let _be = connect_recording_with(rec.clone(), cfg).await;
+
+        assert!(
+            rec.authenticates.lock().await.is_empty(),
+            "ambient credentials must not trigger an interactive authenticate request"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_authenticated_rejects_explicit_auth_method() {
+        let (client_side, _agent_side) = Channel::duplex();
+        let cfg = AcpConfig {
+            auth_method: Some("chat-gpt".to_string()),
+            pre_authenticated: true,
+            ..test_config()
+        };
+
+        match AcpBackend::connect(client_side, cfg).await {
+            Err(BridgeError::ConfigInvalid { reason }) => {
+                assert!(reason.contains("pre_authenticated"), "{reason}");
+                assert!(reason.contains("auth_method"), "{reason}");
+            }
+            Err(other) => panic!("expected ConfigInvalid, got {other:?}"),
+            Ok(_) => panic!("contradictory auth policy must not connect"),
+        }
     }
 
     fn auth_method(id: &'static str) -> AuthMethod {

@@ -392,11 +392,11 @@ impl AgentRegistry for Registry {
                     && c.args == e.args
                     && c.cwd == e.cwd
                     && c.auth_method == e.auth_method
+                    && c.pre_authenticated == e.pre_authenticated
                     && c.kind == e.kind
-                    // All three are frozen into the backend at spawn (sandbox→argv,
-                    // session_cwd→AcpConfig.cwd, api_key_env→ApiConfig) and never refreshed on warm
-                    // reuse — so a change to any MUST force a fresh slot. BEHAVIOR CHANGE: session_cwd /
-                    // api_key_env edits now drain + respawn (were previously silently ignored).
+                    // These are frozen into the backend at spawn and never refreshed on warm reuse,
+                    // so a change to any MUST force a fresh slot. In particular, auth policy changes
+                    // must not leave an already-spawned connection alive under the old policy.
                     && c.sandbox == e.sandbox
                     && c.session_cwd == e.session_cwd
                     && c.api_key_env == e.api_key_env
@@ -531,6 +531,7 @@ mod tests {
             sandbox: None,
             watchdog: None,
             auth_method: None,
+            pre_authenticated: false,
             name: None,
             description: None,
             tags: vec![],
@@ -589,6 +590,7 @@ mod tests {
                 sandbox: None,
                 watchdog: None,
                 auth_method: None,
+                pre_authenticated: false,
                 name: None,
                 description: None,
                 tags: vec![],

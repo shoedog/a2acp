@@ -393,6 +393,7 @@ fn acp_spawn_inputs(
         model: entry.model.clone(),
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
+        pre_authenticated: entry.pre_authenticated,
         container,
         watchdog: entry.watchdog.clone(),
         // ACP-param MCP delivery (claude): the entry's MCP servers ride `session/new`. Codex/kiro
@@ -613,6 +614,7 @@ fn container_rw_cfg_from_entry(
         model: entry.model.clone(),
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
+        pre_authenticated: entry.pre_authenticated,
         watchdog: entry.watchdog.clone(),
         handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
         cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
@@ -4145,7 +4147,7 @@ fn agent_fragment(name: &str) -> &'static str {
             "\n# kiro: zero-auth local default (kiro-cli acp). ACP SDK 1.x can discover Kiro's\n# native model list, but cannot apply Kiro model pins unless the catalog marks\n# the agent `model_configurable: true`; leave model unpinned by default.\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\n"
         }
         "codex" => {
-            "\n# codex: gpt-5.5 with reasoning_effort. Auth defaults to ChatGPT-style login\n# when advertised; API-key-only installs should set auth_method explicitly.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
+            "\n# codex: gpt-5.5 with reasoning_effort. Run `codex login` first; the\n# existing login is ambient, so the bridge must not restart browser auth.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\npre_authenticated = true\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
         }
         "claude" => {
             "\n# claude: subscription. `model` is validated against the advertised values and\n# applied. Fable ids are blocked by this bridge; use another advertised model.\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n"
@@ -6764,6 +6766,7 @@ mod cli_tests {
             mcp: vec![],
             mcp_delivery: Default::default(),
             auth_method: None,
+            pre_authenticated: false,
             name: None,
             description: None,
             tags: vec![],
@@ -7153,6 +7156,7 @@ mod cli_tests {
         let codex_only = vec!["codex".to_string()];
         let cfg = build_init_config(&codex_only, None).unwrap();
         assert!(cfg.contains("default = \"codex\""));
+        assert!(cfg.contains("pre_authenticated = true"));
         // --default override must be among the selected agents.
         assert!(build_init_config(&codex_only, Some("claude")).is_err());
         assert!(build_init_config(&codex_only, Some("codex")).is_ok());

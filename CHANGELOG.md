@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file. The format is b
 API/config stability guarantees yet, but breaking changes are called out explicitly per
 release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
+## [Unreleased]
+
+### Fixed
+
+- Containerized and already-logged-in Codex agents can declare `pre_authenticated = true`, preventing
+  the bridge from re-invoking codex-acp's interactive ChatGPT browser login before `session/new`.
+  Shipped Codex configs now use the setting, restoring gpt-5.6-sol model/effort selection and prompt
+  turns with codex-acp 1.1.2 in browserless containers.
+
 ## [0.2.0] - 2026-07-03
 
 ### Changed

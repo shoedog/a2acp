@@ -148,6 +148,9 @@ pub struct AgentEntry {
     /// when `mcp` is empty; defaults to `Acp`.
     pub mcp_delivery: crate::mcp::McpDelivery,
     pub auth_method: Option<String>,
+    /// The launched ACP process already has ambient credentials; do not invoke
+    /// an advertised interactive authentication method during initialization.
+    pub pre_authenticated: bool,
     pub name: Option<String>,
     pub description: Option<String>,
     pub tags: Vec<String>,
@@ -420,6 +423,7 @@ mod tests {
             sandbox: None,
             watchdog: None,
             auth_method: None,
+            pre_authenticated: false,
             name: None,
             description: None,
             tags: vec![],
@@ -451,6 +455,7 @@ mod tests {
             sandbox: None,
             watchdog: None,
             auth_method: None,
+            pre_authenticated: false,
             name: None,
             description: None,
             tags: vec![],
@@ -480,6 +485,7 @@ mod tests {
             sandbox: None,
             watchdog: None,
             auth_method: None,
+            pre_authenticated: false,
             name: None,
             description: None,
             tags: vec![],

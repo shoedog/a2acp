@@ -55,9 +55,13 @@ Each `[[agents]]` entry is one backend:
 | agent  | `cmd`              | auth                          |
 |--------|--------------------|-------------------------------|
 | kiro   | `kiro-cli` `["acp"]` | none (local default)        |
-| codex  | `codex-acp`        | codex login                   |
+| codex  | `codex-acp`        | `codex login` + `pre_authenticated = true` |
 | claude | `claude-agent-acp` | claude subscription / login   |
 | api    | —                  | `OPENAI_API_KEY` (env var name) |
+
+Set `pre_authenticated = true` when an ACP process already has credentials from its host profile or a
+mounted auth file. This prevents the bridge from invoking an advertised interactive login method during
+startup. Do not combine it with `auth_method`, which explicitly asks the bridge to authenticate.
 
 ### model / effort / mode
 

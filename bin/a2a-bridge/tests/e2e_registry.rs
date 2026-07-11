@@ -111,6 +111,7 @@ fn acp_spawn_fn() -> SpawnFn {
                         model: entry.model.clone(),
                         mode: entry.mode.clone(),
                         auth_method: entry.auth_method.clone(),
+                        pre_authenticated: entry.pre_authenticated,
                         ..AcpConfig::default()
                     };
                     let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
@@ -241,6 +242,7 @@ fn entry(
         sandbox: None,
         watchdog: None,
         auth_method: auth_method.map(str::to_string),
+        pre_authenticated: false,
         name: None,
         description: None,
         tags: vec![],
@@ -580,6 +582,7 @@ async fn api_entry_resolves_and_serves_through_registry() {
         sandbox: None,
         watchdog: None,
         auth_method: None,
+        pre_authenticated: false,
         name: None,
         description: None,
         tags: vec![],
@@ -640,6 +643,7 @@ async fn registry_rejects_api_entry_with_cmd() {
         sandbox: None,
         watchdog: None,
         auth_method: None,
+        pre_authenticated: false,
         name: None,
         description: None,
         tags: vec![],
