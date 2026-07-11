@@ -329,6 +329,11 @@ impl WorkflowExecutor {
                         ttft: None,
                         outcome: &TurnOutcome::Canceled,
                     });
+                    ctx.observer.record(&ObsEvent::UsageFinalized {
+                        ctx: &obs_ctx,
+                        usage: None,
+                        fin: UsageFinalization::TurnFinal,
+                    });
                     ctx.observer.record(&ObsEvent::NodeFinished {
                         ctx: &obs_ctx,
                         outcome: &TurnOutcome::Canceled,
@@ -346,6 +351,11 @@ impl WorkflowExecutor {
                             latency: turn_start.elapsed(),
                             ttft: None,
                             outcome: &fail_out,
+                        });
+                        ctx.observer.record(&ObsEvent::UsageFinalized {
+                            ctx: &obs_ctx,
+                            usage: None,
+                            fin: UsageFinalization::TurnFinal,
                         });
                         ctx.observer
                             .record(&ObsEvent::NodeFinished { ctx: &obs_ctx, outcome: &fail_out });
@@ -406,13 +416,11 @@ impl WorkflowExecutor {
                 ttft: ttft_val,
                 outcome: &node_outcome,
             });
-            if let Some(u) = &last_usage {
-                ctx.observer.record(&ObsEvent::UsageFinalized {
-                    ctx: &obs_ctx,
-                    usage: u,
-                    fin: UsageFinalization::TurnFinal,
-                });
-            }
+            ctx.observer.record(&ObsEvent::UsageFinalized {
+                ctx: &obs_ctx,
+                usage: last_usage.as_ref(),
+                fin: UsageFinalization::TurnFinal,
+            });
             ctx.observer.record(&ObsEvent::NodeFinished {
                 ctx: &obs_ctx,
                 outcome: &node_outcome,
@@ -732,13 +740,11 @@ impl WorkflowExecutor {
                                 ttft: None,
                                 outcome: &TurnOutcome::Canceled,
                             });
-                            if let Some(u) = &usage {
-                                ctx.observer.record(&ObsEvent::UsageFinalized {
-                                    ctx: obs_ctx,
-                                    usage: u,
-                                    fin: UsageFinalization::TurnFinal,
-                                });
-                            }
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: obs_ctx,
+                                usage: usage.as_ref(),
+                                fin: UsageFinalization::TurnFinal,
+                            });
                         }
                         break 'node_loop (marker, false, usage, TurnOutcome::Canceled);
                     }
@@ -750,13 +756,11 @@ impl WorkflowExecutor {
                                 ttft: ttft_val,
                                 outcome: &TurnOutcome::Success,
                             });
-                            if let Some(u) = &usage {
-                                ctx.observer.record(&ObsEvent::UsageFinalized {
-                                    ctx: obs_ctx,
-                                    usage: u,
-                                    fin: UsageFinalization::TurnFinal,
-                                });
-                            }
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: obs_ctx,
+                                usage: usage.as_ref(),
+                                fin: UsageFinalization::TurnFinal,
+                            });
                         }
                         break 'node_loop (text, true, usage, TurnOutcome::Success);
                     }
@@ -773,13 +777,11 @@ impl WorkflowExecutor {
                                 ttft: ttft_val,
                                 outcome: &fail_out,
                             });
-                            if let Some(u) = &usage {
-                                ctx.observer.record(&ObsEvent::UsageFinalized {
-                                    ctx: obs_ctx,
-                                    usage: u,
-                                    fin: UsageFinalization::TurnFinal,
-                                });
-                            }
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: obs_ctx,
+                                usage: usage.as_ref(),
+                                fin: UsageFinalization::TurnFinal,
+                            });
                         }
                         break 'node_loop (text, false, usage, fail_out);
                     }
@@ -794,13 +796,11 @@ impl WorkflowExecutor {
                                 ttft: None,
                                 outcome: &fail_out,
                             });
-                            if let Some(u) = &usage {
-                                ctx.observer.record(&ObsEvent::UsageFinalized {
-                                    ctx: obs_ctx,
-                                    usage: u,
-                                    fin: UsageFinalization::TurnFinal,
-                                });
-                            }
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: obs_ctx,
+                                usage: usage.as_ref(),
+                                fin: UsageFinalization::TurnFinal,
+                            });
                         }
                         if should_retry_after_attempt {
                             self.registry.invalidate(&node.agent).await;
@@ -4622,6 +4622,183 @@ mod observability_tests {
         }
     }
 
+    #[derive(Default)]
+    struct UsageFinalRec(Mutex<Vec<bool>>);
+    impl Observer for UsageFinalRec {
+        fn record(&self, e: &ObsEvent<'_>) {
+            if let ObsEvent::UsageFinalized { usage, fin, .. } = e {
+                if *fin == UsageFinalization::TurnFinal {
+                    self.0.lock().unwrap().push(usage.is_some());
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct PromptOpenFinalizationRec(Mutex<Vec<&'static str>>);
+    impl Observer for PromptOpenFinalizationRec {
+        fn record(&self, e: &ObsEvent<'_>) {
+            let tag = match e {
+                ObsEvent::TurnFinished { .. } => "turn_finished",
+                ObsEvent::UsageFinalized {
+                    usage: None,
+                    fin: UsageFinalization::TurnFinal,
+                    ..
+                } => "no_usage_finalized",
+                ObsEvent::UsageFinalized { .. } => "unexpected_usage_finalization",
+                ObsEvent::NodeFinished { .. } => "node_finished",
+                _ => return,
+            };
+            self.0.lock().unwrap().push(tag);
+        }
+    }
+
+    struct NoUsageIdleBackend;
+    #[async_trait::async_trait]
+    impl AgentBackend for NoUsageIdleBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(futures::stream::pending::<
+                Result<Update, BridgeError>,
+            >()))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct NoUsageIdleRegistry;
+    #[async_trait::async_trait]
+    impl AgentRegistry for NoUsageIdleRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            Ok(Resolved {
+                entry: Arc::new(super::tests::minimal_entry(id)),
+                backend: Arc::new(NoUsageIdleBackend),
+                lease: Box::new(NoopLease2),
+            })
+        }
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+        async fn apply(&self, _: bridge_core::domain::RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    #[derive(Default)]
+    struct StartAndUsageFinalRec {
+        started: AtomicUsize,
+        usages: Mutex<Vec<bool>>,
+    }
+    impl Observer for StartAndUsageFinalRec {
+        fn record(&self, e: &ObsEvent<'_>) {
+            match e {
+                ObsEvent::TurnStarted { .. } => {
+                    self.started.fetch_add(1, Ordering::SeqCst);
+                }
+                ObsEvent::UsageFinalized { usage, fin, .. }
+                    if *fin == UsageFinalization::TurnFinal =>
+                {
+                    self.usages.lock().unwrap().push(usage.is_some());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_success_without_usage_emits_explicit_no_usage() {
+        let rec = Arc::new(UsageFinalRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(TextRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-no-usage-success".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+
+        let events = rec.0.lock().unwrap().clone();
+        assert_eq!(events, vec![false]);
+    }
+
+    #[tokio::test]
+    async fn workflow_failure_without_usage_emits_explicit_no_usage() {
+        let rec = Arc::new(UsageFinalRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(TimedOutRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-no-usage-failure".into(),
+            CancellationToken::new(),
+            ctx,
+        );
+        while stream.next().await.is_some() {}
+
+        let events = rec.0.lock().unwrap().clone();
+        assert_eq!(events, vec![false]);
+    }
+
+    #[tokio::test]
+    async fn workflow_cancel_without_usage_emits_explicit_no_usage() {
+        let rec = Arc::new(StartAndUsageFinalRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let token = CancellationToken::new();
+        let exec = WorkflowExecutor::new(Arc::new(NoUsageIdleRegistry));
+        let mut stream = exec.run_with_context(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-no-usage-cancel".into(),
+            token.clone(),
+            ctx,
+        );
+        let drain = tokio::spawn(async move { while stream.next().await.is_some() {} });
+
+        for _ in 0..1000 {
+            if rec.started.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(rec.started.load(Ordering::SeqCst), 1);
+        token.cancel();
+        drain.await.unwrap();
+
+        let events = rec.usages.lock().unwrap().clone();
+        assert_eq!(events, vec![false]);
+    }
+
     #[tokio::test]
     async fn turn_finished_emitted_before_usage_finalized_cold_path() {
         let rec = Arc::new(OrderRec::default());
@@ -4695,6 +4872,147 @@ mod observability_tests {
             tags,
             vec!["turn_finished", "usage_finalized"],
             "TurnFinished must precede UsageFinalized on warm path; got: {tags:?}"
+        );
+    }
+
+    struct SlowPromptOpenDispatcher;
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for SlowPromptOpenDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            struct SlowPromptOpenBackend;
+            #[async_trait::async_trait]
+            impl AgentBackend for SlowPromptOpenBackend {
+                async fn prompt(
+                    &self,
+                    _s: &SessionId,
+                    _parts: Vec<Part>,
+                ) -> Result<BackendStream, BridgeError> {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    Ok(Box::pin(futures::stream::empty()))
+                }
+
+                async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                    Ok(())
+                }
+            }
+
+            Ok(NodeTurn {
+                backend: Arc::new(SlowPromptOpenBackend),
+                session: SessionId::parse("warm-slow-prompt-open").unwrap(),
+                seed: None,
+                cleanup: Box::new(NoopCleanup),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_cancel_during_prompt_open_emits_explicit_no_usage() {
+        let rec = Arc::new(PromptOpenFinalizationRec::default());
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel.cancel();
+        });
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            exec.run_with_context_and_dispatcher(
+                make_single_node_graph(),
+                "inp".into(),
+                "run-cancel-prompt-open".into(),
+                token,
+                ctx,
+                Arc::new(SlowPromptOpenDispatcher),
+            )
+            .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("cancellation must preempt warm prompt setup");
+
+        assert_eq!(
+            rec.0.lock().unwrap().as_slice(),
+            ["turn_finished", "no_usage_finalized", "node_finished"]
+        );
+    }
+
+    struct FailingPromptOpenDispatcher;
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for FailingPromptOpenDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            struct FailingPromptOpenBackend;
+            #[async_trait::async_trait]
+            impl AgentBackend for FailingPromptOpenBackend {
+                async fn prompt(
+                    &self,
+                    _s: &SessionId,
+                    _parts: Vec<Part>,
+                ) -> Result<BackendStream, BridgeError> {
+                    Err(BridgeError::AgentTimedOut)
+                }
+
+                async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+                    Ok(())
+                }
+            }
+
+            Ok(NodeTurn {
+                backend: Arc::new(FailingPromptOpenBackend),
+                session: SessionId::parse("warm-failing-prompt-open").unwrap(),
+                seed: None,
+                cleanup: Box::new(NoopCleanup),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_prompt_error_emits_explicit_no_usage() {
+        let rec = Arc::new(PromptOpenFinalizationRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec.clone(),
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+        };
+        let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
+
+        exec.run_with_context_and_dispatcher(
+            make_single_node_graph(),
+            "inp".into(),
+            "run-error-prompt-open".into(),
+            CancellationToken::new(),
+            ctx,
+            Arc::new(FailingPromptOpenDispatcher),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(
+            rec.0.lock().unwrap().as_slice(),
+            ["turn_finished", "no_usage_finalized", "node_finished"]
         );
     }
 }

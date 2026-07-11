@@ -5,6 +5,7 @@ use bridge_core::{
     error::BridgeError,
     ids::{NodeId, OperationId, SessionId, TaskId},
     ports::SessionStore,
+    task_store::{durable_retention_ms, system_wall_now_ms, PersistenceClock},
 };
 use rusqlite::OptionalExtension;
 use std::collections::HashSet;
@@ -14,6 +15,7 @@ use std::sync::{Arc, Mutex};
 /// and a per-task pending-request that is cleared atomically on first read.
 pub struct SqliteStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    now_ms: PersistenceClock,
     // Held for the store's lifetime: an exclusive advisory lock on `<path>.lock`
     // so only one `serve` owns a DB file (makes the boot sweep safe). `None` for
     // in-memory stores.
@@ -23,6 +25,10 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Open an in-memory database (suitable for tests).
     pub fn open_in_memory() -> Result<Self, BridgeError> {
+        Self::open_in_memory_with_clock(Arc::new(system_wall_now_ms))
+    }
+
+    pub fn open_in_memory_with_clock(now_ms: PersistenceClock) -> Result<Self, BridgeError> {
         let conn = rusqlite::Connection::open_in_memory().map_err(|_| BridgeError::StoreFailure)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -30,6 +36,7 @@ impl SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            now_ms,
             _lock: None,
         };
         store.create_schema()?;
@@ -89,6 +96,7 @@ impl SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            now_ms: Arc::new(system_wall_now_ms),
             _lock: Some(lock),
         };
         store.create_schema()?;
@@ -134,7 +142,9 @@ impl SqliteStore {
                 result     TEXT,
                 error      TEXT,
                 created_ms INTEGER NOT NULL,
-                updated_ms INTEGER NOT NULL
+                updated_ms INTEGER NOT NULL,
+                last_artifact_ms INTEGER,
+                artifacts_purged_at INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_ms);
             CREATE TABLE IF NOT EXISTS task_node_checkpoints (
@@ -187,7 +197,9 @@ impl SqliteStore {
                 cached_write_tokens INTEGER,
                 cost_amount REAL,
                 cost_currency TEXT,
-                traceparent TEXT
+                traceparent TEXT,
+                usage_finalized_ms INTEGER,
+                usage_finalization_kind TEXT NOT NULL DEFAULT 'pending'
             );
             CREATE INDEX IF NOT EXISTS idx_turn_log_completed ON turn_log(completed_ms);
             CREATE INDEX IF NOT EXISTS idx_turn_log_task ON turn_log(task_id, node);
@@ -233,6 +245,8 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         ("journal_complete_from_birth", "INTEGER NOT NULL DEFAULT 0"),
         ("batch_id", "TEXT"),
         ("item_id", "TEXT"),
+        ("last_artifact_ms", "INTEGER"),
+        ("artifacts_purged_at", "INTEGER"),
     ];
     for (col, def) in additive {
         if !existing.contains(col) {
@@ -255,6 +269,26 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if !cp_existing.contains("usage_json") {
         conn.execute_batch("ALTER TABLE task_node_checkpoints ADD COLUMN usage_json TEXT;")?;
     }
+
+    let mut stmt3 = conn.prepare("PRAGMA table_info(turn_log)")?;
+    let turn_existing: HashSet<String> = stmt3
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !turn_existing.contains("usage_finalized_ms") {
+        conn.execute_batch("ALTER TABLE turn_log ADD COLUMN usage_finalized_ms INTEGER;")?;
+    }
+    if !turn_existing.contains("usage_finalization_kind") {
+        conn.execute_batch(
+            "ALTER TABLE turn_log ADD COLUMN usage_finalization_kind TEXT NOT NULL DEFAULT 'pending';",
+        )?;
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact_retention
+            ON tasks(status, updated_ms, last_artifact_ms);
+         CREATE INDEX IF NOT EXISTS idx_turn_log_retention
+            ON turn_log(usage_finalized_ms, completed_ms);",
+    )?;
 
     Ok(())
 }
@@ -303,6 +337,8 @@ fn row_to_turn_log_row(
         cost_amount: row.get(22)?,
         cost_currency: row.get(23)?,
         traceparent: traceparent_from_string(row.get(24)?),
+        usage_finalized_ms: row.get(25)?,
+        usage_finalization_kind: row.get(26)?,
     })
 }
 
@@ -310,7 +346,7 @@ const TURN_LOG_SELECT: &str =
     "SELECT turn_id, session_id, task_id, workflow, node, attempt, agent, model, effort, mode,
         prompt_id, started_ms, completed_ms, latency_ms, ttft_ms, outcome, failure_class,
         input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens,
-        cost_amount, cost_currency, traceparent
+        cost_amount, cost_currency, traceparent, usage_finalized_ms, usage_finalization_kind
  FROM turn_log";
 
 fn insert_journal_event(
@@ -325,6 +361,30 @@ fn insert_journal_event(
     )
     .map_err(|_| BridgeError::StoreFailure)?;
     Ok(())
+}
+
+fn bump_last_artifact_sql(
+    tx: &rusqlite::Transaction<'_>,
+    task: &TaskId,
+    artifact_ms: i64,
+) -> Result<usize, BridgeError> {
+    tx.execute(
+        "UPDATE tasks
+         SET last_artifact_ms = CASE
+             WHEN last_artifact_ms IS NULL OR last_artifact_ms < ?2 THEN ?2
+             ELSE last_artifact_ms
+         END
+         WHERE id=?1",
+        rusqlite::params![task.as_str(), artifact_ms],
+    )
+    .map_err(|_| BridgeError::StoreFailure)
+}
+
+fn immediate_transaction(
+    conn: &rusqlite::Connection,
+) -> Result<rusqlite::Transaction<'_>, BridgeError> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| BridgeError::StoreFailure)
 }
 
 fn batch_status_as_str(status: bridge_core::task_store::BatchStatus) -> &'static str {
@@ -533,9 +593,9 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms,
-                               input, workflow_spec_json, resume_attempts, session_cwd,
-                               journal_complete_from_birth, batch_id, item_id)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13)",
+                               last_artifact_ms, input, workflow_spec_json, resume_attempts, session_cwd,
+                               journal_complete_from_birth, batch_id, item_id, artifacts_purged_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15)",
             rusqlite::params![
                 rec.id.as_str(),
                 rec.workflow,
@@ -544,12 +604,14 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 rec.error,
                 rec.created_ms,
                 rec.updated_ms,
+                rec.last_artifact_ms,
                 rec.input,
                 rec.workflow_spec_json,
                 rec.resume_attempts as i64,
                 rec.session_cwd,
                 rec.batch_id.as_ref().map(|b| b.as_str()),
-                rec.item_id
+                rec.item_id,
+                rec.artifacts_purged_at
             ],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
@@ -568,7 +630,13 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let n = conn
             .execute(
                 "UPDATE tasks SET status=?2, result=?3, error=?4, updated_ms=?5 WHERE id=?1",
-                rusqlite::params![id.as_str(), status.as_str(), result, error, updated_ms],
+                rusqlite::params![
+                    id.as_str(),
+                    status.as_str(),
+                    result,
+                    error,
+                    durable_retention_ms(updated_ms)
+                ],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         if n == 0 {
@@ -585,8 +653,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts, session_cwd,
-                        batch_id, item_id
+                        last_artifact_ms, input, workflow_spec_json, resume_attempts, session_cwd,
+                        batch_id, item_id, artifacts_purged_at
                  FROM tasks WHERE id=?1",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -607,8 +675,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts, session_cwd,
-                        batch_id, item_id
+                        last_artifact_ms, input, workflow_spec_json, resume_attempts, session_cwd,
+                        batch_id, item_id, artifacts_purged_at
                  FROM tasks ORDER BY updated_ms DESC LIMIT ?1",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -628,7 +696,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .execute(
                 "UPDATE tasks SET status='interrupted', error='interrupted (serve restarted)', updated_ms=?1
                  WHERE status='working'",
-                rusqlite::params![updated_ms],
+                rusqlite::params![durable_retention_ms(updated_ms)],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         Ok(n as u64)
@@ -638,7 +706,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let n = conn
             .execute(
                 "UPDATE tasks SET status='canceled', updated_ms=?1 WHERE id=?2 AND status='working'",
-                rusqlite::params![updated_ms, id.as_str()],
+                rusqlite::params![durable_retention_ms(updated_ms), id.as_str()],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         Ok(n > 0)
@@ -652,12 +720,18 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         ts: i64,
     ) -> Result<(), BridgeError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let tx = immediate_transaction(&conn)?;
+        let artifact_ms = durable_retention_ms((self.now_ms)());
+        if bump_last_artifact_sql(&tx, task, artifact_ms)? == 0 {
+            return Err(BridgeError::StoreFailure);
+        }
+        tx.execute(
             "INSERT INTO task_node_checkpoints(task_id, node_id, output, ok, ts)
              VALUES(?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![task.as_str(), node.as_str(), output, ok as i64, ts],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
         Ok(())
     }
 
@@ -706,10 +780,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     ) -> Result<bridge_core::task_store::ResumeClaim, BridgeError> {
         use bridge_core::task_store::ResumeClaim;
         let conn = self.conn.lock().unwrap();
-        // unchecked_transaction takes &self — safe to use through the MutexGuard.
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| BridgeError::StoreFailure)?;
+        // `new_unchecked` takes `&Connection`; the enclosing mutex serializes transactions.
+        let tx = immediate_transaction(&conn)?;
         let current: Option<i64> = tx
             .query_row(
                 "SELECT resume_attempts FROM tasks WHERE id=?1",
@@ -740,8 +812,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts, session_cwd,
-                        batch_id, item_id
+                        last_artifact_ms, input, workflow_spec_json, resume_attempts, session_cwd,
+                        batch_id, item_id, artifacts_purged_at
                  FROM tasks WHERE status='working'",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -758,14 +830,19 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         row: &bridge_core::task_store::TurnLogFinished,
     ) -> Result<(), BridgeError> {
         let conn = self.conn.lock().unwrap();
+        let tx = immediate_transaction(&conn)?;
+        let artifact_ms = durable_retention_ms((self.now_ms)());
+        if let Some(task) = row.ctx.task_id.as_ref() {
+            let _ = bump_last_artifact_sql(&tx, task, artifact_ms)?;
+        }
         let (outcome, failure_class) =
             bridge_core::task_store::turn_log_outcome_strings(&row.outcome);
-        conn.execute(
+        tx.execute(
             "INSERT INTO turn_log(
                 turn_id, session_id, task_id, workflow, node, attempt, agent, model, effort, mode,
                 prompt_id, started_ms, completed_ms, latency_ms, ttft_ms, outcome, failure_class,
-                traceparent
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                traceparent, usage_finalization_kind
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'pending')
              ON CONFLICT(turn_id) DO UPDATE SET
                 session_id=excluded.session_id,
                 task_id=excluded.task_id,
@@ -806,42 +883,107 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             ],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
         Ok(())
     }
 
-    async fn update_turn_usage(
+    async fn finalize_turn_usage(
         &self,
-        row: &bridge_core::task_store::TurnLogUsage,
+        row: &bridge_core::task_store::TurnLogFinalized,
     ) -> Result<(), BridgeError> {
+        use bridge_core::task_store::TurnUsageFinalization;
+
         let conn = self.conn.lock().unwrap();
-        let term = row.usage.terminal.as_ref();
-        let cost = row.usage.cost.as_ref();
-        let n = conn
-            .execute(
-                "UPDATE turn_log SET
-                    input_tokens=COALESCE(?2, input_tokens),
-                    output_tokens=COALESCE(?3, output_tokens),
-                    thought_tokens=COALESCE(?4, thought_tokens),
-                    cached_read_tokens=COALESCE(?5, cached_read_tokens),
-                    cached_write_tokens=COALESCE(?6, cached_write_tokens),
-                    cost_amount=COALESCE(?7, cost_amount),
-                    cost_currency=COALESCE(?8, cost_currency)
-                 WHERE turn_id=?1",
-                rusqlite::params![
-                    row.ctx.turn_id.as_str(),
-                    term.map(|t| t.input_tokens as i64),
-                    term.map(|t| t.output_tokens as i64),
-                    term.and_then(|t| t.thought_tokens).map(|v| v as i64),
-                    term.and_then(|t| t.cached_read_tokens).map(|v| v as i64),
-                    term.and_then(|t| t.cached_write_tokens).map(|v| v as i64),
-                    cost.map(|c| c.amount),
-                    cost.map(|c| c.currency.as_str()),
-                ],
-            )
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
+        let persistence_ms = durable_retention_ms((self.now_ms)());
+        let (expected_kind, n) = match &row.finalization {
+            TurnUsageFinalization::Usage(usage) => {
+                let term = usage.terminal.as_ref();
+                let cost = usage.cost.as_ref();
+                let n = tx
+                    .execute(
+                        "UPDATE turn_log SET
+                            input_tokens=COALESCE(?2, input_tokens),
+                            output_tokens=COALESCE(?3, output_tokens),
+                            thought_tokens=COALESCE(?4, thought_tokens),
+                            cached_read_tokens=COALESCE(?5, cached_read_tokens),
+                            cached_write_tokens=COALESCE(?6, cached_write_tokens),
+                            cost_amount=COALESCE(?7, cost_amount),
+                            cost_currency=COALESCE(?8, cost_currency),
+                            usage_finalized_ms=?9,
+                            usage_finalization_kind='usage'
+                         WHERE turn_id=?1
+                           AND completed_ms IS NOT NULL
+                           AND usage_finalized_ms IS NULL",
+                        rusqlite::params![
+                            row.ctx.turn_id.as_str(),
+                            term.map(|t| t.input_tokens as i64),
+                            term.map(|t| t.output_tokens as i64),
+                            term.and_then(|t| t.thought_tokens).map(|v| v as i64),
+                            term.and_then(|t| t.cached_read_tokens).map(|v| v as i64),
+                            term.and_then(|t| t.cached_write_tokens).map(|v| v as i64),
+                            cost.map(|c| c.amount),
+                            cost.map(|c| c.currency.as_str()),
+                            persistence_ms,
+                        ],
+                    )
+                    .map_err(|_| BridgeError::StoreFailure)?;
+                ("usage", n)
+            }
+            TurnUsageFinalization::NoUsage => {
+                let n = tx
+                    .execute(
+                        "UPDATE turn_log SET
+                            usage_finalized_ms=?2,
+                            usage_finalization_kind='no_usage'
+                         WHERE turn_id=?1
+                           AND completed_ms IS NOT NULL
+                           AND usage_finalized_ms IS NULL
+                           AND input_tokens IS NULL
+                           AND output_tokens IS NULL
+                           AND thought_tokens IS NULL
+                           AND cached_read_tokens IS NULL
+                           AND cached_write_tokens IS NULL
+                           AND cost_amount IS NULL
+                           AND cost_currency IS NULL",
+                        rusqlite::params![row.ctx.turn_id.as_str(), persistence_ms],
+                    )
+                    .map_err(|_| BridgeError::StoreFailure)?;
+                ("no_usage", n)
+            }
+        };
+
         if n == 0 {
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT usage_finalization_kind FROM turn_log
+                     WHERE turn_id=?1 AND usage_finalized_ms IS NOT NULL",
+                    rusqlite::params![row.ctx.turn_id.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|_| BridgeError::StoreFailure)?;
+            if current.as_deref() == Some(expected_kind) {
+                tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+                return Ok(());
+            }
             return Err(BridgeError::StoreFailure);
         }
+
+        let task_id: Option<String> = tx
+            .query_row(
+                "SELECT task_id FROM turn_log WHERE turn_id=?1",
+                rusqlite::params![row.ctx.turn_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|_| BridgeError::StoreFailure)?
+            .flatten();
+        if let Some(task_id) = task_id {
+            let task = TaskId::parse(task_id).map_err(|_| BridgeError::StoreFailure)?;
+            let _ = bump_last_artifact_sql(&tx, &task, persistence_ms)?;
+        }
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
         Ok(())
     }
 
@@ -1089,8 +1231,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow, status, result, error, created_ms, updated_ms,
-                        input, workflow_spec_json, resume_attempts, session_cwd,
-                        batch_id, item_id
+                        last_artifact_ms, input, workflow_spec_json, resume_attempts, session_cwd,
+                        batch_id, item_id, artifacts_purged_at
                  FROM tasks WHERE batch_id=?1",
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -1134,9 +1276,9 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
 
             conn.execute(
                 "INSERT INTO tasks(id, workflow, status, result, error, created_ms, updated_ms,
-                                   input, workflow_spec_json, resume_attempts, session_cwd,
-                                   journal_complete_from_birth, batch_id, item_id)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13)",
+                                   last_artifact_ms, input, workflow_spec_json, resume_attempts, session_cwd,
+                                   journal_complete_from_birth, batch_id, item_id, artifacts_purged_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15)",
                 rusqlite::params![
                     rec.id.as_str(),
                     rec.workflow,
@@ -1145,12 +1287,14 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                     rec.error,
                     rec.created_ms,
                     rec.updated_ms,
+                    rec.last_artifact_ms,
                     rec.input,
                     rec.workflow_spec_json,
                     rec.resume_attempts as i64,
                     rec.session_cwd,
                     batch.as_str(),
-                    item
+                    item,
+                    rec.artifacts_purged_at
                 ],
             )?;
             conn.execute_batch("COMMIT;")?;
@@ -1176,7 +1320,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .execute(
                 "UPDATE batch SET status='canceling', updated_ms=?1
                  WHERE id=?2 AND status='working'",
-                rusqlite::params![ts, id.as_str()],
+                rusqlite::params![durable_retention_ms(ts), id.as_str()],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         Ok(n > 0)
@@ -1195,7 +1339,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 "UPDATE batch SET status=?1, updated_ms=?2 WHERE id=?3 AND status=?4",
                 rusqlite::params![
                     batch_status_as_str(new),
-                    ts,
+                    durable_retention_ms(ts),
                     id.as_str(),
                     batch_status_as_str(expect)
                 ],
@@ -1216,7 +1360,12 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .execute(
                 "UPDATE batch SET status='failed', error=?1, updated_ms=?2
                  WHERE id=?3 AND status=?4",
-                rusqlite::params![error, ts, id.as_str(), batch_status_as_str(expect)],
+                rusqlite::params![
+                    error,
+                    durable_retention_ms(ts),
+                    id.as_str(),
+                    batch_status_as_str(expect)
+                ],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         Ok(n > 0)
@@ -1230,14 +1379,18 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         ts: i64,
     ) -> Result<i64, BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         // Allocate seq by bumping last_event_seq.
         let n = tx
             .execute(
-                "UPDATE tasks SET last_event_seq = last_event_seq + 1 WHERE id=?1",
-                rusqlite::params![task.as_str()],
+                "UPDATE tasks SET
+                    last_event_seq = last_event_seq + 1,
+                    last_artifact_ms = CASE
+                        WHEN last_artifact_ms IS NULL OR last_artifact_ms < ?2 THEN ?2
+                        ELSE last_artifact_ms
+                    END
+                 WHERE id=?1",
+                rusqlite::params![task.as_str(), durable_retention_ms((self.now_ms)())],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         if n == 0 {
@@ -1290,14 +1443,18 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             .transpose()
             .map_err(|_| BridgeError::StoreFailure)?;
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         // Allocate seq.
         let n = tx
             .execute(
-                "UPDATE tasks SET last_event_seq = last_event_seq + 1 WHERE id=?1",
-                rusqlite::params![task.as_str()],
+                "UPDATE tasks SET
+                    last_event_seq = last_event_seq + 1,
+                    last_artifact_ms = CASE
+                        WHEN last_artifact_ms IS NULL OR last_artifact_ms < ?2 THEN ?2
+                        ELSE last_artifact_ms
+                    END
+                 WHERE id=?1",
+                rusqlite::params![task.as_str(), durable_retention_ms((self.now_ms)())],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         if n == 0 {
@@ -1360,14 +1517,18 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         ts: i64,
     ) -> Result<i64, BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         // Allocate seq.
         let n = tx
             .execute(
-                "UPDATE tasks SET last_event_seq = last_event_seq + 1 WHERE id=?1",
-                rusqlite::params![task.as_str()],
+                "UPDATE tasks SET
+                    last_event_seq = last_event_seq + 1,
+                    last_artifact_ms = CASE
+                        WHEN last_artifact_ms IS NULL OR last_artifact_ms < ?2 THEN ?2
+                        ELSE last_artifact_ms
+                    END
+                 WHERE id=?1",
+                rusqlite::params![task.as_str(), durable_retention_ms((self.now_ms)())],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         if n == 0 {
@@ -1383,7 +1544,14 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         // Write the terminal status, result, error, and record terminal_seq.
         tx.execute(
             "UPDATE tasks SET status=?2, result=?3, error=?4, updated_ms=?5, terminal_seq=?6 WHERE id=?1",
-            rusqlite::params![task.as_str(), status.as_str(), result, error, ts, seq],
+            rusqlite::params![
+                task.as_str(),
+                status.as_str(),
+                result,
+                error,
+                durable_retention_ms(ts),
+                seq
+            ],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
         // Clear all start rows for this task.
@@ -1417,13 +1585,17 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         kind: bridge_core::orch::OrchEventKind,
     ) -> Result<i64, BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         let n = tx
             .execute(
-                "UPDATE tasks SET last_event_seq = last_event_seq + 1 WHERE id=?1",
-                rusqlite::params![task.as_str()],
+                "UPDATE tasks SET
+                    last_event_seq = last_event_seq + 1,
+                    last_artifact_ms = CASE
+                        WHEN last_artifact_ms IS NULL OR last_artifact_ms < ?2 THEN ?2
+                        ELSE last_artifact_ms
+                    END
+                 WHERE id=?1",
+                rusqlite::params![task.as_str(), durable_retention_ms((self.now_ms)())],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         if n == 0 {
@@ -1483,9 +1655,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     ) -> Result<bridge_core::task_store::JournalFoldInputs, BridgeError> {
         use bridge_core::task_store::{JournalFoldInputs, JournalScalars, TaskRecordStatus};
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         let (status_s, result, error, terminal_seq, cut_seq, complete_from_birth): (
             String,
             Option<String>,
@@ -1554,9 +1724,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         max_bytes: usize,
     ) -> Result<bridge_core::task_store::JournalRead, BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
 
         let (events, bytes): (i64, i64) = tx
             .query_row(
@@ -1689,9 +1857,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         use bridge_core::task_store::TaskProgressSnapshot;
         let conn = self.conn.lock().unwrap();
         // Use a transaction for a consistent read so cut_seq is exact.
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| BridgeError::StoreFailure)?;
+        let tx = immediate_transaction(&conn)?;
         // Read task row: status, result, error, terminal_seq, last_event_seq.
         let (status_s, result, error, terminal_seq, cut_seq): (
             String,
@@ -1779,12 +1945,14 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
     let error: Option<String> = row.get(4).map_err(|_| BridgeError::StoreFailure)?;
     let created_ms: i64 = row.get(5).map_err(|_| BridgeError::StoreFailure)?;
     let updated_ms: i64 = row.get(6).map_err(|_| BridgeError::StoreFailure)?;
-    let input: Option<String> = row.get(7).map_err(|_| BridgeError::StoreFailure)?;
-    let workflow_spec_json: Option<String> = row.get(8).map_err(|_| BridgeError::StoreFailure)?;
-    let resume_attempts: Option<i64> = row.get(9).map_err(|_| BridgeError::StoreFailure)?;
-    let session_cwd: Option<String> = row.get(10).map_err(|_| BridgeError::StoreFailure)?;
-    let batch_id: Option<String> = row.get(11).map_err(|_| BridgeError::StoreFailure)?;
-    let item_id: Option<String> = row.get(12).map_err(|_| BridgeError::StoreFailure)?;
+    let last_artifact_ms: Option<i64> = row.get(7).map_err(|_| BridgeError::StoreFailure)?;
+    let input: Option<String> = row.get(8).map_err(|_| BridgeError::StoreFailure)?;
+    let workflow_spec_json: Option<String> = row.get(9).map_err(|_| BridgeError::StoreFailure)?;
+    let resume_attempts: Option<i64> = row.get(10).map_err(|_| BridgeError::StoreFailure)?;
+    let session_cwd: Option<String> = row.get(11).map_err(|_| BridgeError::StoreFailure)?;
+    let batch_id: Option<String> = row.get(12).map_err(|_| BridgeError::StoreFailure)?;
+    let item_id: Option<String> = row.get(13).map_err(|_| BridgeError::StoreFailure)?;
+    let artifacts_purged_at: Option<i64> = row.get(14).map_err(|_| BridgeError::StoreFailure)?;
     Ok(TaskRecord {
         id: TaskId::parse(id).map_err(|_| BridgeError::StoreFailure)?,
         workflow,
@@ -1793,6 +1961,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
         error,
         created_ms,
         updated_ms,
+        last_artifact_ms,
         input: input.unwrap_or_default(),
         workflow_spec_json,
         resume_attempts: resume_attempts.unwrap_or(0) as u32,
@@ -1802,6 +1971,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<bridge_core::task_store::TaskRecor
             .transpose()
             .map_err(|_| BridgeError::StoreFailure)?,
         item_id,
+        artifacts_purged_at,
     })
 }
 
@@ -1837,9 +2007,22 @@ mod tests {
     use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
     use bridge_core::ports::{FailureClass, SessionStore, TraceParent, TurnContext, TurnOutcome};
     use bridge_core::task_store::{
-        BatchRecord, BatchStatus, ChildClaim, TaskRecord, TaskRecordStatus, TaskStore,
-        TurnLogFinished, TurnLogUsage,
+        BatchRecord, BatchStatus, ChildClaim, MemoryTaskStore, TaskRecord, TaskRecordStatus,
+        TaskStore, TurnLogFinalized, TurnLogFinished, TurnUsageFinalization,
+        RETENTION_NEVER_ELIGIBLE_MS,
     };
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    type LegacyTurnColumns = (
+        Option<i64>,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+    );
 
     fn trec(id: &str, ms: i64) -> TaskRecord {
         TaskRecord {
@@ -1850,12 +2033,14 @@ mod tests {
             error: None,
             created_ms: ms,
             updated_ms: ms,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         }
     }
 
@@ -1897,6 +2082,37 @@ mod tests {
         }
     }
 
+    fn sqlite_usage(input: u64, output: u64, at_ms: i64) -> UsageSnapshot {
+        UsageSnapshot {
+            used: None,
+            size: None,
+            cost: Some(UsageCost {
+                amount: 0.42,
+                currency: "USD".to_string(),
+            }),
+            terminal: Some(TerminalUsage {
+                total_tokens: input + output,
+                input_tokens: input,
+                output_tokens: output,
+                thought_tokens: Some(1),
+                cached_read_tokens: Some(2),
+                cached_write_tokens: Some(3),
+            }),
+            at_ms,
+        }
+    }
+
+    fn sqlite_finished(ctx: TurnContext, completed_ms: i64) -> TurnLogFinished {
+        TurnLogFinished {
+            ctx,
+            started_ms: completed_ms - 10,
+            completed_ms,
+            latency: std::time::Duration::from_millis(10),
+            ttft: None,
+            outcome: TurnOutcome::Success,
+        }
+    }
+
     async fn write_sqlite_turn(
         store: &SqliteStore,
         ctx: TurnContext,
@@ -1917,9 +2133,9 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx,
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: None,
                     size: None,
                     cost: cost.map(|(currency, amount)| UsageCost {
@@ -1935,7 +2151,7 @@ mod tests {
                         cached_write_tokens: None,
                     }),
                     at_ms: completed_ms,
-                },
+                }),
             })
             .await
             .unwrap();
@@ -1964,13 +2180,653 @@ mod tests {
             error: None,
             created_ms: 0,
             updated_ms: 0,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some(r#"{"v":1,"nodes":[]}"#.into()),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: Some(bid.clone()),
             item_id: Some(item.to_string()),
+            artifacts_purged_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_finalized_some_updates_usage_and_barrier_atomically() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 12_345)).unwrap();
+        let ctx = ctx_for("sqlite-final-usage", "ctx-final-usage", "task-1", 0);
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
+            .await
+            .unwrap();
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::Usage(sqlite_usage(5, 7, 1)),
+            })
+            .await
+            .unwrap();
+
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.input_tokens, Some(5));
+        assert_eq!(row.output_tokens, Some(7));
+        assert_eq!(row.cost_amount, Some(0.42));
+        assert_eq!(row.usage_finalized_ms, Some(12_345));
+        assert_eq!(row.usage_finalization_kind, "usage");
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_finalization_uses_persistence_time_not_old_event_time() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 86_400_001)).unwrap();
+        let ctx = ctx_for("sqlite-persist-time", "ctx-persist-time", "task-1", 0);
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
+            .await
+            .unwrap();
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::Usage(sqlite_usage(5, 7, 1)),
+            })
+            .await
+            .unwrap();
+
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.usage_finalized_ms, Some(86_400_001));
+        assert_ne!(row.usage_finalized_ms, Some(1));
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_finalized_none_sets_no_usage_barrier() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 12_346)).unwrap();
+        let ctx = ctx_for("sqlite-final-none", "ctx-final-none", "task-1", 0);
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
+            .await
+            .unwrap();
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .unwrap();
+
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.input_tokens, None);
+        assert_eq!(row.cost_amount, None);
+        assert_eq!(row.usage_finalized_ms, Some(12_346));
+        assert_eq!(row.usage_finalization_kind, "no_usage");
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_finalization_invalid_clock_uses_never_eligible_timestamp() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 0)).unwrap();
+        let ctx = ctx_for("sqlite-final-zero", "ctx-final-zero", "task-1", 0);
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
+            .await
+            .unwrap();
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .unwrap();
+
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.usage_finalized_ms, Some(RETENTION_NEVER_ELIGIBLE_MS));
+        assert_ne!(row.usage_finalized_ms, Some(0));
+    }
+
+    #[tokio::test]
+    async fn sqlite_no_usage_finalization_rejects_existing_usage_columns() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 12_347)).unwrap();
+        let ctx = ctx_for(
+            "sqlite-final-contradict",
+            "ctx-final-contradict",
+            "task-1",
+            0,
+        );
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
+            .await
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE turn_log SET input_tokens=1 WHERE turn_id=?1",
+                rusqlite::params![ctx.turn_id.as_str()],
+            )
+            .unwrap();
+        }
+
+        assert!(store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .is_err());
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.input_tokens, Some(1));
+        assert_eq!(row.usage_finalized_ms, None);
+        assert_eq!(row.usage_finalization_kind, "pending");
+    }
+
+    #[tokio::test]
+    async fn sqlite_turn_finished_upsert_does_not_clear_finalization() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 12_348)).unwrap();
+        let ctx = ctx_for("sqlite-final-replay", "ctx-final-replay", "task-1", 0);
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
+            .await
+            .unwrap();
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .unwrap();
+
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 250))
+            .await
+            .unwrap();
+        let row = store.turn_log_row(&ctx.turn_id).await.unwrap().unwrap();
+        assert_eq!(row.usage_finalized_ms, Some(12_348));
+        assert_eq!(row.usage_finalization_kind, "no_usage");
+    }
+
+    #[tokio::test]
+    async fn sqlite_turn_finished_task_linked_bumps_artifact_recency() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 50_000)).unwrap();
+        let task = TaskId::parse("task-recency-finish").unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+        let ctx = ctx_for(
+            "sqlite-recency-finish",
+            "ctx-recency-finish",
+            task.as_str(),
+            0,
+        );
+
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx, 200))
+            .await
+            .unwrap();
+
+        let row = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(row.last_artifact_ms, Some(50_000));
+    }
+
+    #[tokio::test]
+    async fn sqlite_finalize_turn_usage_task_linked_bumps_artifact_recency() {
+        let clock = Arc::new(AtomicI64::new(60_000));
+        let store = SqliteStore::open_in_memory_with_clock({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        })
+        .unwrap();
+        let task = TaskId::parse("task-recency-finalize").unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+        let ctx = ctx_for(
+            "sqlite-recency-finalize",
+            "ctx-recency-finalize",
+            task.as_str(),
+            0,
+        );
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
+            .await
+            .unwrap();
+        clock.store(70_000, Ordering::SeqCst);
+
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx,
+                finalization: TurnUsageFinalization::NoUsage,
+            })
+            .await
+            .unwrap();
+
+        let row = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(row.last_artifact_ms, Some(70_000));
+    }
+
+    async fn finish_for_finalization<S: TaskStore + ?Sized>(store: &S, ctx: &TurnContext) {
+        store
+            .upsert_turn_finished(&sqlite_finished(ctx.clone(), 200))
+            .await
+            .unwrap();
+    }
+
+    async fn parity_turn_row(
+        memory: &MemoryTaskStore,
+        sqlite: &SqliteStore,
+        turn: &TurnId,
+    ) -> bridge_core::task_store::TurnLogRow {
+        let memory_row = memory.turn_log_row(turn).await.unwrap().unwrap();
+        let sqlite_row = sqlite.turn_log_row(turn).await.unwrap().unwrap();
+        assert_eq!(memory_row, sqlite_row);
+        memory_row
+    }
+
+    async fn finalize_both(
+        memory: &MemoryTaskStore,
+        sqlite: &SqliteStore,
+        row: &TurnLogFinalized,
+    ) -> (Result<(), BridgeError>, Result<(), BridgeError>) {
+        (
+            memory.finalize_turn_usage(row).await,
+            sqlite.finalize_turn_usage(row).await,
+        )
+    }
+
+    #[tokio::test]
+    async fn memory_finalization_matches_sqlite() {
+        let clock = Arc::new(AtomicI64::new(88_000));
+        let memory = MemoryTaskStore::with_clock({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        });
+        let sqlite = SqliteStore::open_in_memory_with_clock({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        })
+        .unwrap();
+
+        // Usage finalization persists all usage fields at storage time, not event time.
+        let usage_ctx = ctx_for("parity-usage", "ctx-final-parity", "task-1", 0);
+        finish_for_finalization(&memory, &usage_ctx).await;
+        finish_for_finalization(&sqlite, &usage_ctx).await;
+        let usage = TurnLogFinalized {
+            ctx: usage_ctx.clone(),
+            finalization: TurnUsageFinalization::Usage(sqlite_usage(3, 4, 1)),
+        };
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &usage).await;
+        assert!(memory_result.is_ok() && sqlite_result.is_ok());
+        let first_usage_row = parity_turn_row(&memory, &sqlite, &usage_ctx.turn_id).await;
+        assert_eq!(first_usage_row.input_tokens, Some(3));
+        assert_eq!(first_usage_row.output_tokens, Some(4));
+        assert_eq!(first_usage_row.usage_finalized_ms, Some(88_000));
+        assert_ne!(first_usage_row.usage_finalized_ms, Some(1));
+        assert_eq!(first_usage_row.usage_finalization_kind, "usage");
+
+        // A same-kind duplicate is idempotent: later storage time and payload do not overwrite.
+        clock.store(88_100, Ordering::SeqCst);
+        let duplicate_usage = TurnLogFinalized {
+            ctx: usage_ctx.clone(),
+            finalization: TurnUsageFinalization::Usage(sqlite_usage(30, 40, 2)),
+        };
+        let (memory_result, sqlite_result) =
+            finalize_both(&memory, &sqlite, &duplicate_usage).await;
+        assert!(memory_result.is_ok() && sqlite_result.is_ok());
+        let duplicate_usage_row = parity_turn_row(&memory, &sqlite, &usage_ctx.turn_id).await;
+        assert_eq!(duplicate_usage_row, first_usage_row);
+
+        // A contradictory finalization kind is rejected without changing the stored usage row.
+        let contradictory = TurnLogFinalized {
+            ctx: usage_ctx.clone(),
+            finalization: TurnUsageFinalization::NoUsage,
+        };
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &contradictory).await;
+        assert!(memory_result.is_err() && sqlite_result.is_err());
+        assert_eq!(
+            parity_turn_row(&memory, &sqlite, &usage_ctx.turn_id).await,
+            first_usage_row
+        );
+
+        // Explicit no-usage and its duplicate have the same barrier semantics.
+        clock.store(89_000, Ordering::SeqCst);
+        let no_usage_ctx = ctx_for("parity-no-usage", "ctx-final-parity", "task-1", 0);
+        finish_for_finalization(&memory, &no_usage_ctx).await;
+        finish_for_finalization(&sqlite, &no_usage_ctx).await;
+        let no_usage = TurnLogFinalized {
+            ctx: no_usage_ctx.clone(),
+            finalization: TurnUsageFinalization::NoUsage,
+        };
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &no_usage).await;
+        assert!(memory_result.is_ok() && sqlite_result.is_ok());
+        let first_no_usage_row = parity_turn_row(&memory, &sqlite, &no_usage_ctx.turn_id).await;
+        assert_eq!(first_no_usage_row.input_tokens, None);
+        assert_eq!(first_no_usage_row.cost_amount, None);
+        assert_eq!(first_no_usage_row.usage_finalized_ms, Some(89_000));
+        assert_eq!(first_no_usage_row.usage_finalization_kind, "no_usage");
+
+        clock.store(89_100, Ordering::SeqCst);
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &no_usage).await;
+        assert!(memory_result.is_ok() && sqlite_result.is_ok());
+        assert_eq!(
+            parity_turn_row(&memory, &sqlite, &no_usage_ctx.turn_id).await,
+            first_no_usage_row
+        );
+
+        // Unknown turns fail identically and do not synthesize rows.
+        let unknown_ctx = ctx_for("parity-unknown", "ctx-final-parity", "task-1", 0);
+        let unknown = TurnLogFinalized {
+            ctx: unknown_ctx.clone(),
+            finalization: TurnUsageFinalization::NoUsage,
+        };
+        let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &unknown).await;
+        assert!(memory_result.is_err() && sqlite_result.is_err());
+        assert!(memory
+            .turn_log_row(&unknown_ctx.turn_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(sqlite
+            .turn_log_row(&unknown_ctx.turn_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // An invalid zero clock and the explicit sentinel both fail closed to the sentinel.
+        for (turn, clock_value) in [
+            ("parity-invalid-clock", 0),
+            ("parity-sentinel-clock", RETENTION_NEVER_ELIGIBLE_MS),
+        ] {
+            clock.store(clock_value, Ordering::SeqCst);
+            let ctx = ctx_for(turn, "ctx-final-parity", "task-1", 0);
+            finish_for_finalization(&memory, &ctx).await;
+            finish_for_finalization(&sqlite, &ctx).await;
+            let finalized = TurnLogFinalized {
+                ctx: ctx.clone(),
+                finalization: TurnUsageFinalization::NoUsage,
+            };
+            let (memory_result, sqlite_result) = finalize_both(&memory, &sqlite, &finalized).await;
+            assert!(memory_result.is_ok() && sqlite_result.is_ok());
+            let row = parity_turn_row(&memory, &sqlite, &ctx.turn_id).await;
+            assert_eq!(row.usage_finalized_ms, Some(RETENTION_NEVER_ELIGIBLE_MS));
+            assert_ne!(row.usage_finalized_ms, Some(0));
+            assert_eq!(row.usage_finalization_kind, "no_usage");
+        }
+    }
+
+    async fn assert_task_recency<S: TaskStore + ?Sized>(
+        store: &S,
+        task: &TaskId,
+        expected_ms: i64,
+    ) {
+        assert_eq!(
+            store.get(task).await.unwrap().unwrap().last_artifact_ms,
+            Some(expected_ms),
+            "unexpected storage-authored recency for {}",
+            task.as_str()
+        );
+    }
+
+    async fn assert_all_seven_writer_recencies<S: TaskStore + ?Sized>(
+        store: &S,
+        clock: &Arc<AtomicI64>,
+    ) {
+        const STALE_CALLER_MS: i64 = 1;
+
+        let checkpoint_task = TaskId::parse("recency-legacy-checkpoint").unwrap();
+        store
+            .create(&trec(checkpoint_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_001, Ordering::SeqCst);
+        store
+            .put_node_checkpoint(
+                &checkpoint_task,
+                &bridge_core::ids::NodeId::parse("legacy-node").unwrap(),
+                "checkpoint",
+                true,
+                STALE_CALLER_MS,
+            )
+            .await
+            .unwrap();
+        assert_task_recency(store, &checkpoint_task, 100_001).await;
+
+        let start_task = TaskId::parse("recency-node-start").unwrap();
+        store
+            .create(&trec(start_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_002, Ordering::SeqCst);
+        store
+            .record_node_started(
+                &start_task,
+                &bridge_core::ids::NodeId::parse("started-node").unwrap(),
+                &OperationId::parse("op-recency-node-start").unwrap(),
+                STALE_CALLER_MS,
+            )
+            .await
+            .unwrap();
+        assert_task_recency(store, &start_task, 100_002).await;
+
+        let sequenced_checkpoint_task = TaskId::parse("recency-sequenced-checkpoint").unwrap();
+        store
+            .create(&trec(sequenced_checkpoint_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_003, Ordering::SeqCst);
+        store
+            .put_node_checkpoint_sequenced(
+                &sequenced_checkpoint_task,
+                &bridge_core::ids::NodeId::parse("sequenced-node").unwrap(),
+                &OperationId::parse("op-recency-sequenced-checkpoint").unwrap(),
+                "checkpoint",
+                true,
+                STALE_CALLER_MS,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_task_recency(store, &sequenced_checkpoint_task, 100_003).await;
+
+        let terminal_task = TaskId::parse("recency-terminal").unwrap();
+        store
+            .create(&trec(terminal_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_004, Ordering::SeqCst);
+        store
+            .set_terminal_sequenced(
+                &terminal_task,
+                &OperationId::parse("op-recency-terminal").unwrap(),
+                TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                STALE_CALLER_MS,
+            )
+            .await
+            .unwrap();
+        assert_task_recency(store, &terminal_task, 100_004).await;
+
+        let rich_event_task = TaskId::parse("recency-rich-event").unwrap();
+        store
+            .create(&trec(rich_event_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_005, Ordering::SeqCst);
+        store
+            .record_event_sequenced(
+                &rich_event_task,
+                &OperationId::parse("op-recency-rich-event").unwrap(),
+                STALE_CALLER_MS,
+                bridge_core::orch::OrchEventKind::Plan { entries: vec![] },
+            )
+            .await
+            .unwrap();
+        assert_task_recency(store, &rich_event_task, 100_005).await;
+
+        let finished_task = TaskId::parse("recency-turn-finished").unwrap();
+        store
+            .create(&trec(finished_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        let finished_ctx = ctx_for(
+            "recency-turn-finished-row",
+            "ctx-recency-writers",
+            finished_task.as_str(),
+            0,
+        );
+        clock.store(100_006, Ordering::SeqCst);
+        store
+            .upsert_turn_finished(&sqlite_finished(finished_ctx, STALE_CALLER_MS))
+            .await
+            .unwrap();
+        assert_task_recency(store, &finished_task, 100_006).await;
+
+        let finalized_task = TaskId::parse("recency-turn-finalized").unwrap();
+        store
+            .create(&trec(finalized_task.as_str(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        let finalized_ctx = ctx_for(
+            "recency-turn-finalized-row",
+            "ctx-recency-writers",
+            finalized_task.as_str(),
+            0,
+        );
+        clock.store(100_006, Ordering::SeqCst);
+        store
+            .upsert_turn_finished(&sqlite_finished(finalized_ctx.clone(), STALE_CALLER_MS))
+            .await
+            .unwrap();
+        clock.store(100_007, Ordering::SeqCst);
+        store
+            .finalize_turn_usage(&TurnLogFinalized {
+                ctx: finalized_ctx,
+                finalization: TurnUsageFinalization::Usage(sqlite_usage(1, 2, STALE_CALLER_MS)),
+            })
+            .await
+            .unwrap();
+        assert_task_recency(store, &finalized_task, 100_007).await;
+    }
+
+    #[tokio::test]
+    async fn storage_authored_recency_covers_all_seven_writer_families() {
+        let memory_clock = Arc::new(AtomicI64::new(0));
+        let memory = MemoryTaskStore::with_clock({
+            let clock = Arc::clone(&memory_clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        });
+        assert_all_seven_writer_recencies(&memory, &memory_clock).await;
+
+        let sqlite_clock = Arc::new(AtomicI64::new(0));
+        let sqlite = SqliteStore::open_in_memory_with_clock({
+            let clock = Arc::clone(&sqlite_clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        })
+        .unwrap();
+        assert_all_seven_writer_recencies(&sqlite, &sqlite_clock).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_legacy_migration_is_ddl_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    workflow TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result TEXT,
+                    error TEXT,
+                    created_ms INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL,
+                    input TEXT NOT NULL DEFAULT '',
+                    workflow_spec_json TEXT,
+                    resume_attempts INTEGER NOT NULL DEFAULT 0,
+                    session_cwd TEXT,
+                    last_event_seq INTEGER NOT NULL DEFAULT 0,
+                    terminal_seq INTEGER,
+                    journal_complete_from_birth INTEGER NOT NULL DEFAULT 0,
+                    batch_id TEXT,
+                    item_id TEXT
+                );
+                CREATE TABLE turn_log (
+                    turn_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    task_id TEXT,
+                    workflow TEXT,
+                    node TEXT,
+                    attempt INTEGER NOT NULL,
+                    agent TEXT NOT NULL,
+                    model TEXT,
+                    effort TEXT,
+                    mode TEXT,
+                    prompt_id TEXT,
+                    started_ms INTEGER,
+                    completed_ms INTEGER,
+                    latency_ms INTEGER,
+                    ttft_ms INTEGER,
+                    outcome TEXT,
+                    failure_class TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    thought_tokens INTEGER,
+                    cached_read_tokens INTEGER,
+                    cached_write_tokens INTEGER,
+                    cost_amount REAL,
+                    cost_currency TEXT,
+                    traceparent TEXT
+                );
+                INSERT INTO tasks(id, workflow, status, created_ms, updated_ms, input)
+                VALUES('task-legacy', 'code-review', 'completed', 1, 2, 'input');
+                INSERT INTO turn_log(
+                    turn_id, session_id, task_id, workflow, node, attempt, agent,
+                    completed_ms, outcome, input_tokens, output_tokens, cost_amount, cost_currency
+                ) VALUES(
+                    'turn-legacy', 'ctx-legacy', 'task-legacy', 'code-review', 'reviewer', 0,
+                    'codex', 3, 'success', 5, 7, 0.42, 'USD'
+                );",
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let task_cols: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT last_artifact_ms, artifacts_purged_at FROM tasks WHERE id='task-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(task_cols, (None, None));
+        let turn: LegacyTurnColumns = conn
+            .query_row(
+                "SELECT usage_finalized_ms, usage_finalization_kind, input_tokens, output_tokens,
+                        cost_amount, cost_currency, task_id
+                 FROM turn_log WHERE turn_id='turn-legacy'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            turn,
+            (
+                None,
+                "pending".to_string(),
+                Some(5),
+                Some(7),
+                Some(0.42),
+                Some("USD".to_string()),
+                Some("task-legacy".to_string())
+            )
+        );
     }
 
     #[tokio::test]
@@ -2209,12 +3065,14 @@ mod tests {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some("{\"v\":1}".into()),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -2294,12 +3152,14 @@ mod tests {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: Some("/req".to_string()),
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -2812,9 +3672,9 @@ mod tests {
         };
         store.upsert_turn_finished(&first).await.unwrap();
         store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx: first.ctx.clone(),
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: Some(50),
                     size: Some(1000),
                     cost: Some(UsageCost {
@@ -2830,7 +3690,7 @@ mod tests {
                         cached_write_tokens: Some(3),
                     }),
                     at_ms: 251,
-                },
+                }),
             })
             .await
             .unwrap();
@@ -2875,10 +3735,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_update_turn_usage_partial_updates_keep_existing_values() {
+    async fn sqlite_duplicate_usage_finalization_is_idempotent() {
         let store = SqliteStore::open_in_memory().unwrap();
         let base = TurnLogFinished {
-            ctx: ctx("turn-merge", 0),
+            ctx: ctx("turn-duplicate-finalization", 0),
             started_ms: 100,
             completed_ms: 200,
             latency: std::time::Duration::from_millis(100),
@@ -2888,12 +3748,15 @@ mod tests {
         store.upsert_turn_finished(&base).await.unwrap();
 
         store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx: base.ctx.clone(),
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: None,
                     size: None,
-                    cost: None,
+                    cost: Some(UsageCost {
+                        amount: 1.23,
+                        currency: "USD".to_string(),
+                    }),
                     terminal: Some(TerminalUsage {
                         total_tokens: 12,
                         input_tokens: 6,
@@ -2903,24 +3766,31 @@ mod tests {
                         cached_write_tokens: None,
                     }),
                     at_ms: 205,
-                },
+                }),
             })
             .await
             .unwrap();
 
         store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx: base.ctx.clone(),
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: None,
                     size: None,
                     cost: Some(UsageCost {
-                        amount: 1.23,
-                        currency: "USD".to_string(),
+                        amount: 9.99,
+                        currency: "EUR".to_string(),
                     }),
-                    terminal: None,
+                    terminal: Some(TerminalUsage {
+                        total_tokens: 200,
+                        input_tokens: 100,
+                        output_tokens: 100,
+                        thought_tokens: None,
+                        cached_read_tokens: None,
+                        cached_write_tokens: None,
+                    }),
                     at_ms: 210,
-                },
+                }),
             })
             .await
             .unwrap();
@@ -2930,7 +3800,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|r| r.turn_id.as_str() == "turn-merge")
+            .find(|r| r.turn_id.as_str() == "turn-duplicate-finalization")
             .unwrap();
         assert_eq!(row.input_tokens, Some(6));
         assert_eq!(row.output_tokens, Some(6));
@@ -2938,6 +3808,8 @@ mod tests {
         assert_eq!(row.cached_read_tokens, Some(0));
         assert_eq!(row.cost_amount, Some(1.23));
         assert_eq!(row.cost_currency.as_deref(), Some("USD"));
+        assert!(row.usage_finalized_ms.is_some());
+        assert_eq!(row.usage_finalization_kind, "usage");
     }
 
     #[tokio::test]
@@ -3134,18 +4006,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_update_turn_usage_unknown_turn_returns_error() {
+    async fn sqlite_finalize_turn_usage_unknown_turn_returns_error() {
         let store = SqliteStore::open_in_memory().unwrap();
         let err = store
-            .update_turn_usage(&TurnLogUsage {
+            .finalize_turn_usage(&TurnLogFinalized {
                 ctx: ctx("missing-turn", 0),
-                usage: UsageSnapshot {
+                finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                     used: None,
                     size: None,
                     cost: None,
                     terminal: None,
                     at_ms: 0,
-                },
+                }),
             })
             .await
             .unwrap_err();

@@ -538,6 +538,7 @@ dependencies = [
  "a2a-lf",
  "async-trait",
  "bridge-core",
+ "bridge-observ",
  "bridge-workflow",
  "futures",
  "serde",

@@ -326,7 +326,7 @@ pub enum ObsEvent<'a> {
     },
     UsageFinalized {
         ctx: &'a TurnContext,
-        usage: &'a UsageSnapshot,
+        usage: Option<&'a UsageSnapshot>,
         fin: UsageFinalization,
     },
 }

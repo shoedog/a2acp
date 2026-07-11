@@ -2177,13 +2177,11 @@ fn spawn_local_producer(
                         ttft,
                         outcome: &outcome,
                     });
-                    if let Some(usage) = &last_usage {
-                        observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                            ctx: &obs_ctx,
-                            usage,
-                            fin: bridge_core::ports::UsageFinalization::TurnFinal,
-                        });
-                    }
+                    observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                        ctx: &obs_ctx,
+                        usage: last_usage.as_ref(),
+                        fin: bridge_core::ports::UsageFinalization::TurnFinal,
+                    });
                     return;
                 }
                 _ = tx.closed() => {
@@ -2196,13 +2194,11 @@ fn spawn_local_producer(
                         ttft,
                         outcome: &outcome,
                     });
-                    if let Some(usage) = &last_usage {
-                        observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                            ctx: &obs_ctx,
-                            usage,
-                            fin: bridge_core::ports::UsageFinalization::TurnFinal,
-                        });
-                    }
+                    observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                        ctx: &obs_ctx,
+                        usage: last_usage.as_ref(),
+                        fin: bridge_core::ports::UsageFinalization::TurnFinal,
+                    });
                     return;
                 }
                 maybe = events.next() => match maybe {
@@ -2247,13 +2243,11 @@ fn spawn_local_producer(
                     ttft,
                     outcome: &bridge_core::ports::TurnOutcome::Canceled,
                 });
-                if let Some(usage) = &last_usage {
-                    observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                        ctx: &obs_ctx,
-                        usage,
-                        fin: bridge_core::ports::UsageFinalization::TurnFinal,
-                    });
-                }
+                observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                    ctx: &obs_ctx,
+                    usage: last_usage.as_ref(),
+                    fin: bridge_core::ports::UsageFinalization::TurnFinal,
+                });
                 return;
             }
         }
@@ -2281,13 +2275,11 @@ fn spawn_local_producer(
             ttft,
             outcome: &outcome,
         });
-        if let Some(usage) = &last_usage {
-            observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                ctx: &obs_ctx,
-                usage,
-                fin: bridge_core::ports::UsageFinalization::TurnFinal,
-            });
-        }
+        observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+            ctx: &obs_ctx,
+            usage: last_usage.as_ref(),
+            fin: bridge_core::ports::UsageFinalization::TurnFinal,
+        });
         // `_guard` drops here too (clean exit) → eviction. Channel closes on drop ->
         // SSE stream terminates after the terminal flush.
     });
@@ -5107,6 +5099,7 @@ mod tests {
         },
         UsageFinalized {
             ctx: bridge_core::ports::TurnContext,
+            has_usage: bool,
         },
     }
 
@@ -5132,9 +5125,10 @@ mod tests {
                         outcome: (*outcome).clone(),
                     })
                 }
-                bridge_core::ports::ObsEvent::UsageFinalized { ctx, .. } => {
+                bridge_core::ports::ObsEvent::UsageFinalized { ctx, usage, .. } => {
                     out.push(RecordedObsEvent::UsageFinalized {
                         ctx: (*ctx).clone(),
+                        has_usage: usage.is_some(),
                     })
                 }
                 bridge_core::ports::ObsEvent::TaskStarted { .. }
@@ -5331,7 +5325,8 @@ mod tests {
         use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
         use bridge_core::ports::{TraceParent, TurnContext, TurnOutcome};
         use bridge_core::task_store::{
-            MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinished, TurnLogUsage,
+            MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinalized,
+            TurnLogFinished, TurnUsageFinalization,
         };
         use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
         use std::io::Write;
@@ -5396,12 +5391,14 @@ mod tests {
                 error: None,
                 created_ms: 1,
                 updated_ms: 1,
+                last_artifact_ms: None,
                 input: "input".into(),
                 workflow_spec_json,
                 resume_attempts: 0,
                 session_cwd: None,
                 batch_id: None,
                 item_id: None,
+                artifacts_purged_at: None,
             }
         }
 
@@ -5471,9 +5468,9 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .update_turn_usage(&TurnLogUsage {
+                .finalize_turn_usage(&TurnLogFinalized {
                     ctx,
-                    usage: UsageSnapshot {
+                    finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                         used: None,
                         size: None,
                         cost: Some(UsageCost {
@@ -5489,7 +5486,7 @@ mod tests {
                             cached_write_tokens: None,
                         }),
                         at_ms: 100,
-                    },
+                    }),
                 })
                 .await
                 .unwrap();
@@ -9447,6 +9444,96 @@ mod tests {
         assert!(matches!(events[2], RecordedObsEvent::UsageFinalized { .. }));
     }
 
+    #[tokio::test]
+    async fn inbound_disconnect_without_usage_emits_explicit_no_usage() {
+        let observer = std::sync::Arc::new(RecordingObserver::default());
+        let backend = std::sync::Arc::new(NoUsageIdleBackend);
+        let srv = build_with_observer(
+            backend.clone() as Arc<dyn AgentBackend>,
+            Arc::new(AlwaysGrant),
+            observer.clone() as Arc<dyn bridge_core::ports::Observer>,
+        );
+        let abort = tokio_util::sync::CancellationToken::new();
+        let dispatch = LocalDispatch {
+            backend: backend.clone() as Arc<dyn AgentBackend>,
+            session: SessionId::parse("ctx-streaming-no-usage-disconnect-g0").unwrap(),
+            seed: None,
+            injects: Vec::new(),
+            turn_meta: None,
+            guard: None,
+            warm_guard: None,
+            obs_ctx: bridge_core::ports::TurnContext {
+                turn_id: bridge_core::ids::TurnId::parse("turn-streaming-no-usage-disconnect")
+                    .unwrap(),
+                session_id: ContextId::parse("streaming-no-usage-disconnect").unwrap(),
+                task_id: Some(TaskId::parse("task-streaming-no-usage-disconnect").unwrap()),
+                workflow: None,
+                node: None,
+                attempt: 0,
+                agent: "a".to_string(),
+                model: None,
+                effort: None,
+                mode: None,
+                prompt_id: None,
+                traceparent: None,
+            },
+            abort,
+        };
+        let routed = RoutedCall {
+            task: TaskId::parse("task-streaming-no-usage-disconnect").unwrap(),
+            session: SessionId::parse("session-task-streaming-no-usage-disconnect").unwrap(),
+            parts: vec![Part { text: "hi".into() }],
+            target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: Some(ContextId::parse("streaming-no-usage-disconnect").unwrap()),
+            session_cwd: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        spawn_local_producer(&srv, routed, dispatch, tx);
+
+        wait_until(|| {
+            matches!(
+                observer.snapshot().first(),
+                Some(RecordedObsEvent::Start(_))
+            )
+        })
+        .await;
+        drop(rx);
+
+        wait_until(|| {
+            let events = observer.snapshot();
+            matches!(
+                events.as_slice(),
+                [
+                    RecordedObsEvent::Start(_),
+                    RecordedObsEvent::Finish { .. },
+                    RecordedObsEvent::UsageFinalized { .. }
+                ]
+            )
+        })
+        .await;
+
+        let events = observer.snapshot();
+        assert!(matches!(
+            events[1],
+            RecordedObsEvent::Finish {
+                outcome: bridge_core::ports::TurnOutcome::Canceled,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            RecordedObsEvent::UsageFinalized {
+                has_usage: false,
+                ..
+            }
+        ));
+    }
+
     /// Backend that immediately yields many Text events then Done, designed to saturate
     /// a small-capacity channel so that `tx.send(ev).await` fails when the receiver is
     /// dropped while a send is in-flight.
@@ -9755,6 +9842,25 @@ mod tests {
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct NoUsageIdleBackend;
+
+    #[async_trait::async_trait]
+    impl AgentBackend for NoUsageIdleBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(futures::stream::pending::<
+                Result<Update, BridgeError>,
+            >()))
         }
 
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -11626,12 +11732,14 @@ mod tests {
             error: None,
             created_ms: now,
             updated_ms: now,
+            last_artifact_ms: None,
             input: "test input".to_string(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         };
         store.create(&rec).await.unwrap();
 
@@ -11676,12 +11784,14 @@ mod tests {
             error: None,
             created_ms: now,
             updated_ms: now,
+            last_artifact_ms: None,
             input: "test input".to_string(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         };
         store.create(&rec).await.unwrap();
 
@@ -11840,12 +11950,14 @@ mod tests {
             error: None,
             created_ms: now,
             updated_ms: now,
+            last_artifact_ms: None,
             input: "test input".to_string(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         }
     }
 

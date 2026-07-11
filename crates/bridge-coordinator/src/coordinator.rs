@@ -581,13 +581,11 @@ impl Coordinator {
                 ttft,
                 outcome: &outcome,
             });
-            if let Some(usage) = &last_usage {
-                self.observer.record(&ObsEvent::UsageFinalized {
-                    ctx: &obs_ctx,
-                    usage,
-                    fin: UsageFinalization::TurnFinal,
-                });
-            }
+            self.observer.record(&ObsEvent::UsageFinalized {
+                ctx: &obs_ctx,
+                usage: last_usage.as_ref(),
+                fin: UsageFinalization::TurnFinal,
+            });
             return Err(e.clone());
         }
         let events: Vec<Event> = collected.into_iter().filter_map(Result::ok).collect();
@@ -632,13 +630,11 @@ impl Coordinator {
             ttft,
             outcome: &outcome,
         });
-        if let Some(usage) = &last_usage {
-            self.observer.record(&ObsEvent::UsageFinalized {
-                ctx: &obs_ctx,
-                usage,
-                fin: UsageFinalization::TurnFinal,
-            });
-        }
+        self.observer.record(&ObsEvent::UsageFinalized {
+            ctx: &obs_ctx,
+            usage: last_usage.as_ref(),
+            fin: UsageFinalization::TurnFinal,
+        });
 
         Ok(TurnOutput {
             text: out_text,
@@ -679,12 +675,14 @@ impl Coordinator {
             error: None,
             created_ms: now,
             updated_ms: now,
+            last_artifact_ms: None,
             input: input.clone(),
             workflow_spec_json,
             resume_attempts: 0,
             session_cwd: session_cwd.as_ref().map(|c| c.as_str().to_string()),
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         };
         self.task_store.create(&rec).await?;
 
@@ -708,6 +706,7 @@ impl Coordinator {
             HashMap::new(),
             WorkflowRunContext {
                 session_cwd,
+                task_id: Some(task.clone()),
                 make_rich_sink: None,
                 observer: self.observer.clone(),
                 ..WorkflowRunContext::default()
@@ -921,13 +920,11 @@ impl Drop for TurnFinishGuard {
             outcome: &TurnOutcome::Canceled,
         });
         let usage = self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(u) = usage {
-            observer.record(&ObsEvent::UsageFinalized {
-                ctx: &ctx,
-                usage: &u,
-                fin: UsageFinalization::TurnFinal,
-            });
-        }
+        observer.record(&ObsEvent::UsageFinalized {
+            ctx: &ctx,
+            usage: usage.as_ref(),
+            fin: UsageFinalization::TurnFinal,
+        });
         tokio::spawn(async move {
             sm.finish_turn(&ctx.session_id, generation, &op).await;
         });
@@ -951,7 +948,8 @@ mod tests {
         AgentBackend, BackendStream, Lease, Resolved, TurnContext, TurnOutcome, Update,
     };
     use bridge_core::task_store::{
-        MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinished, TurnLogUsage,
+        MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinalized,
+        TurnLogFinished, TurnUsageFinalization,
     };
     use bridge_workflow::graph::WorkflowNode;
     use std::sync::Mutex as StdMutex;
@@ -1343,12 +1341,14 @@ mod tests {
             error: None,
             created_ms: 10,
             updated_ms: 10,
+            last_artifact_ms: None,
             input: "input".into(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         }
     }
 
@@ -1818,6 +1818,7 @@ mod tests {
             },
             UsageFinalized {
                 ctx: TurnContext,
+                has_usage: bool,
             },
         }
 
@@ -1837,9 +1838,10 @@ mod tests {
                             outcome: (*outcome).clone(),
                         })
                     }
-                    ObsEvent::UsageFinalized { ctx, .. } => {
+                    ObsEvent::UsageFinalized { ctx, usage, .. } => {
                         g.push(RecordedObsEvent::UsageFinalized {
                             ctx: (*ctx).clone(),
+                            has_usage: usage.is_some(),
                         })
                     }
                     _ => {}
@@ -1998,10 +2000,12 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let usages: Vec<TurnContext> = events
+            let usages: Vec<(TurnContext, bool)> = events
                 .iter()
                 .filter_map(|event| match event {
-                    RecordedObsEvent::UsageFinalized { ctx, .. } => Some(ctx.clone()),
+                    RecordedObsEvent::UsageFinalized { ctx, has_usage } => {
+                        Some((ctx.clone(), *has_usage))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -2009,7 +2013,8 @@ mod tests {
             assert_eq!(finishes.len(), 1);
             assert_eq!(usages.len(), 1);
             assert_eq!(starts[0].turn_id, finishes[0].0.turn_id);
-            assert_eq!(starts[0].turn_id, usages[0].turn_id);
+            assert_eq!(starts[0].turn_id, usages[0].0.turn_id);
+            assert!(usages[0].1);
             let start_idx = events
                 .iter()
                 .position(|e| matches!(e, RecordedObsEvent::Start(_)))
@@ -2190,7 +2195,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn collect_turn_dropped_emit_canceled_without_usage_finalized() {
+        async fn turn_finish_drop_guard_without_usage_emits_explicit_no_usage() {
             let observer = Arc::new(RecordingObserver::default());
             let backend = Arc::new(FakeBackend::new(Some(Arc::new(tokio::sync::Notify::new()))));
             let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry { backend });
@@ -2272,10 +2277,12 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let usages: Vec<TurnContext> = events
+            let usages: Vec<(TurnContext, bool)> = events
                 .iter()
                 .filter_map(|event| match event {
-                    RecordedObsEvent::UsageFinalized { ctx, .. } => Some(ctx.clone()),
+                    RecordedObsEvent::UsageFinalized { ctx, has_usage } => {
+                        Some((ctx.clone(), *has_usage))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -2284,7 +2291,9 @@ mod tests {
             assert_eq!(finishes.len(), 1);
             assert_eq!(starts[0].turn_id, finishes[0].0.turn_id);
             assert_eq!(finishes[0].1, TurnOutcome::Canceled);
-            assert_eq!(usages.len(), 0);
+            assert_eq!(usages.len(), 1);
+            assert_eq!(starts[0].turn_id, usages[0].0.turn_id);
+            assert!(!usages[0].1);
             let start_idx = events
                 .iter()
                 .position(|e| matches!(e, RecordedObsEvent::Start(_)))
@@ -2456,12 +2465,14 @@ mod tests {
                 error: None,
                 created_ms: 1,
                 updated_ms: 1,
+                last_artifact_ms: None,
                 input: String::new(),
                 workflow_spec_json: None, // unresumable: no snapshot to reconstruct the graph
                 resume_attempts: 0,
                 session_cwd: None,
                 batch_id: None,
                 item_id: None,
+                artifacts_purged_at: None,
             })
             .await
             .unwrap();
@@ -2536,7 +2547,7 @@ mod tests {
         turn: &str,
         task: &str,
         completed_ms: i64,
-    ) -> (TurnContext, TurnLogFinished, TurnLogUsage) {
+    ) -> (TurnContext, TurnLogFinished, TurnLogFinalized) {
         let ctx = TurnContext {
             turn_id: bridge_core::ids::TurnId::parse(turn).unwrap(),
             session_id: ContextId::parse("ctx-dto").unwrap(),
@@ -2559,9 +2570,9 @@ mod tests {
             ttft: None,
             outcome: TurnOutcome::Success,
         };
-        let usage = TurnLogUsage {
+        let usage = TurnLogFinalized {
             ctx: ctx.clone(),
-            usage: UsageSnapshot {
+            finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                 used: Some(999),
                 size: Some(1000),
                 cost: Some(UsageCost {
@@ -2577,7 +2588,7 @@ mod tests {
                     cached_write_tokens: None,
                 }),
                 at_ms: completed_ms,
-            },
+            }),
         };
         (ctx, finished, usage)
     }
@@ -2599,7 +2610,11 @@ mod tests {
                 .upsert_turn_finished(&finished)
                 .await
                 .unwrap();
-            fixture.task_store.update_turn_usage(&usage).await.unwrap();
+            fixture
+                .task_store
+                .finalize_turn_usage(&usage)
+                .await
+                .unwrap();
         }
 
         let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
@@ -2639,10 +2654,17 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage)
+            .await
+            .unwrap();
 
         let (_ctx, finished, mut usage2) = dto_turn_ctx("turn-eur", id.as_str(), 20);
-        usage2.usage.cost = Some(UsageCost {
+        let TurnUsageFinalization::Usage(snapshot) = &mut usage2.finalization else {
+            unreachable!("dto helper always creates usage finalization")
+        };
+        snapshot.cost = Some(UsageCost {
             amount: 0.25,
             currency: "EUR".into(),
         });
@@ -2651,7 +2673,11 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage2).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage2)
+            .await
+            .unwrap();
 
         let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
 
@@ -2681,7 +2707,11 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage)
+            .await
+            .unwrap();
 
         let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
 
@@ -2713,7 +2743,11 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage)
+            .await
+            .unwrap();
 
         let dto = coordinator.status(None, Some(id)).await.unwrap();
 
@@ -2748,7 +2782,11 @@ mod tests {
                 .upsert_turn_finished(&finished)
                 .await
                 .unwrap();
-            fixture.task_store.update_turn_usage(&usage).await.unwrap();
+            fixture
+                .task_store
+                .finalize_turn_usage(&usage)
+                .await
+                .unwrap();
         }
 
         let dto = coordinator.status(None, Some(id)).await.unwrap();
