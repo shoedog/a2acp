@@ -92,6 +92,7 @@ volumes = ["/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/
 [[agents]]
 id  = "codex"
 cmd = "codex-acp"
+pre_authenticated = true
 [agents.sandbox]
 image   = "a2a-agent-reader:latest"
 mount   = "/Users/wesleyjinks/code"
@@ -128,6 +129,7 @@ volumes = ["a2a-kiro-data:/root/.local/share"]
 id     = "impl"
 kind   = "container_rw"
 cmd    = "codex-acp"
+pre_authenticated = true
 effort = "high"
 args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
 [agents.sandbox]

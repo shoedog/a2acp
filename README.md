@@ -191,12 +191,13 @@ allowed_cmds = ["kiro-cli", "codex-acp"]   # optional; defaults to the union of 
 id   = "kiro"
 cmd  = "kiro-cli"
 args = ["acp"]
-# name / model / model_provider / effort / mode / cwd / auth_method — all optional, see below
+# name / model / model_provider / effort / mode / cwd / auth_method / pre_authenticated — optional
 
 [[agents]]
 id   = "codex"
 cmd  = "codex-acp"
 args = []
+pre_authenticated = true # reuse the existing `codex login`; do not launch browser auth
 
 [server]
 addr = "127.0.0.1:8080"
@@ -217,6 +218,7 @@ addr = "127.0.0.1:8080"
 | `mode` | no | Mode id for `session/set_mode` (hard error if the agent rejects it) |
 | `cwd` | no | Working directory for `session/new`; relative values join onto the bridge's `current_dir()` |
 | `auth_method` | no | Auth method id for `authenticate` (defaults to ChatGPT-style auth when advertised, else the first advertised method) |
+| `pre_authenticated` | no | Skip `authenticate` because credentials are already ambient (for example, `codex login` or a mounted `auth.json`); cannot be combined with `auth_method` |
 | `description`, `tags`, `version` | no | Seamed for future per-entry Agent Cards |
 
 Model/effort resolution details, the effort-level-per-model table, and the `kind="api"` fields

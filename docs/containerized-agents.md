@@ -51,6 +51,10 @@ mount breaks refresh):
   chmod -R u+rw ~/.config/a2a-creds
   ```
 
+The shipped container configs pair these mounted files with `pre_authenticated = true`. That setting is
+required for browserless ChatGPT-auth containers: it reuses the mounted login instead of invoking
+codex-acp's advertised browser-login action. Do not also set `auth_method` on the same agent.
+
 > **Token rotation (re-sync before each session).** OAuth/SSO tokens **rotate on refresh** (the refresh
 > token is single-use), so a copy goes **stale** when you use the agent *on the host* — the host rotates
 > the lineage and the copy's refresh token dies, surfacing as `session/prompt failed: transport error`.

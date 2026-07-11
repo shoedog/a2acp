@@ -122,6 +122,7 @@ mod tests {
                     sandbox: None,
                     watchdog: None,
                     auth_method: None,
+                    pre_authenticated: false,
                     name: None,
                     description: None,
                     tags: vec![],

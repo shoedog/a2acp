@@ -36,6 +36,7 @@ pub fn single_agent_registry(id: &str, backend: Arc<dyn AgentBackend>) -> Arc<dy
         sandbox: None,
         watchdog: None,
         auth_method: None,
+        pre_authenticated: false,
         name: Some(id.to_owned()),
         description: None,
         tags: vec![],

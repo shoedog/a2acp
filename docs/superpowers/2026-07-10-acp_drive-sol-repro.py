@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Drive codex-acp (in the a2a-toolchain container) through a minimal ACP session and
-capture stdout (JSON-RPC) + stderr (where a sol crash surfaces). Usage: acp_drive.py <model>"""
+"""Drive codex-acp in a2a-toolchain through a minimal ACP session.
+
+Usage: acp_drive-sol-repro.py <launch-model>
+Optional environment: SWITCH_MODEL, SWITCH_EFFORT, WITH_MCP, AUTHENTICATE.
+AUTHENTICATE is intentionally opt-in because mounted credentials are already authenticated.
+"""
 import subprocess, json, sys, threading, time
 
 model = sys.argv[1] if len(sys.argv) > 1 else "gpt-5.6-sol"
@@ -51,9 +55,10 @@ try:
     send({"jsonrpc":"2.0","id":1,"method":"initialize",
           "params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":False,"writeTextFile":False},"terminal":False}}})
     read_until(lambda m: m.get("id")==1)
-    send({"jsonrpc":"2.0","id":2,"method":"authenticate","params":{"methodId":"chatgpt"}})
-    read_until(lambda m: m.get("id")==2)
     import os
+    if os.environ.get("AUTHENTICATE"):
+        send({"jsonrpc":"2.0","id":2,"method":"authenticate","params":{"methodId":"chat-gpt"}})
+        read_until(lambda m: m.get("id")==2)
     mcp = []
     if os.environ.get("WITH_MCP"):
         mcp = [{"name":"lsp","command":"/usr/local/bin/lsp-mcp",
@@ -68,8 +73,14 @@ try:
         if switch:
             # reproduce the BRIDGE's in-session model switch (acp_backend.rs:618)
             send({"jsonrpc":"2.0","id":"sw","method":"session/set_config_option",
-                  "params":{"sessionId":sid,"configOptionId":"model","valueId":switch}})
+                  "params":{"sessionId":sid,"configId":"model","value":switch}})
             print("SWITCH RESULT:", json.dumps(read_until(lambda m: m.get("id")=="sw", timeout=60) or {"NO_RESPONSE":True}), flush=True)
+        effort = os.environ.get("SWITCH_EFFORT")
+        if effort:
+            # reproduce the bridge's effort reconciliation after model selection
+            send({"jsonrpc":"2.0","id":"se","method":"session/set_config_option",
+                  "params":{"sessionId":sid,"configId":"reasoning_effort","value":effort}})
+            print("EFFORT RESULT:", json.dumps(read_until(lambda m: m.get("id")=="se", timeout=60) or {"NO_RESPONSE":True}), flush=True)
         send({"jsonrpc":"2.0","id":"m","method":"session/set_mode","params":{"sessionId":sid,"modeId":"agent-full-access"}})
         read_until(lambda m: m.get("id")=="m", timeout=15)
         send({"jsonrpc":"2.0","id":4,"method":"session/prompt",

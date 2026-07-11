@@ -550,6 +550,10 @@ pub struct AgentEntryToml {
     pub watchdog: Option<WatchdogToml>,
     #[serde(default)]
     pub auth_method: Option<String>,
+    /// Credentials are supplied out of band (for example by a mounted auth file),
+    /// so the bridge must not invoke an interactive ACP auth method.
+    #[serde(default)]
+    pub pre_authenticated: bool,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -1386,11 +1390,23 @@ impl RegistryConfig {
         let mut entries = Vec::with_capacity(self.agents.len());
         for a in self.agents {
             let id = AgentId::parse(a.id).map_err(|e| ConfigError::Registry(e.to_string()))?;
+            if a.pre_authenticated && a.auth_method.is_some() {
+                return Err(ConfigError::Registry(format!(
+                    "agent {:?}: pre_authenticated=true cannot be combined with auth_method",
+                    id.as_str()
+                )));
+            }
             let effort = a.effort.as_deref().map(parse_effort).transpose()?;
             let kind = match a.kind.as_deref() {
                 Some(s) => parse_kind(s)?,
                 None => AgentKind::default(),
             };
+            if matches!(kind, AgentKind::Api) && a.pre_authenticated {
+                return Err(ConfigError::Registry(format!(
+                    "api agent {:?}: pre_authenticated is only valid for ACP process agents",
+                    id.as_str()
+                )));
+            }
             // Parse-shape guard: per-kind cmd/base_url requirements. Placed before
             // `a.cmd`/`a.id` are moved into the constructed entry below.
             match kind {
@@ -1522,6 +1538,7 @@ impl RegistryConfig {
                 mcp,
                 mcp_delivery,
                 auth_method: a.auth_method,
+                pre_authenticated: a.pre_authenticated,
                 name: a.name,
                 description: a.description,
                 tags: a.tags,
@@ -2030,6 +2047,75 @@ cmd = "beta-cli"
         assert!(
             matches!(err, ConfigError::Registry(_)),
             "expected Registry variant, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pre_authenticated_rejects_explicit_auth_method() {
+        let toml = r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+auth_method = "chat-gpt"
+pre_authenticated = true
+
+[server]
+"#;
+
+        let parsed = RegistryConfig::parse(toml).expect("pre_authenticated is valid syntax");
+        let err = parsed.into_snapshot().unwrap_err();
+        assert!(
+            err.to_string().contains("pre_authenticated")
+                && err.to_string().contains("auth_method"),
+            "contradictory auth policy should name both settings: {err}"
+        );
+    }
+
+    #[test]
+    fn pre_authenticated_flows_into_agent_entry() {
+        let toml = r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+pre_authenticated = true
+
+[server]
+"#;
+
+        let snapshot = RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+        assert!(snapshot.entries[0].pre_authenticated);
+        assert!(snapshot.entries[0].auth_method.is_none());
+    }
+
+    #[test]
+    fn pre_authenticated_rejects_api_agent() {
+        let toml = r#"
+default = "api"
+
+[[agents]]
+id = "api"
+kind = "api"
+base_url = "http://localhost:11434/v1"
+pre_authenticated = true
+
+[server]
+"#;
+
+        let err = RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("pre_authenticated")
+                && err.to_string().contains("ACP process agents"),
+            "invalid API auth policy should be explicit: {err}"
         );
     }
 

@@ -208,6 +208,7 @@ fn agent_entry() -> AgentEntry {
         mcp: Vec::new(),
         mcp_delivery: Default::default(),
         auth_method: None,
+        pre_authenticated: false,
         name: None,
         description: None,
         tags: Vec::new(),
