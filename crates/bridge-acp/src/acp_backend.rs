@@ -1224,6 +1224,17 @@ impl AcpBackend {
         advertised: &[AuthMethod],
     ) -> Option<AuthMethodId> {
         if let Some(method) = configured {
+            // `auth_method = "none"`: operator opt-out — skip client-driven
+            // `authenticate` entirely. For an agent that is ALREADY authenticated
+            // out-of-band (codex with a valid ~/.codex/auth.json), codex-acp's
+            // `chat-gpt` authenticate is redundant-but-not-idempotent: when its
+            // accountRead/refresh doesn't confirm the login it falls into an
+            // INTERACTIVE browser OAuth flow and hangs headless runs until the
+            // handshake timeout ("initialize handshake timed out"). This is the
+            // softer policy the note below anticipated.
+            if method == "none" {
+                return None;
+            }
             return Some(AuthMethodId::new(method));
         }
         if advertised.is_empty() {
@@ -5829,6 +5840,17 @@ mod tests {
             .expect("auth method selected");
 
         assert_eq!(chosen.0.as_ref(), "custom");
+    }
+
+    #[test]
+    fn choose_auth_method_none_skips_even_when_advertised() {
+        // `auth_method = "none"` is the operator opt-out for agents that are
+        // already authenticated out-of-band (e.g. codex with a valid
+        // ~/.codex/auth.json): skip client-driven `authenticate` even though the
+        // agent advertises methods — codex-acp's `chat-gpt` flow otherwise falls
+        // into an interactive browser OAuth and hangs headless runs.
+        let advertised = vec![auth_method("api-key"), auth_method("chat-gpt")];
+        assert!(AcpBackend::choose_auth_method(Some("none"), &advertised).is_none());
     }
 
     #[tokio::test]

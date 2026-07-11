@@ -216,7 +216,7 @@ addr = "127.0.0.1:8080"
 | `effort` | no | Effort tier (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`); falls back to the highest supported level ≤ requested |
 | `mode` | no | Mode id for `session/set_mode` (hard error if the agent rejects it) |
 | `cwd` | no | Working directory for `session/new`; relative values join onto the bridge's `current_dir()` |
-| `auth_method` | no | Auth method id for `authenticate` (defaults to ChatGPT-style auth when advertised, else the first advertised method) |
+| `auth_method` | no | Auth method id for `authenticate` (defaults to ChatGPT-style auth when advertised, else the first advertised method); `"none"` skips client-driven `authenticate` entirely for agents already authenticated out-of-band |
 | `description`, `tags`, `version` | no | Seamed for future per-entry Agent Cards |
 
 Model/effort resolution details, the effort-level-per-model table, and the `kind="api"` fields
