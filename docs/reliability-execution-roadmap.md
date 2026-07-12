@@ -1,9 +1,9 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **R2a implementation baseline:** `main` at `24aff09c` on 2026-07-11
-- **Completed through:** R2a provenance diagnostics
-- **Next action:** merge the approved R2b0 contract, then advance the cursor to R2b1
+- **R2b0 contract baseline:** `main` at `11ebc402` on 2026-07-11
+- **Completed through:** R2b0 structured-diagnostics contract
+- **Next action:** start R2b1 diagnostic foundation and rollback-safe persistence surface
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -18,7 +18,7 @@ and completion evidence.
 
 ```text
 R2a provenance (MERGED)
-  -> R2b0 contract clarifications
+  -> R2b0 contract clarifications (MERGED)
   -> R2b1 diagnostic types + rollback-safe persistence surface
   -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety
   -> R2b3 API/provider mapping + remaining container/dispatch observation
@@ -41,8 +41,9 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R0 — front door/baseline | **MERGED** | [`bridge-reliability.md`](bridge-reliability.md) | Docs index, compatibility matrix, priority reset. |
 | R1 — Fable isolation | **MERGED** | [R1 disposition](superpowers/2026-07-11-fable-r1-disposition.md) | Host and reader controls dispositioned. |
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
-| R2b0 — contract clarifications | **IN REVIEW** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED, merge pending. |
-| R2b1–R2b3 — structured diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Three reviewed, independently mergeable implementation PRs after R2b0. |
+| R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
+| R2b1 — diagnostic foundation | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | **Next:** types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
+| R2b2–R2b3 — lifecycle and API diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Two independently reviewed implementation PRs after R2b1. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
@@ -171,13 +172,13 @@ Next action:
 
 ## Current handoff
 
-- `origin/main` contains R2a at `24aff09c` and the durable reliability plans at `144b900d`.
-- R2a's last full suite was 1,607 passed / 0 failed / 12 ignored live-agent tests.
+- `origin/main` contains the approved R2b0 contract at `11ebc402`; R2b1 is the next implementation slice.
+- R2b0's full local suite was 1,607 passed / 0 failed / 12 ignored live-agent tests.
 - A fresh bridge-mediated Fable/xhigh review returned `R2A: READY`, `V6 DESIGN: READY`, `MERGE`.
 - The Podman bare image-id normalization and non-vacuous descendant survivor-marker regression were
   folded after that review and revalidated by the full local gate set.
 - No R2b production code exists yet.
-- R2b0 design v13 is on `agent/reliability-r2b0-contract`. The first Sol/max review returned `REVISE`:
+- R2b0 design v13 landed from `agent/reliability-r2b0-contract`. The first Sol/max review returned `REVISE`:
   cold resolution preceded the named owners, direct correlation ids lacked durable task rows, diagnostic
   observation collided with the existing rich-event method, two warm-reconcile debug sinks were omitted,
   and the plan named one nonexistent helper. V8 folded those findings. Its re-review closed five, left
@@ -195,5 +196,6 @@ Next action:
   and returned `APPROVE`.
 - R2b0 local gates passed: Markdown links, `git diff --check`, fmt, workspace check, clippy with warnings
   denied, **1,607 passed / 0 failed / 12 ignored**, release binary build, and repository hygiene (37
-  tracked artifacts / 7 example configs). Commit, fast-forward merge, push, and verify the approved
-  contract before adding diagnostic types.
+  tracked artifacts / 7 example configs). The approved contract was fast-forwarded to `origin/main` at
+  `11ebc402`. Create `agent/reliability-r2b1-diagnostic-foundation` from current `origin/main`; do not
+  combine R2b1 with production error-site migration.
