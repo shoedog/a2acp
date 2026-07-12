@@ -34,7 +34,10 @@ Use the content and action class, not container availability, to choose the tier
 Never silently downgrade. A generic `AgentCrashed`, model rejection, auth failure, or prompt failure is
 not evidence that the container is degraded. Do not replay on the host after a prompt may have been
 accepted; surface the first attempt's phase and terminal state and require an operator retry decision.
-The current bridge has explicit host/container entries but no automatic fallback policy.
+The current bridge has explicit host/container entries but no automatic fallback policy. Treat only a
+local operator invocation as a trust assertion; never accept `content_trust` or equivalent caller A2A
+metadata as authority to downgrade. In-process fallback requires a policy-issued attestation bound to an
+authenticated caller and is not part of the initial R2 path.
 
 ## Run a normal workflow
 
@@ -73,7 +76,36 @@ credential-only isolation may omit Fable from `session/new`. Use
 [`../../deploy/containers/claude-fable-settings.json`](../../deploy/containers/claude-fable-settings.json)
 at `/root/.claude/settings.json:ro`; never mount the full host Claude settings or state directory.
 
+### Provider capacity and full-review fallback
+
+Provider capacity is not container health. Before a long full-branch review, check any operator-visible
+usage window as well as bridge preflight. For trusted own-repo reviews:
+
+- Use Fable at `xhigh` only when its usage window has headroom.
+- When Claude is known to be near its usage limit, select the separately configured raw
+  `gpt-5.6-sol` model at `max` before starting. Confirm both the raw id and `max` in `models`; do not
+  reconstruct an effort-suffixed id by hand.
+- If Fable already reached prompt start and then fails, do not automatically resume, retry, or fall
+  through. Preserve it as possibly accepted. A Sol review is a new, explicit operator-selected attempt
+  with a new task/attempt id and separately recorded provenance/cost.
+- Treat a provider limit as confirmed only when the adapter/provider exposes structured evidence. With
+  generic `AgentCrashed`, record the operator-visible usage state as context but keep the bridge diagnosis
+  `unknown` until the underlying cause is retained.
+
+This cross-provider choice never relaxes the execution tier: untrusted reads still require Tier 2 and
+write-capable work still requires Tier 3.
+
 ## Capture provenance before diagnosing
+
+Run `doctor --json` first and retain its `provenance:<agent>:*` rows. R2a reports canonical host
+executables, exact installed adapter and nested agent CLI/SDK packages, auth/configured model evidence,
+and immutable local image ids when bounded inspect succeeds. A container package warning is honest: the
+bridge does not infer in-image packages from the host. Missing optional provenance is a warning; the
+existing command/runtime row remains the hard prerequisite failure.
+
+Treat adapter provenance as exact only when the resolved executable is owned by a recognized package's
+bounded `bin` mapping. An unrelated manifest, unresolved runtime, or incomplete Claude bundled-version
+field is intentionally `warn` even when other provenance fields are known.
 
 Record all of the following in the hypothesis/probe/result log:
 

@@ -45,7 +45,17 @@ Container health and content trust are separate decisions. Follow ADR-0032:
 Fallback must be based on a classified container-infrastructure failure, not generic `AgentCrashed`,
 model rejection, authentication failure, or prompt failure. Never automatically replay a prompt that
 may have been accepted; the retry could duplicate cost or side effects. The current bridge has explicit
-host and container entries but no automatic fallback policy.
+host and container entries but no automatic fallback policy. R2's first fallback surface is a local,
+non-billable operator plan/recommendation only; caller-supplied A2A metadata cannot assert trust or start
+a host attempt. In-process fallback is deferred until policy can bind a non-forgeable trust attestation
+to authenticated caller context.
+
+Provider capacity is a separate axis. For trusted own-repo full-branch reviews, use Fable xhigh only when
+its usage window has headroom; when Claude is known to be near its usage limit, select the explicit
+`gpt-5.6-sol` reviewer at `max` before starting. If a Fable turn already reached prompt start, a Sol review
+is a new operator-selected attempt, not an automatic retry: preserve the first attempt as possibly
+accepted and record both costs/provenance. A structured provider-limit/reset signal may recommend that
+choice but never executes it. Tier 2/3 rules still apply independently.
 
 ## Work slices
 
@@ -78,17 +88,21 @@ missing Fable opt-in and missing reader settings prerequisite before a paid turn
 
 ### R2 — provenance and phase-specific diagnostics
 
-- Extend read-only `doctor --json` with resolved executable/package/CLI/image provenance. Keep it
-  non-billable and do not turn it into a hidden live prompt.
+- **R2a complete 2026-07-11:** read-only `doctor --json` now reports resolved
+  executable/package/CLI/image/auth/model provenance as additive four-key rows. It remains non-billable
+  and does not start an agent or container.
 - Add an explicit, billable `smoke` path for one agent/model/effort with a bounded minimal prompt.
 - Emit structured phase transitions for spawn, initialize, auth, session creation, config application,
   prompt start, stream, and finish.
 - Preserve adapter stderr/error sources through the bridge error mapping and task journal.
+- Distinguish structured provider usage-window/rate-limit failures from overload and unknown transport
+  loss; preserve a structured reset/retry hint without automatically sleeping, replaying, or rerouting.
 - Include whether authentication was skipped through `pre_authenticated` or applied through an
   advertised method.
 - Classify container infrastructure failures separately from agent/model/prompt failures.
 - Design an explicit, default-off trusted-host fallback policy with a named host target, audit event,
-  and no replay after prompt acceptance. Do not weaken Tier 2/3 fail-closed behavior.
+  and no replay after prompt acceptance. R2d emits only a local operator plan; authenticated in-process
+  execution/auditing is a separately gated R2e. Do not weaken Tier 2/3 fail-closed behavior.
 
 Exit: an operator can tell which boundary failed from one bounded run and its JSON artifact.
 
@@ -126,13 +140,15 @@ Exit: a release cannot claim an agent path that was not tested from its distribu
 
 ## Immediate queue
 
-1. Design the R2 phase vocabulary and container-degradation classification before adding fallback logic.
-2. Specify the explicit trusted-host fallback contract; keep automatic fallback disabled until reviewed.
-3. Add resolved executable/package/image provenance to `doctor --json` and a separate bounded live-smoke
-   command.
+1. Implement the reviewed R2b phase/diagnostic contract, including total detached projection and
+   post-acceptance no-replay mappings.
+2. Add the separate explicitly billable R2c live-smoke command.
+3. Implement R2d's local non-billable fallback-plan only; keep authenticated in-process R2e disabled.
 4. Preserve adapter stderr and the deepest prompt error in the task journal.
-5. Make the reader image reproducible, then establish pinned and floating host/container lanes.
-6. Make the compatibility matrix a release checklist gate.
+5. Make provider-limit failures explicit and keep the Fable-xhigh → Sol-max full-review fallback an
+   operator-selected, separately recorded attempt.
+6. Make the reader image reproducible, then establish pinned and floating host/container lanes.
+7. Make the compatibility matrix a release checklist gate.
 
 ## Guardrails
 

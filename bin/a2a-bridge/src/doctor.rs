@@ -106,6 +106,36 @@ impl PathStat {
     };
 }
 
+const MAX_PROVENANCE_METADATA_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPackage {
+    pub name: String,
+    pub version: String,
+    pub manifest_path: PathBuf,
+    package_root: PathBuf,
+    bundled_cli_version: Option<String>,
+    bin_targets: Vec<PathBuf>,
+    bin_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledAgentCli {
+    pub name: String,
+    pub version: String,
+    pub manifest_path: PathBuf,
+    pub bundled_cli_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProcessProvenance {
+    pub resolved_executable: Option<PathBuf>,
+    pub adapter: Option<InstalledPackage>,
+    pub adapter_warning: Option<String>,
+    pub agent_cli: Option<InstalledAgentCli>,
+    pub agent_cli_warning: Option<String>,
+}
+
 /// Every external probe `run_checks` needs, injectable so unit tests never touch the real system.
 /// Implementations MUST be bounded — a hung/wedged external process must resolve to `false` within a
 /// hard timeout, never block indefinitely (see `RealProbes`'s `bounded_probe_ok`).
@@ -113,6 +143,19 @@ pub trait RuntimeProbes {
     /// `cmd` resolves to an executable file — either as a literal path (absolute or containing `/`) or
     /// by searching `$PATH` for a bare name.
     fn which_on_path(&self, cmd: &str) -> bool;
+    /// Canonical executable selected by the same literal-path/PATH rules as `which_on_path`.
+    fn resolved_executable(&self, cmd: &str) -> Option<PathBuf> {
+        self.which_on_path(cmd).then(|| PathBuf::from(cmd))
+    }
+    /// Exact installed adapter/agent package metadata behind a host executable. Never invokes the
+    /// executable and never guesses from dependency ranges.
+    fn process_provenance(&self, cmd: &str) -> ProcessProvenance {
+        ProcessProvenance {
+            resolved_executable: self.resolved_executable(cmd),
+            adapter_warning: Some("installed package metadata unavailable".into()),
+            ..ProcessProvenance::default()
+        }
+    }
     /// `<runtime> info` (or equivalent) exits 0 within a bound. Callers MUST gate on `runtime_is_allowed`
     /// first — never on a config-named binary the allowlist would reject (defense-in-depth parity with
     /// main.rs's `preflight_runtimes`).
@@ -124,6 +167,10 @@ pub trait RuntimeProbes {
     /// means the runtime will pull it on first use (or fail offline), never a hard requirement. Same
     /// allowlist-gate requirement as `runtime_responds`.
     fn image_exists(&self, runtime: &str, image: &str) -> bool;
+    /// Immutable local image id from a bounded read-only inspect. Callers MUST allowlist-gate runtime.
+    fn image_id(&self, _runtime: &str, _image: &str) -> Result<String, String> {
+        Err("immutable local image id unavailable".into())
+    }
     /// Stat a host path. Never creates, never follows into a write probe (TOCTOU/mutating — cut per
     /// the spec's adversarial review).
     fn path_stat(&self, path: &Path) -> PathStat;
@@ -183,17 +230,24 @@ fn is_executable_file(p: &Path) -> bool {
     p.is_file()
 }
 
-fn which_on_path_impl(cmd: &str) -> bool {
+fn resolved_executable_impl(cmd: &str) -> Option<PathBuf> {
     if cmd.is_empty() {
-        return false;
+        return None;
     }
-    if cmd.contains('/') {
-        return is_executable_file(Path::new(cmd));
-    }
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
+    let selected = if cmd.contains('/') {
+        let path = PathBuf::from(cmd);
+        is_executable_file(&path).then_some(path)
+    } else {
+        let path_var = std::env::var_os("PATH")?;
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(cmd))
+            .find(|candidate| is_executable_file(candidate))
     };
-    std::env::split_paths(&path_var).any(|dir| is_executable_file(&dir.join(cmd)))
+    selected.map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+fn which_on_path_impl(cmd: &str) -> bool {
+    resolved_executable_impl(cmd).is_some()
 }
 
 fn path_stat_impl(path: &Path) -> PathStat {
@@ -207,12 +261,542 @@ fn path_stat_impl(path: &Path) -> PathStat {
     }
 }
 
+fn bounded_regular_file_with_open(
+    path: &Path,
+    open: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
+) -> Result<Vec<u8>, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("metadata unavailable: {e}"))?;
+    if !metadata.is_file() {
+        return Err("metadata path is not a regular file".into());
+    }
+    if metadata.len() > MAX_PROVENANCE_METADATA_BYTES as u64 {
+        return Err(format!(
+            "metadata exceeds {} byte limit",
+            MAX_PROVENANCE_METADATA_BYTES
+        ));
+    }
+    let file = open(path).map_err(|e| format!("metadata unreadable: {e}"))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    use std::io::Read as _;
+    file.take((MAX_PROVENANCE_METADATA_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("metadata unreadable: {e}"))?;
+    if bytes.len() > MAX_PROVENANCE_METADATA_BYTES {
+        return Err(format!(
+            "metadata exceeds {} byte limit",
+            MAX_PROVENANCE_METADATA_BYTES
+        ));
+    }
+    Ok(bytes)
+}
+
+fn bounded_regular_file(path: &Path) -> Result<Vec<u8>, String> {
+    bounded_regular_file_with_open(path, |path| std::fs::File::open(path))
+}
+
+fn bounded_package_field(value: &serde_json::Value, key: &str) -> Result<String, String> {
+    let value = value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("package.json missing string {key:?}"))?;
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(format!("package.json field {key:?} is invalid"));
+    }
+    Ok(value.to_string())
+}
+
+fn optional_bounded_package_field(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("package.json field {key:?} is not a string"))?;
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(format!("package.json field {key:?} is invalid"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn package_bin_targets(value: &serde_json::Value) -> (Vec<PathBuf>, Option<String>) {
+    let Some(bin) = value.get("bin") else {
+        return (Vec::new(), None);
+    };
+    let values: Vec<&str> = match bin {
+        serde_json::Value::String(value) => vec![value],
+        serde_json::Value::Object(entries) if entries.len() <= 64 => {
+            let mut values = Vec::with_capacity(entries.len());
+            for value in entries.values() {
+                let Some(value) = value.as_str() else {
+                    return (
+                        Vec::new(),
+                        Some("package.json bin mapping contains a non-string target".into()),
+                    );
+                };
+                values.push(value);
+            }
+            values
+        }
+        serde_json::Value::Object(_) => {
+            return (
+                Vec::new(),
+                Some("package.json bin mapping exceeds 64-entry limit".into()),
+            );
+        }
+        _ => {
+            return (
+                Vec::new(),
+                Some("package.json bin field is neither a string nor an object".into()),
+            );
+        }
+    };
+
+    let mut targets = Vec::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+            return (
+                Vec::new(),
+                Some(
+                    "package.json bin target is empty, oversized, or contains control bytes".into(),
+                ),
+            );
+        }
+        let target = PathBuf::from(value);
+        if target.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return (
+                Vec::new(),
+                Some("package.json bin target escapes the package root".into()),
+            );
+        }
+        targets.push(target);
+    }
+    (targets, None)
+}
+
+fn read_installed_package(manifest_path: &Path) -> Result<InstalledPackage, String> {
+    let bytes = bounded_regular_file(manifest_path)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("malformed package.json: {e}"))?;
+    let name = bounded_package_field(&value, "name")?;
+    let version = bounded_package_field(&value, "version")?;
+    let bundled_cli_version = optional_bounded_package_field(&value, "claudeCodeVersion")?;
+    let manifest_path =
+        std::fs::canonicalize(manifest_path).unwrap_or_else(|_| manifest_path.to_path_buf());
+    let package_root = manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let (bin_targets, bin_warning) = package_bin_targets(&value);
+    Ok(InstalledPackage {
+        name,
+        version,
+        manifest_path,
+        package_root,
+        bundled_cli_version,
+        bin_targets,
+        bin_warning,
+    })
+}
+
+fn is_known_adapter_package(name: &str) -> bool {
+    matches!(
+        name,
+        "@agentclientprotocol/codex-acp" | "@agentclientprotocol/claude-agent-acp"
+    )
+}
+
+fn package_owns_executable(package: &InstalledPackage, executable: &Path) -> Result<bool, String> {
+    if let Some(warning) = &package.bin_warning {
+        return Err(format!(
+            "adapter executable ownership unavailable: {warning}"
+        ));
+    }
+    for target in &package.bin_targets {
+        let candidate = package.package_root.join(target);
+        match std::fs::canonicalize(&candidate) {
+            Ok(candidate) if candidate == executable => return Ok(true),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "adapter executable ownership unavailable for {candidate:?}: {e}"
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn nearest_installed_package(executable: &Path) -> Result<InstalledPackage, String> {
+    let Some(parent) = executable.parent() else {
+        return Err("resolved executable has no parent directory".into());
+    };
+    for ancestor in parent.ancestors() {
+        let candidate = ancestor.join("package.json");
+        match std::fs::metadata(&candidate) {
+            Ok(_) => {
+                let package = read_installed_package(&candidate)?;
+                if !is_known_adapter_package(&package.name) {
+                    continue;
+                }
+                if package_owns_executable(&package, executable)? {
+                    return Ok(package);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("package metadata unavailable: {e}")),
+        }
+    }
+    Err("no recognized package.json bin mapping proves adapter executable ownership".into())
+}
+
+fn node_package_path(base: &Path, package_name: &str) -> PathBuf {
+    package_name
+        .split('/')
+        .fold(base.join("node_modules"), |path, segment| {
+            path.join(segment)
+        })
+        .join("package.json")
+}
+
+fn resolve_installed_dependency(
+    adapter: &InstalledPackage,
+    expected_name: &str,
+) -> Result<InstalledPackage, String> {
+    for ancestor in adapter.package_root.ancestors() {
+        let candidate = node_package_path(ancestor, expected_name);
+        match std::fs::metadata(&candidate) {
+            Ok(_) => {
+                let package = read_installed_package(&candidate)?;
+                if package.name != expected_name {
+                    return Err(format!(
+                        "installed dependency name mismatch: expected {expected_name:?}, found {:?}",
+                        package.name
+                    ));
+                }
+                return Ok(package);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("installed dependency metadata unavailable: {e}")),
+        }
+    }
+    Err(format!(
+        "installed dependency package {expected_name:?} not found"
+    ))
+}
+
+fn process_provenance_impl(cmd: &str) -> ProcessProvenance {
+    let Some(resolved_executable) = resolved_executable_impl(cmd) else {
+        return ProcessProvenance {
+            adapter_warning: Some("resolved executable unavailable".into()),
+            agent_cli_warning: Some("agent CLI provenance unavailable".into()),
+            ..ProcessProvenance::default()
+        };
+    };
+    let adapter = match nearest_installed_package(&resolved_executable) {
+        Ok(package) => package,
+        Err(warning) => {
+            return ProcessProvenance {
+                resolved_executable: Some(resolved_executable),
+                adapter_warning: Some(warning),
+                agent_cli_warning: Some("agent CLI provenance unavailable".into()),
+                ..ProcessProvenance::default()
+            };
+        }
+    };
+
+    let dependency_name = match adapter.name.as_str() {
+        "@agentclientprotocol/codex-acp" => Some("@openai/codex"),
+        "@agentclientprotocol/claude-agent-acp" => Some("@anthropic-ai/claude-agent-sdk"),
+        _ => None,
+    };
+    let (agent_cli, agent_cli_warning) = match dependency_name {
+        Some(expected_name) => match resolve_installed_dependency(&adapter, expected_name) {
+            Ok(package) => {
+                let warning = (expected_name == "@anthropic-ai/claude-agent-sdk"
+                    && package.bundled_cli_version.is_none())
+                .then(|| {
+                    "installed Claude SDK package.json is missing string \"claudeCodeVersion\""
+                        .to_string()
+                });
+                (
+                    Some(InstalledAgentCli {
+                        name: package.name,
+                        version: package.version,
+                        manifest_path: package.manifest_path,
+                        bundled_cli_version: package.bundled_cli_version,
+                    }),
+                    warning,
+                )
+            }
+            Err(warning) => (None, Some(warning)),
+        },
+        None => (
+            None,
+            Some(format!(
+                "adapter package {:?} has no supported agent CLI provenance rule",
+                adapter.name
+            )),
+        ),
+    };
+
+    ProcessProvenance {
+        resolved_executable: Some(resolved_executable),
+        adapter: Some(adapter),
+        adapter_warning: None,
+        agent_cli,
+        agent_cli_warning,
+    }
+}
+
+fn bounded_probe_stdout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    #[cfg(unix)]
+    {
+        bounded_probe_stdout_unix(program, args, timeout, max_bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        bounded_probe_stdout_portable(program, args, timeout, max_bytes)
+    }
+}
+
+#[cfg(unix)]
+fn terminate_probe_process_group(child: &mut std::process::Child) {
+    if let Ok(process_group) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: the child was spawned into a process group whose id equals its pid. A negative
+        // pid targets that group only; it can never target the doctor's own process group.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn set_nonblocking(stdout: &std::process::ChildStdout) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    let fd = stdout.as_raw_fd();
+    // SAFETY: `fd` is owned by the live ChildStdout. `F_GETFL` and `F_SETFL` do not transfer or close
+    // ownership, and the return values are checked before use.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags == -1 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+            return Err("inspect stdout could not be bounded".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bounded_probe_stdout_unix(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|_| "inspect spawn failed".to_string())?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "inspect stdout unavailable".to_string())?;
+    if let Err(error) = set_nonblocking(&stdout) {
+        terminate_probe_process_group(&mut child);
+        return Err(error);
+    }
+
+    let mut output = Vec::new();
+    let mut status = None;
+    let mut stdout_closed = false;
+    loop {
+        if !stdout_closed {
+            loop {
+                let mut buffer = [0_u8; 8192];
+                match stdout.read(&mut buffer) {
+                    Ok(0) => {
+                        stdout_closed = true;
+                        break;
+                    }
+                    Ok(count) => {
+                        output.extend_from_slice(&buffer[..count]);
+                        if output.len() > max_bytes {
+                            terminate_probe_process_group(&mut child);
+                            return Err("inspect output exceeded byte limit".into());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        terminate_probe_process_group(&mut child);
+                        return Err("inspect output unreadable".into());
+                    }
+                }
+            }
+        }
+
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(child_status) => status = child_status,
+                Err(_) => {
+                    terminate_probe_process_group(&mut child);
+                    return Err("inspect wait failed".into());
+                }
+            }
+        }
+        if let Some(status) = status {
+            if stdout_closed {
+                if !status.success() {
+                    return Err("image is not present locally".into());
+                }
+                return Ok(output);
+            }
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            terminate_probe_process_group(&mut child);
+            return Err("inspect timed out".into());
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(25)));
+    }
+}
+
+#[cfg(not(unix))]
+fn bounded_probe_stdout_portable(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| "inspect spawn failed".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "inspect stdout unavailable".to_string())?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take((max_bytes + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+            .map_err(|_| "inspect output unreadable".to_string());
+        let _ = tx.send(result);
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buffered_output: Option<Result<Vec<u8>, String>> = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                if buffered_output.is_none() {
+                    if let Ok(result) = rx.try_recv() {
+                        if result.as_ref().is_ok_and(|bytes| bytes.len() > max_bytes) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = reader.join();
+                            return Err("inspect output exceeded byte limit".into());
+                        }
+                        buffered_output = Some(result);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("inspect timed out".into());
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("inspect wait failed".into());
+            }
+        }
+    };
+    let output = match buffered_output {
+        Some(result) => result?,
+        None => rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "inspect output unavailable".to_string())??,
+    };
+    let _ = reader.join();
+    if !status.success() {
+        return Err("image is not present locally".into());
+    }
+    if output.len() > max_bytes {
+        return Err("inspect output exceeded byte limit".into());
+    }
+    Ok(output)
+}
+
+fn parse_immutable_image_id(output: &[u8]) -> Result<String, String> {
+    let id = std::str::from_utf8(output)
+        .map_err(|_| "image id is not UTF-8".to_string())?
+        .trim();
+    // Docker returns `sha256:<hex>` while Podman returns the same immutable digest as bare hex.
+    let digest = id.strip_prefix("sha256:").unwrap_or(id);
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("runtime returned an invalid sha256 image id".into());
+    }
+    Ok(format!("sha256:{}", digest.to_ascii_lowercase()))
+}
+
+fn immutable_image_id(runtime: &str, image: &str) -> Result<String, String> {
+    let output = bounded_probe_stdout(
+        runtime,
+        &["image", "inspect", "--format", "{{.Id}}", image],
+        PROBE_TIMEOUT,
+        MAX_PROVENANCE_METADATA_BYTES,
+    )?;
+    parse_immutable_image_id(&output)
+}
+
 /// The production `RuntimeProbes` — every method is bounded (nothing here can hang `doctor`).
 pub struct RealProbes;
 
 impl RuntimeProbes for RealProbes {
     fn which_on_path(&self, cmd: &str) -> bool {
         which_on_path_impl(cmd)
+    }
+    fn resolved_executable(&self, cmd: &str) -> Option<PathBuf> {
+        resolved_executable_impl(cmd)
+    }
+    fn process_provenance(&self, cmd: &str) -> ProcessProvenance {
+        process_provenance_impl(cmd)
     }
     fn runtime_responds(&self, runtime: &str) -> bool {
         // Reused verbatim from main.rs (same bounded `<runtime> info` pattern preflight_runtimes uses).
@@ -223,6 +807,9 @@ impl RuntimeProbes for RealProbes {
     }
     fn image_exists(&self, runtime: &str, image: &str) -> bool {
         bounded_probe_ok(runtime, &["image", "inspect", image], PROBE_TIMEOUT)
+    }
+    fn image_id(&self, runtime: &str, image: &str) -> Result<String, String> {
+        immutable_image_id(runtime, image)
     }
     fn path_stat(&self, path: &Path) -> PathStat {
         path_stat_impl(path)
@@ -445,8 +1032,257 @@ pub fn run_checks(cfg: &LoadedConfig, probes: &dyn RuntimeProbes) -> Vec<CheckRe
     check_review_slice_cmd(&cfg.review, probes, &mut out); // check 8
     check_creds(snapshot, probes, &mut out); // check 9
     check_fable_prerequisites(snapshot, probes, &mut out); // check 10
+    check_provenance(snapshot, probes, &mut out); // R2a additive provenance rows
 
     out
+}
+
+fn agent_kind_name(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Acp => "acp",
+        AgentKind::Api => "api",
+        AgentKind::ContainerRw => "container_rw",
+    }
+}
+
+fn effort_name(effort: bridge_core::domain::Effort) -> &'static str {
+    use bridge_core::domain::Effort;
+    match effort {
+        Effort::Minimal => "minimal",
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::Xhigh => "xhigh",
+        Effort::Max => "max",
+    }
+}
+
+fn known_agent_cli(cmd: Option<&str>, adapter: Option<&InstalledPackage>) -> bool {
+    let basename = cmd
+        .and_then(|cmd| Path::new(cmd).file_name())
+        .and_then(|name| name.to_str());
+    matches!(basename, Some("codex-acp" | "claude-agent-acp"))
+        || adapter.is_some_and(|package| {
+            matches!(
+                package.name.as_str(),
+                "@agentclientprotocol/codex-acp" | "@agentclientprotocol/claude-agent-acp"
+            )
+        })
+}
+
+fn check_provenance(
+    snapshot: &RegistrySnapshot,
+    probes: &dyn RuntimeProbes,
+    out: &mut Vec<CheckResult>,
+) {
+    for entry in &snapshot.entries {
+        let id = entry.id.as_str();
+        let kind = agent_kind_name(entry.kind);
+
+        if entry.kind == AgentKind::Api {
+            out.push(CheckResult::ok(
+                format!("provenance:{id}:execution"),
+                format!("kind={kind} execution=remote"),
+            ));
+        } else if let Some(sandbox) = &entry.sandbox {
+            let runtime = sandbox.runtime();
+            let runtime_path = if runtime_is_allowed(runtime, &snapshot.allowed_cmds) {
+                probes.resolved_executable(runtime)
+            } else {
+                None
+            };
+            let mut detail = format!(
+                "kind={kind} execution=container runtime={runtime} inner_cmd={}",
+                entry.cmd.as_deref().unwrap_or("unknown")
+            );
+            if let Some(path) = runtime_path {
+                detail.push_str(&format!(" runtime_executable={path:?}"));
+                out.push(CheckResult::ok(
+                    format!("provenance:{id}:execution"),
+                    detail,
+                ));
+            } else {
+                detail.push_str(" runtime_executable=unknown");
+                let remedy = if runtime_is_allowed(runtime, &snapshot.allowed_cmds) {
+                    "install the configured runtime or fix PATH, then rerun doctor for exact provenance"
+                } else {
+                    "allowlist the configured runtime before resolving its executable provenance"
+                };
+                out.push(CheckResult::warn(
+                    format!("provenance:{id}:execution"),
+                    detail,
+                    remedy,
+                ));
+            }
+            out.push(CheckResult::warn(
+                format!("provenance:{id}:adapter"),
+                "container adapter package provenance is unknown; host inner command was not inspected",
+                "record package metadata in immutable image labels/manifest (R3/R4)",
+            ));
+            if known_agent_cli(entry.cmd.as_deref(), None) {
+                out.push(CheckResult::warn(
+                    format!("provenance:{id}:agent-cli"),
+                    "container agent CLI provenance is unknown; host packages were not inspected",
+                    "record exact agent CLI/SDK metadata in immutable image labels/manifest (R3/R4)",
+                ));
+            }
+            let image_check = format!("provenance:{id}:image");
+            if !runtime_is_allowed(runtime, &snapshot.allowed_cmds) {
+                out.push(CheckResult::warn(
+                    image_check,
+                    format!(
+                        "runtime={runtime} image={} immutable_id=unknown (runtime not allowlisted)",
+                        sandbox.image
+                    ),
+                    "allowlist the configured runtime before inspecting image provenance",
+                ));
+            } else {
+                match probes.image_id(runtime, &sandbox.image) {
+                    Ok(image_id) => out.push(CheckResult::ok(
+                        image_check,
+                        format!(
+                            "runtime={runtime} image={} immutable_id={image_id}",
+                            sandbox.image
+                        ),
+                    )),
+                    Err(reason) => out.push(CheckResult::warn(
+                        image_check,
+                        format!(
+                            "runtime={runtime} image={} immutable_id=unknown ({reason})",
+                            sandbox.image
+                        ),
+                        format!(
+                            "ensure image {:?} is present and {runtime:?} supports bounded image inspect",
+                            sandbox.image
+                        ),
+                    )),
+                }
+            }
+        } else {
+            let cmd = entry.cmd.as_deref().unwrap_or("unknown");
+            let allowed = snapshot.allowed_cmds.iter().any(|allowed| allowed == cmd);
+            let provenance = if allowed {
+                probes.process_provenance(cmd)
+            } else {
+                ProcessProvenance {
+                    adapter_warning: Some(
+                        "command is not allowlisted; package metadata not inspected".into(),
+                    ),
+                    agent_cli_warning: Some(
+                        "command is not allowlisted; agent CLI metadata not inspected".into(),
+                    ),
+                    ..ProcessProvenance::default()
+                }
+            };
+            let execution_check = format!("provenance:{id}:execution");
+            match &provenance.resolved_executable {
+                Some(path) => out.push(CheckResult::ok(
+                    execution_check,
+                    format!("kind={kind} execution=host configured_cmd={cmd} executable={path:?}"),
+                )),
+                None => out.push(CheckResult::warn(
+                    execution_check,
+                    format!("kind={kind} execution=host configured_cmd={cmd} executable=unknown"),
+                    "fix the existing agent command failure, then rerun doctor for exact provenance",
+                )),
+            }
+
+            let adapter_check = format!("provenance:{id}:adapter");
+            match &provenance.adapter {
+                Some(package) => out.push(CheckResult::ok(
+                    adapter_check,
+                    format!(
+                        "executable={:?} package={} version={} manifest={:?}",
+                        provenance
+                            .resolved_executable
+                            .as_deref()
+                            .unwrap_or_else(|| Path::new("unknown")),
+                        package.name,
+                        package.version,
+                        package.manifest_path
+                    ),
+                )),
+                None => out.push(CheckResult::warn(
+                    adapter_check,
+                    provenance
+                        .adapter_warning
+                        .clone()
+                        .unwrap_or_else(|| "installed adapter package metadata unavailable".into()),
+                    "use an installed package with bounded readable metadata, or record this native command as unknown",
+                )),
+            }
+
+            if known_agent_cli(entry.cmd.as_deref(), provenance.adapter.as_ref()) {
+                let cli_check = format!("provenance:{id}:agent-cli");
+                match &provenance.agent_cli {
+                    Some(cli) => {
+                        let bundled = cli
+                            .bundled_cli_version
+                            .as_deref()
+                            .map(|version| format!(" bundled_cli_version={version}"))
+                            .unwrap_or_else(|| {
+                                if cli.name == "@anthropic-ai/claude-agent-sdk" {
+                                    " bundled_cli_version=unknown".to_string()
+                                } else {
+                                    String::new()
+                                }
+                            });
+                        let detail = format!(
+                            "package={} version={} manifest={:?}{bundled}",
+                            cli.name, cli.version, cli.manifest_path
+                        );
+                        if let Some(warning) = &provenance.agent_cli_warning {
+                            out.push(CheckResult::warn(
+                                cli_check,
+                                format!("{detail} ({warning})"),
+                                "install an SDK package with complete bounded provenance metadata",
+                            ));
+                        } else {
+                            out.push(CheckResult::ok(cli_check, detail));
+                        }
+                    }
+                    None => out.push(CheckResult::warn(
+                        cli_check,
+                        provenance
+                            .agent_cli_warning
+                            .clone()
+                            .unwrap_or_else(|| "installed agent CLI package metadata unavailable".into()),
+                        "install/resolve the adapter's exact agent CLI/SDK package; dependency ranges are not provenance",
+                    )),
+                }
+            }
+        }
+
+        let auth_detail = if entry.kind == AgentKind::Api {
+            match entry.api_key_env.as_deref() {
+                Some(name) => format!(
+                    "path=api_key_env api_key_env={name} present={}",
+                    probes.env_var_set(name)
+                ),
+                None => "path=not_applicable api_key_env=none".into(),
+            }
+        } else if entry.pre_authenticated {
+            "path=pre_authenticated".into()
+        } else if let Some(method) = entry.auth_method.as_deref() {
+            format!("path=configured_method method={method}")
+        } else {
+            "path=automatic".into()
+        };
+        out.push(CheckResult::ok(
+            format!("provenance:{id}:auth"),
+            auth_detail,
+        ));
+
+        out.push(CheckResult::ok(
+            format!("provenance:{id}:model"),
+            format!(
+                "model={} effort={} mode={}",
+                entry.model.as_deref().unwrap_or("default"),
+                entry.effort.map(effort_name).unwrap_or("default"),
+                entry.mode.as_deref().unwrap_or("default")
+            ),
+        ));
+    }
 }
 
 /// Whether `runtime` is present in the snapshot's `[registry].allowed_cmds` allowlist. Every runtime
@@ -1191,18 +2027,55 @@ mod tests {
         }
     }
 
+    fn fake_package(name: &str, version: &str, manifest: &str) -> InstalledPackage {
+        let manifest_path = PathBuf::from(manifest);
+        InstalledPackage {
+            name: name.into(),
+            version: version.into(),
+            package_root: manifest_path.parent().unwrap().to_path_buf(),
+            manifest_path,
+            bundled_cli_version: None,
+            bin_targets: Vec::new(),
+            bin_warning: None,
+        }
+    }
+
+    fn fake_codex_provenance() -> ProcessProvenance {
+        ProcessProvenance {
+            resolved_executable: Some(PathBuf::from("/opt/bin/codex-acp")),
+            adapter: Some(fake_package(
+                "@agentclientprotocol/codex-acp",
+                "1.1.2",
+                "/opt/lib/node_modules/@agentclientprotocol/codex-acp/package.json",
+            )),
+            adapter_warning: None,
+            agent_cli: Some(InstalledAgentCli {
+                name: "@openai/codex".into(),
+                version: "0.144.1".into(),
+                manifest_path: PathBuf::from(
+                    "/opt/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex/package.json",
+                ),
+                bundled_cli_version: None,
+            }),
+            agent_cli_warning: None,
+        }
+    }
+
     #[derive(Default)]
     struct FakeProbes {
         on_path: HashSet<String>,
         responsive_runtimes: HashSet<String>,
         networks: HashSet<String>,
         images: HashSet<String>,
+        image_ids: HashMap<(String, String), Result<String, String>>,
+        process_provenance: HashMap<String, ProcessProvenance>,
         env_vars: HashMap<String, String>,
         paths: HashMap<PathBuf, PathStat>,
         /// Records every runtime-executing probe call (`runtime_responds`/`network_exists`/
         /// `image_exists`) so tests can assert a config-named runtime binary was never actually invoked
         /// once it fails the `allowed_cmds` gate. `RefCell` because `RuntimeProbes` methods take `&self`.
         runtime_probe_calls: std::cell::RefCell<Vec<String>>,
+        executable_probe_calls: std::cell::RefCell<Vec<String>>,
     }
 
     impl FakeProbes {
@@ -1223,6 +2096,15 @@ mod tests {
         }
         fn allow_image(mut self, i: &str) -> Self {
             self.images.insert(i.to_string());
+            self
+        }
+        fn with_image_id(mut self, runtime: &str, image: &str, id: &str) -> Self {
+            self.image_ids
+                .insert((runtime.to_string(), image.to_string()), Ok(id.to_string()));
+            self
+        }
+        fn with_process_provenance(mut self, cmd: &str, provenance: ProcessProvenance) -> Self {
+            self.process_provenance.insert(cmd.to_string(), provenance);
             self
         }
         fn allow_env(mut self, e: &str) -> Self {
@@ -1260,11 +2142,37 @@ mod tests {
         fn runtime_probe_calls(&self) -> Vec<String> {
             self.runtime_probe_calls.borrow().clone()
         }
+        fn executable_probe_calls(&self) -> Vec<String> {
+            self.executable_probe_calls.borrow().clone()
+        }
     }
 
     impl RuntimeProbes for FakeProbes {
         fn which_on_path(&self, cmd: &str) -> bool {
+            self.executable_probe_calls
+                .borrow_mut()
+                .push(format!("which:{cmd}"));
             self.on_path.contains(cmd)
+        }
+        fn resolved_executable(&self, cmd: &str) -> Option<PathBuf> {
+            self.executable_probe_calls
+                .borrow_mut()
+                .push(format!("resolved:{cmd}"));
+            self.on_path.contains(cmd).then(|| PathBuf::from(cmd))
+        }
+        fn process_provenance(&self, cmd: &str) -> ProcessProvenance {
+            self.executable_probe_calls
+                .borrow_mut()
+                .push(format!("provenance:{cmd}"));
+            self.process_provenance
+                .get(cmd)
+                .cloned()
+                .unwrap_or_else(|| ProcessProvenance {
+                    resolved_executable: self.on_path.contains(cmd).then(|| PathBuf::from(cmd)),
+                    adapter_warning: Some("installed package metadata unavailable".into()),
+                    agent_cli_warning: Some("agent CLI provenance unavailable".into()),
+                    ..ProcessProvenance::default()
+                })
         }
         fn runtime_responds(&self, runtime: &str) -> bool {
             self.runtime_probe_calls
@@ -1283,6 +2191,15 @@ mod tests {
                 .borrow_mut()
                 .push(format!("image_exists:{runtime}:{image}"));
             self.images.contains(image)
+        }
+        fn image_id(&self, runtime: &str, image: &str) -> Result<String, String> {
+            self.runtime_probe_calls
+                .borrow_mut()
+                .push(format!("image_id:{runtime}:{image}"));
+            self.image_ids
+                .get(&(runtime.to_string(), image.to_string()))
+                .cloned()
+                .unwrap_or_else(|| Err("immutable local image id unavailable".into()))
         }
         fn path_stat(&self, path: &Path) -> PathStat {
             self.paths.get(path).copied().unwrap_or(PathStat::ABSENT)
@@ -2014,7 +2931,7 @@ mod tests {
     // ---- end-to-end: all-ok config ----
 
     #[test]
-    fn all_ok_config_produces_zero_warn_or_fail() {
+    fn all_operational_checks_ok_with_only_honest_container_provenance_warning() {
         let host = acp_entry("codex", "codex-acp");
         let mut sandboxed = acp_entry("kiro", "kiro-cli");
         sandboxed.sandbox = Some(locked_sandbox("reader:latest", "a2a-net", vec![]));
@@ -2039,10 +2956,17 @@ mod tests {
 
         let probes = FakeProbes::new()
             .allow_path("codex-acp")
+            .allow_path("docker")
+            .with_process_provenance("codex-acp", fake_codex_provenance())
             .allow_path("prism")
             .allow_runtime("docker")
             .allow_network("a2a-net")
             .allow_image("reader:latest")
+            .with_image_id(
+                "docker",
+                "reader:latest",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             .allow_image("toolchain:rust")
             .with_dir("/store", true);
 
@@ -2052,7 +2976,499 @@ mod tests {
             .iter()
             .filter(|r| r.status != CheckStatus::Ok)
             .collect();
-        assert!(bad.is_empty(), "expected all-ok, got: {bad:#?}");
+        assert_eq!(bad.len(), 1, "unexpected non-ok rows: {bad:#?}");
+        assert_eq!(bad[0].check, "provenance:kiro:adapter");
+        assert_eq!(bad[0].status, CheckStatus::Warn);
+    }
+
+    // ---- R2a provenance rows ----
+
+    #[test]
+    fn r2a_api_provenance_is_additive_and_never_serializes_env_value() {
+        let mut api = api_entry("remote", Some("OPENAI_API_KEY"));
+        api.model = Some("gpt-test".into());
+        api.effort = Some(bridge_core::domain::Effort::High);
+        api.mode = Some("review".into());
+        let cfg = base_loaded(snapshot("remote", vec![api], vec![]));
+        let probes = FakeProbes::new().with_env("OPENAI_API_KEY", "super-secret-value");
+
+        let results = run_checks(&cfg, &probes);
+        let execution = find(&results, "provenance:remote:execution");
+        assert_eq!(execution.status, CheckStatus::Ok);
+        assert!(
+            execution.detail.contains("kind=api"),
+            "{}",
+            execution.detail
+        );
+        assert!(
+            execution.detail.contains("execution=remote"),
+            "{}",
+            execution.detail
+        );
+
+        let auth = find(&results, "provenance:remote:auth");
+        assert_eq!(auth.status, CheckStatus::Ok);
+        assert!(
+            auth.detail.contains("api_key_env=OPENAI_API_KEY"),
+            "{}",
+            auth.detail
+        );
+        assert!(auth.detail.contains("present=true"), "{}", auth.detail);
+
+        let model = find(&results, "provenance:remote:model");
+        assert_eq!(model.status, CheckStatus::Ok);
+        assert!(model.detail.contains("model=gpt-test"), "{}", model.detail);
+        assert!(model.detail.contains("effort=high"), "{}", model.detail);
+        assert!(model.detail.contains("mode=review"), "{}", model.detail);
+
+        let json = serde_json::to_string(&results).unwrap();
+        assert!(!json.contains("super-secret-value"));
+        for row in serde_json::from_str::<serde_json::Value>(&json)
+            .unwrap()
+            .as_array()
+            .unwrap()
+        {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["check", "detail", "remedy", "status"]);
+        }
+    }
+
+    #[test]
+    fn r2a_sandbox_provenance_is_container_scoped_and_does_not_claim_host_packages() {
+        let mut codex = acp_entry("codex", "codex-acp");
+        codex.model = Some("gpt-5.6-sol".into());
+        codex.effort = Some(bridge_core::domain::Effort::Max);
+        codex.pre_authenticated = true;
+        codex.sandbox = Some(locked_sandbox("reader:latest", "a2a-net", vec![]));
+        let cfg = base_loaded(snapshot("codex", vec![codex], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_path("codex-acp")
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest");
+
+        let results = run_checks(&cfg, &probes);
+        let execution = find(&results, "provenance:codex:execution");
+        assert_eq!(execution.status, CheckStatus::Warn);
+        assert!(
+            execution.detail.contains("execution=container"),
+            "{}",
+            execution.detail
+        );
+        assert!(
+            execution.detail.contains("runtime=docker"),
+            "{}",
+            execution.detail
+        );
+
+        let adapter = find(&results, "provenance:codex:adapter");
+        assert_eq!(adapter.status, CheckStatus::Warn);
+        assert!(adapter.detail.contains("container"), "{}", adapter.detail);
+        assert!(adapter.detail.contains("host"), "{}", adapter.detail);
+
+        let cli = find(&results, "provenance:codex:agent-cli");
+        assert_eq!(cli.status, CheckStatus::Warn);
+        assert!(cli.detail.contains("container"), "{}", cli.detail);
+
+        let image = find(&results, "provenance:codex:image");
+        assert!(image.detail.contains("runtime=docker"), "{}", image.detail);
+        assert!(
+            image.detail.contains("image=reader:latest"),
+            "{}",
+            image.detail
+        );
+        assert!(
+            probes
+                .executable_probe_calls()
+                .iter()
+                .all(|call| !call.contains("codex-acp")),
+            "sandbox provenance must never inspect the host inner command: {:?}",
+            probes.executable_probe_calls()
+        );
+    }
+
+    #[test]
+    fn r2a_host_provenance_reports_exact_adapter_and_agent_cli_packages() {
+        let cfg = base_loaded(snapshot(
+            "codex",
+            vec![acp_entry("codex", "codex-acp")],
+            vec!["codex-acp"],
+        ));
+        let probes = FakeProbes::new()
+            .allow_path("codex-acp")
+            .with_process_provenance("codex-acp", fake_codex_provenance());
+
+        let results = run_checks(&cfg, &probes);
+        let execution = find(&results, "provenance:codex:execution");
+        assert_eq!(execution.status, CheckStatus::Ok);
+        assert!(execution.detail.contains("/opt/bin/codex-acp"));
+
+        let adapter = find(&results, "provenance:codex:adapter");
+        assert_eq!(adapter.status, CheckStatus::Ok);
+        assert!(adapter.detail.contains("@agentclientprotocol/codex-acp"));
+        assert!(adapter.detail.contains("version=1.1.2"));
+
+        let cli = find(&results, "provenance:codex:agent-cli");
+        assert_eq!(cli.status, CheckStatus::Ok);
+        assert!(cli.detail.contains("package=@openai/codex"));
+        assert!(cli.detail.contains("version=0.144.1"));
+    }
+
+    #[test]
+    fn r2a_unknown_native_command_warns_without_guessing_agent_cli() {
+        let cfg = base_loaded(snapshot(
+            "native",
+            vec![acp_entry("native", "native-reviewer")],
+            vec!["native-reviewer"],
+        ));
+        let probes = FakeProbes::new().allow_path("native-reviewer");
+
+        let results = run_checks(&cfg, &probes);
+        let adapter = find(&results, "provenance:native:adapter");
+        assert_eq!(adapter.status, CheckStatus::Warn);
+        assert!(adapter.detail.contains("unavailable"));
+        assert!(results
+            .iter()
+            .all(|row| row.check != "provenance:native:agent-cli"));
+        assert_eq!(
+            find(&results, "provenance:native:model").detail,
+            "model=default effort=default mode=default"
+        );
+    }
+
+    #[test]
+    fn r2a_image_provenance_reports_named_and_digest_refs_and_warns_when_unknown() {
+        const ID: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for image in [
+            "reader:latest",
+            "registry.example/reader@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ] {
+            let mut entry = acp_entry("reader", "codex-acp");
+            entry.sandbox = Some(locked_sandbox(image, "a2a-net", vec![]));
+            let cfg = base_loaded(snapshot("reader", vec![entry], vec!["docker"]));
+            let probes = FakeProbes::new()
+                .allow_runtime("docker")
+                .allow_network("a2a-net")
+                .allow_image(image)
+                .with_image_id("docker", image, ID);
+
+            let results = run_checks(&cfg, &probes);
+            let row = find(&results, "provenance:reader:image");
+            assert_eq!(row.status, CheckStatus::Ok);
+            assert!(row.detail.contains(image), "{}", row.detail);
+            assert!(row.detail.contains(ID), "{}", row.detail);
+        }
+
+        let mut entry = acp_entry("reader", "codex-acp");
+        entry.sandbox = Some(locked_sandbox("missing:latest", "a2a-net", vec![]));
+        let cfg = base_loaded(snapshot("reader", vec![entry], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net");
+        let results = run_checks(&cfg, &probes);
+        let row = find(&results, "provenance:reader:image");
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(row.detail.contains("immutable_id=unknown"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2a_real_codex_package_probe_follows_symlink_and_ignores_stale_range() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = temp
+            .path()
+            .join("lib/node_modules/@agentclientprotocol/codex-acp");
+        let dist = adapter.join("dist");
+        let cli = adapter.join("node_modules/@openai/codex");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = dist.join("index.js");
+        std::fs::write(&target, "#!/usr/bin/env node\n").unwrap();
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&target, permissions).unwrap();
+        std::fs::write(
+            adapter.join("package.json"),
+            r#"{"name":"@agentclientprotocol/codex-acp","version":"1.1.2","bin":{"codex-acp":"dist/index.js"},"dependencies":{"@openai/codex":"^0.144.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cli.join("package.json"),
+            r#"{"name":"@openai/codex","version":"0.144.1"}"#,
+        )
+        .unwrap();
+        let link = bin.join("codex-acp");
+        symlink(&target, &link).unwrap();
+
+        let provenance = process_provenance_impl(link.to_str().unwrap());
+        let canonical_target = std::fs::canonicalize(&target).unwrap();
+        assert_eq!(
+            provenance.resolved_executable.as_deref(),
+            Some(canonical_target.as_path())
+        );
+        let adapter = provenance.adapter.unwrap();
+        assert_eq!(adapter.name, "@agentclientprotocol/codex-acp");
+        assert_eq!(adapter.version, "1.1.2");
+        let cli = provenance.agent_cli.unwrap();
+        assert_eq!(cli.name, "@openai/codex");
+        assert_eq!(cli.version, "0.144.1");
+        assert_ne!(cli.version, "^0.144.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2a_package_probe_requires_known_adapter_and_manifest_bin_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        for (name, bin_target) in [
+            ("unrelated-project", "dist/index.js"),
+            ("@agentclientprotocol/codex-acp", "dist/different.js"),
+        ] {
+            let package = temp.path().join(name.replace(['/', '@'], "_"));
+            let dist = package.join("dist");
+            std::fs::create_dir_all(&dist).unwrap();
+            let executable = dist.join("index.js");
+            std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+            let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&executable, permissions).unwrap();
+            std::fs::write(
+                package.join("package.json"),
+                format!(
+                    r#"{{"name":"{name}","version":"1.0.0","bin":{{"reviewer":"{bin_target}"}}}}"#
+                ),
+            )
+            .unwrap();
+
+            let provenance = process_provenance_impl(executable.to_str().unwrap());
+            assert!(
+                provenance.adapter.is_none(),
+                "{name} must not own {:?}: {provenance:#?}",
+                executable
+            );
+            assert!(
+                provenance
+                    .adapter_warning
+                    .as_deref()
+                    .is_some_and(|warning| warning.contains("ownership")),
+                "{provenance:#?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2a_real_claude_package_probe_reports_sdk_and_bundled_cli_versions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = temp
+            .path()
+            .join("node_modules/@agentclientprotocol/claude-agent-acp");
+        let dist = adapter.join("dist");
+        let sdk = adapter.join("node_modules/@anthropic-ai/claude-agent-sdk");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::create_dir_all(&sdk).unwrap();
+        let executable = dist.join("index.js");
+        std::fs::write(&executable, "#!/usr/bin/env node\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(
+            adapter.join("package.json"),
+            r#"{"name":"@agentclientprotocol/claude-agent-acp","version":"0.55.0","bin":{"claude-agent-acp":"dist/index.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sdk.join("package.json"),
+            r#"{"name":"@anthropic-ai/claude-agent-sdk","version":"0.3.198","claudeCodeVersion":"2.1.198"}"#,
+        )
+        .unwrap();
+
+        let provenance = process_provenance_impl(executable.to_str().unwrap());
+        let cli = provenance.agent_cli.unwrap();
+        assert_eq!(cli.name, "@anthropic-ai/claude-agent-sdk");
+        assert_eq!(cli.version, "0.3.198");
+        assert_eq!(cli.bundled_cli_version.as_deref(), Some("2.1.198"));
+
+        std::fs::write(
+            sdk.join("package.json"),
+            r#"{"name":"@anthropic-ai/claude-agent-sdk","version":"0.3.198"}"#,
+        )
+        .unwrap();
+        let partial = process_provenance_impl(executable.to_str().unwrap());
+        assert!(partial.agent_cli.is_some(), "{partial:#?}");
+        assert!(
+            partial
+                .agent_cli_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("claudeCodeVersion")),
+            "{partial:#?}"
+        );
+        let command = executable.to_str().unwrap();
+        let cfg = base_loaded(snapshot(
+            "claude",
+            vec![acp_entry("claude", command)],
+            vec![command],
+        ));
+        let probes = FakeProbes::new()
+            .allow_path(command)
+            .with_process_provenance(command, partial);
+        let results = run_checks(&cfg, &probes);
+        let row = find(&results, "provenance:claude:agent-cli");
+        assert_eq!(row.status, CheckStatus::Warn);
+        assert!(row.detail.contains("version=0.3.198"), "{}", row.detail);
+        assert!(
+            row.detail.contains("bundled_cli_version=unknown"),
+            "{}",
+            row.detail
+        );
+    }
+
+    #[test]
+    fn r2a_package_metadata_failures_are_bounded_and_honest() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(read_installed_package(temp.path()).is_err());
+
+        let malformed = temp.path().join("malformed.json");
+        std::fs::write(&malformed, "{").unwrap();
+        assert!(read_installed_package(&malformed)
+            .unwrap_err()
+            .contains("malformed"));
+
+        let invalid_extra = temp.path().join("invalid-extra.json");
+        std::fs::write(
+            &invalid_extra,
+            r#"{"name":"@anthropic-ai/claude-agent-sdk","version":"1","claudeCodeVersion":7}"#,
+        )
+        .unwrap();
+        assert!(read_installed_package(&invalid_extra)
+            .unwrap_err()
+            .contains("not a string"));
+
+        let oversized = temp.path().join("oversized.json");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len((MAX_PROVENANCE_METADATA_BYTES + 1) as u64)
+            .unwrap();
+        assert!(read_installed_package(&oversized)
+            .unwrap_err()
+            .contains("exceeds"));
+
+        assert!(read_installed_package(&temp.path().join("disappeared.json")).is_err());
+
+        let denied = temp.path().join("denied.json");
+        std::fs::write(&denied, r#"{"name":"x","version":"1"}"#).unwrap();
+        let denied_error = bounded_regular_file_with_open(&denied, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected permission denial",
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            denied_error.contains("metadata unreadable"),
+            "{denied_error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2a_runtime_output_probe_is_success_failure_size_and_time_bounded() {
+        let ok = bounded_probe_stdout("/bin/sh", &["-c", "printf ok"], Duration::from_secs(1), 4)
+            .unwrap();
+        assert_eq!(ok, b"ok");
+
+        let oversized = bounded_probe_stdout(
+            "/bin/sh",
+            &["-c", "printf 12345"],
+            Duration::from_secs(1),
+            4,
+        )
+        .unwrap_err();
+        assert!(oversized.contains("byte limit"), "{oversized}");
+
+        let timed_out =
+            bounded_probe_stdout("/bin/sh", &["-c", "sleep 1"], Duration::from_millis(20), 4)
+                .unwrap_err();
+        assert!(timed_out.contains("timed out"), "{timed_out}");
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("descendant.pid");
+        let survived_path = temp.path().join("descendant-survived");
+        let started = std::time::Instant::now();
+        let leaked = bounded_probe_stdout(
+            "/bin/sh",
+            &[
+                "-c",
+                "(sleep 1; printf survived > \"$2\") & echo $! > \"$1\"; exit 0",
+                "probe",
+                pid_path.to_str().unwrap(),
+                survived_path.to_str().unwrap(),
+            ],
+            Duration::from_millis(100),
+            64,
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let observation_at = started + Duration::from_millis(1_500);
+        if let Some(remaining) = observation_at.checked_duration_since(std::time::Instant::now()) {
+            std::thread::sleep(remaining);
+        }
+        let descendant_survived = survived_path.exists();
+        if unsafe { libc::kill(pid, 0) == 0 } {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(leaked.contains("timed out"), "{leaked}");
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "probe exceeded its original deadline: {elapsed:?}"
+        );
+        assert!(
+            !descendant_survived,
+            "probe descendant {pid} survived long enough to write its marker"
+        );
+    }
+
+    #[test]
+    fn r2a_image_id_parser_accepts_only_one_full_sha256_identity() {
+        let upper = format!("sha256:{}\n", "A".repeat(64));
+        let podman_bare = format!("{}\n", "B".repeat(64));
+        assert_eq!(
+            parse_immutable_image_id(upper.as_bytes()).unwrap(),
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            parse_immutable_image_id(podman_bare.as_bytes()).unwrap(),
+            format!("sha256:{}", "b".repeat(64))
+        );
+        for invalid in [
+            b"latest".as_slice(),
+            b"sha256:abc".as_slice(),
+            b"sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+                .as_slice(),
+            b"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nsha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .as_slice(),
+        ] {
+            assert!(parse_immutable_image_id(invalid).is_err());
+        }
     }
 
     // ---- JSON shape ----

@@ -26,6 +26,7 @@ dependencies = [
  "bridge-workflow",
  "bridge-worktree",
  "futures",
+ "libc",
  "lsp-mcp",
  "notify",
  "reqwest",
