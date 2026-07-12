@@ -54,7 +54,9 @@ to authenticated caller context.
 
 Provider capacity is a separate axis. For trusted own-repo full-branch reviews, use Fable xhigh only when
 its usage window has headroom; when Claude is known to be near its usage limit, select the explicit
-`gpt-5.6-sol` reviewer at `max` before starting. If a Fable turn already reached prompt start, a Sol review
+`gpt-5.6-sol` reviewer at `xhigh` before starting. Reserve max for the tightly connected correctness and
+concurrency cases in the operator skill, or after High/xhigh fails to resolve the issue. If a Fable turn
+already reached prompt start, a Sol review
 is a new operator-selected attempt, not an automatic retry: preserve the first attempt as possibly
 accepted and record both costs/provenance. A structured provider-limit/reset signal may recommend that
 choice but never executes it. Tier 2/3 rules still apply independently.
@@ -151,7 +153,7 @@ Exit: a release cannot claim an agent path that was not tested from its distribu
    [R2d plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md); keep authenticated in-process
    [R2e](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) deferred.
 4. Preserve adapter stderr and the deepest prompt error in the task journal.
-5. Make provider-limit failures explicit and keep the Fable-xhigh → Sol-max full-review fallback an
+5. Make provider-limit failures explicit and keep the Fable-xhigh → Sol-xhigh full-review fallback an
    operator-selected, separately recorded attempt.
 6. Establish the pinned/floating compatibility lanes in the
    [R3 plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md).

@@ -1,9 +1,9 @@
-# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v6)
+# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v13)
 
-- **Status:** R2a merge-ready after Fable/xhigh review; R2b-R2e remain design-gated
+- **Status:** R2a merged; R2b0 design v13 APPROVED by Sol/xhigh; merge pending
 - **Date:** 2026-07-11
-- **Base:** `37d0091167c2c71ac1508b47740fb2fd03454c8d` (`origin/main` after R1)
-- **Branch:** `agent/reliability-r2-diagnostics`
+- **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
+- **Branch:** `agent/reliability-r2b0-contract`
 - **Program:** [`docs/bridge-reliability.md`](../../bridge-reliability.md), R2
 - **Security boundary:** [`ADR-0032`](../../adr/0032-sandbox-tier-model.md)
 
@@ -235,6 +235,71 @@ gaps. V6 closes them as follows:
 | **SMELL:** provider-limit recognition has no exact schemas/codes/precedence | Add the closed mapping and metadata-precedence tables below; every unlisted or conflicting value is `unknown`. |
 | **SMELL:** raw SDK `Debug` can be traced before diagnostic construction | Remove raw initialize/session-create SDK logging and require captured-trace secret regressions at those sites. |
 
+The fresh Fable/xhigh merge-readiness review approved R2a and v6, then identified two minor R2b
+handoff ambiguities. V7 folds both before R2b implementation begins:
+
+| Finding | Disposition in v7 |
+|---|---|
+| **SMELL:** direct inbound and coordinator translator paths have no named diagnostic-observer owner | Add an observed translator port and assign every current production `Translator::run` caller below. |
+| **SMELL:** the raw SDK logging checklist names only one of two `session/new` sites and does not enumerate the three effort walk-down warnings | Enumerate all six current sites and require captured-trace coverage for each. |
+
+The fresh Sol/max R2b0 review found no runtime `WRONG` item because R2b0 is contract-only, but it found
+one concrete plan error and five remaining ownership/safety gaps. V8 folds all six before implementation:
+
+| Finding | Disposition in v8 |
+|---|---|
+| **WRONG:** the plan routes effort logging work to nonexistent `apply_effort_with_fallback` | Name the live owner, `AcpBackend::apply_effort_walkdown`, in the design and plan. |
+| **SMELL:** inbound and coordinator observers start after cold resolution | Create the operation observer before `resolve_configure_bind`, `resolve_for_fanout`, or coordinator checkout and pass it through resolution and prompt collection. |
+| **SMELL:** direct A2A/coordinator correlation ids are not durable `TaskStore` records | Give those paths bounded in-memory observers; reserve journal-backed observers for owners that have successfully created a `TaskRecord`. |
+| **SMELL:** diagnostic observation is not composed with the existing rich-event `prompt_observed` API | Preserve that API unchanged and add one composite `BackendObservers`/`prompt_with_observers` path with source-compatible defaults. |
+| **SMELL:** the six-site trace audit misses two warm-reconcile `BridgeError::Debug` sinks | Enumerate all eight upstream-derived trace sites and test both warm-reconcile arms with the same secret-injection harness. |
+| **SMELL:** the R2b0 plan advances the cursor before merge | Keep R2b0 active through review; advance to R2b1 only after the approved contract is present on `origin/main`. |
+
+The fresh Sol/max v8 re-review closed five findings and left journal authority partial, then found one
+constructible trace leak and one teardown-lifetime gap. V9 closes all three:
+
+| Finding | Disposition in v9 |
+|---|---|
+| **SMELL:** direct A2A warm workflows were still assigned a journal-backed observer without a task row | Add an explicit per-node diagnostic-observer factory to `WorkflowRunContext`; detached task owners supply the journal factory, while direct A2A supplies in-memory regardless of correlation ids. |
+| **WRONG:** agent-controlled model/effort/auth values can equal a bridge-known credential and reach success-path tracing | Route all 16 current ACP trace calls through a typed metadata-only funnel that accepts no arbitrary string, and inject a known secret through every current dynamic source. |
+| **SMELL:** a cached backend could retain a per-operation observer or miss late teardown | Keep constructor and prompt observers out of cached config/state; add observer-aware synchronous cleanup ports, and classify later registry retirement as process-scoped rather than task-owned. |
+
+The Sol/max v9 review closed workflow authority and the complete ACP trace audit, but kept cleanup
+implementability partial and found two constructible safety failures plus stale base metadata. V10 closes
+all four:
+
+| Finding | Disposition in v10 |
+|---|---|
+| **SMELL:** existing spawn/container/reaper/worktree seams cannot implement observed cleanup as written | Name additive `ObservedSpawnFn`, `ContainerSpawn::spawn_observed`, joinable `ReapController`, and error-preserving worktree cleanup APIs below, with legacy adapters/defaults. |
+| **WRONG:** a bridge-known credential used as an auth method id bypasses `FailureDiagnostic` redaction and enters a persisted transition | Require every serializable transition to be built with `DiagnosticRedactor`; arbitrary ids use a tagged `RedactedDiagnosticId` that stores no partial value when redaction occurs. |
+| **WRONG:** coordinator and direct A2A warm owners return every structured failure to `Idle` | Define one exhaustive structured-failure survivability classifier and require workflow, coordinator, streaming inbound, and synchronous inbound owners to expire every `AgentFailure`. |
+| **SMELL:** the design still names the R1 base | Set the base to the actual R2b0 branch point, `144b900d95da11cd852de12540d363a6c41a82d0`. |
+
+The Sol/xhigh v10 review closed three findings and left one structured-failure guard race partial. V11
+closes it:
+
+| Finding | Disposition in v11 |
+|---|---|
+| **WRONG:** cancellation while async expiry is pending can run the armed finish fallback or strand `Running` | Synchronously set a generation/operation-bound drop action before any await, hand removal ownership to an `ExpiryClaim`, and make both cancellation windows finish unobserved cleanup without returning `Idle` or writing late diagnostics. |
+
+The Sol/xhigh v11 review closed the pre-claim and stale-generation windows but found duplicate/canceled
+cleanup after claim. V12 closes it:
+
+| Finding | Disposition in v12 |
+|---|---|
+| **WRONG:** canceling observed cleanup after its first side effect can start release twice or lose worktree metadata | Transfer all owned cleanup state into one non-cancelable `CleanupFlight` before the first await; observation joins its report but the flight never captures an observer, and drop never starts a second release. |
+
+The concurrency-qualified Sol/max v12 review closed waiter cancellation but found a deterministic-session
+remint window and a worktree retirement race. V13 closes both:
+
+| Finding | Disposition in v13 |
+|---|---|
+| **WRONG:** removing the warm handle before cleanup finishes lets a new checkout remint the same `ctx-…-g0` session | Replace the live handle with a resource-free claim-identified `Expiring` tombstone; checkout rejects it, and only the successful matching cleanup flight may clear it. |
+| **SMELL:** forced registry retirement can independently drain worktree entries while observed release is in flight | Make release and retirement join the same per-session worktree cleanup cell; retirement seals new sessions, joins all cells, and retires the inner backend only after per-session ownership is resolved. |
+
+The fresh Sol/xhigh v13 re-review adjudicated both findings `FIXED`, found no new issues, and returned
+`APPROVE`.
+
 ## Stable lifecycle phase vocabulary
 
 `DiagnosticPhase` is serialized in `snake_case` and is append-only within diagnostic schema v1.
@@ -250,7 +315,7 @@ gaps. V6 closes them as follows:
 | `prompt_start` | bridge is about to dispatch SDK/API prompt work | the request/stream future is installed locally | The started transition and replay barrier are recorded before dispatch; synchronous construction failure fails this phase. |
 | `prompt_stream` | immediately after the dispatch future is installed, before its first poll/update | stream ends at a terminal response | Zero-update send, status, body, frame, transport, and timeout failures validly fail this already-started phase. |
 | `prompt_finish` | terminal prompt response is processed | terminal update and usage are emitted | Stop reason is metadata, not a new phase. |
-| `teardown` | cancellation, retirement, or container reap begins | owned process/container is reaped or released | Teardown failure never rewrites an earlier primary failure. |
+| `teardown` | operation-owned cancel/release/container cleanup begins | that synchronous cleanup returns | Background registry retirement and detached escalation are process-scoped, never written to an operation/task observer. Teardown failure never rewrites an earlier primary failure. |
 
 Each transition is:
 
@@ -270,38 +335,84 @@ Journal sequence numbers remain the ordering authority.
 ### Transition observation ownership
 
 R2b adds one small bridge-owned `DiagnosticObserver` port and threads it through the lifecycle instead of
-trying to reconstruct phases from error strings:
+trying to reconstruct phases from error strings. Observation is independent of persistence: an operation
+may use a bounded in-memory observer even when no durable bridge task exists.
+
+- `BackendObservers` composes `diagnostic: Arc<dyn DiagnosticObserver>` with
+  `rich: Option<Arc<dyn RichEventSink>>`. `AgentBackend` keeps its existing `prompt` and
+  `prompt_observed(..., RichEventSink)` methods unchanged and adds
+  `prompt_with_observers(..., BackendObservers)`. Its source-compatible default delegates to the existing
+  `prompt_observed` path when `rich` is present and to `prompt` otherwise, ignoring diagnostics only for
+  an implementation that has not opted into R2b. ACP, API, container, worktree, and resilient production
+  decorators override/forward the composite method. ACP uses one internal prompt implementation so
+  legacy `prompt`, rich-only `prompt_observed`, and composite observation cannot drop or duplicate tool
+  events.
 
 - `AgentRegistry` gains an additive `resolve_observed(id, observer)` method whose default implementation
   calls `resolve`. Workflow execution and smoke use the observed form; existing mock registries and
   callers remain source-compatible.
-- The concrete registry emits `resolve` and passes the same observer into `AcpConfig`. ACP spawn,
-  initialize, and authentication emit at the boundary where each operation actually occurs.
-- `AgentBackend::prompt_observed` carries the observer into `ensure_session` as well as prompt draining,
-  so session creation, config application, prompt start/stream/finish, and teardown share one attempt
-  timeline. The default `prompt` path uses a no-op observer.
-- The warm workflow branch in `bridge-workflow::executor` creates the same node-owned rich sink as the
-  cold branch and calls `NodeTurn.backend.prompt_observed`; `WorkflowNodeDispatcher::checkout` does not
-  consume or replace that observer. Prompt-construction failure flushes the sink before
-  `WarmNodeCleanup::on_exit`, exactly as the cold owner does. Tests exercise the production
-  `WarmWorkflowNodeDispatcher`, not only a direct backend fixture.
-- `ContainerRwBackend` overrides `prompt_observed` rather than falling back to `prompt`. It threads the
-  per-turn observer through `open_inner` and the `ContainerSpawn::spawn` seam into the newly created
-  `AcpBackend`, covering spawn/initialize for both cold per-turn and warm cache-miss containers. Reused
-  warm containers emit `backend.reused`; write-capable targets remain ineligible for host fallback.
-- `ApiBackend::prompt_observed` records config and prompt phases inside the lazily polled stream. It flips
+- `bridge-registry` keeps public `SpawnFn` and `Registry::new` unchanged, adds
+  `ObservedSpawnFn(entry, observer)` plus `Registry::new_observed`, and stores the observed form
+  internally. `Registry::new` wraps a legacy `SpawnFn` with a no-op diagnostic adapter; production wiring
+  uses `new_observed`. The concrete registry emits `resolve` and passes the winning initialization
+  observer separately to the observed spawn closure and then `AcpBackend::spawn_observed`; `AcpConfig`,
+  the returned `AcpBackend`, and the registry cache never store it. The `OnceCell` initialization owner records
+  spawn/initialize/authenticate and drops its observer before cache publication; concurrent waiters and
+  later resolves emit only `backend.reused` to their own observer. A failed initialization returns a
+  diagnostic from that attempt and leaves the cell uninitialized for a later observer/attempt.
+- `AgentBackend::prompt_with_observers` carries the diagnostic observer into `ensure_session` as well as
+  prompt draining, so session creation, config application, and prompt start/stream/finish share one
+  attempt timeline. The active prompt future/stream owns the observer reference and releases it after
+  synchronous cleanup; the cached backend and per-session config never retain it. Legacy prompt entry
+  points supply a no-op diagnostic observer.
+- `Translator` gains an additive `run_observed(..., observer)` method; legacy `run` delegates with a
+  no-op observer. Current production ownership is exhaustive:
+  - the inbound streaming handler creates a bounded in-memory operation observer before
+    `warm_local_dispatch`/`resolve_configure_bind`, passes it through `resolve_observed`, and transfers it
+    to `spawn_local_producer` for normal streaming `message/send`;
+  - the synchronous local dispatch arm creates the same kind of observer before
+    `warm_local_dispatch`/`resolve_configure_bind` and passes it into `Translator::run_observed`;
+  - each `local_kiro_source` fan-out source receives an in-memory observer created before
+    `resolve_for_fanout`, so source resolution and local prompt work share one attempt;
+  - `Coordinator::prompt` and `continue_turn` create an in-memory observer before
+    `SessionManager::checkout_turn`/`checkout_existing_turn`, pass it through any registry resolution,
+    and transfer it to `collect_turn`. The minted prompt `TaskId` remains correlation only; it is not a
+    `TaskStore` record.
+  Direct A2A and coordinator paths do not create hidden `TaskRecord`s and never call
+  `TaskStore::record_event_sequenced`. Their structured failure remains in the bounded
+  `AgentFailure` diagnostic for trusted operator handling while the A2A wire category stays static.
+  Catalog/model probes such as `AcpBackend::describe_options` have no task journal and use an explicit
+  in-memory/no-op observer; they never invent task ownership.
+- `WorkflowRunContext` gains an explicit per-node/attempt `DiagnosticObserverFactory`, independent of
+  `task_id` and `make_rich_sink`. A detached workflow owner supplies a journal-backed factory only after
+  its real `TaskRecord` exists; direct A2A workflow execution supplies an in-memory factory even when it
+  has a correlation `task_id`. Both cold and warm branches obtain the observer from that factory and call
+  `prompt_with_observers`; `WorkflowNodeDispatcher::checkout` does not consume or replace it.
+  Prompt-construction failure performs observed cleanup before the owner flushes/finalizes the diagnostic.
+  Tests exercise the production `WarmWorkflowNodeDispatcher`, not only a direct backend fixture.
+- `ContainerSpawn` keeps required `spawn` unchanged and adds `spawn_observed(..., observer)` with a
+  source-compatible default that calls `spawn`. Production `AcpContainerSpawn` overrides the observed
+  method and calls `AcpBackend::spawn_observed`. `ContainerRwBackend` overrides
+  `prompt_with_observers`, threads both observer channels through `open_inner` and
+  `ContainerSpawn::spawn_observed`, and never stores the operation observer in `WarmInner`. This covers
+  spawn/initialize for both cold per-turn and warm cache-miss containers. Reused warm containers emit
+  `backend.reused`; write-capable targets remain ineligible for host fallback.
+- `ApiBackend::prompt_with_observers` records config and prompt phases inside the lazily polled stream. It flips
   the replay barrier immediately before installing the first `builder.send()` future, completes
   `prompt_start`, starts `prompt_stream`, and only then polls the future; every HTTP status, body, SSE,
   frame, or tool-round failure is therefore a valid post-barrier stream failure with
   `AgentFailure { disposition: Fatal }`. The barrier remains set across subsequent tool-round POSTs.
   Pre-send model/config rejection remains pre-barrier.
-- The workflow observer translates transitions into its existing storage-owned rich-event sink. Smoke
-  supplies an in-memory collector, which is how it obtains the full sequence without a task journal.
+- A task-backed workflow may construct a journal-backed diagnostic observer only after its `TaskRecord`
+  and operation id exist. It translates transitions into the existing storage-owned rich-event sink.
+  Selection is explicit at the caller; neither a correlation `task_id` nor the presence/absence of a rich
+  sink chooses journal authority. Smoke and direct workflows supply in-memory collectors, which is how
+  they obtain the full sequence without a task journal.
 - `TurnRunner` gains an additive `run_turn_observed` method whose default delegates to `run_turn` with a
   no-op observer. The production implement path calls the observed method. `ResilientWarm` overrides it
-  and calls `prompt_observed` for the initial backend and every rebuilt backend, preserving one observer
-  per attempt and emitting a new attempt boundary before a retry-safe pre-prompt respawn. No rebuild can
-  silently fall back to plain `prompt`.
+  and calls `prompt_with_observers` for the initial backend and every rebuilt backend, preserving both
+  observer channels per attempt and emitting a new attempt boundary before a retry-safe pre-prompt
+  respawn. No rebuild can silently fall back to plain `prompt` or discard rich tool events.
 - Detached rich persistence and live projection are separate steps. The total, exhaustive projection
   function returns `Option<Frame>`; it persists every diagnostic-bearing progress event but returns
   `None` for it. Live SSE and reattach use the same filter, so operator diagnostics never panic the runner
@@ -309,9 +420,45 @@ trying to reconstruct phases from error strings:
 - A cached backend does not replay historical spawn/initialize/authenticate events into a new task. The
   observed resolve emits a `backend.reused` completed snapshot; a fresh resolution emits its live
   transitions. A resolve failure carries the transitions accumulated before the failure.
+- Operation-owned teardown uses additive compatibility ports:
+  `AgentBackend::{cancel_observed,forget_session_observed,release_session_observed}` and
+  `NodeTurnCleanup::on_exit_observed` accept the same observer and return `Result`; their defaults call
+  the existing methods and return `Ok`. ACP/container and warm-session production owners override them,
+  and `SessionManager` exposes observed cancel/expire/release paths. The workflow/translator owner calls
+  observed cleanup before final diagnostic flush and drops the observer when cleanup returns. A teardown
+  failure becomes the primary diagnostic only when no earlier failure exists; otherwise it is appended as
+  bounded `teardown.secondary` evidence without replacing the primary phase/class.
+- Container cleanup keeps legacy fire-and-forget `ReapFn`/`reap_once` for `Drop`, but production container
+  backends also own a joinable `ReapController`. Its shared state is `not_started | running | succeeded |
+  failed(code)`: `reap_observed` starts or joins one bounded removal attempt and returns the same typed
+  result to every waiter, while `reap_detached` starts/joins without attaching an operation observer.
+  `ContainerRwBackend` and observed ACP `:ro` release await `reap_observed`; timeout, spawn, and nonzero
+  exit are visible teardown failures. `Drop`/registry retirement use `reap_detached`. A legacy `ReapFn`
+  adapter remains available to existing tests/constructors.
+- `WorktreeBackend` owns a sealed, per-session `WorktreeCleanupCoordinator`. Each `SessionCleanupCell`
+  retains the canonical source/path/sidecar and a monotonic requested strength (`forget < release`) until
+  one observer-free session flight finishes. Concurrent legacy/observed forget, release, and retirement
+  start or join that cell; an upgrade may perform the stronger inner action once, while provider and
+  sidecar removal each occur exactly once. Observed callers locally record the shared report; legacy
+  callers preserve best-effort return behavior.
+- `WorktreeBackend::retire` first seals the coordinator against new sessions, snapshots every ready/running
+  cell, requests `release` strength, and joins all of those same flights before calling `inner.retire`.
+  It never independently drains provider entries. Thus registry force-retirement after its grace period
+  can join an observed release but cannot duplicate/cancel it. `NotFound` remains success; other
+  inner/provider/filesystem failures appear in the bounded shared report and retain fail-closed cleanup
+  state for an explicit retry.
+- Registry lease-drain retirement, plain `Drop`, and a detached ACP cancel-grace escalation are
+  process-scoped cleanup. They may emit only the typed metadata-only process trace described below; they
+  never retain an operation observer, write a task journal, or mutate an already returned diagnostic. If
+  detached escalation breaks an active prompt, that prompt observes the resulting stream failure at
+  `prompt_stream`; the watcher itself does not write a late transition.
 
-An observer failure at a task-journal boundary remains a persistence failure. The diagnostic observer
-must not invent task ownership for background process events or process-wide stderr.
+An observer failure at a real task-journal boundary remains a persistence failure. An in-memory observer
+cannot manufacture a persistence failure, and the diagnostic observer must not invent task ownership for
+direct prompts, background process events, or process-wide stderr. A resolve failure before any backend
+is returned still snapshots the transitions already held by the operation observer into the returned
+structured failure. Weak-reference tests prove constructor and prompt observers are released before a
+cached backend can serve a later operation.
 
 ## Failure classification
 
@@ -447,24 +594,68 @@ nor cause text becomes a metric label.
 ### Warm-session survivability is separate from retry disposition
 
 `FailureDisposition` decides whether the failed operation may be attempted again; it does not prove that
-the current backend/session is healthy. R2b adds a separate closed `WarmSessionSurvivability` mapping
-used by `bridge-a2a-inbound::WarmNodeCleanup`:
+the current backend/session is healthy. R2b adds one closed, exhaustive
+`warm_session_survivability(&BridgeError)` mapping in bridge-core and requires every warm owner to consume
+it: workflow `WarmNodeCleanup`, coordinator `collect_turn`, inbound streaming producer cleanup, and the
+synchronous inbound collector.
 
 | Node exit | Warm-session action in R2b |
 |---|---|
-| `Normal` | `finish_turn` / reusable |
-| `Canceled` | existing cancel path |
-| legacy `AgentCrashed` | `expire_turn` / retire |
+| `Normal` | existing owner-specific success path |
+| `Canceled` | existing owner-specific cancel/drop path |
 | any `AgentFailure`, for every current diagnostic class and disposition | `expire_turn` / retire |
-| other legacy `BridgeError` | preserve existing `finish_turn` behavior |
+| any legacy `BridgeError`, including `AgentCrashed` | preserve that owner's existing behavior |
 
 This is intentionally conservative: R2b does not reuse a session after any newly structured agent
 failure, even when the provider may have rejected work before acceptance. Relaxing a class to reusable
 requires a later proof and review. The mapping function has no wildcard `AgentFailure` class fallback;
 a table test enumerates every `DiagnosticFailureClass`, and integration regressions prove structured
 `transport`, `agent_process`, and watchdog `timeout` errors reach `expire_turn`, never `finish_turn`.
-`WarmWorkflowNodeDispatcher` is the production test entry so the cleanup ownership path cannot be
-accidentally bypassed.
+Legacy errors retain each owner's current behavior.
+
+All four owners use one `WarmCompletionGuard` bound to context, generation, and operation. Its synchronous
+`observe_exit(exit)` method applies the classifier and changes the armed drop action from `Finish` to
+`Expire` immediately when an `AgentFailure` is observed, before formatting, flushing, locking, or any
+other await. A stale guard can act only on the exact matching generation/operation.
+
+The consuming async `complete()` uses that armed action. For expiry it calls
+`SessionManager::begin_expire_current(ctx, generation, op)`, which atomically verifies the matching live
+handle, moves its backend/session/lease/child ownership into an `ExpiryClaim`, and replaces the live slot
+with a resource-free `ExpiringTombstone { generation, op, cleanup_claim_id, state }`. Only after that claim
+and tombstone exist is the original completion guard disarmed. Checkout/status treat `Expiring` and
+`CleanupFailed` as non-reusable (`SessionExpired`) and perform zero resolve/configure/mint work.
+
+Before its first cancelable await, `ExpiryClaim::cleanup_observed` synchronously transfers all owned state
+into exactly one spawned `CleanupFlight`. That task owns and completes backend/session release, worktree
+and sidecar removal, lease drop, and child-registration pruning. It returns one bounded `CleanupReport`
+through a join channel, but it never receives or captures a `DiagnosticObserver`, task store, or journal
+sink. The observed caller awaits the report and only then records teardown completion/failure through its
+still-local observer. Canceling that waiter merely drops the receiver; the same cleanup task continues.
+After every owned cleanup side effect completes successfully, the flight removes the tombstone only when
+context, generation, operation, and `cleanup_claim_id` still match. On cleanup failure it changes only
+that matching tombstone to `CleanupFailed { code }`; it stays non-reusable and retains no resource or
+operator prose. Explicit release/clear may join or retry the backend's shared cleanup cell, but no ordinary
+checkout can clear the tombstone or remint deterministic `ctx-{ctx}-g0` while old cleanup is unfinished.
+
+Both cancellation windows fail closed:
+
+- if cancellation occurs before the handle is claimed, dropping the still-armed completion guard spawns
+  a generation/operation-checked **unobserved** expiry;
+- if cancellation occurs after claim but before `CleanupFlight` starts, dropping `ExpiryClaim` starts that
+  one flight unobserved;
+- if cancellation occurs after the flight starts or during any release side effect, dropping the observed
+  waiter detaches from that same flight; `Drop` never invokes backend/worktree/container release again.
+
+`CleanupFlight` is the single-flight/idempotency boundary, generalizing the container-specific joinable
+reaper: every release side effect occurs at most once, and worktree ownership metadata remains in the
+never-canceled task until provider and sidecar removal finish. An unobserved completion may emit only a
+typed process-scoped cleanup status; it cannot write a late task transition. The slot is either still
+`Running` only until the checked expiry task obtains the lock or a non-reusable tombstone until the exact
+flight finishes—never absent during cleanup, never returned to `Idle`, and never able to expire a newer
+generation. Normal/canceled and legacy-error actions preserve their existing owner semantics.
+`Coordinator::collect_turn`, workflow `WarmNodeCleanup`, inbound streaming, and inbound synchronous
+dispatch synchronously call `observe_exit` at the error match site and then `complete`; no owner
+implements its own finish/expire race.
 
 ## Diagnostic failure record
 
@@ -531,18 +722,31 @@ operator opt-in to bounded best-effort-redacted text. The CLI help and JSON fiel
 as `best_effort`; arbitrary unlabeled secrets in opaque upstream text cannot be proven absent. Successful
 turns never persist stderr text.
 
-Tracing records only bounded stderr metadata, never opaque stderr text. ACP SDK errors are subject to
-the same rule before diagnostic construction: the current raw `error=?e` initialize warning and raw
-`error=?e` `session/new` warning in `acp_backend.rs` are removed. Their replacements record only a
-bridge-owned phase/code and, when available, a bounded numeric ACP/JSON-RPC code; SDK `Display`, `Debug`,
-message, and data are never tracing fields. The same metadata-only helper is used for model/mode/effort
-request errors so a future call site cannot reintroduce raw SDK logging.
+Tracing records only typed bounded metadata, never opaque stderr text or another arbitrary runtime
+string. R2b routes all 16 current `tracing!` invocations in `bridge-acp` through one internal
+`AcpTraceEvent` funnel:
 
-A captured-trace regression injects a credential literal independently into initialize error message,
-initialize error data, session-create error message, and session-create error data. It proves the literal
-is absent from every field and formatted trace while the sanitized diagnostic still retains its static
-phase/code. This test runs before and after `FailureDiagnostic::build`, covering the pre-construction
-window that DTO redaction alone cannot protect.
+- five model/effort outcome sites: no refreshed model options, unsupported effort, no effort option,
+  `resolved_log_line`, and the advertised-effort fallback;
+- the three `apply_effort_walkdown` request-error sites;
+- five handshake/session sites: initialize error, auth-method mismatch, pre-authenticated skip count,
+  session mint, and the separate `describe_options` session mint;
+- the generic prompt failure site; and
+- both warm-reconcile `ApplyConfigError::{NotAdvertised, Rejected}` sites.
+
+The funnel accepts only a bridge-owned event enum plus typed phase/code, booleans, bounded counts,
+hard-coded effort ranks, and a bounded numeric ACP/JSON-RPC code. Its API accepts no `String`, `&str`,
+arbitrary `Debug`/`Display`, path, id, model/effort/auth value, SDK message/data, or derived `BridgeError`.
+Raw values remain available only to the bounded diagnostic builder. A source regression scans production
+`bridge-acp/src` and permits direct `tracing!` only inside that funnel, so a future success or error path
+cannot bypass the typed boundary. The production use of free-form `resolved_log_line` is removed.
+
+Captured-trace regressions use one bridge-known credential literal and inject it independently as agent
+id, session id, configured/current/applied model, config id, configured/advertised effort, configured and
+advertised auth method, SDK message, and SDK data. They exercise all 16 current event paths and prove the
+literal is absent from every field and formatted trace while the sanitized diagnostic still retains its
+static phase/code. The tests run before and after `FailureDiagnostic::build`, covering both success-path
+capability logging and the pre-construction error window that DTO redaction alone cannot protect.
 
 Before a line enters the ring, sanitization:
 
@@ -600,14 +804,20 @@ pub struct PersistedPhaseTransition {
 
 Rules:
 
-- The workflow/turn owner emits transitions through the existing rich-event sink so task linkage and
-  journal sequencing remain storage-owned.
-- Transition fields are private and constructed through a validating bridge-core builder.
+- A task-backed workflow owner emits transitions through the existing rich-event sink only after the
+  corresponding `TaskRecord` exists, so task linkage and journal sequencing remain storage-owned.
+- Direct inbound, coordinator, smoke, and catalog observers do not use this representation; an external
+  or correlation `TaskId` is not evidence that a durable task row exists.
+- Transition fields are private and every serializable transition is constructed through
+  `PersistedPhaseTransition::build(input, &DiagnosticRedactor)`, not through the failure builder alone.
+  Any dynamic transition field passes the same bridge-known credential set, bounds, marker/URL scan, and
+  adjacency-safe record guard before the DTO can implement `Serialize`.
   `DiagnosticCode` is limited to a 64-byte bridge-owned `[a-z0-9._-]` token; `DiagnosticOperation` and
   `AuthenticationEvidence` are typed enums. `Progress.text` is the static `diagnostic transition`, never
   operator detail.
 - A failed turn emits exactly one primary failed diagnostic before `NodeFinished`/terminal persistence.
-- A journal write failure still aborts the drain; diagnostics never make persistence best-effort.
+- A journal write failure from a journal-backed observer still aborts the drain; diagnostics never make
+  real task persistence best-effort. In-memory/no-op observation has no journal-write failure mode.
 - Journal folding handles diagnostic-bearing progress exactly like any other progress event for
   task-status reconstruction. Diagnostics are evidence, not a second terminal-state machine.
 - A rollback fixture serializes a diagnostic-bearing progress event with the new type and deserializes it
@@ -629,10 +839,20 @@ The private `AuthenticationEvidence` enum records one of:
 - `api_key_env` — environment variable name and present/absent only;
 - `not_applicable`.
 
-No token value, credential file content, account id, or refresh timestamp is captured.
-Method ids are capped at 16 entries/64 UTF-8 bytes each. The auth evidence is carried inside the
-persisted transition, so `pre_authenticated`, `no_methods_advertised`, and configured/selected methods
-remain distinguishable after restart and reattach.
+No token value, credential file content, account id, or refresh timestamp is captured. Every arbitrary
+method id and API-key environment name is represented by a tagged private `RedactedDiagnosticId`:
+
+```text
+{ "state": "value", "value": "chat-gpt" }
+{ "state": "redacted" }
+```
+
+`value` is emitted only when the bounded context-free sanitizer and exact bridge-known credential pass
+leave the entire id unchanged. If any replacement/removal would occur, the builder emits the fixed
+`redacted` state and stores no prefix, suffix, length, hash, or partially sanitized value. Method lists are
+capped at 16 entries/64 UTF-8 bytes each before the whole-record guard. The auth evidence is carried inside
+the persisted transition, so `pre_authenticated`, `no_methods_advertised`, and configured/selected
+presence remain distinguishable after restart and reattach without retaining a redacted credential.
 
 ## `smoke` command
 
@@ -714,7 +934,9 @@ Provider/model degradation is not container degradation and never enters the R2d
 For trusted own-repo full-branch reviews, the operating policy is:
 
 - If the Claude/Fable usage window is known to be near exhaustion before a prompt, select the separately
-  configured `gpt-5.6-sol` reviewer at `max` up front.
+  configured `gpt-5.6-sol` reviewer at `xhigh` up front. Reserve max for tightly connected concurrency,
+  transaction-safety, critical-proof/migration, complex leak, or rare-failure work, or after High/xhigh
+  fails to resolve the issue; provider degradation alone is not sufficient.
 - If a Fable turn fails after `prompt_start`, do not resume, retry, or automatically route the same
   attempt. Preserve it as possibly accepted. An operator may explicitly start a distinct cross-provider
   review attempt; the new attempt has its own id, provenance, usage, and cost.
@@ -753,8 +975,21 @@ For trusted own-repo full-branch reviews, the operating policy is:
   failure starts and fails `prompt_start`. No failed transition exists without a preceding start.
 - A fresh `resolve_observed` captures spawn/initialize/authenticate while a cached resolve emits only a
   `backend.reused` snapshot; smoke captures the complete applicable attempt timeline.
+- Streaming inbound, synchronous inbound, fan-out local source, and coordinator warm turns create their
+  in-memory observer before resolution/checkout and carry it through `Translator::run_observed`;
+  `describe_options` remains explicitly non-task/in-memory.
+- Direct inbound/coordinator observers and direct A2A workflows never call `TaskStore` for
+  correlation-only ids. An explicit detached-workflow factory requires an existing task row, persists
+  before projection, and makes write failure fatal; neither `task_id` nor `make_rich_sink` selects it.
+- Constructor and prompt observer weak references are released before a cached backend is reused.
+  Concurrent `resolve_observed` waiters receive `backend.reused`, and later registry retirement/detached
+  cancel escalation produces no late task transition.
+- Legacy `SpawnFn`/`Registry::new` and `ContainerSpawn::spawn` fixtures remain source-compatible, while
+  production `ObservedSpawnFn`, `Registry::new_observed`, and `ContainerSpawn::spawn_observed` deliver the
+  initialization observer without retaining it.
 - Initialize timeout cannot report authenticate; model rejection cannot report prompt.
-- Prompt SDK error text and the deepest cause survive into one journal diagnostic.
+- Prompt SDK error text and the deepest cause survive into one bounded diagnostic; a task-backed workflow
+  persists the same sanitized value in its journal.
 - Cause truncation keeps the two outermost and six deepest causes.
 - Exact bridge-known credential values, including every two-line and three-line hard-wrap split, are
   absent from opted-in JSONL, CLI JSON, and the A2A response; opaque stderr text never enters tracing.
@@ -762,12 +997,22 @@ For trusted own-repo full-branch reviews, the operating policy is:
   opted-in transformed-secret handling is bounded and labeled `best_effort`.
 - A per-attempt cursor excludes older process stderr; a concurrency test demonstrates why retained lines
   remain labeled process-scoped rather than task-owned.
-- Teardown failure cannot replace the primary phase/class.
+- Observer-aware cancel/forget/release and node cleanup cover synchronous operation teardown. A teardown
+  failure is primary only when no prior failure exists; otherwise it appends `teardown.secondary` without
+  replacing the primary phase/class. Compatibility defaults preserve legacy cleanup behavior.
+- Joinable reaper tests cover success, runtime-spawn error, timeout, nonzero exit, concurrent observed
+  waiters receiving one result, and detached `Drop` starting/joining without a late task write.
+- `WorktreeBackend` observed cleanup propagates inner/provider/sidecar errors (`NotFound` excepted) while
+  legacy cleanup remains best-effort; primary failure ordering retains cleanup as `teardown.secondary`.
 - Journal diagnostics appear as `progress` before node/terminal completion and do not alter snapshot
   folding. A prior-schema reader fixture accepts the new optional payload.
 - Persisted transitions retain typed mode/model/effort operation, bridge code, and auth evidence;
   `pre_authenticated`, `no_methods_advertised`, and `backend.reused` remain distinguishable after a
   store round trip.
+- A configured/advertised/selected auth id and API-key environment name equal to a bridge-known
+  credential serialize only tagged `RedactedDiagnosticId { state: redacted }`; the literal is absent from
+  the task journal, smoke artifact, CLI JSON, trace, and wire response. Unchanged safe ids round-trip in
+  tagged value form, and no partial prefix/suffix/hash is retained.
 - Detached live and reattach paths persist diagnostic progress, emit no diagnostic SSE frame, do not
   panic, and continue through the following `NodeFinished`/terminal event. The event projector has an
   exhaustive table covering every current `OrchEventKind`.
@@ -779,6 +1024,27 @@ For trusted own-repo full-branch reviews, the operating policy is:
 - Production `WarmWorkflowNodeDispatcher` cleanup retires the checked-out warm session for every
   `AgentFailure`; table coverage includes every diagnostic class and explicit transport, agent-process,
   and watchdog-timeout regressions.
+- Coordinator prompt/continue, inbound streaming, and inbound synchronous dispatch use the same
+  exhaustive warm-session classifier. Each expires every `AgentFailure` before any guard can return the
+  handle to `Idle`; legacy errors preserve that owner's pre-R2b behavior.
+- Deterministic gates cancel completion (a) before `begin_expire_current` obtains the manager lock,
+  (b) after `ExpiryClaim` replaces the live handle with its tombstone but before flight start, and (c) after the cleanup task's first
+  release side effect while worktree provider removal is blocked. Every case makes checkout/status
+  non-reusable immediately or after the checked lock handoff, invokes backend release exactly once,
+  completes provider and sidecar removal, drops the lease exactly once, never calls `finish_turn`, and
+  leaves the finalized task-journal event count unchanged after the detached flight reports.
+- Checkout started after claim and after the first release side effect sees the matching `Expiring`
+  tombstone and performs zero resolve/configure/session-mint calls. Successful flight completion clears
+  only its claim-id tombstone and then permits one fresh checkout; failed cleanup leaves
+  `CleanupFailed` non-reusable.
+- A cleanup failure report reaches the local observer only when its waiter remains alive. Dropping the
+  waiter proves the flight holds no observer/task-store reference and emits no late journal event.
+- A stale expiry fallback carrying an older generation/operation cannot remove or idle a newer handle for
+  the same context.
+- With worktree provider removal blocked, force registry retirement and observed release concurrently.
+  Both join one session cell: inner release, provider removal, and sidecar removal each run once; retirement
+  calls `inner.retire` only after the cell finishes, and neither path retains/writes through the turn
+  observer after its waiter is canceled.
 - Table-driven API tests cover first/later send error, recognized and unknown HTTP status, SSE chunk,
   malformed SSE frame, non-streaming body/read/parse, and later tool-round POST failure. Every path after
   future installation is post-barrier/fatal and neither E6 nor `ResilientWarm` replays it. A pre-send API
@@ -788,11 +1054,13 @@ For trusted own-repo full-branch reviews, the operating policy is:
   to `unknown`. Error bodies are capped at 64 KiB before parsing. Retry/reset values must be a single
   nonnegative structured delta/date within 30 days; malformed, oversized, or conflicting metadata is
   omitted with a bridge-owned diagnostic code and never changes retry disposition.
-- Cold per-turn and warm cache-miss `ContainerRwBackend::prompt_observed` tests prove the observer sees
-  inner spawn/initialize transitions; warm reuse emits only `backend.reused`.
+- Cold per-turn and warm cache-miss `ContainerRwBackend::prompt_with_observers` tests prove the observer
+  sees inner spawn/initialize transitions without dropping rich tool events; warm reuse emits only
+  `backend.reused`.
 - The warm workflow executor and production implement `TurnRunner` both call their observed paths.
-  `ResilientWarm` preserves the observer through a retry-safe rebuild, while an unobserved test double
-  proves the default compatibility method remains no-op only for legacy callers.
+  `ResilientWarm` preserves both observer channels through a retry-safe rebuild. A test double that
+  implements only legacy `prompt`/`prompt_observed` proves the composite default still delivers its rich
+  events while safely ignoring unsupported diagnostics.
 - `ContainerFallbackCandidate` is not transient to E6 or warm respawn.
 - A structured provider usage-window fixture maps to
   `AgentFailure { class: provider_limit, disposition: Fatal }`, preserves structured reset/retry timing,
@@ -804,8 +1072,10 @@ For trusted own-repo full-branch reviews, the operating policy is:
   redacted and behavior-compatible.
 - `format!("{failure}")` and `format!("{failure:?}")` cannot expose summary, causes, stderr, or known
   credentials, while custom serialization retains the bounded redacted operator record.
-- Captured traces for initialize and `session/new` errors containing credential literals in SDK message
-  and data retain only static phase/code metadata and never the raw SDK `Display`/`Debug` value.
+- All 16 current `bridge-acp` trace events pass through the typed metadata-only funnel, and a source scan
+  rejects direct production `tracing!` calls outside it. Captured traces retain only enum/numeric/count
+  metadata when the same known credential is injected as agent/session/model/config/effort/auth ids and
+  SDK message/data; no SDK/derived `Display`/`Debug` or capability value is present.
 
 ### R2c
 

@@ -84,8 +84,14 @@ usage window as well as bridge preflight. For trusted own-repo reviews:
 
 - Use Fable at `xhigh` only when its usage window has headroom.
 - When Claude is known to be near its usage limit, select the separately configured raw
-  `gpt-5.6-sol` model at `max` before starting. Confirm both the raw id and `max` in `models`; do not
+  `gpt-5.6-sol` model at `xhigh` before starting. Confirm both the raw id and `xhigh` in `models`; do not
   reconstruct an effort-suffixed id by hand.
+- Reserve `max` for work where tightly connected evidence benefits from depth rather than parallelism:
+  complex memory leaks, deadlocks/data races or related concurrency failures, transaction-safety proofs,
+  critical algorithm correctness, zero-downtime migrations, rare production failures, or a problem that
+  High/xhigh failed to resolve. Record the qualifying reason before launch. Ordinary full-branch and spec
+  reviews use xhigh; provider degradation alone is not a reason to choose max. A max run can exceed one
+  hour, so set its hard watchdog deliberately and monitor liveness without interrupting active reasoning.
 - If Fable already reached prompt start and then fails, do not automatically resume, retry, or fall
   through. Preserve it as possibly accepted. A Sol review is a new, explicit operator-selected attempt
   with a new task/attempt id and separately recorded provenance/cost.

@@ -3,7 +3,7 @@
 - **Program status:** active P0
 - **R2a implementation baseline:** `main` at `24aff09c` on 2026-07-11
 - **Completed through:** R2a provenance diagnostics
-- **Next action:** R2b0 contract clarifications
+- **Next action:** merge the approved R2b0 contract, then advance the cursor to R2b1
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -41,7 +41,8 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R0 — front door/baseline | **MERGED** | [`bridge-reliability.md`](bridge-reliability.md) | Docs index, compatibility matrix, priority reset. |
 | R1 — Fable isolation | **MERGED** | [R1 disposition](superpowers/2026-07-11-fable-r1-disposition.md) | Host and reader controls dispositioned. |
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
-| R2b0–R2b3 — structured diagnostics | **NEXT / NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Four reviewed, independently mergeable PRs. |
+| R2b0 — contract clarifications | **IN REVIEW** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED, merge pending. |
+| R2b1–R2b3 — structured diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Three reviewed, independently mergeable implementation PRs after R2b0. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
@@ -135,9 +136,14 @@ contract that later code will follow.
 ### Review and dogfood gate
 
 - R2b–R2e require a fresh adversarial full-branch review through the bridge before merge.
-- Prefer Fable/xhigh when its usage window has headroom. If it is degraded or near its limit, an
-  operator may select `gpt-5.6-sol`/`max` as a new, separately recorded attempt. Never auto-resume or
-  auto-route the first attempt.
+- Prefer Fable/xhigh when its usage window has headroom. If it is degraded or near its limit, an operator
+  may select `gpt-5.6-sol`/`xhigh` as a new, separately recorded attempt. Never auto-resume or auto-route
+  the first attempt.
+- `max` prioritizes depth rather than parallelism and is reserved for tightly connected evidence: complex
+  memory leaks, deadlocks/data races or other concurrency failures, transaction-safety proofs, critical
+  algorithm correctness, zero-downtime migrations, rare production failures, or a problem that
+  High/xhigh failed to resolve. Record that reason before launch and budget the watchdog for a run that
+  may exceed one hour; ordinary full-branch/spec reviews use xhigh.
 - Every finding is tagged `WRONG` or `SMELL`; a `WRONG` finding names the constructible state and
   incorrect result. Prior findings are adjudicated before new findings.
 - R3/R4 additionally require a release/compatibility reviewer focused on credentials, cost bounds,
@@ -165,11 +171,29 @@ Next action:
 
 ## Current handoff
 
-- `origin/main` contains R2a at `24aff09c`.
+- `origin/main` contains R2a at `24aff09c` and the durable reliability plans at `144b900d`.
 - R2a's last full suite was 1,607 passed / 0 failed / 12 ignored live-agent tests.
 - A fresh bridge-mediated Fable/xhigh review returned `R2A: READY`, `V6 DESIGN: READY`, `MERGE`.
 - The Podman bare image-id normalization and non-vacuous descendant survivor-marker regression were
   folded after that review and revalidated by the full local gate set.
 - No R2b production code exists yet.
-- **Start with R2b0 only:** clarify direct inbound/coordinator observer ownership and enumerate every
-  raw ACP SDK log site in the design. Land that contract patch before adding diagnostic types.
+- R2b0 design v13 is on `agent/reliability-r2b0-contract`. The first Sol/max review returned `REVISE`:
+  cold resolution preceded the named owners, direct correlation ids lacked durable task rows, diagnostic
+  observation collided with the existing rich-event method, two warm-reconcile debug sinks were omitted,
+  and the plan named one nonexistent helper. V8 folded those findings. Its re-review closed five, left
+  direct-workflow journal authority partial, and found agent-controlled success-trace leakage plus an
+  unsafe cached/teardown observer lifetime. V9 folded those three. Its max review closed storage authority
+  and trace coverage, then required concrete spawn/reap/worktree seams, transition-wide credential
+  redaction, and shared warm-session failure retirement. V10 folded those items. Its Sol/xhigh review
+  closed three findings and found one cancellation window around async expiry. V11 folds a synchronous
+  drop-action plus owned expiry-claim handoff. Its Sol/xhigh review closed the pre-claim race but found
+  cleanup could be canceled/restarted after its first side effect. V12 transfers resources into one
+  observer-free cleanup flight before the first await. Its concurrency-qualified max review found that
+  early handle removal still exposed deterministic `g0` remint and forced worktree retirement could race
+  release. V13 retains a non-reusable tombstone until the exact flight succeeds and makes release/retire
+  join one worktree cleanup cell. A fresh Sol/xhigh re-review adjudicated both `FIXED`, found no new issues,
+  and returned `APPROVE`.
+- R2b0 local gates passed: Markdown links, `git diff --check`, fmt, workspace check, clippy with warnings
+  denied, **1,607 passed / 0 failed / 12 ignored**, release binary build, and repository hygiene (37
+  tracked artifacts / 7 example configs). Commit, fast-forward merge, push, and verify the approved
+  contract before adding diagnostic types.
