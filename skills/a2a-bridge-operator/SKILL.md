@@ -16,7 +16,8 @@ authentication, and container failures without guessing.
 3. For a sandboxed entry, also read
    [`../../docs/containerized-agents.md`](../../docs/containerized-agents.md).
 4. For current priorities and planned reliability work, read
-   [`../../docs/bridge-reliability.md`](../../docs/bridge-reliability.md).
+   [`../../docs/bridge-reliability.md`](../../docs/bridge-reliability.md) and resume from the canonical
+   [`../../docs/reliability-execution-roadmap.md`](../../docs/reliability-execution-roadmap.md).
 
 Treat checked-in docs and the live executable as the sources of truth. Treat historical files under
 `docs/superpowers/` and `docs/history/` as provenance, not current operating instructions.

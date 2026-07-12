@@ -9,6 +9,8 @@
 
 - [`roadmap.md`](roadmap.md) — priority order and the pause/resume boundary.
 - [`bridge-reliability.md`](bridge-reliability.md) — active reliability program and exit gates.
+- [`reliability-execution-roadmap.md`](reliability-execution-roadmap.md) — canonical slice status,
+  dependency graph, detailed-plan index, and new-session resume protocol.
 - [`compatibility.md`](compatibility.md) — dated host/container/model evidence and incident dispositions.
 - [`m4-observability-roadmap.md`](m4-observability-roadmap.md) — M4 Slice 3b, reserved 3c, and the
   Slice 1/2 deferred-item ledger.

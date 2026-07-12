@@ -2,6 +2,8 @@
 
 - **Status:** active P0 as of 2026-07-11
 - **Compatibility baseline:** [`compatibility.md`](compatibility.md)
+- **Execution and handoff cursor:**
+  [`reliability-execution-roadmap.md`](reliability-execution-roadmap.md)
 - **Operator workflow:** [`../skills/a2a-bridge-operator/SKILL.md`](../skills/a2a-bridge-operator/SKILL.md)
 
 ## Objective
@@ -140,15 +142,21 @@ Exit: a release cannot claim an agent path that was not tested from its distribu
 
 ## Immediate queue
 
-1. Implement the reviewed R2b phase/diagnostic contract, including total detached projection and
-   post-acceptance no-replay mappings.
-2. Add the separate explicitly billable R2c live-smoke command.
-3. Implement R2d's local non-billable fallback-plan only; keep authenticated in-process R2e disabled.
+1. Implement the reviewed R2b phase/diagnostic contract as R2b0–R2b3, including total detached
+   projection and post-acceptance no-replay mappings. Use the
+   [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md).
+2. Add the separate explicitly billable R2c live-smoke command from the
+   [R2c plan](superpowers/plans/2026-07-11-r2c-live-smoke.md).
+3. Implement R2d's local non-billable fallback-plan only from the
+   [R2d plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md); keep authenticated in-process
+   [R2e](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) deferred.
 4. Preserve adapter stderr and the deepest prompt error in the task journal.
 5. Make provider-limit failures explicit and keep the Fable-xhigh → Sol-max full-review fallback an
    operator-selected, separately recorded attempt.
-6. Make the reader image reproducible, then establish pinned and floating host/container lanes.
-7. Make the compatibility matrix a release checklist gate.
+6. Establish the pinned/floating compatibility lanes in the
+   [R3 plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md).
+7. Make the reader image reproducible and the compatibility matrix a release gate through the
+   [R4 plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md).
 
 ## Guardrails
 

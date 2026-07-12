@@ -6,7 +6,8 @@
 
 1. **P0 — bridge reliability and compatibility.** Make upstream agent, adapter, SDK, model, and
    container changes detectable and diagnosable before they consume feature work. The active plan is
-   [`bridge-reliability.md`](bridge-reliability.md).
+   [`bridge-reliability.md`](bridge-reliability.md); resume implementation from the canonical
+   [`reliability execution roadmap`](reliability-execution-roadmap.md).
 2. **M4 observability — paused after Slice 3a.** Slice 3a merged in
    [PR #19](https://github.com/shoedog/a2acp/pull/19). Slice 3b remains designed but unimplemented.
    Resume from [`m4-observability-roadmap.md`](m4-observability-roadmap.md), not from an older Slice 3
