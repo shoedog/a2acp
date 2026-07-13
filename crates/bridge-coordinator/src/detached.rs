@@ -232,13 +232,38 @@ pub trait WorkflowSink: Send {
 /// (the caller handles the no-terminal case per its own sink semantics).
 /// Returns `Err` on the first sink error, aborting the drain.
 pub async fn drain_workflow<S: WorkflowSink>(
-    mut stream: WorkflowStream,
+    stream: WorkflowStream,
     sink: &mut S,
 ) -> Result<bool, BridgeError> {
+    drain_workflow_inner(stream, sink, None).await
+}
+
+/// Detached-owner drain: preserve the first sink error, cancel the workflow,
+/// and keep polling until every already-in-flight node reaches its prompt/drain
+/// cleanup and rich-sink flush path. No further sink calls occur after the
+/// first error, so durable writes remain fail-closed while sibling ownership is
+/// still settled.
+pub async fn drain_workflow_cancel_on_sink_error<S: WorkflowSink>(
+    stream: WorkflowStream,
+    sink: &mut S,
+    cancel: CancellationToken,
+) -> Result<bool, BridgeError> {
+    drain_workflow_inner(stream, sink, Some(cancel)).await
+}
+
+async fn drain_workflow_inner<S: WorkflowSink>(
+    mut stream: WorkflowStream,
+    sink: &mut S,
+    cancel_on_error: Option<CancellationToken>,
+) -> Result<bool, BridgeError> {
     let mut terminal_seen = false;
+    let mut first_error = None;
     while let Some(item) = stream.next().await {
-        match item {
-            Ok(WorkflowEvent::NodeStarted { node }) => sink.node_started(node.as_str()).await?,
+        if first_error.is_some() {
+            continue;
+        }
+        let result = match item {
+            Ok(WorkflowEvent::NodeStarted { node }) => sink.node_started(node.as_str()).await,
             Ok(WorkflowEvent::NodeFinished {
                 node,
                 ok,
@@ -246,16 +271,29 @@ pub async fn drain_workflow<S: WorkflowSink>(
                 usage,
             }) => {
                 sink.node_finished(node.as_str(), ok, &output, usage.as_ref())
-                    .await?
+                    .await
             }
             Ok(WorkflowEvent::Terminal { outcome, output }) => {
-                sink.terminal(outcome, output).await?;
-                terminal_seen = true;
+                let result = sink.terminal(outcome, output).await;
+                if result.is_ok() {
+                    terminal_seen = true;
+                }
+                result
             }
-            Err(e) => sink.error(e).await?,
+            Err(e) => sink.error(e).await,
+        };
+        if let Err(error) = result {
+            let Some(cancel) = cancel_on_error.as_ref() else {
+                return Err(error);
+            };
+            first_error = Some(error);
+            cancel.cancel();
         }
     }
-    Ok(terminal_seen)
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(terminal_seen),
+    }
 }
 
 /// Unix-ms timestamp (server-side; `bridge-core` forbids `Date::now`, the server does not).
@@ -270,7 +308,7 @@ pub fn now_ms() -> i64 {
 use bridge_core::ids::{NodeId, OperationId, TaskId};
 use bridge_core::ports::{RichEventSink, RichEventSinkFactory};
 use bridge_core::task_store::{ResumeClaim, TaskRecord, TaskRecordStatus, TaskStore};
-use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
+use bridge_workflow::executor::{WorkflowDiagnosticContext, WorkflowExecutor, WorkflowRunContext};
 use bridge_workflow::graph::WorkflowGraph;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -545,6 +583,74 @@ mod sink_tests {
             })]));
         let mut sink = FailTerminalSink;
         assert!(drain_workflow(stream, &mut sink).await.is_err());
+    }
+
+    struct FailFirstNodeSink {
+        calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowSink for FailFirstNodeSink {
+        async fn node_finished(
+            &mut self,
+            _node: &str,
+            _ok: bool,
+            _output: &str,
+            _usage: Option<&bridge_core::orch::UsageSnapshot>,
+        ) -> Result<(), BridgeError> {
+            self.calls += 1;
+            Err(BridgeError::StoreFailure)
+        }
+
+        async fn terminal(
+            &mut self,
+            _outcome: WorkflowOutcome,
+            _output: String,
+        ) -> Result<(), BridgeError> {
+            panic!("no sink calls are allowed after the first durable error")
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_sink_error_cancels_and_drains_sibling_flush_before_returning() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cancel = CancellationToken::new();
+        let sibling_cancel = cancel.clone();
+        let rich_flushes = Arc::new(AtomicUsize::new(0));
+        let sibling_flushes = rich_flushes.clone();
+        let node = NodeId::parse("checkpoint-owner").unwrap();
+        let first = futures::stream::once(async move {
+            Ok(WorkflowEvent::NodeFinished {
+                node,
+                ok: true,
+                output: "checkpoint".into(),
+                usage: None,
+            })
+        });
+        let sibling = futures::stream::once(async move {
+            sibling_cancel.cancelled().await;
+            sibling_flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Canceled,
+                output: "canceled after sibling flush".into(),
+            })
+        });
+        let stream: WorkflowStream = Box::pin(first.chain(sibling));
+        let mut sink = FailFirstNodeSink { calls: 0 };
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drain_workflow_cancel_on_sink_error(stream, &mut sink, cancel.clone()),
+        )
+        .await
+        .expect("cancel-and-drain must not park")
+        .expect_err("the first checkpoint error remains primary");
+
+        assert!(matches!(error, BridgeError::StoreFailure));
+        assert!(cancel.is_cancelled());
+        assert_eq!(sink.calls, 1);
+        assert_eq!(rich_flushes.load(Ordering::SeqCst), 1);
     }
 
     /// Recording sink that logs the order of calls. Used to assert that
@@ -1340,6 +1446,33 @@ pub fn spawn_detached_workflow(
                 return;
             }
         };
+        let diagnostic_factory =
+            match bridge_core::diagnostics::TaskJournalDiagnosticObserverFactory::new(
+                deps.task_store.clone(),
+                task.clone(),
+                op.clone(),
+            )
+            .await
+            {
+                Ok(factory) => factory,
+                Err(_) => {
+                    let _ = finalize_detached(
+                        &deps.task_store,
+                        &deps.progress_hubs,
+                        &task,
+                        bridge_core::task_store::TaskRecordStatus::Failed,
+                        None,
+                        Some("diagnostic observer factory failed"),
+                        Some(&hub),
+                    )
+                    .await;
+                    fin.done = true;
+                    deps.workflow_cancels.lock().await.remove(&task);
+                    return;
+                }
+            };
+        let diagnostic_factory: Arc<dyn bridge_core::ports::DiagnosticObserverFactory> =
+            Arc::new(diagnostic_factory);
         ctx.make_rich_sink = Some(Arc::new(DetachedRichSinkFactory {
             store: deps.task_store.clone(),
             task: task.clone(),
@@ -1352,12 +1485,20 @@ pub fn spawn_detached_workflow(
         // stale value. This is the central safety boundary; caller-side fixes are defense in
         // depth. Must sit after sink construction and before any turn can be emitted.
         ctx.task_id = Some(task.clone());
-        let stream = executor.run_from_with_context(graph, input, run_id, token, seed, ctx);
+        let drain_cancel = token.clone();
+        let stream = executor.run_from_with_diagnostic_context(
+            graph,
+            input,
+            run_id,
+            token,
+            seed,
+            WorkflowDiagnosticContext::new(ctx, diagnostic_factory),
+        );
         // The DetachedProgressSink OWNS the sequenced terminal write: on a clean drain it
         // has already written `set_terminal_sequenced` AND published the Terminal frame.
         let mut sink =
             DetachedProgressSink::new(deps.task_store.clone(), task.clone(), hub.clone());
-        match drain_workflow(stream, &mut sink).await {
+        match drain_workflow_cancel_on_sink_error(stream, &mut sink, drain_cancel).await {
             Ok(true) => {
                 // Sink already committed+published the terminal. Do NOT write it again.
                 // M1: flip the finalizer done flag BEFORE the hub-removal await so the
@@ -1818,11 +1959,16 @@ pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
 mod resume_tests {
     use super::*;
     use crate::clock::ManualClock;
+    use bridge_core::diagnostics::{
+        DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor, PersistedPhaseTransition,
+        PersistedPhaseTransitionInput, PhaseStatus,
+    };
     use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
     use bridge_core::ids::{AgentId, NodeId, OperationId, SessionId, WorkflowId};
     use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::{
-        AgentBackend, AgentRegistry, BackendStream, Lease, ObsEvent, Observer, Resolved, Update,
+        AgentBackend, AgentRegistry, BackendObservers, BackendStream, DiagnosticObserver, Lease,
+        ObsEvent, Observer, Resolved, Update,
     };
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
     use bridge_observ::{DropCounter, TurnLogObserver};
@@ -1867,6 +2013,25 @@ mod resume_tests {
             item_id: None,
             artifacts_purged_at: None,
         }
+    }
+
+    fn diagnostic_event(phase: DiagnosticPhase, status: PhaseStatus) -> DiagnosticEvent {
+        DiagnosticEvent::new(
+            PersistedPhaseTransition::build(
+                PersistedPhaseTransitionInput {
+                    phase,
+                    status,
+                    at_ms: 10,
+                    operation: None,
+                    code: None,
+                    auth: None,
+                },
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
     }
 
     async fn wait_turn_rows_for_task(
@@ -1967,6 +2132,27 @@ mod resume_tests {
             })
         }
 
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            observer
+                .record(diagnostic_event(
+                    DiagnosticPhase::Resolve,
+                    PhaseStatus::Started,
+                ))
+                .await?;
+            let resolved = self.resolve(id).await?;
+            observer
+                .record(diagnostic_event(
+                    DiagnosticPhase::Resolve,
+                    PhaseStatus::Completed,
+                ))
+                .await?;
+            Ok(resolved)
+        }
+
         fn default_id(&self) -> AgentId {
             AgentId::parse("synth").unwrap()
         }
@@ -1977,6 +2163,165 @@ mod resume_tests {
 
         fn list(&self) -> Vec<AgentId> {
             vec![AgentId::parse("synth").unwrap()]
+        }
+    }
+
+    struct SelectiveFailureStore {
+        inner: MemoryTaskStore,
+        fail_checkpoint: bool,
+        fail_diagnostic: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskStore for SelectiveFailureStore {
+        async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError> {
+            self.inner.create(rec).await
+        }
+
+        async fn set_terminal(
+            &self,
+            id: &TaskId,
+            status: TaskRecordStatus,
+            result: Option<&str>,
+            error: Option<&str>,
+            updated_ms: i64,
+        ) -> Result<(), BridgeError> {
+            self.inner
+                .set_terminal(id, status, result, error, updated_ms)
+                .await
+        }
+
+        async fn get(&self, id: &TaskId) -> Result<Option<TaskRecord>, BridgeError> {
+            self.inner.get(id).await
+        }
+
+        async fn list(&self, limit: usize) -> Result<Vec<TaskRecord>, BridgeError> {
+            self.inner.list(limit).await
+        }
+
+        async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError> {
+            self.inner.sweep_interrupted(updated_ms).await
+        }
+
+        async fn cancel_if_working(
+            &self,
+            id: &TaskId,
+            updated_ms: i64,
+        ) -> Result<bool, BridgeError> {
+            self.inner.cancel_if_working(id, updated_ms).await
+        }
+
+        async fn put_node_checkpoint(
+            &self,
+            task: &TaskId,
+            node: &NodeId,
+            output: &str,
+            ok: bool,
+            ts: i64,
+        ) -> Result<(), BridgeError> {
+            self.inner
+                .put_node_checkpoint(task, node, output, ok, ts)
+                .await
+        }
+
+        async fn node_checkpoints(
+            &self,
+            task: &TaskId,
+        ) -> Result<Vec<(NodeId, String, bool, Option<UsageSnapshot>)>, BridgeError> {
+            self.inner.node_checkpoints(task).await
+        }
+
+        async fn claim_resume_attempt(
+            &self,
+            task: &TaskId,
+            cap: u32,
+            now_ms: i64,
+        ) -> Result<bridge_core::task_store::ResumeClaim, BridgeError> {
+            self.inner.claim_resume_attempt(task, cap, now_ms).await
+        }
+
+        async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError> {
+            self.inner.working_tasks().await
+        }
+
+        async fn record_node_started(
+            &self,
+            task: &TaskId,
+            node: &NodeId,
+            operation_id: &OperationId,
+            ts: i64,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .record_node_started(task, node, operation_id, ts)
+                .await
+        }
+
+        async fn put_node_checkpoint_sequenced(
+            &self,
+            task: &TaskId,
+            node: &NodeId,
+            operation_id: &OperationId,
+            output: &str,
+            ok: bool,
+            ts: i64,
+            usage: Option<&UsageSnapshot>,
+        ) -> Result<i64, BridgeError> {
+            if self.fail_checkpoint {
+                return Err(BridgeError::StoreFailure);
+            }
+            self.inner
+                .put_node_checkpoint_sequenced(task, node, operation_id, output, ok, ts, usage)
+                .await
+        }
+
+        async fn set_terminal_sequenced(
+            &self,
+            task: &TaskId,
+            operation_id: &OperationId,
+            status: TaskRecordStatus,
+            result: Option<&str>,
+            error: Option<&str>,
+            ts: i64,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .set_terminal_sequenced(task, operation_id, status, result, error, ts)
+                .await
+        }
+
+        async fn record_event_sequenced(
+            &self,
+            task: &TaskId,
+            operation_id: &OperationId,
+            ts: i64,
+            kind: bridge_core::orch::OrchEventKind,
+        ) -> Result<i64, BridgeError> {
+            if self.fail_diagnostic
+                && matches!(
+                    &kind,
+                    bridge_core::orch::OrchEventKind::Progress { progress }
+                        if progress.diagnostic_event().is_some()
+                )
+            {
+                return Err(BridgeError::StoreFailure);
+            }
+            self.inner
+                .record_event_sequenced(task, operation_id, ts, kind)
+                .await
+        }
+
+        async fn journal_from(
+            &self,
+            task: &TaskId,
+            after_seq: i64,
+        ) -> Result<Vec<bridge_core::orch::OrchEvent>, BridgeError> {
+            self.inner.journal_from(task, after_seq).await
+        }
+
+        async fn progress_snapshot(
+            &self,
+            task: &TaskId,
+        ) -> Result<bridge_core::task_store::TaskProgressSnapshot, BridgeError> {
+            self.inner.progress_snapshot(task).await
         }
     }
 
@@ -2044,6 +2389,253 @@ mod resume_tests {
             clock: Arc::new(ManualClock::new(100)),
             observer,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RichRaceRole {
+        CheckpointOwner,
+        PendingRichSibling,
+        Synth,
+    }
+
+    struct RichRaceBackend {
+        role: RichRaceRole,
+        sibling_recorded: Arc<tokio::sync::Notify>,
+        cancels: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for RichRaceBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("detached rich ownership must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            match self.role {
+                RichRaceRole::CheckpointOwner => {
+                    self.sibling_recorded.notified().await;
+                    Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    })])))
+                }
+                RichRaceRole::PendingRichSibling => {
+                    observers
+                        .rich
+                        .expect("detached owner supplies a rich sink")
+                        .record(bridge_core::orch::OrchEventKind::Plan { entries: vec![] });
+                    self.sibling_recorded.notify_one();
+                    Ok(Box::pin(futures::stream::pending()))
+                }
+                RichRaceRole::Synth => panic!("cancellation must prevent synth scheduling"),
+            }
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.cancels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RichRaceRegistry {
+        sibling_recorded: Arc<tokio::sync::Notify>,
+        sibling_cancels: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RichRaceRegistry {
+        fn entry(id: &AgentId) -> AgentEntry {
+            AgentEntry {
+                id: id.clone(),
+                cmd: Some("x".into()),
+                base_url: None,
+                api_key_env: None,
+                args: vec![],
+                kind: AgentKind::Acp,
+                model_provider: None,
+                model: None,
+                effort: None,
+                mode: None,
+                cwd: None,
+                session_cwd: None,
+                sandbox: None,
+                watchdog: None,
+                auth_method: None,
+                pre_authenticated: false,
+                name: None,
+                description: None,
+                tags: vec![],
+                version: None,
+                mcp: vec![],
+                mcp_delivery: Default::default(),
+                extensions: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for RichRaceRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            let (role, cancels) = match id.as_str() {
+                "checkpoint" => (
+                    RichRaceRole::CheckpointOwner,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                ),
+                "pending" => (
+                    RichRaceRole::PendingRichSibling,
+                    self.sibling_cancels.clone(),
+                ),
+                "synth" => (
+                    RichRaceRole::Synth,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                ),
+                other => return Err(BridgeError::UnknownAgent { id: other.into() }),
+            };
+            Ok(Resolved {
+                entry: Arc::new(Self::entry(id)),
+                backend: Arc::new(RichRaceBackend {
+                    role,
+                    sibling_recorded: self.sibling_recorded.clone(),
+                    cancels,
+                }),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            observer
+                .record(diagnostic_event(
+                    DiagnosticPhase::Resolve,
+                    PhaseStatus::Started,
+                ))
+                .await?;
+            let resolved = self.resolve(id).await?;
+            observer
+                .record(diagnostic_event(
+                    DiagnosticPhase::Resolve,
+                    PhaseStatus::Completed,
+                ))
+                .await?;
+            Ok(resolved)
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("checkpoint").unwrap()
+        }
+
+        async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            ["checkpoint", "pending", "synth"]
+                .into_iter()
+                .map(|id| AgentId::parse(id).unwrap())
+                .collect()
+        }
+    }
+
+    fn rich_race_graph() -> Arc<WorkflowGraph> {
+        let node = |id: &str, agent: &str, inputs: &[&str]| WorkflowNode {
+            id: NodeId::parse(id).unwrap(),
+            agent: AgentId::parse(agent).unwrap(),
+            prompt_template: "{{input}}".into(),
+            inputs: inputs
+                .iter()
+                .map(|input| NodeId::parse(*input).unwrap())
+                .collect(),
+            retry: None,
+        };
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("rich-race").unwrap(),
+            nodes: vec![
+                node("checkpoint", "checkpoint", &[]),
+                node("pending", "pending", &[]),
+                node("synth", "synth", &["checkpoint", "pending"]),
+            ],
+            panel: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn detached_checkpoint_failure_flushes_inflight_sibling_before_terminal_failure() {
+        let store = Arc::new(SelectiveFailureStore {
+            inner: MemoryTaskStore::new(),
+            fail_checkpoint: true,
+            fail_diagnostic: false,
+        });
+        let task = TaskId::parse("t-detached-checkpoint-rich-race").unwrap();
+        store
+            .create(&make_task_record(task.as_str()))
+            .await
+            .unwrap();
+        let graph = rich_race_graph();
+        let sibling_recorded = Arc::new(tokio::sync::Notify::new());
+        let sibling_cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deps = DetachedDeps {
+            task_store: store.clone(),
+            executor: Some(Arc::new(WorkflowExecutor::new(Arc::new(
+                RichRaceRegistry {
+                    sibling_recorded,
+                    sibling_cancels: sibling_cancels.clone(),
+                },
+            )))),
+            workflows: Arc::new(HashMap::from([(graph.id.clone(), graph.clone())])),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+            observer: Arc::new(NoopObserver),
+        };
+        let hub = Arc::new(TaskProgressHub::new());
+        deps.progress_hubs
+            .lock()
+            .await
+            .insert(task.clone(), hub.clone());
+
+        let handle = spawn_detached_workflow(
+            &deps,
+            task.clone(),
+            "input".into(),
+            graph,
+            task.as_str().into(),
+            CancellationToken::new(),
+            HashMap::new(),
+            WorkflowRunContext::default(),
+            hub,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("detached failure must cancel and drain the pending sibling")
+            .unwrap();
+
+        assert_eq!(sibling_cancels.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let journal = store.journal_from(&task, -1).await.unwrap();
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|event| {
+                    matches!(&event.kind, bridge_core::orch::OrchEventKind::Plan { .. })
+                })
+                .count(),
+            1,
+            "the pending sibling's accepted rich event must flush before failure returns"
+        );
+        assert_eq!(
+            store.get(&task).await.unwrap().unwrap().status,
+            TaskRecordStatus::Failed
+        );
     }
 
     #[tokio::test]
@@ -2119,6 +2711,114 @@ mod resume_tests {
 
         let rows = wait_turn_rows_for_task(&store, &task).await;
         assert!(rows.iter().all(|row| row.task_id == Some(task.clone())));
+
+        let journal = store.journal_from(&task, -1).await.unwrap();
+        let diagnostics: Vec<_> = journal
+            .iter()
+            .filter_map(|event| match &event.kind {
+                bridge_core::orch::OrchEventKind::Progress { progress } => {
+                    progress.diagnostic_event()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(diagnostics[1].transition().status(), PhaseStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn detached_diagnostic_write_failure_is_fatal_before_backend_prompt() {
+        let store: Arc<dyn TaskStore> = Arc::new(SelectiveFailureStore {
+            inner: MemoryTaskStore::new(),
+            fail_checkpoint: false,
+            fail_diagnostic: true,
+        });
+        let task = TaskId::parse("t-detached-diagnostic-write-fails").unwrap();
+        store
+            .create(&make_task_record(task.as_str()))
+            .await
+            .unwrap();
+        let graph = single_retry_graph();
+        let prompts = Arc::new(PromptRec::default());
+        let deps = DetachedDeps {
+            task_store: store.clone(),
+            executor: Some(Arc::new(WorkflowExecutor::new(Arc::new(
+                RecordingRegistry {
+                    synth: prompts.clone(),
+                },
+            )))),
+            workflows: Arc::new(HashMap::from([(graph.id.clone(), graph.clone())])),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+            observer: Arc::new(NoopObserver),
+        };
+
+        let handle = spawn_detached_workflow_for_test(
+            &deps,
+            task.clone(),
+            vec!["DIFF".into()],
+            graph.id.clone(),
+        )
+        .await;
+        handle.await.unwrap();
+
+        assert!(
+            prompts.prompts.lock().unwrap().is_empty(),
+            "a durable diagnostic failure during resolution must stop before prompt"
+        );
+        let record = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(record.status, TaskRecordStatus::Failed);
+        let journal = store.journal_from(&task, -1).await.unwrap();
+        assert!(journal.iter().all(|event| {
+            !matches!(
+                &event.kind,
+                bridge_core::orch::OrchEventKind::Progress { progress }
+                    if progress.diagnostic_event().is_some()
+            )
+        }));
+        assert!(
+            journal.iter().any(|event| matches!(
+                event.kind,
+                bridge_core::orch::OrchEventKind::Terminal { .. }
+            )),
+            "the failed task still receives one durable terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_missing_task_row_never_constructs_journal_authority_or_prompts() {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let task = TaskId::parse("t-detached-missing-row").unwrap();
+        let graph = single_retry_graph();
+        let prompts = Arc::new(PromptRec::default());
+        let deps = DetachedDeps {
+            task_store: store.clone(),
+            executor: Some(Arc::new(WorkflowExecutor::new(Arc::new(
+                RecordingRegistry {
+                    synth: prompts.clone(),
+                },
+            )))),
+            workflows: Arc::new(HashMap::from([(graph.id.clone(), graph.clone())])),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+            observer: Arc::new(NoopObserver),
+        };
+
+        let handle = spawn_detached_workflow_for_test(
+            &deps,
+            task.clone(),
+            vec!["DIFF".into()],
+            graph.id.clone(),
+        )
+        .await;
+        handle.await.unwrap();
+
+        assert!(prompts.prompts.lock().unwrap().is_empty());
+        assert!(store.get(&task).await.unwrap().is_none());
+        assert!(deps.progress_hubs.lock().await.is_empty());
     }
 
     #[tokio::test]

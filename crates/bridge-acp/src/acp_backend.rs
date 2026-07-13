@@ -3077,17 +3077,90 @@ impl AcpBackend {
     /// `:ro` container (the [`Drop`] impl). The advertised list is account/adapter-driven and
     /// sandbox-independent, so the probe builds this backend host-side (sandbox stripped).
     pub async fn describe_options(&self, cwd: &std::path::Path) -> Result<AgentCaps, BridgeError> {
-        let cx = self.cx()?;
+        self.describe_options_observed(
+            cwd,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    pub async fn describe_options_observed(
+        &self,
+        cwd: &std::path::Path,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<AgentCaps, BridgeError> {
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        let stderr = self
+            .stderr_ring
+            .as_ref()
+            .map(|ring| (ring.clone(), ring.cursor()));
+        let lifecycle = AcpLifecycle::new(
+            observer,
+            self.diagnostic_redactor_for_cwds(std::slice::from_ref(&cwd_text)),
+            stderr,
+        );
+        lifecycle
+            .record(
+                DiagnosticPhase::SessionCreate,
+                PhaseStatus::Started,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        let cx = match self.cx() {
+            Ok(cx) => cx,
+            Err(error) => {
+                AcpTraceEvent::DiscoverySessionCreateFailed.emit();
+                return Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::SessionCreate,
+                        Some(DiagnosticPhase::Authenticate),
+                        DiagnosticFailureClass::Transport,
+                        FailureDisposition::RetrySameTarget,
+                        "acp.discovery.session_create.transport",
+                        "ACP discovery session creation failed",
+                        Some(error.to_string()),
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await);
+            }
+        };
         // session/new with NO MCP servers — discovery configures nothing.
         let req = Self::new_session_request(cwd.to_path_buf(), &[]);
-        let resp = cx
-            .send_request(req)
-            .block_task()
-            .await
-            .inspect_err(|_| AcpTraceEvent::DiscoverySessionCreateFailed.emit())
-            .map_err(|e| {
-                BridgeError::agent_crashed(format!("session/new (describe_options) failed: {e}"))
-            })?;
+        let resp = match cx.send_request(req).block_task().await {
+            Ok(resp) => resp,
+            Err(error) => {
+                AcpTraceEvent::DiscoverySessionCreateFailed.emit();
+                return Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::SessionCreate,
+                        Some(DiagnosticPhase::Authenticate),
+                        DiagnosticFailureClass::Transport,
+                        FailureDisposition::RetrySameTarget,
+                        "acp.discovery.session_create.transport",
+                        "ACP discovery session creation failed",
+                        Some(error.to_string()),
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await);
+            }
+        };
+        lifecycle
+            .record(
+                DiagnosticPhase::SessionCreate,
+                PhaseStatus::Completed,
+                None,
+                None,
+                None,
+            )
+            .await?;
         let opts0 = resp.config_options.unwrap_or_default();
         let mut caps = if !opts0.is_empty() {
             caps_from_config_options(&opts0)
@@ -10473,8 +10546,9 @@ mod tests {
         // describe_options reads them into AgentCaps WITHOUT sending a prompt or configuring anything.
         let rec = Recorder::new("agent-sess-DESCRIBE");
         let be = connect_recording(rec.clone()).await;
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
         let caps = be
-            .describe_options(std::path::Path::new("/tmp"))
+            .describe_options_observed(std::path::Path::new("/tmp"), observer.clone())
             .await
             .expect("describe_options succeeds");
         assert_eq!(caps.current_model.as_deref(), Some("default"));
@@ -10494,6 +10568,65 @@ mod tests {
             rec.set_config_options.lock().await.is_empty() && rec.set_modes.lock().await.is_empty(),
             "describe_options configures nothing"
         );
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.transition().phase() == DiagnosticPhase::SessionCreate));
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn describe_options_observed_reports_structured_session_failure() {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_session_rejecting_agent(agent_side, "discovery session rejected");
+        let backend = AcpBackend::connect(client_side, test_config())
+            .await
+            .unwrap();
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+
+        let error = backend
+            .describe_options_observed(std::path::Path::new("/tmp"), observer.clone())
+            .await
+            .expect_err("rejected discovery session must fail");
+
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::SessionCreate,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        assert_eq!(
+            diagnostic.disposition(),
+            FailureDisposition::RetrySameTarget
+        );
+        assert_eq!(
+            diagnostic.code().as_str(),
+            "acp.discovery.session_create.transport"
+        );
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn describe_options_observer_failure_prevents_session_creation() {
+        let rec = Recorder::new("agent-sess-DESCRIBE-OBSERVER-FAIL");
+        let backend = connect_recording(rec.clone()).await;
+        let observer = Arc::new(RejectOnRecord {
+            count: AtomicU64::new(0),
+            reject_at: 1,
+        });
+
+        let error = backend
+            .describe_options_observed(std::path::Path::new("/tmp"), observer)
+            .await
+            .expect_err("failed started-event write must stop discovery");
+
+        assert!(matches!(error, BridgeError::StoreFailure));
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

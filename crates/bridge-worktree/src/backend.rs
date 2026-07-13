@@ -7,7 +7,7 @@ use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
 use bridge_core::permission::TurnMeta;
-use bridge_core::ports::{AgentBackend, BackendStream, RichEventSink};
+use bridge_core::ports::{AgentBackend, BackendObservers, BackendStream, RichEventSink};
 use bridge_core::SessionCwd;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,6 +80,17 @@ impl AgentBackend for WorktreeBackend {
         sink: Arc<dyn RichEventSink>,
     ) -> Result<BackendStream, BridgeError> {
         self.inner.prompt_observed(session, parts, sink).await
+    }
+
+    async fn prompt_with_observers(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        observers: BackendObservers,
+    ) -> Result<BackendStream, BridgeError> {
+        self.inner
+            .prompt_with_observers(session, parts, observers)
+            .await
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
@@ -306,13 +317,16 @@ mod tests {
     use bridge_core::domain::{EffectiveConfig, Part, SessionSpec};
     use bridge_core::error::BridgeError;
     use bridge_core::ids::SessionId;
-    use bridge_core::ports::{AgentBackend, BackendStream, Update};
+    use bridge_core::ports::{
+        AgentBackend, BackendStream, DiagnosticObserver, RichEventSink, Update,
+    };
     use bridge_core::SessionCwd;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
+    use tokio_stream::StreamExt;
 
     #[derive(Default)]
     struct Rec {
@@ -321,6 +335,9 @@ mod tests {
         configure_count: AtomicUsize,
         add_count: AtomicUsize,
         remove_count: AtomicUsize,
+        composite_count: AtomicUsize,
+        diagnostics: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+        rich_sinks: Mutex<Vec<Arc<dyn RichEventSink>>>,
     }
 
     struct FakeInner {
@@ -334,6 +351,28 @@ mod tests {
             _session: &SessionId,
             _parts: Vec<Part>,
         ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::iter(Vec::<
+                Result<Update, BridgeError>,
+            >::new())))
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            self.rec.composite_count.fetch_add(1, Ordering::SeqCst);
+            self.rec
+                .diagnostics
+                .lock()
+                .unwrap()
+                .push(observers.diagnostic);
+            self.rec
+                .rich_sinks
+                .lock()
+                .unwrap()
+                .push(observers.rich.expect("test supplies a rich sink"));
             Ok(Box::pin(tokio_stream::iter(Vec::<
                 Result<Update, BridgeError>,
             >::new())))
@@ -451,6 +490,59 @@ mod tests {
             identity(),
         ));
         (be, rec, tmp, source, cfg)
+    }
+
+    #[derive(Default)]
+    struct MarkerDiagnostic;
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for MarkerDiagnostic {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MarkerRichSink;
+
+    #[async_trait::async_trait]
+    impl RichEventSink for MarkerRichSink {
+        fn record(&self, _kind: bridge_core::orch::OrchEventKind) {}
+
+        async fn flush(&self) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_with_observers_forwards_both_channels_exactly_once() {
+        let (backend, rec, tmp, _source, _cfg) = backend_fixture("composite-forwarding");
+        let session = SessionId::parse("ctx-composite-g0").unwrap();
+        let diagnostic: Arc<dyn DiagnosticObserver> = Arc::new(MarkerDiagnostic);
+        let rich: Arc<dyn RichEventSink> = Arc::new(MarkerRichSink);
+
+        let mut stream = backend
+            .prompt_with_observers(
+                &session,
+                vec![],
+                BackendObservers::new(diagnostic.clone(), Some(rich.clone())),
+            )
+            .await
+            .unwrap();
+        assert!(stream.next().await.is_none());
+
+        assert_eq!(rec.composite_count.load(Ordering::SeqCst), 1);
+        let seen_diagnostics = rec.diagnostics.lock().unwrap();
+        assert_eq!(seen_diagnostics.len(), 1);
+        assert!(Arc::ptr_eq(&seen_diagnostics[0], &diagnostic));
+        let seen_rich = rec.rich_sinks.lock().unwrap();
+        assert_eq!(seen_rich.len(), 1);
+        assert!(Arc::ptr_eq(&seen_rich[0], &rich));
+
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[tokio::test]

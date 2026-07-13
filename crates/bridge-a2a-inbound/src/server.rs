@@ -44,14 +44,15 @@ use bridge_core::ids::{
 };
 use bridge_core::permission::{PermissionRegistry, TurnMeta};
 use bridge_core::ports::{
-    AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
-    RouteDecision, SessionStore,
+    AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, DiagnosticObserver, Lease,
+    PolicyEngine, RouteDecision, SessionStore,
 };
 use bridge_core::task_store::BatchItem;
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 use bridge_core::SessionCwd;
 use bridge_workflow::executor::{
-    NodeTurn, NodeTurnCleanup, NodeTurnExit, WorkflowNodeDispatcher, WorkflowRunContext,
+    NodeTurn, NodeTurnCleanup, NodeTurnExit, WorkflowDiagnosticContext, WorkflowNodeDispatcher,
+    WorkflowRunContext,
 };
 use bridge_workflow::graph::WorkflowNode;
 
@@ -73,6 +74,14 @@ const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
 const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error.
 const JSONRPC_INTERNAL: i32 = -32603;
+const DIRECT_DIAGNOSTIC_CAPACITY: usize = 64;
+
+fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
+    Arc::new(
+        bridge_core::diagnostics::InMemoryDiagnosticObserver::new(DIRECT_DIAGNOSTIC_CAPACITY)
+            .expect("direct diagnostic capacity is nonzero"),
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceHttpConfig {
@@ -477,6 +486,7 @@ async fn resolve_configure_bind(
     routed: &RoutedCall,
     overrides: Option<&AgentOverride>,
     session_cwd: Option<SessionCwd>,
+    observer: Arc<dyn DiagnosticObserver>,
 ) -> Result<LocalDispatch, BridgeError> {
     let session = &routed.session;
     // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
@@ -519,7 +529,7 @@ async fn resolve_configure_bind(
         }
     }
     // First message: resolve, configure, bind, and hand back an eviction guard.
-    let resolved = srv.registry().resolve(agent_id).await?;
+    let resolved = srv.registry().resolve_observed(agent_id, observer).await?;
     let eff = effective_config(&resolved.entry, overrides);
     let obs_model = eff.model.clone();
     let obs_effort = eff.effort;
@@ -622,15 +632,17 @@ async fn warm_local_dispatch(
     srv: &Arc<InboundServer>,
     agent_id: &AgentId,
     routed: &RoutedCall,
+    observer: Arc<dyn DiagnosticObserver>,
 ) -> Option<Result<LocalDispatch, BridgeError>> {
     let ctx = routed.context_id.clone()?;
     let sm = srv.session_manager().clone();
     match sm
-        .checkout_turn(
+        .checkout_turn_observed(
             &ctx,
             agent_id.clone(),
             routed.overrides.clone(),
             routed.session_cwd.clone(),
+            observer,
         )
         .await
     {
@@ -686,7 +698,25 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
         wf_id: &str,
         node: &WorkflowNode,
         _run_id: &str,
+        ctx: &WorkflowRunContext,
+    ) -> Result<NodeTurn, BridgeError> {
+        self.checkout_observed(
+            wf_id,
+            node,
+            _run_id,
+            ctx,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    async fn checkout_observed(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        _run_id: &str,
         _ctx: &WorkflowRunContext,
+        observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<NodeTurn, BridgeError> {
         let child = ContextId::parse(format!(
             "{}::workflow::{}::node::{}",
@@ -696,12 +726,13 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
         ))?;
         let turn = self
             .sm
-            .checkout_child_turn(
+            .checkout_child_turn_observed(
                 &self.parent,
                 &child,
                 node.agent.clone(),
                 None,
                 self.cwd.clone(),
+                observer,
             )
             .await?;
         Ok(NodeTurn {
@@ -759,8 +790,9 @@ async fn resolve_for_fanout(
     session: &SessionId,
     overrides: Option<&AgentOverride>,
     session_cwd: Option<SessionCwd>,
+    observer: Arc<dyn DiagnosticObserver>,
 ) -> Result<(Arc<dyn AgentBackend>, Box<dyn Lease>), BridgeError> {
-    let resolved = srv.registry().resolve(agent_id).await?;
+    let resolved = srv.registry().resolve_observed(agent_id, observer).await?;
     let eff = effective_config(&resolved.entry, overrides);
     resolved
         .backend
@@ -1513,23 +1545,26 @@ async fn stream_message(
             // SSE frame rather than a JSON-RPC error (streaming has already committed
             // to an SSE response).
             let agent_id = local_agent_id(&srv, &routed.target);
-            let dispatch = match warm_local_dispatch(&srv, &agent_id, &routed).await {
-                Some(r) => r,
-                None => {
-                    resolve_configure_bind(
-                        &srv,
-                        &agent_id,
-                        &routed,
-                        routed.overrides.as_ref(),
-                        routed.session_cwd.clone(),
-                    )
-                    .await
-                }
-            };
+            let diagnostic = direct_diagnostic_observer();
+            let dispatch =
+                match warm_local_dispatch(&srv, &agent_id, &routed, diagnostic.clone()).await {
+                    Some(r) => r,
+                    None => {
+                        resolve_configure_bind(
+                            &srv,
+                            &agent_id,
+                            &routed,
+                            routed.overrides.as_ref(),
+                            routed.session_cwd.clone(),
+                            diagnostic.clone(),
+                        )
+                        .await
+                    }
+                };
             match dispatch {
                 Ok(dispatch) => {
                     let _ = srv.store.put(&routed.task, &dispatch.session).await;
-                    spawn_local_producer(&srv, routed, dispatch, tx)
+                    spawn_local_producer(&srv, routed, dispatch, diagnostic, tx)
                 }
                 Err(e) => {
                     tokio::spawn(async move {
@@ -2111,6 +2146,7 @@ fn spawn_local_producer(
     srv: &Arc<InboundServer>,
     routed: RoutedCall,
     dispatch: LocalDispatch,
+    diagnostic: Arc<dyn DiagnosticObserver>,
     tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
 ) {
     let store = srv.store.clone();
@@ -2141,13 +2177,14 @@ fn spawn_local_producer(
             backend.configure_turn(&session, meta).await;
         }
         let translator = Translator::new();
-        let mut events = translator.run(
+        let mut events = translator.run_observed(
             backend.as_ref(),
             store.as_ref(),
             policy.as_ref(),
             &task,
             &session,
             parts,
+            diagnostic,
         );
         let mut errored = false;
         // Whether the translator already emitted its own terminal frame (a
@@ -2443,6 +2480,7 @@ async fn poll_cancel_requested(store: &dyn SessionStore, local: &TaskId) {
 
 /// Build a `Source` for the local Kiro backend by running the Translator inside an
 /// `async_stream::stream!` that owns all the `Arc` clones it needs — no lifetime fight.
+#[allow(clippy::too_many_arguments)]
 fn local_kiro_source(
     label: String,
     backend: Arc<dyn AgentBackend>,
@@ -2451,17 +2489,19 @@ fn local_kiro_source(
     task: TaskId,
     session: SessionId,
     parts: Vec<Part>,
+    diagnostic: Arc<dyn DiagnosticObserver>,
 ) -> Source {
     // Build the stream by cloning Arc refs into a `'static + Send` stream.
     let stream: crate::fanout::EventStream = Box::pin(async_stream::stream! {
         let translator = Translator::new();
-        let mut events = translator.run(
+        let mut events = translator.run_observed(
             backend.as_ref(),
             store.as_ref(),
             policy.as_ref(),
             &task,
             &session,
             parts,
+            diagnostic,
         );
         while let Some(ev) = events.next().await {
             // A fan-out SOURCE must never emit a terminal frame — the fan-out
@@ -2510,6 +2550,7 @@ fn spawn_fanout_producer(
         //    out from under either path. `_lease` is kept alive until the producer
         //    task exits. A resolve/configure failure makes the local source a single
         //    labeled error frame (the coordinator's terminal still covers completion).
+        let diagnostic = direct_diagnostic_observer();
         let (kiro_source, kiro_backend, _lease): (Source, Option<Arc<dyn AgentBackend>>, _) =
             match resolve_for_fanout(
                 &srv,
@@ -2518,6 +2559,7 @@ fn spawn_fanout_producer(
                 &session,
                 overrides.as_ref(),
                 session_cwd,
+                diagnostic.clone(),
             )
             .await
             {
@@ -2530,6 +2572,7 @@ fn spawn_fanout_producer(
                         task.clone(),
                         session.clone(),
                         parts.clone(),
+                        diagnostic,
                     );
                     (src, Some(backend), Some(lease))
                 }
@@ -2788,25 +2831,34 @@ fn spawn_workflow_producer(
                 task_id: Some(routed.task.clone()),
                 prompt_id: routed.prompt_id.clone(),
             };
+            let diagnostic_ctx = WorkflowDiagnosticContext::new(
+                wf_ctx,
+                Arc::new(
+                    bridge_core::diagnostics::InMemoryDiagnosticObserverFactory::new(
+                        DIRECT_DIAGNOSTIC_CAPACITY,
+                    )
+                    .expect("direct diagnostic capacity is nonzero"),
+                ),
+            );
             let stream = match &workflow_token {
-                Some((c, _)) => executor.run_with_context_and_dispatcher(
+                Some((c, _)) => executor.run_with_diagnostic_context_and_dispatcher(
                     graph,
                     input,
                     task.as_str().into(),
                     token,
-                    wf_ctx,
+                    diagnostic_ctx,
                     Arc::new(WarmWorkflowNodeDispatcher {
                         sm: srv.session_manager().clone(),
                         parent: c.clone(),
                         cwd: routed.session_cwd.clone(),
                     }),
                 ),
-                None => executor.run_with_context(
+                None => executor.run_with_diagnostic_context(
                     graph,
                     input,
                     task.as_str().to_string(),
                     token,
-                    wf_ctx,
+                    diagnostic_ctx,
                 ),
             };
             let mut sink = SseSink { tx: tx.clone() };
@@ -3110,19 +3162,22 @@ async fn unary_message(
             // for the call's DURATION (so an interleaved cancel finds the binding) and
             // is dropped at the end of this scope → eviction after `collect().await`.
             // A follow-up reuses the binding and carries no guard (no premature evict).
-            let dispatch = match warm_local_dispatch(&srv, agent_id, &routed).await {
-                Some(r) => r,
-                None => {
-                    resolve_configure_bind(
-                        &srv,
-                        agent_id,
-                        &routed,
-                        routed.overrides.as_ref(),
-                        routed.session_cwd.clone(),
-                    )
-                    .await
-                }
-            };
+            let diagnostic = direct_diagnostic_observer();
+            let dispatch =
+                match warm_local_dispatch(&srv, agent_id, &routed, diagnostic.clone()).await {
+                    Some(r) => r,
+                    None => {
+                        resolve_configure_bind(
+                            &srv,
+                            agent_id,
+                            &routed,
+                            routed.overrides.as_ref(),
+                            routed.session_cwd.clone(),
+                            diagnostic.clone(),
+                        )
+                        .await
+                    }
+                };
             let dispatch = match dispatch {
                 Ok(d) => d,
                 Err(e) => return bridge_err_to_jsonrpc(id, &e),
@@ -3143,13 +3198,14 @@ async fn unary_message(
             let parts =
                 assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
             let translator = Translator::new();
-            let mut events = translator.run(
+            let mut events = translator.run_observed(
                 dispatch.backend.as_ref(),
                 srv.store.as_ref(),
                 srv.policy().as_ref(),
                 &routed.task,
                 &dispatch.session,
                 parts,
+                diagnostic,
             );
             let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
             loop {
@@ -3327,6 +3383,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
     // (`_lease`) for the unary collect's lifetime so the slot can't retire mid-run.
     // A resolve/configure failure makes the local source a single labeled error frame.
     let agent_id = local_agent_id(&srv, &routed.target);
+    let diagnostic = direct_diagnostic_observer();
     let (kiro_source, _lease) = match resolve_for_fanout(
         &srv,
         &agent_id,
@@ -3334,6 +3391,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
         &routed.session,
         routed.overrides.as_ref(),
         routed.session_cwd.clone(),
+        diagnostic.clone(),
     )
     .await
     {
@@ -3346,6 +3404,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
                 routed.task.clone(),
                 routed.session.clone(),
                 routed.parts.clone(),
+                diagnostic,
             );
             (src, Some(lease))
         }
@@ -4468,6 +4527,7 @@ mod tests {
         default: AgentId,
         entries: std::collections::HashMap<String, AgentEntry>,
         backends: std::collections::HashMap<String, Arc<dyn AgentBackend>>,
+        observed: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
     }
 
     impl FakeRegistry {
@@ -4495,7 +4555,12 @@ mod tests {
                 default: AgentId::parse(default).unwrap(),
                 entries,
                 backends,
+                observed: Mutex::new(Vec::new()),
             })
+        }
+
+        fn observed(&self) -> Vec<Arc<dyn DiagnosticObserver>> {
+            self.observed.lock().unwrap().clone()
         }
     }
 
@@ -4511,6 +4576,14 @@ mod tests {
                 }),
                 _ => Err(BridgeError::UnknownAgent { id: key.to_owned() }),
             }
+        }
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            self.observed.lock().unwrap().push(observer);
+            self.resolve(id).await
         }
         fn default_id(&self) -> AgentId {
             self.default.clone()
@@ -5088,6 +5161,113 @@ mod tests {
             Arc::new(NoDelegation),
             "kiro",
         ))
+    }
+
+    #[derive(Default)]
+    struct InboundObserverBackend {
+        prompts: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for InboundObserverBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("inbound owners must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            assert!(observers.rich.is_none());
+            self.prompts.lock().unwrap().push(observers.diagnostic);
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::Text("observed".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct InboundObserverRegistry {
+        backend: Arc<InboundObserverBackend>,
+        resolutions: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+        fail_resolution: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for InboundObserverRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            panic!("inbound owners must use resolve_observed")
+        }
+
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            self.resolutions.lock().unwrap().push(observer);
+            if self.fail_resolution {
+                return Err(BridgeError::UnknownAgent {
+                    id: id.as_str().to_string(),
+                });
+            }
+            Ok(Resolved {
+                entry: Arc::new(bare_entry(id.as_str())),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("kiro").unwrap()
+        }
+
+        async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![self.default_id()]
+        }
+    }
+
+    fn build_observer_path_server(
+        route: Arc<dyn RouteDecision>,
+        delegation: Arc<dyn DelegationPort>,
+        fail_resolution: bool,
+    ) -> (
+        Arc<InboundServer>,
+        Arc<InboundObserverRegistry>,
+        Arc<InboundObserverBackend>,
+    ) {
+        let backend = Arc::new(InboundObserverBackend::default());
+        let registry = Arc::new(InboundObserverRegistry {
+            backend: backend.clone(),
+            resolutions: Mutex::new(Vec::new()),
+            fail_resolution,
+        });
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let coordinator = test_coordinator(registry.clone(), store, Arc::new(AutoApprove));
+        let server = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            route,
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            delegation,
+            "kiro",
+        ));
+        (server, registry, backend)
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6966,6 +7146,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_unary_and_streaming_thread_resolution_observer_into_prompt() {
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(AlwaysKiro), Arc::new(NoDelegation), false);
+
+        let unary = router(server.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "taskId": "observer-unary", "message": { "text": "unary" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unary.status(), StatusCode::OK);
+        let unary_body = body_string(unary).await;
+        assert!(unary_body.contains("observed"), "{unary_body}");
+
+        let streaming = router(server)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "taskId": "observer-streaming", "message": { "text": "streaming" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(streaming.status(), StatusCode::OK);
+        let streaming_body = body_string(streaming).await;
+        assert!(streaming_body.contains("observed"), "{streaming_body}");
+
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(resolutions.len(), 2);
+        assert_eq!(prompts.len(), 2);
+        for index in 0..2 {
+            assert!(Arc::ptr_eq(&resolutions[index], &prompts[index]));
+        }
+        assert!(
+            !Arc::ptr_eq(&resolutions[0], &resolutions[1]),
+            "each inbound operation owns a fresh observer"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_unary_and_streaming_thread_checkout_observer_into_prompt() {
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(AlwaysKiro), Arc::new(NoDelegation), false);
+
+        let unary = router(server.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": "observer-warm-unary-task",
+                    "message": {
+                        "contextId": "observer-warm-unary",
+                        "text": "unary"
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unary.status(), StatusCode::OK);
+        let unary_body = body_string(unary).await;
+        assert!(unary_body.contains("observed"), "{unary_body}");
+
+        let streaming = router(server)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({
+                    "taskId": "observer-warm-streaming-task",
+                    "message": {
+                        "contextId": "observer-warm-streaming",
+                        "text": "streaming"
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(streaming.status(), StatusCode::OK);
+        let streaming_body = body_string(streaming).await;
+        assert!(streaming_body.contains("observed"), "{streaming_body}");
+
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(resolutions.len(), 2);
+        assert_eq!(prompts.len(), 2);
+        for index in 0..2 {
+            assert!(Arc::ptr_eq(&resolutions[index], &prompts[index]));
+        }
+        assert!(!Arc::ptr_eq(&resolutions[0], &resolutions[1]));
+    }
+
+    #[tokio::test]
+    async fn direct_unary_and_streaming_observe_resolution_failure_before_prompt() {
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(AlwaysKiro), Arc::new(NoDelegation), true);
+
+        let unary = router(server.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "taskId": "observer-fail-unary", "message": { "text": "unary" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let unary_body = body_string(unary).await;
+        assert!(unary_body.contains("unknown agent"), "{unary_body}");
+
+        let streaming = router(server)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "taskId": "observer-fail-streaming", "message": { "text": "streaming" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let streaming_body = body_string(streaming).await;
+        assert!(streaming_body.contains("unknown agent"), "{streaming_body}");
+
+        assert_eq!(registry.resolutions.lock().unwrap().len(), 2);
+        assert!(
+            backend.prompts.lock().unwrap().is_empty(),
+            "translator/prompt must not begin after resolution failure"
+        );
+    }
+
+    #[tokio::test]
     async fn unary_send_message_returns_full_multichunk_artifact() {
         let srv = build(
             MultiChunkBackend::new(vec!["AL", "PHA"], "end_turn"),
@@ -8115,6 +8422,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fanout_unary_and_streaming_thread_one_local_source_observer() {
+        let delegation = FakeDelegation::new(vec![Ok(Event::artifact("peer"))], Some("peer-1"));
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(FanoutSkillRoute), delegation, false);
+
+        let unary = router(server.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(unary.status(), StatusCode::OK);
+        let unary_body = body_string(unary).await;
+        assert!(unary_body.contains("observed"), "{unary_body}");
+
+        let streaming = router(server)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                fanout_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(streaming.status(), StatusCode::OK);
+        let streaming_body = body_string(streaming).await;
+        assert!(streaming_body.contains("observed"), "{streaming_body}");
+
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(resolutions.len(), 2);
+        assert_eq!(prompts.len(), 2);
+        for index in 0..2 {
+            assert!(Arc::ptr_eq(&resolutions[index], &prompts[index]));
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_local_source_observes_resolution_failure_before_prompt() {
+        let delegation = FakeDelegation::new(vec![Ok(Event::artifact("peer"))], Some("peer-1"));
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(FanoutSkillRoute), delegation, true);
+
+        let response = router(server)
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        let _ = body_string(response).await;
+
+        assert_eq!(registry.resolutions.lock().unwrap().len(), 1);
+        assert!(
+            backend.prompts.lock().unwrap().is_empty(),
+            "fan-out translator/prompt must not begin after resolution failure"
+        );
+    }
+
+    #[tokio::test]
     async fn local_kiro_source_drops_usage_events() {
         let source = local_kiro_source(
             "kiro".into(),
@@ -8124,6 +8485,7 @@ mod tests {
             TaskId::parse("task-usage").unwrap(),
             SessionId::parse("session-usage").unwrap(),
             vec![Part { text: "go".into() }],
+            direct_diagnostic_observer(),
         );
 
         let out: Vec<Result<Event, BridgeError>> = source.stream.collect().await;
@@ -8965,6 +9327,7 @@ mod tests {
         release_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         release_started: Arc<tokio::sync::Notify>,
         release_started_count: AtomicUsize,
+        diagnostics: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
     }
 
     impl WarmRecordingBackend {
@@ -8978,6 +9341,7 @@ mod tests {
                 release_gate: Arc::new(Mutex::new(None)),
                 release_started: Arc::new(tokio::sync::Notify::new()),
                 release_started_count: AtomicUsize::new(0),
+                diagnostics: Mutex::new(Vec::new()),
             })
         }
 
@@ -8999,6 +9363,10 @@ mod tests {
 
         fn forgotten(&self) -> Vec<String> {
             self.forgotten.lock().unwrap().clone()
+        }
+
+        fn diagnostics(&self) -> Vec<Arc<dyn DiagnosticObserver>> {
+            self.diagnostics.lock().unwrap().clone()
         }
 
         fn gate_release_session(&self) -> oneshot::Sender<()> {
@@ -9044,6 +9412,17 @@ mod tests {
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            session: &SessionId,
+            parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            assert!(observers.rich.is_none());
+            self.diagnostics.lock().unwrap().push(observers.diagnostic);
+            self.prompt(session, parts).await
         }
 
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -9241,6 +9620,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_warm_workflow_with_correlation_task_uses_in_memory_observer() {
+        use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+
+        struct FixedDiagnosticFactory(Arc<dyn DiagnosticObserver>);
+        impl DiagnosticObserverFactory for FixedDiagnosticFactory {
+            fn make(
+                &self,
+                _node: &bridge_core::ids::NodeId,
+                _attempt: u32,
+            ) -> Arc<dyn DiagnosticObserver> {
+                self.0.clone()
+            }
+        }
+
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        let observer = direct_diagnostic_observer();
+        let context = WorkflowRunContext {
+            task_id: Some(TaskId::parse("correlation-only-warm-workflow").unwrap()),
+            ..WorkflowRunContext::default()
+        };
+        let graph = Arc::new(WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("wf-observed").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: bridge_core::ids::NodeId::parse("n1").unwrap(),
+                agent: AgentId::parse("a").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+            }],
+            panel: None,
+        });
+        let dispatcher = Arc::new(WarmWorkflowNodeDispatcher {
+            sm,
+            parent: ContextId::parse("parent-observed").unwrap(),
+            cwd: None,
+        });
+
+        let events = WorkflowExecutor::new(registry.clone())
+            .run_with_diagnostic_context_and_dispatcher(
+                graph,
+                "go".into(),
+                "run-observed".into(),
+                tokio_util::sync::CancellationToken::new(),
+                WorkflowDiagnosticContext::new(
+                    context,
+                    Arc::new(FixedDiagnosticFactory(observer.clone())),
+                ),
+                dispatcher,
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let resolutions = registry.observed();
+        let prompts = backend.diagnostics();
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(prompts.len(), 1);
+        assert!(Arc::ptr_eq(&resolutions[0], &observer));
+        assert!(Arc::ptr_eq(&prompts[0], &observer));
+    }
+
+    #[tokio::test]
     async fn pre_producer_run_guard_drop_releases_context_unless_disarmed() {
         let runs = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let cancels = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -9342,7 +9792,7 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
-        spawn_local_producer(&srv, routed, dispatch, tx);
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
@@ -9404,7 +9854,7 @@ mod tests {
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-        spawn_local_producer(&srv, routed, dispatch, tx);
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
 
         wait_until(|| {
             matches!(
@@ -9495,7 +9945,7 @@ mod tests {
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-        spawn_local_producer(&srv, routed, dispatch, tx);
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
 
         wait_until(|| {
             matches!(
@@ -9615,7 +10065,7 @@ mod tests {
         // Capacity=1: first tx.send succeeds, second blocks → dropping rx makes it fail.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
 
-        spawn_local_producer(&srv, routed, dispatch, tx);
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
 
         // Wait for TurnStarted so the producer is running, then drop the receiver.
         wait_until(|| {

@@ -2,8 +2,8 @@
 
 - **Program status:** active P0
 - **R2b1 implementation baseline:** `main` at `7b788c1f` on 2026-07-12
-- **Completed through:** R2b2a observer/storage/registry compatibility
-- **Next action:** close the fresh Sol/xhigh R2b2b review, then run exact-tree full gates and commit 2b
+- **Completed through:** R2b2c production-owner/workflow authority, review-approved and exact-tree full-gated (commit pending)
+- **Next action:** commit and push R2b2c as the third internal R2b2 commit, then begin concurrency-qualified R2b2d
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -43,7 +43,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
-| R2b2 — ACP/Fable lifecycle diagnostics | **IN PROGRESS** (2a committed at `4ed12f1`; 2b closure pending) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, then concurrency-qualified warm cleanup; one final merge boundary. |
+| R2b2 — ACP/Fable lifecycle diagnostics | **IN PROGRESS** (2a `4ed12f1`; 2b `f40096df`; 2c review 7 `APPROVE` and exact-tree gates green; 2d next) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, then concurrency-qualified warm cleanup; one final merge boundary. |
 | R2b3 — API/container diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
@@ -192,7 +192,9 @@ Next action:
 
 ## Current handoff
 
-- `origin/main` contains R2b1 at `7b788c1f`; R2b2 ACP/Fable lifecycle evidence is the next slice.
+- `origin/main` contains R2b1 at `7b788c1f`; R2b2 is active on
+  `agent/reliability-r2b2-acp-lifecycle`. R2b2c has final review 7 `APPROVE` and exact-tree full gates;
+  commit/push 2c, then begin 2d.
 - R2b0's full local suite was 1,607 passed / 0 failed / 12 ignored live-agent tests.
 - A fresh bridge-mediated Fable/xhigh review returned `R2A: READY`, `V6 DESIGN: READY`, `MERGE`.
 - The Podman bare image-id normalization and non-vacuous descendant survivor-marker regression were
@@ -246,8 +248,9 @@ Next action:
 - R2b1 was fast-forwarded to `origin/main` at `7b788c1fa6b62459e8a8473ca853f9414b28bfbc` after the
   final `APPROVE`; the post-merge cursor branch is `agent/reliability-r2b2-cursor`.
 - R2b2 implementation is active on `agent/reliability-r2b2-acp-lifecycle`; R2b2a is committed at
-  `4ed12f1035c16fa5dbd55169e59ca4c277373da4`. R2b2b is implemented in the working tree based on
-  `3b0b4f9973991e9f76a73e0c41013b08334205eb`; a fresh Sol/xhigh closure review is the next action.
+  `4ed12f1035c16fa5dbd55169e59ca4c277373da4` and R2b2b at
+  `f40096dfcfb43a37236ce5626fd362a16645f0fe`. R2b2c owner/workflow authority has final review 7
+  `APPROVE` and exact-tree full gates on that base; its internal commit/push is next, followed by 2d.
 - R2b2a adds bounded/no-op/task-journal diagnostic observers and explicit factories, composite backend
   compatibility methods, `resolve_observed`, legacy/observed registry spawn constructors, initializer-only
   observer ownership, cache/waiter `backend.reused`, and live `new_observed` wiring. No ACP lifecycle
@@ -274,5 +277,55 @@ Next action:
   warnings-denied changed-crate Clippy. The fresh Sol/xhigh closure review returned `APPROVE` with no new
   `WRONG` or `SMELL`. The exact code tree passes workspace check, workspace/all-target warnings-denied
   Clippy, **1,700 passed / 0 failed / 12 ignored** across 46 test executables, release build, format/diff,
-  and repository hygiene (**37** tracked artifacts / **7** example configs). R2b2b is ready to commit and
-  push; do not merge the R2b2 branch until R2b2a-d plus the full-branch review gate are complete.
+  and repository hygiene (**37** tracked artifacts / **7** example configs). R2b2b is committed and pushed
+  at `f40096df`; do not merge the R2b2 branch until R2b2a-d plus the full-branch review gate are complete.
+- R2b2c threads one explicit operation observer through direct inbound streaming, synchronous, and fan-out
+  owners; coordinator prompt/continue; fresh and child warm session checkout; cold/retry/warm workflow
+  execution; the implement `TurnRunner`; and the worktree decorator. The additive
+  `WorkflowDiagnosticContext` wrapper owns the explicit per-node/attempt factory without changing the
+  exhaustively constructible public `WorkflowRunContext`. Direct and correlation-only workflows remain
+  bounded in-memory even when they carry a `task_id`; detached owners install the journal factory only
+  after proving the durable task row exists. Mutation-sensitive tests require exact observer identity across resolve/checkout/prompt,
+  preserve one rich event with one flush, allocate a fresh observer per retry attempt, reject a missing
+  durable row before prompt, and make a journal diagnostic write failure fail the task before backend
+  prompt. The complete affected-crate run passed **912 tests** except three unrelated process-fixture
+  precondition failures under parallel execution; all **13 process tests** passed immediately in isolated
+  serial execution. Its first fresh bridge-mediated Sol/xhigh review inspected all 12 then-changed paths,
+  found no untracked files, and returned `REVISE`: one `WRONG/MAJOR` showed a warm prompt-open future could
+  record a rich event and then lose it when cancellation won before stream return; one `SMELL/MAJOR` showed
+  the two production implement callsites were not mutation-locked against a return to legacy `run_turn`.
+  The fold flushes the constructed sink exactly once before canceled completion and routes edit/fix through
+  one observed-only helper whose test panics on legacy dispatch. Self-audit also routes the non-task ACP
+  catalog probe through one in-memory observer across spawn and discovery, emits structured discovery
+  session-create failures, prevents ACP traffic when observation fails, and preserves a primary canceled
+  `Done` outcome when rich flush also fails. The four catalog tests, both warm flush/cancellation tests, and
+  the observed implement helper test pass; workspace check and workspace/all-target Clippy are clean with
+  warnings denied. Closure review 2 adjudicated both inherited findings `FIXED`, independently verified both
+  self-audit folds, and then returned `REVISE` for the analogous `WRONG/MAJOR` cold prompt-open race: its
+  sink was constructed inside the cancel-raced future, so a recorded rich event could be dropped without a
+  flush. The second fold hoists cold sink ownership outside the race, flushes once before canceled cleanup,
+  and adds a deterministic record-then-cancel regression with exact event/flush counts. That regression
+  passes. Closure review 3 marked all three inherited findings `FIXED` and both self-audit folds verified,
+  then returned `REVISE` for two `WRONG/MAJOR`, one `SMELL/MAJOR`, and one `WRONG/MINOR`: the required public
+  context field broke downstream exhaustive literals; detached checkpoint failure could drop an in-flight
+  sibling rich event; warm inbound/catalog owner seams lacked mutation locks; and this status row was stale.
+  The fold moves authority into additive diagnostic-context entrypoints with an external exhaustive-literal
+  compile regression; cancels and drains detached siblings after the first sink error while retaining that
+  primary error; proves a real two-root detached checkpoint race flushes its pending sibling exactly once;
+  and adds exact observer-identity tests for warm unary/streaming and the injected production catalog owner.
+  Focused workflow, detached, inbound, and catalog tests pass. Closure review 4 adjudicated all seven
+  inherited findings `FIXED`, verified both self-audit folds, and found no new code/test defect. Its sole
+  `WRONG/MINOR` was the implementation plan header's stale “2b closure review pending” cursor; the header
+  then recorded 2b at `f40096df`, 2c's review-4 fold, and 2d not started. Review 5 marked that header
+  finding `FIXED`, found no code/test defect, and reported only one `WRONG/MINOR`: the status table
+  abbreviated 2b as `f40096d` while the other cursors used `f40096df`. Review 6 marked the corrected exact
+  prefix `FIXED`, found no code/test defect, and reported one `WRONG/MINOR`: the older Current handoff
+  sentence still called the first 2c review “next.” Review 7 marked that inherited finding `FIXED`, read
+  the complete 16-file base diff, found no new code/test defect or cursor contradiction, and returned
+  `APPROVE`. The exact tree passes format/diff checks, workspace check, workspace/all-target warnings-denied
+  Clippy, **1,725 passed / 0 failed / 12 ignored** across 47 test binaries in serial execution, the release
+  binary build, and repository hygiene (**37** tracked artifacts / **7** example configs). This full serial
+  gate also clears the three unchanged process-fixture precondition failures seen only during the earlier
+  parallel affected-crate run. No live/billable gate was run. Commit/push 2c, then begin 2d; R2f
+  phase-aware liveness/takeover remains deferred and does not reopen 2c absent a concrete 2c contract
+  violation.

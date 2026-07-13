@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a committed at `4ed12f1`; 2b closure review pending); R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a committed at `4ed12f1`; 2b committed at `f40096df`; 2c review 7 `APPROVE` and exact-tree full-gated, commit pending; 2d next); R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -55,9 +55,10 @@ R2b does **not** own:
      before session-manager checkout and transfer it through resolution to `collect_turn`;
    - direct A2A/coordinator correlation ids do not imply a `TaskRecord`; those paths never write a task
      journal or create a hidden task row;
-   - `WorkflowRunContext` selects an explicit per-node observer factory: detached tasks provide a
-     journal-backed factory after task creation, while direct A2A workflows provide in-memory regardless
-     of `task_id` or rich-sink presence;
+   - preserve the exhaustively constructible public `WorkflowRunContext` and add explicit
+     `WorkflowDiagnosticContext` entrypoints for per-node observer authority: detached tasks provide a
+     journal-backed factory after task creation, while legacy/direct A2A entrypoints provide in-memory
+     regardless of `task_id` or rich-sink presence;
    - non-task catalog probes such as `AcpBackend::describe_options` use an in-memory/no-op observer and
      never invent task ownership.
 
@@ -205,10 +206,10 @@ revertible commits so a lost session can resume from the first incomplete item:
    regressions.
 3. **R2b2c — production owner and workflow authority.** Thread one attempt observer through inbound
    streaming/synchronous/fan-out, coordinator prompt/continue, cold and warm workflow paths, and
-   `TurnRunner`. Add the explicit `WorkflowRunContext` factory: direct/correlation-only paths always use
-   in-memory observation, while detached tasks use a journal factory created only after the durable task
-   row exists. Prove rich events are neither lost nor duplicated and journal failure is fatal before
-   completion.
+   `TurnRunner`. Preserve `WorkflowRunContext` source compatibility and add explicit diagnostic-context
+   entrypoints: direct/correlation-only paths always use in-memory observation, while detached tasks use a
+   journal factory created only after the durable task row exists. Prove rich events are neither lost nor
+   duplicated and journal failure is fatal before completion.
 4. **R2b2d — warm expiry and cleanup single-flight.** Add the shared survivability classifier,
    `WarmCompletionGuard`, claim-identified tombstones, `ExpiryClaim`, observer-free `CleanupFlight`, and
    joined worktree cleanup. Exercise all cancellation windows, stale generation/claim protection,
@@ -235,8 +236,7 @@ R2b2a implementation evidence (`4ed12f1035c16fa5dbd55169e59ca4c277373da4`):
 - exact post-fold gates: workspace check, warnings-denied all-target clippy, **1,640 passed / 0 failed /
   12 ignored**, release build, and repository hygiene (37 tracked artifacts / 7 example configs).
 
-R2b2b implementation handoff (uncommitted working tree based on
-`3b0b4f9973991e9f76a73e0c41013b08334205eb`):
+R2b2b implementation evidence (`f40096dfcfb43a37236ce5626fd362a16645f0fe`):
 
 - lifecycle observation now spans ACP spawn, initialize, authentication, session creation, configuration,
   prompt start/stream/finish, and operation-owned cancellation, forget, and release. Process-scoped
@@ -347,8 +347,79 @@ R2b2b implementation handoff (uncommitted working tree based on
   workspace check, workspace/all-target warnings-denied Clippy, **1,700 passed / 0 failed / 12 ignored**
   across 46 test executables, the release binary build, format/diff checks, and repository hygiene
   (**37** tracked artifacts / **7** example configs). The ignored set remains authenticated Kiro/two-bridge
-  and local Ollama coverage. R2b2b is ready to commit and push, but remains unmerged until R2b2a-d and the
-  full branch review gate complete.
+  and local Ollama coverage. R2b2b is committed and pushed at
+  `f40096dfcfb43a37236ce5626fd362a16645f0fe`, but remains unmerged until R2b2a-d and the full branch review
+  gate complete.
+
+R2b2c implementation handoff (review-approved/full-gated working tree based on
+`f40096dfcfb43a37236ce5626fd362a16645f0fe`):
+
+- `Translator::run_observed`, `SessionManager::{checkout_turn_observed,checkout_child_turn_observed}`,
+  `WorkflowNodeDispatcher::checkout_observed`, and `TurnRunner::run_turn_observed` are additive seams.
+  Concrete legacy owner entrypoints use grammar-valid no-op observers, while public trait compatibility
+  defaults delegate the observed call back to the legacy implementation;
+- direct inbound streaming, synchronous, and unary/streaming fan-out owners construct bounded in-memory
+  observers before cold resolution and carry the same `Arc` into prompt ownership. Coordinator
+  prompt/continue and the production implement turns do the same. The worktree decorator forwards the
+  exact composite observer pair;
+- the additive `WorkflowDiagnosticContext` wrapper owns an explicit `DiagnosticObserverFactory` while
+  legacy `WorkflowRunContext` literals remain source-compatible. Cold execution creates one observer per
+  node attempt before resolution; warm execution creates it before child checkout and passes the same
+  value to `prompt_with_observers`. Legacy/direct A2A entrypoints select an in-memory factory regardless of
+  a correlation `task_id`;
+- detached execution constructs `TaskJournalDiagnosticObserverFactory` only after the operation id and
+  existing durable task row are proven, then overwrites caller context with that explicit authority. A
+  missing row prevents any backend prompt. A diagnostic journal write failure propagates before prompt and
+  leaves a single durable failed terminal rather than a completion;
+- mutation-sensitive coverage proves exact observer identity at resolution/checkout/prompt for inbound,
+  coordinator, workflow, warm-child, and rebuilt implement paths; one observer per cold retry attempt;
+  rich-event preservation and flush counts in cold, retry, warm, and worktree-decorator paths; direct warm
+  correlation authority; and journal-backed cold plus warm workflow authority;
+- the first fresh bridge-mediated Sol/xhigh review inspected every changed path, found no untracked files,
+  and returned `REVISE` for one `WRONG/MAJOR` and one `SMELL/MAJOR`: cancellation during a warm prompt-open
+  could discard an already-recorded rich event without flushing, and the production edit/fix callsites
+  were not mutation-locked against legacy `run_turn`. The fold flushes once before canceled completion and
+  routes both callsites through one observed-only helper tested with a runner that panics on legacy use;
+- self-audit closed two additional owner/error-precedence gaps. The non-task ACP catalog probe now carries
+  one bounded in-memory observer across `spawn_observed` and `describe_options_observed`; discovery emits
+  typed session-create start/completed/failed transitions and an observer write failure prevents the ACP
+  request. A canceled `Done` remains the primary warm outcome if rich flush also fails instead of being
+  overwritten by the secondary store error. Deterministic tests cover both cases;
+- focused new tests pass. The review fold passes workspace check and workspace/all-target Clippy with
+  warnings denied. Closure review 2 marked both inherited findings `FIXED`, verified the two self-audit
+  folds, and returned `REVISE` for one new `WRONG/MAJOR`: the cold prompt-open branch still constructed its
+  rich sink inside the cancellation race and could discard an already-recorded event. The fold hoists the
+  cold sink outside the race, flushes once before cancellation cleanup, and adds a deterministic backend
+  that records before signaling cancellation; its exact one-event/one-flush regression passes. A complete
+  affected-crate run passed **912 tests** while three unchanged `bridge-core::process` tests failed only at their
+  pre-teardown liveness preconditions under parallel executable load; the entire process module then passed
+  **13 / 0** serially, including those three. No baseline was changed;
+- closure review 3 marked all three inherited findings `FIXED` and both self-audit folds verified, then
+  returned `REVISE` for two `WRONG/MAJOR`, one `SMELL/MAJOR`, and one `WRONG/MINOR`: a new required public
+  context field broke exhaustive downstream literals; detached checkpoint failure could drop a pending
+  sibling rich event; warm inbound/catalog production seams lacked mutation locks; and the roadmap cursor
+  was stale. The fold introduces additive `WorkflowDiagnosticContext` entrypoints plus an external
+  exhaustive-literal compile regression, preserves legacy entrypoints with bounded in-memory authority,
+  cancels and fully drains detached siblings after the first sink error, and proves the real two-root
+  checkpoint race persists the sibling rich event before terminal failure. New exact-identity regressions
+  exercise both warm inbound branches and the production catalog owner. Focused tests pass. Sol/xhigh
+  closure review 4 adjudicated all seven inherited findings `FIXED`, verified both self-audit folds, and
+  found only one `WRONG/MINOR`: this plan's top status still claimed 2b review was pending. The header now
+  records 2b committed at `f40096df`, 2c at its current fold, and 2d not started. Closure review 5 marked
+  that finding `FIXED`, found no code/test defect, and reported one `WRONG/MINOR` exact-cursor mismatch:
+  the roadmap table used `f40096d` while its other cursors used `f40096df`. The table now uses the exact
+  prefix. Closure review 6 marked that finding `FIXED`, found no code/test defect, and reported one
+  `WRONG/MINOR`: the roadmap's older Current handoff sentence still said the first 2c review was next.
+  Closure review 7 marked that inherited finding `FIXED`, read the complete 16-file base diff, found no new
+  code/test defect or cursor contradiction, and returned `APPROVE`. The exact tree passes format/diff
+  checks, workspace check, workspace/all-target warnings-denied Clippy, **1,725 passed / 0 failed / 12
+  ignored** across 47 test binaries under serial execution, the release binary build, and repository
+  hygiene (**37** tracked artifacts / **7** example configs). This full serial run clears the three
+  unchanged process-fixture precondition failures seen only under the earlier parallel affected-crate run.
+  No live/billable gate was run. Commit/push 2c, then begin 2d;
+- R2b2d still exclusively owns observed cleanup methods, structured-failure warm expiry, completion guards,
+  tombstones/claims, cleanup flight, and worktree release/retire single-flight. R2b3 still owns API and
+  container adapter diagnostic implementation. R2f still owns phase-aware stagnation/takeover.
 
 ### Observation plumbing
 

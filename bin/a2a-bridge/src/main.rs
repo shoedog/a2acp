@@ -1743,6 +1743,23 @@ async fn run_review_step(
 
 /// The production `tweak::TweakEffects`: the real verify/review/fix turns. Borrows the loop's setup for its
 /// lifetime; `fix` is only called when `fix_graph` is `Some` (the loop guards with `fix_available`).
+fn direct_diagnostic_observer() -> Arc<dyn bridge_core::ports::DiagnosticObserver> {
+    Arc::new(
+        bridge_core::diagnostics::InMemoryDiagnosticObserver::new(64)
+            .expect("direct diagnostic capacity is nonzero"),
+    )
+}
+
+async fn run_direct_implement_turn(
+    runner: &dyn turn::TurnRunner,
+    session: &bridge_core::ids::SessionId,
+    parts: Vec<bridge_core::domain::Part>,
+) -> bool {
+    runner
+        .run_turn_observed(session, parts, direct_diagnostic_observer())
+        .await
+}
+
 struct ProdEffects<'a> {
     verify_cfg: &'a Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&'a bridge_core::profile::LanguageProfile>,
@@ -1798,7 +1815,7 @@ impl tweak::TweakEffects for ProdEffects<'_> {
         let parts = vec![bridge_core::domain::Part {
             text: bridge_workflow::template::render(template, &vars),
         }];
-        self.runner.run_turn(self.impl_session, parts).await
+        run_direct_implement_turn(self.runner, self.impl_session, parts).await
     }
 }
 
@@ -2373,7 +2390,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // `.git/A2A_TASK.md` (no task interpolation), so the prompt itself is small + ASCII regardless of task.
     let edit_vars: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     let edit_input = bridge_workflow::template::render(&warm_impl.edit_template, &edit_vars);
-    let completed = turn::TurnRunner::run_turn(
+    let completed = run_direct_implement_turn(
         warm_runner.as_ref(),
         &warm_impl.impl_session,
         vec![bridge_core::domain::Part { text: edit_input }],
@@ -6626,6 +6643,69 @@ mod cli_tests {
             runner.seen.lock().unwrap().as_slice(),
             &[("implement-test".to_string(), vec!["hello".to_string()])]
         );
+    }
+
+    struct ObservedOnlyTurnRunner {
+        completed: bool,
+        observed: std::sync::atomic::AtomicUsize,
+        seen: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl turn::TurnRunner for ObservedOnlyTurnRunner {
+        async fn run_turn(
+            &self,
+            _session: &bridge_core::ids::SessionId,
+            _parts: Vec<bridge_core::domain::Part>,
+        ) -> bool {
+            panic!("production implement turns must use run_turn_observed")
+        }
+
+        async fn run_turn_observed(
+            &self,
+            session: &bridge_core::ids::SessionId,
+            parts: Vec<bridge_core::domain::Part>,
+            _observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
+        ) -> bool {
+            self.observed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.seen.lock().unwrap().push((
+                session.as_str().to_string(),
+                parts.into_iter().map(|part| part.text).collect(),
+            ));
+            self.completed
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_implement_turn_uses_observed_runner_and_preserves_result() {
+        let session = bridge_core::ids::SessionId::parse("implement-observed").unwrap();
+
+        for completed in [true, false] {
+            let runner = ObservedOnlyTurnRunner {
+                completed,
+                observed: std::sync::atomic::AtomicUsize::new(0),
+                seen: std::sync::Mutex::new(Vec::new()),
+            };
+            let result = run_direct_implement_turn(
+                &runner,
+                &session,
+                vec![bridge_core::domain::Part {
+                    text: "implement payload".into(),
+                }],
+            )
+            .await;
+
+            assert_eq!(result, completed);
+            assert_eq!(runner.observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                runner.seen.lock().unwrap().as_slice(),
+                &[(
+                    "implement-observed".to_string(),
+                    vec!["implement payload".to_string()]
+                )]
+            );
+        }
     }
 
     fn cr_entry(id: &str, mount: &str) -> AgentEntry {

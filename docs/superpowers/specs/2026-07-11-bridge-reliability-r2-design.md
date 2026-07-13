@@ -262,7 +262,7 @@ constructible trace leak and one teardown-lifetime gap. V9 closes all three:
 
 | Finding | Disposition in v9 |
 |---|---|
-| **SMELL:** direct A2A warm workflows were still assigned a journal-backed observer without a task row | Add an explicit per-node diagnostic-observer factory to `WorkflowRunContext`; detached task owners supply the journal factory, while direct A2A supplies in-memory regardless of correlation ids. |
+| **SMELL:** direct A2A warm workflows were still assigned a journal-backed observer without a task row | Preserve the public `WorkflowRunContext` literal shape and add an explicit `WorkflowDiagnosticContext` wrapper/entrypoints; detached task owners supply the journal factory, while legacy/direct A2A entrypoints supply in-memory regardless of correlation ids. |
 | **WRONG:** agent-controlled model/effort/auth values can equal a bridge-known credential and reach success-path tracing | Route all 16 current ACP trace calls through a typed metadata-only funnel that accepts no arbitrary string, and inject a known secret through every current dynamic source. |
 | **SMELL:** a cached backend could retain a per-operation observer or miss late teardown | Keep constructor and prompt observers out of cached config/state; add observer-aware synchronous cleanup ports, and classify later registry retirement as process-scoped rather than task-owned. |
 
@@ -432,11 +432,14 @@ may use a bounded in-memory observer even when no durable bridge task exists.
   `AgentFailure` diagnostic for trusted operator handling while the A2A wire category stays static.
   Catalog/model probes such as `AcpBackend::describe_options` have no task journal and use an explicit
   in-memory/no-op observer; they never invent task ownership.
-- `WorkflowRunContext` gains an explicit per-node/attempt `DiagnosticObserverFactory`, independent of
-  `task_id` and `make_rich_sink`. A detached workflow owner supplies a journal-backed factory only after
-  its real `TaskRecord` exists; direct A2A workflow execution supplies an in-memory factory even when it
-  has a correlation `task_id`. Both cold and warm branches obtain the observer from that factory and call
-  `prompt_with_observers`; `WorkflowNodeDispatcher::checkout` does not consume or replace it.
+- The exhaustively constructible public `WorkflowRunContext` retains its existing field set. An additive
+  `WorkflowDiagnosticContext` wrapper and executor entrypoints carry the explicit per-node/attempt
+  `DiagnosticObserverFactory`, independent of `task_id` and `make_rich_sink`; legacy executor entrypoints
+  wrap their context with a bounded in-memory factory. A detached workflow owner supplies a journal-backed
+  factory only after its real `TaskRecord` exists; direct A2A workflow execution supplies an in-memory
+  factory even when it has a correlation `task_id`. Both cold and warm branches obtain the observer from
+  that factory and call `prompt_with_observers`; `WorkflowNodeDispatcher::checkout` does not consume or
+  replace it.
   Prompt-construction failure performs observed cleanup before the owner flushes/finalizes the diagnostic.
   Tests exercise the production `WarmWorkflowNodeDispatcher`, not only a direct backend fixture.
 - `ContainerSpawn` keeps required `spawn` unchanged and adds `spawn_observed(..., observer)` with a

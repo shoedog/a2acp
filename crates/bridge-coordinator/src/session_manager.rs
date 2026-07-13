@@ -11,7 +11,7 @@ use bridge_core::ids::{
 };
 use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome, UsageSnapshot};
 use bridge_core::permission::PermissionRegistry;
-use bridge_core::ports::{AgentBackend, AgentRegistry, Lease};
+use bridge_core::ports::{AgentBackend, AgentRegistry, DiagnosticObserver, Lease};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::session_fingerprint::SessionSpecFingerprint;
 use std::collections::{HashMap, HashSet};
@@ -419,7 +419,27 @@ impl SessionManager {
         overrides: Option<AgentOverride>,
         cwd: Option<SessionCwd>,
     ) -> Result<WarmTurn, BridgeError> {
-        let (res, removed) = self.checkout_turn_inner(ctx, agent, overrides, cwd).await;
+        self.checkout_turn_observed(
+            ctx,
+            agent,
+            overrides,
+            cwd,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    pub async fn checkout_turn_observed(
+        &self,
+        ctx: &ContextId,
+        agent: AgentId,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<WarmTurn, BridgeError> {
+        let (res, removed) = self
+            .checkout_turn_inner(ctx, agent, overrides, cwd, observer)
+            .await;
         for ctx in &removed {
             self.prune_child_registration(ctx).await;
         }
@@ -465,6 +485,7 @@ impl SessionManager {
         agent: AgentId,
         overrides: Option<AgentOverride>,
         cwd: Option<SessionCwd>,
+        observer: Arc<dyn DiagnosticObserver>,
     ) -> (Result<WarmTurn, BridgeError>, Vec<ContextId>) {
         // W1-B (verified serialization point): `by_context` used to stay held across BOTH
         // `registry.resolve()` (lazy agent spawn) and `configure_session()` on the fresh path, and
@@ -495,7 +516,7 @@ impl SessionManager {
             }
         }
 
-        let resolved = match self.registry.resolve(&agent).await {
+        let resolved = match self.registry.resolve_observed(&agent, observer).await {
             Ok(resolved) => resolved,
             Err(e) => return (Err(e), Vec::new()),
         };
@@ -824,12 +845,34 @@ impl SessionManager {
         overrides: Option<AgentOverride>,
         cwd: Option<SessionCwd>,
     ) -> Result<WarmTurn, BridgeError> {
+        self.checkout_child_turn_observed(
+            parent,
+            child,
+            agent,
+            overrides,
+            cwd,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    pub async fn checkout_child_turn_observed(
+        &self,
+        parent: &ContextId,
+        child: &ContextId,
+        agent: AgentId,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<WarmTurn, BridgeError> {
         // PFIX-4 (FIX-2 atomicity): hold `children` ACROSS checkout_turn + insert. A concurrent
         // `*_with_children` sweep (Task 4) takes `children` FIRST, so it WAITS for an in-progress child
         // checkout instead of missing it — closes the register-after-release leak window. Lock order is
         // children -> by_context (checkout_turn locks by_context internally); the sweeps use the same order.
         let mut children = self.children.lock().await;
-        let (turn, removed) = self.checkout_turn_inner(child, agent, overrides, cwd).await;
+        let (turn, removed) = self
+            .checkout_turn_inner(child, agent, overrides, cwd, observer)
+            .await;
         Self::prune_child_registration_locked(&mut children, &removed);
         let turn = turn?;
         children
@@ -1757,6 +1800,7 @@ mod tests {
         entries: Vec<AgentEntry>,
         backend: Arc<FakeBackend>,
         retired: Arc<AtomicBool>,
+        observed: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
     }
 
     impl FakeRegistry {
@@ -1765,6 +1809,7 @@ mod tests {
                 entries: vec![entry],
                 backend,
                 retired: Arc::new(AtomicBool::new(false)),
+                observed: StdMutex::new(Vec::new()),
             }
         }
 
@@ -1773,6 +1818,7 @@ mod tests {
                 entries,
                 backend,
                 retired: Arc::new(AtomicBool::new(false)),
+                observed: StdMutex::new(Vec::new()),
             }
         }
 
@@ -1796,6 +1842,15 @@ mod tests {
                     retired: self.retired.clone(),
                 }),
             })
+        }
+
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            self.observed.lock().unwrap().push(observer);
+            self.resolve(id).await
         }
 
         fn default_id(&self) -> AgentId {
@@ -1940,10 +1995,66 @@ mod tests {
         Some(SessionCwd::parse(path).unwrap())
     }
 
+    #[derive(Default)]
+    struct MarkerDiagnostic;
+
+    #[async_trait]
+    impl DiagnosticObserver for MarkerDiagnostic {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn is_claimed_includes_compacting() {
         assert!(super::is_claimed(super::SessionState::Compacting));
         assert!(super::is_claimed(super::SessionState::Cancelling));
+    }
+
+    #[tokio::test]
+    async fn observed_checkout_forwards_exact_observer_to_registry_resolution() {
+        let (manager, _backend, registry) = manager();
+        let observer: Arc<dyn DiagnosticObserver> = Arc::new(MarkerDiagnostic);
+
+        let turn = manager
+            .checkout_turn_observed(
+                &ctx("observed-checkout"),
+                agent(),
+                None,
+                None,
+                observer.clone(),
+            )
+            .await
+            .unwrap();
+
+        let observed = registry.observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(Arc::ptr_eq(&observed[0], &observer));
+        drop(turn);
+    }
+
+    #[tokio::test]
+    async fn observed_child_checkout_forwards_exact_observer_before_registration() {
+        let (manager, _backend, registry) = manager();
+        let parent = ctx("observed-parent");
+        let child = ctx("observed-child");
+        let observer: Arc<dyn DiagnosticObserver> = Arc::new(MarkerDiagnostic);
+
+        let turn = manager
+            .checkout_child_turn_observed(&parent, &child, agent(), None, None, observer.clone())
+            .await
+            .unwrap();
+
+        {
+            let observed = registry.observed.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            assert!(Arc::ptr_eq(&observed[0], &observer));
+        }
+        assert!(manager.child_registered(&parent, &child).await);
+        drop(turn);
     }
 
     #[tokio::test]

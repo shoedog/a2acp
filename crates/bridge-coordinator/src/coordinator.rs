@@ -10,8 +10,8 @@ use bridge_core::ids::{BatchId, ContextId, OperationId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, TerminalUsage, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{
-    classify_failure, AgentRegistry, FailureClass, ObsEvent, Observer, PolicyEngine, SessionStore,
-    TurnContext, TurnOutcome, UsageFinalization,
+    classify_failure, AgentRegistry, DiagnosticObserver, FailureClass, ObsEvent, Observer,
+    PolicyEngine, SessionStore, TurnContext, TurnOutcome, UsageFinalization,
 };
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{BatchSummary, TaskRecord, TaskRecordStatus, TaskStore};
@@ -33,6 +33,14 @@ use crate::params::{OpParams, PermitParams};
 use crate::turn_parts::assemble_turn_parts;
 
 static PROMPT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+const DIRECT_DIAGNOSTIC_CAPACITY: usize = 64;
+
+fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
+    Arc::new(
+        bridge_core::diagnostics::InMemoryDiagnosticObserver::new(DIRECT_DIAGNOSTIC_CAPACITY)
+            .expect("direct diagnostic capacity is nonzero"),
+    )
+}
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -409,11 +417,19 @@ impl Coordinator {
             .clone()
             .unwrap_or_else(|| self.registry.default_id());
         let ctx = p.context.clone().unwrap_or_else(|| self.mint_context_id());
+        let diagnostic = direct_diagnostic_observer();
         let turn = self
             .session_manager
-            .checkout_turn(&ctx, agent, Some(p.agent_override()), cwd)
+            .checkout_turn_observed(
+                &ctx,
+                agent,
+                Some(p.agent_override()),
+                cwd,
+                diagnostic.clone(),
+            )
             .await?;
-        self.collect_turn(ctx, turn, p.input).await
+        self.collect_turn_observed(ctx, turn, p.input, diagnostic)
+            .await
     }
 
     /// Continue an EXISTING warm context. Unlike `prompt`, this REUSES the context's stored fingerprint
@@ -425,8 +441,10 @@ impl Coordinator {
             .context
             .clone()
             .ok_or(BridgeError::InvalidRequest { field: "context" })?;
+        let diagnostic = direct_diagnostic_observer();
         let turn = self.session_manager.checkout_existing_turn(&ctx).await?;
-        self.collect_turn(ctx, turn, p.input).await
+        self.collect_turn_observed(ctx, turn, p.input, diagnostic)
+            .await
     }
 
     pub async fn inject(&self, req: InjectRequest) -> Result<usize, BridgeError> {
@@ -473,11 +491,28 @@ impl Coordinator {
     /// guard if the turn future is cancelled mid-drain (the MCP loop is sequential and never drops
     /// mid-turn, but the Coordinator is a general service API — a cancelled caller must not strand the
     /// handle `Running`; this mirrors the A2A unary path's `WarmTurnGuard`).
+    #[cfg(test)]
     async fn collect_turn(
         &self,
         ctx: ContextId,
         turn: crate::session_manager::WarmTurn,
         input: String,
+    ) -> Result<TurnOutput, BridgeError> {
+        self.collect_turn_observed(
+            ctx,
+            turn,
+            input,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    async fn collect_turn_observed(
+        &self,
+        ctx: ContextId,
+        turn: crate::session_manager::WarmTurn,
+        input: String,
+        diagnostic: Arc<dyn DiagnosticObserver>,
     ) -> Result<TurnOutput, BridgeError> {
         let task = self.mint_prompt_task_id();
         let obs_ctx = Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn);
@@ -517,13 +552,14 @@ impl Coordinator {
             .await;
 
         let translator = Translator::new();
-        let mut events = translator.run(
+        let mut events = translator.run_observed(
             turn.backend.as_ref(),
             self.session_store.as_ref(),
             self.policy.as_ref(),
             &task,
             &turn.session,
             parts,
+            diagnostic,
         );
         let mut collected = Vec::new();
         let mut aborted = false;
@@ -945,7 +981,8 @@ mod tests {
     use bridge_core::ids::{AgentId, ContextId, NodeId, SessionId};
     use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
     use bridge_core::ports::{
-        AgentBackend, BackendStream, Lease, Resolved, TurnContext, TurnOutcome, Update,
+        AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, Lease, Resolved,
+        TurnContext, TurnOutcome, Update,
     };
     use bridge_core::task_store::{
         MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinalized,
@@ -1459,6 +1496,114 @@ mod tests {
             Arc::new(NoopObserver),
             3,
         )
+    }
+
+    #[derive(Default)]
+    struct ObserverPathBackend {
+        prompts: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
+    }
+
+    #[async_trait]
+    impl AgentBackend for ObserverPathBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("coordinator must use the composite prompt path")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            assert!(observers.rich.is_none());
+            self.prompts.lock().unwrap().push(observers.diagnostic);
+            Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            })])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct ObserverPathRegistry {
+        backend: Arc<ObserverPathBackend>,
+        resolutions: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
+    }
+
+    #[async_trait]
+    impl AgentRegistry for ObserverPathRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            panic!("coordinator checkout must use observed resolution")
+        }
+
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            self.resolutions.lock().unwrap().push(observer);
+            Ok(Resolved {
+                entry: Arc::new({
+                    let mut entry = entry();
+                    entry.id = id.clone();
+                    entry
+                }),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+
+        async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![self.default_id()]
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_and_continue_thread_one_fresh_operation_observer() {
+        let backend = Arc::new(ObserverPathBackend::default());
+        let registry = Arc::new(ObserverPathRegistry {
+            backend: backend.clone(),
+            resolutions: StdMutex::new(Vec::new()),
+        });
+        let coordinator = coordinator_fixture_with_registry(
+            registry.clone(),
+            Arc::new(ManualClock::new(1_700_000_000_000)),
+        );
+
+        let first = coordinator.prompt(prompt_params("first")).await.unwrap();
+        let first_resolution = registry.resolutions.lock().unwrap()[0].clone();
+        let first_prompt = backend.prompts.lock().unwrap()[0].clone();
+        assert!(
+            Arc::ptr_eq(&first_resolution, &first_prompt),
+            "prompt must use the checkout observer for collection"
+        );
+
+        let mut continuation = prompt_params("second");
+        continuation.context = Some(first.context);
+        let _ = coordinator.continue_turn(continuation).await.unwrap();
+
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(resolutions.len(), 1, "warm continue must not re-resolve");
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            !Arc::ptr_eq(&prompts[0], &prompts[1]),
+            "each coordinator operation owns a fresh observer"
+        );
     }
 
     #[tokio::test]

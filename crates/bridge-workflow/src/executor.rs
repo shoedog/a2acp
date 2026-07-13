@@ -7,9 +7,9 @@ use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::orch::UsageSnapshot;
 use bridge_core::ports::{
-    classify_failure, AgentBackend, AgentRegistry, FailureClass, ObsEvent, Observer,
-    RichEventSinkFactory, TurnContext, TurnOutcome, Update, UsageFinalization,
-    STOP_REASON_CANCELLED,
+    classify_failure, AgentBackend, AgentRegistry, BackendObservers, DiagnosticObserver,
+    DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, RichEventSinkFactory, TurnContext,
+    TurnOutcome, Update, UsageFinalization, STOP_REASON_CANCELLED,
 };
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
@@ -44,6 +44,36 @@ impl Default for WorkflowRunContext {
     }
 }
 
+/// Additive diagnostic-authority wrapper for workflow execution. Keeping the
+/// factory out of [`WorkflowRunContext`] preserves source compatibility for
+/// downstream exhaustive struct literals while making durable authority an
+/// explicit choice at the executor entrypoint.
+#[derive(Clone)]
+pub struct WorkflowDiagnosticContext {
+    request: WorkflowRunContext,
+    factory: Arc<dyn DiagnosticObserverFactory>,
+}
+
+impl WorkflowDiagnosticContext {
+    pub fn new(request: WorkflowRunContext, factory: Arc<dyn DiagnosticObserverFactory>) -> Self {
+        Self { request, factory }
+    }
+
+    pub fn in_memory(request: WorkflowRunContext) -> Self {
+        Self::new(
+            request,
+            Arc::new(
+                bridge_core::diagnostics::InMemoryDiagnosticObserverFactory::new(64)
+                    .expect("workflow diagnostic capacity is nonzero"),
+            ),
+        )
+    }
+
+    fn into_parts(self) -> (WorkflowRunContext, Arc<dyn DiagnosticObserverFactory>) {
+        (self.request, self.factory)
+    }
+}
+
 pub enum NodeTurnExit {
     Normal,
     Canceled,
@@ -73,6 +103,17 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
         run_id: &str,
         ctx: &WorkflowRunContext,
     ) -> Result<NodeTurn, BridgeError>;
+
+    async fn checkout_observed(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        ctx: &WorkflowRunContext,
+        _observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<NodeTurn, BridgeError> {
+        self.checkout(wf_id, node, run_id, ctx).await
+    }
 }
 
 /// Uniform future type used in the per-run `FuturesUnordered` pool.
@@ -269,6 +310,7 @@ impl WorkflowExecutor {
         run_id: &str,
         cancel: &CancellationToken,
         ctx: &WorkflowRunContext,
+        diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
         dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>,
     ) -> (String, bool, Option<UsageSnapshot>) {
         if cancel.is_cancelled() {
@@ -276,11 +318,15 @@ impl WorkflowExecutor {
         }
         if let Some(d) = dispatcher {
             let rendered = render(&node.prompt_template, vars);
+            let diagnostic = diagnostic_factory.make(&node.id, 1);
             // Emit NodeStarted before checkout (analogous to the cold path emitting before resolve).
             let obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 1);
             ctx.observer
                 .record(&ObsEvent::NodeStarted { ctx: &obs_ctx });
-            let turn = match d.checkout(wf_id, node, run_id, ctx).await {
+            let turn = match d
+                .checkout_observed(wf_id, node, run_id, ctx, diagnostic.clone())
+                .await
+            {
                 Ok(t) => t,
                 Err(e) => {
                     let fail_out = TurnOutcome::Failed(classify_failure(&e));
@@ -318,10 +364,23 @@ impl WorkflowExecutor {
                 .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
             let turn_start = std::time::Instant::now();
             let mut ttft_val: Option<std::time::Duration> = None;
+            let rich_sink = ctx
+                .make_rich_sink
+                .as_ref()
+                .map(|factory| factory.make(&node.id));
 
             let mut stream = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
+                    if let Some(sink) = &rich_sink {
+                        if let Err(flush_error) = sink.flush().await {
+                            eprintln!(
+                                "rich sink flush failed after warm prompt-open cancellation for node {}: {:?}",
+                                node.id.as_str(),
+                                flush_error
+                            );
+                        }
+                    }
                     turn.cleanup.on_exit(NodeTurnExit::Canceled).await;
                     ctx.observer.record(&ObsEvent::TurnFinished {
                         ctx: &obs_ctx,
@@ -340,9 +399,22 @@ impl WorkflowExecutor {
                     });
                     return (format!("[node {} canceled]", node.id.as_str()), false, None);
                 }
-                s = turn.backend.prompt(&turn.session, parts) => match s {
+                s = turn.backend.prompt_with_observers(
+                    &turn.session,
+                    parts,
+                    BackendObservers::new(diagnostic, rich_sink.clone()),
+                ) => match s {
                     Ok(s) => s,
                     Err(e) => {
+                        if let Some(sink) = &rich_sink {
+                            if let Err(flush_error) = sink.flush().await {
+                                eprintln!(
+                                    "rich sink flush failed after warm prompt error for node {}: {:?}",
+                                    node.id.as_str(),
+                                    flush_error
+                                );
+                            }
+                        }
                         let text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
                         let fail_out = TurnOutcome::Failed(classify_failure(&e));
                         turn.cleanup.on_exit(NodeTurnExit::Error(e)).await;
@@ -366,7 +438,7 @@ impl WorkflowExecutor {
             let mut text = String::new();
             let mut ok = true;
             let mut last_usage: Option<UsageSnapshot> = None;
-            let exit = loop {
+            let mut exit = loop {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -401,6 +473,25 @@ impl WorkflowExecutor {
                     }
                 }
             };
+            if let Some(sink) = &rich_sink {
+                if let Err(flush_error) = sink.flush().await {
+                    if ok && matches!(&exit, NodeTurnExit::Normal) {
+                        ok = false;
+                        text = format!(
+                            "[node {} rich-flush failed: {:?}]",
+                            node.id.as_str(),
+                            flush_error
+                        );
+                        exit = NodeTurnExit::Error(flush_error);
+                    } else {
+                        eprintln!(
+                            "rich sink flush failed after warm node exit for {}: {:?}",
+                            node.id.as_str(),
+                            flush_error
+                        );
+                    }
+                }
+            }
             // Keep whatever usage the agent reported, even if the turn then errored or was
             // cancelled — the tokens were really consumed and belong in the durable footprint.
             // `last_usage` is already `None` when no `Update::Usage` was ever observed.
@@ -488,6 +579,7 @@ impl WorkflowExecutor {
                 let mut obs_ctx_opt: Option<TurnContext> = None;
                 let mut turn_started: Option<std::time::Instant> = None;
                 let mut ttft_val: Option<std::time::Duration> = None;
+                let diagnostic = diagnostic_factory.make(&node.id, attempt);
                 let outcome = 'attempt: {
                     // resolve, with cancel
                     let resolved = tokio::select! {
@@ -498,7 +590,7 @@ impl WorkflowExecutor {
                                 usage: None,
                             };
                         }
-                        r = self.registry.resolve(&node.agent) => match r {
+                        r = self.registry.resolve_observed(&node.agent, diagnostic.clone()) => match r {
                             Ok(r) => r,
                             Err(e) => {
                                 if retry_enabled && e.is_transient() {
@@ -569,31 +661,36 @@ impl WorkflowExecutor {
                         };
                     }
                     // prompt, with cancel
-                    let rich_sink;
+                    let rich_sink = ctx
+                        .make_rich_sink
+                        .as_ref()
+                        .map(|factory| factory.make(&node.id));
                     let mut stream = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
+                            if let Some(sink) = &rich_sink {
+                                if let Err(flush_error) = sink.flush().await {
+                                    eprintln!(
+                                        "rich sink flush failed after cold prompt-open cancellation for node {}: {:?}",
+                                        node.id.as_str(),
+                                        flush_error
+                                    );
+                                }
+                            }
                             resolved.backend.forget_session(&session).await;
                             break 'attempt Attempt::Canceled {
                                 marker: format!("[node {} canceled]", node.id.as_str()),
                                 usage: None,
                             };
                         }
-                        s = async {
-                            let sink = ctx.make_rich_sink.as_ref().map(|factory| factory.make(&node.id));
-                            let parts = vec![Part { text: rendered.clone() }];
-                            let stream = match &sink {
-                                Some(sink) => resolved.backend.prompt_observed(&session, parts, sink.clone()).await,
-                                None => resolved.backend.prompt(&session, parts).await,
-                            };
-                            (sink, stream)
-                        } => match s {
-                            (sink, Ok(s)) => {
-                                rich_sink = sink;
-                                s
-                            }
-                            (sink, Err(e)) => {
-                                if let Some(sink) = &sink {
+                        s = resolved.backend.prompt_with_observers(
+                            &session,
+                            vec![Part { text: rendered.clone() }],
+                            BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
+                        ) => match s {
+                            Ok(s) => s,
+                            Err(e) => {
+                                if let Some(sink) = &rich_sink {
                                     if let Err(flush_err) = sink.flush().await {
                                         eprintln!(
                                             "rich sink flush failed after prompt error for node {}: {:?}",
@@ -870,7 +967,24 @@ impl WorkflowExecutor {
         cancel: CancellationToken,
         ctx: WorkflowRunContext,
     ) -> WorkflowStream {
-        self.run_from_with_context(graph, input, run_id, cancel, HashMap::new(), ctx)
+        self.run_with_diagnostic_context(
+            graph,
+            input,
+            run_id,
+            cancel,
+            WorkflowDiagnosticContext::in_memory(ctx),
+        )
+    }
+
+    pub fn run_with_diagnostic_context(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        ctx: WorkflowDiagnosticContext,
+    ) -> WorkflowStream {
+        self.run_from_with_diagnostic_context(graph, input, run_id, cancel, HashMap::new(), ctx)
     }
 
     pub fn run_with_context_and_dispatcher(
@@ -882,7 +996,26 @@ impl WorkflowExecutor {
         ctx: WorkflowRunContext,
         dispatcher: Arc<dyn WorkflowNodeDispatcher>,
     ) -> WorkflowStream {
-        self.run_from_with_context_and_dispatcher(
+        self.run_with_diagnostic_context_and_dispatcher(
+            graph,
+            input,
+            run_id,
+            cancel,
+            WorkflowDiagnosticContext::in_memory(ctx),
+            dispatcher,
+        )
+    }
+
+    pub fn run_with_diagnostic_context_and_dispatcher(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        ctx: WorkflowDiagnosticContext,
+        dispatcher: Arc<dyn WorkflowNodeDispatcher>,
+    ) -> WorkflowStream {
+        self.run_from_with_diagnostic_context_and_dispatcher(
             graph,
             input,
             run_id,
@@ -933,7 +1066,36 @@ impl WorkflowExecutor {
         seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowRunContext,
     ) -> WorkflowStream {
-        self.run_from_with_context_inner(graph, input, run_id, cancel, seed, ctx, None)
+        self.run_from_with_diagnostic_context(
+            graph,
+            input,
+            run_id,
+            cancel,
+            seed,
+            WorkflowDiagnosticContext::in_memory(ctx),
+        )
+    }
+
+    pub fn run_from_with_diagnostic_context(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
+        ctx: WorkflowDiagnosticContext,
+    ) -> WorkflowStream {
+        let (ctx, diagnostic_factory) = ctx.into_parts();
+        self.run_from_with_context_inner(
+            graph,
+            input,
+            run_id,
+            cancel,
+            seed,
+            ctx,
+            diagnostic_factory,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -947,7 +1109,39 @@ impl WorkflowExecutor {
         ctx: WorkflowRunContext,
         dispatcher: Arc<dyn WorkflowNodeDispatcher>,
     ) -> WorkflowStream {
-        self.run_from_with_context_inner(graph, input, run_id, cancel, seed, ctx, Some(dispatcher))
+        self.run_from_with_diagnostic_context_and_dispatcher(
+            graph,
+            input,
+            run_id,
+            cancel,
+            seed,
+            WorkflowDiagnosticContext::in_memory(ctx),
+            dispatcher,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_from_with_diagnostic_context_and_dispatcher(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
+        ctx: WorkflowDiagnosticContext,
+        dispatcher: Arc<dyn WorkflowNodeDispatcher>,
+    ) -> WorkflowStream {
+        let (ctx, diagnostic_factory) = ctx.into_parts();
+        self.run_from_with_context_inner(
+            graph,
+            input,
+            run_id,
+            cancel,
+            seed,
+            ctx,
+            diagnostic_factory,
+            Some(dispatcher),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -959,6 +1153,7 @@ impl WorkflowExecutor {
         cancel: CancellationToken,
         seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowRunContext,
+        diagnostic_factory: Arc<dyn DiagnosticObserverFactory>,
         dispatcher: Option<Arc<dyn WorkflowNodeDispatcher>>,
     ) -> WorkflowStream {
         let this = WorkflowExecutor {
@@ -1065,12 +1260,22 @@ impl WorkflowExecutor {
                                 let cancel = cancel.clone();
                                 let wf_id = graph.id.as_str().to_string();
                                 let ctx = ctx.clone();
+                                let diagnostic_factory = diagnostic_factory.clone();
                                 let dispatcher = dispatcher.clone();
                                 let this = &this;
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
                                         owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                                    let (text, ok, usage) = this.run_node(&wf_id, &node, &vars, &run_id, &cancel, &ctx, dispatcher.as_ref()).await;
+                                    let (text, ok, usage) = this.run_node(
+                                        &wf_id,
+                                        &node,
+                                        &vars,
+                                        &run_id,
+                                        &cancel,
+                                        &ctx,
+                                        &diagnostic_factory,
+                                        dispatcher.as_ref(),
+                                    ).await;
                                     (node.id.clone(), text, ok, usage)
                                 }) as NodeFut);
                             }
@@ -1230,6 +1435,221 @@ mod tests {
             vec![]
         }
     }
+
+    #[derive(Default)]
+    struct MarkerDiagnostic;
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for MarkerDiagnostic {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    type RecordedDiagnostic = (String, u32, Arc<dyn DiagnosticObserver>);
+
+    #[derive(Default)]
+    struct RecordingDiagnosticFactory {
+        made: Mutex<Vec<RecordedDiagnostic>>,
+    }
+
+    impl DiagnosticObserverFactory for RecordingDiagnosticFactory {
+        fn make(&self, node: &NodeId, attempt: u32) -> Arc<dyn DiagnosticObserver> {
+            let observer: Arc<dyn DiagnosticObserver> = Arc::new(MarkerDiagnostic);
+            self.made
+                .lock()
+                .unwrap()
+                .push((node.as_str().to_string(), attempt, observer.clone()));
+            observer
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRichSink {
+        events: AtomicUsize,
+        flushes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::ports::RichEventSink for RecordingRichSink {
+        fn record(&self, _kind: bridge_core::orch::OrchEventKind) {
+            self.events.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn flush(&self) -> Result<(), BridgeError> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RecordingRichFactory {
+        sink: Arc<RecordingRichSink>,
+    }
+
+    impl RichEventSinkFactory for RecordingRichFactory {
+        fn make(&self, _node: &NodeId) -> Arc<dyn bridge_core::ports::RichEventSink> {
+            self.sink.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingRichSink {
+        flushes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::ports::RichEventSink for FailingRichSink {
+        fn record(&self, _kind: bridge_core::orch::OrchEventKind) {}
+
+        async fn flush(&self) -> Result<(), BridgeError> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Err(BridgeError::StoreFailure)
+        }
+    }
+
+    struct FailingRichFactory {
+        sink: Arc<FailingRichSink>,
+    }
+
+    impl RichEventSinkFactory for FailingRichFactory {
+        fn make(&self, _node: &NodeId) -> Arc<dyn bridge_core::ports::RichEventSink> {
+            self.sink.clone()
+        }
+    }
+
+    struct CompositePathBackend {
+        prompts: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+        calls: AtomicUsize,
+        fail_first: bool,
+    }
+
+    impl CompositePathBackend {
+        fn new(fail_first: bool) -> Self {
+            Self {
+                prompts: Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+                fail_first,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for CompositePathBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("workflow must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            self.prompts.lock().unwrap().push(observers.diagnostic);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_first && call == 0 {
+                return Err(BridgeError::AgentTimedOut);
+            }
+            if let Some(sink) = observers.rich {
+                sink.record(bridge_core::orch::OrchEventKind::Plan { entries: vec![] });
+            }
+            Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            })])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct CompositePathRegistry {
+        backend: Arc<CompositePathBackend>,
+        resolutions: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for CompositePathRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            panic!("workflow must use resolve_observed")
+        }
+
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            self.resolutions.lock().unwrap().push(observer);
+            Ok(Resolved {
+                entry: Arc::new(minimal_entry(id)),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+
+        async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn invalidate(&self, _agent: &AgentId) {}
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    struct CompositePathCleanup;
+
+    #[async_trait::async_trait]
+    impl NodeTurnCleanup for CompositePathCleanup {
+        async fn on_exit(self: Box<Self>, _exit: NodeTurnExit) {}
+    }
+
+    struct CompositePathDispatcher {
+        backend: Arc<CompositePathBackend>,
+        checkouts: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for CompositePathDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            panic!("warm workflow must use checkout_observed")
+        }
+
+        async fn checkout_observed(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<NodeTurn, BridgeError> {
+            self.checkouts.lock().unwrap().push(observer);
+            Ok(NodeTurn {
+                backend: self.backend.clone(),
+                session: SessionId::parse("workflow-observed-warm").unwrap(),
+                seed: None,
+                cleanup: Box::new(CompositePathCleanup),
+            })
+        }
+    }
     pub(super) fn one_node_graph() -> Arc<WorkflowGraph> {
         one_node_graph_with_template("echo {{input}}")
     }
@@ -1278,6 +1698,269 @@ mod tests {
             terminal: None,
             at_ms: used as i64,
         }
+    }
+
+    #[tokio::test]
+    async fn cold_direct_workflow_threads_one_observer_and_preserves_one_rich_event() {
+        let backend = Arc::new(CompositePathBackend::new(false));
+        let registry = Arc::new(CompositePathRegistry {
+            backend: backend.clone(),
+            resolutions: Mutex::new(Vec::new()),
+        });
+        let diagnostic_factory = Arc::new(RecordingDiagnosticFactory::default());
+        let rich_sink = Arc::new(RecordingRichSink::default());
+        let context = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("correlation-only").unwrap()),
+            make_rich_sink: Some(Arc::new(RecordingRichFactory {
+                sink: rich_sink.clone(),
+            })),
+            ..WorkflowRunContext::default()
+        };
+
+        let events = WorkflowExecutor::new(registry.clone())
+            .run_with_diagnostic_context(
+                one_node_graph(),
+                "input".into(),
+                "direct-observed".into(),
+                CancellationToken::new(),
+                WorkflowDiagnosticContext::new(context, diagnostic_factory.clone()),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let made = diagnostic_factory.made.lock().unwrap();
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].0, "only");
+        assert_eq!(made[0].1, 1);
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(prompts.len(), 1);
+        assert!(Arc::ptr_eq(&made[0].2, &resolutions[0]));
+        assert!(Arc::ptr_eq(&made[0].2, &prompts[0]));
+        assert_eq!(rich_sink.events.load(Ordering::SeqCst), 1);
+        assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_retry_mints_one_observer_per_attempt_without_duplicating_rich_events() {
+        let backend = Arc::new(CompositePathBackend::new(true));
+        let registry = Arc::new(CompositePathRegistry {
+            backend: backend.clone(),
+            resolutions: Mutex::new(Vec::new()),
+        });
+        let diagnostic_factory = Arc::new(RecordingDiagnosticFactory::default());
+        let rich_sink = Arc::new(RecordingRichSink::default());
+        let context = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(RecordingRichFactory {
+                sink: rich_sink.clone(),
+            })),
+            ..WorkflowRunContext::default()
+        };
+
+        let events = WorkflowExecutor::new(registry.clone())
+            .run_with_diagnostic_context(
+                retry_graph(Some(retry_policy(2, 0))),
+                "input".into(),
+                "retry-observed".into(),
+                CancellationToken::new(),
+                WorkflowDiagnosticContext::new(context, diagnostic_factory.clone()),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let made = diagnostic_factory.made.lock().unwrap();
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(
+            made.iter()
+                .map(|(_, attempt, _)| *attempt)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(resolutions.len(), 2);
+        assert_eq!(prompts.len(), 2);
+        for index in 0..2 {
+            assert!(Arc::ptr_eq(&made[index].2, &resolutions[index]));
+            assert!(Arc::ptr_eq(&made[index].2, &prompts[index]));
+        }
+        assert_eq!(rich_sink.events.load(Ordering::SeqCst), 1);
+        assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn warm_workflow_threads_checkout_observer_and_preserves_one_rich_event() {
+        let backend = Arc::new(CompositePathBackend::new(false));
+        let dispatcher = Arc::new(CompositePathDispatcher {
+            backend: backend.clone(),
+            checkouts: Mutex::new(Vec::new()),
+        });
+        let diagnostic_factory = Arc::new(RecordingDiagnosticFactory::default());
+        let rich_sink = Arc::new(RecordingRichSink::default());
+        let context = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(RecordingRichFactory {
+                sink: rich_sink.clone(),
+            })),
+            ..WorkflowRunContext::default()
+        };
+
+        let events = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: HashMap::new(),
+        }))
+        .run_with_diagnostic_context_and_dispatcher(
+            one_node_graph(),
+            "input".into(),
+            "warm-observed".into(),
+            CancellationToken::new(),
+            WorkflowDiagnosticContext::new(context, diagnostic_factory.clone()),
+            dispatcher.clone(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let made = diagnostic_factory.made.lock().unwrap();
+        let checkouts = dispatcher.checkouts.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(made.len(), 1);
+        assert_eq!(checkouts.len(), 1);
+        assert_eq!(prompts.len(), 1);
+        assert!(Arc::ptr_eq(&made[0].2, &checkouts[0]));
+        assert!(Arc::ptr_eq(&made[0].2, &prompts[0]));
+        assert_eq!(rich_sink.events.load(Ordering::SeqCst), 1);
+        assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn existing_task_journal_factory_drives_warm_dispatcher_diagnostics() {
+        use bridge_core::diagnostics::{
+            DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor, PersistedPhaseTransition,
+            PersistedPhaseTransitionInput, PhaseStatus, TaskJournalDiagnosticObserverFactory,
+        };
+        use bridge_core::ids::{OperationId, TaskId};
+        use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+
+        fn event(status: PhaseStatus) -> DiagnosticEvent {
+            DiagnosticEvent::new(
+                PersistedPhaseTransition::build(
+                    PersistedPhaseTransitionInput {
+                        phase: DiagnosticPhase::Resolve,
+                        status,
+                        at_ms: 10,
+                        operation: None,
+                        code: None,
+                        auth: None,
+                    },
+                    &DiagnosticRedactor::default(),
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+        }
+
+        struct JournalDispatcher {
+            backend: Arc<CompositePathBackend>,
+        }
+
+        #[async_trait::async_trait]
+        impl WorkflowNodeDispatcher for JournalDispatcher {
+            async fn checkout(
+                &self,
+                _wf_id: &str,
+                _node: &WorkflowNode,
+                _run_id: &str,
+                _ctx: &WorkflowRunContext,
+            ) -> Result<NodeTurn, BridgeError> {
+                panic!("journal warm workflow must use checkout_observed")
+            }
+
+            async fn checkout_observed(
+                &self,
+                _wf_id: &str,
+                _node: &WorkflowNode,
+                _run_id: &str,
+                _ctx: &WorkflowRunContext,
+                observer: Arc<dyn DiagnosticObserver>,
+            ) -> Result<NodeTurn, BridgeError> {
+                observer.record(event(PhaseStatus::Started)).await?;
+                observer.record(event(PhaseStatus::Completed)).await?;
+                Ok(NodeTurn {
+                    backend: self.backend.clone(),
+                    session: SessionId::parse("workflow-journal-warm").unwrap(),
+                    seed: None,
+                    cleanup: Box::new(CompositePathCleanup),
+                })
+            }
+        }
+
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let task = TaskId::parse("task-journal-warm").unwrap();
+        store
+            .create(&TaskRecord {
+                id: task.clone(),
+                workflow: "w".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+                last_artifact_ms: None,
+                input: "input".into(),
+                workflow_spec_json: None,
+                resume_attempts: 0,
+                session_cwd: None,
+                batch_id: None,
+                item_id: None,
+                artifacts_purged_at: None,
+            })
+            .await
+            .unwrap();
+        let factory: Arc<dyn DiagnosticObserverFactory> = Arc::new(
+            TaskJournalDiagnosticObserverFactory::new(
+                store.clone(),
+                task.clone(),
+                OperationId::parse("op-task-journal-warm").unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let context = WorkflowRunContext {
+            task_id: Some(task.clone()),
+            ..WorkflowRunContext::default()
+        };
+        let backend = Arc::new(CompositePathBackend::new(false));
+
+        let events = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: HashMap::new(),
+        }))
+        .run_with_diagnostic_context_and_dispatcher(
+            one_node_graph(),
+            "input".into(),
+            "journal-warm".into(),
+            CancellationToken::new(),
+            WorkflowDiagnosticContext::new(context, factory),
+            Arc::new(JournalDispatcher { backend }),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let journal = store.journal_from(&task, -1).await.unwrap();
+        let diagnostics: Vec<_> = journal
+            .iter()
+            .filter_map(|event| match &event.kind {
+                bridge_core::orch::OrchEventKind::Progress { progress } => {
+                    progress.diagnostic_event()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(diagnostics[1].transition().status(), PhaseStatus::Completed);
     }
 
     #[tokio::test]
@@ -2461,6 +3144,13 @@ mod tests {
 
         let rec = Arc::new(Rec::default());
         let exits = Arc::new(Mutex::new(Vec::new()));
+        let rich_sink = Arc::new(FailingRichSink::default());
+        let context = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(FailingRichFactory {
+                sink: rich_sink.clone(),
+            })),
+            ..WorkflowRunContext::default()
+        };
         let ex = WorkflowExecutor::new(Arc::new(FakeRegistry {
             backends: std::collections::HashMap::new(),
         }));
@@ -2470,7 +3160,7 @@ mod tests {
                 "DIFF".into(),
                 "run1".into(),
                 CancellationToken::new(),
-                WorkflowRunContext::default(),
+                context,
                 Arc::new(DoneCancelledDispatcher {
                     rec: rec.clone(),
                     exits: exits.clone(),
@@ -2492,6 +3182,7 @@ mod tests {
         ));
         assert_eq!(*rec.cancels.lock().unwrap(), 0);
         assert_eq!(exits.lock().unwrap().as_slice(), ["normal"]);
+        assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3492,7 +4183,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_during_slow_prompt_ends_canceled_promptly() {
-        struct SlowPrompt;
+        struct SlowPrompt {
+            rich_recorded: Arc<tokio::sync::Notify>,
+        }
         #[async_trait::async_trait]
         impl AgentBackend for SlowPrompt {
             async fn prompt(
@@ -3500,22 +4193,34 @@ mod tests {
                 _s: &SessionId,
                 _p: Vec<Part>,
             ) -> Result<BackendStream, BridgeError> {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await; // long setup
-                Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
-                    stop_reason: "end_turn".into(),
-                })])))
+                panic!("cold prompt-open owner must use prompt_with_observers")
+            }
+            async fn prompt_with_observers(
+                &self,
+                _s: &SessionId,
+                _p: Vec<Part>,
+                observers: BackendObservers,
+            ) -> Result<BackendStream, BridgeError> {
+                observers
+                    .rich
+                    .expect("test supplies a rich sink")
+                    .record(bridge_core::orch::OrchEventKind::Plan { entries: vec![] });
+                self.rich_recorded.notify_one();
+                std::future::pending().await
             }
             async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
                 Ok(())
             }
         }
-        struct SReg;
+        struct SReg {
+            backend: Arc<SlowPrompt>,
+        }
         #[async_trait::async_trait]
         impl AgentRegistry for SReg {
             async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
                 Ok(Resolved {
                     entry: Arc::new(minimal_entry(id)),
-                    backend: Arc::new(SlowPrompt),
+                    backend: self.backend.clone(),
                     lease: Box::new(NoopLease),
                 })
             }
@@ -3531,15 +4236,25 @@ mod tests {
         }
         let token = CancellationToken::new();
         let t2 = token.clone();
+        let rich_recorded = Arc::new(tokio::sync::Notify::new());
+        let cancel_after_record = rich_recorded.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel_after_record.notified().await;
             t2.cancel();
         });
-        let ex = WorkflowExecutor::new(Arc::new(SReg));
-        // Must finish well under the 10s prompt sleep → the cancel preempted setup.
+        let rich_sink = Arc::new(RecordingRichSink::default());
+        let context = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(RecordingRichFactory {
+                sink: rich_sink.clone(),
+            })),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(Arc::new(SReg {
+            backend: Arc::new(SlowPrompt { rich_recorded }),
+        }));
         let evs = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            ex.run(one_node_graph(), "x".into(), "r".into(), token)
+            ex.run_with_context(one_node_graph(), "x".into(), "r".into(), token, context)
                 .collect::<Vec<_>>(),
         )
         .await
@@ -3551,6 +4266,8 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(rich_sink.events.load(Ordering::SeqCst), 1);
+        assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
     }
 
     // ── run_from tests ──────────────────────────────────────────────────────
@@ -4875,7 +5592,40 @@ mod observability_tests {
         );
     }
 
-    struct SlowPromptOpenDispatcher;
+    #[derive(Default)]
+    struct PromptOpenRichSink {
+        events: AtomicUsize,
+        flushes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::ports::RichEventSink for PromptOpenRichSink {
+        fn record(&self, _kind: bridge_core::orch::OrchEventKind) {
+            self.events.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn flush(&self) -> Result<(), BridgeError> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct PromptOpenRichFactory {
+        sink: Arc<PromptOpenRichSink>,
+    }
+
+    impl bridge_core::ports::RichEventSinkFactory for PromptOpenRichFactory {
+        fn make(
+            &self,
+            _node: &bridge_core::ids::NodeId,
+        ) -> Arc<dyn bridge_core::ports::RichEventSink> {
+            self.sink.clone()
+        }
+    }
+
+    struct SlowPromptOpenDispatcher {
+        rich_recorded: Arc<tokio::sync::Notify>,
+    }
     #[async_trait::async_trait]
     impl WorkflowNodeDispatcher for SlowPromptOpenDispatcher {
         async fn checkout(
@@ -4885,7 +5635,9 @@ mod observability_tests {
             _run_id: &str,
             _ctx: &WorkflowRunContext,
         ) -> Result<NodeTurn, BridgeError> {
-            struct SlowPromptOpenBackend;
+            struct SlowPromptOpenBackend {
+                rich_recorded: Arc<tokio::sync::Notify>,
+            }
             #[async_trait::async_trait]
             impl AgentBackend for SlowPromptOpenBackend {
                 async fn prompt(
@@ -4893,8 +5645,21 @@ mod observability_tests {
                     _s: &SessionId,
                     _parts: Vec<Part>,
                 ) -> Result<BackendStream, BridgeError> {
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    Ok(Box::pin(futures::stream::empty()))
+                    panic!("warm prompt-open owner must use prompt_with_observers")
+                }
+
+                async fn prompt_with_observers(
+                    &self,
+                    _s: &SessionId,
+                    _parts: Vec<Part>,
+                    observers: BackendObservers,
+                ) -> Result<BackendStream, BridgeError> {
+                    observers
+                        .rich
+                        .expect("test supplies a rich sink")
+                        .record(bridge_core::orch::OrchEventKind::Plan { entries: vec![] });
+                    self.rich_recorded.notify_one();
+                    std::future::pending().await
                 }
 
                 async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -4903,7 +5668,9 @@ mod observability_tests {
             }
 
             Ok(NodeTurn {
-                backend: Arc::new(SlowPromptOpenBackend),
+                backend: Arc::new(SlowPromptOpenBackend {
+                    rich_recorded: self.rich_recorded.clone(),
+                }),
                 session: SessionId::parse("warm-slow-prompt-open").unwrap(),
                 seed: None,
                 cleanup: Box::new(NoopCleanup),
@@ -4916,13 +5683,18 @@ mod observability_tests {
         let rec = Arc::new(PromptOpenFinalizationRec::default());
         let token = CancellationToken::new();
         let cancel = token.clone();
+        let rich_recorded = Arc::new(tokio::sync::Notify::new());
+        let cancel_after_record = rich_recorded.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel_after_record.notified().await;
             cancel.cancel();
         });
+        let rich_sink = Arc::new(PromptOpenRichSink::default());
         let ctx = WorkflowRunContext {
             session_cwd: None,
-            make_rich_sink: None,
+            make_rich_sink: Some(Arc::new(PromptOpenRichFactory {
+                sink: rich_sink.clone(),
+            })),
             observer: rec.clone(),
             parent_traceparent: None,
             task_id: None,
@@ -4938,7 +5710,7 @@ mod observability_tests {
                 "run-cancel-prompt-open".into(),
                 token,
                 ctx,
-                Arc::new(SlowPromptOpenDispatcher),
+                Arc::new(SlowPromptOpenDispatcher { rich_recorded }),
             )
             .collect::<Vec<_>>(),
         )
@@ -4949,6 +5721,8 @@ mod observability_tests {
             rec.0.lock().unwrap().as_slice(),
             ["turn_finished", "no_usage_finalized", "node_finished"]
         );
+        assert_eq!(rich_sink.events.load(Ordering::SeqCst), 1);
+        assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
     }
 
     struct FailingPromptOpenDispatcher;

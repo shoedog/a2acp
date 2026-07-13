@@ -11,6 +11,7 @@
 //! agent is logged and OMITTED (the catalog holds only successes), so one bad agent never fails the rest.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bridge_acp::acp_backend::{AcpBackend, AcpConfig};
@@ -18,7 +19,7 @@ use bridge_core::catalog::{
     parse_kiro_list_models, parse_ollama_models, sanitize_model_caps, AgentCaps, ModelCatalog,
 };
 use bridge_core::domain::{AgentEntry, AgentKind};
-use bridge_core::ports::AgentBackend; // for `.retire()`
+use bridge_core::ports::{AgentBackend, DiagnosticObserver};
 
 /// Per-agent probe bound. The kiro host-side ACP hang made this load-bearing (spec §2): without it a
 /// single unresponsive adapter would block startup/CLI forever.
@@ -104,9 +105,70 @@ async fn probe_api(entry: &AgentEntry) -> Result<AgentCaps, String> {
     parse_ollama_models(&body).map_err(|e| format!("parse {url}: {e}"))
 }
 
+#[async_trait::async_trait]
+trait CatalogAcpBackend: Send + Sync {
+    async fn describe_options_observed(
+        &self,
+        cwd: &Path,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<AgentCaps, bridge_core::error::BridgeError>;
+    async fn retire(&self);
+}
+
+#[async_trait::async_trait]
+impl CatalogAcpBackend for AcpBackend {
+    async fn describe_options_observed(
+        &self,
+        cwd: &Path,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<AgentCaps, bridge_core::error::BridgeError> {
+        AcpBackend::describe_options_observed(self, cwd, observer).await
+    }
+
+    async fn retire(&self) {
+        let _ = AgentBackend::retire(self).await;
+    }
+}
+
+#[async_trait::async_trait]
+trait CatalogAcpSpawner: Send + Sync {
+    async fn spawn_observed(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        config: AcpConfig,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<Arc<dyn CatalogAcpBackend>, bridge_core::error::BridgeError>;
+}
+
+struct ProductionCatalogAcpSpawner;
+
+#[async_trait::async_trait]
+impl CatalogAcpSpawner for ProductionCatalogAcpSpawner {
+    async fn spawn_observed(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        config: AcpConfig,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<Arc<dyn CatalogAcpBackend>, bridge_core::error::BridgeError> {
+        AcpBackend::spawn_observed(cmd, args, config, observer)
+            .await
+            .map(|backend| Arc::new(backend) as Arc<dyn CatalogAcpBackend>)
+    }
+}
+
 /// ACP host describe (claude/codex): spawn the adapter HOST-SIDE (sandbox stripped, no container reaper, no
 /// MCP, nothing configured), read the advertised options via [`AcpBackend::describe_options`], then reap.
 async fn probe_acp_host(entry: &AgentEntry, cwd: &Path) -> Result<AgentCaps, String> {
+    probe_acp_host_with(entry, cwd, &ProductionCatalogAcpSpawner).await
+}
+
+async fn probe_acp_host_with(
+    entry: &AgentEntry,
+    cwd: &Path,
+    spawner: &dyn CatalogAcpSpawner,
+) -> Result<AgentCaps, String> {
     let cmd = entry
         .cmd
         .as_deref()
@@ -126,11 +188,16 @@ async fn probe_acp_host(entry: &AgentEntry, cwd: &Path) -> Result<AgentCaps, Str
         mcp: Vec::new(),
         ..AcpConfig::default()
     };
-    let backend = AcpBackend::spawn(&cmd, &argv, acp)
+    let observer: Arc<dyn DiagnosticObserver> = Arc::new(
+        bridge_core::diagnostics::InMemoryDiagnosticObserver::new(64)
+            .expect("catalog diagnostic capacity is nonzero"),
+    );
+    let backend = spawner
+        .spawn_observed(&cmd, &argv, acp, observer.clone())
         .await
         .map_err(|e| format!("spawn {cmd}: {e}"))?;
     let caps = backend
-        .describe_options(cwd)
+        .describe_options_observed(cwd, observer)
         .await
         .map_err(|e| format!("describe_options: {e}"));
     // Graceful teardown (SIGTERM→SIGKILL of the host child). If the outer timeout cancels this future
@@ -225,6 +292,80 @@ mod tests {
         assert_eq!(
             probe_strategy(&entry("impl", Some("codex-acp"), AgentKind::ContainerRw)),
             Strategy::Acp
+        );
+    }
+
+    struct RecordingProbeBackend {
+        described: std::sync::Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+        retired: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl CatalogAcpBackend for RecordingProbeBackend {
+        async fn describe_options_observed(
+            &self,
+            _cwd: &Path,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<AgentCaps, bridge_core::error::BridgeError> {
+            self.described.lock().unwrap().push(observer);
+            Ok(AgentCaps {
+                models: vec!["observed-model".into()],
+                ..AgentCaps::default()
+            })
+        }
+
+        async fn retire(&self) {
+            self.retired
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct RecordingProbeSpawner {
+        spawned: std::sync::Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+        backend: Arc<RecordingProbeBackend>,
+    }
+
+    #[async_trait::async_trait]
+    impl CatalogAcpSpawner for RecordingProbeSpawner {
+        async fn spawn_observed(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _config: AcpConfig,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Arc<dyn CatalogAcpBackend>, bridge_core::error::BridgeError> {
+            self.spawned.lock().unwrap().push(observer);
+            Ok(self.backend.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn production_acp_probe_owner_reuses_exact_observer_for_spawn_and_discovery() {
+        let backend = Arc::new(RecordingProbeBackend {
+            described: std::sync::Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+        });
+        let spawner = RecordingProbeSpawner {
+            spawned: std::sync::Mutex::new(Vec::new()),
+            backend: backend.clone(),
+        };
+        let caps = probe_acp_host_with(
+            &entry("codex", Some("codex-acp"), AgentKind::Acp),
+            Path::new("/tmp"),
+            &spawner,
+        )
+        .await
+        .unwrap();
+
+        let spawned = spawner.spawned.lock().unwrap();
+        let described = backend.described.lock().unwrap();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(described.len(), 1);
+        assert!(Arc::ptr_eq(&spawned[0], &described[0]));
+        assert_eq!(caps.models, vec!["observed-model"]);
+        assert!(
+            backend.retired.load(std::sync::atomic::Ordering::SeqCst),
+            "production owner must retire the one-shot backend"
         );
     }
 
