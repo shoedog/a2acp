@@ -71,6 +71,41 @@ fn diagnostic_code_accepts_only_bounded_bridge_tokens() {
 }
 
 #[test]
+fn static_codes_survive_short_secret_collision_without_weakening_dynamic_redaction() {
+    let redactor = DiagnosticRedactor::new(["a"]);
+    let transition = PersistedPhaseTransition::build_static_code(
+        PersistedPhaseTransitionInput {
+            phase: DiagnosticPhase::Authenticate,
+            status: PhaseStatus::Skipped,
+            at_ms: 42,
+            operation: None,
+            code: Some("a".into()),
+            auth: Some(AuthenticationEvidenceInput::ConfiguredMethod {
+                configured_id: "a".into(),
+                advertised: false,
+            }),
+        },
+        Some("acp.auth.no_methods_advertised"),
+        &redactor,
+    )
+    .unwrap();
+    assert_eq!(
+        transition.code().map(|code| code.as_str()),
+        Some("acp.auth.no_methods_advertised")
+    );
+    let transition_json = serde_json::to_string(&transition).unwrap();
+    assert!(!transition_json.contains("\"value\":\"a\""));
+
+    let mut input = base_failure("acp.initialize.transport");
+    input.code = "a".into();
+    input.causes = vec!["a".into()];
+    let failure =
+        FailureDiagnostic::build_static_code(input, "acp.initialize.transport", &redactor).unwrap();
+    assert_eq!(failure.code().as_str(), "acp.initialize.transport");
+    assert_eq!(failure.causes(), ["[REDACTED KNOWN SECRET]"]);
+}
+
+#[test]
 fn cause_truncation_keeps_two_outermost_and_six_deepest() {
     let redactor = DiagnosticRedactor::default();
     let mut input = base_failure("acp.initialize.transport");
@@ -116,6 +151,22 @@ fn redaction_covers_unsplit_adjacent_and_multibyte_values() {
     let bounded = FailureDiagnostic::build(long, &DiagnosticRedactor::default()).unwrap();
     assert!(bounded.summary().len() <= 512);
     assert!(bounded.summary().is_char_boundary(bounded.summary().len()));
+}
+
+#[test]
+fn redactor_extension_removes_runtime_derived_values() {
+    let redactor = DiagnosticRedactor::new(["configured-template"]).with_known_values([
+        "runtime-derived-secret",
+        "runtime-derived-secret",
+        "",
+    ]);
+    let mut input = base_failure("acp.initialize.transport");
+    input.causes = vec!["agent echoed runtime-derived-secret".to_owned()];
+
+    let diagnostic = FailureDiagnostic::build(input, &redactor).unwrap();
+    let rendered = serde_json::to_string(&diagnostic).unwrap();
+    assert!(!rendered.contains("runtime-derived-secret"));
+    assert!(rendered.contains("REDACTED KNOWN SECRET"));
 }
 
 #[test]
@@ -371,7 +422,7 @@ fn every_diagnostic_class_has_a_bounded_metrics_mapping() {
 }
 
 #[test]
-fn production_sources_do_not_construct_agent_failure_yet() {
+fn production_sources_construct_agent_failure_only_through_central_builder() {
     use syn::visit::Visit;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -489,6 +540,9 @@ fn production_sources_do_not_construct_agent_failure_yet() {
         violations: Vec<String>,
         in_central_builder: bool,
         central_builder_constructor_count: usize,
+        in_acp_lifecycle_impl: bool,
+        in_acp_lifecycle_failure: bool,
+        acp_lifecycle_constructor_count: usize,
     }
 
     impl<'ast> Visit<'ast> for ConstructorVisitor<'_> {
@@ -508,6 +562,22 @@ fn production_sources_do_not_construct_agent_failure_yet() {
             syn::visit::visit_item_use(self, node);
         }
 
+        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+            let was_in_acp_lifecycle_impl = self.in_acp_lifecycle_impl;
+            self.in_acp_lifecycle_impl =
+                self.path.ends_with("crates/bridge-acp/src/acp_backend.rs")
+                    && node.trait_.is_none()
+                    && matches!(
+                        node.self_ty.as_ref(),
+                        syn::Type::Path(path)
+                            if path.qself.is_none()
+                                && path.path.segments.len() == 1
+                                && path.path.is_ident("AcpLifecycle")
+                    );
+            syn::visit::visit_item_impl(self, node);
+            self.in_acp_lifecycle_impl = was_in_acp_lifecycle_impl;
+        }
+
         fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
             if test_only(&node.attrs) {
                 return;
@@ -518,8 +588,12 @@ fn production_sources_do_not_construct_agent_failure_yet() {
             {
                 self.in_central_builder = true;
             }
+            let was_in_acp_lifecycle_failure = self.in_acp_lifecycle_failure;
+            self.in_acp_lifecycle_failure =
+                self.in_acp_lifecycle_impl && node.sig.ident == "failure";
             syn::visit::visit_impl_item_fn(self, node);
             self.in_central_builder = was_in_central_builder;
+            self.in_acp_lifecycle_failure = was_in_acp_lifecycle_failure;
         }
 
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
@@ -556,6 +630,35 @@ fn production_sources_do_not_construct_agent_failure_yet() {
             syn::visit::visit_expr_path(self, node);
         }
 
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            let is_agent_failure_call = match node.func.as_ref() {
+                syn::Expr::Path(path) => {
+                    let segments: Vec<_> = path.path.segments.iter().collect();
+                    segments.len() >= 2
+                        && segments[segments.len() - 2].ident == "BridgeError"
+                        && segments[segments.len() - 1].ident == "agent_failure"
+                }
+                _ => false,
+            };
+            if is_agent_failure_call {
+                let exact_path = matches!(node.func.as_ref(), syn::Expr::Path(path)
+                    if path.qself.is_none() && path.path.segments.len() == 2);
+                if self.in_acp_lifecycle_failure && exact_path {
+                    self.acp_lifecycle_constructor_count += 1;
+                } else {
+                    self.violations.push(format!(
+                        "{}: BridgeError::agent_failure outside AcpLifecycle::failure",
+                        self.path.display()
+                    ));
+                }
+                for argument in &node.args {
+                    self.visit_expr(argument);
+                }
+            } else {
+                syn::visit::visit_expr_call(self, node);
+            }
+        }
+
         fn visit_macro(&mut self, node: &'ast syn::Macro) {
             let tokens = node.tokens.to_string();
             if tokens.contains("AgentFailure") || tokens.contains("agent_failure") {
@@ -568,16 +671,41 @@ fn production_sources_do_not_construct_agent_failure_yet() {
         }
     }
 
-    fn source_violations(source: &str) -> Vec<String> {
+    fn source_violations_at(path: &std::path::Path, source: &str) -> Vec<String> {
         let file = syn::parse_file(source).unwrap();
         let mut visitor = ConstructorVisitor {
-            path: std::path::Path::new("synthetic.rs"),
+            path,
             violations: Vec::new(),
             in_central_builder: false,
             central_builder_constructor_count: 0,
+            in_acp_lifecycle_impl: false,
+            in_acp_lifecycle_failure: false,
+            acp_lifecycle_constructor_count: 0,
         };
         visitor.visit_file(&file);
+        if path.ends_with("crates/bridge-core/src/error.rs")
+            && visitor.central_builder_constructor_count != 1
+        {
+            visitor.violations.push(format!(
+                "{}: central builder contains {} AgentFailure constructors, expected 1",
+                path.display(),
+                visitor.central_builder_constructor_count
+            ));
+        }
+        if path.ends_with("crates/bridge-acp/src/acp_backend.rs")
+            && visitor.acp_lifecycle_constructor_count != 1
+        {
+            visitor.violations.push(format!(
+                "{}: AcpLifecycle::failure contains {} agent_failure calls, expected 1",
+                path.display(),
+                visitor.acp_lifecycle_constructor_count
+            ));
+        }
         visitor.violations
+    }
+
+    fn source_violations(source: &str) -> Vec<String> {
+        source_violations_at(std::path::Path::new("synthetic.rs"), source)
     }
 
     fn visit(path: &std::path::Path, violations: &mut Vec<String>) {
@@ -591,29 +719,13 @@ fn production_sources_do_not_construct_agent_failure_yet() {
                     .any(|component| component.as_os_str() == "src")
             {
                 let source = std::fs::read_to_string(&path).unwrap();
-                let file = syn::parse_file(&source).unwrap_or_else(|error| {
+                syn::parse_file(&source).unwrap_or_else(|error| {
                     panic!(
                         "failed to parse {} for source guard: {error}",
                         path.display()
                     )
                 });
-                let mut visitor = ConstructorVisitor {
-                    path: &path,
-                    violations: Vec::new(),
-                    in_central_builder: false,
-                    central_builder_constructor_count: 0,
-                };
-                visitor.visit_file(&file);
-                if path.ends_with("crates/bridge-core/src/error.rs")
-                    && visitor.central_builder_constructor_count != 1
-                {
-                    visitor.violations.push(format!(
-                        "{}: central builder contains {} AgentFailure constructors, expected 1",
-                        path.display(),
-                        visitor.central_builder_constructor_count
-                    ));
-                }
-                violations.extend(visitor.violations);
+                violations.extend(source_violations_at(&path, &source));
             }
         }
     }
@@ -631,12 +743,22 @@ fn production_sources_do_not_construct_agent_failure_yet() {
         "#[cfg(test)] fn fixture() { BridgeError::agent_failure(diagnostic); }"
     )
     .is_empty());
+    assert!(source_violations_at(
+        std::path::Path::new("crates/bridge-acp/src/acp_backend.rs"),
+        "struct AcpLifecycle; impl AcpLifecycle { \
+         async fn failure(&self) { let _ = BridgeError::agent_failure(diagnostic); } }"
+    )
+    .is_empty());
+    assert!(
+        !source_violations("fn production_site() { BridgeError::agent_failure(diagnostic); }")
+            .is_empty(),
+        "an arbitrary production site must not bypass the central lifecycle builder"
+    );
     for source in [
         "use BridgeError::AgentFailure as AF; fn f() { let _ = AF { diagnostic }; }",
         "use BridgeError::agent_failure as make; fn f() { let _ = make(diagnostic); }",
-        "#[cfg(not(test))] fn f() { BridgeError::agent_failure(diagnostic); }",
-        "#[cfg(any(test, feature = \"x\"))] fn f() { BridgeError::agent_failure(diagnostic); }",
-        "#[custom::test] fn f() { BridgeError::agent_failure(diagnostic); }",
+        "fn f() { let make = BridgeError::agent_failure; make(diagnostic); }",
+        "fn f() { Other::agent_failure(diagnostic); }",
     ] {
         assert!(
             !source_violations(source).is_empty(),

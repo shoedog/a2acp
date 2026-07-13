@@ -222,23 +222,57 @@ impl DiagnosticRedactor {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut known_values: Vec<String> = known_values
+        let known_values: Vec<String> = known_values
             .into_iter()
             .map(Into::into)
             .filter(|value| !value.is_empty())
             .collect();
-        known_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        known_values.dedup();
         Self {
-            known_values,
+            known_values: Self::normalize_known_values(known_values),
             home_dir: std::env::var("HOME").ok().filter(|value| !value.is_empty()),
         }
+    }
+
+    /// Add exact bridge-known credential values while preserving the existing
+    /// home-directory policy. Longer values remain first so an embedded shorter
+    /// credential cannot partially rewrite a longer one before it is removed.
+    #[must_use]
+    pub fn with_known_values<I, S>(mut self, known_values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.known_values.extend(
+            known_values
+                .into_iter()
+                .map(Into::into)
+                .filter(|value| !value.is_empty()),
+        );
+        self.known_values = Self::normalize_known_values(self.known_values);
+        self
+    }
+
+    fn normalize_known_values(mut known_values: Vec<String>) -> Vec<String> {
+        known_values
+            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        known_values.dedup();
+        known_values
     }
 
     pub fn with_home_dir(mut self, home_dir: impl Into<String>) -> Self {
         let home_dir = home_dir.into();
         self.home_dir = (!home_dir.is_empty()).then_some(home_dir);
         self
+    }
+
+    /// Sanitize one process-stderr record before it enters an in-memory ring.
+    ///
+    /// This is intentionally the same second-line defense used by persisted
+    /// diagnostics: exact bridge-known credential values, URL query/fragment
+    /// data, secret markers, the operator home directory, and control
+    /// characters are removed before the caller applies its storage bound.
+    pub fn sanitize_stderr_line(&self, value: &str, max_bytes: usize) -> String {
+        self.sanitize_text(value, max_bytes)
     }
 
     fn contains_known_value(&self, value: &str) -> bool {
@@ -454,13 +488,23 @@ impl DiagnosticCode {
         value: impl Into<String>,
         redactor: &DiagnosticRedactor,
     ) -> Result<Self, DiagnosticBuildError> {
-        let value = value.into();
+        Self::build_inner(value.into(), Some(redactor))
+    }
+
+    fn build_static(value: String) -> Result<Self, DiagnosticBuildError> {
+        Self::build_inner(value, None)
+    }
+
+    fn build_inner(
+        value: String,
+        redactor: Option<&DiagnosticRedactor>,
+    ) -> Result<Self, DiagnosticBuildError> {
         if value.is_empty()
             || value.len() > MAX_CODE_BYTES
             || !value.bytes().all(|byte| {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
             })
-            || redactor.contains_known_value(&value)
+            || redactor.is_some_and(|redactor| redactor.contains_known_value(&value))
             || looks_secret_shaped(&value)
         {
             return Err(DiagnosticBuildError::InvalidCode);
@@ -877,9 +921,37 @@ impl PersistedPhaseTransition {
         input: PersistedPhaseTransitionInput,
         redactor: &DiagnosticRedactor,
     ) -> Result<Self, DiagnosticBuildError> {
+        Self::build_inner(input, redactor, false)
+    }
+
+    /// Build a transition whose code is a bridge-owned static token while all
+    /// runtime auth evidence still uses the full known-value redactor. This
+    /// prevents a short credential such as `a` from colliding with a trusted
+    /// code without weakening redaction of dynamic fields.
+    #[doc(hidden)]
+    pub fn build_static_code(
+        mut input: PersistedPhaseTransitionInput,
+        static_code: Option<&'static str>,
+        redactor: &DiagnosticRedactor,
+    ) -> Result<Self, DiagnosticBuildError> {
+        input.code = static_code.map(str::to_owned);
+        Self::build_inner(input, redactor, true)
+    }
+
+    fn build_inner(
+        input: PersistedPhaseTransitionInput,
+        redactor: &DiagnosticRedactor,
+        static_code: bool,
+    ) -> Result<Self, DiagnosticBuildError> {
         let code = input
             .code
-            .map(|code| DiagnosticCode::build(code, redactor))
+            .map(|code| {
+                if static_code {
+                    DiagnosticCode::build_static(code)
+                } else {
+                    DiagnosticCode::build(code, redactor)
+                }
+            })
             .transpose()?;
         let mut auth = input
             .auth
@@ -887,11 +959,13 @@ impl PersistedPhaseTransition {
 
         if let Some(auth) = auth.as_mut() {
             let mut dynamic = Vec::with_capacity(1 + auth.dynamic_values().len());
-            dynamic.push(
+            dynamic.push(if static_code {
+                String::new()
+            } else {
                 code.as_ref()
                     .map(|code| code.as_str().to_owned())
-                    .unwrap_or_default(),
-            );
+                    .unwrap_or_default()
+            });
             dynamic.extend(auth.dynamic_values());
             let sensitive = redactor.adjacent_sensitive_indices(&dynamic);
             if sensitive.first().copied().unwrap_or(false) {
@@ -1009,7 +1083,19 @@ impl FailureDiagnostic {
         input: FailureDiagnosticInput,
         redactor: &DiagnosticRedactor,
     ) -> Result<Self, DiagnosticBuildError> {
-        Self::build_with_reference_time(input, redactor, diagnostic_now_ms())
+        Self::build_with_reference_time_inner(input, redactor, diagnostic_now_ms(), false)
+    }
+
+    /// Build a diagnostic whose code is a bridge-owned static token while all
+    /// summaries, causes, and stderr retain the full known-value redactor.
+    #[doc(hidden)]
+    pub fn build_static_code(
+        mut input: FailureDiagnosticInput,
+        static_code: &'static str,
+        redactor: &DiagnosticRedactor,
+    ) -> Result<Self, DiagnosticBuildError> {
+        input.code = static_code.to_owned();
+        Self::build_with_reference_time_inner(input, redactor, diagnostic_now_ms(), true)
     }
 
     pub fn build_at(
@@ -1017,7 +1103,7 @@ impl FailureDiagnostic {
         redactor: &DiagnosticRedactor,
         reference_time_ms: i64,
     ) -> Result<Self, DiagnosticBuildError> {
-        Self::build_with_reference_time(input, redactor, Some(reference_time_ms))
+        Self::build_with_reference_time_inner(input, redactor, Some(reference_time_ms), false)
     }
 
     #[doc(hidden)]
@@ -1025,6 +1111,15 @@ impl FailureDiagnostic {
         input: FailureDiagnosticInput,
         redactor: &DiagnosticRedactor,
         reference_time_ms: Option<i64>,
+    ) -> Result<Self, DiagnosticBuildError> {
+        Self::build_with_reference_time_inner(input, redactor, reference_time_ms, false)
+    }
+
+    fn build_with_reference_time_inner(
+        input: FailureDiagnosticInput,
+        redactor: &DiagnosticRedactor,
+        reference_time_ms: Option<i64>,
+        static_code: bool,
     ) -> Result<Self, DiagnosticBuildError> {
         validate_disposition(&input)?;
         validate_stderr(&input)?;
@@ -1041,7 +1136,11 @@ impl FailureDiagnostic {
             return Err(DiagnosticBuildError::InvalidRetryMetadata);
         }
 
-        let code = DiagnosticCode::build(input.code, redactor)?;
+        let code = if static_code {
+            DiagnosticCode::build_static(input.code)?
+        } else {
+            DiagnosticCode::build(input.code, redactor)?
+        };
         let mut causes = if input.causes.len() > MAX_CAUSES {
             input
                 .causes
@@ -1060,7 +1159,11 @@ impl FailureDiagnostic {
         });
 
         let mut all_dynamic = Vec::new();
-        all_dynamic.push(code.as_str().to_owned());
+        all_dynamic.push(if static_code {
+            String::new()
+        } else {
+            code.as_str().to_owned()
+        });
         all_dynamic.push(summary.clone());
         all_dynamic.extend(causes.iter().cloned());
         if let Some(lines) = &stderr_tail {

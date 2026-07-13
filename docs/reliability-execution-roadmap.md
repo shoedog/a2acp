@@ -2,8 +2,8 @@
 
 - **Program status:** active P0
 - **R2b1 implementation baseline:** `main` at `7b788c1f` on 2026-07-12
-- **Completed through:** R2b1 diagnostic foundation
-- **Next action:** start R2b2b ACP lifecycle and safe evidence from committed R2b2a
+- **Completed through:** R2b2a observer/storage/registry compatibility
+- **Next action:** close the fresh Sol/xhigh R2b2b review, then run exact-tree full gates and commit 2b
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -20,7 +20,7 @@ and completion evidence.
 R2a provenance (MERGED)
   -> R2b0 contract clarifications (MERGED)
   -> R2b1 diagnostic types + rollback-safe persistence surface (MERGED)
-  -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (NEXT)
+  -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (IN PROGRESS)
   -> R2b3 API/provider mapping + remaining container/dispatch observation
   -> R2c explicit one-turn billable smoke
        -> R2d local non-billable fallback plan
@@ -43,7 +43,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
-| R2b2 — ACP/Fable lifecycle diagnostics | **IN PROGRESS** (2a committed at `4ed12f1`; 2b next) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, then concurrency-qualified warm cleanup; one final merge boundary. |
+| R2b2 — ACP/Fable lifecycle diagnostics | **IN PROGRESS** (2a committed at `4ed12f1`; 2b closure pending) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, then concurrency-qualified warm cleanup; one final merge boundary. |
 | R2b3 — API/container diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
@@ -246,7 +246,8 @@ Next action:
 - R2b1 was fast-forwarded to `origin/main` at `7b788c1fa6b62459e8a8473ca853f9414b28bfbc` after the
   final `APPROVE`; the post-merge cursor branch is `agent/reliability-r2b2-cursor`.
 - R2b2 implementation is active on `agent/reliability-r2b2-acp-lifecycle`; R2b2a is committed at
-  `4ed12f1035c16fa5dbd55169e59ca4c277373da4`, and R2b2b is the next implementation item.
+  `4ed12f1035c16fa5dbd55169e59ca4c277373da4`. R2b2b is implemented in the working tree based on
+  `3b0b4f9973991e9f76a73e0c41013b08334205eb`; a fresh Sol/xhigh closure review is the next action.
 - R2b2a adds bounded/no-op/task-journal diagnostic observers and explicit factories, composite backend
   compatibility methods, `resolve_observed`, legacy/observed registry spawn constructors, initializer-only
   observer ownership, cache/waiter `backend.reused`, and live `new_observed` wiring. No ACP lifecycle
@@ -259,3 +260,19 @@ Next action:
 - R2b2a's exact post-fold tree passed workspace check, warnings-denied all-target clippy, **1,640 passed /
   0 failed / 12 ignored**, release binary build, and repository hygiene (37 tracked artifacts / 7 example
   configs). The ignored set remains authenticated real-agent/two-bridge and local Ollama coverage.
+- R2b2b threads structured lifecycle observation through ACP spawn/initialize/auth/session/config/prompt
+  and operation-owned teardown; adds accepted-work no-replay fencing, bounded process-scoped redacted
+  stderr, deterministic cancellation settling, and an AST-enforced typed trace funnel. Its first full
+  review plus ten closure reviews are recorded in the implementation plan. The latest fold makes process
+  stderr metadata-only monotonically after an uncertain credential-bearing mint or session removal, so a
+  later finite redactor replacement cannot expose delayed text. Prior folds keep accepted work evidence
+  through route removal, own active mint-cwd cleanup before redactor awaits, order cancel delivery against
+  prompt installation, and preserve effective-cwd values across live sessions. Deferred R2f evidence
+  remains on its own parked branch. Focused gates pass: bridge-acp **183 / 0**,
+  bridge-container **24 / 0**,
+  R2b1 diagnostics **20 / 0**, process lifecycle **13 / 0**, targeted host/core MCP regressions, and
+  warnings-denied changed-crate Clippy. The fresh Sol/xhigh closure review returned `APPROVE` with no new
+  `WRONG` or `SMELL`. The exact code tree passes workspace check, workspace/all-target warnings-denied
+  Clippy, **1,700 passed / 0 failed / 12 ignored** across 46 test executables, release build, format/diff,
+  and repository hygiene (**37** tracked artifacts / **7** example configs). R2b2b is ready to commit and
+  push; do not merge the R2b2 branch until R2b2a-d plus the full-branch review gate are complete.

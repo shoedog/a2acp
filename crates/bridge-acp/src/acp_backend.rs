@@ -36,12 +36,19 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::model_effort::{
     caps_from_config_options, effort_opt, is_blocked_model, is_unsupported_effort_error,
-    model_values, resolve_effort, resolve_model, resolved_log_line, EffortDecision, ModelDecision,
+    model_values, resolve_effort, resolve_model, EffortDecision, ModelDecision,
     ModelResolutionError, EFFORT_ORDER,
 };
 use bridge_core::catalog::AgentCaps;
+use bridge_core::diagnostics::{
+    diagnostic_timestamp_ms, AuthenticationEvidenceInput, DiagnosticFailureClass,
+    DiagnosticOperation, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+    FailureDiagnosticInput, FailureDisposition, PersistedPhaseTransition,
+    PersistedPhaseTransitionInput, PhaseStatus, StderrScope,
+};
 use bridge_core::domain::{
-    Effort, PermissionDecision, PermissionRequest, PermitDecision, SessionContext, SessionSpec,
+    EffectiveConfig, Effort, PermissionDecision, PermissionRequest, PermitDecision, SessionContext,
+    SessionSpec,
 };
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
@@ -53,11 +60,13 @@ use bridge_core::permission::{
     TurnMeta,
 };
 use bridge_core::ports::{
-    AgentBackend, BackendStream, PolicyEngine, PolicyOutcome, RichEventSink, Update,
-    STOP_REASON_CANCELLED,
+    AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, PolicyEngine, PolicyOutcome,
+    RichEventSink, Update, STOP_REASON_CANCELLED,
 };
 
-use bridge_core::process::Supervised;
+use bridge_core::process::{
+    ProcessStderrCursor, ProcessStderrRing, ProcessStderrSnapshot, Supervised,
+};
 
 /// Default bound on the `initialize` handshake. A real agent that connects its
 /// stdio but never sends the initialize response would otherwise hang
@@ -78,6 +87,245 @@ const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(50
 const RICH_CONTENT_CAP: usize = 2048;
 const RICH_VEC_CAP: usize = 64;
 const PERMISSION_VIEW_CAP: usize = 4096;
+
+#[derive(Clone)]
+struct AcpLifecycle {
+    observer: Arc<dyn DiagnosticObserver>,
+    redactor: DiagnosticRedactor,
+    stderr: Option<(ProcessStderrRing, ProcessStderrCursor)>,
+}
+
+impl AcpLifecycle {
+    fn new(
+        observer: Arc<dyn DiagnosticObserver>,
+        redactor: DiagnosticRedactor,
+        stderr: Option<(ProcessStderrRing, ProcessStderrCursor)>,
+    ) -> Self {
+        Self {
+            observer,
+            redactor,
+            stderr,
+        }
+    }
+
+    fn stderr_snapshot(&self) -> Option<ProcessStderrSnapshot> {
+        self.stderr
+            .as_ref()
+            .map(|(ring, cursor)| ring.metadata_since(*cursor))
+    }
+
+    async fn record(
+        &self,
+        phase: DiagnosticPhase,
+        status: PhaseStatus,
+        operation: Option<DiagnosticOperation>,
+        code: Option<&'static str>,
+        auth: Option<AuthenticationEvidenceInput>,
+    ) -> Result<(), BridgeError> {
+        let transition = PersistedPhaseTransition::build_static_code(
+            PersistedPhaseTransitionInput {
+                phase,
+                status,
+                at_ms: diagnostic_timestamp_ms(),
+                operation,
+                code: None,
+                auth,
+            },
+            code,
+            &self.redactor,
+        )
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+        let event = bridge_core::diagnostics::DiagnosticEvent::new(transition, None)
+            .map_err(|_| BridgeError::InvalidStateTransition)?;
+        self.observer.record(event).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn failure(
+        &self,
+        phase: DiagnosticPhase,
+        last_completed_phase: Option<DiagnosticPhase>,
+        class: DiagnosticFailureClass,
+        disposition: FailureDisposition,
+        code: &'static str,
+        summary: &'static str,
+        cause: Option<String>,
+        prompt_may_have_been_accepted: bool,
+        stderr: Option<ProcessStderrSnapshot>,
+        operation: Option<DiagnosticOperation>,
+        auth: Option<AuthenticationEvidenceInput>,
+    ) -> BridgeError {
+        let stderr = stderr.or_else(|| self.stderr_snapshot());
+        let stderr_line_count = stderr.as_ref().map_or(0, ProcessStderrSnapshot::line_count);
+        let stderr_observed = stderr_line_count != 0;
+        let failure = match FailureDiagnostic::build_static_code(
+            FailureDiagnosticInput {
+                failed_phase: phase,
+                last_completed_phase,
+                class,
+                disposition,
+                code: String::new(),
+                summary: summary.to_owned(),
+                causes: cause.into_iter().collect(),
+                stderr_observed,
+                stderr_line_count,
+                stderr_scope: stderr_observed.then_some(StderrScope::Process),
+                stderr_tail: None,
+                stderr_redaction: None,
+                retry_after_ms: None,
+                reset_at_ms: None,
+                prompt_may_have_been_accepted,
+            },
+            code,
+            &self.redactor,
+        ) {
+            Ok(failure) => failure,
+            Err(_) => return BridgeError::InvalidStateTransition,
+        };
+        let transition = match PersistedPhaseTransition::build_static_code(
+            PersistedPhaseTransitionInput {
+                phase,
+                status: PhaseStatus::Failed,
+                at_ms: diagnostic_timestamp_ms(),
+                operation,
+                code: None,
+                auth,
+            },
+            Some(code),
+            &self.redactor,
+        ) {
+            Ok(transition) => transition,
+            Err(_) => return BridgeError::InvalidStateTransition,
+        };
+        let event =
+            match bridge_core::diagnostics::DiagnosticEvent::new(transition, Some(failure.clone()))
+            {
+                Ok(event) => event,
+                Err(_) => return BridgeError::InvalidStateTransition,
+            };
+        match self.observer.record(event).await {
+            Ok(()) => BridgeError::agent_failure(failure),
+            Err(error) => error,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AcpTraceEvent {
+    ModelOptionsMissing,
+    EffortBelowMinimum {
+        advertised_count: u16,
+    },
+    EffortOptionMissing,
+    ConfigResolved {
+        effort_applied: bool,
+        fell_back: bool,
+    },
+    EffortFallback,
+    EffortRequestRejected {
+        rpc_code: i64,
+    },
+    EffortWalkdownExhausted {
+        rpc_code: i64,
+    },
+    EffortWalkdownRetry {
+        rpc_code: i64,
+    },
+    InitializeFailed,
+    AuthMethodMismatch {
+        advertised_count: u16,
+    },
+    PreAuthenticated {
+        advertised_count: u16,
+    },
+    SessionCreateFailed,
+    DiscoverySessionCreateFailed,
+    PromptFailed,
+    WarmConfigNotAdvertised,
+    WarmConfigRejected,
+}
+
+impl AcpTraceEvent {
+    fn bounded_count(count: usize) -> u16 {
+        u16::try_from(count).unwrap_or(u16::MAX)
+    }
+
+    fn emit(self) {
+        match self {
+            Self::ModelOptionsMissing => tracing::warn!(
+                event = "acp.model_options_missing",
+                "ACP lifecycle metadata"
+            ),
+            Self::EffortBelowMinimum { advertised_count } => tracing::warn!(
+                event = "acp.effort_below_minimum",
+                advertised_count,
+                "ACP lifecycle metadata"
+            ),
+            Self::EffortOptionMissing => tracing::warn!(
+                event = "acp.effort_option_missing",
+                "ACP lifecycle metadata"
+            ),
+            Self::ConfigResolved {
+                effort_applied,
+                fell_back,
+            } => tracing::info!(
+                event = "acp.config_resolved",
+                effort_applied,
+                fell_back,
+                "ACP lifecycle metadata"
+            ),
+            Self::EffortFallback => {
+                tracing::warn!(event = "acp.effort_fallback", "ACP lifecycle metadata")
+            }
+            Self::EffortRequestRejected { rpc_code } => tracing::warn!(
+                event = "acp.effort_request_rejected",
+                rpc_code,
+                "ACP lifecycle metadata"
+            ),
+            Self::EffortWalkdownExhausted { rpc_code } => tracing::warn!(
+                event = "acp.effort_walkdown_exhausted",
+                rpc_code,
+                "ACP lifecycle metadata"
+            ),
+            Self::EffortWalkdownRetry { rpc_code } => tracing::warn!(
+                event = "acp.effort_walkdown_retry",
+                rpc_code,
+                "ACP lifecycle metadata"
+            ),
+            Self::InitializeFailed => {
+                tracing::warn!(event = "acp.initialize_failed", "ACP lifecycle metadata")
+            }
+            Self::AuthMethodMismatch { advertised_count } => tracing::warn!(
+                event = "acp.auth_method_mismatch",
+                advertised_count,
+                "ACP lifecycle metadata"
+            ),
+            Self::PreAuthenticated { advertised_count } => tracing::debug!(
+                event = "acp.pre_authenticated",
+                advertised_count,
+                "ACP lifecycle metadata"
+            ),
+            Self::SessionCreateFailed => tracing::warn!(
+                event = "acp.session_create_failed",
+                "ACP lifecycle metadata"
+            ),
+            Self::DiscoverySessionCreateFailed => tracing::warn!(
+                event = "acp.discovery_session_create_failed",
+                "ACP lifecycle metadata"
+            ),
+            Self::PromptFailed => {
+                tracing::warn!(event = "acp.prompt_failed", "ACP lifecycle metadata")
+            }
+            Self::WarmConfigNotAdvertised => tracing::warn!(
+                event = "acp.warm_config_not_advertised",
+                "ACP lifecycle metadata"
+            ),
+            Self::WarmConfigRejected => {
+                tracing::warn!(event = "acp.warm_config_rejected", "ACP lifecycle metadata")
+            }
+        }
+    }
+}
 
 /// Static configuration for an ACP agent connection.
 ///
@@ -124,6 +372,10 @@ pub struct AcpConfig {
     pub mcp: Vec<bridge_core::mcp::McpServerSpec>,
     /// Optional per-turn watchdog. `None` disables watchdog behavior.
     pub watchdog: Option<bridge_core::domain::WatchdogConfig>,
+    /// Exact credential values the bridge already possesses and must remove
+    /// from lifecycle causes and process stderr before either is retained.
+    /// `Debug` reports only a count; values are never rendered.
+    pub diagnostic_redactor: DiagnosticRedactor,
 }
 
 /// Reaper handle for a containerized (`:ro` sandbox) agent: the named `docker run` container is removed
@@ -160,6 +412,7 @@ impl Default for AcpConfig {
             container: None,
             mcp: Vec::new(),
             watchdog: None,
+            diagnostic_redactor: DiagnosticRedactor::default(),
         }
     }
 }
@@ -238,6 +491,10 @@ struct TurnRoute {
     #[allow(dead_code)]
     turn_meta: Option<TurnMeta>,
     cancelled: Arc<AtomicBool>,
+    /// True only while the accepted agent turn can still require escalation.
+    /// The terminal driver and cancel watcher race on this bit so a slow
+    /// post-response observer cannot be mistaken for live agent work.
+    active: Arc<AtomicBool>,
 }
 
 struct TurnWatch {
@@ -273,6 +530,37 @@ enum TurnEvent {
     /// `Err` item, so a crash surfaces to the A2A caller as `Failed` — never the
     /// silent `Done{"unknown"}` that downstream reads as a clean `Completed`.
     Failed(BridgeError),
+}
+
+enum PromptDriverFailure {
+    Sdk(String),
+    KillSwitch,
+    Watchdog(Option<String>),
+    DroppedStreamTimeout,
+}
+
+enum CancelSettle<T, E> {
+    Prompt(Result<T, E>),
+    KillSwitch,
+    GraceElapsed,
+}
+
+async fn settle_prompt_after_cancel<F, T, E>(
+    prompt_fut: std::pin::Pin<&mut F>,
+    kill: &tokio::sync::Notify,
+    grace: std::time::Duration,
+) -> CancelSettle<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    tokio::select! {
+        // If an SDK terminal and a local deadline are both ready in the same
+        // poll, preserve the SDK result and its deeper cause deterministically.
+        biased;
+        outcome = prompt_fut => CancelSettle::Prompt(outcome),
+        _ = kill.notified() => CancelSettle::KillSwitch,
+        _ = tokio::time::sleep(grace) => CancelSettle::GraceElapsed,
+    }
 }
 
 // ── SDK connection handle ────────────────────────────────────────────────────
@@ -323,19 +611,33 @@ struct AgentSession {
     /// The agent-minted session id, set exactly once by the `session/new` that
     /// `ensure_session` drives. `OnceCell` guarantees single init under races.
     agent_id: OnceCell<AgentSessionId>,
+    /// Single-flight owner for initialization. The owner moves into a spawned
+    /// task, so cancelling the caller that first requested a session cannot
+    /// cancel an already-started `session/new`/configuration lifecycle and
+    /// leave a durable `Started` without a terminal event.
+    init_lock: Arc<Mutex<()>>,
     /// The cwd string that was ACTUALLY passed to `session/new` when this session
-    /// was minted. Set inside the same `get_or_try_init` closure as `agent_id`
+    /// was minted. Set by the same shielded single-flight task as `agent_id`
     /// (so it is always set iff the session exists) and used by the immutability
     /// guard: if a later `configure_session` stashes a DIFFERENT cwd for an
     /// already-minted session, `ensure_session` returns `InvalidStateTransition`
     /// rather than silently re-using the old cwd. ACP §11A: a session's cwd is
     /// fixed at `session/new` time.
     minted_cwd: OnceCell<String>,
+    /// Cwd selected by the one active mint attempt. `init_lock` makes this
+    /// single-valued; the initializer clears it on every exit, while successful
+    /// minting transfers durable ownership to `minted_cwd`.
+    active_mint_cwd: StdMutex<Option<String>>,
     /// Per-session turn lock. Held for the duration of a prompt turn so turns on
     /// one agent session run strictly sequentially. `Arc<Mutex<()>>` (not a bare
     /// field) so `prompt` can take an OWNED guard (`lock_owned`) and move it into
     /// the driver task that holds it for the whole streamed turn.
     turn_lock: Arc<Mutex<()>>,
+    /// Operation-scoped accepted-work evidence for the turn that owns
+    /// `turn_lock`. Routing ends as soon as the SDK result is terminal, but
+    /// completion observation can still be in flight; this slot deliberately
+    /// outlives the routing entry and is cleared before the turn lock releases.
+    turn_accepted: Arc<StdMutex<Option<Arc<AtomicBool>>>>,
     /// The advertised config surface from `session/new`, refreshed by later
     /// `session/set_config_option` calls so warm config reconcile can reuse it.
     config_surface: StdMutex<Option<ConfigSurface>>,
@@ -360,11 +662,85 @@ impl AgentSession {
     fn new() -> Self {
         Self {
             agent_id: OnceCell::new(),
+            init_lock: Arc::new(Mutex::new(())),
             minted_cwd: OnceCell::new(),
+            active_mint_cwd: StdMutex::new(None),
             turn_lock: Arc::new(Mutex::new(())),
+            turn_accepted: Arc::new(StdMutex::new(None)),
             config_surface: StdMutex::new(None),
             cancel_requested: AtomicBool::new(false),
             turn_kill: Arc::new(StdMutex::new(None)),
+        }
+    }
+}
+
+struct ActiveMintCwdGuard(Arc<AgentSession>);
+
+impl Drop for ActiveMintCwdGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active_cwd) = self.0.active_mint_cwd.lock() {
+            *active_cwd = None;
+        }
+    }
+}
+
+struct MintProcessEvidenceGuard {
+    stderr_ring: Option<ProcessStderrRing>,
+    credential_delivery_uncertain: bool,
+}
+
+impl MintProcessEvidenceGuard {
+    fn new(stderr_ring: Option<ProcessStderrRing>) -> Self {
+        Self {
+            stderr_ring,
+            credential_delivery_uncertain: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.credential_delivery_uncertain = true;
+    }
+
+    fn commit(&mut self) {
+        self.credential_delivery_uncertain = false;
+    }
+}
+
+impl Drop for MintProcessEvidenceGuard {
+    fn drop(&mut self) {
+        if self.credential_delivery_uncertain {
+            if let Some(stderr_ring) = self.stderr_ring.as_ref() {
+                stderr_ring.retain_metadata_only();
+            }
+        }
+    }
+}
+
+struct TurnAcceptanceGuard {
+    slot: Arc<StdMutex<Option<Arc<AtomicBool>>>>,
+    accepted: Arc<AtomicBool>,
+}
+
+impl TurnAcceptanceGuard {
+    fn install(slot: Arc<StdMutex<Option<Arc<AtomicBool>>>>, accepted: Arc<AtomicBool>) -> Self {
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&accepted));
+        Self { slot, accepted }
+    }
+}
+
+impl Drop for TurnAcceptanceGuard {
+    fn drop(&mut self) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|accepted| Arc::ptr_eq(accepted, &self.accepted))
+        {
+            *slot = None;
         }
     }
 }
@@ -384,6 +760,24 @@ enum ApplyPurpose {
 enum ApplyConfigError {
     NotAdvertised(BridgeError),
     Rejected(BridgeError),
+}
+
+#[derive(Debug)]
+struct TeardownFailure {
+    error: BridgeError,
+    prompt_may_have_been_accepted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelDispatch {
+    Delivered,
+    Latched,
+}
+
+#[derive(Clone)]
+struct SessionConfigSnapshot {
+    desired_cwd: String,
+    config: EffectiveConfig,
 }
 
 // ── Public struct ────────────────────────────────────────────────────────────
@@ -406,11 +800,23 @@ pub struct AcpBackend {
     /// (the loser sees `None`), and the backend still drops it on `Drop` if no
     /// escalation ever fired.
     supervised: Arc<StdMutex<Option<Supervised>>>,
+    /// Process-scoped stderr evidence retained independently from the child
+    /// owner so prompt attempts can snapshot a cursor without retaining the
+    /// operation observer on the cached backend.
+    stderr_ring: Option<ProcessStderrRing>,
     /// Static config (cwd for `session/new`, model/mode for later tasks).
     config: Option<AcpConfig>,
     /// Idempotency flag for the `:ro` container reaper (shared across the teardown sites: cancel-escalate,
     /// retire, Drop). Always present; reaping is a no-op when `config.container` is `None`.
     reaped: Arc<AtomicBool>,
+    /// Set when bounded cancellation escalates the shared connection. The real
+    /// process is terminated; the flag also fences the in-process transport so
+    /// no later prompt can overlap work from an agent that ignored cancel.
+    unavailable: Arc<AtomicBool>,
+    /// Orders the final availability check plus SDK request installation
+    /// against connection-wide escalation and retirement. No await occurs
+    /// while held.
+    dispatch_gate: Arc<StdMutex<()>>,
     /// bridge-session-key → per-session agent state. The map itself is behind a
     /// `Mutex` held ONLY long enough to look up / insert the `Arc<AgentSession>`;
     /// it is dropped before any `session/new` await so the mint of one session
@@ -450,6 +856,14 @@ pub struct AcpBackend {
     permission_registry: PermissionRegistryHandle,
     /// Bounded operator-decision wait for deferred permissions.
     perm_timeout_ms: Arc<AtomicU64>,
+    #[cfg(test)]
+    prompt_snapshot_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_process_redactor_hook: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    fail_deferred_cancel_send: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_cancel_send: Arc<AtomicBool>,
 }
 
 /// Shared, swappable handle to the active [`PolicyEngine`]. See [`AcpBackend::policy`].
@@ -457,6 +871,213 @@ type PolicyHandle = Arc<StdMutex<Arc<dyn PolicyEngine>>>;
 type PermissionRegistryHandle = Arc<StdMutex<Option<Arc<PermissionRegistry>>>>;
 
 impl AcpBackend {
+    fn install_prompt_request<T>(
+        dispatch_gate: &Arc<StdMutex<()>>,
+        unavailable: &Arc<AtomicBool>,
+        accepted: &Arc<AtomicBool>,
+        install: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _dispatch = dispatch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if unavailable.load(Ordering::SeqCst) {
+            None
+        } else {
+            let installed = install();
+            accepted.store(true, Ordering::SeqCst);
+            Some(installed)
+        }
+    }
+
+    #[cfg(test)]
+    fn turn_prompt_accepted(entry: &AgentSession) -> bool {
+        Self::turn_prompt_accepted_handle(entry)
+            .is_some_and(|accepted| accepted.load(Ordering::SeqCst))
+    }
+
+    fn turn_prompt_accepted_handle(entry: &AgentSession) -> Option<Arc<AtomicBool>> {
+        entry
+            .turn_accepted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn session_config_snapshot(
+        &self,
+        key: &SessionId,
+    ) -> Result<SessionConfigSnapshot, BridgeError> {
+        let Some(config) = self.config.as_ref() else {
+            return Err(BridgeError::agent_crashed(
+                "no config available for ACP session",
+            ));
+        };
+        let stashed = self
+            .session_cfg
+            .lock()
+            .ok()
+            .and_then(|configs| configs.get(key).cloned());
+        let desired_cwd = stashed
+            .as_ref()
+            .and_then(|spec| spec.cwd.as_ref())
+            .map(|cwd| cwd.as_str().to_owned())
+            .unwrap_or_else(|| config.cwd.to_string_lossy().into_owned());
+        let effective_config = stashed.map_or_else(
+            || EffectiveConfig {
+                model: config.model.clone(),
+                effort: None,
+                mode: config.mode.clone(),
+            },
+            |spec| spec.config,
+        );
+        Ok(SessionConfigSnapshot {
+            desired_cwd,
+            config: effective_config,
+        })
+    }
+
+    fn diagnostic_redactor_for_cwds(&self, cwds: &[String]) -> DiagnosticRedactor {
+        let Some(config) = self.config.as_ref() else {
+            return DiagnosticRedactor::default();
+        };
+        let values = cwds
+            .iter()
+            .flat_map(|cwd| bridge_core::mcp::env_redaction_values(&config.mcp, cwd).into_iter());
+        config.diagnostic_redactor.clone().with_known_values(values)
+    }
+
+    async fn diagnostic_redactor_for_operation(&self, key: &SessionId) -> DiagnosticRedactor {
+        let mut cwds = self
+            .session_config_snapshot(key)
+            .map(|snapshot| vec![snapshot.desired_cwd])
+            .unwrap_or_default();
+        let entry = self.sessions.lock().await.get(key).cloned();
+        if let Some(entry) = entry {
+            if let Ok(active) = entry.active_mint_cwd.lock() {
+                cwds.extend(active.iter().cloned());
+            }
+            if let Some(minted) = entry.minted_cwd.get() {
+                cwds.push(minted.clone());
+            }
+        }
+        self.diagnostic_redactor_for_cwds(&cwds)
+    }
+
+    async fn apply_process_redactor_for_live_sessions(&self, extra_cwd: Option<String>) {
+        let Some(stderr_ring) = self.stderr_ring.as_ref() else {
+            return;
+        };
+        // Keep collection and replacement under the map lock. A concurrent mint
+        // can publish its active cwd only before or after this critical section,
+        // and must run this same method before sending its own session/new. That
+        // prevents an older snapshot from overwriting a newer union.
+        let sessions = self.sessions.lock().await;
+        let mut cwds = Vec::with_capacity(sessions.len().saturating_mul(2).saturating_add(1));
+        for entry in sessions.values() {
+            if let Ok(active) = entry.active_mint_cwd.lock() {
+                cwds.extend(active.iter().cloned());
+            }
+            if let Some(minted) = entry.minted_cwd.get() {
+                cwds.push(minted.clone());
+            }
+        }
+        cwds.extend(extra_cwd);
+        stderr_ring.apply_redactor(self.diagnostic_redactor_for_cwds(&cwds));
+    }
+
+    fn send_cancel_under_dispatch_fence<E>(
+        dispatch_gate: &Arc<StdMutex<()>>,
+        unavailable: &Arc<AtomicBool>,
+        accepted: impl FnOnce() -> Option<Arc<AtomicBool>>,
+        send: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), TeardownFailure>
+    where
+        E: std::fmt::Display,
+    {
+        // Route lookup and notification installation share the same short,
+        // non-awaiting gate as prompt installation. If cancellation wins while
+        // no route is published, a failed send closes the fence before a later
+        // prompt can cross the accepted-work barrier. If prompt installation
+        // won, its accepted store is visible before the failure sample.
+        let _dispatch = dispatch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accepted = accepted();
+        send().map_err(|cause| {
+            unavailable.store(true, Ordering::SeqCst);
+            TeardownFailure {
+                error: BridgeError::agent_crashed(format!(
+                    "failed to send session/cancel notification: {cause}"
+                )),
+                prompt_may_have_been_accepted: accepted
+                    .is_some_and(|accepted| accepted.load(Ordering::SeqCst)),
+            }
+        })
+    }
+
+    async fn deferred_cancel_delivery_failure(
+        lifecycle: &AcpLifecycle,
+        cause: String,
+    ) -> BridgeError {
+        if let Err(error) = lifecycle
+            .record(
+                DiagnosticPhase::PromptStart,
+                PhaseStatus::Started,
+                None,
+                Some("acp.prompt_start.deferred_cancel"),
+                None,
+            )
+            .await
+        {
+            return error;
+        }
+        lifecycle
+            .failure(
+                DiagnosticPhase::PromptStart,
+                Some(DiagnosticPhase::ConfigApply),
+                DiagnosticFailureClass::Transport,
+                FailureDisposition::Fatal,
+                "acp.prompt_start.deferred_cancel_failed",
+                "ACP deferred cancellation could not be delivered before prompt dispatch",
+                Some(cause),
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+    }
+
+    async fn require_prompt_connection(&self, lifecycle: &AcpLifecycle) -> Result<(), BridgeError> {
+        if !self.unavailable.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        lifecycle
+            .record(
+                DiagnosticPhase::PromptStart,
+                PhaseStatus::Started,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        Err(lifecycle
+            .failure(
+                DiagnosticPhase::PromptStart,
+                Some(DiagnosticPhase::ConfigApply),
+                DiagnosticFailureClass::AgentProcess,
+                FailureDisposition::Fatal,
+                "acp.prompt_start.connection_terminated",
+                "ACP connection was terminated by a prior lifecycle escalation",
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await)
+    }
+
     /// Build the `initialize` request this backend sends to the agent.
     ///
     /// Exposed so the wire-golden test can assert the serialized frame is
@@ -629,11 +1250,7 @@ impl AcpBackend {
                                 ))
                             })?;
                     let opts = if refreshed.is_empty() {
-                        tracing::warn!(
-                            agent = %agent_id,
-                            model = %value,
-                            "model applied but agent returned no refreshed options; effort levels may be stale"
-                        );
+                        AcpTraceEvent::ModelOptionsMissing.emit();
                         opts0.to_vec()
                     } else {
                         refreshed
@@ -724,12 +1341,10 @@ impl AcpBackend {
                 let decision = resolve_effort(effort, &advertised);
                 match decision {
                     EffortDecision::Unsupported { from } => {
-                        tracing::warn!(
-                            agent = %agent_id,
-                            effort = %from,
-                            valid = ?advertised.levels,
-                            "configured effort is below the lowest advertised effort level; skipping"
-                        );
+                        AcpTraceEvent::EffortBelowMinimum {
+                            advertised_count: AcpTraceEvent::bounded_count(advertised.levels.len()),
+                        }
+                        .emit();
                         EffortDecision::Unsupported { from }
                     }
                     EffortDecision::Skip => EffortDecision::Skip,
@@ -760,21 +1375,18 @@ impl AcpBackend {
                 }
             }
             None => {
-                if let Some(effort) = effort {
-                    tracing::warn!(
-                        agent = %agent_id,
-                        effort = ?effort,
-                        "agent advertised no effort option; skipping configured effort"
-                    );
+                if effort.is_some() {
+                    AcpTraceEvent::EffortOptionMissing.emit();
                 }
                 EffortDecision::Skip
             }
         };
         let model_current_for_log = model_current.as_deref().unwrap_or("unknown");
-        tracing::info!(
-            "{}",
-            resolved_log_line(agent_id, model_current_for_log, &effort_outcome)
-        );
+        AcpTraceEvent::ConfigResolved {
+            effort_applied: matches!(effort_outcome, EffortDecision::Apply { .. }),
+            fell_back: matches!(effort_outcome, EffortDecision::FellBack { .. }),
+        }
+        .emit();
 
         if matches!(purpose, ApplyPurpose::Warm) && effort.is_some() {
             match &effort_outcome {
@@ -802,7 +1414,7 @@ impl AcpBackend {
     async fn apply_effort_walkdown(
         cx: &ConnectionTo<Agent>,
         agent_session_id: &AgentSessionId,
-        agent_id: &str,
+        _agent_id: &str,
         initial: EffortDecision,
         advertised_levels: &[String],
     ) -> Result<(EffortDecision, Option<Vec<SessionConfigOption>>), BridgeError> {
@@ -813,12 +1425,7 @@ impl AcpBackend {
                 from,
                 to,
             } => {
-                tracing::warn!(
-                    agent = %agent_id,
-                    from = %from,
-                    to = %to,
-                    "configured effort not advertised; falling back to nearest lower effort"
-                );
+                AcpTraceEvent::EffortFallback.emit();
                 (config_id, from, to)
             }
             EffortDecision::Skip => return Ok((EffortDecision::Skip, None)),
@@ -845,26 +1452,14 @@ impl AcpBackend {
                 Err(e) => {
                     let code = Self::error_code_i64(e.code);
                     if !is_unsupported_effort_error(code, &e.message, e.data.as_ref()) {
-                        tracing::warn!(
-                            agent = %agent_id,
-                            config_id = %config_id,
-                            level = %level,
-                            error = ?e,
-                            "session/set_config_option(effort) failed; stopping effort walk-down"
-                        );
+                        AcpTraceEvent::EffortRequestRejected { rpc_code: code }.emit();
                         return Err(BridgeError::agent_crashed(format!(
                             "session/set_config_option({config_id}) rejected: {e}"
                         )));
                     }
 
                     let Some(next) = Self::next_lower_effort(&level, advertised_levels) else {
-                        tracing::warn!(
-                            agent = %agent_id,
-                            config_id = %config_id,
-                            level = %level,
-                            error = ?e,
-                            "session/set_config_option(effort) unsupported and no lower advertised level remains"
-                        );
+                        AcpTraceEvent::EffortWalkdownExhausted { rpc_code: code }.emit();
                         return Ok((
                             EffortDecision::Unsupported {
                                 from: requested_from,
@@ -872,14 +1467,7 @@ impl AcpBackend {
                             None,
                         ));
                     };
-                    tracing::warn!(
-                        agent = %agent_id,
-                        config_id = %config_id,
-                        from = %level,
-                        to = %next,
-                        error = ?e,
-                        "session/set_config_option(effort) unsupported; retrying next lower advertised level"
-                    );
+                    AcpTraceEvent::EffortWalkdownRetry { rpc_code: code }.emit();
                     level = next;
                 }
             }
@@ -906,34 +1494,136 @@ impl AcpBackend {
     /// This is `Supervised` + `connect(ByteStreams)`: process lifecycle stays
     /// with `Supervised`; protocol drive is the shared `connect` core.
     pub async fn spawn(cmd: &str, args: &[&str], config: AcpConfig) -> Result<Self, BridgeError> {
+        Self::spawn_observed(
+            cmd,
+            args,
+            config,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    pub async fn spawn_observed(
+        cmd: &str,
+        args: &[&str],
+        config: AcpConfig,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<Self, BridgeError> {
+        let redactor = config.diagnostic_redactor.clone();
+        let lifecycle = AcpLifecycle::new(observer.clone(), redactor.clone(), None);
+        lifecycle
+            .record(
+                DiagnosticPhase::Spawn,
+                PhaseStatus::Started,
+                None,
+                None,
+                None,
+            )
+            .await?;
         // Reaper handle for the SPAWN-FAILURE path (Site A): once `Supervised::spawn` succeeds the
         // `docker run` container is up, but if pipe-take or the handshake then fails there is no backend
         // to reap from — so reap here. Cloned before `config` moves into `connect`.
         let container_on_fail = config.container.clone();
-        let mut supervised = Supervised::spawn(cmd, args, None)
-            .map_err(|e| BridgeError::agent_crashed(format!("spawn failed: {e}")))?;
+        let mut supervised =
+            match Supervised::spawn_with_stderr_redactor(cmd, args, None, redactor.clone()) {
+                Ok(supervised) => supervised,
+                Err(error) => {
+                    return Err(lifecycle
+                        .failure(
+                            DiagnosticPhase::Spawn,
+                            None,
+                            DiagnosticFailureClass::AgentProcess,
+                            FailureDisposition::RetrySameTarget,
+                            "acp.spawn.failed",
+                            "ACP agent process failed to start",
+                            Some(error.to_string()),
+                            false,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await)
+                }
+            };
+        let stderr_ring = supervised.stderr_ring();
+        let stderr_cursor = stderr_ring.origin();
+        let lifecycle = AcpLifecycle::new(
+            observer.clone(),
+            redactor,
+            Some((stderr_ring.clone(), stderr_cursor)),
+        );
         // Everything after the (now-running) child: any error orphans the container → reap it.
         let result = async {
             let child = supervised.child_mut();
-            let stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| BridgeError::agent_crashed("agent stdin unavailable after spawn"))?;
-            let stdout = child.stdout.take().ok_or_else(|| {
-                BridgeError::agent_crashed("agent stdout unavailable after spawn")
-            })?;
+            let stdin = match child.stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    return Err(lifecycle
+                        .failure(
+                            DiagnosticPhase::Spawn,
+                            None,
+                            DiagnosticFailureClass::AgentProcess,
+                            FailureDisposition::RetrySameTarget,
+                            "acp.spawn.stdin_unavailable",
+                            "ACP agent stdin was unavailable after spawn",
+                            None,
+                            false,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await)
+                }
+            };
+            let stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    return Err(lifecycle
+                        .failure(
+                            DiagnosticPhase::Spawn,
+                            None,
+                            DiagnosticFailureClass::AgentProcess,
+                            FailureDisposition::RetrySameTarget,
+                            "acp.spawn.stdout_unavailable",
+                            "ACP agent stdout was unavailable after spawn",
+                            None,
+                            false,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await)
+                }
+            };
             // The crate uses `futures` async-io; our child uses tokio pipes — adapt
             // with tokio_util::compat. ByteStreams::new(outgoing_writer, incoming_reader).
             let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-            Self::connect(transport, config).await
+            lifecycle
+                .record(
+                    DiagnosticPhase::Spawn,
+                    PhaseStatus::Completed,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            Self::connect_observed_after(
+                transport,
+                config,
+                observer,
+                Some(DiagnosticPhase::Spawn),
+                Some((stderr_ring.clone(), stderr_cursor)),
+            )
+            .await
         }
         .await;
         match result {
-            Ok(backend) => {
+            Ok(mut backend) => {
                 // `supervised` (the process-group owner) MUST live for the whole backend lifetime:
                 // `kill_on_drop(true)` would SIGKILL the child the instant it dropped, killing the
                 // event-loop task's pipes. Hold it on the backend.
                 *backend.supervised.lock().expect("supervised lock") = Some(supervised);
+                backend.stderr_ring = Some(stderr_ring);
                 Ok(backend)
             }
             Err(e) => {
@@ -954,11 +1644,35 @@ impl AcpBackend {
         transport: impl ConnectTo<Client> + 'static,
         config: AcpConfig,
     ) -> Result<Self, BridgeError> {
+        Self::connect_observed(
+            transport,
+            config,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    pub async fn connect_observed(
+        transport: impl ConnectTo<Client> + 'static,
+        config: AcpConfig,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<Self, BridgeError> {
+        Self::connect_observed_after(transport, config, observer, None, None).await
+    }
+
+    async fn connect_observed_after(
+        transport: impl ConnectTo<Client> + 'static,
+        config: AcpConfig,
+        observer: Arc<dyn DiagnosticObserver>,
+        last_completed_before_initialize: Option<DiagnosticPhase>,
+        stderr: Option<(ProcessStderrRing, ProcessStderrCursor)>,
+    ) -> Result<Self, BridgeError> {
         if config.pre_authenticated && config.auth_method.is_some() {
             return Err(BridgeError::config_invalid(
                 "pre_authenticated=true cannot be combined with auth_method",
             ));
         }
+        let lifecycle = AcpLifecycle::new(observer, config.diagnostic_redactor.clone(), stderr);
         let (cx_tx, cx_rx) = oneshot::channel::<ConnectionTo<Agent>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -1126,82 +1840,223 @@ impl AcpBackend {
                 .await;
         });
 
-        // Bound the WHOLE handshake — transport connect + `initialize` response +
-        // `authenticate` — under the SAME `handshake_timeout`. `authenticate` MUST
-        // be inside this bounded block: an agent that answers `initialize` but then
-        // HANGS on `authenticate` would otherwise block `connect`/`spawn`/`main`
-        // forever. A closed transport EOFs cleanly (the `map_err` arms); a true
-        // hang on either step is caught by the outer timeout.
+        // One deadline bounds transport connect, initialize, and authenticate,
+        // while each await is observed separately so a timeout cannot be
+        // mislabeled as a later phase.
+        let deadline = tokio::time::Instant::now() + config.handshake_timeout;
         let auth_method_cfg = config.auth_method.clone();
         let pre_authenticated = config.pre_authenticated;
-        let handshake = async move {
-            let cx = cx_rx.await.map_err(|_| {
-                BridgeError::agent_crashed(
-                    "handshake response channel closed before connection was established",
-                )
-            })?;
-
-            // Run the ACP `initialize` handshake and capture the negotiated caps.
-            let resp: InitializeResponse = cx
-                .send_request(Self::initialize_request())
-                .block_task()
-                .await
-                .inspect_err(|e| tracing::warn!(error = ?e, "initialize handshake failed"))
-                .map_err(|e| {
-                    BridgeError::agent_crashed(format!("initialize handshake failed: {e}"))
-                })?;
-
-            // ── authenticate ──────────────────────────────────────────────────
-            //
-            // Lifecycle order is initialize → optional authenticate → (later)
-            // session/new. A pre-authenticated agent already has ambient credentials,
-            // so advertised methods are retained for diagnostics but no auth action is
-            // invoked. Otherwise, no advertised methods means no client-driven auth;
-            // with methods present we attempt exactly once using the configured id or
-            // the stable default preference below. A definitive error is fatal and
-            // surfaces `AgentNotAuthenticated`.
-            if !pre_authenticated {
-                if let Some(m) = auth_method_cfg.as_deref() {
-                    // I4: a configured auth_method that the agent did NOT advertise
-                    // is a likely operator misconfiguration. We still ATTEMPT it
-                    // (the agent is authoritative — it may accept an unlisted id),
-                    // but WARN naming the configured value and the advertised list so
-                    // an opaque `AgentNotAuthenticated` can be diagnosed.
-                    let advertised: Vec<String> = resp
-                        .auth_methods
-                        .iter()
-                        .map(|a| a.id().0.to_string())
-                        .collect();
-                    if !advertised.iter().any(|a| a == m) {
-                        tracing::warn!(
-                            configured_auth_method = %m,
-                            advertised = ?advertised,
-                            "configured auth_method is not among the methods the agent \
-                             advertised; attempting anyway (agent is authoritative)"
-                        );
-                    }
-                }
-                let chosen =
-                    Self::choose_auth_method(auth_method_cfg.as_deref(), &resp.auth_methods);
-                if let Some(method_id) = chosen {
-                    cx.send_request(AuthenticateRequest::new(method_id))
-                        .block_task()
-                        .await
-                        .map_err(|_| BridgeError::AgentNotAuthenticated)?;
-                }
-            } else {
-                tracing::debug!(
-                    advertised_auth_methods = resp.auth_methods.len(),
-                    "skipping authenticate for pre-authenticated agent"
-                );
+        lifecycle
+            .record(
+                DiagnosticPhase::Initialize,
+                PhaseStatus::Started,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        let cx = match tokio::time::timeout_at(deadline, cx_rx).await {
+            Err(_) => {
+                return Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::Initialize,
+                        last_completed_before_initialize,
+                        DiagnosticFailureClass::Timeout,
+                        FailureDisposition::RetrySameTarget,
+                        "acp.initialize.timeout",
+                        "ACP initialize handshake timed out",
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await)
             }
-
-            Ok::<_, BridgeError>((cx, resp))
+            Ok(Err(error)) => {
+                return Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::Initialize,
+                        last_completed_before_initialize,
+                        DiagnosticFailureClass::Transport,
+                        FailureDisposition::RetrySameTarget,
+                        "acp.initialize.connection_closed",
+                        "ACP transport closed before initialize",
+                        Some(error.to_string()),
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await)
+            }
+            Ok(Ok(cx)) => cx,
         };
 
-        let (cx, resp) = tokio::time::timeout(config.handshake_timeout, handshake)
-            .await
-            .map_err(|_| BridgeError::agent_crashed("initialize handshake timed out"))??;
+        let initialize = cx.send_request(Self::initialize_request()).block_task();
+        let resp: InitializeResponse = match tokio::time::timeout_at(deadline, initialize).await {
+            Err(_) => {
+                return Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::Initialize,
+                        last_completed_before_initialize,
+                        DiagnosticFailureClass::Timeout,
+                        FailureDisposition::RetrySameTarget,
+                        "acp.initialize.timeout",
+                        "ACP initialize handshake timed out",
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await)
+            }
+            Ok(Err(error)) => {
+                AcpTraceEvent::InitializeFailed.emit();
+                return Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::Initialize,
+                        last_completed_before_initialize,
+                        DiagnosticFailureClass::Transport,
+                        FailureDisposition::RetrySameTarget,
+                        "acp.initialize.transport",
+                        "ACP initialize request failed",
+                        Some(error.to_string()),
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await);
+            }
+            Ok(Ok(resp)) => resp,
+        };
+        lifecycle
+            .record(
+                DiagnosticPhase::Initialize,
+                PhaseStatus::Completed,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+        let advertised: Vec<String> = resp
+            .auth_methods
+            .iter()
+            .map(|method| method.id().0.to_string())
+            .collect();
+        let chosen = Self::choose_auth_method(auth_method_cfg.as_deref(), &resp.auth_methods);
+        let auth_evidence = if pre_authenticated {
+            AuthenticationEvidenceInput::PreAuthenticated {
+                advertised_method_ids: advertised.clone(),
+            }
+        } else if let Some(configured_id) = auth_method_cfg.clone() {
+            AuthenticationEvidenceInput::ConfiguredMethod {
+                advertised: advertised.iter().any(|id| id == &configured_id),
+                configured_id,
+            }
+        } else if let Some(method) = chosen.as_ref() {
+            AuthenticationEvidenceInput::SelectedAdvertisedMethod {
+                selected_id: method.0.to_string(),
+            }
+        } else {
+            AuthenticationEvidenceInput::NoMethodsAdvertised
+        };
+        lifecycle
+            .record(
+                DiagnosticPhase::Authenticate,
+                PhaseStatus::Started,
+                None,
+                None,
+                Some(auth_evidence.clone()),
+            )
+            .await?;
+
+        if pre_authenticated {
+            AcpTraceEvent::PreAuthenticated {
+                advertised_count: AcpTraceEvent::bounded_count(advertised.len()),
+            }
+            .emit();
+            lifecycle
+                .record(
+                    DiagnosticPhase::Authenticate,
+                    PhaseStatus::Skipped,
+                    None,
+                    Some("acp.auth.pre_authenticated"),
+                    Some(auth_evidence),
+                )
+                .await?;
+        } else if let Some(method_id) = chosen {
+            if auth_method_cfg.is_some() && !advertised.iter().any(|id| id == method_id.0.as_ref())
+            {
+                AcpTraceEvent::AuthMethodMismatch {
+                    advertised_count: AcpTraceEvent::bounded_count(advertised.len()),
+                }
+                .emit();
+            }
+            let authenticate = cx
+                .send_request(AuthenticateRequest::new(method_id))
+                .block_task();
+            match tokio::time::timeout_at(deadline, authenticate).await {
+                Err(_) => {
+                    return Err(lifecycle
+                        .failure(
+                            DiagnosticPhase::Authenticate,
+                            Some(DiagnosticPhase::Initialize),
+                            DiagnosticFailureClass::Timeout,
+                            FailureDisposition::RetrySameTarget,
+                            "acp.authenticate.timeout",
+                            "ACP authenticate request timed out",
+                            None,
+                            false,
+                            None,
+                            None,
+                            Some(auth_evidence),
+                        )
+                        .await)
+                }
+                Ok(Err(error)) => {
+                    return Err(lifecycle
+                        .failure(
+                            DiagnosticPhase::Authenticate,
+                            Some(DiagnosticPhase::Initialize),
+                            DiagnosticFailureClass::Authentication,
+                            FailureDisposition::Fatal,
+                            "acp.authenticate.rejected",
+                            "ACP authentication failed",
+                            Some(error.to_string()),
+                            false,
+                            None,
+                            None,
+                            Some(auth_evidence),
+                        )
+                        .await)
+                }
+                Ok(Ok(_)) => {
+                    lifecycle
+                        .record(
+                            DiagnosticPhase::Authenticate,
+                            PhaseStatus::Completed,
+                            None,
+                            None,
+                            Some(auth_evidence),
+                        )
+                        .await?;
+                }
+            }
+        } else {
+            lifecycle
+                .record(
+                    DiagnosticPhase::Authenticate,
+                    PhaseStatus::Skipped,
+                    None,
+                    Some("acp.auth.no_methods_advertised"),
+                    Some(auth_evidence),
+                )
+                .await?;
+        }
 
         Ok(Self {
             conn: Some(AcpConn {
@@ -1212,14 +2067,25 @@ impl AcpBackend {
                 updates,
             }),
             supervised: Arc::new(StdMutex::new(None)),
+            stderr_ring: None,
             config: Some(config),
             reaped: Arc::new(AtomicBool::new(false)),
+            unavailable: Arc::new(AtomicBool::new(false)),
+            dispatch_gate: Arc::new(StdMutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             policy,
             permission_registry,
             perm_timeout_ms,
+            #[cfg(test)]
+            prompt_snapshot_hook: StdMutex::new(None),
+            #[cfg(test)]
+            before_process_redactor_hook: StdMutex::new(None),
+            #[cfg(test)]
+            fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_cancel_send: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1605,7 +2471,8 @@ impl AcpBackend {
     /// LAZILY via `session/new` on first call and reusing the stored id after.
     ///
     /// Exactly-once minting [Cx-M2]: concurrent first calls for the same `key`
-    /// share one `OnceCell` init future, so the agent sees `session/new` ONCE.
+    /// serialize on `init_lock`; the winner moves the guard into a spawned task,
+    /// so the agent sees `session/new` ONCE and caller cancellation cannot abort it.
     ///
     /// Cancel-latch [Cx-M2]: the minting task — and only it — drains the latch
     /// AFTER `OnceCell` has published the id (so a concurrent `request_cancel`
@@ -1614,61 +2481,64 @@ impl AcpBackend {
     /// The latch is *claimed* with an atomic swap so exactly one of the minting
     /// task and a concurrent `request_cancel` sends the notification (no double).
     ///
-    /// Lost-cancel window closed: the drain runs after `get_or_try_init` returns,
-    /// not inside the init closure. If a `request_cancel` ran while the id was
-    /// not yet observable (`get() == None`), it stored `true` and did not send;
-    /// the post-init drain (which runs once the id IS observable) then sees the
-    /// latch and sends. If `request_cancel` ran after the id became observable,
-    /// it and the drain race on the same `swap` and exactly one sends.
+    /// Lost-cancel window closed: the task publishes the `OnceCell` id, then
+    /// drains the latch. If `request_cancel` ran while the id was not observable,
+    /// it stored `true`; once the id is visible, it and the initializer race on
+    /// the same `swap` and exactly one sends.
     ///
     /// `prompt` calls this, then acquires `turn_lock` and sends `session/prompt`.
     async fn ensure_session(&self, key: &SessionId) -> Result<AgentSessionId, BridgeError> {
-        let entry = self.session_entry(key).await;
-        let cx = self.cx()?;
-        // Resolve the per-session config (Increment 3b / session-cwd). Read the
-        // stash for THIS bridge key; if dispatch (T10) called `configure_session(key,
-        // ..)` before the prompt, that effective `model`/`effort`/`mode`/`cwd` drives
-        // the mint. If there's NO stash entry (direct callers / the gated e2es that
-        // don't go through `configure_session`), FALL BACK to `AcpConfig`'s static
-        // `model`/`mode`/`cwd` so the pre-3b behavior is preserved. Captured up front
-        // as owned values so the init closure (which must be `'static`/move-safe)
-        // owns them — session configuration lives INSIDE the closure (see below).
-        let stashed = self
-            .session_cfg
-            .lock()
-            .ok()
-            .and_then(|m| m.get(key).cloned());
-        // Desired cwd for this mint: stashed SessionSpec.cwd → static AcpConfig.cwd.
-        // Neither present → AgentCrashed (no config at all; constructor guarantees
-        // this can't happen on the normal spawn/connect paths).
-        let desired_cwd: String = stashed
+        self.ensure_session_observed(
+            key,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    async fn ensure_session_observed(
+        &self,
+        key: &SessionId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<AgentSessionId, BridgeError> {
+        let snapshot = self.session_config_snapshot(key)?;
+        self.ensure_session_observed_with_snapshot(key, observer, snapshot)
+            .await
+    }
+
+    async fn ensure_session_observed_with_snapshot(
+        &self,
+        key: &SessionId,
+        observer: Arc<dyn DiagnosticObserver>,
+        snapshot: SessionConfigSnapshot,
+    ) -> Result<AgentSessionId, BridgeError> {
+        let stderr = self
+            .stderr_ring
             .as_ref()
-            .and_then(|s| s.cwd.as_ref())
-            .map(|c| c.as_str().to_string())
-            .or_else(|| {
-                self.config
-                    .as_ref()
-                    .map(|c| c.cwd.to_string_lossy().into_owned())
-            })
-            .ok_or_else(|| BridgeError::agent_crashed("no cwd available for session/new (neither session spec nor backend config provides one)"))?;
-        let (mode, model, effort) = match stashed {
-            Some(spec) => (spec.config.mode, spec.config.model, spec.config.effort),
-            None => (
-                self.config.as_ref().and_then(|c| c.mode.clone()),
-                self.config.as_ref().and_then(|c| c.model.clone()),
-                None,
-            ),
-        };
+            .map(|ring| (ring.clone(), ring.cursor()));
+        let lifecycle = AcpLifecycle::new(
+            observer,
+            self.diagnostic_redactor_for_cwds(std::slice::from_ref(&snapshot.desired_cwd)),
+            stderr,
+        );
+        let entry = self.session_entry(key).await;
+        // One owned snapshot supplies both mint inputs and the lifecycle redactor.
+        // A concurrent `configure_session` replacement affects the next snapshot,
+        // never half of this attempt.
+        let desired_cwd = snapshot.desired_cwd;
+        let EffectiveConfig {
+            mode,
+            model,
+            effort,
+        } = snapshot.config;
         let agent_id_for_mint = self
             .config
             .as_ref()
             .map(|c| c.agent_id.clone())
             .unwrap_or_default();
 
-        // Did THIS call mint the agent session? The init closure runs for at most
-        // one caller (`OnceCell`); set the flag inside it so only the minter does
-        // the post-init latch drain below.
-        let mut newly_minted = false;
+        // A spawned single-flight task owns initialization once it starts. This
+        // shields the ACP request and its lifecycle grammar from cancellation of
+        // the caller that happened to win the race to initialize.
         let cwd_for_mint = desired_cwd.clone();
         // MCP servers to offer at session/new (ADR-0028). Static per agent (the entry's `mcp`);
         // `{cwd}` is substituted with `cwd_for_mint` inside `new_session_request`. Empty for
@@ -1678,69 +2548,308 @@ impl AcpBackend {
             .as_ref()
             .map(|c| c.mcp.clone())
             .unwrap_or_default();
-        let id = entry
-            .agent_id
-            .get_or_try_init(|| async {
-                newly_minted = true;
-                // (1) session/new — mint the agent session id.
-                let req = Self::new_session_request(PathBuf::from(&cwd_for_mint), &mcp_for_mint);
-                let resp = cx
-                    .send_request(req)
-                    .block_task()
-                    .await
-                    .inspect_err(|e| tracing::warn!(error = ?e, "session/new mint failed"))
-                    .map_err(|e| BridgeError::agent_crashed(format!("session/new failed: {e}")))?;
-                let id = resp.session_id;
-                let opts0 = resp.config_options.unwrap_or_default();
-
-                // (2) set_mode — HARD error, configured INSIDE the closure (before
-                // returning the id). The operator asked for a specific mode; if the
-                // agent REJECTS the mode id we FAIL session setup. Because this
-                // `?`-returns from the init closure, `get_or_try_init` FAILS and the
-                // `OnceCell` stays UNINITIALIZED — so the next `ensure_session`
-                // re-runs the full mint+configure rather than seeing a committed-but-
-                // unconfigured session and silently proceeding in the WRONG mode.
-                // (No prompt is sent on a failed setup, so the minted-then-abandoned
-                // agent session does no uncontrolled work.)
-                if let Some(mode) = mode.as_deref() {
-                    cx.send_request(Self::set_mode_request(id.clone(), mode))
-                        .block_task()
-                        .await
-                        .map_err(|e| {
-                            BridgeError::agent_crashed(format!("session/set_mode rejected: {e}"))
-                        })?;
+        let (id, newly_minted) = if let Some(id) = entry.agent_id.get() {
+            (id.clone(), false)
+        } else {
+            let init_guard = Arc::clone(&entry.init_lock).lock_owned().await;
+            if let Some(id) = entry.agent_id.get() {
+                drop(init_guard);
+                (id.clone(), false)
+            } else {
+                if let Ok(mut active_cwd) = entry.active_mint_cwd.lock() {
+                    *active_cwd = Some(desired_cwd.clone());
                 }
+                // Own cleanup before the first await after publication. If the
+                // caller is cancelled while waiting to install the process
+                // redactor, this local guard clears the attempt; once the
+                // initializer is spawned, ownership moves into that task.
+                let active_mint_cwd = ActiveMintCwdGuard(Arc::clone(&entry));
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .before_process_redactor_hook
+                        .lock()
+                        .ok()
+                        .and_then(|hook| hook.clone());
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.apply_process_redactor_for_live_sessions(None).await;
+                let entry_for_init = Arc::clone(&entry);
+                let cx_for_init = self.cx()?.clone();
+                let lifecycle_for_init = lifecycle.clone();
+                let stderr_ring_for_init = self.stderr_ring.clone();
+                #[cfg(test)]
+                let fail_deferred_cancel_send = Arc::clone(&self.fail_deferred_cancel_send);
+                let task = tokio::spawn(async move {
+                    let _init_guard = init_guard;
+                    let entry = entry_for_init;
+                    let cx = cx_for_init;
+                    let lifecycle = lifecycle_for_init;
+                    let _active_mint_cwd = active_mint_cwd;
+                    let mut process_evidence = MintProcessEvidenceGuard::new(stderr_ring_for_init);
+                    let outcome = async {
+                        // (1) session/new — mint the agent session id.
+                        lifecycle
+                            .record(
+                                DiagnosticPhase::SessionCreate,
+                                PhaseStatus::Started,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        let req =
+                            Self::new_session_request(PathBuf::from(&cwd_for_mint), &mcp_for_mint);
+                        // From request installation until durable minted-cwd
+                        // publication, the process may have consumed a
+                        // cwd-expanded credential that a later bounded policy
+                        // cannot safely enumerate. Any error/abort in this
+                        // interval makes process stderr metadata-only.
+                        process_evidence.arm();
+                        let resp = match cx.send_request(req).block_task().await {
+                            Ok(resp) => resp,
+                            Err(error) => {
+                                AcpTraceEvent::SessionCreateFailed.emit();
+                                return Err(lifecycle
+                                    .failure(
+                                        DiagnosticPhase::SessionCreate,
+                                        Some(DiagnosticPhase::Authenticate),
+                                        DiagnosticFailureClass::Transport,
+                                        FailureDisposition::RetrySameTarget,
+                                        "acp.session_create.transport",
+                                        "ACP session creation failed",
+                                        Some(error.to_string()),
+                                        false,
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await);
+                            }
+                        };
+                        let id = resp.session_id;
+                        let opts0 = resp.config_options.unwrap_or_default();
+                        lifecycle
+                            .record(
+                                DiagnosticPhase::SessionCreate,
+                                PhaseStatus::Completed,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await?;
 
-                // (3) model + (4) effort. Model remains a hard mint error; effort
-                // remains best-effort at mint. The helper carries native errors so
-                // this mapping re-raises the exact config_invalid/agent_crashed.
-                let surface = ConfigSurface { opts: opts0 };
-                let (refreshed_surface, _model_current) = Self::apply_model_effort(
-                    cx,
-                    &id,
-                    &agent_id_for_mint,
-                    &surface,
-                    model.as_deref(),
-                    effort,
-                    ApplyPurpose::Mint,
-                )
-                .await
-                .map_err(|err| match err {
-                    ApplyConfigError::NotAdvertised(err) | ApplyConfigError::Rejected(err) => err,
-                })?;
-                *entry.config_surface.lock().expect("config_surface lock") =
-                    Some(refreshed_surface);
+                        // (2) set_mode — HARD error, configured INSIDE the closure (before
+                        // returning the id). The operator asked for a specific mode; if the
+                        // agent REJECTS the mode id we FAIL session setup. Because this
+                        // `?`-returns from the task before publishing the id, so the
+                        // `OnceCell` stays UNINITIALIZED and the next `ensure_session`
+                        // re-runs the full mint+configure rather than seeing a committed-but-
+                        // unconfigured session and silently proceeding in the WRONG mode.
+                        // (No prompt is sent on a failed setup, so the minted-then-abandoned
+                        // agent session does no uncontrolled work.)
+                        if let Some(mode) = mode.as_deref() {
+                            lifecycle
+                                .record(
+                                    DiagnosticPhase::ConfigApply,
+                                    PhaseStatus::Started,
+                                    Some(DiagnosticOperation::Mode),
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                            if let Err(error) = cx
+                                .send_request(Self::set_mode_request(id.clone(), mode))
+                                .block_task()
+                                .await
+                            {
+                                return Err(lifecycle
+                                    .failure(
+                                        DiagnosticPhase::ConfigApply,
+                                        Some(DiagnosticPhase::SessionCreate),
+                                        DiagnosticFailureClass::Model,
+                                        FailureDisposition::Fatal,
+                                        "acp.config.mode_rejected",
+                                        "ACP mode configuration was rejected",
+                                        Some(error.to_string()),
+                                        false,
+                                        None,
+                                        Some(DiagnosticOperation::Mode),
+                                        None,
+                                    )
+                                    .await);
+                            }
+                            lifecycle
+                                .record(
+                                    DiagnosticPhase::ConfigApply,
+                                    PhaseStatus::Completed,
+                                    Some(DiagnosticOperation::Mode),
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                        }
 
-                // (5) Record the cwd that was actually used to mint this session so
-                // the immutability guard below can compare future requests against
-                // what the agent was ACTUALLY given at session/new (ACP §11A).
-                // `set` on a `OnceCell` can only fail if already set (impossible here
-                // since we are inside the init closure); ignore the result.
-                let _ = entry.minted_cwd.set(cwd_for_mint);
+                        // (3) model remains hard. (4) effort remains best-effort, but is
+                        // observed as its own typed operation after model settles.
+                        let mut refreshed_surface = ConfigSurface { opts: opts0 };
+                        // Always validate the advertised/current model surface. With no
+                        // pin this still rejects a bridge-blocked current model, matching
+                        // the pre-observation safety contract.
+                        lifecycle
+                            .record(
+                                DiagnosticPhase::ConfigApply,
+                                PhaseStatus::Started,
+                                Some(DiagnosticOperation::Model),
+                                None,
+                                None,
+                            )
+                            .await?;
+                        match Self::apply_model_effort(
+                            &cx,
+                            &id,
+                            &agent_id_for_mint,
+                            &refreshed_surface,
+                            model.as_deref(),
+                            None,
+                            ApplyPurpose::Mint,
+                        )
+                        .await
+                        {
+                            Ok((surface, _)) => refreshed_surface = surface,
+                            Err(
+                                ApplyConfigError::NotAdvertised(error)
+                                | ApplyConfigError::Rejected(error),
+                            ) => {
+                                return Err(lifecycle
+                                    .failure(
+                                        DiagnosticPhase::ConfigApply,
+                                        Some(DiagnosticPhase::SessionCreate),
+                                        DiagnosticFailureClass::Model,
+                                        FailureDisposition::Fatal,
+                                        "acp.config.model_rejected",
+                                        "ACP model configuration failed",
+                                        Some(error.to_string()),
+                                        false,
+                                        None,
+                                        Some(DiagnosticOperation::Model),
+                                        None,
+                                    )
+                                    .await);
+                            }
+                        }
+                        lifecycle
+                            .record(
+                                DiagnosticPhase::ConfigApply,
+                                PhaseStatus::Completed,
+                                Some(DiagnosticOperation::Model),
+                                model.is_none().then_some("acp.config.model_validated"),
+                                None,
+                            )
+                            .await?;
+                        if effort.is_some() {
+                            lifecycle
+                                .record(
+                                    DiagnosticPhase::ConfigApply,
+                                    PhaseStatus::Started,
+                                    Some(DiagnosticOperation::Effort),
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                            match Self::apply_model_effort(
+                                &cx,
+                                &id,
+                                &agent_id_for_mint,
+                                &refreshed_surface,
+                                None,
+                                effort,
+                                ApplyPurpose::Mint,
+                            )
+                            .await
+                            {
+                                Ok((surface, _)) => refreshed_surface = surface,
+                                Err(
+                                    ApplyConfigError::NotAdvertised(error)
+                                    | ApplyConfigError::Rejected(error),
+                                ) => {
+                                    return Err(lifecycle
+                                        .failure(
+                                            DiagnosticPhase::ConfigApply,
+                                            Some(DiagnosticPhase::SessionCreate),
+                                            DiagnosticFailureClass::Model,
+                                            FailureDisposition::Fatal,
+                                            "acp.config.effort_rejected",
+                                            "ACP effort configuration failed",
+                                            Some(error.to_string()),
+                                            false,
+                                            None,
+                                            Some(DiagnosticOperation::Effort),
+                                            None,
+                                        )
+                                        .await);
+                                }
+                            }
+                            lifecycle
+                                .record(
+                                    DiagnosticPhase::ConfigApply,
+                                    PhaseStatus::Completed,
+                                    Some(DiagnosticOperation::Effort),
+                                    Some("acp.config.effort_settled"),
+                                    None,
+                                )
+                                .await?;
+                        }
+                        *entry.config_surface.lock().expect("config_surface lock") =
+                            Some(refreshed_surface);
 
-                Ok::<_, BridgeError>(id)
-            })
-            .await?;
+                        // (5) Record the cwd that was actually used to mint this session so
+                        // the immutability guard below can compare future requests against
+                        // what the agent was ACTUALLY given at session/new (ACP §11A).
+                        // `set` on a `OnceCell` can only fail if already set (impossible here
+                        // since we own the single-flight init guard); ignore the result.
+                        let _ = entry.minted_cwd.set(cwd_for_mint);
+                        entry
+                            .agent_id
+                            .set(id.clone())
+                            .map_err(|_| BridgeError::InvalidStateTransition)?;
+                        process_evidence.commit();
+
+                        // Publish the id before draining the cancel latch. A racing
+                        // `request_cancel` either claims the same latch or observes
+                        // the id and sends; exactly one side handles the raced cancel.
+                        if entry.cancel_requested.swap(false, Ordering::SeqCst) {
+                            #[cfg(test)]
+                            let send_result = if fail_deferred_cancel_send.load(Ordering::SeqCst) {
+                                Err(agent_client_protocol::Error::internal_error())
+                            } else {
+                                cx.send_notification(CancelNotification::new(id.clone()))
+                            };
+                            #[cfg(not(test))]
+                            let send_result =
+                                cx.send_notification(CancelNotification::new(id.clone()));
+                            if let Err(error) = send_result {
+                                return Err(AcpBackend::deferred_cancel_delivery_failure(
+                                    &lifecycle,
+                                    error.to_string(),
+                                )
+                                .await);
+                            }
+                        }
+
+                        Ok::<_, BridgeError>(id)
+                    }
+                    .await;
+                    outcome
+                });
+                let id = task.await.map_err(|_| {
+                    BridgeError::agent_crashed("ACP session initialization task failed")
+                })??;
+                (id, true)
+            }
+        };
 
         // Immutability guard (ACP §11A): a session's cwd is fixed at `session/new`.
         // If this call did NOT mint the session (it already existed) but the desired
@@ -1749,29 +2858,64 @@ impl AcpBackend {
         // the wrong directory. Matching cwd (same session recycled for the same repo)
         // is fine and does not error.
         if !newly_minted {
+            lifecycle
+                .record(
+                    DiagnosticPhase::SessionCreate,
+                    PhaseStatus::Started,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            lifecycle
+                .record(
+                    DiagnosticPhase::SessionCreate,
+                    PhaseStatus::Skipped,
+                    None,
+                    Some("acp.session.reused"),
+                    None,
+                )
+                .await?;
+            lifecycle
+                .record(
+                    DiagnosticPhase::ConfigApply,
+                    PhaseStatus::Started,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
             if let Some(minted) = entry.minted_cwd.get() {
                 if *minted != desired_cwd {
-                    return Err(BridgeError::InvalidStateTransition);
+                    return Err(lifecycle
+                        .failure(
+                            DiagnosticPhase::ConfigApply,
+                            Some(DiagnosticPhase::SessionCreate),
+                            DiagnosticFailureClass::Config,
+                            FailureDisposition::Fatal,
+                            "acp.config.cwd_mismatch",
+                            "ACP session cwd cannot change after creation",
+                            None,
+                            false,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await);
                 }
             }
+            lifecycle
+                .record(
+                    DiagnosticPhase::ConfigApply,
+                    PhaseStatus::Skipped,
+                    None,
+                    Some("acp.config.reused"),
+                    None,
+                )
+                .await?;
         }
 
-        // Post-init cancel-latch drain — runs only on the minting call, and only
-        // AFTER `get_or_try_init` returned, i.e. once the id is observable to a
-        // concurrent `request_cancel`. CLAIM the latch with an atomic swap so
-        // exactly one of {this drain, a concurrent `request_cancel`} sends the
-        // notification (the other sees `false` and is a no-op): no double-send,
-        // and no lost cancel (see the interleaving argument on the method docs).
-        if newly_minted && entry.cancel_requested.swap(false, Ordering::SeqCst) {
-            cx.send_notification(CancelNotification::new(id.clone()))
-                .map_err(|e| {
-                    BridgeError::agent_crashed(format!(
-                        "failed to send deferred session/cancel after mint: {e}"
-                    ))
-                })?;
-        }
-
-        Ok(id.clone())
+        Ok(id)
     }
 
     /// Record a cancel for bridge key `key`, honoring the create/cancel race.
@@ -1784,9 +2928,12 @@ impl AcpBackend {
     ///
     /// Task 4 builds full `cancel()` completion semantics (waiting for the
     /// prompt result with `stopReason:"cancelled"`) on top of this.
-    async fn request_cancel(&self, key: &SessionId) -> Result<(), BridgeError> {
+    async fn request_cancel(&self, key: &SessionId) -> Result<CancelDispatch, TeardownFailure> {
         let entry = self.session_entry(key).await;
-        let cx = self.cx()?;
+        let cx = self.cx().map_err(|error| TeardownFailure {
+            error,
+            prompt_may_have_been_accepted: false,
+        })?;
         // Set the latch FIRST so a `session/new` completing concurrently observes
         // it. If the id is ALREADY present, CLAIM the latch (swap→false): if we
         // win the claim we fire now; if the minting task already claimed and
@@ -1794,15 +2941,88 @@ impl AcpBackend {
         entry.cancel_requested.store(true, Ordering::SeqCst);
         if let Some(agent_id) = entry.agent_id.get() {
             if entry.cancel_requested.swap(false, Ordering::SeqCst) {
-                cx.send_notification(CancelNotification::new(agent_id.clone()))
-                    .map_err(|e| {
-                        BridgeError::agent_crashed(format!(
-                            "failed to send session/cancel notification: {e}"
-                        ))
-                    })?;
+                Self::send_cancel_under_dispatch_fence(
+                    &self.dispatch_gate,
+                    &self.unavailable,
+                    || Self::turn_prompt_accepted_handle(&entry),
+                    || {
+                        #[cfg(test)]
+                        if self.fail_cancel_send.load(Ordering::SeqCst) {
+                            return Err(agent_client_protocol::Error::internal_error());
+                        }
+                        cx.send_notification(CancelNotification::new(agent_id.clone()))
+                    },
+                )?;
+                return Ok(CancelDispatch::Delivered);
             }
         }
-        Ok(())
+        Ok(CancelDispatch::Latched)
+    }
+
+    async fn cancel_inner(&self, session: &SessionId) -> Result<CancelDispatch, TeardownFailure> {
+        let dispatch = self.request_cancel(session).await?;
+
+        let entry = self.session_entry(session).await;
+        let (turn_active, turn_meta) = if let Some(agent_id) = entry.agent_id.get() {
+            self.updates()
+                .ok()
+                .and_then(|updates| {
+                    updates.lock().ok().and_then(|map| {
+                        map.get(agent_id).map(|route| {
+                            route.cancelled.store(true, Ordering::SeqCst);
+                            (Arc::clone(&route.active), route.turn_meta.clone())
+                        })
+                    })
+                })
+                .map_or((None, None), |(active, turn_meta)| {
+                    (Some(active), turn_meta)
+                })
+        } else {
+            (None, None)
+        };
+        if let (Some(reg), Some(meta)) = (
+            self.permission_registry.lock().ok().and_then(|r| r.clone()),
+            turn_meta,
+        ) {
+            reg.resolve_context_cancelled(&meta.context_id);
+        }
+        let Some(turn_active) = turn_active else {
+            return Ok(dispatch);
+        };
+        if entry.turn_lock.try_lock().is_ok() {
+            return Ok(dispatch);
+        }
+
+        let turn_lock = Arc::clone(&entry.turn_lock);
+        let supervised = Arc::clone(&self.supervised);
+        let container = self.config.as_ref().and_then(|c| c.container.clone());
+        let reaped = Arc::clone(&self.reaped);
+        let unavailable = Arc::clone(&self.unavailable);
+        let dispatch_gate = Arc::clone(&self.dispatch_gate);
+        let kill_slot = Arc::clone(&entry.turn_kill);
+        let grace = self.cancel_grace();
+        tokio::spawn(async move {
+            if tokio::time::timeout(grace, turn_lock.lock()).await.is_err() {
+                if turn_active
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    return;
+                }
+                AcpBackend::escalate_terminate(
+                    &supervised,
+                    &container,
+                    &reaped,
+                    &dispatch_gate,
+                    &unavailable,
+                );
+                let kill = kill_slot.lock().ok().and_then(|guard| guard.clone());
+                if let Some(kill) = kill {
+                    kill.notify_one();
+                }
+            }
+        });
+        Ok(dispatch)
     }
 
     /// Construct from an already-spawned `Supervised` child, driving the ACP
@@ -1817,6 +3037,9 @@ impl AcpBackend {
         mut supervised: Supervised,
         config: AcpConfig,
     ) -> Result<Self, BridgeError> {
+        supervised.apply_stderr_redactor(config.diagnostic_redactor.clone());
+        let stderr_ring = supervised.stderr_ring();
+        let stderr_cursor = stderr_ring.origin();
         let child = supervised.child_mut();
         let stdin = child
             .stdin
@@ -1827,8 +3050,16 @@ impl AcpBackend {
             .take()
             .ok_or_else(|| BridgeError::agent_crashed("agent stdout unavailable in from_child"))?;
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-        let backend = Self::connect(transport, config).await?;
+        let mut backend = Self::connect_observed_after(
+            transport,
+            config,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            None,
+            Some((stderr_ring.clone(), stderr_cursor)),
+        )
+        .await?;
         *backend.supervised.lock().expect("supervised lock") = Some(supervised);
+        backend.stderr_ring = Some(stderr_ring);
         Ok(backend)
     }
 
@@ -1853,7 +3084,7 @@ impl AcpBackend {
             .send_request(req)
             .block_task()
             .await
-            .inspect_err(|e| tracing::warn!(error = ?e, "session/new (describe_options) failed"))
+            .inspect_err(|_| AcpTraceEvent::DiscoverySessionCreateFailed.emit())
             .map_err(|e| {
                 BridgeError::agent_crashed(format!("session/new (describe_options) failed: {e}"))
             })?;
@@ -1890,6 +3121,52 @@ impl AcpBackend {
             .unwrap_or(DEFAULT_CANCEL_GRACE)
     }
 
+    async fn operation_lifecycle(
+        &self,
+        session: &SessionId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> AcpLifecycle {
+        let stderr = self
+            .stderr_ring
+            .as_ref()
+            .map(|ring| (ring.clone(), ring.cursor()));
+        AcpLifecycle::new(
+            observer,
+            self.diagnostic_redactor_for_operation(session).await,
+            stderr,
+        )
+    }
+
+    async fn release_session_result(&self, session: &SessionId) -> Result<(), TeardownFailure> {
+        // Cleanup is unconditional: even a transport error while sending cancel
+        // must not retain stale per-session routing/config state. The error is
+        // still returned to the observed owner instead of being discarded.
+        let cancel_result = self.cancel_inner(session).await;
+        {
+            let mut sessions = self.sessions.lock().await;
+            if sessions.contains_key(session) {
+                // ACP has no session-close acknowledgement here. Once bridge
+                // ownership is removed, the shared process can still emit late
+                // text derived from this session's MCP environment, while a
+                // future mint will replace the finite exact-value policy.
+                // Fail closed before removal so that replacement can retain
+                // counts but can never re-enable process stderr text.
+                if let Some(stderr_ring) = self.stderr_ring.as_ref() {
+                    stderr_ring.retain_metadata_only();
+                }
+            }
+            sessions.remove(session);
+        }
+        if let Ok(mut configs) = self.session_cfg.lock() {
+            configs.remove(session);
+        }
+        self.pending_turn_meta
+            .lock()
+            .expect("pending_turn_meta lock")
+            .remove(session);
+        cancel_result.map(|_| ())
+    }
+
     /// Last-resort escalation when a cancelled turn does not complete within the
     /// grace window: TAKE the supervised child (exactly once — a concurrent
     /// escalator sees `None`) and SIGTERM→SIGKILL the whole agent PROCESS.
@@ -1905,11 +3182,21 @@ impl AcpBackend {
     /// no-op there (closing the duplex channel is the test's own concern).
     /// `terminate(self, _)` is async + consumes the child, so we run it on a
     /// detached task and return immediately.
+    fn close_connection_fence(dispatch_gate: &Arc<StdMutex<()>>, unavailable: &Arc<AtomicBool>) {
+        let _dispatch = dispatch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unavailable.store(true, Ordering::SeqCst);
+    }
+
     fn escalate_terminate(
         supervised: &Arc<StdMutex<Option<Supervised>>>,
         container: &Option<ContainerReap>,
         reaped: &Arc<AtomicBool>,
+        dispatch_gate: &Arc<StdMutex<()>>,
+        unavailable: &Arc<AtomicBool>,
     ) {
+        Self::close_connection_fence(dispatch_gate, unavailable);
         let taken = supervised.lock().ok().and_then(|mut g| g.take());
         if let Some(child) = taken {
             tokio::spawn(async move {
@@ -2230,17 +3517,57 @@ impl AcpBackend {
         session: &SessionId,
         parts: Vec<bridge_core::domain::Part>,
         rich_sink: Option<Arc<dyn RichEventSink>>,
+        diagnostic_observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<BackendStream, BridgeError> {
+        let config_snapshot = self.session_config_snapshot(session)?;
+        #[cfg(test)]
+        {
+            let hook = self
+                .prompt_snapshot_hook
+                .lock()
+                .ok()
+                .and_then(|hook| hook.clone());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let stderr_evidence = self
+            .stderr_ring
+            .as_ref()
+            .map(|ring| (ring.clone(), ring.cursor()));
+        let lifecycle = AcpLifecycle::new(
+            diagnostic_observer.clone(),
+            self.diagnostic_redactor_for_cwds(std::slice::from_ref(&config_snapshot.desired_cwd)),
+            stderr_evidence,
+        );
+        self.require_prompt_connection(&lifecycle).await?;
+        let stderr_cursor: Option<ProcessStderrCursor> =
+            self.stderr_ring.as_ref().map(ProcessStderrRing::cursor);
         let turn_meta = self.take_pending_turn_meta(session);
 
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
         let entry = self.session_entry(session).await;
-        let agent_id = self.ensure_session(session).await?;
+        let agent_id = self
+            .ensure_session_observed_with_snapshot(session, diagnostic_observer, config_snapshot)
+            .await?;
 
         // Acquire the turn lock as an OWNED guard so it can move into the driver
         // task and be held for the whole streamed turn (released on drop there).
         let turn_guard: OwnedMutexGuard<()> = Arc::clone(&entry.turn_lock).lock_owned().await;
+        // A caller can pass the first fence check and then queue behind a turn
+        // that escalates the shared connection. Revalidate after acquiring the
+        // lock so that queued caller cannot dispatch onto a killed/fenced agent.
+        self.require_prompt_connection(&lifecycle).await?;
+        lifecycle
+            .record(
+                DiagnosticPhase::PromptStart,
+                PhaseStatus::Started,
+                None,
+                None,
+                None,
+            )
+            .await?;
 
         // Build the per-turn channel and register its sender BEFORE sending the
         // prompt, so the handler routes every chunk (no drop between send and
@@ -2249,7 +3576,26 @@ impl AcpBackend {
         // stream yields chunks then Done, in order).
         let (tx, rx) = mpsc::unbounded_channel::<TurnEvent>();
         let done_sender = tx.clone();
-        let registry = Arc::clone(self.updates()?);
+        let (registry, cx) = match self.conn.as_ref() {
+            Some(conn) => (Arc::clone(&conn.updates), conn.cx.clone()),
+            None => {
+                return Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::PromptStart,
+                        Some(DiagnosticPhase::ConfigApply),
+                        DiagnosticFailureClass::Transport,
+                        FailureDisposition::Fatal,
+                        "acp.prompt_start.connection_unavailable",
+                        "ACP prompt connection was unavailable",
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await)
+            }
+        };
         let watch = if self
             .config
             .as_ref()
@@ -2263,10 +3609,31 @@ impl AcpBackend {
         } else {
             None
         };
+        if registry.is_poisoned() {
+            return Err(lifecycle
+                .failure(
+                    DiagnosticPhase::PromptStart,
+                    Some(DiagnosticPhase::ConfigApply),
+                    DiagnosticFailureClass::Unknown,
+                    FailureDisposition::Fatal,
+                    "acp.prompt_start.registry_poisoned",
+                    "ACP prompt routing lock was unavailable",
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await);
+        }
+        let turn_active = Arc::new(AtomicBool::new(true));
+        let prompt_accepted = Arc::new(AtomicBool::new(false));
+        let turn_acceptance = TurnAcceptanceGuard::install(
+            Arc::clone(&entry.turn_accepted),
+            Arc::clone(&prompt_accepted),
+        );
         {
-            let mut map = registry
-                .lock()
-                .map_err(|_| BridgeError::agent_crashed("update routing registry lock poisoned"))?;
+            let mut map = registry.lock().expect("update routing registry lock");
             map.insert(
                 agent_id.clone(),
                 TurnRoute {
@@ -2274,11 +3641,10 @@ impl AcpBackend {
                     watch: watch.clone(),
                     turn_meta,
                     cancelled: Arc::new(AtomicBool::new(false)),
+                    active: Arc::clone(&turn_active),
                 },
             );
         }
-
-        let cx = self.cx()?.clone();
         let req = Self::prompt_request(agent_id.clone(), &parts);
 
         // Install a FRESH per-turn kill switch on the session: the external cancel
@@ -2286,6 +3652,41 @@ impl AcpBackend {
         // driver `select!`s on it and clears the slot on exit.
         let kill = Arc::new(tokio::sync::Notify::new());
         *entry.turn_kill.lock().expect("turn_kill lock") = Some(Arc::clone(&kill));
+
+        // This is the accepted-work barrier. The connection-wide gate makes
+        // the final availability sample and SDK request installation one
+        // atomic ordering point with escalation and retirement. All observer
+        // awaits are complete before this short synchronous critical section.
+        let prompt_fut = Self::install_prompt_request(
+            &self.dispatch_gate,
+            &self.unavailable,
+            &prompt_accepted,
+            || cx.send_request(req).block_task(),
+        );
+        let Some(prompt_fut) = prompt_fut else {
+            turn_active.store(false, Ordering::SeqCst);
+            if let Ok(mut map) = registry.lock() {
+                map.remove(&agent_id);
+            }
+            if let Ok(mut slot) = entry.turn_kill.lock() {
+                *slot = None;
+            }
+            return Err(lifecycle
+                .failure(
+                    DiagnosticPhase::PromptStart,
+                    Some(DiagnosticPhase::ConfigApply),
+                    DiagnosticFailureClass::AgentProcess,
+                    FailureDisposition::Fatal,
+                    "acp.prompt_start.connection_terminated",
+                    "ACP connection terminated before prompt dispatch",
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await);
+        };
 
         // (3) Driver: holds the turn lock for the whole streamed turn (it OWNS
         // `turn_guard`, releasing the lock only when it finishes) and awaits the
@@ -2295,7 +3696,11 @@ impl AcpBackend {
         let supervised_for_driver = Arc::clone(&self.supervised);
         let container_for_driver = self.config.as_ref().and_then(|c| c.container.clone());
         let reaped_for_driver = Arc::clone(&self.reaped);
+        let unavailable_for_driver = Arc::clone(&self.unavailable);
+        let dispatch_gate_for_driver = Arc::clone(&self.dispatch_gate);
+        let stderr_ring_for_driver = self.stderr_ring.clone();
         let kill_slot = Arc::clone(&entry.turn_kill);
+        let turn_acceptance_for_driver = turn_acceptance;
         let grace = self.cancel_grace();
         let watchdog_cfg = self.config.as_ref().and_then(|c| c.watchdog.clone());
         let (watchdog_fired, watchdog_done_tx) = if let (Some(watchdog_cfg), Some(watch)) =
@@ -2346,6 +3751,10 @@ impl AcpBackend {
         tokio::spawn(async move {
             // Hold the turn lock for the entire turn.
             let _turn = turn_guard;
+            // Clear operation-scoped acceptance evidence before `_turn` drops,
+            // including task abort/unwind paths. The routing entry can be
+            // removed earlier once the SDK result is terminal.
+            let _turn_acceptance = turn_acceptance_for_driver;
 
             // Await the prompt result, but bail out on either:
             //   * the CONSUMER dropping the stream (`done_sender.closed()` resolves
@@ -2356,16 +3765,75 @@ impl AcpBackend {
             //   * the external cancel grace-watcher firing the kill switch (a hung
             //     agent that ignored `session/cancel` past grace) — we abandon the
             //     await so the lock releases and the caller's stream ends.
-            let prompt_fut = cx.send_request(req).block_task();
+            // The accepted-work barrier was crossed under the connection-wide
+            // dispatch gate immediately before this task was spawned. Every
+            // exit below is therefore post-barrier and fatal.
             tokio::pin!(prompt_fut);
-            let mut timed_out_local = false;
-            let outcome: Result<_, ()> = tokio::select! {
+            let persistence_error = match lifecycle
+                .record(
+                    DiagnosticPhase::PromptStart,
+                    PhaseStatus::Completed,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(()) => lifecycle
+                    .record(
+                        DiagnosticPhase::PromptStream,
+                        PhaseStatus::Started,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .err(),
+                Err(error) => Some(error),
+            };
+            if let Some(error) = persistence_error {
+                // Work crossed the accepted-work barrier before persistence
+                // failed. Keep the route and turn lock until the request is
+                // terminal, or until bounded cancellation escalates the whole
+                // shared connection. Returning immediately would let a second
+                // prompt overlap an agent that ignored this best-effort cancel.
+                let _ = cx.send_notification(CancelNotification::new(agent_id_for_driver.clone()));
+                tokio::select! {
+                    _ = &mut prompt_fut => {}
+                    _ = kill.notified() => {
+                        AcpBackend::close_connection_fence(
+                            &dispatch_gate_for_driver,
+                            &unavailable_for_driver,
+                        );
+                    }
+                    _ = tokio::time::sleep(grace) => {
+                        AcpBackend::escalate_terminate(
+                            &supervised_for_driver,
+                            &container_for_driver,
+                            &reaped_for_driver,
+                            &dispatch_gate_for_driver,
+                            &unavailable_for_driver,
+                        );
+                    }
+                }
+                turn_active.store(false, Ordering::SeqCst);
+                if let Ok(mut map) = registry_for_driver.lock() {
+                    map.remove(&agent_id_for_driver);
+                }
+                if let Ok(mut slot) = kill_slot.lock() {
+                    *slot = None;
+                }
+                drop(watchdog_done_tx);
+                let _ = done_sender.send(TurnEvent::Failed(error));
+                return;
+            }
+            let outcome: Result<_, PromptDriverFailure> = tokio::select! {
                 // BIASED: poll the arms in order so a `prompt_fut` that became ready in the SAME
                 // poll as a fired watchdog ALWAYS wins (the natural completion is never relabeled
                 // AgentTimedOut). Without `biased`, tokio picks a ready arm at random.
                 biased;
-                outcome = &mut prompt_fut => outcome.map_err(|_| ()),
-                _ = kill.notified() => Err(()),
+                outcome = &mut prompt_fut => outcome.map_err(|error| PromptDriverFailure::Sdk(error.to_string())),
+                _ = kill.notified() => Err(PromptDriverFailure::KillSwitch),
                 _ = async {
                     match &watchdog_fired {
                         Some(n) => n.notified().await,
@@ -2375,19 +3843,29 @@ impl AcpBackend {
                     let _ = cx.send_notification(CancelNotification::new(
                         agent_id_for_driver.clone(),
                     ));
-                    tokio::select! {
-                        _ = &mut prompt_fut => {}
-                        _ = kill.notified() => {}
-                        _ = tokio::time::sleep(grace) => {
+                    let cause = match settle_prompt_after_cancel(
+                        prompt_fut.as_mut(),
+                        kill.as_ref(),
+                        grace,
+                    )
+                    .await
+                    {
+                        CancelSettle::Prompt(outcome) => {
+                            outcome.err().map(|error| error.to_string())
+                        }
+                        CancelSettle::KillSwitch => None,
+                        CancelSettle::GraceElapsed => {
                             AcpBackend::escalate_terminate(
                                 &supervised_for_driver,
                                 &container_for_driver,
                                 &reaped_for_driver,
+                                &dispatch_gate_for_driver,
+                                &unavailable_for_driver,
                             );
+                            None
                         }
-                    }
-                    timed_out_local = true;
-                    Err(())
+                    };
+                    Err(PromptDriverFailure::Watchdog(cause))
                 },
                 _ = done_sender.closed() => {
                     // Early stream-drop → cancel THIS turn's agent session, then
@@ -2400,16 +3878,25 @@ impl AcpBackend {
                     let _ = cx.send_notification(CancelNotification::new(
                         agent_id_for_driver.clone(),
                     ));
-                    tokio::select! {
-                        outcome = &mut prompt_fut => outcome.map_err(|_| ()),
-                        _ = kill.notified() => Err(()),
-                        _ = tokio::time::sleep(grace) => {
+                    match settle_prompt_after_cancel(
+                        prompt_fut.as_mut(),
+                        kill.as_ref(),
+                        grace,
+                    )
+                    .await
+                    {
+                        CancelSettle::Prompt(outcome) => outcome
+                            .map_err(|error| PromptDriverFailure::Sdk(error.to_string())),
+                        CancelSettle::KillSwitch => Err(PromptDriverFailure::KillSwitch),
+                        CancelSettle::GraceElapsed => {
                             AcpBackend::escalate_terminate(
                                 &supervised_for_driver,
                                 &container_for_driver,
                                 &reaped_for_driver,
+                                &dispatch_gate_for_driver,
+                                &unavailable_for_driver,
                             );
-                            Err(())
+                            Err(PromptDriverFailure::DroppedStreamTimeout)
                         }
                     }
                 }
@@ -2417,6 +3904,7 @@ impl AcpBackend {
 
             // Unregister this turn's sender FIRST so no late chunk is routed
             // after the terminal Done is emitted.
+            turn_active.store(false, Ordering::SeqCst);
             if let Ok(mut map) = registry_for_driver.lock() {
                 map.remove(&agent_id_for_driver);
             }
@@ -2431,28 +3919,102 @@ impl AcpBackend {
                 // to Done{"cancelled"} — NOT an error). Emit the mapped Done.
                 Ok(resp) => {
                     let stop_reason = AcpBackend::stop_reason_str(resp.stop_reason);
-                    if let Some(usage) = resp.usage {
-                        let _ = done_sender.send(TurnEvent::Usage(
-                            AcpBackend::map_prompt_response_usage(usage),
-                        ));
+                    if let Err(error) = lifecycle
+                        .record(
+                            DiagnosticPhase::PromptStream,
+                            PhaseStatus::Completed,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        TurnEvent::Failed(error)
+                    } else if let Err(error) = lifecycle
+                        .record(
+                            DiagnosticPhase::PromptFinish,
+                            PhaseStatus::Started,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        TurnEvent::Failed(error)
+                    } else {
+                        if let Some(usage) = resp.usage {
+                            let _ = done_sender.send(TurnEvent::Usage(
+                                AcpBackend::map_prompt_response_usage(usage),
+                            ));
+                        }
+                        match lifecycle
+                            .record(
+                                DiagnosticPhase::PromptFinish,
+                                PhaseStatus::Completed,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(()) => TurnEvent::Done(Update::Done { stop_reason }),
+                            Err(error) => TurnEvent::Failed(error),
+                        }
                     }
-                    TurnEvent::Done(Update::Done { stop_reason })
                 }
                 // A transport/agent error (agent crash / mid-turn transport
                 // failure), OR a kill-switch/grace escalation, FAILED the turn:
                 // surface a terminal Err on the stream so downstream reports the
                 // inbound A2A caller `Failed` — never a silent Done{"unknown"}
                 // that reads as a clean `Completed`.
-                Err(()) if timed_out_local => TurnEvent::Failed(BridgeError::AgentTimedOut),
-                Err(()) => {
-                    tracing::warn!(
-                        session = ?agent_id_for_driver,
-                        "session/prompt failed (transport/SDK error or kill-switch): \
-                         surfacing AgentCrashed"
-                    );
-                    TurnEvent::Failed(BridgeError::agent_crashed(
-                        "session/prompt failed: transport error or kill-switch escalation",
-                    ))
+                Err(failure) => {
+                    AcpTraceEvent::PromptFailed.emit();
+                    let stderr = stderr_ring_for_driver
+                        .as_ref()
+                        .and_then(|ring| stderr_cursor.map(|cursor| ring.metadata_since(cursor)));
+                    let (class, code, summary, cause) = match failure {
+                        PromptDriverFailure::Sdk(cause) => (
+                            DiagnosticFailureClass::Transport,
+                            "acp.prompt.transport",
+                            "ACP prompt transport failed",
+                            Some(cause),
+                        ),
+                        PromptDriverFailure::KillSwitch => (
+                            DiagnosticFailureClass::AgentProcess,
+                            "acp.prompt.kill_switch",
+                            "ACP prompt was terminated after cancellation grace",
+                            None,
+                        ),
+                        PromptDriverFailure::Watchdog(cause) => (
+                            DiagnosticFailureClass::Timeout,
+                            "acp.prompt.watchdog_timeout",
+                            "ACP prompt exceeded its watchdog bound",
+                            cause,
+                        ),
+                        PromptDriverFailure::DroppedStreamTimeout => (
+                            DiagnosticFailureClass::Timeout,
+                            "acp.prompt.dropped_stream_timeout",
+                            "ACP prompt did not stop after its consumer disconnected",
+                            None,
+                        ),
+                    };
+                    TurnEvent::Failed(
+                        lifecycle
+                            .failure(
+                                DiagnosticPhase::PromptStream,
+                                Some(DiagnosticPhase::PromptStart),
+                                class,
+                                FailureDisposition::Fatal,
+                                code,
+                                summary,
+                                cause,
+                                true,
+                                stderr,
+                                None,
+                                None,
+                            )
+                            .await,
+                    )
                 }
             };
             // If the consumer already dropped the stream this `send` is a no-op,
@@ -2505,7 +4067,13 @@ impl AgentBackend for AcpBackend {
         session: &SessionId,
         parts: Vec<bridge_core::domain::Part>,
     ) -> Result<BackendStream, BridgeError> {
-        self.prompt_inner(session, parts, None).await
+        self.prompt_inner(
+            session,
+            parts,
+            None,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
     }
 
     async fn prompt_observed(
@@ -2514,7 +4082,23 @@ impl AgentBackend for AcpBackend {
         parts: Vec<bridge_core::domain::Part>,
         sink: Arc<dyn RichEventSink>,
     ) -> Result<BackendStream, BridgeError> {
-        self.prompt_inner(session, parts, Some(sink)).await
+        self.prompt_inner(
+            session,
+            parts,
+            Some(sink),
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    async fn prompt_with_observers(
+        &self,
+        session: &SessionId,
+        parts: Vec<bridge_core::domain::Part>,
+        observers: BackendObservers,
+    ) -> Result<BackendStream, BridgeError> {
+        self.prompt_inner(session, parts, observers.rich, observers.diagnostic)
+            .await
     }
 
     async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
@@ -2552,59 +4136,63 @@ impl AgentBackend for AcpBackend {
     /// not block the caller for the grace window). If no turn is in flight (the
     /// lock is free right now), there is nothing to bound and we skip the watcher.
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
-        self.request_cancel(session).await?;
+        self.cancel_inner(session)
+            .await
+            .map(|_| ())
+            .map_err(|failure| failure.error)
+    }
 
-        let entry = self.session_entry(session).await;
-        if let Some(agent_id) = entry.agent_id.get() {
-            let turn_meta = self.updates().ok().and_then(|updates| {
-                updates.lock().ok().and_then(|map| {
-                    map.get(agent_id).map(|route| {
-                        route.cancelled.store(true, Ordering::SeqCst);
-                        route.turn_meta.clone()
-                    })
-                })
-            });
-            if let (Some(reg), Some(meta)) = (
-                self.permission_registry.lock().ok().and_then(|r| r.clone()),
-                turn_meta.flatten(),
-            ) {
-                reg.resolve_context_cancelled(&meta.context_id);
+    async fn cancel_observed(
+        &self,
+        session: &SessionId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        let lifecycle = self.operation_lifecycle(session, observer).await;
+        lifecycle
+            .record(
+                DiagnosticPhase::Teardown,
+                PhaseStatus::Started,
+                None,
+                Some("acp.teardown.cancel"),
+                None,
+            )
+            .await?;
+        let dispatch = match self.cancel_inner(session).await {
+            Ok(dispatch) => dispatch,
+            Err(TeardownFailure {
+                error,
+                prompt_may_have_been_accepted,
+            }) => {
+                return Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::Teardown,
+                        None,
+                        DiagnosticFailureClass::Transport,
+                        FailureDisposition::Fatal,
+                        "acp.teardown.cancel_failed",
+                        "ACP session cancellation failed",
+                        Some(error.to_string()),
+                        prompt_may_have_been_accepted,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await)
             }
-        }
-        // No in-flight turn → the lock is free → nothing to bound. (A turn that
-        // starts AFTER this check is a fresh turn, not the one this cancel
-        // targeted, so it is correct not to arm a watcher for it.)
-        if entry.turn_lock.try_lock().is_ok() {
-            return Ok(());
-        }
-
-        let turn_lock = Arc::clone(&entry.turn_lock);
-        let supervised = Arc::clone(&self.supervised);
-        let container = self.config.as_ref().and_then(|c| c.container.clone());
-        let reaped = Arc::clone(&self.reaped);
-        let kill_slot = Arc::clone(&entry.turn_kill);
-        let grace = self.cancel_grace();
-        tokio::spawn(async move {
-            // Wait up to `grace` for the in-flight turn to release the lock (its
-            // driver drops the guard on every exit). If it does, the turn
-            // completed (cleanly cancelled or otherwise) — no escalation. If the
-            // grace elapses first, the agent ignored `session/cancel`: ESCALATE.
-            if tokio::time::timeout(grace, turn_lock.lock()).await.is_err() {
-                // Nuke a real agent PROCESS (closes its pipes → every in-flight
-                // `send_request` errors). For the in-process transport (no child)
-                // this is a no-op, so ALSO fire the per-turn kill switch to unblock
-                // the driver deterministically; either path ends the turn with a
-                // terminal `Err`, releases the lock, and unhangs the caller.
-                AcpBackend::escalate_terminate(&supervised, &container, &reaped);
-                let kill = kill_slot.lock().ok().and_then(|g| g.clone());
-                if let Some(k) = kill {
-                    // `notify_one` stores a permit if the driver has not yet
-                    // registered its `notified()` waiter, so the kill is never lost.
-                    k.notify_one();
-                }
-            }
-        });
-        Ok(())
+        };
+        let completion_code = match dispatch {
+            CancelDispatch::Delivered => "acp.teardown.cancelled",
+            CancelDispatch::Latched => "acp.teardown.cancel_latched",
+        };
+        lifecycle
+            .record(
+                DiagnosticPhase::Teardown,
+                PhaseStatus::Completed,
+                None,
+                Some(completion_code),
+                None,
+            )
+            .await
     }
 
     /// Stash the per-session spec (Increment 3b/session-cwd). Dispatch (T10) calls
@@ -2637,6 +4225,33 @@ impl AgentBackend for AcpBackend {
             .lock()
             .expect("pending_turn_meta lock")
             .remove(session);
+    }
+
+    async fn forget_session_observed(
+        &self,
+        session: &SessionId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        let lifecycle = self.operation_lifecycle(session, observer).await;
+        lifecycle
+            .record(
+                DiagnosticPhase::Teardown,
+                PhaseStatus::Started,
+                None,
+                Some("acp.teardown.forget"),
+                None,
+            )
+            .await?;
+        self.forget_session(session).await;
+        lifecycle
+            .record(
+                DiagnosticPhase::Teardown,
+                PhaseStatus::Completed,
+                None,
+                Some("acp.teardown.forgotten"),
+                None,
+            )
+            .await
     }
 
     /// Re-apply warm-session model/effort against the cached ACP config surface.
@@ -2690,11 +4305,13 @@ impl AgentBackend for AcpBackend {
                 Ok(ReconcileOutcome::Applied)
             }
             Err(ApplyConfigError::NotAdvertised(b)) => {
-                tracing::warn!(?b, "reconcile not advertised");
+                let _ = b;
+                AcpTraceEvent::WarmConfigNotAdvertised.emit();
                 Ok(ReconcileOutcome::NotAdvertised)
             }
             Err(ApplyConfigError::Rejected(b)) => {
-                tracing::warn!(?b, "reconcile rejected");
+                let _ = b;
+                AcpTraceEvent::WarmConfigRejected.emit();
                 Ok(ReconcileOutcome::Rejected)
             }
         }
@@ -2718,15 +4335,54 @@ impl AgentBackend for AcpBackend {
     /// the config stash. Does NOT `retire()` the shared process (warm for serve's lifetime,
     /// shared across sessions). [Slice 0]
     async fn release_session(&self, session: &SessionId) {
-        let _ = self.cancel(session).await;
-        self.sessions.lock().await.remove(session);
-        if let Ok(mut m) = self.session_cfg.lock() {
-            m.remove(session);
+        let _ = self.release_session_result(session).await;
+    }
+
+    async fn release_session_observed(
+        &self,
+        session: &SessionId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        let lifecycle = self.operation_lifecycle(session, observer).await;
+        lifecycle
+            .record(
+                DiagnosticPhase::Teardown,
+                PhaseStatus::Started,
+                None,
+                Some("acp.teardown.release"),
+                None,
+            )
+            .await?;
+        if let Err(TeardownFailure {
+            error,
+            prompt_may_have_been_accepted,
+        }) = self.release_session_result(session).await
+        {
+            return Err(lifecycle
+                .failure(
+                    DiagnosticPhase::Teardown,
+                    None,
+                    DiagnosticFailureClass::Transport,
+                    FailureDisposition::Fatal,
+                    "acp.teardown.release_failed",
+                    "ACP session release failed",
+                    Some(error.to_string()),
+                    prompt_may_have_been_accepted,
+                    None,
+                    None,
+                    None,
+                )
+                .await);
         }
-        self.pending_turn_meta
-            .lock()
-            .expect("pending_turn_meta lock")
-            .remove(session);
+        lifecycle
+            .record(
+                DiagnosticPhase::Teardown,
+                PhaseStatus::Completed,
+                None,
+                Some("acp.teardown.released"),
+                None,
+            )
+            .await
     }
 
     /// Graceful async teardown of the agent process (Increment 3b §5.4). IDEMPOTENT
@@ -2734,9 +4390,10 @@ impl AgentBackend for AcpBackend {
     /// once — a concurrent/second caller sees `None`) and SIGTERM→SIGKILL it. Both
     /// `resolve`'s race-loss path AND the registry retirement task may call this on
     /// the same backend (T5 review), so the take-once makes the second call a clean
-    /// no-op. On the in-process `connect` path there is no child (`None`) → retire
-    /// is a clean no-op there too.
+    /// no-op. The connection fence closes before either path so an active lease
+    /// cannot install new work while retirement tears down the shared agent.
     async fn retire(&self) -> Result<(), BridgeError> {
+        Self::close_connection_fence(&self.dispatch_gate, &self.unavailable);
         let sup = self.supervised.lock().ok().and_then(|mut g| g.take());
         if let Some(sup) = sup {
             sup.terminate(self.cancel_grace()).await;
@@ -2763,9 +4420,13 @@ impl Drop for AcpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_core::diagnostics::{
+        DiagnosticFailureClass, DiagnosticPhase, FailureDisposition, InMemoryDiagnosticObserver,
+        PhaseStatus,
+    };
     use bridge_core::domain::EffectiveConfig;
     use bridge_core::error::BridgeError;
-    use bridge_core::ports::{AgentBackend, RichEventSink, Update};
+    use bridge_core::ports::{AgentBackend, BackendObservers, RichEventSink, Update};
     use bridge_core::process::Supervised;
     use bridge_core::SessionCwd;
     use futures::StreamExt;
@@ -2781,6 +4442,445 @@ mod tests {
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::{Agent, Channel};
 
+    fn trace_source_violations(source: &str) -> Vec<String> {
+        trace_source_violations_with_funnel(source, true)
+    }
+
+    fn trace_source_violations_with_funnel(source: &str, allow_typed_funnel: bool) -> Vec<String> {
+        use syn::visit::Visit;
+
+        struct Visitor {
+            allow_typed_funnel: bool,
+            module_depth: usize,
+            inside_trace_impl: bool,
+            inside_emit: bool,
+            violations: Vec<String>,
+        }
+
+        fn use_tree_contains_tracing(tree: &syn::UseTree) -> bool {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    path.ident == "tracing" || use_tree_contains_tracing(&path.tree)
+                }
+                syn::UseTree::Name(name) => name.ident == "tracing",
+                syn::UseTree::Rename(rename) => {
+                    rename.ident == "tracing" || rename.rename == "tracing"
+                }
+                syn::UseTree::Group(group) => group.items.iter().any(use_tree_contains_tracing),
+                syn::UseTree::Glob(_) => false,
+            }
+        }
+
+        fn is_test_only_module(node: &syn::ItemMod) -> bool {
+            node.attrs.iter().any(|attribute| match &attribute.meta {
+                syn::Meta::List(list) if list.path.is_ident("cfg") => {
+                    list.tokens.to_string() == "test"
+                }
+                _ => false,
+            })
+        }
+
+        fn item_macro_contains_ident(node: &syn::ItemMacro, expected: &str) -> bool {
+            node.mac
+                .tokens
+                .to_string()
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .any(|token| token == expected)
+        }
+
+        impl<'ast> Visit<'ast> for Visitor {
+            fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+                if is_test_only_module(node) {
+                    return;
+                }
+                let prior = self.module_depth;
+                self.module_depth += 1;
+                syn::visit::visit_item_mod(self, node);
+                self.module_depth = prior;
+            }
+
+            fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+                let is_funnel = self.allow_typed_funnel
+                    && self.module_depth == 0
+                    && node.trait_.is_none()
+                    && match node.self_ty.as_ref() {
+                        syn::Type::Path(path) => {
+                            path.qself.is_none()
+                                && path.path.segments.len() == 1
+                                && path.path.is_ident("AcpTraceEvent")
+                        }
+                        _ => false,
+                    };
+                let prior = self.inside_trace_impl;
+                self.inside_trace_impl = is_funnel;
+                syn::visit::visit_item_impl(self, node);
+                self.inside_trace_impl = prior;
+            }
+
+            fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+                let prior = self.inside_emit;
+                let exact_receiver = matches!(
+                    node.sig.inputs.first(),
+                    Some(syn::FnArg::Receiver(receiver))
+                        if receiver.reference.is_none()
+                            && receiver.mutability.is_none()
+                            && receiver.colon_token.is_none()
+                );
+                self.inside_emit = self.inside_trace_impl
+                    && node.sig.ident == "emit"
+                    && node.sig.inputs.len() == 1
+                    && exact_receiver
+                    && node.sig.generics.params.is_empty()
+                    && node.sig.asyncness.is_none()
+                    && node.sig.unsafety.is_none()
+                    && node.sig.abi.is_none()
+                    && node.sig.variadic.is_none()
+                    && matches!(node.sig.output, syn::ReturnType::Default);
+                syn::visit::visit_impl_item_fn(self, node);
+                self.inside_emit = prior;
+            }
+
+            fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+                if node
+                    .path
+                    .segments
+                    .first()
+                    .is_some_and(|segment| segment.ident == "tracing")
+                {
+                    self.violations
+                        .push("direct tracing expression bypasses the typed funnel".to_string());
+                }
+                syn::visit::visit_expr_path(self, node);
+            }
+
+            fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+                if node
+                    .path
+                    .segments
+                    .first()
+                    .is_some_and(|segment| segment.ident == "tracing")
+                {
+                    self.violations
+                        .push("direct tracing type bypasses the typed funnel".to_string());
+                }
+                syn::visit::visit_type_path(self, node);
+            }
+
+            fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+                if use_tree_contains_tracing(&node.tree) {
+                    self.violations
+                        .push("tracing import or alias bypasses the typed funnel".to_string());
+                }
+                syn::visit::visit_item_use(self, node);
+            }
+
+            fn visit_item_extern_crate(&mut self, node: &'ast syn::ItemExternCrate) {
+                if node.ident == "tracing" {
+                    self.violations
+                        .push("tracing extern-crate alias bypasses the typed funnel".to_string());
+                }
+                syn::visit::visit_item_extern_crate(self, node);
+            }
+
+            fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+                let segments: Vec<String> = node
+                    .path()
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect();
+                if segments.first().is_some_and(|name| name == "tracing")
+                    || segments.last().is_some_and(|name| name == "instrument")
+                {
+                    self.violations
+                        .push("tracing attribute bypasses the typed funnel".to_string());
+                }
+                syn::visit::visit_attribute(self, node);
+            }
+
+            fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+                if node.ident.is_some() && item_macro_contains_ident(node, "tracing") {
+                    self.violations
+                        .push("local macro expansion bypasses the typed trace funnel".to_string());
+                }
+                syn::visit::visit_item_macro(self, node);
+            }
+
+            fn visit_macro(&mut self, node: &'ast syn::Macro) {
+                let segments: Vec<String> = node
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect();
+                let is_log_macro = segments.last().is_some_and(|name| {
+                    matches!(name.as_str(), "trace" | "debug" | "info" | "warn" | "error")
+                });
+                let is_trace_macro = segments.last().is_some_and(|name| {
+                    matches!(
+                        name.as_str(),
+                        "trace"
+                            | "debug"
+                            | "info"
+                            | "warn"
+                            | "error"
+                            | "event"
+                            | "span"
+                            | "trace_span"
+                            | "debug_span"
+                            | "info_span"
+                            | "warn_span"
+                            | "error_span"
+                            | "enabled"
+                    )
+                });
+                let direct_tracing_macro = segments.first().is_some_and(|name| name == "tracing");
+                let exact_funnel_call = self.inside_emit
+                    && segments.len() == 2
+                    && segments[0] == "tracing"
+                    && is_log_macro;
+                if (direct_tracing_macro || is_trace_macro || self.inside_trace_impl)
+                    && !exact_funnel_call
+                {
+                    self.violations
+                        .push("trace macro bypasses AcpTraceEvent::emit".to_string());
+                }
+                syn::visit::visit_macro(self, node);
+            }
+        }
+
+        let syntax = syn::parse_file(source).unwrap();
+        let mut visitor = Visitor {
+            allow_typed_funnel,
+            module_depth: 0,
+            inside_trace_impl: false,
+            inside_emit: false,
+            violations: Vec::new(),
+        };
+        visitor.visit_file(&syntax);
+        visitor.violations
+    }
+
+    #[test]
+    fn trace_source_guard_rejects_direct_calls_outside_typed_funnel() {
+        let source = include_str!("acp_backend.rs");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                let file = std::fs::read_to_string(&path).unwrap();
+                let allow_typed_funnel = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == "acp_backend.rs");
+                violations.extend(
+                    trace_source_violations_with_funnel(&file, allow_typed_funnel)
+                        .into_iter()
+                        .map(|violation| format!("{}: {violation}", path.display())),
+                );
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "production trace calls bypassed the typed funnel: {violations:?}"
+        );
+        assert!(
+            !trace_source_violations("fn leak(secret: &str) { tracing::warn!(%secret); }")
+                .is_empty()
+        );
+        assert!(!trace_source_violations(
+            "use tracing::warn; fn leak(secret: &str) { warn!(%secret); }"
+        )
+        .is_empty());
+        assert!(!trace_source_violations(
+            "use tracing as t; fn leak(secret: &str) { t::warn!(%secret); }"
+        )
+        .is_empty());
+        assert!(!trace_source_violations(
+            "enum AcpTraceEvent { Safe } impl AcpTraceEvent { fn helper(self) { tracing::warn!(\"leak\"); } }"
+        )
+        .is_empty());
+        assert!(!trace_source_violations(
+            "enum AcpTraceEvent { Safe } impl AcpTraceEvent { fn emit(self) { leak!(self); } }"
+        )
+        .is_empty());
+        assert!(!trace_source_violations(
+            "fn leak(secret: &str) { tracing::Span::current().record(\"secret\", secret); }"
+        )
+        .is_empty());
+        assert!(!trace_source_violations(
+            "trait Leak { fn emit(self, secret: &str); } enum AcpTraceEvent { Safe } \
+             impl Leak for AcpTraceEvent { fn emit(self, secret: &str) { tracing::warn!(%secret); } }"
+        )
+        .is_empty());
+        assert!(!trace_source_violations(
+            "#[tracing::instrument] fn leak(secret: &str) { let _ = secret; }"
+        )
+        .is_empty());
+        assert!(!trace_source_violations(
+            "macro_rules! leak { ($secret:expr) => { tracing::warn!(%$secret); } } \
+             fn expose(secret: &str) { leak!(secret); }"
+        )
+        .is_empty());
+        assert!(!trace_source_violations(
+            "mod nested { enum AcpTraceEvent { Leak(String) } \
+             impl AcpTraceEvent { fn emit(self) { tracing::warn!(\"leak\"); } } }"
+        )
+        .is_empty());
+        assert!(
+            !trace_source_violations_with_funnel(
+                "enum AcpTraceEvent { Leak } \
+                 impl AcpTraceEvent { fn emit(self) { tracing::warn!(\"sibling leak\"); } }",
+                false,
+            )
+            .is_empty(),
+            "a root-level lookalike in a sibling source file must not become the trusted funnel"
+        );
+        assert!(!trace_source_violations(
+            "extern crate tracing as telemetry; \
+             macro_rules! leak { () => { telemetry::warn!(\"leak\"); } } fn expose() { leak!(); }"
+        )
+        .is_empty());
+        assert!(trace_source_violations(
+            "#[cfg(test)] mod tests { fn capture() { tracing::subscriber::with_default((), || {}); } }"
+        )
+        .is_empty());
+
+        let syntax = syn::parse_file(source).unwrap();
+        let event = syntax
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Enum(item) if item.ident == "AcpTraceEvent" => Some(item),
+                _ => None,
+            })
+            .expect("typed trace event enum");
+        for field in event.variants.iter().flat_map(|variant| &variant.fields) {
+            let syn::Type::Path(path) = &field.ty else {
+                panic!("trace funnel accepts a non-scalar field");
+            };
+            let name = path.path.segments.last().unwrap().ident.to_string();
+            assert!(
+                matches!(name.as_str(), "bool" | "u16" | "i64"),
+                "trace funnel must not accept opaque runtime data: {name}"
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct TraceCapture(Arc<StdMutex<Vec<u8>>>);
+
+    struct TraceWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceCapture {
+        type Writer = TraceWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            TraceWriter(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn typed_trace_funnel_emits_metadata_without_opaque_secret_text() {
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+            .with_writer(TraceCapture(bytes.clone()))
+            .finish();
+        let known_secret = "sk-known-secret-must-not-appear";
+        tracing::subscriber::with_default(subscriber, || {
+            for event in [
+                AcpTraceEvent::ModelOptionsMissing,
+                AcpTraceEvent::EffortBelowMinimum {
+                    advertised_count: AcpTraceEvent::bounded_count(known_secret.len()),
+                },
+                AcpTraceEvent::EffortOptionMissing,
+                AcpTraceEvent::ConfigResolved {
+                    effort_applied: true,
+                    fell_back: false,
+                },
+                AcpTraceEvent::EffortFallback,
+                AcpTraceEvent::EffortRequestRejected { rpc_code: -32603 },
+                AcpTraceEvent::EffortWalkdownExhausted { rpc_code: -32602 },
+                AcpTraceEvent::EffortWalkdownRetry { rpc_code: -32601 },
+                AcpTraceEvent::InitializeFailed,
+                AcpTraceEvent::AuthMethodMismatch {
+                    advertised_count: AcpTraceEvent::bounded_count(known_secret.len()),
+                },
+                AcpTraceEvent::PreAuthenticated {
+                    advertised_count: AcpTraceEvent::bounded_count(known_secret.len()),
+                },
+                AcpTraceEvent::SessionCreateFailed,
+                AcpTraceEvent::DiscoverySessionCreateFailed,
+                AcpTraceEvent::PromptFailed,
+                AcpTraceEvent::WarmConfigNotAdvertised,
+                AcpTraceEvent::WarmConfigRejected,
+            ] {
+                event.emit();
+            }
+        });
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("acp.prompt_failed"));
+        assert!(!output.contains(known_secret));
+        assert!(!output.contains("sk-known-secret"));
+    }
+
+    struct RejectOnRecord {
+        count: AtomicU64,
+        reject_at: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for RejectOnRecord {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            let current = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+            if current == self.reject_at {
+                Err(BridgeError::StoreFailure)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct BlockOnRecord {
+        count: AtomicU64,
+        block_at: u64,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for BlockOnRecord {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            let current = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+            if current == self.block_at {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn bump_activity_advances_last_activity() {
         let w = TurnWatch {
@@ -2794,6 +4894,221 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 >= 1
         );
+    }
+
+    #[test]
+    fn dispatch_install_and_fence_close_share_one_atomic_gate() {
+        let dispatch_gate = Arc::new(StdMutex::new(()));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicBool::new(false));
+        let install_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_install = Arc::new(std::sync::Barrier::new(2));
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+        let install_thread = {
+            let dispatch_gate = Arc::clone(&dispatch_gate);
+            let unavailable = Arc::clone(&unavailable);
+            let accepted = Arc::clone(&accepted);
+            let install_entered = Arc::clone(&install_entered);
+            let release_install = Arc::clone(&release_install);
+            std::thread::spawn(move || {
+                let installed = AcpBackend::install_prompt_request(
+                    &dispatch_gate,
+                    &unavailable,
+                    &accepted,
+                    || {
+                        install_entered.wait();
+                        release_install.wait();
+                        "installed"
+                    },
+                );
+                installed_tx.send(installed).unwrap();
+            })
+        };
+        install_entered.wait();
+        assert!(
+            dispatch_gate.try_lock().is_err(),
+            "request installation must hold the connection-wide gate"
+        );
+        assert!(
+            !accepted.load(Ordering::SeqCst),
+            "a published route must remain pre-acceptance while installation is incomplete"
+        );
+
+        let close_started = Arc::new(std::sync::Barrier::new(2));
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let close_thread = {
+            let dispatch_gate = Arc::clone(&dispatch_gate);
+            let unavailable = Arc::clone(&unavailable);
+            let close_started = Arc::clone(&close_started);
+            std::thread::spawn(move || {
+                close_started.wait();
+                AcpBackend::close_connection_fence(&dispatch_gate, &unavailable);
+                closed_tx.send(()).unwrap();
+            })
+        };
+        close_started.wait();
+        assert!(
+            closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "fence close must wait until request installation leaves the same gate"
+        );
+
+        release_install.wait();
+        assert_eq!(installed_rx.recv().unwrap(), Some("installed"));
+        assert!(
+            accepted.load(Ordering::SeqCst),
+            "installation must cross the accepted-work barrier before releasing the gate"
+        );
+        closed_rx.recv().unwrap();
+        install_thread.join().unwrap();
+        close_thread.join().unwrap();
+        assert!(unavailable.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancel_delivery_fence_orders_acceptance_sample() {
+        let dispatch_gate = Arc::new(StdMutex::new(()));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicBool::new(false));
+        let install_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_install = Arc::new(std::sync::Barrier::new(2));
+        let install_thread = {
+            let dispatch_gate = Arc::clone(&dispatch_gate);
+            let unavailable = Arc::clone(&unavailable);
+            let accepted = Arc::clone(&accepted);
+            let install_entered = Arc::clone(&install_entered);
+            let release_install = Arc::clone(&release_install);
+            std::thread::spawn(move || {
+                AcpBackend::install_prompt_request(&dispatch_gate, &unavailable, &accepted, || {
+                    install_entered.wait();
+                    release_install.wait();
+                    "installed"
+                })
+            })
+        };
+        install_entered.wait();
+        let (failure_tx, failure_rx) = std::sync::mpsc::channel();
+        let failure_thread = {
+            let dispatch_gate = Arc::clone(&dispatch_gate);
+            let unavailable = Arc::clone(&unavailable);
+            let accepted = Arc::clone(&accepted);
+            std::thread::spawn(move || {
+                let failure = AcpBackend::send_cancel_under_dispatch_fence(
+                    &dispatch_gate,
+                    &unavailable,
+                    || Some(accepted),
+                    || Err::<(), _>("closed"),
+                )
+                .unwrap_err();
+                failure_tx.send(failure).unwrap();
+            })
+        };
+        assert!(
+            failure_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "cancel failure must wait for in-gate request installation"
+        );
+        release_install.wait();
+        assert_eq!(install_thread.join().unwrap(), Some("installed"));
+        let failure = failure_rx.recv().unwrap();
+        failure_thread.join().unwrap();
+        assert!(failure.prompt_may_have_been_accepted);
+        assert!(unavailable.load(Ordering::SeqCst));
+
+        let pre_gate = Arc::new(StdMutex::new(()));
+        let pre_unavailable = Arc::new(AtomicBool::new(false));
+        let pre_accepted = Arc::new(AtomicBool::new(false));
+        let send_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_send = Arc::new(std::sync::Barrier::new(2));
+        let (pre_failure_tx, pre_failure_rx) = std::sync::mpsc::channel();
+        let pre_failure_thread = {
+            let pre_gate = Arc::clone(&pre_gate);
+            let pre_unavailable = Arc::clone(&pre_unavailable);
+            let send_entered = Arc::clone(&send_entered);
+            let release_send = Arc::clone(&release_send);
+            std::thread::spawn(move || {
+                let failure = AcpBackend::send_cancel_under_dispatch_fence(
+                    &pre_gate,
+                    &pre_unavailable,
+                    || None,
+                    || {
+                        send_entered.wait();
+                        release_send.wait();
+                        Err::<(), _>("closed")
+                    },
+                )
+                .unwrap_err();
+                pre_failure_tx.send(failure).unwrap();
+            })
+        };
+        send_entered.wait();
+        let (pre_install_tx, pre_install_rx) = std::sync::mpsc::channel();
+        let pre_install_thread = {
+            let pre_gate = Arc::clone(&pre_gate);
+            let pre_unavailable = Arc::clone(&pre_unavailable);
+            let pre_accepted = Arc::clone(&pre_accepted);
+            std::thread::spawn(move || {
+                let installed = AcpBackend::install_prompt_request(
+                    &pre_gate,
+                    &pre_unavailable,
+                    &pre_accepted,
+                    || "must not install",
+                );
+                pre_install_tx.send(installed).unwrap();
+            })
+        };
+        assert!(
+            pre_install_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "prompt installation must wait while cancel delivery owns the dispatch gate"
+        );
+        release_send.wait();
+        let failure = pre_failure_rx.recv().unwrap();
+        assert!(!failure.prompt_may_have_been_accepted);
+        assert_eq!(pre_install_rx.recv().unwrap(), None);
+        pre_failure_thread.join().unwrap();
+        pre_install_thread.join().unwrap();
+        assert!(pre_unavailable.load(Ordering::SeqCst));
+        assert!(!pre_accepted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn turn_acceptance_is_operation_scoped_and_distinct_from_route_liveness() {
+        let entry = AgentSession::new();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicBool::new(true));
+        let guard =
+            TurnAcceptanceGuard::install(Arc::clone(&entry.turn_accepted), Arc::clone(&accepted));
+
+        assert!(active.load(Ordering::SeqCst));
+        assert!(!AcpBackend::turn_prompt_accepted(&entry));
+        accepted.store(true, Ordering::SeqCst);
+        active.store(false, Ordering::SeqCst);
+        assert!(
+            AcpBackend::turn_prompt_accepted(&entry),
+            "acceptance evidence must survive after active routing ends"
+        );
+        drop(guard);
+        assert!(
+            AcpBackend::turn_prompt_accepted_handle(&entry).is_none(),
+            "operation-scoped acceptance must clear when the turn owner exits"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_settle_prefers_ready_sdk_result_over_ready_local_bounds() {
+        // All three arms are ready on the first poll. Without `biased` prompt
+        // priority, repeated selection eventually chooses kill/grace and loses
+        // the deeper SDK cause.
+        for _ in 0..64 {
+            let prompt = std::future::ready(Err::<(), _>("deep-sdk-cause"));
+            tokio::pin!(prompt);
+            let kill = Notify::new();
+            kill.notify_one();
+            match settle_prompt_after_cancel(prompt.as_mut(), &kill, Duration::ZERO).await {
+                CancelSettle::Prompt(Err(cause)) => assert_eq!(cause, "deep-sdk-cause"),
+                _ => panic!("a ready SDK terminal must win same-poll local bounds"),
+            }
+        }
     }
 
     /// Spawn an in-process fake ACP agent on `channel` that answers `initialize`
@@ -3127,11 +5442,15 @@ mod tests {
         let (client_side, agent_side) = Channel::duplex();
         drop(agent_side);
         match AcpBackend::connect(client_side, test_config()).await {
-            Err(e) => assert!(
-                matches!(e, BridgeError::AgentCrashed { .. }),
-                "expected AgentCrashed, got {e:?}"
-            ),
-            Ok(_) => panic!("expected AgentCrashed when the agent never answers initialize"),
+            Err(error) => {
+                assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::Initialize,
+                    DiagnosticFailureClass::Transport,
+                    false,
+                );
+            }
+            Ok(_) => panic!("expected a failure when the agent never answers initialize"),
         }
     }
 
@@ -3153,12 +5472,230 @@ mod tests {
         .expect("connect must return within the handshake bound, not hang");
 
         match outcome {
-            Err(e) => assert!(
-                matches!(e, BridgeError::AgentCrashed { .. }),
-                "hung initialize handshake must surface a clear error, got {e:?}"
-            ),
+            Err(error) => {
+                assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::Initialize,
+                    DiagnosticFailureClass::Timeout,
+                    false,
+                );
+            }
             Ok(_) => panic!("expected an error when the agent never answers initialize"),
         }
+    }
+
+    #[tokio::test]
+    async fn observed_initialize_timeout_fails_initialize_before_authenticate() {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_hung_agent(agent_side);
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+
+        let error = match AcpBackend::connect_observed(
+            client_side,
+            test_config_short_handshake(),
+            observer.clone(),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("hung initialize must fail"),
+        };
+        let BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("observed initialize timeout must be structured, got {error:?}");
+        };
+        assert_eq!(diagnostic.failed_phase(), DiagnosticPhase::Initialize);
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Timeout);
+        assert_eq!(
+            diagnostic.disposition(),
+            FailureDisposition::RetrySameTarget
+        );
+        assert!(!diagnostic.prompt_may_have_been_accepted());
+
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().phase(), DiagnosticPhase::Initialize);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().phase(), DiagnosticPhase::Initialize);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+        assert!(events
+            .iter()
+            .all(|event| event.transition().phase() != DiagnosticPhase::Authenticate));
+    }
+
+    #[tokio::test]
+    async fn observed_spawn_failure_is_agent_process_and_never_initializes() {
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let error = match AcpBackend::spawn_observed(
+            "/definitely/not/an/a2a-bridge-agent",
+            &[],
+            test_config(),
+            observer.clone(),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("missing executable must fail spawn"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Spawn,
+            DiagnosticFailureClass::AgentProcess,
+            false,
+        );
+        assert_eq!(
+            diagnostic.disposition(),
+            FailureDisposition::RetrySameTarget
+        );
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+        assert!(events
+            .iter()
+            .all(|event| event.transition().phase() == DiagnosticPhase::Spawn));
+    }
+
+    #[tokio::test]
+    async fn connected_backend_does_not_retain_initialization_observer() {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_fake_agent(
+            agent_side,
+            InitializeResponse::new(ProtocolVersion::V1)
+                .agent_capabilities(AgentCapabilities::default()),
+        );
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let observer_dyn: Arc<dyn DiagnosticObserver> = observer.clone();
+        let weak = Arc::downgrade(&observer_dyn);
+        let backend = AcpBackend::connect_observed(client_side, test_config(), observer_dyn)
+            .await
+            .unwrap();
+        drop(observer);
+        assert!(
+            weak.upgrade().is_none(),
+            "cached backend must not retain its initialization observer"
+        );
+        drop(backend);
+    }
+
+    #[tokio::test]
+    async fn from_child_installs_configured_stderr_redactor_on_adopted_process() {
+        const SECRET: &str = "from-child-known-secret";
+        let process = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"echo from-child-known-secret 1>&2; IFS= read -r request; \
+                   id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([^,}]*\).*/\1/p'); \
+                   printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}}\n' "$id"; \
+                   echo from-child-known-secret 1>&2; sleep 30"#,
+            ],
+            None,
+        )
+        .unwrap();
+        let ring = process.stderr_ring();
+        for _ in 0..100 {
+            if ring.metadata_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            ring.metadata_since(ring.origin()).line_count(),
+            1,
+            "the first stderr line must predate adoption"
+        );
+
+        let backend = tokio::time::timeout(
+            Duration::from_secs(2),
+            AcpBackend::from_child(
+                process,
+                AcpConfig {
+                    diagnostic_redactor: DiagnosticRedactor::new([SECRET]),
+                    ..test_config()
+                },
+            ),
+        )
+        .await
+        .expect("scripted child must answer initialize")
+        .expect("from_child must adopt a conformant process");
+        let adopted_ring = backend.stderr_ring.as_ref().expect("adopted stderr ring");
+        for _ in 0..100 {
+            if adopted_ring
+                .metadata_since(adopted_ring.origin())
+                .line_count()
+                == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let debug = format!("{adopted_ring:?}");
+        assert!(
+            debug.contains("known_value_count: 1"),
+            "from_child must install the configured policy on the actual adopted ring: {debug}"
+        );
+        assert!(!debug.contains(SECRET), "safe Debug must not reveal values");
+        assert_eq!(
+            adopted_ring
+                .metadata_since(adopted_ring.origin())
+                .line_count(),
+            2,
+            "the same adopted ring must drain stderr before and after initialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_child_initialize_failure_preserves_bounded_stderr_metadata() {
+        const SECRET: &str = "from-child-initialize-secret";
+        let process = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                r#"echo from-child-initialize-secret 1>&2; IFS= read -r request; \
+                   id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([^,}]*\).*/\1/p'); \
+                   printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"initialize rejected"}}\n' "$id"; \
+                   sleep 30"#,
+            ],
+            None,
+        )
+        .unwrap();
+        let ring = process.stderr_ring();
+        for _ in 0..100 {
+            if ring.metadata_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(ring.metadata_since(ring.origin()).line_count(), 1);
+
+        let error = match tokio::time::timeout(
+            Duration::from_secs(2),
+            AcpBackend::from_child(
+                process,
+                AcpConfig {
+                    diagnostic_redactor: DiagnosticRedactor::new([SECRET]),
+                    ..test_config()
+                },
+            ),
+        )
+        .await
+        .expect("scripted child must reject initialize promptly")
+        {
+            Err(error) => error,
+            Ok(_) => panic!("rejected initialize must fail from_child"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Initialize,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        let json = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(json["stderr_observed"], true);
+        assert_eq!(json["stderr_line_count"], 1);
+        assert_eq!(json["stderr_scope"], "process");
+        assert!(json.get("stderr_tail").is_none());
+        assert!(!serde_json::to_string(&json).unwrap().contains(SECRET));
     }
 
     // B1: `spawn` must HOLD the Supervised child for the backend's lifetime.
@@ -3190,8 +5727,11 @@ mod tests {
         let backend = AcpBackend {
             conn: None,
             supervised: Arc::new(StdMutex::new(Some(supervised))),
+            stderr_ring: None,
             config: None,
             reaped: Arc::new(AtomicBool::new(false)),
+            unavailable: Arc::new(AtomicBool::new(false)),
+            dispatch_gate: Arc::new(StdMutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
@@ -3200,6 +5740,10 @@ mod tests {
             )),
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
+            prompt_snapshot_hook: StdMutex::new(None),
+            before_process_redactor_hook: StdMutex::new(None),
+            fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
+            fail_cancel_send: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(
@@ -3389,7 +5933,7 @@ mod tests {
         /// Auth-method ids observed via `authenticate` requests (in order).
         authenticates: Arc<Mutex<Vec<String>>>,
         /// When set, the `authenticate` handler REJECTS with a JSON-RPC error
-        /// (modeling an auth failure). The backend surfaces `AgentNotAuthenticated`.
+        /// (modeling an auth failure). The backend surfaces a structured authentication failure.
         reject_authenticate: Arc<AtomicBool>,
         /// Auth methods the fake agent advertises in its `initialize` response.
         auth_methods: Arc<Mutex<Vec<AuthMethod>>>,
@@ -4228,8 +6772,76 @@ mod tests {
             .expect("initialize handshake succeeds against recording agent")
     }
 
+    async fn connect_recording_observed_with(
+        rec: Recorder,
+        config: AcpConfig,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<AcpBackend, BridgeError> {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_recording_agent(agent_side, rec);
+        AcpBackend::connect_observed(client_side, config, observer).await
+    }
+
+    fn spawn_session_rejecting_agent(
+        channel: Channel,
+        message: &'static str,
+    ) -> Arc<Mutex<Option<PathBuf>>> {
+        let recorded_cwd = Arc::new(Mutex::new(None));
+        let recorded_cwd_for_agent = Arc::clone(&recorded_cwd);
+        tokio::spawn(async move {
+            let _ = Agent
+                .builder()
+                .name("session-rejecting-agent")
+                .on_receive_request(
+                    move |_req: InitializeRequest,
+                          responder: agent_client_protocol::Responder<InitializeResponse>,
+                          _cx| async move {
+                        responder.respond(
+                            InitializeResponse::new(ProtocolVersion::V1)
+                                .agent_capabilities(AgentCapabilities::default()),
+                        )?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    move |req: NewSessionRequest,
+                          responder: agent_client_protocol::Responder<
+                        agent_client_protocol::schema::v1::NewSessionResponse,
+                    >,
+                          _cx| {
+                        let recorded_cwd = Arc::clone(&recorded_cwd_for_agent);
+                        async move {
+                            *recorded_cwd.lock().await = Some(req.cwd);
+                            responder.respond_with_internal_error(message)?;
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(channel)
+                .await;
+        });
+        recorded_cwd
+    }
+
     fn bkey(s: &str) -> SessionId {
         SessionId::parse(s).unwrap()
+    }
+
+    fn assert_agent_failure(
+        error: &BridgeError,
+        phase: DiagnosticPhase,
+        class: DiagnosticFailureClass,
+        accepted: bool,
+    ) -> &FailureDiagnostic {
+        let BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("expected structured agent failure, got {error:?}");
+        };
+        assert_eq!(diagnostic.failed_phase(), phase);
+        assert_eq!(diagnostic.class(), class);
+        assert_eq!(diagnostic.prompt_may_have_been_accepted(), accepted);
+        diagnostic
     }
 
     fn turn_meta(ctx: &str, generation: u64, op: &str) -> bridge_core::permission::TurnMeta {
@@ -4238,6 +6850,1483 @@ mod tests {
             generation,
             op: bridge_core::ids::OperationId::parse(op).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn observed_auth_paths_round_trip_typed_evidence() {
+        let cases = [
+            ("pre_authenticated", true, Some("chat-gpt"), None),
+            ("configured_method", false, Some("oauth"), Some("oauth")),
+            ("selected_advertised_method", false, Some("oauth"), None),
+            ("no_methods_advertised", false, None, None),
+        ];
+
+        for (expected_kind, pre_authenticated, advertised, configured) in cases {
+            let rec = Recorder::new("agent-sess-AUTH-EVIDENCE");
+            if let Some(method) = advertised {
+                rec.advertise_auth_method(method).await;
+            }
+            let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+            let config = AcpConfig {
+                pre_authenticated,
+                auth_method: configured.map(str::to_owned),
+                ..test_config()
+            };
+            let backend = connect_recording_observed_with(rec, config, observer.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{expected_kind} connect failed: {error:?}"));
+            drop(backend);
+
+            let auth_terminal = observer
+                .snapshot()
+                .await
+                .into_iter()
+                .find(|event| {
+                    event.transition().phase() == DiagnosticPhase::Authenticate
+                        && event.transition().status() != PhaseStatus::Started
+                })
+                .expect("authenticate terminal transition");
+            let json = serde_json::to_value(&auth_terminal).unwrap();
+            assert_eq!(json["transition"]["auth"]["kind"], expected_kind);
+            let round_trip: bridge_core::diagnostics::DiagnosticEvent =
+                serde_json::from_value(json).unwrap();
+            assert_eq!(round_trip, auth_terminal);
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_session_creation_failure_stays_in_session_phase() {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_session_rejecting_agent(agent_side, "session creation rejected");
+        let backend = AcpBackend::connect(client_side, test_config())
+            .await
+            .unwrap();
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let error = match backend
+            .prompt_with_observers(
+                &bkey("bridge-SESSION-REJECT"),
+                vec![],
+                BackendObservers::diagnostic_only(observer.clone()),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("rejected session/new must fail before prompt"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::SessionCreate,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        assert!(diagnostic
+            .causes()
+            .last()
+            .is_some_and(|cause| cause.contains("session creation rejected")));
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+        assert!(events
+            .iter()
+            .all(|event| event.transition().phase() == DiagnosticPhase::SessionCreate));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_failure_redacts_bridge_known_credential_from_sdk_cause() {
+        const SECRET: &str = "bridge-known-lifecycle-credential";
+        const ERROR: &str = "session creation rejected with bridge-known-lifecycle-credential";
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_session_rejecting_agent(agent_side, ERROR);
+        let config = AcpConfig {
+            diagnostic_redactor: DiagnosticRedactor::new([SECRET]),
+            ..test_config()
+        };
+        let backend = AcpBackend::connect(client_side, config).await.unwrap();
+        let error = match backend.prompt(&bkey("bridge-SESSION-REDACT"), vec![]).await {
+            Err(error) => error,
+            Ok(_) => panic!("rejected session/new must fail"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::SessionCreate,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        let rendered = serde_json::to_string(diagnostic).unwrap();
+        assert!(!rendered.contains(SECRET));
+        assert!(rendered.contains("REDACTED KNOWN SECRET"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_failure_redacts_mcp_secret_expanded_with_session_cwd() {
+        const TEMPLATE: &str = "alpha{cwd}omega";
+        const EFFECTIVE: &str = "alpha/srv/requestomega";
+        const ERROR: &str = "session creation rejected with alpha/srv/requestomega";
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_session_rejecting_agent(agent_side, ERROR);
+        let config = AcpConfig {
+            mcp: vec![bridge_core::mcp::McpServerSpec {
+                name: "secret-server".to_owned(),
+                command: "secret-server".to_owned(),
+                args: Vec::new(),
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+            }],
+            diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
+            ..test_config()
+        };
+        let backend = AcpBackend::connect(client_side, config).await.unwrap();
+        let session = bkey("bridge-SESSION-CWD-REDACT");
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/request").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = match backend.prompt(&session, vec![]).await {
+            Err(error) => error,
+            Ok(_) => panic!("rejected session/new must fail"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::SessionCreate,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        let rendered = serde_json::to_string(diagnostic).unwrap();
+        assert!(!rendered.contains(EFFECTIVE));
+        assert!(rendered.contains("REDACTED KNOWN SECRET"));
+    }
+
+    #[tokio::test]
+    async fn mint_inputs_and_redactor_share_one_session_config_snapshot() {
+        const TEMPLATE: &str = "alpha{cwd}omega";
+        const EFFECTIVE_A: &str = "alpha/srv/aomega";
+        const ERROR_A: &str = "session creation rejected with alpha/srv/aomega";
+        let (client_side, agent_side) = Channel::duplex();
+        let recorded_cwd = spawn_session_rejecting_agent(agent_side, ERROR_A);
+        let config = AcpConfig {
+            mcp: vec![bridge_core::mcp::McpServerSpec {
+                name: "secret-server".to_owned(),
+                command: "secret-server".to_owned(),
+                args: Vec::new(),
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+            }],
+            diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
+            ..test_config()
+        };
+        let backend = AcpBackend::connect(client_side, config).await.unwrap();
+        let session = bkey("bridge-SESSION-SNAPSHOT-REDACT");
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/a").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = backend.session_config_snapshot(&session).unwrap();
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/b").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let error = backend
+            .ensure_session_observed_with_snapshot(&session, observer, snapshot)
+            .await
+            .expect_err("the fake agent rejects session/new");
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::SessionCreate,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        assert_eq!(
+            recorded_cwd.lock().await.as_deref(),
+            Some(std::path::Path::new("/srv/a"))
+        );
+        let rendered = serde_json::to_string(diagnostic).unwrap();
+        assert!(!rendered.contains(EFFECTIVE_A));
+        assert!(rendered.contains("REDACTED KNOWN SECRET"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_inner_keeps_snapshot_atomic_across_config_replacement() {
+        const TEMPLATE: &str = "alpha{cwd}omega";
+        const EFFECTIVE_A: &str = "alpha/srv/prompt-aomega";
+        const ERROR_A: &str = "session creation rejected with alpha/srv/prompt-aomega";
+        let (client_side, agent_side) = Channel::duplex();
+        let recorded_cwd = spawn_session_rejecting_agent(agent_side, ERROR_A);
+        let config = AcpConfig {
+            mcp: vec![bridge_core::mcp::McpServerSpec {
+                name: "secret-server".to_owned(),
+                command: "secret-server".to_owned(),
+                args: Vec::new(),
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+            }],
+            diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
+            ..test_config()
+        };
+        let backend = AcpBackend::connect(client_side, config).await.unwrap();
+        let session = bkey("bridge-PROMPT-SNAPSHOT-REDACT");
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/prompt-a").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_snapshot = Arc::new(std::sync::Barrier::new(2));
+        *backend.prompt_snapshot_hook.lock().unwrap() = Some(Arc::new({
+            let snapshot_entered = Arc::clone(&snapshot_entered);
+            let release_snapshot = Arc::clone(&release_snapshot);
+            move || {
+                snapshot_entered.wait();
+                release_snapshot.wait();
+            }
+        }));
+        let backend = Arc::new(backend);
+        let backend_for_prompt = Arc::clone(&backend);
+        let session_for_prompt = session.clone();
+        let prompt =
+            tokio::spawn(
+                async move { backend_for_prompt.prompt(&session_for_prompt, vec![]).await },
+            );
+        snapshot_entered.wait();
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/prompt-b").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        release_snapshot.wait();
+
+        let error = match prompt.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("the fake agent rejects session/new"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::SessionCreate,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        assert_eq!(
+            recorded_cwd.lock().await.as_deref(),
+            Some(std::path::Path::new("/srv/prompt-a"))
+        );
+        let rendered = serde_json::to_string(diagnostic).unwrap();
+        assert!(!rendered.contains(EFFECTIVE_A));
+        assert!(rendered.contains("REDACTED KNOWN SECRET"));
+    }
+
+    #[tokio::test]
+    async fn teardown_redactor_keeps_minted_cwd_after_config_replacement() {
+        const TEMPLATE: &str = "alpha{cwd}omega";
+        const MINTED_SECRET: &str = "alpha/srv/mintedomega";
+        let rec = Recorder::new("agent-sess-TEARDOWN-REDACT");
+        let config = AcpConfig {
+            mcp: vec![bridge_core::mcp::McpServerSpec {
+                name: "secret-server".to_owned(),
+                command: "secret-server".to_owned(),
+                args: Vec::new(),
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+            }],
+            diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
+            ..test_config()
+        };
+        let backend = connect_recording_with(rec, config).await;
+        let session = bkey("bridge-TEARDOWN-REDACT");
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/minted").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        backend.ensure_session(&session).await.unwrap();
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/replacement").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let lifecycle = backend.operation_lifecycle(&session, observer).await;
+        lifecycle
+            .record(
+                DiagnosticPhase::Teardown,
+                PhaseStatus::Started,
+                None,
+                Some("acp.teardown.test"),
+                None,
+            )
+            .await
+            .unwrap();
+        let error = lifecycle
+            .failure(
+                DiagnosticPhase::Teardown,
+                None,
+                DiagnosticFailureClass::Transport,
+                FailureDisposition::Fatal,
+                "acp.teardown.test_failure",
+                "ACP teardown test failure",
+                Some(format!("agent echoed {MINTED_SECRET}")),
+                false,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Teardown,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        let rendered = serde_json::to_string(diagnostic).unwrap();
+        assert!(!rendered.contains(MINTED_SECRET));
+        assert!(rendered.contains("REDACTED KNOWN SECRET"));
+    }
+
+    #[tokio::test]
+    async fn teardown_redactor_covers_active_attempt_after_config_replacement() {
+        const TEMPLATE: &str = "alpha{cwd}omega";
+        const ACTIVE_SECRET: &str = "alpha/srv/activeomega";
+        let rec = Recorder::new("agent-sess-ACTIVE-REDACT");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        let config = AcpConfig {
+            mcp: vec![bridge_core::mcp::McpServerSpec {
+                name: "secret-server".to_owned(),
+                command: "secret-server".to_owned(),
+                args: Vec::new(),
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+            }],
+            diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
+            ..test_config()
+        };
+        let backend = Arc::new(connect_recording_with(rec.clone(), config).await);
+        let session = bkey("bridge-ACTIVE-REDACT");
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/active").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        let backend_for_mint = Arc::clone(&backend);
+        let session_for_mint = session.clone();
+        let mint =
+            tokio::spawn(async move { backend_for_mint.ensure_session(&session_for_mint).await });
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("session/new must hold the active attempted cwd");
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/replacement").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let lifecycle = backend.operation_lifecycle(&session, observer).await;
+        lifecycle
+            .record(
+                DiagnosticPhase::Teardown,
+                PhaseStatus::Started,
+                None,
+                Some("acp.teardown.test"),
+                None,
+            )
+            .await
+            .unwrap();
+        let error = lifecycle
+            .failure(
+                DiagnosticPhase::Teardown,
+                None,
+                DiagnosticFailureClass::Transport,
+                FailureDisposition::Fatal,
+                "acp.teardown.test_failure",
+                "ACP teardown test failure",
+                Some(format!("agent echoed {ACTIVE_SECRET}")),
+                false,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Teardown,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        let rendered = serde_json::to_string(diagnostic).unwrap();
+        assert!(!rendered.contains(ACTIVE_SECRET));
+        rec.new_session_gate.notify_waiters();
+        mint.await.unwrap().unwrap();
+        let entry = backend.session_entry(&session).await;
+        assert!(entry.active_mint_cwd.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_mint_updates_process_redactor_before_request_and_preserves_live_cwds() {
+        const TEMPLATE: &str = "alpha{cwd}omega";
+        const FIRST_SECRET: &str = "alpha/srv/process-aomega";
+        const SECOND_SECRET: &str = "alpha/srv/process-bomega";
+        let rec = Recorder::new("agent-sess-PROCESS-REDACTOR");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        let config = AcpConfig {
+            mcp: vec![bridge_core::mcp::McpServerSpec {
+                name: "secret-server".to_owned(),
+                command: "secret-server".to_owned(),
+                args: Vec::new(),
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+            }],
+            diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
+            ..test_config()
+        };
+        let mut backend = connect_recording_with(rec.clone(), config).await;
+        let stderr_ring = ProcessStderrRing::default();
+        backend.stderr_ring = Some(stderr_ring.clone());
+        let backend = Arc::new(backend);
+
+        let first = bkey("bridge-PROCESS-REDACTOR-A");
+        backend
+            .configure_session(
+                &first,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/process-a").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        let backend_for_first = Arc::clone(&backend);
+        let first_for_mint = first.clone();
+        let first_mint =
+            tokio::spawn(async move { backend_for_first.ensure_session(&first_for_mint).await });
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("first session/new must observe its process redactor");
+        assert!(
+            format!("{stderr_ring:?}").contains("known_value_count: 2"),
+            "raw template plus first effective cwd must be installed before session/new"
+        );
+        assert!(
+            !backend
+                .diagnostic_redactor_for_cwds(&["/srv/process-a".to_owned()])
+                .sanitize_stderr_line(FIRST_SECRET, 1024)
+                .contains(FIRST_SECRET),
+            "the installed effective-cwd value must sanitize the exact delivered credential"
+        );
+        rec.new_session_gate.notify_waiters();
+        first_mint.await.unwrap().unwrap();
+
+        let second = bkey("bridge-PROCESS-REDACTOR-B");
+        backend
+            .configure_session(
+                &second,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/process-b").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        let backend_for_second = Arc::clone(&backend);
+        let second_for_mint = second.clone();
+        let second_mint =
+            tokio::spawn(async move { backend_for_second.ensure_session(&second_for_mint).await });
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("second session/new must observe the union redactor");
+        assert!(
+            format!("{stderr_ring:?}").contains("known_value_count: 3"),
+            "raw template plus both live effective cwd values must remain installed"
+        );
+        let union_redactor = backend.diagnostic_redactor_for_cwds(&[
+            "/srv/process-a".to_owned(),
+            "/srv/process-b".to_owned(),
+        ]);
+        assert!(
+            !union_redactor
+                .sanitize_stderr_line(FIRST_SECRET, 1024)
+                .contains(FIRST_SECRET),
+            "installing the second cwd must not drop the first live credential"
+        );
+        assert!(
+            !union_redactor
+                .sanitize_stderr_line(SECOND_SECRET, 1024)
+                .contains(SECOND_SECRET),
+            "the second effective-cwd credential must also be sanitized"
+        );
+        rec.new_session_gate.notify_waiters();
+        second_mint.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_while_process_redactor_lock_is_contended_clears_active_cwd() {
+        let rec = Recorder::new("agent-sess-PROCESS-REDACTOR-CANCEL");
+        let mut backend = connect_recording(rec.clone()).await;
+        backend.stderr_ring = Some(ProcessStderrRing::default());
+        let key = bkey("bridge-PROCESS-REDACTOR-CANCEL");
+        let entry = backend.session_entry(&key).await;
+
+        let before_redactor = Arc::new(std::sync::Barrier::new(2));
+        let release_redactor = Arc::new(std::sync::Barrier::new(2));
+        *backend.before_process_redactor_hook.lock().unwrap() = Some(Arc::new({
+            let before_redactor = Arc::clone(&before_redactor);
+            let release_redactor = Arc::clone(&release_redactor);
+            move || {
+                before_redactor.wait();
+                release_redactor.wait();
+            }
+        }));
+        let backend = Arc::new(backend);
+        let backend_for_mint = Arc::clone(&backend);
+        let key_for_mint = key.clone();
+        let mint =
+            tokio::spawn(async move { backend_for_mint.ensure_session(&key_for_mint).await });
+
+        before_redactor.wait();
+        let sessions_guard = backend.sessions.lock().await;
+        release_redactor.wait();
+        tokio::task::yield_now().await;
+        assert!(
+            entry.active_mint_cwd.lock().unwrap().is_some(),
+            "attempt cwd must be published while redactor installation waits"
+        );
+
+        mint.abort();
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), mint)
+            .await
+            .expect("cancelled pre-initializer future must stop promptly")
+            .expect_err("aborted pre-initializer future must not succeed");
+        assert!(cancelled.is_cancelled());
+        assert!(
+            entry.active_mint_cwd.lock().unwrap().is_none(),
+            "guard created at publication must clear cwd without acquiring the sessions lock"
+        );
+        drop(sessions_guard);
+        assert!(entry.agent_id.get().is_none());
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_credential_bearing_mint_makes_process_metadata_only_across_next_mint() {
+        const TEMPLATE: &str = "alpha{cwd}omega";
+        let rec = Recorder::new("agent-sess-PROCESS-METADATA-ONLY");
+        let config = AcpConfig {
+            mcp: vec![bridge_core::mcp::McpServerSpec {
+                name: "secret-server".to_owned(),
+                command: "secret-server".to_owned(),
+                args: Vec::new(),
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+            }],
+            diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
+            ..test_config()
+        };
+        let mut backend = connect_recording_with(rec.clone(), config).await;
+        let stderr_ring = ProcessStderrRing::default();
+        backend.stderr_ring = Some(stderr_ring.clone());
+
+        let failed = bkey("bridge-PROCESS-METADATA-FAILED");
+        backend
+            .configure_session(
+                &failed,
+                &SessionSpec {
+                    config: EffectiveConfig {
+                        model: Some("not-advertised".to_owned()),
+                        ..EffectiveConfig::default()
+                    },
+                    cwd: Some(SessionCwd::parse("/srv/failed-delivery").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .ensure_session(&failed)
+            .await
+            .expect_err("model rejection after session/new must fail the mint");
+        assert!(
+            stderr_ring.is_metadata_only(),
+            "an uncertain failed credential delivery must disable retained process text"
+        );
+
+        let next = bkey("bridge-PROCESS-METADATA-NEXT");
+        backend
+            .configure_session(
+                &next,
+                &SessionSpec {
+                    config: EffectiveConfig::default(),
+                    cwd: Some(SessionCwd::parse("/srv/next-delivery").unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        backend.ensure_session(&next).await.unwrap();
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            stderr_ring.is_metadata_only(),
+            "a later live-session redactor replacement must not re-enable process text"
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_minted_session_makes_process_stderr_metadata_only() {
+        let rec = Recorder::new("agent-sess-RELEASE-METADATA-ONLY");
+        let mut backend = connect_recording(rec).await;
+        let stderr_ring = ProcessStderrRing::default();
+        backend.stderr_ring = Some(stderr_ring.clone());
+        let session = bkey("bridge-RELEASE-METADATA-ONLY");
+        backend.ensure_session(&session).await.unwrap();
+        assert!(!stderr_ring.is_metadata_only());
+
+        backend.release_session_result(&session).await.unwrap();
+        assert!(
+            stderr_ring.is_metadata_only(),
+            "removing bridge ownership must fail closed against late session stderr"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_mint_attempt_cwd_is_cleared_before_retry() {
+        let (client_side, agent_side) = Channel::duplex();
+        let recorded_cwd = spawn_session_rejecting_agent(agent_side, "session creation rejected");
+        let backend = AcpBackend::connect(client_side, test_config())
+            .await
+            .unwrap();
+        let session = bkey("bridge-FAILED-MINT-CWD");
+        let entry = backend.session_entry(&session).await;
+        for cwd in ["/srv/failed-a", "/srv/failed-b"] {
+            backend
+                .configure_session(
+                    &session,
+                    &SessionSpec {
+                        config: EffectiveConfig::default(),
+                        cwd: Some(SessionCwd::parse(cwd).unwrap()),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(backend.ensure_session(&session).await.is_err());
+            assert!(
+                entry.active_mint_cwd.lock().unwrap().is_none(),
+                "a failed attempt must not retain its cwd"
+            );
+        }
+        assert_eq!(
+            recorded_cwd.lock().await.as_deref(),
+            Some(std::path::Path::new("/srv/failed-b"))
+        );
+    }
+
+    #[tokio::test]
+    async fn short_known_credential_cannot_collide_with_static_lifecycle_codes() {
+        let rec = Recorder::new("agent-sess-SHORT-CREDENTIAL");
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let backend = connect_recording_observed_with(
+            rec,
+            AcpConfig {
+                diagnostic_redactor: DiagnosticRedactor::new(["a"]),
+                ..test_config()
+            },
+            observer.clone(),
+        )
+        .await
+        .expect("a short known value must not invalidate bridge-owned static codes");
+
+        let auth_skip = observer
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|event| {
+                event.transition().phase() == DiagnosticPhase::Authenticate
+                    && event.transition().status() == PhaseStatus::Skipped
+            })
+            .expect("authenticate skip transition");
+        assert_eq!(
+            auth_skip.transition().code().map(|code| code.as_str()),
+            Some("acp.auth.no_methods_advertised")
+        );
+        drop(backend);
+    }
+
+    #[tokio::test]
+    async fn observed_model_rejection_fails_config_before_prompt() {
+        let rec = Recorder::new("agent-sess-MODEL-DIAG");
+        let config = AcpConfig {
+            agent_id: "recorder".to_string(),
+            model: Some("missing-model".to_string()),
+            ..test_config()
+        };
+        let backend = connect_recording_with(rec.clone(), config).await;
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(32).unwrap());
+        let error = match backend
+            .prompt_with_observers(
+                &bkey("bridge-MODEL-DIAG"),
+                vec![],
+                BackendObservers::diagnostic_only(observer.clone()),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unadvertised model must fail before a prompt stream exists"),
+        };
+        let BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("model rejection must be structured, got {error:?}");
+        };
+        assert_eq!(diagnostic.failed_phase(), DiagnosticPhase::ConfigApply);
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Model);
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        assert!(!diagnostic.prompt_may_have_been_accepted());
+        assert!(observer.snapshot().await.iter().all(|event| {
+            !matches!(
+                event.transition().phase(),
+                DiagnosticPhase::PromptStart
+                    | DiagnosticPhase::PromptStream
+                    | DiagnosticPhase::PromptFinish
+            )
+        }));
+        assert!(rec.prompt_log.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn observed_prompt_sdk_failure_is_post_barrier_fatal() {
+        let rec = Recorder::new("agent-sess-PROMPT-DIAG");
+        rec.fail_prompt.store(true, Ordering::SeqCst);
+        let backend = connect_recording(rec).await;
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(32).unwrap());
+        let mut stream = backend
+            .prompt_with_observers(
+                &bkey("bridge-PROMPT-DIAG"),
+                vec![],
+                BackendObservers::diagnostic_only(observer.clone()),
+            )
+            .await
+            .unwrap();
+        let error = match stream.next().await {
+            Some(Err(error)) => error,
+            other => panic!("prompt SDK failure must be terminal, got {other:?}"),
+        };
+        let BridgeError::AgentFailure { diagnostic } = &error else {
+            panic!("prompt SDK failure must be structured, got {error:?}");
+        };
+        assert_eq!(diagnostic.failed_phase(), DiagnosticPhase::PromptStream);
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Transport);
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        assert!(diagnostic.prompt_may_have_been_accepted());
+        assert!(diagnostic
+            .causes()
+            .last()
+            .is_some_and(|cause| cause.contains("agent failed the turn")));
+        assert!(
+            !error.is_transient(),
+            "E6 must not replay post-barrier work"
+        );
+
+        let events = observer.snapshot().await;
+        let stream_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.transition().phase() == DiagnosticPhase::PromptStream)
+            .collect();
+        assert_eq!(stream_events.len(), 2);
+        assert_eq!(stream_events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(stream_events[1].transition().status(), PhaseStatus::Failed);
+        assert!(events
+            .iter()
+            .all(|event| event.transition().phase() != DiagnosticPhase::PromptFinish));
+    }
+
+    #[tokio::test]
+    async fn prompt_failure_uses_attempt_cursor_and_persists_stderr_metadata_only() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let mut process = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "echo old-process-line 1>&2; echo READY; read _; echo new-unlabeled-secret 1>&2; sleep 30",
+            ],
+            None,
+        )
+        .unwrap();
+        let ring = process.stderr_ring();
+        let stdout = process.child_mut().stdout.take().unwrap();
+        let mut stdout = BufReader::new(stdout).lines();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("READY"));
+        for _ in 0..100 {
+            if ring.metadata_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let rec = Recorder::new("agent-sess-STDERR-DIAG");
+        rec.fail_prompt.store(true, Ordering::SeqCst);
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let mut backend = connect_recording(rec.clone()).await;
+        backend.stderr_ring = Some(ring.clone());
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(32).unwrap());
+        let mut stream = backend
+            .prompt_with_observers(
+                &bkey("bridge-STDERR-DIAG"),
+                vec![],
+                BackendObservers::diagnostic_only(observer),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("prompt reaches gated fake agent");
+
+        process
+            .child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"continue\n")
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if ring.metadata_since(ring.origin()).line_count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        rec.prompt_gate.notify_one();
+
+        let error = match stream.next().await {
+            Some(Err(error)) => error,
+            other => panic!("gated prompt must fail, got {other:?}"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStream,
+            DiagnosticFailureClass::Transport,
+            true,
+        );
+        let json = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(json["stderr_observed"], true);
+        assert_eq!(json["stderr_line_count"], 1, "old line excluded by cursor");
+        assert_eq!(json["stderr_scope"], "process");
+        assert!(
+            json.get("stderr_tail").is_none(),
+            "text is disabled by default"
+        );
+        let encoded = serde_json::to_string(&json).unwrap();
+        assert!(!encoded.contains("old-process-line"));
+        assert!(!encoded.contains("new-unlabeled-secret"));
+    }
+
+    #[tokio::test]
+    async fn pre_prompt_config_failure_includes_available_process_stderr_metadata() {
+        use tokio::io::AsyncWriteExt;
+
+        let mut process = Supervised::spawn(
+            "/bin/sh",
+            &["-c", "read _; echo preprompt-process-secret 1>&2; sleep 30"],
+            None,
+        )
+        .unwrap();
+        let ring = process.stderr_ring();
+
+        let rec = Recorder::new("agent-sess-PREPROMPT-STDERR");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        rec.reject_set_mode.store(true, Ordering::SeqCst);
+        let mut backend = connect_recording_with(
+            rec.clone(),
+            AcpConfig {
+                mode: Some("review".to_string()),
+                ..test_config()
+            },
+        )
+        .await;
+        backend.stderr_ring = Some(ring.clone());
+        let backend = Arc::new(backend);
+        let backend_for_prompt = Arc::clone(&backend);
+        let prompt = tokio::spawn(async move {
+            backend_for_prompt
+                .prompt(&bkey("bridge-PREPROMPT-STDERR"), vec![])
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("session/new must be in flight");
+
+        process
+            .child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"continue\n")
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if ring.metadata_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        rec.new_session_gate.notify_waiters();
+
+        let error = match prompt.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("rejected mode must fail before prompt dispatch"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::ConfigApply,
+            DiagnosticFailureClass::Model,
+            false,
+        );
+        let json = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(json["stderr_observed"], true);
+        assert_eq!(json["stderr_line_count"], 1);
+        assert_eq!(json["stderr_scope"], "process");
+        assert!(json.get("stderr_tail").is_none());
+        assert!(!serde_json::to_string(&json)
+            .unwrap()
+            .contains("preprompt-process-secret"));
+    }
+
+    #[tokio::test]
+    async fn observed_success_emits_complete_prompt_grammar_without_stderr() {
+        let rec = Recorder::new("agent-sess-PROMPT-OK-DIAG");
+        let backend = connect_recording(rec).await;
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(32).unwrap());
+        let mut stream = backend
+            .prompt_with_observers(
+                &bkey("bridge-PROMPT-OK-DIAG"),
+                vec![],
+                BackendObservers::diagnostic_only(observer.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+        ));
+        assert!(stream.next().await.is_none());
+
+        let events = observer.snapshot().await;
+        for phase in [
+            DiagnosticPhase::SessionCreate,
+            DiagnosticPhase::ConfigApply,
+            DiagnosticPhase::PromptStart,
+            DiagnosticPhase::PromptStream,
+            DiagnosticPhase::PromptFinish,
+        ] {
+            let statuses: Vec<_> = events
+                .iter()
+                .filter(|event| event.transition().phase() == phase)
+                .map(|event| event.transition().status())
+                .collect();
+            assert_eq!(statuses.len(), 2, "{phase:?} has one start and terminal");
+            assert_eq!(statuses[0], PhaseStatus::Started);
+            assert!(matches!(
+                statuses[1],
+                PhaseStatus::Completed | PhaseStatus::Skipped
+            ));
+            assert!(events
+                .iter()
+                .filter_map(|event| event.failure())
+                .all(|failure| failure.stderr_tail().is_none()));
+        }
+    }
+
+    #[tokio::test]
+    async fn synchronous_prompt_construction_failure_has_started_transition() {
+        let rec = Recorder::new("agent-sess-PROMPT-SYNC-FAIL");
+        let backend = connect_recording(rec).await;
+        let key = bkey("bridge-PROMPT-SYNC-FAIL");
+        backend.ensure_session(&key).await.unwrap();
+        let registry = Arc::clone(backend.updates().unwrap());
+        let _ = std::thread::spawn(move || {
+            let _guard = registry.lock().unwrap();
+            panic!("poison prompt routing registry for deterministic construction failure");
+        })
+        .join();
+
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let error = match backend
+            .prompt_with_observers(
+                &key,
+                vec![],
+                BackendObservers::diagnostic_only(observer.clone()),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("poisoned prompt registry must fail synchronously"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::Unknown,
+            false,
+        );
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        let prompt_events: Vec<_> = observer
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|event| event.transition().phase() == DiagnosticPhase::PromptStart)
+            .collect();
+        assert_eq!(prompt_events.len(), 2);
+        assert_eq!(prompt_events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(prompt_events[1].transition().status(), PhaseStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn synchronous_missing_connection_is_pre_dispatch_and_not_accepted() {
+        let backend = AcpBackend {
+            conn: None,
+            supervised: Arc::new(StdMutex::new(None)),
+            stderr_ring: None,
+            config: Some(test_config()),
+            reaped: Arc::new(AtomicBool::new(false)),
+            unavailable: Arc::new(AtomicBool::new(false)),
+            dispatch_gate: Arc::new(StdMutex::new(())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_cfg: Arc::new(StdMutex::new(HashMap::new())),
+            pending_turn_meta: StdMutex::new(HashMap::new()),
+            policy: Arc::new(StdMutex::new(
+                Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
+            )),
+            permission_registry: Arc::new(StdMutex::new(None)),
+            perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
+            prompt_snapshot_hook: StdMutex::new(None),
+            before_process_redactor_hook: StdMutex::new(None),
+            fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
+            fail_cancel_send: Arc::new(AtomicBool::new(false)),
+        };
+        let key = bkey("bridge-MISSING-CONNECTION");
+        backend
+            .session_entry(&key)
+            .await
+            .agent_id
+            .set(AgentSessionId::new("agent-sess-MISSING-CONNECTION"))
+            .expect("test pre-mints the session without a connection");
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+
+        let error = match backend
+            .prompt_with_observers(&key, vec![], BackendObservers::diagnostic_only(observer))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a missing connection must fail before SDK request installation"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        assert_eq!(
+            diagnostic.code().as_str(),
+            "acp.prompt_start.connection_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_prompt_does_not_retain_operation_observer() {
+        let rec = Recorder::new("agent-sess-PROMPT-WEAK");
+        let backend = connect_recording(rec).await;
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(32).unwrap());
+        let observer_dyn: Arc<dyn DiagnosticObserver> = observer.clone();
+        let weak = Arc::downgrade(&observer_dyn);
+        let mut stream = backend
+            .prompt_with_observers(
+                &bkey("bridge-PROMPT-WEAK"),
+                vec![],
+                BackendObservers::diagnostic_only(observer_dyn),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+        drop(stream);
+        drop(observer);
+        tokio::task::yield_now().await;
+        assert!(
+            weak.upgrade().is_none(),
+            "cached backend and completed stream must release the prompt observer"
+        );
+        drop(backend);
+    }
+
+    #[tokio::test]
+    async fn cancel_during_slow_completion_observer_does_not_kill_healthy_connection() {
+        let rec = Recorder::new("agent-sess-SLOW-COMPLETION");
+        let backend = connect_recording_with(
+            rec.clone(),
+            AcpConfig {
+                cancel_grace: Duration::from_millis(50),
+                ..test_config()
+            },
+        )
+        .await;
+        let key = bkey("bridge-SLOW-COMPLETION");
+        backend.ensure_session(&key).await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let observer = Arc::new(BlockOnRecord {
+            count: AtomicU64::new(0),
+            block_at: 8,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let mut stream = backend
+            .prompt_with_observers(&key, vec![], BackendObservers::diagnostic_only(observer))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("prompt must reach its completion transition");
+
+        let agent_id = backend
+            .session_entry(&key)
+            .await
+            .agent_id
+            .get()
+            .cloned()
+            .unwrap();
+        assert!(
+            backend
+                .updates()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get(&agent_id)
+                .is_none(),
+            "agent work is terminal before completion persistence blocks"
+        );
+        backend.cancel(&key).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !backend.unavailable.load(Ordering::SeqCst),
+            "a held diagnostics lock without a live prompt route must not kill the connection"
+        );
+
+        release.notify_one();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("completion observer release must finish the stream"),
+            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_failure_after_route_removal_keeps_operation_acceptance() {
+        let rec = Recorder::new("agent-sess-SLOW-COMPLETION-CANCEL-FAIL");
+        let backend = connect_recording(rec).await;
+        let key = bkey("bridge-SLOW-COMPLETION-CANCEL-FAIL");
+        backend.ensure_session(&key).await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let observer = Arc::new(BlockOnRecord {
+            count: AtomicU64::new(0),
+            block_at: 8,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let mut stream = backend
+            .prompt_with_observers(&key, vec![], BackendObservers::diagnostic_only(observer))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("prompt must remove routing before slow completion observation");
+
+        let entry = backend.session_entry(&key).await;
+        let agent_id = entry.agent_id.get().cloned().unwrap();
+        assert!(
+            backend
+                .updates()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get(&agent_id)
+                .is_none(),
+            "the SDK-terminal route must already be removed"
+        );
+        assert!(
+            AcpBackend::turn_prompt_accepted(&entry),
+            "operation acceptance must outlive routing through completion observation"
+        );
+
+        backend.fail_cancel_send.store(true, Ordering::SeqCst);
+        let cancel_observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let error = backend
+            .cancel_observed(&key, cancel_observer)
+            .await
+            .expect_err("injected cancel delivery failure must be structured");
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Teardown,
+            DiagnosticFailureClass::Transport,
+            true,
+        );
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        assert!(backend.unavailable.load(Ordering::SeqCst));
+
+        release.notify_one();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("completion observer release must finish the stream"),
+            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            AcpBackend::turn_prompt_accepted_handle(&entry).is_none(),
+            "turn owner must clear operation acceptance after completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_route_snapshot_cannot_escalate_after_turn_becomes_terminal() {
+        let rec = Recorder::new("agent-sess-CANCEL-ROUTE-RACE");
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let backend = connect_recording_with(
+            rec.clone(),
+            AcpConfig {
+                cancel_grace: Duration::from_millis(50),
+                ..test_config()
+            },
+        )
+        .await;
+        let key = bkey("bridge-CANCEL-ROUTE-RACE");
+        backend.ensure_session(&key).await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let observer = Arc::new(BlockOnRecord {
+            count: AtomicU64::new(0),
+            block_at: 8,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let mut stream = backend
+            .prompt_with_observers(&key, vec![], BackendObservers::diagnostic_only(observer))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("prompt route must be active before cancellation");
+
+        // Cancel snapshots the live route and arms its grace watcher. The agent
+        // then completes before grace, the driver marks the route terminal, and
+        // only completion persistence remains blocked under the turn lock.
+        backend.cancel(&key).await.unwrap();
+        rec.prompt_gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("terminal driver must reach slow completion persistence");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !backend.unavailable.load(Ordering::SeqCst),
+            "a cancel watcher that saw the old route must lose to terminal ownership"
+        );
+
+        release.notify_one();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("completion persistence release must finish the stream"),
+            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_fence_closing_during_prompt_start_persistence_prevents_dispatch() {
+        let rec = Recorder::new("agent-sess-FINAL-DISPATCH-FENCE");
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let key = bkey("bridge-FINAL-DISPATCH-FENCE");
+        backend.ensure_session(&key).await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let observer = Arc::new(BlockOnRecord {
+            count: AtomicU64::new(0),
+            // Four cached-session transitions precede PromptStart Started.
+            block_at: 5,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let backend_for_prompt = Arc::clone(&backend);
+        let key_for_prompt = key.clone();
+        let prompt = tokio::spawn(async move {
+            backend_for_prompt
+                .prompt_with_observers(
+                    &key_for_prompt,
+                    vec![],
+                    BackendObservers::diagnostic_only(observer),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("prompt must pass its early checks and pause before dispatch");
+
+        let container = backend
+            .config
+            .as_ref()
+            .and_then(|config| config.container.clone());
+        AcpBackend::escalate_terminate(
+            &backend.supervised,
+            &container,
+            &backend.reaped,
+            &backend.dispatch_gate,
+            &backend.unavailable,
+        );
+        release.notify_one();
+        let error = match tokio::time::timeout(Duration::from_secs(2), prompt)
+            .await
+            .expect("fenced prompt must settle")
+            .unwrap()
+        {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("a prompt paused before the final gate must not dispatch after fencing")
+            }
+        };
+        assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::AgentProcess,
+            false,
+        );
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "the accepted-work barrier must remain uncrossed"
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_failure_after_prompt_install_is_terminal_before_done() {
+        let rec = Recorder::new("agent-sess-PROMPT-STORE-FAIL");
+        rec.wait_cancel_before_respond.store(true, Ordering::SeqCst);
+        rec.hang_after_cancel.store(true, Ordering::SeqCst);
+        let backend = Arc::new(
+            connect_recording_with(
+                rec.clone(),
+                AcpConfig {
+                    cancel_grace: Duration::from_millis(200),
+                    ..test_config()
+                },
+            )
+            .await,
+        );
+        let key = bkey("bridge-PROMPT-STORE-FAIL");
+        backend.ensure_session(&key).await.unwrap();
+
+        // Cached-session observation writes four transitions, then prompt_start
+        // Started is fifth. Reject the sixth write: PromptStart Completed, after
+        // the accepted-work barrier and SDK future installation.
+        let observer = Arc::new(RejectOnRecord {
+            count: AtomicU64::new(0),
+            reject_at: 6,
+        });
+        let mut stream = backend
+            .prompt_with_observers(&key, vec![], BackendObservers::diagnostic_only(observer))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("observer failure must send cancellation before escalation");
+
+        // Queue the second caller BEFORE escalation. Its initial fence check is
+        // still false, and its four cached-session transitions prove it reached
+        // the turn lock. The post-lock fence must stop dispatch after the first
+        // driver escalates and releases that lock.
+        let second_observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let backend_for_second = Arc::clone(&backend);
+        let key_for_second = key.clone();
+        let observer_for_second: Arc<dyn DiagnosticObserver> = second_observer.clone();
+        let second = tokio::spawn(async move {
+            backend_for_second
+                .prompt_with_observers(
+                    &key_for_second,
+                    vec![],
+                    BackendObservers::diagnostic_only(observer_for_second),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while second_observer.snapshot().await.len() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second prompt must queue behind the accepted turn before escalation");
+
+        match stream.next().await {
+            Some(Err(BridgeError::StoreFailure)) => {}
+            other => panic!("observer failure must replace terminal success, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+
+        assert!(
+            backend.unavailable.load(Ordering::SeqCst),
+            "an ignored cancel after observer failure must fence the shared connection"
+        );
+        let error = match tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("queued second prompt must settle after the first releases its lock")
+            .unwrap()
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a queued caller must recheck the connection fence after the lock"),
+        };
+        assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::AgentProcess,
+            false,
+        );
+        assert_eq!(
+            rec.prompt_log.lock().await.as_slice(),
+            &["start"],
+            "the rejected second prompt must never enter the agent"
+        );
     }
 
     #[tokio::test]
@@ -4470,6 +8559,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_cancel_delivery_failure_is_structured_fatal_pre_dispatch() {
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(32).unwrap());
+        let lifecycle = AcpLifecycle::new(observer.clone(), DiagnosticRedactor::default(), None);
+        let error = AcpBackend::deferred_cancel_delivery_failure(
+            &lifecycle,
+            "connection closed".to_owned(),
+        )
+        .await;
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        assert_eq!(
+            diagnostic.code().as_str(),
+            "acp.prompt_start.deferred_cancel_failed"
+        );
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        assert!(!error.is_transient());
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn initializer_call_site_maps_deferred_cancel_send_failure() {
+        let rec = Recorder::new("agent-sess-DEFERRED-CANCEL-CALLSITE");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        backend
+            .fail_deferred_cancel_send
+            .store(true, Ordering::SeqCst);
+        let session = bkey("bridge-DEFERRED-CANCEL-CALLSITE");
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(32).unwrap());
+        let backend_for_prompt = Arc::clone(&backend);
+        let session_for_prompt = session.clone();
+        let observer_for_prompt = observer.clone();
+        let prompt = tokio::spawn(async move {
+            backend_for_prompt
+                .prompt_with_observers(
+                    &session_for_prompt,
+                    vec![],
+                    BackendObservers::diagnostic_only(observer_for_prompt),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("session/new must be in flight before cancellation");
+        backend.cancel(&session).await.unwrap();
+        rec.new_session_gate.notify_waiters();
+
+        let error = match prompt.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("injected deferred cancel send failure must abort before prompt dispatch")
+            }
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        assert_eq!(
+            diagnostic.code().as_str(),
+            "acp.prompt_start.deferred_cancel_failed"
+        );
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        assert!(!error.is_transient());
+        let prompt_events: Vec<_> = observer
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|event| event.transition().phase() == DiagnosticPhase::PromptStart)
+            .collect();
+        assert_eq!(prompt_events.len(), 2);
+        assert_eq!(prompt_events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(prompt_events[1].transition().status(), PhaseStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn observed_cancel_during_mint_is_reported_as_latched() {
+        let rec = Recorder::new("agent-sess-OBSERVED-CANCEL-LATCH");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let session = bkey("bridge-OBSERVED-CANCEL-LATCH");
+        let backend_for_mint = Arc::clone(&backend);
+        let session_for_mint = session.clone();
+        let mint =
+            tokio::spawn(async move { backend_for_mint.ensure_session(&session_for_mint).await });
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("session/new must be in flight before observed cancellation");
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        backend
+            .cancel_observed(&session, observer.clone())
+            .await
+            .unwrap();
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[1].transition().code().map(|code| code.as_str()),
+            Some("acp.teardown.cancel_latched")
+        );
+        rec.new_session_gate.notify_waiters();
+        mint.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn observed_cancel_send_failure_after_acceptance_closes_fence_and_reports_true() {
+        let rec = Recorder::new("agent-sess-CANCEL-SEND-FAIL");
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let session = bkey("bridge-CANCEL-SEND-FAIL");
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("prompt must cross the accepted-work barrier");
+        backend.fail_cancel_send.store(true, Ordering::SeqCst);
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let error = backend
+            .cancel_observed(&session, observer)
+            .await
+            .expect_err("injected cancel delivery failure must be structured");
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Teardown,
+            DiagnosticFailureClass::Transport,
+            true,
+        );
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        assert!(backend.unavailable.load(Ordering::SeqCst));
+
+        rec.prompt_gate.notify_waiters();
+        while stream.next().await.is_some() {}
+        let later = match backend.prompt(&session, vec![]).await {
+            Err(error) => error,
+            Ok(_) => panic!("cancel-send failure must fence later prompt dispatch"),
+        };
+        assert_agent_failure(
+            &later,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::AgentProcess,
+            false,
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_latched_during_mint_fires_exactly_once_no_double_send() {
         // B2 regression: a cancel issued WHILE session/new is in flight must be
         // delivered EXACTLY ONCE once the id is minted — never lost (the bug:
@@ -4497,7 +8737,7 @@ mod tests {
             "cancel before the id is observable must not be sent yet"
         );
 
-        // Release session/new; the post-init drain (only the minter) flushes the
+        // Release session/new; the shielded init task publishes the id and flushes the
         // latched cancel against the freshly-published id.
         rec.new_session_gate.notify_waiters();
         let minted = mint.await.unwrap().unwrap();
@@ -4803,7 +9043,15 @@ mod tests {
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "partial"));
         // The turn's terminal item is an Err — NOT a Done.
         match s.next().await {
-            Some(Err(BridgeError::AgentCrashed { .. })) => {}
+            Some(Err(error)) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::PromptStream,
+                    DiagnosticFailureClass::Transport,
+                    true,
+                );
+                assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+            }
             other => panic!(
                 "prompt-turn error must surface as terminal Err(AgentCrashed), got {other:?}"
             ),
@@ -4955,6 +9203,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_initializer_waiter_does_not_orphan_or_remint_session() {
+        let rec = Recorder::new("agent-sess-INIT-SHIELDED");
+        rec.gate_new_session.store(true, Ordering::SeqCst);
+        let backend = Arc::new(connect_recording(rec.clone()).await);
+        let key = bkey("bridge-INIT-SHIELDED");
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let observer_dyn: Arc<dyn DiagnosticObserver> = observer.clone();
+        let observer_weak = Arc::downgrade(&observer_dyn);
+
+        let backend_for_first = Arc::clone(&backend);
+        let key_for_first = key.clone();
+        let observer_for_first = observer_dyn;
+        let first = tokio::spawn(async move {
+            backend_for_first
+                .prompt_with_observers(
+                    &key_for_first,
+                    vec![],
+                    BackendObservers::diagnostic_only(observer_for_first),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), rec.new_session_started.notified())
+            .await
+            .expect("session/new must be dispatched before caller cancellation");
+
+        // Dropping the original waiter used to cancel OnceCell's initializer,
+        // leaving SessionCreate Started open and causing the next caller to mint
+        // a second agent session.
+        first.abort();
+        let _ = first.await;
+        rec.new_session_gate.notify_waiters();
+
+        let entry = backend.session_entry(&key).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while entry.agent_id.get().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shielded initializer must publish the minted session");
+
+        let events = observer.snapshot().await;
+        for phase in [DiagnosticPhase::SessionCreate, DiagnosticPhase::ConfigApply] {
+            let terminal = events
+                .iter()
+                .rfind(|event| event.transition().phase() == phase)
+                .expect("started initialization phase must have a terminal event");
+            assert_ne!(terminal.transition().status(), PhaseStatus::Started);
+        }
+        drop(observer);
+        tokio::task::yield_now().await;
+        assert!(
+            observer_weak.upgrade().is_none(),
+            "completed shielded initialization must release its operation observer"
+        );
+
+        let second_observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let mut stream = backend
+            .prompt_with_observers(
+                &key,
+                vec![],
+                BackendObservers::diagnostic_only(second_observer),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+        assert_eq!(
+            rec.new_session_calls.load(Ordering::SeqCst),
+            1,
+            "a cancelled waiter must not cause a second session/new"
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_hung_agent_is_terminated_within_grace() {
         // A hung agent that receives `session/cancel` but NEVER returns must not
         // hang the caller forever. With a SHORT cancel grace, the backend escalates
@@ -4989,7 +9311,14 @@ mod tests {
             .await
             .expect("hung turn must be terminated within grace, not hang")
         {
-            Some(Err(BridgeError::AgentCrashed { .. })) => {}
+            Some(Err(error)) => {
+                assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::PromptStream,
+                    DiagnosticFailureClass::AgentProcess,
+                    true,
+                );
+            }
             other => panic!("hung-agent escalation must end the turn with Err, got {other:?}"),
         }
         assert!(
@@ -4997,30 +9326,23 @@ mod tests {
             "stream terminates after the escalation Err"
         );
 
-        // The turn lock is released (escalation dropped the driver's guard): a
-        // subsequent prompt on S can proceed (it would deadlock if still held).
-        rec.wait_cancel_before_respond
-            .store(false, Ordering::SeqCst);
-        rec.hang_after_cancel.store(false, Ordering::SeqCst);
-        rec.set_stop_reason(StopReason::EndTurn).await;
-        let mut s2 = tokio::time::timeout(Duration::from_secs(2), be.prompt(&key, vec![]))
+        // Escalation kills the shared process connection. The lock is released,
+        // but a later prompt must be fenced rather than overlap the still-running
+        // in-process fake (or target a dead real process).
+        let error = match tokio::time::timeout(Duration::from_secs(2), be.prompt(&key, vec![]))
             .await
-            .expect("a fresh prompt must acquire the released turn lock")
-            .unwrap();
-        let done = loop {
-            match tokio::time::timeout(Duration::from_secs(2), s2.next())
-                .await
-                .expect("fresh turn must complete")
-            {
-                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
-                Some(_) => continue,
-                None => panic!("fresh turn ended without Done"),
-            }
+            .expect("a fenced prompt must return promptly")
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a prompt after shared-connection escalation must be rejected"),
         };
-        assert_eq!(
-            done, "end_turn",
-            "the lock released → the next turn runs to completion"
+        assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::AgentProcess,
+            false,
         );
+        assert_eq!(rec.prompt_log.lock().await.as_slice(), &["start"]);
     }
 
     #[tokio::test]
@@ -5102,8 +9424,17 @@ mod tests {
             .await
             .expect("watchdog must terminate the hung turn")
         {
-            Some(Err(BridgeError::AgentTimedOut)) => {}
-            other => panic!("watchdog terminal must be AgentTimedOut, got {other:?}"),
+            Some(Err(error)) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::PromptStream,
+                    DiagnosticFailureClass::Timeout,
+                    true,
+                );
+                assert_eq!(diagnostic.code().as_str(), "acp.prompt.watchdog_timeout");
+                assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+            }
+            other => panic!("watchdog terminal must be a structured timeout, got {other:?}"),
         }
         assert!(s.next().await.is_none(), "stream terminates after timeout");
 
@@ -5248,14 +9579,22 @@ mod tests {
 
         // The watchdog fires (wall-clock 50ms), sends session/cancel; the agent
         // honors it and returns Cancelled within grace — yet the terminal is
-        // AgentTimedOut, NOT a Done{cancelled}.
+        // a structured timeout, NOT a Done{cancelled}.
         match tokio::time::timeout(Duration::from_secs(2), s.next())
             .await
             .expect("watchdog must terminate the turn even when the agent honors cancel")
         {
-            Some(Err(BridgeError::AgentTimedOut)) => {}
+            Some(Err(error)) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::PromptStream,
+                    DiagnosticFailureClass::Timeout,
+                    true,
+                );
+                assert_eq!(diagnostic.code().as_str(), "acp.prompt.watchdog_timeout");
+            }
             other => {
-                panic!("an honored-within-grace cancel must STILL be AgentTimedOut, got {other:?}")
+                panic!("an honored-within-grace cancel must STILL be a timeout, got {other:?}")
             }
         }
         assert!(s.next().await.is_none(), "stream terminates after timeout");
@@ -5268,6 +9607,48 @@ mod tests {
         assert_eq!(
             rec.cancels.lock().await.as_slice(),
             &["agent-sess-WD-HONOR"]
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_preserves_sdk_failure_returned_during_cancel_grace() {
+        let rec = Recorder::new("agent-sess-WD-CAUSE");
+        rec.wait_cancel_before_respond.store(true, Ordering::SeqCst);
+        rec.fail_prompt.store(true, Ordering::SeqCst);
+        let cfg = AcpConfig {
+            watchdog: Some(bridge_core::domain::WatchdogConfig {
+                idle_timeout: Duration::from_secs(10),
+                hard_wall_clock: Duration::from_millis(50),
+            }),
+            cancel_grace: Duration::from_secs(2),
+            ..test_config()
+        };
+        let backend = connect_recording_with(rec.clone(), cfg).await;
+        let mut stream = backend
+            .prompt(&bkey("bridge-WD-CAUSE"), vec![])
+            .await
+            .unwrap();
+
+        let error = match tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("watchdog must settle after the agent returns its SDK error")
+        {
+            Some(Err(error)) => error,
+            other => panic!("watchdog must remain the typed terminal, got {other:?}"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStream,
+            DiagnosticFailureClass::Timeout,
+            true,
+        );
+        assert!(
+            diagnostic
+                .causes()
+                .iter()
+                .any(|cause| cause.contains("agent failed the turn")),
+            "the deeper SDK cause returned during grace must not be discarded: {:?}",
+            diagnostic.causes()
         );
     }
 
@@ -5681,8 +10062,8 @@ mod tests {
     #[tokio::test]
     async fn set_mode_bad_id_is_hard_error_and_leaves_cell_uninitialized() {
         // The agent REJECTS the configured mode id. Because set_mode is configured
-        // INSIDE the `get_or_try_init` closure (before the id is returned), a hard
-        // `?`-error makes `get_or_try_init` FAIL and the `OnceCell` stays
+        // INSIDE the shielded init task (before the id is published), a hard
+        // `?`-error makes initialization FAIL and the `OnceCell` stays
         // UNINITIALIZED. So:
         //   (a) `ensure_session` returns the hard error, AND
         //   (b) a SECOND `ensure_session` re-runs the FULL mint+set_mode (re-mints,
@@ -5694,7 +10075,15 @@ mod tests {
         let key = bkey("bridge-BADMODE");
 
         match be.ensure_session(&key).await {
-            Err(BridgeError::AgentCrashed { .. }) => {}
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                assert_eq!(diagnostic.code().as_str(), "acp.config.mode_rejected");
+            }
             other => panic!("a rejected set_mode must fail session setup, got {other:?}"),
         }
         // The agent recorded the (rejected) mode request from the first attempt.
@@ -5708,7 +10097,15 @@ mod tests {
         // SECOND attempt: cell is uninitialized → the closure re-runs → re-mints
         // and re-attempts set_mode, then errors again. NOT a silent success.
         match be.ensure_session(&key).await {
-            Err(BridgeError::AgentCrashed { .. }) => {}
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                assert_eq!(diagnostic.code().as_str(), "acp.config.mode_rejected");
+            }
             other => panic!(
                 "a re-attempt after a set_mode failure must re-run and error, \
                  not silently proceed unconfigured, got {other:?}"
@@ -5738,11 +10135,18 @@ mod tests {
         let key = bkey("bridge-MODELERR");
 
         match be.ensure_session(&key).await {
-            Err(BridgeError::ConfigInvalid { reason }) => {
-                assert!(reason.contains("agent recorder"), "{reason}");
-                assert!(reason.contains("missing-model"), "{reason}");
-                assert!(reason.contains("valid models:"), "{reason}");
-                assert!(reason.contains("gpt-x"), "{reason}");
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                let cause = diagnostic.causes().join(" ");
+                assert!(cause.contains("agent recorder"), "{cause}");
+                assert!(cause.contains("missing-model"), "{cause}");
+                assert!(cause.contains("valid models:"), "{cause}");
+                assert!(cause.contains("gpt-x"), "{cause}");
             }
             other => panic!("non-advertised model must fail mint, got {other:?}"),
         }
@@ -5755,7 +10159,7 @@ mod tests {
     #[tokio::test]
     async fn authenticate_failure_surfaces_agent_not_authenticated() {
         // The agent advertises an auth method, then REJECTS `authenticate`. The
-        // backend must surface `AgentNotAuthenticated` from `connect` (hard fail).
+        // backend must surface a structured authentication failure from `connect` (hard fail).
         let rec = Recorder::new("agent-sess-AUTH");
         rec.advertise_auth_method("oauth").await;
         rec.reject_authenticate.store(true, Ordering::SeqCst);
@@ -5763,9 +10167,16 @@ mod tests {
         let (client_side, agent_side) = Channel::duplex();
         spawn_recording_agent(agent_side, rec.clone());
         match AcpBackend::connect(client_side, test_config()).await {
-            Err(BridgeError::AgentNotAuthenticated) => {}
-            Err(e) => panic!("authenticate failure must surface AgentNotAuthenticated, got {e:?}"),
-            Ok(_) => panic!("authenticate failure must surface AgentNotAuthenticated, got Ok"),
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::Authenticate,
+                    DiagnosticFailureClass::Authentication,
+                    false,
+                );
+                assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+            }
+            Ok(_) => panic!("authenticate failure must fail connect"),
         }
         // The backend attempted authenticate with the advertised method id.
         assert_eq!(rec.authenticates.lock().await.as_slice(), &["oauth"]);
@@ -5899,8 +10310,14 @@ mod tests {
         .await
         .expect("connect must return within the handshake bound, not hang");
         match outcome {
-            Err(BridgeError::AgentCrashed { .. }) => {}
-            Err(e) => panic!("a hung initialize handshake must surface a clear error, got {e:?}"),
+            Err(error) => {
+                assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::Initialize,
+                    DiagnosticFailureClass::Timeout,
+                    false,
+                );
+            }
             Ok(_) => panic!("a hung initialize handshake must surface a clear error, got Ok"),
         }
     }
@@ -5963,8 +10380,14 @@ mod tests {
         .await
         .expect("connect must return within the handshake bound, not hang on authenticate");
         match outcome {
-            Err(BridgeError::AgentCrashed { .. }) => {}
-            Err(e) => panic!("a hung authenticate must surface a clear bounded error, got {e:?}"),
+            Err(error) => {
+                assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::Authenticate,
+                    DiagnosticFailureClass::Timeout,
+                    false,
+                );
+            }
             Ok(_) => panic!("a hung authenticate must surface a clear bounded error, got Ok"),
         }
     }
@@ -5975,7 +10398,7 @@ mod tests {
         // attempted (the agent is authoritative). Here the agent advertises a
         // DIFFERENT method ("oauth") and REJECTS the (mismatched) configured one;
         // the backend attempts the configured id, warns about the mismatch, and the
-        // rejection surfaces cleanly as `AgentNotAuthenticated`.
+        // rejection surfaces cleanly as a structured authentication failure.
         let rec = Recorder::new("agent-sess-AUTHMISMATCH");
         rec.advertise_auth_method("oauth").await;
         rec.reject_authenticate.store(true, Ordering::SeqCst);
@@ -5986,9 +10409,15 @@ mod tests {
         let (client_side, agent_side) = Channel::duplex();
         spawn_recording_agent(agent_side, rec.clone());
         match AcpBackend::connect(client_side, cfg).await {
-            Err(BridgeError::AgentNotAuthenticated) => {}
-            Err(e) => panic!("a mismatched+rejected auth_method must fail cleanly, got {e:?}"),
-            Ok(_) => panic!("a mismatched+rejected auth_method must fail cleanly, got Ok"),
+            Err(error) => {
+                assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::Authenticate,
+                    DiagnosticFailureClass::Authentication,
+                    false,
+                );
+            }
+            Ok(_) => panic!("a mismatched+rejected auth_method must fail cleanly"),
         }
         // The backend attempted the CONFIGURED method id (not the advertised one).
         assert_eq!(rec.authenticates.lock().await.as_slice(), &["apikey"]);
@@ -6176,8 +10605,11 @@ mod tests {
         let backend = AcpBackend {
             conn: None,
             supervised: Arc::new(StdMutex::new(Some(supervised))),
+            stderr_ring: None,
             config: None,
             reaped: Arc::new(AtomicBool::new(false)),
+            unavailable: Arc::new(AtomicBool::new(false)),
+            dispatch_gate: Arc::new(StdMutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
@@ -6186,6 +10618,10 @@ mod tests {
             )),
             permission_registry: Arc::new(StdMutex::new(None)),
             perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
+            prompt_snapshot_hook: StdMutex::new(None),
+            before_process_redactor_hook: StdMutex::new(None),
+            fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
+            fail_cancel_send: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(
@@ -6194,6 +10630,10 @@ mod tests {
         );
 
         backend.retire().await.expect("first retire terminates");
+        assert!(
+            backend.unavailable.load(Ordering::SeqCst),
+            "retirement must close the connection fence before process teardown"
+        );
         // The take-once consumed the child; a second retire is a no-op.
         backend
             .retire()
@@ -6205,6 +10645,30 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
         assert!(!alive, "child must be terminated after the first retire");
+    }
+
+    #[tokio::test]
+    async fn in_process_retire_fences_active_lease_before_next_prompt() {
+        let rec = Recorder::new("agent-sess-RETIRED-LEASE");
+        let backend = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-RETIRED-LEASE");
+        backend.ensure_session(&key).await.unwrap();
+
+        backend.retire().await.unwrap();
+        let error = match backend.prompt(&key, vec![]).await {
+            Err(error) => error,
+            Ok(_) => panic!("an active lease must not dispatch after backend retirement"),
+        };
+        assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStart,
+            DiagnosticFailureClass::AgentProcess,
+            false,
+        );
+        assert!(
+            rec.prompt_log.lock().await.is_empty(),
+            "retirement must fence even when the in-process transport remains open"
+        );
     }
 
     #[tokio::test]
@@ -6286,7 +10750,14 @@ mod tests {
         let key = bkey("bridge-NOMODELOPT");
 
         match be.ensure_session(&key).await {
-            Err(BridgeError::ConfigInvalid { reason }) => {
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                let reason = diagnostic.causes().join(" ");
                 assert!(
                     reason.contains("agent recorder advertised no model option"),
                     "{reason}"
@@ -6313,7 +10784,14 @@ mod tests {
         let key = bkey("bridge-FABLE-CURRENT");
 
         match be.ensure_session(&key).await {
-            Err(BridgeError::ConfigInvalid { reason }) => {
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                let reason = diagnostic.causes().join(" ");
                 assert!(
                     reason.contains("current model=claude-fable-5[1m] is blocked by this bridge"),
                     "{reason}"
@@ -6346,7 +10824,14 @@ mod tests {
         let key = bkey("bridge-FABLE-EMPTY-REFRESH");
 
         match be.ensure_session(&key).await {
-            Err(BridgeError::ConfigInvalid { reason }) => {
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                let reason = diagnostic.causes().join(" ");
                 assert!(
                     reason.contains(
                         "could not confirm model=sonnet replaced blocked current model=claude-fable-5[1m]"
@@ -6750,6 +11235,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observed_cancel_is_persistence_first_and_records_teardown() {
+        let rec = Recorder::new("agent-sess-CANCEL-OBSERVED");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CANCEL-OBSERVED");
+        backend.ensure_session(&session).await.unwrap();
+
+        let rejecting = Arc::new(RejectOnRecord {
+            count: AtomicU64::new(0),
+            reject_at: 1,
+        });
+        assert_eq!(
+            backend.cancel_observed(&session, rejecting).await,
+            Err(BridgeError::StoreFailure)
+        );
+        assert!(
+            rec.cancels.lock().await.is_empty(),
+            "cancel must not dispatch when Teardown Started cannot persist"
+        );
+
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(4).unwrap());
+        backend
+            .cancel_observed(&session, observer.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("observed cancel must reach the agent");
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().phase(), DiagnosticPhase::Teardown);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn observed_forget_is_persistence_first_and_clears_only_forget_state() {
+        let backend = connect_recording(Recorder::new("agent-sess-FORGET-OBSERVED")).await;
+        let session = bkey("bridge-FORGET-OBSERVED");
+        backend
+            .configure_session(&session, &SessionSpec::from_config(Default::default()))
+            .await
+            .unwrap();
+        backend
+            .configure_turn(
+                &session,
+                turn_meta("ctx-forget-observed", 1, "op-forget-observed"),
+            )
+            .await;
+        let entry = backend.session_entry(&session).await;
+
+        let rejecting = Arc::new(RejectOnRecord {
+            count: AtomicU64::new(0),
+            reject_at: 1,
+        });
+        assert_eq!(
+            backend.forget_session_observed(&session, rejecting).await,
+            Err(BridgeError::StoreFailure)
+        );
+        assert!(backend.session_cfg.lock().unwrap().contains_key(&session));
+        assert!(backend.take_pending_turn_meta(&session).is_some());
+        backend
+            .configure_turn(
+                &session,
+                turn_meta("ctx-forget-observed", 2, "op-forget-observed-2"),
+            )
+            .await;
+
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(4).unwrap());
+        backend
+            .forget_session_observed(&session, observer.clone())
+            .await
+            .unwrap();
+        assert!(!backend.session_cfg.lock().unwrap().contains_key(&session));
+        assert!(backend.take_pending_turn_meta(&session).is_none());
+        assert!(
+            Arc::ptr_eq(&entry, &backend.session_entry(&session).await),
+            "forget must not release the live ACP session"
+        );
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+    }
+
+    #[tokio::test]
     async fn release_session_clears_pending_turn_meta() {
         let rec = Recorder::new("agent-sess-RELEASE-META");
         let be = connect_recording(rec).await;
@@ -6763,6 +11333,102 @@ mod tests {
             be.take_pending_turn_meta(&s).is_none(),
             "release_session removes pending turn metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn observed_release_records_teardown_and_removes_session_state() {
+        let rec = Recorder::new("agent-sess-RELEASE-OBSERVED");
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-RELEASE-OBSERVED");
+        backend
+            .configure_session(&session, &SessionSpec::from_config(Default::default()))
+            .await
+            .unwrap();
+        backend.ensure_session(&session).await.unwrap();
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+
+        backend
+            .release_session_observed(&session, observer.clone())
+            .await
+            .unwrap();
+
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| { event.transition().phase() == DiagnosticPhase::Teardown }));
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+        assert!(backend.sessions.lock().await.get(&session).is_none());
+        assert!(backend.session_cfg.lock().unwrap().get(&session).is_none());
+        tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
+            .await
+            .expect("observed release must dispatch session/cancel");
+    }
+
+    #[tokio::test]
+    async fn observed_pre_dispatch_cancel_and_release_failures_are_not_accepted() {
+        let backend = AcpBackend {
+            conn: None,
+            supervised: Arc::new(StdMutex::new(None)),
+            stderr_ring: None,
+            config: Some(test_config()),
+            reaped: Arc::new(AtomicBool::new(false)),
+            unavailable: Arc::new(AtomicBool::new(false)),
+            dispatch_gate: Arc::new(StdMutex::new(())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_cfg: Arc::new(StdMutex::new(HashMap::new())),
+            pending_turn_meta: StdMutex::new(HashMap::new()),
+            policy: Arc::new(StdMutex::new(
+                Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
+            )),
+            permission_registry: Arc::new(StdMutex::new(None)),
+            perm_timeout_ms: Arc::new(AtomicU64::new(120_000)),
+            prompt_snapshot_hook: StdMutex::new(None),
+            before_process_redactor_hook: StdMutex::new(None),
+            fail_deferred_cancel_send: Arc::new(AtomicBool::new(false)),
+            fail_cancel_send: Arc::new(AtomicBool::new(false)),
+        };
+        let session = bkey("bridge-RELEASE-ERROR");
+        backend
+            .configure_session(&session, &SessionSpec::from_config(Default::default()))
+            .await
+            .unwrap();
+        let _ = backend.session_entry(&session).await;
+        let cancel_observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let cancel_error = backend
+            .cancel_observed(&session, cancel_observer.clone())
+            .await
+            .expect_err("missing ACP connection must fail observed cancellation");
+        assert_agent_failure(
+            &cancel_error,
+            DiagnosticPhase::Teardown,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        let cancel_events = cancel_observer.snapshot().await;
+        assert_eq!(cancel_events.len(), 2);
+        assert_eq!(cancel_events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(cancel_events[1].transition().status(), PhaseStatus::Failed);
+
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+
+        let error = backend
+            .release_session_observed(&session, observer.clone())
+            .await
+            .expect_err("missing ACP connection must be a teardown failure");
+        assert_agent_failure(
+            &error,
+            DiagnosticPhase::Teardown,
+            DiagnosticFailureClass::Transport,
+            false,
+        );
+        assert!(backend.sessions.lock().await.get(&session).is_none());
+        assert!(backend.session_cfg.lock().unwrap().get(&session).is_none());
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
     }
 
     // ── Task 4 (session-cwd): per-session cwd at mint + immutability guard ────
@@ -6836,7 +11502,7 @@ mod tests {
     async fn cwd_immutable_after_mint() {
         // Once a session is minted with cwd /a, a subsequent `configure_session`
         // stashing cwd /b and then calling `ensure_session` again must return
-        // `InvalidStateTransition` — NOT silently reuse the warm /a session for /b.
+        // a structured config failure — NOT silently reuse the warm /a session for /b.
         let rec = Recorder::new("agent-sess-SCWDIMM");
         // Use a custom config so the static cwd is /a (drives the first mint).
         let cfg = AcpConfig {
@@ -6887,11 +11553,13 @@ mod tests {
         let err = be.ensure_session(&key).await.expect_err(
             "ensure_session on an already-minted session with a DIFFERENT cwd must return an error",
         );
-        assert_eq!(
-            err,
-            BridgeError::InvalidStateTransition,
-            "cwd-conflict on a warm session must map to InvalidStateTransition (ACP §11A)"
+        let diagnostic = assert_agent_failure(
+            &err,
+            DiagnosticPhase::ConfigApply,
+            DiagnosticFailureClass::Config,
+            false,
         );
+        assert_eq!(diagnostic.code().as_str(), "acp.config.cwd_mismatch");
 
         // The session was NOT re-minted (still exactly one session/new).
         assert_eq!(

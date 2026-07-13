@@ -57,6 +57,18 @@ pub fn substitute_cwd(s: &str, cwd: &str) -> String {
     s.replace(CWD_TOKEN, cwd)
 }
 
+/// Credential values the bridge must redact from MCP diagnostics for one
+/// delivery cwd. Keep both the configured template and its effective value:
+/// bridge-side validation can mention the former, while the adapter/agent sees
+/// and may echo the latter.
+pub fn env_redaction_values(specs: &[McpServerSpec], cwd: &str) -> Vec<String> {
+    specs
+        .iter()
+        .flat_map(|server| server.env.iter())
+        .flat_map(|(_, value)| [value.clone(), substitute_cwd(value, cwd)])
+        .collect()
+}
+
 /// Validate that the only `{...}` token in `s` is `{cwd}`. Left-to-right: every `{` must open a
 /// literal `{cwd}`; an unterminated brace or any other `{...}` is an error. (Literal/JSON braces are
 /// unsupported in v1 — MCP args are flat strings.)
@@ -196,6 +208,24 @@ mod tests {
             "--repo /r --cache /r/c"
         );
         assert_eq!(substitute_cwd("no-token", "/r"), "no-token");
+    }
+
+    #[test]
+    fn env_redaction_values_include_template_and_effective_delivery_value() {
+        let specs = vec![McpServerSpec {
+            name: "private".into(),
+            command: "/bin/private".into(),
+            args: vec![],
+            env: vec![
+                ("TOKEN".into(), "alpha{cwd}omega".into()),
+                ("LITERAL".into(), "literal-secret".into()),
+            ],
+        }];
+
+        let values = env_redaction_values(&specs, "/repo/x");
+        assert!(values.contains(&"alpha{cwd}omega".to_string()));
+        assert!(values.contains(&"alpha/repo/xomega".to_string()));
+        assert!(values.contains(&"literal-secret".to_string()));
     }
 
     #[test]

@@ -261,6 +261,9 @@ impl ContainerRwBackend {
             watchdog: self.cfg.watchdog.clone(),
             handshake_timeout: self.cfg.handshake_timeout,
             cancel_grace: self.cfg.cancel_grace,
+            diagnostic_redactor: bridge_core::diagnostics::DiagnosticRedactor::new(
+                bridge_core::mcp::env_redaction_values(&self.cfg.mcp, rw_canon.as_str()),
+            ),
             // :rw has its own reaper (this crate); the inner AcpBackend's :ro reaper stays off.
             container: None,
             // MCP delivery to the inner CONTAINER agent (#1b):
@@ -797,6 +800,7 @@ mod tests {
         fail_prompt: bool,
         last_argv: Mutex<Vec<String>>,
         last_acp_mcp: Mutex<Vec<bridge_core::mcp::McpServerSpec>>,
+        last_diagnostic_redactor: Mutex<Option<bridge_core::diagnostics::DiagnosticRedactor>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
     }
     impl CountingSpawn {
@@ -807,6 +811,7 @@ mod tests {
                 fail_prompt: false,
                 last_argv: Mutex::new(vec![]),
                 last_acp_mcp: Mutex::new(vec![]),
+                last_diagnostic_redactor: Mutex::new(None),
                 last_inner: Mutex::new(None),
             })
         }
@@ -822,6 +827,7 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             *self.last_argv.lock().await = argv.to_vec();
             *self.last_acp_mcp.lock().await = cfg.mcp.clone();
+            *self.last_diagnostic_redactor.lock().await = Some(cfg.diagnostic_redactor.clone());
             if self.fail {
                 return Err(BridgeError::agent_crashed("boom"));
             }
@@ -1051,7 +1057,7 @@ mod tests {
             name: "prism".into(),
             command: "/opt/prism".into(),
             args: vec!["--repo".into(), "{cwd}".into()],
-            env: vec![],
+            env: vec![("PRIVATE_TOKEN".into(), "alpha{cwd}omega".into())],
         }];
         let spawn = CountingSpawn::new(false);
         let (reap, _) = counting_reap();
@@ -1077,6 +1083,19 @@ mod tests {
             "args {{cwd}}->{canon}: {argv:?}"
         );
         assert!(!argv.iter().any(|a| a.contains("{cwd}")));
+        let expanded = format!("alpha{canon}omega");
+        let redactor = spawn
+            .last_diagnostic_redactor
+            .lock()
+            .await
+            .clone()
+            .expect("spawn receives the effective MCP redactor");
+        let sanitized = redactor.sanitize_stderr_line(&format!("adapter echoed {expanded}"), 512);
+        assert!(
+            !sanitized.contains(&expanded),
+            "container delivery must redact the {{cwd}}-expanded credential"
+        );
+        assert!(sanitized.contains("REDACTED KNOWN SECRET"));
         while stream.next().await.is_some() {}
     }
 

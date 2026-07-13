@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a committed at `4ed12f1`; 2b next); R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a committed at `4ed12f1`; 2b closure review pending); R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -234,6 +234,121 @@ R2b2a implementation evidence (`4ed12f1035c16fa5dbd55169e59ca4c277373da4`):
   `APPROVE`;
 - exact post-fold gates: workspace check, warnings-denied all-target clippy, **1,640 passed / 0 failed /
   12 ignored**, release build, and repository hygiene (37 tracked artifacts / 7 example configs).
+
+R2b2b implementation handoff (uncommitted working tree based on
+`3b0b4f9973991e9f76a73e0c41013b08334205eb`):
+
+- lifecycle observation now spans ACP spawn, initialize, authentication, session creation, configuration,
+  prompt start/stream/finish, and operation-owned cancellation, forget, and release. Process-scoped
+  retirement deliberately retains no operation observer; it closes the connection fence before teardown.
+  Post-barrier failures are fatal and never replayed. Bounded escalation and process-scoped retirement
+  close the connection fence; warm expiry after other terminal failures remains R2b2d;
+- process evidence is byte-bounded before retention, invalid UTF-8 is lossy and bounded, known credentials
+  are re-sanitized when an existing child is adopted, and failure diagnostics retain only typed/redacted
+  stderr metadata; all production ACP trace calls pass through one scalar-only typed funnel guarded by an
+  AST regression;
+- the first fresh Sol/xhigh review returned `REVISE` for eight items: empty initial redaction, observer
+  failure abandoning accepted work, cancellable first-session initialization, missing observed
+  cancel/forget teardown, unbounded stderr record reads, omitted pre-prompt stderr, a bypassable trace
+  guard, and watchdog loss of a near-deadline SDK cause;
+- the first closure review marked four `FIXED` and four `PARTIAL`, then found three new `WRONG/MAJOR`
+  cases (short-secret/static-code collision, adopted-child redactor loss, and cancellation during slow
+  completion observation) plus one `SMELL/MINOR` for missing byte-boundary/invalid-UTF-8 tests;
+- the second fold separates trusted static diagnostic codes from dynamic fields without weakening
+  redaction, installs and retroactively applies the adopted-process redactor, re-checks the unavailable
+  fence after turn-lock acquisition, suppresses false cancellation escalation after the prompt route is
+  gone, exercises observed cancel/forget persistence ordering, makes same-poll SDK completion win
+  deterministically, and closes the trace-funnel expression/trait bypasses;
+- the second closure review marked six items `FIXED` and two `PARTIALLY-FIXED`, then returned `REVISE` for
+  one `WRONG/BLOCKER` (connection fencing was not atomic across sessions or retirement), two
+  `WRONG/MAJOR` findings (pre-dispatch failures claimed possible acceptance; trace attributes/local
+  wrapper macros bypassed the guard), and one `SMELL/MAJOR` (the public static-code builder still accepted
+  runtime `String` codes). It also required a production-path `from_child` redactor test and found the
+  cancel watcher could snapshot a live route just before slow completion persistence removed it;
+- the third fold orders the final availability check plus SDK request installation against escalation
+  and retirement with one connection-wide no-await gate, gives each live route an atomic terminal claim,
+  reports every pre-barrier prompt failure as not accepted, rejects tracing attributes and local
+  tracing-expanding macros, structurally separates trusted `&'static str` codes from dynamic inputs, and
+  drives the actual `from_child` path with stderr both before and after adoption;
+- the third closure review marked three items `FIXED` and three `PARTIALLY-FIXED`, then returned `REVISE`
+  for three new `WRONG/MAJOR` cases: adopted-child initialize failures lost available stderr metadata,
+  pre-dispatch observed cancel/release failures falsely claimed possible acceptance, and `{cwd}`-expanded
+  MCP env credentials were not in the redaction set. It also found the dispatch gate lacked a
+  mutation-sensitive mutual-exclusion test, nested `AcpTraceEvent`/`extern crate` aliases still bypassed
+  the trace guard, two pre-dispatch branches lacked direct coverage, and two handoff status claims needed
+  correction;
+- the fourth fold drives failing `from_child` initialization through the same process-scoped evidence,
+  carries accepted-work state in typed teardown failures, removes the unnecessary connection dependency
+  from already-minted session reuse, mutation-locks both sides of the dispatch gate, rejects nested funnel
+  lookalikes and extern-crate aliases, and seeds host/container redactors with raw plus effective MCP env
+  values after `{cwd}` substitution. Retirement ownership and aggregate R2b2 status are now described
+  consistently;
+- the fourth closure review marked five items `FIXED` and three `PARTIALLY-FIXED`, then returned `REVISE`
+  because a root-level funnel lookalike in a sibling source file remained trusted, teardown acceptance was
+  derived from pre-barrier route liveness, and the ACP lifecycle redactor did not know MCP secrets expanded
+  with a per-session cwd. It also found one `WRONG/MINOR` handoff overclaim and one `SMELL/MINOR` gap in the
+  central `AgentFailure` constructor guard;
+- the fifth fold qualifies the typed trace funnel by its owning source file, stores a distinct accepted bit
+  only after SDK request installation under the dispatch gate, derives session/session-operation lifecycle
+  redactors from the effective cwd, narrows the handoff to the fences actually closed, and mutation-locks
+  `BridgeError::agent_failure` to `AcpLifecycle::failure`;
+- the fifth closure review marked four items `FIXED` and the effective-cwd redaction item
+  `PARTIALLY-FIXED`, then returned `REVISE`: config replacement could split the redactor snapshot from
+  the mint snapshot, and a failed deferred cancel delivery after mint remained transient legacy
+  `AgentCrashed` after the observed cancellation had been reported complete;
+- the sixth fold makes one immutable session snapshot own cwd/model/mode/effort plus lifecycle redaction,
+  retains every attempted and minted cwd for later operation redaction, reports a pre-mint observed cancel
+  as latched rather than delivered, and maps a failed deferred delivery to structured fatal pre-dispatch
+  failure. Deterministic regressions cover config replacement, minted-cwd teardown, latched observation,
+  and the deferred failure mapping;
+- the sixth closure review marked both inherited items `PARTIALLY-FIXED`: tests bypassed the production
+  `prompt_inner` snapshot and deferred-send call sites. It also found one `WRONG/MAJOR` unbounded attempted
+  cwd vector retained across failed retries/forget and one `SMELL/MINOR` because deferred R2f incident work
+  crossed the R2b2b branch boundary;
+- the seventh fold replaces the vector with one RAII-cleared active-attempt cwd plus the immutable minted
+  cwd, exercises config replacement after `prompt_inner` snapshot capture, injects failure at the actual
+  initializer send call, and covers active-attempt redaction plus failed-retry cleanup. The R2f material is
+  preserved separately at `ae4a569` on `agent/reliability-r2f-incident-evidence` and removed from this tree;
+- the seventh closure review marked all four inherited items `FIXED`, then returned `REVISE` for two new
+  `WRONG/MAJOR` cases: cancellation delivery could sample `accepted` before a concurrent prompt crossed
+  the barrier, and the process-scoped stderr ring never learned MCP credentials expanded with a
+  per-session cwd;
+- the eighth fold performs route lookup plus synchronous cancel delivery under the same no-await dispatch
+  gate as prompt installation, closes the fence and samples acceptance before releasing that gate on
+  failure, and mutation-locks both orderings including the route-not-yet-published case. Before each real
+  `session/new`, it atomically installs a process redactor containing the raw template plus every active or
+  minted live-session cwd expansion; deterministic two-session coverage proves the first credential is not
+  dropped when the second session mints, while the process-ring regression proves replacement sanitizes
+  retained and future exact values;
+- the eighth closure review marked both inherited items `PARTIALLY-FIXED`: an SDK-terminal route is removed
+  before slow completion observation finishes, so cancellation failure could lose already-accepted
+  evidence, and caller cancellation while process-redactor installation waited on the sessions lock could
+  land before the active-cwd RAII guard existed;
+- the ninth fold moves acceptance evidence from routing lifetime to one operation-scoped per-session slot
+  owned by the turn driver and cleared before its turn lock releases. It also constructs the active-cwd
+  guard immediately after publication, before the first redactor await, then moves that guard into the
+  shielded initializer. Deterministic regressions inject cancel-send failure after route removal during
+  slow completion observation and abort initialization while the sessions lock blocks redactor installation;
+- the ninth closure review marked both inherited items `FIXED`, then returned `REVISE` for one new
+  `WRONG/MAJOR`: a credential-bearing session/config attempt could fail before `minted_cwd` publication,
+  and a later finite redactor replacement could forget that delivered value before delayed process stderr;
+- the tenth fold adds a monotonic process-ring metadata-only mode: entering it retroactively replaces all
+  retained text, future lines retain only count metadata, and later redactor replacement cannot re-enable
+  text. A mint evidence guard arms immediately before `session/new` installation and commits only after
+  minted cwd/id publication; uncertain error/abort/unwind enters metadata-only. Session removal does the
+  same under the sessions lock because ACP has no close acknowledgement. Regressions cover failed mint to
+  successful next mint, normal release, and literal stderr captured before and after policy replacement;
+- the tenth closure review marked the inherited item `FIXED`, found no new `WRONG` or `SMELL` across the
+  complete 12-file tree, and returned `APPROVE`. It confirmed metadata-only monotonicity, mint/release
+  boundary coverage, bounded sequence/count retention, and the R2b2c/R2b2d/R2f exclusions;
+- current focused gates pass: bridge-acp library **183 passed / 0 failed**, bridge-container **24 / 0**,
+  the host and core MCP redaction regressions, R2b1 diagnostics **20 / 0**, process lifecycle **13 / 0**,
+  and warnings-denied all-target Clippy for every changed crate. The approved exact code tree also passes
+  workspace check, workspace/all-target warnings-denied Clippy, **1,700 passed / 0 failed / 12 ignored**
+  across 46 test executables, the release binary build, format/diff checks, and repository hygiene
+  (**37** tracked artifacts / **7** example configs). The ignored set remains authenticated Kiro/two-bridge
+  and local Ollama coverage. R2b2b is ready to commit and push, but remains unmerged until R2b2a-d and the
+  full branch review gate complete.
 
 ### Observation plumbing
 

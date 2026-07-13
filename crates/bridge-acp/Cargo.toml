@@ -27,3 +27,5 @@ futures.workspace = true
 [dev-dependencies]
 tokio = { workspace = true }
 tokio-test = { workspace = true }
+syn = { version = "2", features = ["full", "visit"] }
+tracing-subscriber.workspace = true

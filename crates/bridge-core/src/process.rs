@@ -2,12 +2,222 @@
 // Spec §9 + S3, Codex finding 6: SIGKILL targets the whole group so TERM-ignoring children
 // and their descendants cannot survive.
 
+use std::collections::VecDeque;
 use std::process::Stdio;
-use tokio::process::{Child, Command};
+use std::sync::{Arc, Mutex};
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, ChildStderr, Command};
+
+use crate::diagnostics::DiagnosticRedactor;
+
+const STDERR_RING_CAPACITY: usize = 32;
+const STDERR_LINE_MAX_BYTES: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessStderrCursor(u64);
+
+#[derive(Clone)]
+struct CapturedStderrLine {
+    sequence: u64,
+    #[allow(dead_code)]
+    captured_at_ms: i64,
+    text: String,
+}
+
+#[derive(Default)]
+struct ProcessStderrState {
+    sequence: u64,
+    lines: VecDeque<CapturedStderrLine>,
+    redactor: DiagnosticRedactor,
+    /// Monotonic fail-closed mode used when a process may still emit a
+    /// credential whose exact value can no longer be retained in a bounded
+    /// redaction policy. Sequence/count metadata remains available, but text is
+    /// replaced before retention and can never be re-enabled for this process.
+    metadata_only: bool,
+}
+
+/// Bounded process-scoped stderr evidence. Lines are retained only in memory;
+/// callers receive metadata by default and must not infer task ownership from a
+/// process shared by concurrent attempts.
+#[derive(Clone)]
+pub struct ProcessStderrRing {
+    state: Arc<Mutex<ProcessStderrState>>,
+}
+
+impl Default for ProcessStderrRing {
+    fn default() -> Self {
+        Self::new(DiagnosticRedactor::default())
+    }
+}
+
+impl std::fmt::Debug for ProcessStderrRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock().ok();
+        f.debug_struct("ProcessStderrRing")
+            .field("capacity", &STDERR_RING_CAPACITY)
+            .field(
+                "line_count",
+                &state.as_ref().map_or(0, |state| state.sequence),
+            )
+            .field(
+                "metadata_only",
+                &state.as_ref().is_some_and(|state| state.metadata_only),
+            )
+            .field("redactor", &state.as_ref().map(|state| &state.redactor))
+            .finish()
+    }
+}
+
+impl ProcessStderrRing {
+    fn new(redactor: DiagnosticRedactor) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ProcessStderrState {
+                redactor,
+                ..ProcessStderrState::default()
+            })),
+        }
+    }
+
+    /// Replace the process redactor and retroactively sanitize the already
+    /// bounded retained tail. The ring lock makes adoption race-safe with the
+    /// drain task: lines captured before installation are rewritten, and later
+    /// lines observe the new policy before entering memory.
+    pub fn apply_redactor(&self, redactor: DiagnosticRedactor) {
+        let mut state = self.state.lock().expect("process stderr ring lock");
+        if state.metadata_only {
+            for line in &mut state.lines {
+                line.text = "[REDACTED LINE]".to_owned();
+            }
+        } else {
+            for line in &mut state.lines {
+                line.text = redactor.sanitize_stderr_line(&line.text, STDERR_LINE_MAX_BYTES);
+            }
+        }
+        state.redactor = redactor;
+    }
+
+    /// Permanently disable retained stderr text for this process while keeping
+    /// bounded line-count metadata. Existing lines are rewritten under the
+    /// drain lock and future redactor replacement cannot re-enable text.
+    pub fn retain_metadata_only(&self) {
+        let mut state = self.state.lock().expect("process stderr ring lock");
+        state.metadata_only = true;
+        for line in &mut state.lines {
+            line.text = "[REDACTED LINE]".to_owned();
+        }
+    }
+
+    #[must_use]
+    pub fn is_metadata_only(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.metadata_only)
+    }
+
+    pub fn origin(&self) -> ProcessStderrCursor {
+        ProcessStderrCursor(0)
+    }
+
+    pub fn cursor(&self) -> ProcessStderrCursor {
+        ProcessStderrCursor(self.state.lock().map_or(0, |state| state.sequence))
+    }
+
+    fn push(&self, line: String, oversized: bool) {
+        let mut state = self.state.lock().expect("process stderr ring lock");
+        state.sequence = state.sequence.saturating_add(1);
+        let sequence = state.sequence;
+        let captured_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            .unwrap_or(0);
+        // An oversized logical record is not partially retained: a credential
+        // can straddle the storage boundary, where exact-value redaction could
+        // otherwise leave a secret prefix in the ring. Metadata still records
+        // that the line existed.
+        let text = if oversized || state.metadata_only {
+            "[REDACTED LINE]".to_owned()
+        } else {
+            state
+                .redactor
+                .sanitize_stderr_line(&line, STDERR_LINE_MAX_BYTES)
+        };
+        if state.lines.len() == STDERR_RING_CAPACITY {
+            state.lines.pop_front();
+        }
+        state.lines.push_back(CapturedStderrLine {
+            sequence,
+            captured_at_ms,
+            text,
+        });
+    }
+
+    #[cfg(test)]
+    fn snapshot_since(&self, cursor: ProcessStderrCursor) -> ProcessStderrSnapshot {
+        self.snapshot_since_inner(cursor, true)
+    }
+
+    pub fn metadata_since(&self, cursor: ProcessStderrCursor) -> ProcessStderrSnapshot {
+        self.snapshot_since_inner(cursor, false)
+    }
+
+    fn snapshot_since_inner(
+        &self,
+        cursor: ProcessStderrCursor,
+        include_retained_text: bool,
+    ) -> ProcessStderrSnapshot {
+        let state = self.state.lock().expect("process stderr ring lock");
+        let line_count = state.sequence.saturating_sub(cursor.0).min(u32::MAX as u64) as u32;
+        let retained_lines = if include_retained_text {
+            state
+                .lines
+                .iter()
+                .filter(|line| line.sequence > cursor.0)
+                .map(|line| line.text.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        ProcessStderrSnapshot {
+            line_count,
+            retained_lines,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ProcessStderrSnapshot {
+    line_count: u32,
+    retained_lines: Vec<String>,
+}
+
+impl std::fmt::Debug for ProcessStderrSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessStderrSnapshot")
+            .field("line_count", &self.line_count)
+            .field("scope", &crate::diagnostics::StderrScope::Process)
+            .field("retained_line_count", &self.retained_lines.len())
+            .finish()
+    }
+}
+
+impl ProcessStderrSnapshot {
+    pub fn line_count(&self) -> u32 {
+        self.line_count
+    }
+
+    pub fn scope(&self) -> crate::diagnostics::StderrScope {
+        crate::diagnostics::StderrScope::Process
+    }
+
+    #[cfg(test)]
+    fn retained_lines(&self) -> &[String] {
+        &self.retained_lines
+    }
+}
 
 pub struct Supervised {
     child: Child,
     pid: u32,
+    stderr_ring: ProcessStderrRing,
 }
 
 impl Supervised {
@@ -15,6 +225,17 @@ impl Supervised {
         prog: &str,
         args: &[&str],
         cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with_stderr_redactor(prog, args, cwd, DiagnosticRedactor::default())
+    }
+
+    /// Spawn a supervised child and sanitize process stderr with the supplied
+    /// bridge-known credential set before any text enters the bounded ring.
+    pub fn spawn_with_stderr_redactor(
+        prog: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+        stderr_redactor: DiagnosticRedactor,
     ) -> std::io::Result<Self> {
         let mut cmd = Command::new(prog);
         cmd.args(args)
@@ -33,23 +254,33 @@ impl Supervised {
         // writes past the ~64KB pipe buffer blocks on its next stderr write and
         // deadlocks its entire turn (observed live with a chatty ACP agent — the
         // turn hung, then the process died as AgentCrashed). Reading to EOF keeps
-        // the pipe drained; lines surface at debug under `agent_stderr` so
-        // `RUST_LOG=agent_stderr=debug` shows agent diagnostics on demand.
+        // the pipe drained. Text remains only in the bounded in-memory ring;
+        // opaque agent stderr never enters tracing.
+        let stderr_ring = ProcessStderrRing::new(stderr_redactor);
         if let Some(stderr) = child.stderr.take() {
-            let agent = prog.to_string();
-            tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, BufReader};
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "agent_stderr", %agent, "{line}");
-                }
-            });
+            let stderr_ring = stderr_ring.clone();
+            tokio::spawn(drain_stderr(stderr, stderr_ring));
         }
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            stderr_ring,
+        })
     }
 
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    pub fn stderr_ring(&self) -> ProcessStderrRing {
+        self.stderr_ring.clone()
+    }
+
+    /// Install a known-value redactor when adopting an already-spawned child.
+    /// Existing retained lines are re-sanitized under the same lock used by the
+    /// drain, so no capture/adoption race can leave literal known values behind.
+    pub fn apply_stderr_redactor(&self, redactor: DiagnosticRedactor) {
+        self.stderr_ring.apply_redactor(redactor);
     }
 
     /// Task 8 reads stdout/stdin via this.
@@ -77,6 +308,54 @@ impl Supervised {
         }
         // Always reap to prevent zombies.
         let _ = self.child.wait().await;
+    }
+}
+
+/// Drain stderr without ever allocating in proportion to a peer-controlled
+/// logical line. `AsyncBufReadExt::lines` is deliberately avoided: it buffers
+/// until a newline and therefore lets a single unterminated record grow without
+/// bound. We retain at most `STDERR_LINE_MAX_BYTES`; longer records become a
+/// fixed redaction marker so a bridge-known credential cannot straddle the cap.
+async fn drain_stderr(mut stderr: ChildStderr, ring: ProcessStderrRing) {
+    let mut chunk = [0_u8; 4096];
+    let mut retained = Vec::with_capacity(STDERR_LINE_MAX_BYTES);
+    let mut line_started = false;
+    let mut oversized = false;
+
+    loop {
+        let read = match stderr.read(&mut chunk).await {
+            Ok(read) => read,
+            Err(_) => return,
+        };
+        if read == 0 {
+            if line_started {
+                if !oversized && retained.last() == Some(&b'\r') {
+                    retained.pop();
+                }
+                ring.push(String::from_utf8_lossy(&retained).into_owned(), oversized);
+            }
+            return;
+        }
+
+        for byte in &chunk[..read] {
+            if *byte == b'\n' {
+                if !oversized && retained.last() == Some(&b'\r') {
+                    retained.pop();
+                }
+                ring.push(String::from_utf8_lossy(&retained).into_owned(), oversized);
+                retained.clear();
+                line_started = false;
+                oversized = false;
+                continue;
+            }
+
+            line_started = true;
+            if retained.len() < STDERR_LINE_MAX_BYTES {
+                retained.push(*byte);
+            } else {
+                oversized = true;
+            }
+        }
     }
 }
 
@@ -148,6 +427,313 @@ mod tests {
             buf.contains("DONE"),
             "child never finished; stdout was {buf:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn stderr_cursor_excludes_older_process_lines() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let mut sup = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "echo old 1>&2; echo READY; read _; echo new-a 1>&2; echo new-b 1>&2; echo DONE",
+            ],
+            None,
+        )
+        .unwrap();
+        let ring = sup.stderr_ring();
+        let stdout = sup.child_mut().stdout.take().unwrap();
+        let mut stdout = BufReader::new(stdout).lines();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("READY"));
+
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(ring.snapshot_since(ring.origin()).line_count(), 1);
+        let cursor = ring.cursor();
+
+        sup.child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"continue\n")
+            .await
+            .unwrap();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("DONE"));
+        for _ in 0..100 {
+            if ring.snapshot_since(cursor).line_count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let snapshot = ring.snapshot_since(cursor);
+        assert_eq!(snapshot.line_count(), 2);
+        assert_eq!(snapshot.scope(), crate::diagnostics::StderrScope::Process);
+        assert_eq!(snapshot.retained_lines(), &["new-a", "new-b"]);
+    }
+
+    #[tokio::test]
+    async fn stderr_ring_is_bounded_and_debug_omits_text() {
+        let mut sup = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 80 ]; do echo secret-$i 1>&2; i=$((i+1)); done",
+            ],
+            None,
+        )
+        .unwrap();
+        let ring = sup.stderr_ring();
+        let _ = sup.child_mut().wait().await;
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 80 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let snapshot = ring.snapshot_since(ring.origin());
+        assert_eq!(snapshot.line_count(), 80, "count includes evicted lines");
+        assert_eq!(
+            snapshot.retained_lines().len(),
+            32,
+            "text ring stays bounded"
+        );
+        assert!(!format!("{ring:?}").contains("secret-"));
+        assert!(!format!("{snapshot:?}").contains("secret-"));
+    }
+
+    #[tokio::test]
+    async fn unterminated_oversized_stderr_record_stays_bounded_and_drains() {
+        use tokio::io::AsyncReadExt;
+
+        // Regression: `BufRead::lines()` allocates until a newline. This child
+        // writes a multi-megabyte record with no delimiter before its stdout
+        // sentinel; the drain must stay bounded and let the child finish.
+        let mut sup = Supervised::spawn(
+            "/bin/sh",
+            &["-c", "head -c 2097152 /dev/zero 1>&2; echo DONE"],
+            None,
+        )
+        .unwrap();
+        let ring = sup.stderr_ring();
+        let mut stdout = sup.child_mut().stdout.take().unwrap();
+        let mut text = String::new();
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_to_string(&mut text))
+            .await
+            .expect("bounded stderr drain must not block stdout")
+            .unwrap();
+        assert_eq!(text.trim(), "DONE");
+        let _ = sup.child_mut().wait().await;
+
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let snapshot = ring.snapshot_since(ring.origin());
+        assert_eq!(snapshot.line_count(), 1);
+        assert_eq!(snapshot.retained_lines(), &["[REDACTED LINE]"]);
+    }
+
+    #[tokio::test]
+    async fn stderr_is_sanitized_with_bridge_known_credentials_before_retention() {
+        const SECRET: &str = "bridge-known-secret-value";
+        let command = format!("echo auth={SECRET} 1>&2");
+        let mut sup = Supervised::spawn_with_stderr_redactor(
+            "/bin/sh",
+            &["-c", &command],
+            None,
+            DiagnosticRedactor::new([SECRET]),
+        )
+        .unwrap();
+        let ring = sup.stderr_ring();
+        let _ = sup.child_mut().wait().await;
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let snapshot = ring.snapshot_since(ring.origin());
+        assert_eq!(snapshot.line_count(), 1);
+        assert!(!snapshot.retained_lines()[0].contains(SECRET));
+        assert!(snapshot.retained_lines()[0].contains("[REDACTED KNOWN SECRET]"));
+    }
+
+    #[tokio::test]
+    async fn adopted_process_redacts_lines_captured_before_and_after_policy_install() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const SECRET: &str = "adopted-process-known-secret";
+        let mut sup = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "echo adopted-process-known-secret 1>&2; echo READY; read _; \
+                 echo adopted-process-known-secret 1>&2; echo DONE",
+            ],
+            None,
+        )
+        .unwrap();
+        let ring = sup.stderr_ring();
+        let stdout = sup.child_mut().stdout.take().unwrap();
+        let mut stdout = BufReader::new(stdout).lines();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("READY"));
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        sup.apply_stderr_redactor(DiagnosticRedactor::new([SECRET]));
+        sup.child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"continue\n")
+            .await
+            .unwrap();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("DONE"));
+        let _ = sup.child_mut().wait().await;
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let snapshot = ring.snapshot_since(ring.origin());
+        assert_eq!(snapshot.line_count(), 2);
+        assert!(snapshot
+            .retained_lines()
+            .iter()
+            .all(|line| !line.contains(SECRET) && line.contains("REDACTED KNOWN SECRET")));
+    }
+
+    #[tokio::test]
+    async fn metadata_only_retention_is_monotonic_across_policy_replacement() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const BEFORE: &str = "credential-before-metadata-only";
+        const AFTER: &str = "credential-after-policy-replacement";
+        let mut sup = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "echo credential-before-metadata-only 1>&2; echo READY; read _; \
+                 echo credential-after-policy-replacement 1>&2; echo DONE",
+            ],
+            None,
+        )
+        .unwrap();
+        let ring = sup.stderr_ring();
+        let stdout = sup.child_mut().stdout.take().unwrap();
+        let mut stdout = BufReader::new(stdout).lines();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("READY"));
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        ring.retain_metadata_only();
+        ring.apply_redactor(DiagnosticRedactor::default());
+        assert!(ring.is_metadata_only());
+        sup.child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"continue\n")
+            .await
+            .unwrap();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("DONE"));
+        let _ = sup.child_mut().wait().await;
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let snapshot = ring.snapshot_since(ring.origin());
+        assert_eq!(snapshot.line_count(), 2);
+        assert_eq!(
+            snapshot.retained_lines(),
+            &["[REDACTED LINE]", "[REDACTED LINE]"]
+        );
+        assert!(snapshot
+            .retained_lines()
+            .iter()
+            .all(|line| !line.contains(BEFORE) && !line.contains(AFTER)));
+    }
+
+    #[tokio::test]
+    async fn stderr_byte_boundary_and_invalid_utf8_are_bounded_and_valid() {
+        let exact = "x".repeat(STDERR_LINE_MAX_BYTES);
+        let oversized = "y".repeat(STDERR_LINE_MAX_BYTES + 1);
+        let command = format!(
+            "printf '%s\\n' '{exact}' 1>&2; printf '%s\\n' '{oversized}' 1>&2; \
+             printf '\\377invalid\\n' 1>&2"
+        );
+        let mut sup = Supervised::spawn("/bin/sh", &["-c", &command], None).unwrap();
+        let ring = sup.stderr_ring();
+        let _ = sup.child_mut().wait().await;
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let snapshot = ring.snapshot_since(ring.origin());
+        assert_eq!(snapshot.line_count(), 3);
+        assert_eq!(snapshot.retained_lines()[0].len(), STDERR_LINE_MAX_BYTES);
+        assert_eq!(snapshot.retained_lines()[1], "[REDACTED LINE]");
+        assert_eq!(snapshot.retained_lines()[2], "�invalid");
+        assert!(snapshot.retained_lines()[2].is_char_boundary(0));
+    }
+
+    #[tokio::test]
+    async fn concurrent_stderr_writers_remain_process_scoped() {
+        let mut sup = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "(i=0; while [ $i -lt 10 ]; do echo a-$i 1>&2; i=$((i+1)); done) & \
+                 (i=0; while [ $i -lt 10 ]; do echo b-$i 1>&2; i=$((i+1)); done) & wait",
+            ],
+            None,
+        )
+        .unwrap();
+        let ring = sup.stderr_ring();
+        let _ = sup.child_mut().wait().await;
+        for _ in 0..100 {
+            if ring.snapshot_since(ring.origin()).line_count() == 20 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let snapshot = ring.snapshot_since(ring.origin());
+        assert_eq!(snapshot.line_count(), 20);
+        assert_eq!(snapshot.scope(), crate::diagnostics::StderrScope::Process);
+        assert!(snapshot
+            .retained_lines()
+            .iter()
+            .any(|line| line.starts_with("a-")));
+        assert!(snapshot
+            .retained_lines()
+            .iter()
+            .any(|line| line.starts_with("b-")));
     }
 
     #[tokio::test]

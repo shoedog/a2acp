@@ -387,6 +387,14 @@ fn acp_spawn_inputs(
         name,
         reap_fn: bridge_core::reaper::production_reap_fn(),
     });
+    // MCP environment values are already held by the bridge and can be echoed
+    // by an adapter error. Treat them as credential-shaped diagnostic inputs;
+    // mounted auth files remain out of scope and are deliberately not read just
+    // to expand the redaction set.
+    let mut mcp_redaction_values = bridge_core::mcp::env_redaction_values(&entry.mcp, &cwd_str);
+    mcp_redaction_values.extend(bridge_core::mcp::env_redaction_values(&entry.mcp, &mcp_cwd));
+    let diagnostic_redactor =
+        bridge_core::diagnostics::DiagnosticRedactor::new(mcp_redaction_values);
     let acp = bridge_acp::acp_backend::AcpConfig {
         agent_id: entry.id.as_str().to_string(),
         cwd,
@@ -396,6 +404,7 @@ fn acp_spawn_inputs(
         pre_authenticated: entry.pre_authenticated,
         container,
         watchdog: entry.watchdog.clone(),
+        diagnostic_redactor,
         // ACP-param MCP delivery (claude): the entry's MCP servers ride `session/new`. Codex/kiro
         // native delivery leaves this empty (they get MCP via their native channel, not the param).
         mcp: if matches!(entry.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
@@ -747,8 +756,8 @@ fn validate_worktree_runtime_cfg(cfg: &RegistryConfig) -> Result<(), String> {
 
 /// The production observer-aware spawn factory (Acp compose-or-raw / Api / ContainerRw arms) — shared by
 /// run-workflow and the `implement` subcommand so their registry builds can't drift.
-/// `owner_config_path` seeds the ContainerRw owner token. R2b2b consumes the observer in each adapter;
-/// R2b2a establishes the production ownership path without changing adapter behavior yet.
+/// `owner_config_path` seeds the ContainerRw owner token. R2b2b consumes the observer in ACP; R2b3
+/// completes API and ContainerRw observation through the same ownership path.
 fn make_spawn_fn(
     policy_for_spawn: Arc<dyn bridge_core::ports::PolicyEngine>,
     owner_config_path: PathBuf,
@@ -757,7 +766,7 @@ fn make_spawn_fn(
     perm_timeout_ms: u64,
     worktree_cfg: Option<WorktreeRuntimeCfg>,
 ) -> ObservedSpawnFn {
-    Arc::new(move |entry: Arc<AgentEntry>, _observer| {
+    Arc::new(move |entry: Arc<AgentEntry>, observer| {
         let policy = Arc::clone(&policy_for_spawn);
         let owner_config_path = owner_config_path.clone();
         let run = run.clone();
@@ -787,10 +796,11 @@ fn make_spawn_fn(
                     let (program, argv, acp) =
                         acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)?;
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    let mut be =
-                        bridge_acp::acp_backend::AcpBackend::spawn(&program, &argv_ref, acp)
-                            .await?
-                            .with_policy(policy);
+                    let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed(
+                        &program, &argv_ref, acp, observer,
+                    )
+                    .await?
+                    .with_policy(policy);
                     if let Some(reg) = permission_registry.clone() {
                         be = be
                             .with_permission_registry(reg)
@@ -6744,6 +6754,54 @@ mod cli_tests {
         let wd = acp.watchdog.as_ref().expect("watchdog is forwarded");
         assert_eq!(wd.idle_timeout, std::time::Duration::from_secs(30));
         assert_eq!(wd.hard_wall_clock, std::time::Duration::from_secs(600));
+    }
+
+    #[test]
+    fn acp_spawn_inputs_threads_bridge_known_mcp_env_into_diagnostic_redactor() {
+        const SECRET: &str = "bridge-known-mcp-secret";
+        let mut entry = acp_entry("reader-redaction");
+        entry.mcp = vec![bridge_core::mcp::McpServerSpec {
+            name: "private-mcp".into(),
+            command: "/bin/true".into(),
+            args: vec![],
+            env: vec![
+                ("PRIVATE_TOKEN".into(), SECRET.into()),
+                ("TEMPLATED_TOKEN".into(), "alpha{cwd}omega".into()),
+            ],
+        }];
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run-redaction".into(),
+            host: "h".into(),
+            lease: "/l/run-redaction.lock".into(),
+            start: "0".into(),
+        };
+
+        let cwd = std::path::PathBuf::from("/tmp");
+        let raw_cwd = cwd.to_string_lossy().into_owned();
+        let effective_cwd = std::fs::canonicalize(&cwd)
+            .unwrap_or(cwd.clone())
+            .to_string_lossy()
+            .into_owned();
+        let (_, _, acp) =
+            acp_spawn_inputs(&entry, cwd, std::path::Path::new("/cfg/a2a.toml"), &run).unwrap();
+        let sanitized = acp
+            .diagnostic_redactor
+            .sanitize_stderr_line(&format!("adapter echoed {SECRET}"), 512);
+        assert!(!sanitized.contains(SECRET));
+        assert!(sanitized.contains("REDACTED KNOWN SECRET"));
+        for expanded in [
+            format!("alpha{raw_cwd}omega"),
+            format!("alpha{effective_cwd}omega"),
+        ] {
+            let sanitized = acp
+                .diagnostic_redactor
+                .sanitize_stderr_line(&format!("adapter echoed {expanded}"), 512);
+            assert!(
+                !sanitized.contains(&expanded),
+                "each value delivered after {{cwd}} substitution must be redacted"
+            );
+            assert!(sanitized.contains("REDACTED KNOWN SECRET"));
+        }
     }
 
     fn acp_entry(id: &str) -> AgentEntry {
