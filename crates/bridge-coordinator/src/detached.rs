@@ -1,7 +1,7 @@
 // reattach.rs — per-task in-memory broadcast hub + wire types for streaming reattach.
 // Consumed by Task 4 (DetachedProgressSink publishes) and Tasks 7-9 (SubscribeToTask reads).
 
-use bridge_core::orch::{OrchEventKind, PlanEntry};
+use bridge_core::orch::{OrchEventKind, PlanEntry, TerminalStatus};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -95,8 +95,33 @@ pub struct WorkflowProgressFrame {
     pub kind: FrameKind,
 }
 
-pub fn frame_from_orch(kind: &OrchEventKind, phase: Phase, seq: i64) -> WorkflowProgressFrame {
+pub fn project_orch_frame(
+    kind: &OrchEventKind,
+    phase: Phase,
+    seq: i64,
+) -> Option<WorkflowProgressFrame> {
     let kind = match kind {
+        OrchEventKind::NodeStarted { node } => FrameKind::NodeStarted { node: node.clone() },
+        OrchEventKind::NodeFinished {
+            node,
+            ok,
+            output,
+            usage,
+        } => FrameKind::NodeFinished {
+            node: node.clone(),
+            ok: *ok,
+            output: output.clone(),
+            usage: usage.clone(),
+        },
+        OrchEventKind::Terminal { status, output } => FrameKind::Terminal {
+            outcome: match status {
+                TerminalStatus::Completed => TerminalOutcome::Completed,
+                TerminalStatus::Failed { .. } => TerminalOutcome::Failed,
+                TerminalStatus::Canceled => TerminalOutcome::Canceled,
+            },
+            output: output.clone(),
+        },
+        OrchEventKind::Progress { .. } | OrchEventKind::Usage { .. } => return None,
         OrchEventKind::Plan { entries } => FrameKind::Plan {
             entries: entries.clone(),
         },
@@ -130,15 +155,14 @@ pub fn frame_from_orch(kind: &OrchEventKind, phase: Phase, seq: i64) -> Workflow
             locations: locations.clone(),
             content_preview: content.as_ref().map(|c| c.preview.clone()),
         },
-        _ => unreachable!("frame_from_orch only accepts rich orchestration events"),
     };
 
-    WorkflowProgressFrame {
+    Some(WorkflowProgressFrame {
         v: 1,
         seq,
         phase,
         kind,
-    }
+    })
 }
 
 /// Per-task in-memory broadcast hub. Wraps a `tokio::sync::broadcast` channel so
@@ -414,8 +438,11 @@ impl RichEventSink for DetachedRichSink {
                 .await
             {
                 Ok(seq) => {
-                    self.hub
-                        .publish(crate::detached::frame_from_orch(&kind, Phase::Live, seq))
+                    if let Some(frame) =
+                        crate::detached::project_orch_frame(&kind, Phase::Live, seq)
+                    {
+                        self.hub.publish(frame);
+                    }
                 }
                 Err(e) => {
                     if first_err.is_none() {
@@ -965,6 +992,65 @@ mod sink_tests {
             rx.try_recv().is_err(),
             "no frame may be published after the write failure (no-publish-on-error)"
         );
+    }
+
+    #[tokio::test]
+    async fn detached_rich_sink_persists_diagnostic_without_live_frame() {
+        use bridge_core::diagnostics::{
+            DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor, PersistedPhaseTransition,
+            PersistedPhaseTransitionInput, PhaseStatus,
+        };
+        use bridge_core::ids::OperationId;
+        use bridge_core::orch::{OrchEventKind, ProgressPayload};
+        use bridge_core::ports::RichEventSink;
+        use bridge_core::task_store::{MemoryTaskStore, TaskStore};
+
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let task = TaskId::parse("t-diagnostic-live").unwrap();
+        store
+            .create(&make_task_record("t-diagnostic-live"))
+            .await
+            .unwrap();
+        let hub = Arc::new(TaskProgressHub::new());
+        let mut receiver = hub.subscribe();
+        let sink = DetachedRichSink {
+            store: store.clone(),
+            task: task.clone(),
+            op: OperationId::parse("op-t-diagnostic-live").unwrap(),
+            hub,
+            queue: std::sync::Mutex::new(VecDeque::new()),
+        };
+        let diagnostic = DiagnosticEvent::new(
+            PersistedPhaseTransition::build(
+                PersistedPhaseTransitionInput {
+                    phase: DiagnosticPhase::Initialize,
+                    status: PhaseStatus::Started,
+                    at_ms: 42,
+                    operation: None,
+                    code: Some("acp.initialize.started".into()),
+                    auth: None,
+                },
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+        sink.record(OrchEventKind::Progress {
+            progress: ProgressPayload::diagnostic(diagnostic),
+        });
+        sink.record(OrchEventKind::Plan { entries: vec![] });
+        sink.flush().await.unwrap();
+
+        let events = store.journal_from(&task, -1).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].kind, OrchEventKind::Progress { .. }));
+        assert!(matches!(events[1].kind, OrchEventKind::Plan { .. }));
+
+        let frame = receiver.try_recv().unwrap();
+        assert!(matches!(frame.kind, FrameKind::Plan { .. }));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2374,8 +2460,8 @@ mod frame_tests {
     }
 
     #[test]
-    fn frame_from_orch_rich() {
-        let f = frame_from_orch(
+    fn project_orch_frame_rich() {
+        let f = project_orch_frame(
             &OrchEventKind::ToolCall {
                 tool_call_id: "t1".into(),
                 title: "x".into(),
@@ -2389,13 +2475,73 @@ mod frame_tests {
             },
             Phase::Live,
             5,
-        );
+        )
+        .unwrap();
         let j = serde_json::to_value(&f).unwrap();
         assert_eq!(j["kind"], "tool_call");
         assert_eq!(j["tool_kind"], "read");
         assert_eq!(j["content_preview"], "p");
         assert_eq!(f.seq, 5);
-        let pf = frame_from_orch(&OrchEventKind::Plan { entries: vec![] }, Phase::Live, 6);
+        let pf =
+            project_orch_frame(&OrchEventKind::Plan { entries: vec![] }, Phase::Live, 6).unwrap();
         assert!(matches!(pf.kind, FrameKind::Plan { .. }));
+    }
+
+    #[test]
+    fn diagnostic_progress_is_journal_only_and_projection_is_total() {
+        use bridge_core::diagnostics::{
+            DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor, PersistedPhaseTransition,
+            PersistedPhaseTransitionInput, PhaseStatus,
+        };
+
+        let diagnostic = DiagnosticEvent::new(
+            PersistedPhaseTransition::build(
+                PersistedPhaseTransitionInput {
+                    phase: DiagnosticPhase::Initialize,
+                    status: PhaseStatus::Started,
+                    at_ms: 42,
+                    operation: None,
+                    code: Some("acp.initialize.started".into()),
+                    auth: None,
+                },
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let progress = OrchEventKind::Progress {
+            progress: bridge_core::orch::ProgressPayload::diagnostic(diagnostic),
+        };
+
+        assert!(project_orch_frame(&progress, Phase::Live, 1).is_none());
+        assert!(project_orch_frame(&progress, Phase::Snapshot, 1).is_none());
+
+        let node = project_orch_frame(
+            &OrchEventKind::NodeStarted {
+                node: "next".into(),
+            },
+            Phase::Live,
+            2,
+        )
+        .unwrap();
+        assert!(matches!(node.kind, FrameKind::NodeStarted { .. }));
+
+        let terminal = project_orch_frame(
+            &OrchEventKind::Terminal {
+                status: TerminalStatus::Completed,
+                output: "done".into(),
+            },
+            Phase::Live,
+            3,
+        )
+        .unwrap();
+        assert!(matches!(
+            terminal.kind,
+            FrameKind::Terminal {
+                outcome: TerminalOutcome::Completed,
+                ..
+            }
+        ));
     }
 }

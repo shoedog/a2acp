@@ -268,6 +268,27 @@ pub enum FailureClass {
 pub fn classify_failure(e: &BridgeError) -> FailureClass {
     match e {
         BridgeError::AgentCrashed { .. } => FailureClass::AgentCrashed,
+        BridgeError::AgentFailure { diagnostic } => match diagnostic.class() {
+            crate::diagnostics::DiagnosticFailureClass::Config
+            | crate::diagnostics::DiagnosticFailureClass::Authentication
+            | crate::diagnostics::DiagnosticFailureClass::Model => FailureClass::Config,
+            crate::diagnostics::DiagnosticFailureClass::Protocol
+            | crate::diagnostics::DiagnosticFailureClass::Transport => FailureClass::Transport,
+            crate::diagnostics::DiagnosticFailureClass::AgentProcess
+            | crate::diagnostics::DiagnosticFailureClass::ContainerRuntime
+            | crate::diagnostics::DiagnosticFailureClass::ContainerImage
+            | crate::diagnostics::DiagnosticFailureClass::ContainerNetwork
+            | crate::diagnostics::DiagnosticFailureClass::ContainerMount
+            | crate::diagnostics::DiagnosticFailureClass::ContainerCredentials => {
+                FailureClass::AgentCrashed
+            }
+            crate::diagnostics::DiagnosticFailureClass::Timeout => FailureClass::TimedOut,
+            crate::diagnostics::DiagnosticFailureClass::Overloaded
+            | crate::diagnostics::DiagnosticFailureClass::ProviderLimit => FailureClass::Overloaded,
+            crate::diagnostics::DiagnosticFailureClass::Persistence
+            | crate::diagnostics::DiagnosticFailureClass::Canceled
+            | crate::diagnostics::DiagnosticFailureClass::Unknown => FailureClass::Other,
+        },
         BridgeError::AgentTimedOut | BridgeError::CancelTimeout => FailureClass::TimedOut,
         BridgeError::AgentOverloaded => FailureClass::Overloaded,
         BridgeError::ConfigMismatch { .. }

@@ -3,7 +3,7 @@
 - **Program status:** active P0
 - **R2b0 contract baseline:** `main` at `11ebc402` on 2026-07-11
 - **Completed through:** R2b0 structured-diagnostics contract
-- **Next action:** start R2b1 diagnostic foundation and rollback-safe persistence surface
+- **Next action:** merge the approved R2b1 foundation, then advance the cursor to R2b2
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -42,7 +42,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R1 — Fable isolation | **MERGED** | [R1 disposition](superpowers/2026-07-11-fable-r1-disposition.md) | Host and reader controls dispositioned. |
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
-| R2b1 — diagnostic foundation | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | **Next:** types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
+| R2b1 — diagnostic foundation | **IN REVIEW** (APPROVED; merge pending) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
 | R2b2–R2b3 — lifecycle and API diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Two independently reviewed implementation PRs after R2b1. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
@@ -177,7 +177,7 @@ Next action:
 - A fresh bridge-mediated Fable/xhigh review returned `R2A: READY`, `V6 DESIGN: READY`, `MERGE`.
 - The Podman bare image-id normalization and non-vacuous descendant survivor-marker regression were
   folded after that review and revalidated by the full local gate set.
-- No R2b production code exists yet.
+- R2b1 foundation code is additive; no production failure site constructs `AgentFailure` yet.
 - R2b0 design v13 landed from `agent/reliability-r2b0-contract`. The first Sol/max review returned `REVISE`:
   cold resolution preceded the named owners, direct correlation ids lacked durable task rows, diagnostic
   observation collided with the existing rich-event method, two warm-reconcile debug sinks were omitted,
@@ -197,5 +197,29 @@ Next action:
 - R2b0 local gates passed: Markdown links, `git diff --check`, fmt, workspace check, clippy with warnings
   denied, **1,607 passed / 0 failed / 12 ignored**, release binary build, and repository hygiene (37
   tracked artifacts / 7 example configs). The approved contract was fast-forwarded to `origin/main` at
-  `11ebc402`. Create `agent/reliability-r2b1-diagnostic-foundation` from current `origin/main`; do not
-  combine R2b1 with production error-site migration.
+  `11ebc402`.
+- R2b1 is implemented on `agent/reliability-r2b1-diagnostic-foundation`: private validated diagnostic
+  DTOs, static `AgentFailure` formatting with typed retry behavior, optional rollback-compatible progress
+  diagnostics, total live/snapshot projection, and Memory/SQLite journal coverage. No production failure
+  site constructs `AgentFailure`; the source guard enforces that boundary.
+- R2b1's first bridge-mediated Sol/xhigh review returned `REVISE`: dynamic diagnostic progress text,
+  mixed-case URL queries, unbounded reset timestamps, and contradictory stderr counts were constructible;
+  live/reattach path coverage, exact mapping assertions, and the source guard were too weak. All seven
+  are folded with focused regressions; clippy is clean with warnings denied; the full workspace suite
+  passed **1,629 / 0 / 12 ignored**; release build and repository hygiene passed (37 tracked artifacts /
+  7 example configs). The first closure re-review marked six `FIXED`, the AST guard `PARTIAL`, and found
+  two new `WRONG` invariant gaps: post-barrier container fallback and retryable fatal classes. Those three
+  are folded with an exact class/phase/barrier matrix and alias/cfg-aware guard regressions. Clippy is
+  clean with warnings denied and the full workspace suite passed **1,630 / 0 / 12 ignored**. Rebuild the
+  release binary and hygiene passed. The third fresh review marked both typed invariants `FIXED`, kept the
+  guard `PARTIAL`, and found failed-clock reset validation could accept an unbounded timestamp. The guard
+  now scans and counts the exact central `error.rs` builder, and reset metadata rejects a missing/invalid
+  reference clock. The fourth fresh review marked both `FIXED`, found no new `WRONG`, and requested direct
+  negative/overflow reference-time tests; those now cover reset-bearing rejection and reset-free
+  acceptance. The exact final code-and-test tree passed fmt, clippy with warnings denied, and the full
+  workspace suite at **1,630 passed / 0 failed / 12 ignored**. The release build and repository hygiene
+  gate also passed (37 tracked artifacts / 7 example configs); production code was unchanged after those
+  two gates. The final bounded Sol/xhigh test-closure review marked the last `SMELL` `FIXED`, found no new
+  `WRONG` or `SMELL` findings across the named closed surfaces, and returned `APPROVE`. R2b1 is merge-ready.
+- The 12 ignored tests are authenticated real-agent/two-bridge and local Ollama coverage; no live R2c
+  billable smoke was run in R2b1.

@@ -2654,7 +2654,9 @@ mod tests {
                 &task,
                 &op,
                 10,
-                OrchEventKind::Progress { text: "one".into() },
+                OrchEventKind::Progress {
+                    progress: crate::orch::ProgressPayload::legacy("one"),
+                },
             )
             .await
             .unwrap();
@@ -2663,7 +2665,9 @@ mod tests {
                 &task,
                 &op,
                 11,
-                OrchEventKind::Progress { text: "two".into() },
+                OrchEventKind::Progress {
+                    progress: crate::orch::ProgressPayload::legacy("two"),
+                },
             )
             .await
             .unwrap();

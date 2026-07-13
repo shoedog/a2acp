@@ -57,6 +57,10 @@ pub enum BridgeError {
     MessageTooLarge,
     #[error("agent crashed: {reason}")]
     AgentCrashed { reason: String },
+    #[error("agent crashed")]
+    AgentFailure {
+        diagnostic: Box<crate::diagnostics::FailureDiagnostic>,
+    },
     #[error("agent overloaded")]
     AgentOverloaded,
     #[error("upstream a2a error")]
@@ -83,6 +87,14 @@ impl BridgeError {
         }
     }
 
+    /// Construct a structured agent failure without inflating every
+    /// `Result<_, BridgeError>` with the bounded diagnostic record.
+    pub fn agent_failure(diagnostic: crate::diagnostics::FailureDiagnostic) -> Self {
+        BridgeError::AgentFailure {
+            diagnostic: Box::new(diagnostic),
+        }
+    }
+
     /// Construct a `ConfigInvalid` carrying the operator-facing reason while
     /// keeping [`Self::client_message`] redacted to a static category.
     pub fn config_invalid(reason: impl Into<String>) -> Self {
@@ -100,7 +112,9 @@ impl BridgeError {
     /// keep their `Display` because it's both safe and helpful to the caller.
     pub fn client_message(&self) -> String {
         match self {
-            BridgeError::AgentCrashed { .. } => "agent crashed".to_string(),
+            BridgeError::AgentCrashed { .. } | BridgeError::AgentFailure { .. } => {
+                "agent crashed".to_string()
+            }
             BridgeError::ConfigInvalid { .. } => "invalid config".to_string(),
             other => other.to_string(),
         }
@@ -139,12 +153,17 @@ impl BridgeError {
     /// classifier (`resilient.rs`, deliberately different). Everything else needs human/config action,
     /// indicates a protocol/state/persistence bug, or is user intent (cancel) → fail fast.
     pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            BridgeError::AgentFailure { diagnostic } => match diagnostic.disposition() {
+                crate::diagnostics::FailureDisposition::Fatal => false,
+                crate::diagnostics::FailureDisposition::RetrySameTarget => true,
+                crate::diagnostics::FailureDisposition::ContainerFallbackCandidate => false,
+            },
             BridgeError::AgentCrashed { .. }
-                | BridgeError::AgentOverloaded
-                | BridgeError::AgentTimedOut
-        )
+            | BridgeError::AgentOverloaded
+            | BridgeError::AgentTimedOut => true,
+            _ => false,
+        }
     }
 }
 

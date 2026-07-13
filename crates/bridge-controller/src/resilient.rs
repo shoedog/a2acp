@@ -18,6 +18,13 @@ pub enum Death {
 pub fn classify_death(e: &BridgeError) -> Death {
     use BridgeError::*;
     match e {
+        AgentFailure { diagnostic } => match diagnostic.disposition() {
+            bridge_core::diagnostics::FailureDisposition::Fatal => Death::Fatal,
+            bridge_core::diagnostics::FailureDisposition::RetrySameTarget => Death::Transient,
+            bridge_core::diagnostics::FailureDisposition::ContainerFallbackCandidate => {
+                Death::Fatal
+            }
+        },
         AgentCrashed { .. } | AgentOverloaded | SessionNotFound | CancelTimeout | FrameError => {
             Death::Transient
         }
@@ -167,6 +174,7 @@ mod tests {
             BridgeError::FrameError => "FrameError",
             BridgeError::MessageTooLarge => "MessageTooLarge",
             BridgeError::AgentCrashed { .. } => "AgentCrashed",
+            BridgeError::AgentFailure { .. } => "AgentFailure",
             BridgeError::AgentOverloaded => "AgentOverloaded",
             BridgeError::UpstreamA2aError => "UpstreamA2aError",
             BridgeError::StoreFailure => "StoreFailure",
@@ -183,6 +191,40 @@ mod tests {
 
     #[test]
     fn classify_death_table_is_exhaustive() {
+        use bridge_core::diagnostics::{
+            DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+            FailureDiagnosticInput, FailureDisposition,
+        };
+
+        let structured = |disposition| {
+            BridgeError::agent_failure(
+                FailureDiagnostic::build(
+                    FailureDiagnosticInput {
+                        failed_phase: DiagnosticPhase::Initialize,
+                        last_completed_phase: Some(DiagnosticPhase::Spawn),
+                        class: if disposition == FailureDisposition::ContainerFallbackCandidate {
+                            DiagnosticFailureClass::ContainerRuntime
+                        } else {
+                            DiagnosticFailureClass::Transport
+                        },
+                        disposition,
+                        code: "acp.initialize.transport".into(),
+                        summary: "failed".into(),
+                        causes: vec![],
+                        stderr_observed: false,
+                        stderr_line_count: 0,
+                        stderr_scope: None,
+                        stderr_tail: None,
+                        stderr_redaction: None,
+                        retry_after_ms: None,
+                        reset_at_ms: None,
+                        prompt_may_have_been_accepted: false,
+                    },
+                    &DiagnosticRedactor::default(),
+                )
+                .unwrap(),
+            )
+        };
         let cases = vec![
             (BridgeError::A2aVersionMismatch, Death::Fatal),
             (BridgeError::InvalidRequest { field: "x" }, Death::Fatal),
@@ -208,6 +250,15 @@ mod tests {
             (BridgeError::FrameError, Death::Transient),
             (BridgeError::MessageTooLarge, Death::Fatal),
             (BridgeError::agent_crashed("x"), Death::Transient),
+            (structured(FailureDisposition::Fatal), Death::Fatal),
+            (
+                structured(FailureDisposition::RetrySameTarget),
+                Death::Transient,
+            ),
+            (
+                structured(FailureDisposition::ContainerFallbackCandidate),
+                Death::Fatal,
+            ),
             (BridgeError::AgentOverloaded, Death::Transient),
             (BridgeError::UpstreamA2aError, Death::Fatal),
             (BridgeError::StoreFailure, Death::Fatal),

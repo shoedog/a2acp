@@ -1989,11 +1989,11 @@ fn rich_snapshot_frames(
     for event in events {
         match &event.kind {
             bridge_core::orch::OrchEventKind::Plan { .. } => {
-                latest_plan = Some(crate::reattach::frame_from_orch(
+                latest_plan = crate::reattach::project_orch_frame(
                     &event.kind,
                     crate::reattach::Phase::Snapshot,
                     event.seq,
-                ));
+                );
             }
             bridge_core::orch::OrchEventKind::ToolCall {
                 tool_call_id,
@@ -2068,7 +2068,7 @@ fn rich_snapshot_frames(
         frames.push(frame);
     }
 
-    frames.extend(tool_calls.into_values().map(|tool| {
+    frames.extend(tool_calls.into_values().filter_map(|tool| {
         let kind = if let Some(base) = tool.base {
             bridge_core::orch::OrchEventKind::ToolCall {
                 tool_call_id: base.tool_call_id,
@@ -2088,7 +2088,7 @@ fn rich_snapshot_frames(
                 content: tool.patch.content,
             }
         };
-        crate::reattach::frame_from_orch(&kind, crate::reattach::Phase::Snapshot, tool.last_seq)
+        crate::reattach::project_orch_frame(&kind, crate::reattach::Phase::Snapshot, tool.last_seq)
     }));
 
     frames.sort_by_key(|frame| frame.seq);
@@ -5640,7 +5640,9 @@ mod tests {
                     &task,
                     &op,
                     10,
-                    bridge_core::orch::OrchEventKind::Progress { text: "one".into() },
+                    bridge_core::orch::OrchEventKind::Progress {
+                        progress: bridge_core::orch::ProgressPayload::legacy("one"),
+                    },
                 )
                 .await
                 .unwrap();
@@ -5748,7 +5750,7 @@ mod tests {
                     &op,
                     10,
                     bridge_core::orch::OrchEventKind::Progress {
-                        text: "large".repeat(64),
+                        progress: bridge_core::orch::ProgressPayload::legacy("large".repeat(64)),
                     },
                 )
                 .await
@@ -5794,7 +5796,7 @@ mod tests {
                         &op,
                         10,
                         bridge_core::orch::OrchEventKind::Progress {
-                            text: message.into(),
+                            progress: bridge_core::orch::ProgressPayload::legacy(message),
                         },
                     )
                     .await
@@ -12442,6 +12444,81 @@ mod tests {
         let value = serde_json::to_value(tool_frame).unwrap();
         assert_eq!(value["status"], "completed");
         assert_eq!(value["content_preview"], "opening");
+    }
+
+    #[tokio::test]
+    async fn rich_snapshot_omits_diagnostic_and_projects_later_frames() {
+        use bridge_core::diagnostics::{
+            DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor, PersistedPhaseTransition,
+            PersistedPhaseTransitionInput, PhaseStatus,
+        };
+        use bridge_core::orch::{OrchEventKind, ProgressPayload};
+
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task = bridge_core::ids::TaskId::parse("task-diagnostic-snapshot").unwrap();
+        store
+            .create(&working_record("task-diagnostic-snapshot"))
+            .await
+            .unwrap();
+        let operation = operation_id_for_task(&task);
+        let node = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        let diagnostic = DiagnosticEvent::new(
+            PersistedPhaseTransition::build(
+                PersistedPhaseTransitionInput {
+                    phase: DiagnosticPhase::Initialize,
+                    status: PhaseStatus::Started,
+                    at_ms: now,
+                    operation: None,
+                    code: Some("acp.initialize.started".into()),
+                    auth: None,
+                },
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let diagnostic_seq = store
+            .record_event_sequenced(
+                &task,
+                &operation,
+                now,
+                OrchEventKind::Progress {
+                    progress: ProgressPayload::diagnostic(diagnostic),
+                },
+            )
+            .await
+            .unwrap();
+        let plan_seq = store
+            .record_event_sequenced(
+                &task,
+                &operation,
+                now,
+                OrchEventKind::Plan { entries: vec![] },
+            )
+            .await
+            .unwrap();
+        let node_seq = store
+            .put_node_checkpoint_sequenced(&task, &node, &operation, "done", true, now, None)
+            .await
+            .unwrap();
+        assert_eq!((diagnostic_seq, plan_seq, node_seq), (1, 2, 3));
+
+        let inputs = store.journal_fold_inputs(&task).await.unwrap();
+        assert!(matches!(
+            inputs.events[0].kind,
+            OrchEventKind::Progress { .. }
+        ));
+        let snapshot =
+            bridge_core::task_store::fold_journal_to_snapshot(&inputs.events, &inputs.scalars)
+                .unwrap();
+        let frames = rich_snapshot_frames(&snapshot, &inputs.events, None);
+        assert_eq!(
+            snapshot_tags(&frames),
+            vec![(2, "plan".into()), (3, "node_finished".into())]
+        );
     }
 
     /// (8a) Terminal task with 2 checkpoints (seqs 1, 2) + terminal_seq 3, no cursor.

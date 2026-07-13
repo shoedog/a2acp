@@ -1,6 +1,6 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v13)
 
-- **Status:** R2a and R2b0 merged; v13 is the design of record for R2b1–R2b3
+- **Status:** R2a and R2b0 merged; R2b1 APPROVED with merge pending; v13 is the design of record for R2b1–R2b3
 - **Date:** 2026-07-11
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`
@@ -299,6 +299,44 @@ remint window and a worktree retirement race. V13 closes both:
 
 The fresh Sol/xhigh v13 re-review adjudicated both findings `FIXED`, found no new issues, and returned
 `APPROVE`.
+
+The first bridge-mediated Sol/xhigh R2b1 implementation review returned `REVISE` with four `WRONG` and
+three `SMELL` findings. The implementation folds all seven before re-review:
+
+| Finding | R2b1 disposition |
+|---|---|
+| **WRONG:** public diagnostic `Progress.text` can persist arbitrary text | Keep the legacy wire fields, but flatten one opaque private `ProgressPayload`; its diagnostic constructor and deserializer require the exact static text. |
+| **WRONG:** URL redaction recognizes only lowercase schemes | Match HTTP/HTTPS schemes case-insensitively in both builder and deserialization paths, with mixed-case regressions. |
+| **WRONG:** `reset_at_ms` accepts an unbounded future timestamp | Validate against injected `build_at` reference time; normal build/deserialization use wall-clock time and reject more than 30 days ahead. |
+| **WRONG:** retained stderr can exceed the observed line count | Reject contradictory evidence before applying the 32-line retention cap. |
+| **SMELL:** projection tests call only the projector | Exercise diagnostic then normal events through `DetachedRichSink::flush`/hub and through persisted reattach snapshot folding. |
+| **SMELL:** exhaustive mapping tests accept any result | Assert the exact class-to-metric and disposition-to-warm-death table for every variant. |
+| **SMELL:** the production-constructor guard is line based | Parse every production source tree with a test-only `syn` AST visitor, skipping `cfg(test)` items and allowing only the central builder. |
+
+The fresh Sol/xhigh closure re-review adjudicated the first six items `FIXED`, the constructor guard
+`PARTIAL`, and returned `REVISE` for two new typed-invariant failures. The next fold closes all three:
+
+| Finding | Further R2b1 disposition |
+|---|---|
+| **SMELL:** aliases and production-capable `cfg` expressions can bypass the AST guard | Reject forbidden imports/renames, expression paths, struct expressions, and macro tokens; skip an item only when its `cfg` is provably false with `test=false`; cover aliases, `cfg(test)`, `cfg(not(test))`, and `cfg(any(test, feature=...))`. |
+| **WRONG:** `PromptStream` with a false barrier can become a container fallback candidate | Require `prompt_stream`/`prompt_finish` to carry the accepted-work barrier and require every fallback candidate to fail in a pre-prompt phase. Construction and deserialization share the validator. |
+| **WRONG:** fatal classes such as authentication can be marked retryable | Use a closed matrix: only pre-prompt `transport`, `agent_process`, `timeout`, or explicitly classified `overloaded` may carry `RetrySameTarget`; all other classes are fatal. |
+
+The third fresh Sol/xhigh review adjudicated both typed-invariant findings `FIXED`, kept the guard
+`PARTIAL`, found one clock-edge `WRONG`, and returned `REVISE`. The final fold is:
+
+| Finding | Final R2b1 disposition |
+|---|---|
+| **SMELL:** the guard excludes all of `error.rs` and treats arbitrary namespaced `*::test` attributes as test-only | Scan `error.rs`, allow and count exactly one struct expression inside the named central builder, reject every other constructor, and treat only plain `#[test]` or a `cfg` provably false with `test=false` as test-only. |
+| **WRONG:** failed wall-clock acquisition substitutes `i64::MAX`, making the reset horizon unbounded | Make reference-time acquisition optional/fallible; reject reset metadata when no valid reference or checked 30-day horizon exists, while diagnostics without reset metadata remain constructible. |
+
+The fourth fresh Sol/xhigh review adjudicated both findings `FIXED`, found no new `WRONG`, and returned
+`REVISE` for one test-coverage `SMELL`: negative and checked-overflow reference times were not invoked
+directly. The final test fold exercises reset-bearing rejection and reset-free acceptance for both
+`Some(-1)` and `Some(i64::MAX)`.
+
+The final bounded Sol/xhigh test-closure review adjudicated that remaining `SMELL` `FIXED`, found no
+new `WRONG` or `SMELL` findings across the named closed surfaces, and returned `APPROVE`.
 
 ## Stable lifecycle phase vocabulary
 
@@ -779,11 +817,21 @@ text; the opt-in test must call encoded/transformed-secret handling `best_effort
 Do not add an `OrchEventKind` variant. Extend the existing `Progress` struct variant so old readers keep
 matching `kind="progress"` and ignore the unknown optional field:
 
-```rust
+The rollback wire contract remains exactly:
+
+```text
 Progress {
     text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     diagnostic: Option<DiagnosticEvent>,
+}
+```
+
+The Rust representation prevents callers from creating a diagnostic-bearing row with dynamic text:
+
+```rust
+Progress {
+    #[serde(flatten)]
+    progress: ProgressPayload, // private fields; legacy(...) or diagnostic(...)
 }
 
 pub struct DiagnosticEvent {
@@ -813,8 +861,9 @@ Rules:
   Any dynamic transition field passes the same bridge-known credential set, bounds, marker/URL scan, and
   adjacency-safe record guard before the DTO can implement `Serialize`.
   `DiagnosticCode` is limited to a 64-byte bridge-owned `[a-z0-9._-]` token; `DiagnosticOperation` and
-  `AuthenticationEvidence` are typed enums. `Progress.text` is the static `diagnostic transition`, never
-  operator detail.
+  `AuthenticationEvidence` are typed enums. The opaque diagnostic progress constructor and deserializer
+  enforce static `Progress.text = "diagnostic transition"`; ordinary legacy progress retains its prior
+  arbitrary text and byte-identical JSON.
 - A failed turn emits exactly one primary failed diagnostic before `NodeFinished`/terminal persistence.
 - A journal write failure from a journal-backed observer still aborts the drain; diagnostics never make
   real task persistence best-effort. In-memory/no-op observation has no journal-write failure mode.

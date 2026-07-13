@@ -3445,6 +3445,67 @@ mod tests {
         rich_event_journals(bridge_core::task_store::MemoryTaskStore::new()).await;
     }
 
+    async fn diagnostic_event_journals<S: bridge_core::task_store::TaskStore>(store: S) {
+        use bridge_core::diagnostics::{
+            DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor, PersistedPhaseTransition,
+            PersistedPhaseTransitionInput, PhaseStatus,
+        };
+        use bridge_core::orch::OrchEventKind;
+
+        let task = TaskId::parse("task-diagnostic").unwrap();
+        let operation = OperationId::parse("op-task-diagnostic").unwrap();
+        store.create(&trec("task-diagnostic", 1)).await.unwrap();
+        let diagnostic = DiagnosticEvent::new(
+            PersistedPhaseTransition::build(
+                PersistedPhaseTransitionInput {
+                    phase: DiagnosticPhase::Initialize,
+                    status: PhaseStatus::Started,
+                    at_ms: 7,
+                    operation: None,
+                    code: Some("acp.initialize.started".into()),
+                    auth: None,
+                },
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let seq = store
+            .record_event_sequenced(
+                &task,
+                &operation,
+                7,
+                OrchEventKind::Progress {
+                    progress: bridge_core::orch::ProgressPayload::diagnostic(diagnostic),
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = store.journal_from(&task, -1).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].kind,
+            OrchEventKind::Progress { progress }
+                if progress.text() == "diagnostic transition"
+                    && progress.diagnostic_event().is_some()
+        ));
+        assert_eq!(events[0].seq, seq);
+        let snapshot = store.progress_snapshot(&task).await.unwrap();
+        assert!(snapshot.checkpoints.is_empty() && snapshot.starts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_diagnostic_event() {
+        diagnostic_event_journals(SqliteStore::open_in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_diagnostic_event() {
+        diagnostic_event_journals(bridge_core::task_store::MemoryTaskStore::new()).await;
+    }
+
     #[tokio::test]
     async fn sqlite_journal_jsonl_bounded_body_and_counts() {
         let store = SqliteStore::open_in_memory().unwrap();
@@ -3457,7 +3518,9 @@ mod tests {
                 &task,
                 &op,
                 10,
-                bridge_core::orch::OrchEventKind::Progress { text: "one".into() },
+                bridge_core::orch::OrchEventKind::Progress {
+                    progress: bridge_core::orch::ProgressPayload::legacy("one"),
+                },
             )
             .await
             .unwrap();
@@ -3466,7 +3529,9 @@ mod tests {
                 &task,
                 &op,
                 11,
-                bridge_core::orch::OrchEventKind::Progress { text: "two".into() },
+                bridge_core::orch::OrchEventKind::Progress {
+                    progress: bridge_core::orch::ProgressPayload::legacy("two"),
+                },
             )
             .await
             .unwrap();
@@ -3508,7 +3573,9 @@ mod tests {
                 &task,
                 &op,
                 10,
-                bridge_core::orch::OrchEventKind::Progress { text: "one".into() },
+                bridge_core::orch::OrchEventKind::Progress {
+                    progress: bridge_core::orch::ProgressPayload::legacy("one"),
+                },
             )
             .await
             .unwrap();
@@ -3517,7 +3584,9 @@ mod tests {
                 &task,
                 &op,
                 11,
-                bridge_core::orch::OrchEventKind::Progress { text: "two".into() },
+                bridge_core::orch::OrchEventKind::Progress {
+                    progress: bridge_core::orch::ProgressPayload::legacy("two"),
+                },
             )
             .await
             .unwrap();
@@ -3539,7 +3608,9 @@ mod tests {
                 &task,
                 &op,
                 10,
-                bridge_core::orch::OrchEventKind::Progress { text: "one".into() },
+                bridge_core::orch::OrchEventKind::Progress {
+                    progress: bridge_core::orch::ProgressPayload::legacy("one"),
+                },
             )
             .await
             .unwrap();

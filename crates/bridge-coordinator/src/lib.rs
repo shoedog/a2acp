@@ -11,7 +11,7 @@ pub mod turn_parts;
 pub use batch::{is_settleable, summarize_batch, BatchDeps, BatchRuntime};
 pub use coordinator::Coordinator;
 pub use detached::{
-    drain_workflow, frame_from_orch, now_ms, DetachedProgressSink, DetachedRichSink,
+    drain_workflow, now_ms, project_orch_frame, DetachedProgressSink, DetachedRichSink,
     DetachedRichSinkFactory, Finalizer, FrameKind, Phase, TaskProgressHub, TerminalOutcome,
     WorkflowProgressFrame, WorkflowSink,
 };

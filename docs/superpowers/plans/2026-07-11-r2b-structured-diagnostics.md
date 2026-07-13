@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 NOT STARTED (NEXT); R2b2–R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 APPROVED with merge pending; R2b2–R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -160,15 +160,22 @@ R2b does **not** own:
 - cause truncation retains two outermost plus six deepest causes;
 - per-field and adjacency-normalized credential redaction covers unsplit, two-field, and three-field
   values plus multibyte boundaries;
+- mixed-case HTTP/HTTPS queries and fragments are removed during construction and deserialization;
+- reset timestamps accept the 30-day boundary and reject the next millisecond, extreme futures, and
+  malformed-wire futures; missing/invalid reference time rejects reset metadata; retained stderr never
+  exceeds either its observed count or the 32-line cap;
 - auth method ids and API-key environment names equal to or containing a known credential serialize only
   tagged `redacted` state in journal/artifact JSON; unchanged safe ids round-trip as tagged values;
 - `Display`, `Debug`, `client_message`, and wire serialization cannot expose diagnostic secrets;
 - prior-schema `Progress { text }` fixture reads a new `diagnostic: None` payload and a prior reader
   ignores the optional new field;
 - diagnostic progress persists, produces no live/reattach frame, never panics, and is followed by normal
-  node/terminal projection;
+  node/terminal projection through the actual detached sink/hub and reattach snapshot fold;
 - exhaustive class/disposition/metrics tables fail to compile or test when a variant is unhandled;
+- the exact class/phase/barrier matrix rejects post-barrier fallback and every fatal-class retry pairing
+  during both construction and deserialization;
 - no production constructor of `AgentFailure` exists yet outside fixtures/builders.
+  The AST guard scans `error.rs` too and permits exactly one constructor in the central builder.
 
 ### Merge gate
 
