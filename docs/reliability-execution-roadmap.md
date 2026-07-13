@@ -1,9 +1,9 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **R2b0 contract baseline:** `main` at `11ebc402` on 2026-07-11
-- **Completed through:** R2b0 structured-diagnostics contract
-- **Next action:** merge the approved R2b1 foundation, then advance the cursor to R2b2
+- **R2b1 implementation baseline:** `main` at `7b788c1f` on 2026-07-12
+- **Completed through:** R2b1 diagnostic foundation
+- **Next action:** start R2b2 ACP/Fable lifecycle evidence, journaling, and no-replay safety
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -19,8 +19,8 @@ and completion evidence.
 ```text
 R2a provenance (MERGED)
   -> R2b0 contract clarifications (MERGED)
-  -> R2b1 diagnostic types + rollback-safe persistence surface
-  -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety
+  -> R2b1 diagnostic types + rollback-safe persistence surface (MERGED)
+  -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (NEXT)
   -> R2b3 API/provider mapping + remaining container/dispatch observation
   -> R2c explicit one-turn billable smoke
        -> R2d local non-billable fallback plan
@@ -42,7 +42,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R1 — Fable isolation | **MERGED** | [R1 disposition](superpowers/2026-07-11-fable-r1-disposition.md) | Host and reader controls dispositioned. |
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
-| R2b1 — diagnostic foundation | **IN REVIEW** (APPROVED; merge pending) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
+| R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
 | R2b2–R2b3 — lifecycle and API diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Two independently reviewed implementation PRs after R2b1. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
@@ -172,7 +172,7 @@ Next action:
 
 ## Current handoff
 
-- `origin/main` contains the approved R2b0 contract at `11ebc402`; R2b1 is the next implementation slice.
+- `origin/main` contains R2b1 at `7b788c1f`; R2b2 ACP/Fable lifecycle evidence is the next slice.
 - R2b0's full local suite was 1,607 passed / 0 failed / 12 ignored live-agent tests.
 - A fresh bridge-mediated Fable/xhigh review returned `R2A: READY`, `V6 DESIGN: READY`, `MERGE`.
 - The Podman bare image-id normalization and non-vacuous descendant survivor-marker regression were
@@ -223,3 +223,5 @@ Next action:
   `WRONG` or `SMELL` findings across the named closed surfaces, and returned `APPROVE`. R2b1 is merge-ready.
 - The 12 ignored tests are authenticated real-agent/two-bridge and local Ollama coverage; no live R2c
   billable smoke was run in R2b1.
+- R2b1 was fast-forwarded to `origin/main` at `7b788c1fa6b62459e8a8473ca853f9414b28bfbc` after the
+  final `APPROVE`; the post-merge cursor branch is `agent/reliability-r2b2-cursor`.
