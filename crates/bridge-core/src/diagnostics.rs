@@ -5,7 +5,10 @@
 //! context-free sanitization, and schema bounds.
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub const DIAGNOSTIC_SCHEMA_V1: u16 = 1;
 const MAX_CODE_BYTES: usize = 64;
@@ -186,6 +189,8 @@ pub enum DiagnosticBuildError {
     InvalidEvent,
     #[error("unsupported diagnostic schema")]
     UnsupportedSchema,
+    #[error("invalid diagnostic observer capacity")]
+    InvalidObserverCapacity,
 }
 
 /// Redacts only credential values already held by the bridge. Its `Debug`
@@ -1351,5 +1356,355 @@ impl<'de> Deserialize<'de> for DiagnosticEvent {
     {
         let wire = DiagnosticEventWire::deserialize(deserializer)?;
         Self::new(wire.transition, wire.failure).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenTransition {
+    phase: DiagnosticPhase,
+    operation: Option<DiagnosticOperation>,
+}
+
+#[derive(Clone, Default)]
+struct DiagnosticSequence {
+    open: Vec<OpenTransition>,
+}
+
+impl DiagnosticSequence {
+    fn accept(&mut self, event: &DiagnosticEvent) -> Result<(), crate::error::BridgeError> {
+        let transition = event.transition();
+        let key = OpenTransition {
+            phase: transition.phase(),
+            operation: transition.operation(),
+        };
+        match transition.status() {
+            PhaseStatus::Started => {
+                if self.open.contains(&key) {
+                    return Err(crate::error::BridgeError::InvalidStateTransition);
+                }
+                self.open.push(key);
+            }
+            PhaseStatus::Completed | PhaseStatus::Skipped | PhaseStatus::Failed => {
+                let Some(index) = self.open.iter().rposition(|open| *open == key) else {
+                    return Err(crate::error::BridgeError::InvalidStateTransition);
+                };
+                self.open.remove(index);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Diagnostic wall-clock timestamp for lifecycle transitions. Ordering remains
+/// owned by journal sequence numbers; an unavailable wall clock degrades to the
+/// Unix epoch rather than inventing a future time.
+pub fn diagnostic_timestamp_ms() -> i64 {
+    diagnostic_now_ms().unwrap_or(0)
+}
+
+/// Operation-scoped observer that validates transition grammar and discards
+/// accepted events without persistence.
+#[derive(Default)]
+pub struct NoopDiagnosticObserver {
+    sequence: Mutex<DiagnosticSequence>,
+}
+
+#[async_trait::async_trait]
+impl crate::ports::DiagnosticObserver for NoopDiagnosticObserver {
+    async fn record(&self, event: DiagnosticEvent) -> Result<(), crate::error::BridgeError> {
+        self.sequence.lock().await.accept(&event)
+    }
+}
+
+#[derive(Default)]
+struct InMemoryDiagnosticState {
+    sequence: DiagnosticSequence,
+    events: VecDeque<DiagnosticEvent>,
+    dropped: u64,
+}
+
+/// Bounded, non-durable operation observer for direct prompts and smoke.
+pub struct InMemoryDiagnosticObserver {
+    capacity: usize,
+    state: Mutex<InMemoryDiagnosticState>,
+}
+
+impl fmt::Debug for InMemoryDiagnosticObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InMemoryDiagnosticObserver")
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InMemoryDiagnosticObserver {
+    pub fn new(capacity: usize) -> Result<Self, DiagnosticBuildError> {
+        if capacity == 0 {
+            return Err(DiagnosticBuildError::InvalidObserverCapacity);
+        }
+        Ok(Self {
+            capacity,
+            state: Mutex::new(InMemoryDiagnosticState::default()),
+        })
+    }
+
+    pub async fn snapshot(&self) -> Vec<DiagnosticEvent> {
+        self.state.lock().await.events.iter().cloned().collect()
+    }
+
+    pub async fn dropped_count(&self) -> u64 {
+        self.state.lock().await.dropped
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ports::DiagnosticObserver for InMemoryDiagnosticObserver {
+    async fn record(&self, event: DiagnosticEvent) -> Result<(), crate::error::BridgeError> {
+        let mut state = self.state.lock().await;
+        state.sequence.accept(&event)?;
+        if state.events.len() == self.capacity {
+            state.events.pop_front();
+            state.dropped = state.dropped.saturating_add(1);
+        }
+        state.events.push_back(event);
+        Ok(())
+    }
+}
+
+/// Durable diagnostic observer. Construction proves the task row already
+/// exists; every accepted transition is persisted before `record` returns.
+pub struct TaskJournalDiagnosticObserver {
+    store: Arc<dyn crate::task_store::TaskStore>,
+    task: crate::ids::TaskId,
+    operation: crate::ids::OperationId,
+    sequence: Mutex<DiagnosticSequence>,
+}
+
+impl TaskJournalDiagnosticObserver {
+    pub async fn new(
+        store: Arc<dyn crate::task_store::TaskStore>,
+        task: crate::ids::TaskId,
+        operation: crate::ids::OperationId,
+    ) -> Result<Self, crate::error::BridgeError> {
+        if store.get(&task).await?.is_none() {
+            return Err(crate::error::BridgeError::StoreFailure);
+        }
+        Ok(Self::from_verified_task(store, task, operation))
+    }
+
+    fn from_verified_task(
+        store: Arc<dyn crate::task_store::TaskStore>,
+        task: crate::ids::TaskId,
+        operation: crate::ids::OperationId,
+    ) -> Self {
+        Self {
+            store,
+            task,
+            operation,
+            sequence: Mutex::new(DiagnosticSequence::default()),
+        }
+    }
+
+    async fn commit_after_persist<F>(
+        &self,
+        event: &DiagnosticEvent,
+        persist: F,
+    ) -> Result<(), crate::error::BridgeError>
+    where
+        F: std::future::Future<Output = Result<(), crate::error::BridgeError>>,
+    {
+        let mut sequence = self.sequence.lock().await;
+        let mut staged = sequence.clone();
+        staged.accept(event)?;
+        persist.await?;
+        *sequence = staged;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ports::DiagnosticObserver for TaskJournalDiagnosticObserver {
+    async fn record(&self, event: DiagnosticEvent) -> Result<(), crate::error::BridgeError> {
+        let staged_event = event.clone();
+        let at_ms = event.transition().at_ms();
+        let store = self.store.clone();
+        let task = self.task.clone();
+        let operation = self.operation.clone();
+        self.commit_after_persist(&staged_event, async move {
+            store
+                .record_event_sequenced(
+                    &task,
+                    &operation,
+                    at_ms,
+                    crate::orch::OrchEventKind::Progress {
+                        progress: crate::orch::ProgressPayload::diagnostic(event),
+                    },
+                )
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+#[derive(Default)]
+pub struct NoopDiagnosticObserverFactory;
+
+impl crate::ports::DiagnosticObserverFactory for NoopDiagnosticObserverFactory {
+    fn make(
+        &self,
+        _node: &crate::ids::NodeId,
+        _attempt: u32,
+    ) -> Arc<dyn crate::ports::DiagnosticObserver> {
+        Arc::new(NoopDiagnosticObserver::default())
+    }
+}
+
+pub struct InMemoryDiagnosticObserverFactory {
+    capacity: usize,
+}
+
+impl InMemoryDiagnosticObserverFactory {
+    pub fn new(capacity: usize) -> Result<Self, DiagnosticBuildError> {
+        InMemoryDiagnosticObserver::new(capacity)?;
+        Ok(Self { capacity })
+    }
+}
+
+impl crate::ports::DiagnosticObserverFactory for InMemoryDiagnosticObserverFactory {
+    fn make(
+        &self,
+        _node: &crate::ids::NodeId,
+        _attempt: u32,
+    ) -> Arc<dyn crate::ports::DiagnosticObserver> {
+        Arc::new(
+            InMemoryDiagnosticObserver::new(self.capacity)
+                .expect("factory capacity was validated at construction"),
+        )
+    }
+}
+
+pub struct TaskJournalDiagnosticObserverFactory {
+    store: Arc<dyn crate::task_store::TaskStore>,
+    task: crate::ids::TaskId,
+    operation: crate::ids::OperationId,
+}
+
+impl TaskJournalDiagnosticObserverFactory {
+    pub async fn new(
+        store: Arc<dyn crate::task_store::TaskStore>,
+        task: crate::ids::TaskId,
+        operation: crate::ids::OperationId,
+    ) -> Result<Self, crate::error::BridgeError> {
+        if store.get(&task).await?.is_none() {
+            return Err(crate::error::BridgeError::StoreFailure);
+        }
+        Ok(Self {
+            store,
+            task,
+            operation,
+        })
+    }
+}
+
+impl crate::ports::DiagnosticObserverFactory for TaskJournalDiagnosticObserverFactory {
+    fn make(
+        &self,
+        _node: &crate::ids::NodeId,
+        _attempt: u32,
+    ) -> Arc<dyn crate::ports::DiagnosticObserver> {
+        Arc::new(TaskJournalDiagnosticObserver::from_verified_task(
+            self.store.clone(),
+            self.task.clone(),
+            self.operation.clone(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod observer_transaction_tests {
+    use super::*;
+    use crate::ids::{OperationId, TaskId};
+    use crate::task_store::MemoryTaskStore;
+
+    fn transition(status: PhaseStatus) -> DiagnosticEvent {
+        DiagnosticEvent::new(
+            PersistedPhaseTransition::build(
+                PersistedPhaseTransitionInput {
+                    phase: DiagnosticPhase::Resolve,
+                    status,
+                    at_ms: 1,
+                    operation: None,
+                    code: None,
+                    auth: None,
+                },
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn observer() -> Arc<TaskJournalDiagnosticObserver> {
+        Arc::new(TaskJournalDiagnosticObserver::from_verified_task(
+            Arc::new(MemoryTaskStore::new()),
+            TaskId::parse("task-observer-transaction").unwrap(),
+            OperationId::parse("op-observer-transaction").unwrap(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn failed_persist_does_not_commit_transition_grammar() {
+        let observer = observer();
+        assert_eq!(
+            observer
+                .commit_after_persist(
+                    &transition(PhaseStatus::Started),
+                    std::future::ready(Err(crate::error::BridgeError::StoreFailure)),
+                )
+                .await,
+            Err(crate::error::BridgeError::StoreFailure)
+        );
+        assert_eq!(
+            observer
+                .commit_after_persist(
+                    &transition(PhaseStatus::Completed),
+                    std::future::ready(Ok(())),
+                )
+                .await,
+            Err(crate::error::BridgeError::InvalidStateTransition)
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_persist_does_not_commit_transition_grammar() {
+        let observer = observer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let pending_record = {
+            let observer = observer.clone();
+            let started = transition(PhaseStatus::Started);
+            tokio::spawn(async move {
+                observer
+                    .commit_after_persist(&started, async move {
+                        let _ = entered_tx.send(());
+                        std::future::pending::<Result<(), crate::error::BridgeError>>().await
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+        pending_record.abort();
+        assert!(pending_record.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            observer
+                .commit_after_persist(
+                    &transition(PhaseStatus::Completed),
+                    std::future::ready(Ok(())),
+                )
+                .await,
+            Err(crate::error::BridgeError::InvalidStateTransition)
+        );
     }
 }

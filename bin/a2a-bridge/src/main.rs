@@ -57,7 +57,7 @@ use bridge_policy::{
     auth::AlwaysGrant,
     permission::{AutoPolicy, DeferPolicy},
 };
-use bridge_registry::registry::{Registry, SpawnFn};
+use bridge_registry::registry::{ObservedSpawnFn, Registry, SpawnFn};
 use bridge_store::sqlite::SqliteStore;
 use config::{FileConfigSource, RegistryConfig, ServerConfig};
 use route::SkillRoute;
@@ -745,9 +745,10 @@ fn validate_worktree_runtime_cfg(cfg: &RegistryConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
-/// `implement` subcommand so their registry builds can't drift. `owner_config_path` seeds the ContainerRw
-/// owner token.
+/// The production observer-aware spawn factory (Acp compose-or-raw / Api / ContainerRw arms) — shared by
+/// run-workflow and the `implement` subcommand so their registry builds can't drift.
+/// `owner_config_path` seeds the ContainerRw owner token. R2b2b consumes the observer in each adapter;
+/// R2b2a establishes the production ownership path without changing adapter behavior yet.
 fn make_spawn_fn(
     policy_for_spawn: Arc<dyn bridge_core::ports::PolicyEngine>,
     owner_config_path: PathBuf,
@@ -755,8 +756,8 @@ fn make_spawn_fn(
     permission_registry: Option<Arc<PermissionRegistry>>,
     perm_timeout_ms: u64,
     worktree_cfg: Option<WorktreeRuntimeCfg>,
-) -> bridge_registry::registry::SpawnFn {
-    Arc::new(move |entry: Arc<AgentEntry>| {
+) -> ObservedSpawnFn {
+    Arc::new(move |entry: Arc<AgentEntry>, _observer| {
         let policy = Arc::clone(&policy_for_spawn);
         let owner_config_path = owner_config_path.clone();
         let run = run.clone();
@@ -2345,7 +2346,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         worktree_cfg.clone(),
     );
     let registry = Arc::new(
-        bridge_registry::registry::Registry::new(snapshot, spawn)
+        bridge_registry::registry::Registry::new_observed(snapshot, spawn)
             .map_err(|e| format!("implement: registry: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
@@ -2669,7 +2670,7 @@ async fn implement_resume_cmd(
         worktree_cfg.clone(),
     );
     let registry = Arc::new(
-        bridge_registry::registry::Registry::new(snapshot, spawn)
+        bridge_registry::registry::Registry::new_observed(snapshot, spawn)
             .map_err(|e| format!("implement --resume: registry: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
@@ -3098,7 +3099,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         worktree_cfg,
     );
     let registry = Arc::new(
-        bridge_registry::registry::Registry::new(snapshot, spawn)
+        bridge_registry::registry::Registry::new_observed(snapshot, spawn)
             .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
@@ -4746,7 +4747,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     let policy = make_policy(&cfg.server);
     let perm_registry = PermissionRegistry::new();
     let perm_timeout = permission_timeout_ms(&cfg.server);
-    let spawn: SpawnFn = make_spawn_fn(
+    let spawn: ObservedSpawnFn = make_spawn_fn(
         Arc::clone(&policy) as Arc<dyn PolicyEngine>,
         config_path.clone(),
         run.clone(),
@@ -4765,7 +4766,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
             &bridge_core::liveness::FsLeaseProbe,
         );
     }
-    let registry = Arc::new(Registry::new(snapshot, spawn)?);
+    let registry = Arc::new(Registry::new_observed(snapshot, spawn)?);
 
     let base = config_path
         .parent()
@@ -5955,7 +5956,7 @@ async fn main() -> Result<(), BoxError> {
     //    for the backend's lifetime, and applies the configured mode/model after
     //    each `session/new`. `model`/`mode` here are the per-MINT FALLBACK; the
     //    per-session `configure_session` overrides them at dispatch (Task 6).
-    let spawn: SpawnFn = make_spawn_fn(
+    let spawn: ObservedSpawnFn = make_spawn_fn(
         Arc::clone(&policy) as Arc<dyn PolicyEngine>,
         config_path.clone(),
         run.clone(),
@@ -6001,7 +6002,7 @@ async fn main() -> Result<(), BoxError> {
         .map(|e| (e.id.as_str().to_string(), e.clone()))
         .collect();
     // Registry::new VALIDATES the snapshot → boot fails loud on bad config (spec §7).
-    let registry = Arc::new(Registry::new(snapshot, spawn)?);
+    let registry = Arc::new(Registry::new_observed(snapshot, spawn)?);
 
     // 6. Reconcile loop — consume `watch()` and `apply()` each new snapshot so
     //    on-disk edits hot-reload the live registry. The watch stream is held for
@@ -9220,7 +9221,7 @@ cmd = "cargo build --locked"
             120_000,
             None,
         );
-        bridge_registry::registry::Registry::new(snap, spawn)
+        bridge_registry::registry::Registry::new_observed(snap, spawn)
             .expect("containerized config (incl. the impl container_rw agent) validates");
     }
 

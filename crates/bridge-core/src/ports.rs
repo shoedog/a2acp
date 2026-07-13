@@ -41,6 +41,43 @@ pub trait RichEventSinkFactory: Send + Sync {
     fn make(&self, node: &NodeId) -> std::sync::Arc<dyn RichEventSink>;
 }
 
+/// Operation-scoped lifecycle diagnostic sink.
+///
+/// Implementations validate transition grammar before accepting an event. A
+/// durable implementation returns persistence failures to the lifecycle owner;
+/// callers must not turn them into best-effort logging.
+#[async_trait::async_trait]
+pub trait DiagnosticObserver: Send + Sync {
+    async fn record(&self, event: crate::diagnostics::DiagnosticEvent) -> Result<(), BridgeError>;
+}
+
+/// Explicit per-node/attempt diagnostic ownership for workflow execution.
+/// Correlation ids and rich-event availability never select journal authority.
+pub trait DiagnosticObserverFactory: Send + Sync {
+    fn make(&self, node: &NodeId, attempt: u32) -> std::sync::Arc<dyn DiagnosticObserver>;
+}
+
+/// Composite prompt observers. This keeps the existing rich-event API intact
+/// while allowing adapters to opt into lifecycle diagnostics independently.
+#[derive(Clone)]
+pub struct BackendObservers {
+    pub diagnostic: std::sync::Arc<dyn DiagnosticObserver>,
+    pub rich: Option<std::sync::Arc<dyn RichEventSink>>,
+}
+
+impl BackendObservers {
+    pub fn new(
+        diagnostic: std::sync::Arc<dyn DiagnosticObserver>,
+        rich: Option<std::sync::Arc<dyn RichEventSink>>,
+    ) -> Self {
+        Self { diagnostic, rich }
+    }
+
+    pub fn diagnostic_only(diagnostic: std::sync::Arc<dyn DiagnosticObserver>) -> Self {
+        Self::new(diagnostic, None)
+    }
+}
+
 /// Streaming agent backend — adapters implement this; core never depends on adapters.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
@@ -57,7 +94,25 @@ pub trait AgentBackend: Send + Sync {
     ) -> Result<BackendStream, BridgeError> {
         self.prompt(session, parts).await
     }
+    async fn prompt_with_observers(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        observers: BackendObservers,
+    ) -> Result<BackendStream, BridgeError> {
+        match observers.rich {
+            Some(sink) => self.prompt_observed(session, parts, sink).await,
+            None => self.prompt(session, parts).await,
+        }
+    }
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError>;
+    async fn cancel_observed(
+        &self,
+        session: &SessionId,
+        _observer: std::sync::Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        self.cancel(session).await
+    }
 
     /// Stash per-turn metadata for the NEXT prompt on this session (Slice 9 — lets the reverse permission
     /// handler build a gen-stamped key). Default: no-op. The producer calls this immediately before `prompt`.
@@ -74,11 +129,27 @@ pub trait AgentBackend: Send + Sync {
     /// Drop per-session state (config stash, etc.) when a task/session ends. Default: no-op.
     /// MUST be a trait method — the inbound binding eviction (T11) calls it through `Arc<dyn AgentBackend>`.
     async fn forget_session(&self, _session: &SessionId) {}
+    async fn forget_session_observed(
+        &self,
+        session: &SessionId,
+        _observer: std::sync::Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        self.forget_session(session).await;
+        Ok(())
+    }
     /// Release a warm session: drop ALL per-session backend state + reap any per-session
     /// resource (e.g. a `:rw` container). Default = `forget_session` (correct for
     /// non-warm/non-process backends). Warm backends override. [Slice 0]
     async fn release_session(&self, session: &SessionId) {
         self.forget_session(session).await;
+    }
+    async fn release_session_observed(
+        &self,
+        session: &SessionId,
+        _observer: std::sync::Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        self.release_session(session).await;
+        Ok(())
     }
     /// Reconcile model/effort on a LIVE warm session (Slice 1). Default: NotAdvertised
     /// (non-ACP/non-process backends can't reconcile a live session). cwd/mode are NOT
@@ -378,6 +449,15 @@ pub struct Resolved {
 pub trait AgentRegistry: Send + Sync {
     /// Resolve (and lazily spawn) a backend for the given agent id. [§4.5]
     async fn resolve(&self, id: &crate::ids::AgentId) -> Result<Resolved, BridgeError>;
+    /// Resolve with operation-scoped lifecycle observation. Existing registries
+    /// remain source-compatible and ignore diagnostics through this default.
+    async fn resolve_observed(
+        &self,
+        id: &crate::ids::AgentId,
+        _observer: std::sync::Arc<dyn DiagnosticObserver>,
+    ) -> Result<Resolved, BridgeError> {
+        self.resolve(id).await
+    }
     /// Return the default agent id for this registry.
     fn default_id(&self) -> crate::ids::AgentId;
     /// Atomically reconcile the registry to the given snapshot. [§4.5]
