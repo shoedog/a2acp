@@ -4,7 +4,7 @@
 - **Prerequisite:** R2b structured diagnostics merged; may proceed independently of R2c–R2e afterward
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
-- **Incident id:** `INC-VERIFY-STALL-2026-07-11`
+- **Incident ids:** `INC-VERIFY-STALL-2026-07-11`, `INC-POST-WORK-WEDGE-2026-07-12-A/B/C/D`
 
 ## Incident evidence and limits
 
@@ -19,14 +19,30 @@ orchestration waiter. File modification time alone is not a safe liveness signal
 can make no edits, while a wedged verifier can keep a process alive. R2f must collect the observations that
 separate those alternatives before changing timeout behavior.
 
+The follow-up [2026-07-12 incident record](../2026-07-12-post-work-wedge-incidents.md) now supplies four
+exact failure timelines plus high/xhigh negative controls. One Luna/max and three Sol/max implement runs
+parked after useful content; one had already staged its plan and written `.git/A2A_COMMIT_MSG`. All four
+stopped bridge stderr at `node edit started` and produced no `--out`. In the operator's 12 completed runs,
+max separated 4/4 wedged from high 3/3 clean and xhigh read-only 5/5 clean. That makes requested effort a
+high-value reproduction variable and makes a Luna-only or slow-Cargo-only explanation insufficient, but
+the sample is non-random and still does not distinguish an agent loop, ACP terminal-delivery loss,
+verification behavior, or bridge waiter/finalization leak.
+
 ## R2f0 — Reproduction and meaningful-progress vocabulary
 
 - Capture attempt/provider/adapter/runtime provenance and monotonic timestamps for phase entry, agent
   update, tool start/end, child spawn/exit, bounded stdout/stderr activity, file mutation, and test result.
+- Capture rollout terminal/update state, ACP `prompt_stream` and `prompt_finish`, workflow node terminal
+  persistence, and `--out` finalization as distinct boundaries; a node start without any of those later
+  facts must remain diagnosable after manual termination.
 - Define `meaningful_progress` by phase. Verification progress includes command start/exit and bounded
   output/heartbeat from an owned child; file edits are evidence but never the sole criterion.
 - Reproduce at least: a child blocked forever, an agent waiter parked after a child exits, a silent but
-  healthy long-running verification command, and a provider turn still emitting non-tool updates.
+  healthy long-running verification command, a provider turn still emitting non-tool updates, an ACP
+  terminal delivered to a bridge waiter that never finalizes, and a terminal withheld from that waiter.
+- Run one paired, disposable implement reproduction with identical repo/task/adapter inputs at `high` and
+  `max`. Record the resolved effort actually applied, rather than assuming the requested value reached the
+  adapter, and treat any high wedge or max clean exit as evidence against perfect effort separation.
 - Preserve a hypothesis/probe/result log. Do not label the incident root cause until the observations
   distinguish provider silence, adapter loss, child-process deadlock, and orchestration wait leakage.
 
@@ -65,6 +81,7 @@ separate those alternatives before changing timeout behavior.
 - worktree edits survive termination and the takeover artifact names completed/pending gates exactly;
 - observer/store failure cannot trigger termination or erase the primary diagnostic;
 - no automatic retry, fallback, or second billable attempt;
+- paired high/max reproduction preserves all phase, rollout, child, and output-finalization evidence;
 - one opt-in dogfood run that intentionally wedges a disposable verifier and proves targeted takeover.
 
 ## Completion

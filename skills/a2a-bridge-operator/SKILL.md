@@ -106,6 +106,9 @@ wedged. Before terminating anything, write the debugging hypothesis, expected ob
 one alternative cause. Then inspect the task/journal phase, most recent agent/tool event, owned child tree,
 bounded recent command output, worktree status, and completed verification results. A long test with an
 active owned child or continuing bounded output is progress even when no file changes.
+Repository-side contract evidence such as a staged diff plus `.git/A2A_COMMIT_MSG` is useful for a
+takeover snapshot, but it does not prove the ACP prompt or workflow node completed and must not be used to
+invent a successful terminal result.
 
 When the evidence shows phase stagnation and the operator authorizes takeover:
 

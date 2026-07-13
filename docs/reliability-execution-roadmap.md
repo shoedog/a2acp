@@ -59,11 +59,15 @@ plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) is the restart
 
 ### Deferred incident: verification phase parked after useful edits
 
-`INC-VERIFY-STALL-2026-07-11` records an operator-reported Luna run in `~/code/stockTrading`: 2h54m total,
-useful edits completed in about 25 minutes, last file edit at 17:22, then nearly three hours parked in
-verification. The operator terminated only that process tree, preserved the work, completed verification
-manually, and found the changes clean. Root cause is **unknown**; the evidence does not yet separate a
-provider/adapter stall, child-process failure, or orchestration waiter leak.
+`INC-VERIFY-STALL-2026-07-11` and the more precise [2026-07-12 incident
+record](superpowers/2026-07-12-post-work-wedge-incidents.md) cover four `stockTrading` runs: one Luna/max
+and three Sol/max implement attempts parked after useful work. One Sol run had already staged its 54 KiB
+plan and written the commit-message contract; the other three stopped before staging. All four bridge
+runs stopped at `node edit started`, retained quiet process trees, wrote no node terminal, and produced
+no `--out`. In the 12 completed runs reported that night, max implement attempts wedged 4/4 while high
+implement attempts exited 3/3 and xhigh read-only runs exited 5/5. This is a small non-random correlation,
+not a root cause. The evidence does not yet separate a silent verification child, provider/agent loop,
+ACP terminal-delivery failure, or bridge waiter/finalization leak.
 
 The deferred [R2f plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) requires phase-aware
 meaningful-progress evidence, false-positive controls for silent long tests, a stagnation snapshot, exact
