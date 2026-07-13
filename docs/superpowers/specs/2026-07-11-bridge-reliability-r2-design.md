@@ -1,6 +1,6 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v13)
 
-- **Status:** R2a, R2b0, and R2b1 merged; v13 is the design of record for R2b2–R2b3
+- **Status:** R2a, R2b0, and R2b1 merged; R2b2 in progress; v13 is the design of record for R2b2–R2b3
 - **Date:** 2026-07-11
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`

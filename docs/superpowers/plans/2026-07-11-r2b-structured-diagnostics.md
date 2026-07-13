@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 NEXT; R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a active); R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -186,6 +186,41 @@ Do not begin error-site migration on the same branch.
 
 - **Branch:** `agent/reliability-r2b2-acp-lifecycle`
 - **Priority:** first end-to-end value; directly addresses the observed Fable failure opacity
+
+### Internal execution sequence
+
+R2b2 remains one merge boundary, but implementation and review use four ordered, independently
+revertible commits so a lost session can resume from the first incomplete item:
+
+1. **R2b2a — observer, persistence, and registry compatibility.** Add `DiagnosticObserver`, bounded
+   in-memory/no-op/task-journal implementations, explicit factories, `BackendObservers`, additive backend
+   cleanup methods, `resolve_observed`, and legacy/observed registry spawn constructors. Prove legacy
+   backend/registry implementations compile unchanged, journal authority requires an existing task row,
+   cached resolution emits only `backend.reused`, and constructor observers are not retained.
+2. **R2b2b — ACP lifecycle and safe evidence.** Thread the initialization and prompt observers through
+   spawn, initialize, authentication, session creation, config application, prompt start/stream/finish,
+   and operation-owned teardown. Migrate generic prompt and watchdog failures, add the process-scoped
+   stderr ring, and replace all 16 direct ACP trace sites with the typed metadata-only funnel. This commit
+   owns phase grammar, accepted-work barrier, no-replay, cause retention, auth evidence, and trace-secret
+   regressions.
+3. **R2b2c — production owner and workflow authority.** Thread one attempt observer through inbound
+   streaming/synchronous/fan-out, coordinator prompt/continue, cold and warm workflow paths, and
+   `TurnRunner`. Add the explicit `WorkflowRunContext` factory: direct/correlation-only paths always use
+   in-memory observation, while detached tasks use a journal factory created only after the durable task
+   row exists. Prove rich events are neither lost nor duplicated and journal failure is fatal before
+   completion.
+4. **R2b2d — warm expiry and cleanup single-flight.** Add the shared survivability classifier,
+   `WarmCompletionGuard`, claim-identified tombstones, `ExpiryClaim`, observer-free `CleanupFlight`, and
+   joined worktree cleanup. Exercise all cancellation windows, stale generation/claim protection,
+   cleanup failure, lease lifetime, and forced-retirement races before any owner adopts the new path.
+
+R2b2a–R2b2c use ordinary fresh full-branch xhigh review. R2b2d is concurrency-qualified and may use Max
+because its correctness evidence is one tightly connected cancellation/idempotency proof. Max is not the
+default for the other commits; use it there only after High/xhigh fails to resolve a concrete issue.
+
+After each internal commit, update the central roadmap with the exact commit, focused tests, and next
+item. Do not mark R2b2 `MERGED`, advance to R2b3, or expose partially migrated production errors until all
+four items pass the full workspace/release/hygiene gates and one final bridge-mediated review.
 
 ### Observation plumbing
 
