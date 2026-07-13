@@ -99,6 +99,29 @@ usage window as well as bridge preflight. For trusted own-repo reviews:
   generic `AgentCrashed`, record the operator-visible usage state as context but keep the bridge diagnosis
   `unknown` until the underlying cause is retained.
 
+### Suspected verification stall and takeover
+
+Process existence, total elapsed time, and last file modification are not sufficient to call a run
+wedged. Before terminating anything, write the debugging hypothesis, expected observation, falsifier, and
+one alternative cause. Then inspect the task/journal phase, most recent agent/tool event, owned child tree,
+bounded recent command output, worktree status, and completed verification results. A long test with an
+active owned child or continuing bounded output is progress even when no file changes.
+
+When the evidence shows phase stagnation and the operator authorizes takeover:
+
+1. Capture the attempt id, provenance, phase, last meaningful progress by category, exact owned process
+   tree, worktree diff/hash, completed gates, and pending gates.
+2. Terminate only that attempt's recorded process tree. Never kill by a broad process-name match, and
+   verify unrelated repository processes remain alive.
+3. Preserve the working tree. Record survivors or partial termination honestly; do not reset, clean, or
+   discard useful edits.
+4. Verify the retained work from the first unfinished gate. A takeover is a new explicit attempt; do not
+   resume/replay a possibly accepted model turn or automatically start a duplicate reviewer.
+
+Automatic phase-stall detection and takeover are deferred to
+[`R2f`](../../docs/superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md). Until it lands, this is a
+manual evidence-and-scope procedure, not a claim that the bridge can recover a parked verifier.
+
 This cross-provider choice never relaxes the execution tier: untrusted reads still require Tier 2 and
 write-capable work still requires Tier 3.
 

@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a active); R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a committed at `4ed12f1`; 2b next); R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -221,6 +221,19 @@ default for the other commits; use it there only after High/xhigh fails to resol
 After each internal commit, update the central roadmap with the exact commit, focused tests, and next
 item. Do not mark R2b2 `MERGED`, advance to R2b3, or expose partially migrated production errors until all
 four items pass the full workspace/release/hygiene gates and one final bridge-mediated review.
+
+R2b2a implementation evidence (`4ed12f1035c16fa5dbd55169e59ca4c277373da4`):
+
+- the first fresh Sol/xhigh review found one `WRONG/MAJOR`: cancellation or failure of the awaited
+  journal write could leave volatile transition grammar advanced without its durable start; it also found
+  one `SMELL/MINOR`: no secret-bearing `Debug` regression for the in-memory observer;
+- the fold validates against a cloned grammar state, holds the per-observer ordering lock across the
+  write, commits only after persistence, and adds deterministic write-error/cancellation and exact safe
+  `Debug` tests;
+- the fresh closure review marked both findings `FIXED`, found no new `WRONG` or `SMELL`, and returned
+  `APPROVE`;
+- exact post-fold gates: workspace check, warnings-denied all-target clippy, **1,640 passed / 0 failed /
+  12 ignored**, release build, and repository hygiene (37 tracked artifacts / 7 example configs).
 
 ### Observation plumbing
 

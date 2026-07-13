@@ -3,7 +3,7 @@
 - **Program status:** active P0
 - **R2b1 implementation baseline:** `main` at `7b788c1f` on 2026-07-12
 - **Completed through:** R2b1 diagnostic foundation
-- **Next action:** implement R2b2a observer, persistence, and registry compatibility
+- **Next action:** start R2b2b ACP lifecycle and safe evidence from committed R2b2a
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -43,11 +43,12 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
-| R2b2 — ACP/Fable lifecycle diagnostics | **IN PROGRESS** (2a active) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, then concurrency-qualified warm cleanup; one final merge boundary. |
+| R2b2 — ACP/Fable lifecycle diagnostics | **IN PROGRESS** (2a committed at `4ed12f1`; 2b next) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, then concurrency-qualified warm cleanup; one final merge boundary. |
 | R2b3 — API/container diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
+| R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
 | R3 — compatibility canaries | **NOT STARTED** | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | Local manifest/runner first; scheduling requires runner/credential owner. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
@@ -55,6 +56,19 @@ R2b2 executes on one merge branch in four durable internal commits: **2a** obser
 compatibility, **2b** ACP lifecycle and safe evidence, **2c** production-owner/workflow authority, then
 the concurrency-qualified **2d** warm expiry and cleanup single-flight. The [R2b implementation
 plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) is the restart contract for each item.
+
+### Deferred incident: verification phase parked after useful edits
+
+`INC-VERIFY-STALL-2026-07-11` records an operator-reported Luna run in `~/code/stockTrading`: 2h54m total,
+useful edits completed in about 25 minutes, last file edit at 17:22, then nearly three hours parked in
+verification. The operator terminated only that process tree, preserved the work, completed verification
+manually, and found the changes clean. Root cause is **unknown**; the evidence does not yet separate a
+provider/adapter stall, child-process failure, or orchestration waiter leak.
+
+The deferred [R2f plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) requires phase-aware
+meaningful-progress evidence, false-positive controls for silent long tests, a stagnation snapshot, exact
+process-tree identity, and a bounded takeover artifact. Do not use file mtime or process existence alone,
+do not broad-kill by process name, and do not auto-start a duplicate billable attempt.
 
 Allowed status values are `NOT STARTED`, `IN PROGRESS`, `IN REVIEW`, `MERGED`, `BLOCKED`, and
 `DEFERRED`. Update this table in the same PR that changes a slice status. Never mark `MERGED` from a
@@ -231,5 +245,17 @@ Next action:
   billable smoke was run in R2b1.
 - R2b1 was fast-forwarded to `origin/main` at `7b788c1fa6b62459e8a8473ca853f9414b28bfbc` after the
   final `APPROVE`; the post-merge cursor branch is `agent/reliability-r2b2-cursor`.
-- R2b2 implementation is active on `agent/reliability-r2b2-acp-lifecycle`; resume at R2b2a in the
-  four-item internal sequence before touching ACP production failure sites.
+- R2b2 implementation is active on `agent/reliability-r2b2-acp-lifecycle`; R2b2a is committed at
+  `4ed12f1035c16fa5dbd55169e59ca4c277373da4`, and R2b2b is the next implementation item.
+- R2b2a adds bounded/no-op/task-journal diagnostic observers and explicit factories, composite backend
+  compatibility methods, `resolve_observed`, legacy/observed registry spawn constructors, initializer-only
+  observer ownership, cache/waiter `backend.reused`, and live `new_observed` wiring. No ACP lifecycle
+  failure site is migrated yet. The first bridge-mediated Sol/xhigh review returned `REVISE` for one
+  `WRONG/MAJOR` (journal grammar advanced before an awaited write committed) and one `SMELL/MINOR`
+  (observer `Debug` secrecy lacked a secret-bearing regression). The fold stages grammar on a clone,
+  commits only after successful persistence while serializing the observer, and adds deterministic write
+  error/cancellation plus exact `Debug` regressions. The fresh closure review adjudicated both `FIXED`,
+  found no new `WRONG` or `SMELL`, and returned `APPROVE`.
+- R2b2a's exact post-fold tree passed workspace check, warnings-denied all-target clippy, **1,640 passed /
+  0 failed / 12 ignored**, release binary build, and repository hygiene (37 tracked artifacts / 7 example
+  configs). The ignored set remains authenticated real-agent/two-bridge and local Ollama coverage.

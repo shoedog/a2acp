@@ -5,6 +5,7 @@
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`
 - **R2b1 commit:** `7b788c1fa6b62459e8a8473ca853f9414b28bfbc`
+- **R2b2a commit:** `4ed12f1035c16fa5dbd55169e59ca4c277373da4`
 - **Program:** [`docs/bridge-reliability.md`](../../bridge-reliability.md), R2
 - **Security boundary:** [`ADR-0032`](../../adr/0032-sandbox-tier-model.md)
 
@@ -338,6 +339,15 @@ directly. The final test fold exercises reset-bearing rejection and reset-free a
 
 The final bounded Sol/xhigh test-closure review adjudicated that remaining `SMELL` `FIXED`, found no
 new `WRONG` or `SMELL` findings across the named closed surfaces, and returned `APPROVE`.
+
+The first bridge-mediated Sol/xhigh R2b2a implementation review returned `REVISE` with one
+`WRONG/MAJOR`: task-journal observer grammar committed before its awaited durable write, so write failure
+or cancellation could later admit a terminal transition without a persisted start. It also found one
+`SMELL/MINOR`: observer `Debug` secrecy was not exercised with stored diagnostic text. R2b2a now stages
+grammar on a clone and commits only after persistence while retaining the ordering lock; deterministic
+write-error/cancellation tests prove the staged state is discarded, and a secret-bearing failure proves
+the exact observer `Debug` surface is capacity-only. The fresh closure review adjudicated both `FIXED`,
+found no new `WRONG` or `SMELL`, and returned `APPROVE`.
 
 ## Stable lifecycle phase vocabulary
 

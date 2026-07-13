@@ -110,6 +110,12 @@ missing Fable opt-in and missing reader settings prerequisite before a paid turn
 
 Exit: an operator can tell which boundary failed from one bounded run and its JSON artifact.
 
+Deferred R2f follow-up: phase-aware liveness and safe takeover after useful edits. The trigger is the
+operator-reported `INC-VERIFY-STALL-2026-07-11`, where a Luna run completed edits quickly and then parked
+in verification for nearly three hours. R2f must distinguish a silent healthy verifier from provider,
+adapter, child-process, or waiter failure before adding automated action; see the [R2f
+plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
+
 ### R3 — compatibility harness and canaries
 
 - Check in a versioned smoke manifest covering each supported agent, model class, auth mode, and host
