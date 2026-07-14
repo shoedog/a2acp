@@ -1,10 +1,11 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v13)
 
 - **Status:** R2a, R2b0, and R2b1 merged; R2b2 in progress; v13 is the design of record for R2b2–R2b3
-- **R2b2d review state:** closure review 12 `APPROVE`; exact six-package gate
+- **R2b2d review state:** closure review 12 `APPROVE`; implementation commit
+  `14402f895a5eda2852684a8fbd35f83452e2645f`; exact six-package gate
   **1,090 / 0 / 0 ignored**; full host workspace suite **1,806 / 0 / 12 ignored**; repository hygiene
-  **37** tracked artifacts / **7** validated example configs; R2b2d committed on its branch, with push and
-  final full-R2b2 review pending
+  **37** tracked artifacts / **7** validated example configs; R2b2d committed and pushed, with the final
+  full-R2b2 review pending
 - **Date:** 2026-07-11
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`
@@ -12,6 +13,7 @@
 - **R2b2a commit:** `4ed12f1035c16fa5dbd55169e59ca4c277373da4`
 - **R2b2b commit:** `f40096df`
 - **R2b2c commit:** `40790720`
+- **R2b2d commit:** `14402f895a5eda2852684a8fbd35f83452e2645f`
 - **Program:** [`docs/bridge-reliability.md`](../../bridge-reliability.md), R2
 - **Security boundary:** [`ADR-0032`](../../adr/0032-sandbox-tier-model.md)
 

@@ -2,12 +2,12 @@
 
 - **Program status:** active P0
 - **R2b1 implementation baseline:** `main` at `7b788c1f` on 2026-07-12
-- **Completed through:** R2b2c production-owner/workflow authority (`40790720`)
+- **Completed through:** R2b2d warm expiry/cleanup ownership (`14402f8`), independently approved and pushed
 - **Current exact gate:** **1,090 / 0 / 0 ignored** across the six affected packages; format/diff,
   workspace/all-target check, warnings-denied Clippy, and release build clean
 - **Full workspace gate:** host serial **1,806 / 0 / 12 ignored**; repository hygiene **37** tracked
   artifacts / **7** validated example configs
-- **Next action:** push the folded R2b2d branch commit, then run one fresh full-R2b2 branch review before merge
+- **Next action:** run one fresh full-R2b2 branch review before merge
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -47,7 +47,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
-| R2b2 — ACP/Fable lifecycle diagnostics | **IN PROGRESS** (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d closure review 12 `APPROVE`, committed on branch; exact **1,090 / 0 / 0**; full host workspace **1,806 / 0 / 12 ignored**; hygiene **37/7**; push and final R2b2 review pending) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, then concurrency-qualified warm cleanup; one final merge boundary. |
+| R2b2 — ACP/Fable lifecycle diagnostics | **IN PROGRESS** (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`, closure review 12 `APPROVE`, pushed; exact **1,090 / 0 / 0**; full host workspace **1,806 / 0 / 12 ignored**; hygiene **37/7**; final full-R2b2 review pending) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, then concurrency-qualified warm cleanup; one final merge boundary. |
 | R2b3 — API/container diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
@@ -197,8 +197,8 @@ Next action:
 ## Current handoff
 
 - `origin/main` contains R2b1 at `7b788c1f`; R2b2 is active on
-  `agent/reliability-r2b2-acp-lifecycle`. R2b2c is committed and pushed at `40790720`; R2b2d is
-  review-approved and committed locally on the same branch.
+  `agent/reliability-r2b2-acp-lifecycle`. R2b2d is review-approved, committed, and pushed at
+  `14402f895a5eda2852684a8fbd35f83452e2645f` on that branch.
 - R2b0's full local suite was 1,607 passed / 0 failed / 12 ignored live-agent tests.
 - A fresh bridge-mediated Fable/xhigh review returned `R2A: READY`, `V6 DESIGN: READY`, `MERGE`.
 - The Podman bare image-id normalization and non-vacuous descendant survivor-marker regression were
@@ -497,4 +497,4 @@ Next action:
   **1,806 / 0 / 12 ignored** across 64 terminal result groups, falsifying a branch regression. Repository
   hygiene passes with **37** tracked artifacts and **7** validated example configs. The Git command-fixture
   limitation and bounded yield polling remain minor test-coverage follow-ups. No docs-link checker is present
-  and no live/billable gate has run. Push 2d, then run one fresh full-R2b2 branch review before merge.
+  and no live/billable gate has run. Run one fresh full-R2b2 branch review before merge.

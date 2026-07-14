@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d closure review 12 `APPROVE`, committed on branch; exact **1,090 / 0 / 0**; full host workspace **1,806 / 0 / 12 ignored**; hygiene **37/7**; push and final R2b2 review pending); R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`, closure review 12 `APPROVE`, pushed; exact **1,090 / 0 / 0**; full host workspace **1,806 / 0 / 12 ignored**; hygiene **37/7**; final full-R2b2 review pending); R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -606,7 +606,8 @@ R2b2d implementation handoff (review-approved branch commit based on
   **1,806 / 0 / 12 ignored** across 64 terminal result groups. Repository hygiene passes at **37** tracked
   artifacts / **7** validated example configs. The Git command-fixture limitation and bounded yield polling
   remain documented minor test-coverage follow-ups. No docs-link checker was found and no live/billable gate
-  ran. Push 2d, then run the final full-R2b2 review; do not merge before that approval.
+  ran. R2b2d is pushed at `14402f895a5eda2852684a8fbd35f83452e2645f`. Run the final full-R2b2
+  review; do not merge before that approval.
 
 ### Observation plumbing
 
