@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`, closure review 12 `APPROVE`, pushed; exact **1,090 / 0 / 0**; full host workspace **1,806 / 0 / 12 ignored**; hygiene **37/7**; final full-R2b2 review pending); R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`, closure review 12 `APPROVE`; final review 1 `REVISE`, fold `a459b31`; exact **1,096 / 0 / 0**; full host workspace **1,812 / 0 / 12 ignored**; hygiene **37/7**; re-review pending); R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -608,6 +608,21 @@ R2b2d implementation handoff (review-approved branch commit based on
   remain documented minor test-coverage follow-ups. No docs-link checker was found and no live/billable gate
   ran. R2b2d is pushed at `14402f895a5eda2852684a8fbd35f83452e2645f`. Run the final full-R2b2
   review; do not merge before that approval.
+- Final full-R2b2 review 1 used a fresh Sol/Max read-only instance at published head `5917f175`. It
+  revalidated every warm/session/worktree surface but returned `REVISE` for two cold owner gaps: legacy
+  cleanup discarded a Worktree teardown error after success, and cancellation-first prompt/stream selects
+  discarded an already-ready structured failure. Self-audit also found that final aggregation inferred
+  `Canceled` from the shared token after a warm path had correctly selected a failure.
+- Fold `a459b31de5a4665138a7330868e38dfb8992438b` uses observed result-bearing cold cleanup on every branch,
+  preserves an existing backend/rich failure over secondary teardown evidence, makes one concrete backend
+  result precede control before checking cancellation after benign items, and carries explicit node
+  disposition into terminal aggregation. Pre-change-red tests reproduce cleanup false-success plus both cold
+  ready-error races; existing warm race tests now assert public `Failed`. Cancellation-only, one-item usage,
+  backend-primary, cancel-error, and cleanup-error controls cover the negative edges.
+- Workflow passes **82 / 0 / 0**; the exact six-package gate passes **1,096 / 0 / 0 ignored**; the host serial
+  workspace passes **1,812 / 0 / 12 ignored**. Format/diff, workspace/all-target check, warnings-denied
+  workspace/all-target Clippy, workspace release build, and hygiene **37/7** are clean. No live/billable gate
+  ran. Run a fresh full-R2b2 re-review; do not merge before approval.
 
 ### Observation plumbing
 
