@@ -137,8 +137,63 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
 /// Each fan-out node is boxed to this type so `FuturesUnordered` can hold
 /// futures of different async-block monomorphisations in one collection.
 type NodeFut<'a> = std::pin::Pin<
-    Box<dyn futures::Future<Output = (NodeId, String, bool, Option<UsageSnapshot>)> + Send + 'a>,
+    Box<
+        dyn futures::Future<Output = (NodeId, String, bool, Option<UsageSnapshot>, NodeDisposition)>
+            + Send
+            + 'a,
+    >,
 >;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeDisposition {
+    Completed,
+    Failed,
+    Canceled,
+}
+
+impl NodeDisposition {
+    fn from_turn(outcome: &TurnOutcome) -> Self {
+        match outcome {
+            TurnOutcome::Success => Self::Completed,
+            TurnOutcome::Failed(_) => Self::Failed,
+            TurnOutcome::Canceled => Self::Canceled,
+        }
+    }
+
+    fn workflow_outcome(self) -> WorkflowOutcome {
+        match self {
+            Self::Completed => WorkflowOutcome::Completed,
+            Self::Failed => WorkflowOutcome::Failed,
+            Self::Canceled => WorkflowOutcome::Canceled,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ColdCleanupAction {
+    Forget,
+    Release,
+}
+
+async fn cleanup_cold_session(
+    backend: &Arc<dyn AgentBackend>,
+    session: &SessionId,
+    observer: &Arc<dyn DiagnosticObserver>,
+    action: ColdCleanupAction,
+) -> Result<(), BridgeError> {
+    match action {
+        ColdCleanupAction::Forget => {
+            backend
+                .forget_session_observed(session, observer.clone())
+                .await
+        }
+        ColdCleanupAction::Release => {
+            backend
+                .release_session_observed(session, observer.clone())
+                .await
+        }
+    }
+}
 
 enum RenderInput {
     Freeform(String),
@@ -317,7 +372,7 @@ impl WorkflowExecutor {
     }
 
     /// Run one node: render its prompt from `vars`, resolve+configure+prompt+drain, forget.
-    /// Returns (text, ok, usage). On any failure returns the error marker + ok=false.
+    /// Returns (text, ok, usage, disposition). On any failure returns the error marker + ok=false.
     #[allow(clippy::too_many_arguments)]
     async fn run_node(
         &self,
@@ -329,9 +384,14 @@ impl WorkflowExecutor {
         ctx: &WorkflowRunContext,
         diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
         dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>,
-    ) -> (String, bool, Option<UsageSnapshot>) {
+    ) -> (String, bool, Option<UsageSnapshot>, NodeDisposition) {
         if cancel.is_cancelled() {
-            return (format!("[node {} canceled]", node.id.as_str()), false, None);
+            return (
+                format!("[node {} canceled]", node.id.as_str()),
+                false,
+                None,
+                NodeDisposition::Canceled,
+            );
         }
         if let Some(d) = dispatcher {
             let rendered = render(&node.prompt_template, vars);
@@ -355,6 +415,7 @@ impl WorkflowExecutor {
                         format!("[node {} failed: {:?}]", node.id.as_str(), e),
                         false,
                         None,
+                        NodeDisposition::Failed,
                     );
                 }
             };
@@ -377,7 +438,8 @@ impl WorkflowExecutor {
                     ctx: &obs_ctx,
                     outcome: &outcome,
                 });
-                return (text, false, None);
+                let disposition = NodeDisposition::from_turn(&outcome);
+                return (text, false, None, disposition);
             }
 
             let mut parts = vec![Part { text: rendered }];
@@ -444,7 +506,7 @@ impl WorkflowExecutor {
                         });
                         ctx.observer
                             .record(&ObsEvent::NodeFinished { ctx: &obs_ctx, outcome: &fail_out });
-                        return (text, false, None);
+                        return (text, false, None, NodeDisposition::Failed);
                     }
                 },
                 _ = cancel.cancelled() => {
@@ -487,7 +549,8 @@ impl WorkflowExecutor {
                         ctx: &obs_ctx,
                         outcome: &outcome,
                     });
-                    return (text, false, None);
+                    let disposition = NodeDisposition::from_turn(&outcome);
+                    return (text, false, None, disposition);
                 }
             };
             let mut text = String::new();
@@ -616,7 +679,8 @@ impl WorkflowExecutor {
                 ctx: &obs_ctx,
                 outcome: &node_outcome,
             });
-            return (text, ok, last_usage);
+            let disposition = NodeDisposition::from_turn(&node_outcome);
+            return (text, ok, last_usage, disposition);
         }
         let rendered = render(&node.prompt_template, vars);
         let session = match SessionId::parse(format!(
@@ -631,6 +695,7 @@ impl WorkflowExecutor {
                     format!("[node {} failed: bad session id]", node.id.as_str()),
                     false,
                     None,
+                    NodeDisposition::Failed,
                 )
             }
         };
@@ -735,17 +800,30 @@ impl WorkflowExecutor {
                         .await
                     {
                         if retry_enabled && e.is_transient() {
-                            if should_retry_after_attempt {
-                                resolved.backend.release_session(&session).await;
+                            let action = if should_retry_after_attempt {
+                                ColdCleanupAction::Release
                             } else {
-                                resolved.backend.forget_session(&session).await;
-                            }
+                                ColdCleanupAction::Forget
+                            };
+                            let _ = cleanup_cold_session(
+                                &resolved.backend,
+                                &session,
+                                &diagnostic,
+                                action,
+                            )
+                            .await;
                             break 'attempt Attempt::Transient {
                                 err: e,
                                 usage: None,
                             };
                         }
-                        resolved.backend.forget_session(&session).await;
+                        let _ = cleanup_cold_session(
+                            &resolved.backend,
+                            &session,
+                            &diagnostic,
+                            ColdCleanupAction::Forget,
+                        )
+                        .await;
                         break 'attempt Attempt::Fatal {
                             text: format!("[node {} failed: configure {:?}]", node.id.as_str(), e),
                             usage: None,
@@ -753,11 +831,32 @@ impl WorkflowExecutor {
                         };
                     }
                     if cancel.is_cancelled() {
-                        resolved.backend.forget_session(&session).await;
-                        break 'attempt Attempt::Canceled {
-                            marker: format!("[node {} canceled]", node.id.as_str()),
-                            usage: None,
-                        };
+                        match cleanup_cold_session(
+                            &resolved.backend,
+                            &session,
+                            &diagnostic,
+                            ColdCleanupAction::Forget,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                break 'attempt Attempt::Canceled {
+                                    marker: format!("[node {} canceled]", node.id.as_str()),
+                                    usage: None,
+                                };
+                            }
+                            Err(error) => {
+                                break 'attempt Attempt::Fatal {
+                                    text: format!(
+                                        "[node {} cleanup failed: {:?}]",
+                                        node.id.as_str(),
+                                        error
+                                    ),
+                                    usage: None,
+                                    failure_class: classify_failure(&error),
+                                };
+                            }
+                        }
                     }
                     // prompt, with cancel
                     let rich_sink = ctx
@@ -766,22 +865,6 @@ impl WorkflowExecutor {
                         .map(|factory| factory.make(&node.id));
                     let mut stream = tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => {
-                            if let Some(sink) = &rich_sink {
-                                if let Err(flush_error) = sink.flush().await {
-                                    eprintln!(
-                                        "rich sink flush failed after cold prompt-open cancellation for node {}: {:?}",
-                                        node.id.as_str(),
-                                        flush_error
-                                    );
-                                }
-                            }
-                            resolved.backend.forget_session(&session).await;
-                            break 'attempt Attempt::Canceled {
-                                marker: format!("[node {} canceled]", node.id.as_str()),
-                                usage: None,
-                            };
-                        }
                         s = resolved.backend.prompt_with_observers(
                             &session,
                             vec![Part { text: rendered.clone() }],
@@ -799,14 +882,27 @@ impl WorkflowExecutor {
                                     }
                                 }
                                 if retry_enabled && e.is_transient() {
-                                    if should_retry_after_attempt {
-                                        resolved.backend.release_session(&session).await;
+                                    let action = if should_retry_after_attempt {
+                                        ColdCleanupAction::Release
                                     } else {
-                                        resolved.backend.forget_session(&session).await;
-                                    }
+                                        ColdCleanupAction::Forget
+                                    };
+                                    let _ = cleanup_cold_session(
+                                        &resolved.backend,
+                                        &session,
+                                        &diagnostic,
+                                        action,
+                                    )
+                                    .await;
                                     break 'attempt Attempt::Transient { err: e, usage: None };
                                 }
-                                resolved.backend.forget_session(&session).await;
+                                let _ = cleanup_cold_session(
+                                    &resolved.backend,
+                                    &session,
+                                    &diagnostic,
+                                    ColdCleanupAction::Forget,
+                                )
+                                .await;
                                 break 'attempt Attempt::Fatal {
                                     text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
                                     usage: None,
@@ -814,6 +910,43 @@ impl WorkflowExecutor {
                                 };
                             }
                         },
+                        _ = cancel.cancelled() => {
+                            if let Some(sink) = &rich_sink {
+                                if let Err(flush_error) = sink.flush().await {
+                                    eprintln!(
+                                        "rich sink flush failed after cold prompt-open cancellation for node {}: {:?}",
+                                        node.id.as_str(),
+                                        flush_error
+                                    );
+                                }
+                            }
+                            match cleanup_cold_session(
+                                &resolved.backend,
+                                &session,
+                                &diagnostic,
+                                ColdCleanupAction::Forget,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    break 'attempt Attempt::Canceled {
+                                        marker: format!("[node {} canceled]", node.id.as_str()),
+                                        usage: None,
+                                    };
+                                }
+                                Err(error) => {
+                                    break 'attempt Attempt::Fatal {
+                                        text: format!(
+                                            "[node {} cleanup failed: {:?}]",
+                                            node.id.as_str(),
+                                            error
+                                        ),
+                                        usage: None,
+                                        failure_class: classify_failure(&error),
+                                    };
+                                }
+                            }
+                        }
                     };
                     let mut text = String::new();
                     let mut ok = true;
@@ -823,13 +956,6 @@ impl WorkflowExecutor {
                     loop {
                         tokio::select! {
                             biased;
-                            _ = cancel.cancelled() => {
-                                let _ = resolved.backend.cancel(&session).await;
-                                canceled_during_drain = true;
-                                ok = false;
-                                text = format!("[node {} canceled]", node.id.as_str());
-                                break;
-                            }
                             item = stream.next() => match item {
                                 Some(Ok(Update::Text(t))) => {
                                     if ttft_val.is_none() && !t.is_empty() {
@@ -838,13 +964,32 @@ impl WorkflowExecutor {
                                         }
                                     }
                                     text.push_str(&t);
+                                    if cancel.is_cancelled() {
+                                        canceled_during_drain = true;
+                                        ok = false;
+                                        text = format!("[node {} canceled]", node.id.as_str());
+                                        break;
+                                    }
                                 }
-                                Some(Ok(Update::Permission(_))) => {} // safe: backends resolve permission internally
+                                Some(Ok(Update::Permission(_))) => {
+                                    if cancel.is_cancelled() {
+                                        canceled_during_drain = true;
+                                        ok = false;
+                                        text = format!("[node {} canceled]", node.id.as_str());
+                                        break;
+                                    }
+                                }
                                 Some(Ok(Update::Usage(mut u))) => {
                                     if let Some(previous) = &last_usage {
                                         u.merge_missing_from(previous);
                                     }
                                     last_usage = Some(u);
+                                    if cancel.is_cancelled() {
+                                        canceled_during_drain = true;
+                                        ok = false;
+                                        text = format!("[node {} canceled]", node.id.as_str());
+                                        break;
+                                    }
                                 }
                                 Some(Ok(Update::Done { stop_reason })) => {
                                     if stop_reason == STOP_REASON_CANCELLED { ok = false; }
@@ -857,9 +1002,24 @@ impl WorkflowExecutor {
                                     break;
                                 }
                                 None => break,
+                            },
+                            _ = cancel.cancelled() => {
+                                canceled_during_drain = true;
+                                ok = false;
+                                text = format!("[node {} canceled]", node.id.as_str());
+                                break;
                             }
                         }
                     }
+                    let cancel_error = if canceled_during_drain {
+                        resolved
+                            .backend
+                            .cancel_observed(&session, diagnostic.clone())
+                            .await
+                            .err()
+                    } else {
+                        None
+                    };
                     // Keep whatever usage the agent reported, even on error/cancel (see the warm path):
                     // `last_usage` is `None` only when no `Update::Usage` was ever observed.
                     let mut usage = last_usage;
@@ -878,7 +1038,13 @@ impl WorkflowExecutor {
                                 );
                                 usage = None;
                             } else {
-                                resolved.backend.forget_session(&session).await;
+                                let _ = cleanup_cold_session(
+                                    &resolved.backend,
+                                    &session,
+                                    &diagnostic,
+                                    ColdCleanupAction::Forget,
+                                )
+                                .await;
                                 break 'attempt Attempt::Fatal {
                                     text: format!(
                                         "[node {} rich-flush failed: {:?}]",
@@ -892,32 +1058,84 @@ impl WorkflowExecutor {
                         }
                     }
                     if canceled_during_drain {
-                        resolved.backend.forget_session(&session).await;
-                        break 'attempt Attempt::Canceled {
-                            marker: text,
-                            usage,
-                        };
+                        let cleanup_error = cleanup_cold_session(
+                            &resolved.backend,
+                            &session,
+                            &diagnostic,
+                            ColdCleanupAction::Forget,
+                        )
+                        .await
+                        .err();
+                        match cancel_error.or(cleanup_error) {
+                            Some(error) => {
+                                break 'attempt Attempt::Fatal {
+                                    text: format!(
+                                        "[node {} cleanup failed: {:?}]",
+                                        node.id.as_str(),
+                                        error
+                                    ),
+                                    usage,
+                                    failure_class: classify_failure(&error),
+                                };
+                            }
+                            None => {
+                                break 'attempt Attempt::Canceled {
+                                    marker: text,
+                                    usage,
+                                };
+                            }
+                        }
                     }
                     if let Some(e) = err {
                         if retry_enabled && e.is_transient() {
-                            if should_retry_after_attempt {
-                                resolved.backend.release_session(&session).await;
+                            let action = if should_retry_after_attempt {
+                                ColdCleanupAction::Release
                             } else {
-                                resolved.backend.forget_session(&session).await;
-                            }
+                                ColdCleanupAction::Forget
+                            };
+                            let _ = cleanup_cold_session(
+                                &resolved.backend,
+                                &session,
+                                &diagnostic,
+                                action,
+                            )
+                            .await;
                             break 'attempt Attempt::Transient { err: e, usage };
                         }
                         let fc = classify_failure(&e);
-                        resolved.backend.forget_session(&session).await;
+                        let _ = cleanup_cold_session(
+                            &resolved.backend,
+                            &session,
+                            &diagnostic,
+                            ColdCleanupAction::Forget,
+                        )
+                        .await;
                         break 'attempt Attempt::Fatal {
                             text,
                             usage,
                             failure_class: fc,
                         };
                     }
-                    resolved.backend.forget_session(&session).await;
+                    let cleanup = cleanup_cold_session(
+                        &resolved.backend,
+                        &session,
+                        &diagnostic,
+                        ColdCleanupAction::Forget,
+                    )
+                    .await;
                     if ok {
-                        Attempt::Ok { text, usage }
+                        match cleanup {
+                            Ok(()) => Attempt::Ok { text, usage },
+                            Err(error) => Attempt::Fatal {
+                                text: format!(
+                                    "[node {} cleanup failed: {:?}]",
+                                    node.id.as_str(),
+                                    error
+                                ),
+                                usage,
+                                failure_class: classify_failure(&error),
+                            },
+                        }
                     } else {
                         Attempt::Fatal {
                             text,
@@ -1041,7 +1259,8 @@ impl WorkflowExecutor {
             ctx: &node_obs_ctx,
             outcome: &final_node_outcome,
         });
-        (final_text, final_ok, final_usage)
+        let disposition = NodeDisposition::from_turn(&final_node_outcome);
+        (final_text, final_ok, final_usage, disposition)
     }
 
     /// Run a workflow from scratch (no prior checkpoints).
@@ -1296,6 +1515,19 @@ impl WorkflowExecutor {
                 }
             }
 
+            let mut dispositions: HashMap<String, NodeDisposition> = seed
+                .iter()
+                .map(|(node, (_, ok, _))| {
+                    (
+                        node.clone(),
+                        if *ok {
+                            NodeDisposition::Completed
+                        } else {
+                            NodeDisposition::Failed
+                        },
+                    )
+                })
+                .collect();
             let mut outputs: HashMap<String, (String, bool, Option<UsageSnapshot>)> = seed;
             let mut done: HashSet<String> = outputs.keys().cloned().collect();
             let terminal_id = graph.terminal().map(|n| n.id.as_str().to_string()).unwrap_or_default();
@@ -1365,7 +1597,7 @@ impl WorkflowExecutor {
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
                                         owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                                    let (text, ok, usage) = this.run_node(
+                                    let (text, ok, usage, disposition) = this.run_node(
                                         &wf_id,
                                         &node,
                                         &vars,
@@ -1375,7 +1607,7 @@ impl WorkflowExecutor {
                                         &diagnostic_factory,
                                         dispatcher.as_ref(),
                                     ).await;
-                                    (node.id.clone(), text, ok, usage)
+                                    (node.id.clone(), text, ok, usage, disposition)
                                 }) as NodeFut);
                             }
                         }
@@ -1387,9 +1619,10 @@ impl WorkflowExecutor {
             for node in schedule_ready!() {
                 yield Ok(WorkflowEvent::NodeStarted { node });
             }
-            while let Some((node_id, text, ok, usage)) = inflight.next().await {
+            while let Some((node_id, text, ok, usage, disposition)) = inflight.next().await {
                 yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok, output: text.clone(), usage: usage.clone() });
                 done.insert(node_id.as_str().to_string());
+                dispositions.insert(node_id.as_str().to_string(), disposition);
                 outputs.insert(node_id.as_str().to_string(), (text, ok, usage));
                 if cancel.is_cancelled() {
                     // Stop scheduling NEW nodes, but keep draining so every already-in-flight
@@ -1403,10 +1636,18 @@ impl WorkflowExecutor {
                     yield Ok(WorkflowEvent::NodeStarted { node });
                 }
             }
-            let (term_text, term_ok, _usage) = outputs.get(&terminal_id).cloned().unwrap_or_default();
-            let outcome = if term_ok { WorkflowOutcome::Completed }
-                else if cancel.is_cancelled() { WorkflowOutcome::Canceled }
-                else { WorkflowOutcome::Failed };
+            let (term_text, _, _usage) = outputs.get(&terminal_id).cloned().unwrap_or_default();
+            let outcome = dispositions
+                .get(&terminal_id)
+                .copied()
+                .map(NodeDisposition::workflow_outcome)
+                .unwrap_or_else(|| {
+                    if cancel.is_cancelled() {
+                        WorkflowOutcome::Canceled
+                    } else {
+                        WorkflowOutcome::Failed
+                    }
+                });
             yield Ok(WorkflowEvent::Terminal { outcome, output: term_text });
         })
     }
@@ -1621,6 +1862,7 @@ mod tests {
 
     struct CompositePathBackend {
         prompts: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+        cleanups: Mutex<Vec<(&'static str, Arc<dyn DiagnosticObserver>)>>,
         calls: AtomicUsize,
         fail_first: bool,
     }
@@ -1629,6 +1871,7 @@ mod tests {
         fn new(fail_first: bool) -> Self {
             Self {
                 prompts: Mutex::new(Vec::new()),
+                cleanups: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
                 fail_first,
             }
@@ -1667,6 +1910,24 @@ mod tests {
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             Ok(())
         }
+
+        async fn forget_session_observed(
+            &self,
+            _session: &SessionId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<(), BridgeError> {
+            self.cleanups.lock().unwrap().push(("forget", observer));
+            Ok(())
+        }
+
+        async fn release_session_observed(
+            &self,
+            _session: &SessionId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<(), BridgeError> {
+            self.cleanups.lock().unwrap().push(("release", observer));
+            Ok(())
+        }
     }
 
     struct CompositePathRegistry {
@@ -1702,6 +1963,33 @@ mod tests {
         }
 
         async fn invalidate(&self, _agent: &AgentId) {}
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    struct SingleBackendRegistry {
+        backend: Arc<dyn AgentBackend>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for SingleBackendRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            Ok(Resolved {
+                entry: Arc::new(minimal_entry(id)),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+
+        async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
 
         fn list(&self) -> Vec<AgentId> {
             vec![]
@@ -1831,13 +2119,17 @@ mod tests {
         let made = diagnostic_factory.made.lock().unwrap();
         let resolutions = registry.resolutions.lock().unwrap();
         let prompts = backend.prompts.lock().unwrap();
+        let cleanups = backend.cleanups.lock().unwrap();
         assert_eq!(made.len(), 1);
         assert_eq!(made[0].0, "only");
         assert_eq!(made[0].1, 1);
         assert_eq!(resolutions.len(), 1);
         assert_eq!(prompts.len(), 1);
+        assert_eq!(cleanups.len(), 1);
+        assert_eq!(cleanups[0].0, "forget");
         assert!(Arc::ptr_eq(&made[0].2, &resolutions[0]));
         assert!(Arc::ptr_eq(&made[0].2, &prompts[0]));
+        assert!(Arc::ptr_eq(&made[0].2, &cleanups[0].1));
         assert_eq!(rich_sink.events.load(Ordering::SeqCst), 1);
         assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
     }
@@ -1873,6 +2165,7 @@ mod tests {
         let made = diagnostic_factory.made.lock().unwrap();
         let resolutions = registry.resolutions.lock().unwrap();
         let prompts = backend.prompts.lock().unwrap();
+        let cleanups = backend.cleanups.lock().unwrap();
         assert_eq!(
             made.iter()
                 .map(|(_, attempt, _)| *attempt)
@@ -1881,9 +2174,17 @@ mod tests {
         );
         assert_eq!(resolutions.len(), 2);
         assert_eq!(prompts.len(), 2);
+        assert_eq!(
+            cleanups
+                .iter()
+                .map(|(action, _)| *action)
+                .collect::<Vec<_>>(),
+            ["release", "forget"]
+        );
         for index in 0..2 {
             assert!(Arc::ptr_eq(&made[index].2, &resolutions[index]));
             assert!(Arc::ptr_eq(&made[index].2, &prompts[index]));
+            assert!(Arc::ptr_eq(&made[index].2, &cleanups[index].1));
         }
         assert_eq!(rich_sink.events.load(Ordering::SeqCst), 1);
         assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 2);
@@ -2903,7 +3204,7 @@ mod tests {
         let executor = WorkflowExecutor::new(Arc::new(FakeRegistry {
             backends: HashMap::new(),
         }));
-        let _events = executor
+        let events = executor
             .run_with_context_and_dispatcher(
                 one_node_graph(),
                 "DIFF".into(),
@@ -2922,6 +3223,11 @@ mod tests {
             exits.lock().unwrap().as_slice(),
             ["error:StoreFailure"],
             "an already-ready backend failure owns the turn before simultaneous cancellation"
+        );
+        assert_eq!(
+            workflow_terminal(&events),
+            WorkflowOutcome::Failed,
+            "the selected structured failure must also own the public workflow terminal"
         );
     }
 
@@ -3092,7 +3398,7 @@ mod tests {
             ..WorkflowRunContext::default()
         };
 
-        let _events = executor
+        let events = executor
             .run_with_context_and_dispatcher(
                 one_node_graph(),
                 "DIFF".into(),
@@ -3111,6 +3417,343 @@ mod tests {
             ["error:StoreFailure"],
             "an already-ready prompt-open failure owns the turn before simultaneous cancellation"
         );
+        assert_eq!(
+            workflow_terminal(&events),
+            WorkflowOutcome::Failed,
+            "the selected prompt-open failure must also own the public workflow terminal"
+        );
+    }
+
+    struct ColdCleanupResultBackend {
+        backend_error: Option<BridgeError>,
+        cleanup_error: Option<BridgeError>,
+        legacy_forgets: Arc<AtomicUsize>,
+        checked_forgets: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ColdCleanupResultBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates = match &self.backend_error {
+                Some(error) => vec![Err(error.clone())],
+                None => vec![Ok(Update::Done {
+                    stop_reason: "end_turn".to_owned(),
+                })],
+            };
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn forget_session(&self, _session: &SessionId) {
+            self.legacy_forgets.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn forget_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.checked_forgets.fetch_add(1, Ordering::SeqCst);
+            match &self.cleanup_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_review_cold_cleanup_failure_is_primary_only_without_backend_failure() {
+        for (backend_error, expected_fragment) in [
+            (None, "cleanup failed: StoreFailure"),
+            (
+                Some(BridgeError::ConfigMismatch { field: "model" }),
+                "ConfigMismatch",
+            ),
+        ] {
+            let legacy_forgets = Arc::new(AtomicUsize::new(0));
+            let checked_forgets = Arc::new(AtomicUsize::new(0));
+            let executor = WorkflowExecutor::new(Arc::new(SingleBackendRegistry {
+                backend: Arc::new(ColdCleanupResultBackend {
+                    backend_error,
+                    cleanup_error: Some(BridgeError::StoreFailure),
+                    legacy_forgets: legacy_forgets.clone(),
+                    checked_forgets: checked_forgets.clone(),
+                }),
+            }));
+            let events = executor
+                .run_with_context(
+                    one_node_graph(),
+                    "input".into(),
+                    "cold-cleanup-result".into(),
+                    CancellationToken::new(),
+                    WorkflowRunContext::default(),
+                )
+                .collect::<Vec<_>>()
+                .await;
+            let (ok, output) = events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .find_map(|event| match event {
+                    WorkflowEvent::NodeFinished { ok, output, .. } => Some((*ok, output.clone())),
+                    _ => None,
+                })
+                .unwrap();
+            let terminal = events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .find_map(|event| match event {
+                    WorkflowEvent::Terminal { outcome, .. } => Some(outcome.clone()),
+                    _ => None,
+                })
+                .unwrap();
+
+            assert!(!ok);
+            assert!(output.contains(expected_fragment), "{output}");
+            assert_eq!(terminal, WorkflowOutcome::Failed);
+            assert_eq!(checked_forgets.load(Ordering::SeqCst), 1);
+            assert_eq!(legacy_forgets.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    enum ColdReadyRace {
+        PromptOpenError,
+        StreamError,
+        CancellationOnly,
+    }
+
+    struct ColdReadyRaceBackend {
+        cancel: CancellationToken,
+        race: ColdReadyRace,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ColdReadyRaceBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            match self.race {
+                ColdReadyRace::PromptOpenError => Err(BridgeError::StoreFailure),
+                ColdReadyRace::StreamError => {
+                    self.cancel.cancel();
+                    Ok(Box::pin(tokio_stream::iter(vec![Err(
+                        BridgeError::StoreFailure,
+                    )])))
+                }
+                ColdReadyRace::CancellationOnly => {
+                    self.cancel.cancel();
+                    Ok(Box::pin(futures::stream::pending()))
+                }
+            }
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct ColdCancelAfterPrecheckFactory {
+        cancel: CancellationToken,
+        sink: Arc<RecordingRichSink>,
+    }
+
+    impl RichEventSinkFactory for ColdCancelAfterPrecheckFactory {
+        fn make(&self, _node: &NodeId) -> Arc<dyn bridge_core::ports::RichEventSink> {
+            self.cancel.cancel();
+            self.sink.clone()
+        }
+    }
+
+    async fn run_cold_ready_race(
+        race: ColdReadyRace,
+        cancel_before_prompt_poll: bool,
+    ) -> Vec<Result<WorkflowEvent, BridgeError>> {
+        let cancel = CancellationToken::new();
+        let executor = WorkflowExecutor::new(Arc::new(SingleBackendRegistry {
+            backend: Arc::new(ColdReadyRaceBackend {
+                cancel: cancel.clone(),
+                race,
+            }),
+        }));
+        let context = WorkflowRunContext {
+            make_rich_sink: cancel_before_prompt_poll.then(|| {
+                Arc::new(ColdCancelAfterPrecheckFactory {
+                    cancel: cancel.clone(),
+                    sink: Arc::new(RecordingRichSink::default()),
+                }) as Arc<dyn RichEventSinkFactory>
+            }),
+            ..WorkflowRunContext::default()
+        };
+        executor
+            .run_with_context(
+                one_node_graph(),
+                "input".into(),
+                "cold-ready-race".into(),
+                cancel,
+                context,
+            )
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    fn workflow_terminal(events: &[Result<WorkflowEvent, BridgeError>]) -> WorkflowOutcome {
+        events
+            .iter()
+            .filter_map(|event| event.as_ref().ok())
+            .find_map(|event| match event {
+                WorkflowEvent::Terminal { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn final_review_cold_ready_prompt_open_error_beats_cancellation() {
+        let events = run_cold_ready_race(ColdReadyRace::PromptOpenError, true).await;
+        assert_eq!(workflow_terminal(&events), WorkflowOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn final_review_cold_ready_stream_error_beats_cancellation() {
+        let events = run_cold_ready_race(ColdReadyRace::StreamError, false).await;
+        assert_eq!(workflow_terminal(&events), WorkflowOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn final_review_cold_pending_stream_still_yields_to_cancellation() {
+        let events = run_cold_ready_race(ColdReadyRace::CancellationOnly, false).await;
+        assert_eq!(workflow_terminal(&events), WorkflowOutcome::Canceled);
+    }
+
+    struct ColdCancellationCleanupBackend {
+        cancel: CancellationToken,
+        cancel_error: Option<BridgeError>,
+        cleanup_error: Option<BridgeError>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ColdCancellationCleanupBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.cancel.cancel();
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            match &self.cancel_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+
+        async fn forget_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            match &self.cleanup_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_review_cold_cancellation_surfaces_cancel_or_cleanup_failure() {
+        for (cancel_error, cleanup_error, expected) in [
+            (None, None, WorkflowOutcome::Canceled),
+            (
+                Some(BridgeError::StoreFailure),
+                None,
+                WorkflowOutcome::Failed,
+            ),
+            (
+                None,
+                Some(BridgeError::StoreFailure),
+                WorkflowOutcome::Failed,
+            ),
+        ] {
+            let cancel = CancellationToken::new();
+            let executor = WorkflowExecutor::new(Arc::new(SingleBackendRegistry {
+                backend: Arc::new(ColdCancellationCleanupBackend {
+                    cancel: cancel.clone(),
+                    cancel_error,
+                    cleanup_error,
+                }),
+            }));
+            let events = executor
+                .run_with_context(
+                    one_node_graph(),
+                    "input".into(),
+                    "cold-cancel-cleanup".into(),
+                    cancel,
+                    WorkflowRunContext::default(),
+                )
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(workflow_terminal(&events), expected);
+        }
+    }
+
+    struct ColdReadyUsageBackend {
+        cancel: CancellationToken,
+        updates: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ColdReadyUsageBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.cancel.cancel();
+            let updates = self.updates.clone();
+            let stream = futures::stream::iter((0..128).map(move |_| {
+                updates.fetch_add(1, Ordering::SeqCst);
+                Ok(Update::Usage(UsageSnapshot {
+                    used: Some(1),
+                    size: Some(10),
+                    cost: None,
+                    terminal: None,
+                    at_ms: 0,
+                }))
+            }))
+            .chain(futures::stream::pending());
+            Ok(Box::pin(stream))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn final_review_cold_ready_usage_checks_cancellation_before_repolling() {
+        let cancel = CancellationToken::new();
+        let updates = Arc::new(AtomicUsize::new(0));
+        let executor = WorkflowExecutor::new(Arc::new(SingleBackendRegistry {
+            backend: Arc::new(ColdReadyUsageBackend {
+                cancel: cancel.clone(),
+                updates: updates.clone(),
+            }),
+        }));
+        let events = executor
+            .run_with_context(
+                one_node_graph(),
+                "input".into(),
+                "cold-ready-usage".into(),
+                cancel,
+                WorkflowRunContext::default(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(updates.load(Ordering::SeqCst), 1);
+        assert_eq!(workflow_terminal(&events), WorkflowOutcome::Canceled);
     }
 
     struct ResultCleanup {
