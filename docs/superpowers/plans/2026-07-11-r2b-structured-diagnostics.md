@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a committed at `4ed12f1`; 2b committed at `f40096df`; 2c review 7 `APPROVE` and exact-tree full-gated, commit pending; 2d next); R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d closure review 12 `APPROVE`, committed on branch; exact **1,090 / 0 / 0**; full host workspace **1,806 / 0 / 12 ignored**; hygiene **37/7**; push and final R2b2 review pending); R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -351,7 +351,8 @@ R2b2b implementation evidence (`f40096dfcfb43a37236ce5626fd362a16645f0fe`):
   `f40096dfcfb43a37236ce5626fd362a16645f0fe`, but remains unmerged until R2b2a-d and the full branch review
   gate complete.
 
-R2b2c implementation handoff (review-approved/full-gated working tree based on
+R2b2c implementation handoff (committed and pushed at
+`407907202982d732c2395be0f6319f6029622f82`, based on
 `f40096dfcfb43a37236ce5626fd362a16645f0fe`):
 
 - `Translator::run_observed`, `SessionManager::{checkout_turn_observed,checkout_child_turn_observed}`,
@@ -417,9 +418,195 @@ R2b2c implementation handoff (review-approved/full-gated working tree based on
   hygiene (**37** tracked artifacts / **7** example configs). This full serial run clears the three
   unchanged process-fixture precondition failures seen only under the earlier parallel affected-crate run.
   No live/billable gate was run. Commit/push 2c, then begin 2d;
-- R2b2d still exclusively owns observed cleanup methods, structured-failure warm expiry, completion guards,
-  tombstones/claims, cleanup flight, and worktree release/retire single-flight. R2b3 still owns API and
-  container adapter diagnostic implementation. R2f still owns phase-aware stagnation/takeover.
+- R2b2d exclusively owns observed cleanup methods, structured-failure warm expiry, completion guards,
+  tombstones/claims, cleanup flight, and worktree release/retire single-flight. Its local implementation
+  and evidence are recorded below. R2b3 still owns API and container adapter diagnostic implementation.
+  R2f still owns phase-aware stagnation/takeover.
+
+R2b2d implementation handoff (review-approved branch commit based on
+`407907202982d732c2395be0f6319f6029622f82`):
+
+- `warm_session_survivability` exhaustively expires every structured failure class/disposition while
+  preserving each owner's legacy policy. Inbound streaming/unary, coordinator prompt/continue, and warm
+  workflow cleanup synchronously arm one sticky completion guard before formatting, channel sends,
+  persistence, or cleanup awaits. Ready backend results beat simultaneous workflow cancellation or stream
+  receiver close after prompt ownership; force-reset abort remains first.
+- `SessionTable` separates live handles from claim-id `Expiring`/`CleanupFailed` tombstones. Exact
+  generation/operation claims synchronously transfer the backend session, lease, outstanding operation
+  abort tokens, and child-cleanup ownership into detached cleanup. Claim drop starts an unstarted flight;
+  waiter cancellation detaches a started one; any whole-worker panic or surfaced task `JoinError` uses a
+  retained exact-claim settlement capability to become a bounded cleanup failure; only the matching
+  successful claim clears its tombstone. Explicit release, reap, cancel-error, and all registered
+  children are claimed before their first cleanup await. A failed flight drops the warm handle and lease
+  but retains one adjacent backend/session retry capability; release/clear atomically reclaim it under a
+  new claim id, failure restores it, and waiter cancellation detaches from the retry flight.
+- Cancel settlement uses an owned future that is polled once inline. Immediate success preserves existing
+  SessionCancel/busy-token ordering; a pending future is moved intact into a task, so waiter cancellation
+  cannot strand `Cancelling` or issue a second backend cancel. A panic expires and releases the handle.
+- `NodeTurnCleanup::on_exit_observed` is additive and source-compatible. Workflow owners settle observed
+  cleanup before `TurnFinished`/`NodeFinished`; cleanup failure becomes primary only without an earlier
+  backend/rich failure. Additive synchronous `arm_exit` makes structured expiry sticky at the prompt-open
+  or stream-error match site before a cancellable rich-sink flush. At prompt-open and stream-drain ownership
+  boundaries, a simultaneously ready concrete backend result precedes workflow cancellation; a pending
+  backend future remains cancelable. On expiry, `WarmCompletionGuard` consumes its claim into the detached
+  observer-free flight before teardown-start persistence and joins that report before returning even when
+  the start observation fails. The shared operation observer remains outside detached cleanup.
+- `WorktreeBackend` owns sealed per-session shared flights. A synchronous cell/report selection starts or
+  joins before the first await; equal callers receive one report, a stronger `release` installs a detached
+  monotonic upgrade, completed components are not repeated, and an explicit post-failure call retries only
+  incomplete work. Every successful configure retains its cell until cleanup, and admission, retirement
+  seal, and successful eviction linearize under the cell-map lock. Cleanup cells retain `WtEntry` until
+  provider and sidecar completion, including ownerless reservation, partial add, sidecar-write, and inner-
+  configure failures. Reservation publication arms cleanup-on-drop before provider/sidecar/inner awaits;
+  returned failure or cancellation marks the same cell and synchronously starts detached Release after
+  balancing admission. Failed compensation re-arms release in that flight slot with bounded backoff, while
+  explicit release or retirement can replace it by exact flight id. A takeover retains the maximum existing/
+  requested strength, so Forget cannot erase failed Release. Degraded cleanup rejects new allocation before
+  provider add, and a 64-admission circuit breaker bounds the already-in-flight wave. Retirement seals all
+  configure paths, waits admitted calls, joins cleanup cells, then
+  calls `inner.retire`. Observed callers record started/completed/failed locally; observer persistence
+  failure is fatal but does not suppress cleanup.
+- Max review 1 returned `REVISE` for four `WRONG` R2b2d schedules: workflow drop during rich flush used the
+  guard's default cancel action; release could pass configure between admission and reservation publication;
+  `HostGitWorktree::remove` discarded both command statuses; and successful cells accumulated by distinct
+  session id. Each schedule was reproduced red before its fold. The implementation now arms the warm error
+  synchronously, shares a pre-await per-session configure/cleanup lifecycle cell, waits every admitted git,
+  non-git, and no-cwd configure before teardown, reports incomplete real git cleanup while treating an
+  already-absent target plus successful prune as idempotent success, and token-evicts the exact successful
+  flight before its report becomes visible. Failure retains component state; an older completion cannot
+  evict a stronger replacement. The review's inherited claimed-state/sweep-cancellation concern was tagged
+  `SMELL` and remains in R2f.
+- Deterministic regressions first failed for: multi-child waiter cancellation (**1** release, expected
+  **3**); provider gate receiver dropped with the report waiter; inner release preceding a reserving
+  configure; concurrent waiters seeing different failure/retry reports; canceled stronger upgrade; warm
+  cancel gate receiver dropped with the completion waiter; and a ready backend error losing to simultaneous
+  cancellation/receiver close. Each now passes with exact count/state/order assertions plus stale-claim,
+  cleanup-failure/panic, post-seal, non-git/no-cwd, and observer-lifetime edges.
+- Debugging the affected-crate gate followed the hypothesis/probe log. A silent `workflow_producer` process
+  localized to `session_cancel_keeps_context_busy_until_producer_exits`; the suspected child-lock cycle was
+  ruled out. Temporary phase markers proved SessionCancel returned but the second request was admitted and
+  blocked on its fake prompt. Root cause was the unconditional spawn yield in cancel settlement. Inline
+  first-poll plus transfer-on-pending restored the existing ordering while retaining detached ownership;
+  the full producer binary passes **50 / 0** and the markers were removed.
+- Closure review 1 marked the workflow-arm and pre-reservation-admission findings `FIXED`, then returned
+  `REVISE`: absent-target success did not prove exact Git registration absence, and retirement could miss a
+  post-eviction release generation. The fold makes Git cleanup success require target metadata absence,
+  successful prune, and byte-exact absence from `worktree list --porcelain -z`; metadata/list/prune failure
+  fails closed, and git subprocess cancellation kills its child. Sealed retirement retains completed cells
+  for late known owners, while unknown post-seal cleanup cannot create unbounded cells. A gated retirement-
+  first test was red at two inner releases and is green at one.
+- Self-audit additionally reproduced release parked forever after its configure owner was canceled during
+  provider add. `Reserving` now stores configure-owner identity plus cleanup metadata; lifecycle admission
+  tracks active identities, wakes peer configures on owner drop, and lets release, a peer, or retirement take
+  the orphan only after all admitted configuration settles. The prior reservation test acknowledgement was
+  moved to that real wait boundary. Two exact stale worktree test processes from earlier yielded commands
+  were terminated; a new complete run emitted **38 / 0 / 0** and no stale process remains.
+- Closure review 2 adjudicated Git final-state proof and the repaired harness `FIXED`, configure cancellation
+  `PARTIAL`, and the retirement fold `NOT FIXED`, then returned `REVISE` with four present-slice failures:
+  a known release could fall through between seal and retirement's cell snapshot; ownerless reservation
+  cleanup lost `WtEntry` after provider failure; prompt-open cancellation preceded an already-ready
+  structured error; and `CleanupFailed` made the backend's failed cleanup cell unreachable to release/clear.
+  It also identified stale gate wording and retained-registration command injection as a documented coverage
+  limitation, while leaving the generic reset/reconcile/compact/cancel sweep in R2f.
+- Each closure-2 failure was reproduced deterministically before its fold. Configure success now retains a
+  bounded cell and seal/admission/eviction share one lock boundary; failed cleanup retains exact worktree
+  metadata through retry; prompt-open polls the concrete backend result first; and `CleanupFailed` retains a
+  minimal retry owner consumed by explicit release/clear. Additional edges prove partial add, sidecar-write,
+  and inner-configure cleanup retry; repeated manager retry failure; and retry-waiter cancellation.
+- Closure review 3 marked ownerless metadata, prompt-open precedence, retry capability, and docs `FIXED`,
+  but returned `REVISE` with three worktree blockers. A later failed/canceled configure could remove a cell
+  retained by an earlier successful no-cwd configure; configure rejection after cleanup start decremented an
+  unincremented global counter from zero to `u64::MAX`; and observed cleanup awaited `teardown started`
+  persistence before selecting its flight. All three schedules were reproduced red.
+- Cell lifecycle now persists configured ownership independently of transient admissions; rejected admission
+  leaves the global counter untouched; and observed cleanup synchronously starts/joins the observer-free
+  flight before its first diagnostic await. Canceled and returned-error admissions retain the known cell;
+  retirement completes after rejected configure; and canceling a pending observer write drops the observer
+  while provider cleanup continues. The complete worktree package passes **47 / 0 / 0**.
+- Closure review 4 marked all three closure-3 blockers `FIXED`, then returned `REVISE` for the analogous
+  outer warm-guard boundary: it claimed the session but awaited teardown-start persistence before spawning
+  cleanup, and an immediate observation error returned before detached cleanup settled. Pending and
+  immediate-error schedules reproduced both failures red. `ExpiryClaim::into_flight` now synchronously
+  transfers ownership; `WarmCompletionGuard` starts that flight before its diagnostic await and joins it
+  before returning observation failure.
+- Closure review 5 marked the observer-ordering fold `FIXED`, then returned `REVISE` because a public lease
+  destructor panic after checked backend release escaped the release-only unwind boundary. The resulting
+  `JoinError` lacked generation/operation/claim identity and left an unrecoverable `Expiring` tombstone.
+  Deterministic lease-panic and task-abort tests first reproduced the stuck state. `CleanupFlight` now keeps
+  an exact-claim settlement capability in the whole-worker recovery and joiner; either failure installs one
+  bounded backend/session retry owner only if the same claim still owns the tombstone. Both former-red
+  schedules pass through explicit retry.
+- Closure review 6 marked the claim-aware worker/joiner fold `FIXED` but found a separate
+  `WRONG/BLOCKER`: partial Worktree configuration plus failed compensation retained exact metadata after
+  warm, direct inbound, fan-out, and workflow callers dropped their only owner. Same-session configure was
+  rejected and distinct failures could accumulate. A deterministic production-owner regression reproduced
+  the second allocation. Failed configuration now marks its cell before admission drops; the reporter
+  re-arms exact release with exponential backoff and yields by flight id to explicit release/retirement.
+  Degraded cleanup rejects new allocation before provider add, while a 64-admission circuit breaker bounds
+  the pre-marker wave. The retry performs exactly one additional provider removal and does not repeat the
+  completed inner release. The review's `SMELL/MAJOR` test gap is also closed: a worker-only lease-panic test
+  discards the joiner capability before allowing the panic. The complete worktree package passes
+  **49 / 0 / 0** and coordinator passes **228 / 0 / 0**.
+- Closure review 7 marked worker-only panic recovery `FIXED`, but returned `REVISE` for two Worktree
+  blockers. Cancellation after reservation/provider side effects dropped an unmarked admission before any
+  reporter existed, so sequential orphans bypassed the capacity bound. A completed failed Release slot also
+  allowed weaker Forget takeover, which could clear the marker and stop Release recovery. Both schedules
+  reproduced red. Reservation publication now arms a destructor fallback; admission drop marks the cell,
+  balances counts, and synchronously starts observer-free Release. Failed-slot replacement keeps maximum
+  strength. The cancellation regression proves cleanup without manual release, distinct-allocation rejection,
+  exact provider retry, and no repeated inner release; the takeover regression requires two Releases and zero
+  Forgets. The autonomous-retry test now directly asserts exactly two provider removals and one inner release,
+  closing review 7's proof gap. The complete worktree package passes **51 / 0 / 0**.
+- Closure review 8 marked the standalone cancellation/strength folds `FIXED`, but returned `REVISE` for a
+  cross-flight race: pending Forget superseded by destructor-owned Release could report success and clear the
+  failed-config marker before checking flight identity. A later Release failure then lost admission closure
+  and automatic retry. The combined schedule reproduced red. Success finalization now requires exact current
+  flight ownership; when failed-config cleanup is pending, the current slot must also be Release strength.
+  Stale/weaker success reports to its own waiter but cannot clear/evict shared state. The regression requires
+  pending Forget, canceled configure, failed Release, distinct-allocation rejection, two Releases, one Forget,
+  one provider removal, and automatic exact-cell recovery. Worktree passes **52 / 0 / 0**.
+- Closure review 9 marked closure 8's exact-flight finalization and Release satisfaction `FIXED`, then returned
+  `REVISE` for a cross-owner structured-failure/`SessionCancel` race. Failure observation could arm expiry
+  locally, cancel could settle the same operation to `Idle`, and the later exact claim would no-op. Both
+  in-flight and already-completed cancel settlement orders reproduced red. Every warm turn now shares one
+  opaque exact-operation expiry intent between `WarmCompletionGuard` and its retained turn record.
+  `observe_exit` publishes it synchronously; cancel settlement converts it to expiry, `Cancelling` claims
+  accept an exact deferred-expiry handoff, and only the exact armed retained operation may claim a settled
+  `Idle` handle. The existing stale-operation test keeps a newer turn untouched. Coordinator passes
+  **230 / 0 / 0**.
+- Review 9's major test-proof smell is folded with a deterministic state that keeps the exact current slot at
+  Forget while a failed-config marker is present. Forget success preserves the marker/cell; a temporary
+  predicate mutation accepting Forget makes the regression fail. A marker-free Forget control proves exact
+  success eviction. Worktree passes **54 / 0 / 0**.
+- Closure review 10 marked the Worktree fold and mutation proof `FIXED`, then returned `REVISE` for two
+  production schedules. Cancel could restore A to `Idle`, A could arm expiry afterward, and B could check out
+  before A acquired the table; both existing-context and ordinary checkout reproduced the poisoned reuse.
+  `WarmExpiryIntent` now atomically chooses `armed` or `successor_reserved`. Failure-first checkout claims one
+  detached expiry and returns `SessionExpired`; successor-first makes a late stale arm inert. Both former-red
+  paths and a direct two-order atomic control pass. Coordinator passes **233 / 0 / 0**.
+- Repeated biased data priority also let 128 always-ready usage items postpone already-ready workflow cancel
+  or inbound disconnect through the whole prefix. The next item still wins once, so queued structured errors
+  retain precedence; every benign workflow item and inbound usage item checks control before another data
+  poll. Inbound closed-select, usage, and failed-send paths share one canceled finalizer. Both former-red tests
+  now consume one item, and the prior error-precedence/finalization controls remain green. Workflow passes
+  **76 / 0 / 0** and inbound passes **263 / 0 / 0**.
+- Closure review 11 adjudicated both production folds and every inherited implementation/test surface
+  `FIXED`. Its only `WRONG/MINOR` was that the design header, roadmap top/table, and this plan header did not
+  all state closure 10, exact **1,090 / 0 / 0**, and the full-workspace/hygiene pending boundary. Those
+  authoritative summaries now agree. The retained Git fixture and bounded-yield polling remain minor smells;
+  review 11 found no open code or test defect.
+- Closure review 12 used a fresh Sol/xhigh read-only instance for the documentation-only fold. It confirmed
+  that no production/test path changed after review 11, adjudicated the design/roadmap/plan summaries
+  consistent, retained only the two accepted minor coverage debts, found no new `WRONG`, and returned
+  `APPROVE`.
+- The post-fold exact six-package gate passes **1,090 / 0 / 0 ignored**. Format and diff checks, workspace/
+  all-target check, warnings-denied workspace/all-target Clippy, and the workspace release build are clean on
+  the same tree. The managed-sandbox full run stopped at **268 / 14** because 12 Wiremock tests received OS
+  port `PermissionDenied` and two file-watch tests timed out. The identical host serial command passes
+  **1,806 / 0 / 12 ignored** across 64 terminal result groups. Repository hygiene passes at **37** tracked
+  artifacts / **7** validated example configs. The Git command-fixture limitation and bounded yield polling
+  remain documented minor test-coverage follow-ups. No docs-link checker was found and no live/billable gate
+  ran. Push 2d, then run the final full-R2b2 review; do not merge before that approval.
 
 ### Observation plumbing
 
@@ -472,7 +659,9 @@ R2b2c implementation handoff (review-approved/full-gated working tree based on
    only joins and records that report. Cancellation before flight start makes claim drop start it, while
    cancellation after start detaches the waiter and never starts a second release. Checkout rejects the
    tombstone; only successful matching claim-id completion clears it, while cleanup failure leaves
-   `CleanupFailed` non-reusable.
+   `CleanupFailed` non-reusable and retains one adjacent bounded backend/session retry capability. Explicit
+   release/clear consumes that capability into a new claim-id flight; failure restores it, and success clears
+   it without retaining the warm handle, lease, observer, or task store.
 
 ### ACP failure migration
 
@@ -513,8 +702,36 @@ R2b2c implementation handoff (review-approved/full-gated working tree based on
 - checkout after claim and after first cleanup side effect sees `Expiring`, performs zero new
   resolve/configure/mint calls, and becomes eligible only after successful matching claim-id cleanup;
 - cleanup failure leaves `CleanupFailed` non-reusable, and a stale flight cannot clear a newer tombstone;
+- explicit release and clear retry a recovered `CleanupFailed` backend/session capability; repeated failure
+  restores it, and cancellation of the retry waiter does not cancel the owned flight;
+- a ready prompt-open structured failure beats cancellation made ready after the eager precheck, while a
+  pending prompt-open future remains immediately cancelable;
+- configure success publishes a retained per-session cleanup cell before retirement seal; a known release
+  between seal and retirement snapshot joins that cell/report, while unknown post-seal ids remain bounded;
+- a later failed and a later canceled same-session configure cannot erase an earlier successful no-cwd
+  configured cell; configure rejected after cleanup start leaves the global admission count exactly zero
+  and retirement completes after the shared flight;
+- ownerless reservation, partial provider-add, sidecar-write, and inner-configure cleanup failures retain
+  canonical source/path until provider and sidecar completion, and retry only incomplete components;
+- failed configuration plus failed compensation retains a backend-owned retry in the same exact flight slot,
+  blocks a distinct allocation before provider add, bounds the admitted wave at 64, and automatically clears
+  the cell without an external session owner once the provider recovers;
+- cancellation after reservation/provider publication starts that same owned Release from admission drop,
+  blocks distinct allocation, and resumes only incomplete provider cleanup after recovery;
+- a Forget takeover of completed failed Release retains Release strength and cannot clear the marker until
+  the stronger inner action succeeds;
+- a pending Forget superseded by cancellation-owned Release cannot clear the failed-config marker; Release
+  failure keeps distinct admission closed and automatic retry finishes only the missing stronger component;
 - dropping the cleanup-report waiter proves the flight retains no observer/task-store reference; a
   retained waiter records the same bounded success/failure report once;
+- canceling a pending `teardown started` observer write drops the observer but cannot suppress the already-
+  claimed observer-free provider/sidecar cleanup flight;
+- outer warm completion starts backend release while teardown-start persistence is pending, and an immediate
+  start-observation error cannot return before its gated cleanup report settles;
+- a lease-destructor panic after checked backend release and an explicitly aborted cleanup task each settle
+  only the exact tombstone to `CleanupFailed`, retain one retry capability, and clear on explicit release;
+- dropping the joiner's settlement capability before a lease-destructor panic still lets the raw worker task
+  catch the panic, publish `CleanupFailed`, and clear on explicit release;
 - a stale generation/operation expiry fallback cannot affect a newer handle for the same context;
 - direct inbound streaming, synchronous inbound, fan-out local source, and coordinator prompt observe a
   cold resolution failure before translator/collection begins;

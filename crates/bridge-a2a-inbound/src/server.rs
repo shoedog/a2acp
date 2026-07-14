@@ -39,9 +39,9 @@ use bridge_core::domain::{
     SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
-use bridge_core::ids::{
-    AgentId, BatchId, ContextId, OperationId, SessionGeneration, SessionId, TaskId,
-};
+#[cfg(test)]
+use bridge_core::ids::OperationId;
+use bridge_core::ids::{AgentId, BatchId, ContextId, SessionId, TaskId};
 use bridge_core::permission::{PermissionRegistry, TurnMeta};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, DiagnosticObserver, Lease,
@@ -57,7 +57,9 @@ use bridge_workflow::executor::{
 use bridge_workflow::graph::WorkflowNode;
 
 use bridge_coordinator::coordinator::StatusDto;
-use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
+use bridge_coordinator::dispatch::{
+    BindingGuard, LocalDispatch, TaskBinding, WarmCompletionExit, WarmCompletionGuard,
+};
 use bridge_coordinator::params::{validate_cwd_str, InjectParams, PermitParams};
 use bridge_coordinator::turn_parts::assemble_turn_parts;
 use bridge_coordinator::{BatchDeps, BatchRuntime};
@@ -636,6 +638,7 @@ async fn warm_local_dispatch(
 ) -> Option<Result<LocalDispatch, BridgeError>> {
     let ctx = routed.context_id.clone()?;
     let sm = srv.session_manager().clone();
+    let completion_observer = observer.clone();
     match sm
         .checkout_turn_observed(
             &ctx,
@@ -663,12 +666,14 @@ async fn warm_local_dispatch(
                     op: turn.op.clone(),
                 }),
                 guard: None,
-                warm_guard: Some(WarmTurnGuard {
+                warm_guard: Some(WarmCompletionGuard::finish_owner(
                     sm,
                     ctx,
-                    generation: turn.generation,
-                    op: turn.op.clone(),
-                }),
+                    turn.generation,
+                    turn.op.clone(),
+                    turn.expiry_intent,
+                    completion_observer,
+                )),
                 // Warm: the handle's per-turn abort token — a force-reset cancels it (cancel-tokens F2).
                 abort: turn.abort,
                 obs_ctx: obs_ctx_for_dispatch(
@@ -724,6 +729,7 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
             wf_id,
             node.id.as_str()
         ))?;
+        let completion_observer = observer.clone();
         let turn = self
             .sm
             .checkout_child_turn_observed(
@@ -740,10 +746,14 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
             session: turn.session,
             seed: turn.seed,
             cleanup: Box::new(WarmNodeCleanup {
-                sm: self.sm.clone(),
-                child,
-                gen: turn.generation,
-                op: turn.op,
+                guard: WarmCompletionGuard::workflow_owner(
+                    self.sm.clone(),
+                    child,
+                    turn.generation,
+                    turn.op,
+                    turn.expiry_intent,
+                    completion_observer,
+                ),
             }),
         })
     }
@@ -751,29 +761,37 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
 
 #[allow(dead_code)] // constructed by WarmWorkflowNodeDispatcher once the producer is wired
 struct WarmNodeCleanup {
-    sm: Arc<crate::session_manager::SessionManager>,
-    child: ContextId,
-    gen: SessionGeneration,
-    op: OperationId,
+    guard: WarmCompletionGuard,
 }
 
 #[async_trait::async_trait]
 impl NodeTurnCleanup for WarmNodeCleanup {
+    fn arm_exit(&mut self, exit: &NodeTurnExit) {
+        self.guard.observe_exit(match exit {
+            NodeTurnExit::Normal => WarmCompletionExit::Normal,
+            NodeTurnExit::Canceled => WarmCompletionExit::Canceled,
+            NodeTurnExit::Error(error) => WarmCompletionExit::Error(error),
+        });
+    }
+
     async fn on_exit(self: Box<Self>, exit: NodeTurnExit) {
-        match exit {
-            NodeTurnExit::Normal => {
-                self.sm.finish_turn(&self.child, self.gen, &self.op).await;
-            }
-            NodeTurnExit::Canceled => {
-                let _ = self.sm.cancel(&self.child).await;
-            }
-            NodeTurnExit::Error(BridgeError::AgentCrashed { .. }) => {
-                self.sm.expire_turn(&self.child).await;
-            }
-            NodeTurnExit::Error(_) => {
-                self.sm.finish_turn(&self.child, self.gen, &self.op).await;
-            }
-        }
+        let _ = self.finish(exit).await;
+    }
+
+    async fn on_exit_observed(
+        self: Box<Self>,
+        exit: NodeTurnExit,
+        _observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        self.finish(exit).await
+    }
+}
+
+impl WarmNodeCleanup {
+    async fn finish(mut self: Box<Self>, exit: NodeTurnExit) -> Result<(), BridgeError> {
+        self.arm_exit(&exit);
+        let WarmNodeCleanup { guard } = *self;
+        guard.complete().await
     }
 }
 
@@ -2167,7 +2185,7 @@ fn spawn_local_producer(
     tokio::spawn(async move {
         // Hold the guard for the whole producer; dropped on every return path below.
         let _guard = guard;
-        let warm = warm;
+        let mut warm = warm;
         let started = std::time::Instant::now();
         let mut ttft = None;
         let mut last_usage: Option<bridge_core::orch::UsageSnapshot> = None;
@@ -2192,6 +2210,7 @@ fn spawn_local_producer(
         // which the translator maps to a terminal Canceled event). If so we must
         // NOT append a second terminal — we honor the one it sent.
         let mut translator_terminal = false;
+        let mut disconnected = false;
         loop {
             // Race the next translator event against caller-disconnect. The
             // `tx.closed()` arm is essential for an IDLE backend stream: a producer
@@ -2204,6 +2223,9 @@ fn spawn_local_producer(
                 // Emit a terminal Canceled and STOP without polling events — a pre-first-poll abort means
                 // `backend.prompt` never runs, so the released (cleared) session is never re-minted.
                 _ = abort.cancelled() => {
+                    if let Some(warm) = warm.as_mut() {
+                        warm.observe_exit(WarmCompletionExit::Canceled);
+                    }
                     if !translator_terminal {
                         let _ = tx.send(Ok(Event::terminal(TaskOutcome::Canceled))).await;
                     }
@@ -2219,29 +2241,25 @@ fn spawn_local_producer(
                         usage: last_usage.as_ref(),
                         fin: bridge_core::ports::UsageFinalization::TurnFinal,
                     });
+                    if let Some(warm) = warm.take() {
+                        let _ = warm.complete().await;
+                    }
                     return;
                 }
-                _ = tx.closed() => {
-                    // Receiver gone (client disconnected) — stop driving; the `_guard`
-                    // Drop evicts the binding/lease/stash on this early return.
-                    let outcome = bridge_core::ports::TurnOutcome::Canceled;
-                    observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
-                        ctx: &obs_ctx,
-                        latency: started.elapsed(),
-                        ttft,
-                        outcome: &outcome,
-                    });
-                    observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                        ctx: &obs_ctx,
-                        usage: last_usage.as_ref(),
-                        fin: bridge_core::ports::UsageFinalization::TurnFinal,
-                    });
-                    return;
-                }
+                // Once prompt ownership exists, a queued backend result wins
+                // over a simultaneous receiver close. That makes an already-
+                // observed structured failure arm expiry before disconnect
+                // cleanup; a merely pending backend still loses immediately to
+                // `tx.closed()`. The force-reset abort remains first because it
+                // must never poll a session that has already been released.
                 maybe = events.next() => match maybe {
                     Some(ev) => ev,
                     None => break,
                 },
+                _ = tx.closed() => {
+                    disconnected = true;
+                    break;
+                }
             };
             // Slice 2: usage is telemetry — record it on the warm handle, never forward to SSE.
             if let Ok(e) = &ev {
@@ -2249,9 +2267,12 @@ fn spawn_local_producer(
                     if let Some(snap) = e.usage_snapshot() {
                         last_usage = Some(snap.clone());
                         if let Some(w) = warm.as_ref() {
-                            w.sm.record_usage(&w.ctx, w.generation, &w.op, snap.clone())
-                                .await;
+                            w.record_usage(snap.clone()).await;
                         }
+                    }
+                    if tx.is_closed() {
+                        disconnected = true;
+                        break;
                     }
                     continue;
                 }
@@ -2260,7 +2281,12 @@ fn spawn_local_producer(
                 ttft = Some(started.elapsed());
             }
             // Track whether the stream ended with an error.
-            if ev.is_err() {
+            if let Err(error) = &ev {
+                if let Some(warm) = warm.as_mut() {
+                    // Arm expiry before the channel send below can await or be
+                    // canceled by a disconnected receiver.
+                    warm.observe_exit(WarmCompletionExit::Error(error));
+                }
                 errored = true;
             }
             // Note a translator-emitted terminal (e.g. Canceled) so we don't
@@ -2268,25 +2294,42 @@ fn spawn_local_producer(
             if let Ok(e) = &ev {
                 if e.kind() == &EventKind::Terminal {
                     translator_terminal = true;
+                    if e.outcome() == Some(TaskOutcome::Canceled) {
+                        if let Some(warm) = warm.as_mut() {
+                            warm.observe_exit(WarmCompletionExit::Canceled);
+                        }
+                    }
                 }
             }
             // If the receiver is gone (client disconnected) stop driving. The
             // `_guard` Drop still evicts the binding/lease/stash on this early return.
             if tx.send(ev).await.is_err() {
-                // Receiver gone — emit exactly one TurnFinished(Canceled) then return.
-                observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
-                    ctx: &obs_ctx,
-                    latency: started.elapsed(),
-                    ttft,
-                    outcome: &bridge_core::ports::TurnOutcome::Canceled,
-                });
-                observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                    ctx: &obs_ctx,
-                    usage: last_usage.as_ref(),
-                    fin: bridge_core::ports::UsageFinalization::TurnFinal,
-                });
-                return;
+                disconnected = true;
+                break;
             }
+        }
+        if disconnected {
+            if let Some(warm) = warm.as_mut() {
+                warm.observe_exit(WarmCompletionExit::Canceled);
+            }
+            // Receiver gone — emit exactly one TurnFinished(Canceled), settle
+            // warm cleanup, then return. This path also handles usage events,
+            // which are intentionally not forwarded through the channel.
+            observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
+                ctx: &obs_ctx,
+                latency: started.elapsed(),
+                ttft,
+                outcome: &bridge_core::ports::TurnOutcome::Canceled,
+            });
+            observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                ctx: &obs_ctx,
+                usage: last_usage.as_ref(),
+                fin: bridge_core::ports::UsageFinalization::TurnFinal,
+            });
+            if let Some(warm) = warm.take() {
+                let _ = warm.complete().await;
+            }
+            return;
         }
         // Append exactly one terminal frame after the inner stream ends, UNLESS
         // the translator already sent its own terminal (cancelled turn).
@@ -2317,6 +2360,14 @@ fn spawn_local_producer(
             usage: last_usage.as_ref(),
             fin: bridge_core::ports::UsageFinalization::TurnFinal,
         });
+        if !errored && !translator_terminal {
+            if let Some(warm) = warm.as_mut() {
+                warm.observe_exit(WarmCompletionExit::Normal);
+            }
+        }
+        if let Some(warm) = warm.take() {
+            let _ = warm.complete().await;
+        }
         // `_guard` drops here too (clean exit) → eviction. Channel closes on drop ->
         // SSE stream terminates after the terminal flush.
     });
@@ -3186,7 +3237,7 @@ async fn unary_message(
             // Held until this arm returns; its Drop evicts the binding/lease/stash
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
-            let warm = dispatch.warm_guard;
+            let mut warm = dispatch.warm_guard;
             if let Some(meta) = dispatch.turn_meta.clone() {
                 dispatch
                     .backend
@@ -3214,6 +3265,9 @@ async fn unary_message(
                     // cancel-tokens F2 (L1 — abort arm FIRST, biased): a force-reset cancelled this turn.
                     // Record a Canceled terminal and stop without polling events (pre-first-poll → no re-mint).
                     _ = abort.cancelled() => {
+                        if let Some(warm) = warm.as_mut() {
+                            warm.observe_exit(WarmCompletionExit::Canceled);
+                        }
                         collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
                         break;
                     }
@@ -3225,13 +3279,34 @@ async fn unary_message(
                 if let Ok(e) = &ev {
                     if e.kind() == &EventKind::Usage {
                         if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
-                            w.sm.record_usage(&w.ctx, w.generation, &w.op, snap.clone())
-                                .await;
+                            w.record_usage(snap.clone()).await;
                         }
                         continue; // exclude usage from the unary output
                     }
+                    if e.kind() == &EventKind::Terminal
+                        && e.outcome() == Some(TaskOutcome::Canceled)
+                    {
+                        if let Some(warm) = warm.as_mut() {
+                            warm.observe_exit(WarmCompletionExit::Canceled);
+                        }
+                    }
+                } else if let Err(error) = &ev {
+                    if let Some(warm) = warm.as_mut() {
+                        // Synchronous fail-closed transition before any later
+                        // response serialization or cleanup await.
+                        warm.observe_exit(WarmCompletionExit::Error(error));
+                    }
                 }
                 collected.push(ev);
+            }
+            drop(events);
+            if let Some(mut warm) = warm.take() {
+                warm.observe_exit(WarmCompletionExit::Normal);
+                if let Err(cleanup_error) = warm.complete().await {
+                    if collected.iter().all(Result::is_ok) {
+                        collected.push(Err(cleanup_error));
+                    }
+                }
             }
             collected
         }
@@ -4497,6 +4572,10 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+    use bridge_core::diagnostics::{
+        DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+        FailureDiagnosticInput, FailureDisposition,
+    };
     use bridge_core::domain::RouteTarget;
     use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot, SessionSpec};
     use bridge_core::domain::{
@@ -9463,6 +9542,95 @@ mod tests {
         }
     }
 
+    struct WarmErrorBackend {
+        error: BridgeError,
+        prompt_open: bool,
+        releases: AtomicUsize,
+        release_completed: tokio::sync::Notify,
+        cancels: AtomicUsize,
+        cancel_completed: tokio::sync::Notify,
+    }
+
+    impl WarmErrorBackend {
+        async fn wait_for_release_or_cancel(&self) -> &'static str {
+            loop {
+                let release = self.release_completed.notified();
+                let cancel = self.cancel_completed.notified();
+                if self.releases.load(Ordering::SeqCst) > 0 {
+                    return "release";
+                }
+                if self.cancels.load(Ordering::SeqCst) > 0 {
+                    return "cancel";
+                }
+                tokio::select! {
+                    _ = release => {}
+                    _ = cancel => {}
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for WarmErrorBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            if self.prompt_open {
+                return Err(self.error.clone());
+            }
+            Ok(Box::pin(tokio_stream::iter(vec![Err(self.error.clone())])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            self.cancel_completed.notify_waiters();
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            _session: &SessionId,
+            _spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            self.release_completed.notify_waiters();
+            Ok(())
+        }
+    }
+
+    fn warm_structured_failure(class: DiagnosticFailureClass) -> BridgeError {
+        BridgeError::agent_failure(
+            FailureDiagnostic::build_static_code(
+                FailureDiagnosticInput {
+                    failed_phase: DiagnosticPhase::PromptStream,
+                    last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                    class,
+                    disposition: FailureDisposition::Fatal,
+                    code: "ignored".to_owned(),
+                    summary: "bounded test failure".to_owned(),
+                    causes: Vec::new(),
+                    stderr_observed: false,
+                    stderr_line_count: 0,
+                    stderr_scope: None,
+                    stderr_tail: None,
+                    stderr_redaction: None,
+                    retry_after_ms: None,
+                    reset_at_ms: None,
+                    prompt_may_have_been_accepted: true,
+                },
+                "test.warm.failure",
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+        )
+    }
+
     // Build the warm-session test server (mirrors session_clear_dispatch :6510-6536).
     fn seed_test_server() -> (
         Arc<InboundServer>,
@@ -9470,6 +9638,45 @@ mod tests {
         Arc<WarmRecordingBackend>,
     ) {
         let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let coord = test_coordinator(
+            registry as Arc<dyn AgentRegistry>,
+            store,
+            Arc::new(AutoApprove),
+        );
+        let sm = coord.session_manager.clone();
+        let srv = Arc::new(InboundServer::from_coordinator(
+            coord,
+            Arc::new(RegistryRoute {
+                default: AgentId::parse("a").unwrap(),
+            }),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "a",
+        ));
+        (srv, sm, backend)
+    }
+
+    fn warm_error_server(
+        error: BridgeError,
+    ) -> (
+        Arc<InboundServer>,
+        Arc<crate::session_manager::SessionManager>,
+        Arc<WarmErrorBackend>,
+    ) {
+        let backend = Arc::new(WarmErrorBackend {
+            error,
+            prompt_open: false,
+            releases: AtomicUsize::new(0),
+            release_completed: tokio::sync::Notify::new(),
+            cancels: AtomicUsize::new(0),
+            cancel_completed: tokio::sync::Notify::new(),
+        });
         let registry = FakeRegistry::with_entries(
             "a",
             vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
@@ -9616,6 +9823,412 @@ mod tests {
         assert_eq!(
             backend.forgotten(),
             vec!["ctx-parent::workflow::wf::node::n1-g0".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_workflow_cleanup_expires_structured_failures_and_preserves_legacy_branches() {
+        use bridge_workflow::executor::{NodeTurnExit, WorkflowNodeDispatcher, WorkflowRunContext};
+        use bridge_workflow::graph::WorkflowNode;
+
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry as Arc<dyn AgentRegistry>,
+            std::time::Duration::from_secs(60),
+        ));
+        let dispatcher = WarmWorkflowNodeDispatcher {
+            sm: sm.clone(),
+            parent: ContextId::parse("parent-structured").unwrap(),
+            cwd: None,
+        };
+        let node = WorkflowNode {
+            id: bridge_core::ids::NodeId::parse("n1").unwrap(),
+            agent: AgentId::parse("a").unwrap(),
+            prompt_template: "go".into(),
+            inputs: vec![],
+            retry: None,
+        };
+
+        for (index, class) in [
+            DiagnosticFailureClass::Transport,
+            DiagnosticFailureClass::AgentProcess,
+            DiagnosticFailureClass::Timeout,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let workflow = format!("wf-{index}");
+            let child =
+                ContextId::parse(format!("parent-structured::workflow::{workflow}::node::n1"))
+                    .unwrap();
+            let turn = dispatcher
+                .checkout_observed(
+                    &workflow,
+                    &node,
+                    "run",
+                    &WorkflowRunContext::default(),
+                    direct_diagnostic_observer(),
+                )
+                .await
+                .unwrap();
+            turn.cleanup
+                .on_exit(NodeTurnExit::Error(warm_structured_failure(class)))
+                .await;
+            assert!(sm.status(&child).await.is_none(), "{class:?}");
+        }
+
+        let legacy_finish_child =
+            ContextId::parse("parent-structured::workflow::wf-legacy-finish::node::n1").unwrap();
+        let turn = dispatcher
+            .checkout_observed(
+                "wf-legacy-finish",
+                &node,
+                "run",
+                &WorkflowRunContext::default(),
+                direct_diagnostic_observer(),
+            )
+            .await
+            .unwrap();
+        turn.cleanup
+            .on_exit(NodeTurnExit::Error(BridgeError::StoreFailure))
+            .await;
+        assert_eq!(sm.status(&legacy_finish_child).await.unwrap().state, "idle");
+
+        let legacy_crash_child =
+            ContextId::parse("parent-structured::workflow::wf-legacy-crash::node::n1").unwrap();
+        let turn = dispatcher
+            .checkout_observed(
+                "wf-legacy-crash",
+                &node,
+                "run",
+                &WorkflowRunContext::default(),
+                direct_diagnostic_observer(),
+            )
+            .await
+            .unwrap();
+        turn.cleanup
+            .on_exit(NodeTurnExit::Error(BridgeError::agent_crashed("legacy")))
+            .await;
+        assert!(sm.status(&legacy_crash_child).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn warm_workflow_arms_structured_expiry_before_rich_sink_flush() {
+        use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+        use futures::StreamExt;
+
+        struct BlockingFlushSink {
+            entered_count: AtomicUsize,
+            entered: tokio::sync::Notify,
+            gate: Mutex<Option<oneshot::Receiver<()>>>,
+        }
+
+        impl BlockingFlushSink {
+            async fn wait_until_entered(&self) {
+                loop {
+                    let entered = self.entered.notified();
+                    if self.entered_count.load(Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    entered.await;
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RichEventSink for BlockingFlushSink {
+            fn record(&self, _kind: bridge_core::orch::OrchEventKind) {}
+
+            async fn flush(&self) -> Result<(), BridgeError> {
+                self.entered_count.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_waiters();
+                let gate = self
+                    .gate
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("flush is entered once");
+                let _ = gate.await;
+                Ok(())
+            }
+        }
+
+        struct BlockingFlushFactory(Arc<BlockingFlushSink>);
+
+        impl RichEventSinkFactory for BlockingFlushFactory {
+            fn make(&self, _node: &bridge_core::ids::NodeId) -> Arc<dyn RichEventSink> {
+                self.0.clone()
+            }
+        }
+
+        for (prompt_open, suffix) in [(true, "open"), (false, "stream")] {
+            let backend = Arc::new(WarmErrorBackend {
+                error: warm_structured_failure(DiagnosticFailureClass::AgentProcess),
+                prompt_open,
+                releases: AtomicUsize::new(0),
+                release_completed: tokio::sync::Notify::new(),
+                cancels: AtomicUsize::new(0),
+                cancel_completed: tokio::sync::Notify::new(),
+            });
+            let registry = FakeRegistry::with_entries(
+                "a",
+                vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+            );
+            let sm = Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            ));
+            let parent_raw = format!("parent-flush-drop-{suffix}");
+            let workflow_raw = format!("wf-flush-drop-{suffix}");
+            let parent = ContextId::parse(&parent_raw).unwrap();
+            let child =
+                ContextId::parse(format!("{parent_raw}::workflow::{workflow_raw}::node::n1"))
+                    .unwrap();
+            let dispatcher = Arc::new(WarmWorkflowNodeDispatcher {
+                sm: sm.clone(),
+                parent,
+                cwd: None,
+            });
+            let graph = Arc::new(WorkflowGraph {
+                id: bridge_core::ids::WorkflowId::parse(&workflow_raw).unwrap(),
+                nodes: vec![WorkflowNode {
+                    id: bridge_core::ids::NodeId::parse("n1").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                }],
+                panel: None,
+            });
+            let (_allow_flush, flush_gate) = oneshot::channel();
+            let sink = Arc::new(BlockingFlushSink {
+                entered_count: AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                gate: Mutex::new(Some(flush_gate)),
+            });
+            let context = WorkflowRunContext {
+                make_rich_sink: Some(Arc::new(BlockingFlushFactory(sink.clone()))),
+                ..WorkflowRunContext::default()
+            };
+
+            let run = tokio::spawn(async move {
+                WorkflowExecutor::new(registry)
+                    .run_with_context_and_dispatcher(
+                        graph,
+                        "go".into(),
+                        format!("run-flush-drop-{suffix}"),
+                        tokio_util::sync::CancellationToken::new(),
+                        context,
+                        dispatcher,
+                    )
+                    .collect::<Vec<_>>()
+                    .await
+            });
+            sink.wait_until_entered().await;
+            run.abort();
+            assert!(run.await.unwrap_err().is_cancelled());
+
+            assert_eq!(
+                backend.wait_for_release_or_cancel().await,
+                "release",
+                "dropping during {suffix} error flush must retain the structured failure"
+            );
+            assert!(
+                sm.status(&child).await.is_none(),
+                "the poisoned warm child must not return to Idle ({suffix})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_unary_and_streaming_expire_structured_backend_failures() {
+        for (method, context, class) in [
+            (
+                methods::SEND_MESSAGE,
+                "ctx-structured-unary",
+                DiagnosticFailureClass::Transport,
+            ),
+            (
+                methods::SEND_STREAMING_MESSAGE,
+                "ctx-structured-streaming",
+                DiagnosticFailureClass::Timeout,
+            ),
+        ] {
+            let (srv, sm, backend) = warm_error_server(warm_structured_failure(class));
+            let response = router(srv)
+                .oneshot(post_request(
+                    method,
+                    json!({
+                        "message": {
+                            "contextId": context,
+                            "text": "go",
+                            "metadata": { "a2a-bridge.agent": "a" }
+                        }
+                    }),
+                    "1.0",
+                ))
+                .await
+                .unwrap();
+            let _ = body_string(response).await;
+            assert_eq!(backend.releases.load(Ordering::SeqCst), 1, "{method}");
+            assert!(
+                sm.status(&ContextId::parse(context).unwrap())
+                    .await
+                    .is_none(),
+                "{method} must not return the structured-failure session to Idle"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_structured_error_beats_simultaneous_stream_receiver_close() {
+        let context = ContextId::parse("ctx-ready-error-and-close").unwrap();
+        let (srv, sm, backend) = warm_error_server(warm_structured_failure(
+            DiagnosticFailureClass::AgentProcess,
+        ));
+        let routed = RoutedCall {
+            task: TaskId::parse("task-ready-error-and-close").unwrap(),
+            session: SessionId::parse("session-ready-error-and-close").unwrap(),
+            parts: vec![Part { text: "go".into() }],
+            target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: Some(context.clone()),
+            session_cwd: None,
+        };
+        let diagnostic = direct_diagnostic_observer();
+        let dispatch = warm_local_dispatch(
+            &srv,
+            &AgentId::parse("a").unwrap(),
+            &routed,
+            diagnostic.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        spawn_local_producer(&srv, routed, dispatch, diagnostic, tx);
+        for _ in 0..100 {
+            if backend.releases.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
+        assert!(sm.status(&context).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ready_usage_burst_cannot_starve_inbound_disconnect() {
+        struct ReadyUsageBurstBackend {
+            updates: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentBackend for ReadyUsageBurstBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                let updates = self.updates.clone();
+                let ready = futures::stream::iter((0..128).map(move |_| {
+                    updates.fetch_add(1, Ordering::SeqCst);
+                    Ok(Update::Usage(UsageSnapshot {
+                        used: Some(1),
+                        size: Some(10),
+                        cost: None,
+                        terminal: None,
+                        at_ms: 0,
+                    }))
+                }));
+                Ok(Box::pin(futures::StreamExt::chain(
+                    ready,
+                    futures::stream::pending(),
+                )))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        let observer = Arc::new(RecordingObserver::default());
+        let updates = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(ReadyUsageBurstBackend {
+            updates: updates.clone(),
+        });
+        let srv = build_with_observer(
+            backend.clone(),
+            Arc::new(AlwaysGrant),
+            observer.clone() as Arc<dyn bridge_core::ports::Observer>,
+        );
+        let dispatch = LocalDispatch {
+            backend,
+            session: SessionId::parse("ctx-ready-usage-disconnect-g0").unwrap(),
+            seed: None,
+            injects: Vec::new(),
+            turn_meta: None,
+            guard: None,
+            warm_guard: None,
+            obs_ctx: bridge_core::ports::TurnContext {
+                turn_id: bridge_core::ids::TurnId::parse("turn-ready-usage-disconnect").unwrap(),
+                session_id: ContextId::parse("ready-usage-disconnect").unwrap(),
+                task_id: Some(TaskId::parse("task-ready-usage-disconnect").unwrap()),
+                workflow: None,
+                node: None,
+                attempt: 0,
+                agent: "a".to_string(),
+                model: None,
+                effort: None,
+                mode: None,
+                prompt_id: None,
+                traceparent: None,
+            },
+            abort: tokio_util::sync::CancellationToken::new(),
+        };
+        let routed = RoutedCall {
+            task: TaskId::parse("task-ready-usage-disconnect").unwrap(),
+            session: SessionId::parse("session-ready-usage-disconnect").unwrap(),
+            parts: vec![Part { text: "go".into() }],
+            target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: Some(ContextId::parse("ready-usage-disconnect").unwrap()),
+            session_cwd: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
+        wait_until(|| {
+            observer.snapshot().iter().any(|event| {
+                matches!(
+                    event,
+                    RecordedObsEvent::Finish {
+                        outcome: bridge_core::ports::TurnOutcome::Canceled,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+
+        assert_eq!(
+            updates.load(Ordering::SeqCst),
+            1,
+            "ready-result precedence may consume one usage item, then must honor receiver close"
         );
     }
 

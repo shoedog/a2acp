@@ -4300,6 +4300,11 @@ impl AgentBackend for AcpBackend {
             .remove(session);
     }
 
+    async fn forget_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+        self.forget_session(session).await;
+        Ok(())
+    }
+
     async fn forget_session_observed(
         &self,
         session: &SessionId,
@@ -4409,6 +4414,12 @@ impl AgentBackend for AcpBackend {
     /// shared across sessions). [Slice 0]
     async fn release_session(&self, session: &SessionId) {
         let _ = self.release_session_result(session).await;
+    }
+
+    async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+        self.release_session_result(session)
+            .await
+            .map_err(|failure| failure.error)
     }
 
     async fn release_session_observed(
@@ -11543,6 +11554,19 @@ mod tests {
         assert_eq!(cancel_events.len(), 2);
         assert_eq!(cancel_events[0].transition().status(), PhaseStatus::Started);
         assert_eq!(cancel_events[1].transition().status(), PhaseStatus::Failed);
+
+        let checked_error = backend.release_session_checked(&session).await.expect_err(
+            "checked release must not downgrade a transport failure to best-effort success",
+        );
+        assert!(matches!(checked_error, BridgeError::AgentCrashed { .. }));
+        assert!(backend.sessions.lock().await.get(&session).is_none());
+        assert!(backend.session_cfg.lock().unwrap().get(&session).is_none());
+
+        backend
+            .configure_session(&session, &SessionSpec::from_config(Default::default()))
+            .await
+            .unwrap();
+        let _ = backend.session_entry(&session).await;
 
         let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
 

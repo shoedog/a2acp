@@ -6,7 +6,9 @@ use std::time::Instant;
 use a2a;
 use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{BatchId, ContextId, OperationId, TaskId, WorkflowId};
+#[cfg(test)]
+use bridge_core::ids::OperationId;
+use bridge_core::ids::{BatchId, ContextId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, TerminalUsage, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{
@@ -28,7 +30,7 @@ use crate::detached::{
     new_detached_task_id, resume_working_tasks, spawn_detached_workflow, DetachedDeps,
     TaskProgressHub,
 };
-use crate::dispatch::TaskBinding;
+use crate::dispatch::{TaskBinding, WarmCompletionExit, WarmCompletionGuard};
 use crate::params::{OpParams, PermitParams};
 use crate::turn_parts::assemble_turn_parts;
 
@@ -486,11 +488,10 @@ impl Coordinator {
     }
 
     /// Drive ONE warm turn to completion and collect it into a `TurnOutput`. Records usage as a side
-    /// effect (excluded from output) and returns the handle to Idle on EVERY exit — synchronously on the
-    /// normal/error path (so a sequential `continue` observes Idle deterministically), and via the drop
-    /// guard if the turn future is cancelled mid-drain (the MCP loop is sequential and never drops
-    /// mid-turn, but the Coordinator is a general service API — a cancelled caller must not strand the
-    /// handle `Running`; this mirrors the A2A unary path's `WarmTurnGuard`).
+    /// effect (excluded from output) and settles the handle on EVERY exit: normal and legacy-owner paths
+    /// return to Idle, structured failures expire through the exact cleanup claim, and cancellation uses
+    /// the drop fallback if the caller disappears mid-drain. The MCP loop is sequential, but Coordinator
+    /// is also a general service API, so a canceled caller must never strand `Running`.
     #[cfg(test)]
     async fn collect_turn(
         &self,
@@ -523,15 +524,21 @@ impl Coordinator {
             Arc::new(std::sync::Mutex::new(None));
         self.observer
             .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
+        let completion = WarmCompletionGuard::finish_owner(
+            self.session_manager.clone(),
+            ctx.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            diagnostic.clone(),
+        );
         let mut finish_guard = TurnFinishGuard {
             observer: self.observer.clone(),
-            sm: self.session_manager.clone(),
             ctx: obs_ctx.clone(),
-            generation: turn.generation,
-            op: turn.op.clone(),
             started,
             armed: true,
             usage: shared_usage.clone(),
+            completion: Some(completion),
         };
 
         let parts = assemble_turn_parts(
@@ -569,6 +576,7 @@ impl Coordinator {
                 // cancel-tokens F2 (L1 — abort arm FIRST): a force-reset cancelled this turn → stop without
                 // polling events (a pre-first-poll abort means `backend.prompt` never runs → no re-mint).
                 _ = turn.abort.cancelled() => {
+                    finish_guard.observe_exit(WarmCompletionExit::Canceled);
                     aborted = true;
                     break;
                 }
@@ -592,6 +600,19 @@ impl Coordinator {
                     }
                     continue;
                 }
+                Err(error) => {
+                    // Arm expiry synchronously at the error observation site,
+                    // before collection/formatting or any cleanup await.
+                    finish_guard.observe_exit(WarmCompletionExit::Error(error));
+                    collected.push(ev);
+                }
+                Ok(event)
+                    if event.kind() == &EventKind::Terminal
+                        && event.outcome() == Some(TaskOutcome::Canceled) =>
+                {
+                    finish_guard.observe_exit(WarmCompletionExit::Canceled);
+                    collected.push(ev);
+                }
                 _ => collected.push(ev),
             }
         }
@@ -601,12 +622,13 @@ impl Coordinator {
             collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
         }
 
-        // Finish synchronously on the normal/error path, then disarm so the guard's drop is a no-op
-        // (no double finish_turn). If the future was cancelled before reaching here, the still-armed
-        // guard fires `finish_turn` on drop.
-        self.session_manager
-            .finish_turn(&ctx, turn.generation, &turn.op)
-            .await;
+        if !aborted && collected.iter().all(Result::is_ok) {
+            finish_guard.observe_exit(WarmCompletionExit::Normal);
+        }
+        // Complete synchronously on the normal/error path. Cancellation before
+        // or during this await drops the shared guard/claim and transfers cleanup
+        // to the checked unobserved path.
+        let cleanup_result = finish_guard.complete().await;
         finish_guard.disarm();
 
         if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
@@ -624,6 +646,7 @@ impl Coordinator {
             });
             return Err(e.clone());
         }
+        cleanup_result?;
         let events: Vec<Event> = collected.into_iter().filter_map(Result::ok).collect();
         let out_text = if let Some(artifact_text) = events
             .iter()
@@ -916,23 +939,33 @@ impl Coordinator {
     }
 }
 
-/// Returns a warm handle to Idle (via `finish_turn`) if a turn future is dropped before it finishes
-/// synchronously. `collect_turn` finishes the turn synchronously on the normal/error path and then
-/// `disarm`s this guard, so on those paths the guard's `Drop` is a no-op; it only fires when the turn
-/// future is cancelled mid-drain. Mirrors the A2A unary path's `WarmTurnGuard` (the spawn-in-Drop
-/// pattern), kept local to the Coordinator because here it's disarmed after a synchronous finish.
+/// Records telemetry on a dropped coordinator turn, while the nested shared completion guard owns the
+/// exact finish/cancel/expire fallback. `collect_turn` settles synchronously on ordinary paths and then
+/// disarms this wrapper; cancellation mid-drain drops the nested guard without retaining this telemetry
+/// observer in any detached cleanup flight.
 struct TurnFinishGuard {
     observer: Arc<dyn Observer>,
-    sm: Arc<crate::session_manager::SessionManager>,
     ctx: TurnContext,
-    generation: bridge_core::ids::SessionGeneration,
-    op: OperationId,
     started: Instant,
     armed: bool,
     usage: Arc<std::sync::Mutex<Option<UsageSnapshot>>>,
+    completion: Option<WarmCompletionGuard>,
 }
 
 impl TurnFinishGuard {
+    fn observe_exit(&mut self, exit: WarmCompletionExit<'_>) {
+        if let Some(completion) = self.completion.as_mut() {
+            completion.observe_exit(exit);
+        }
+    }
+
+    async fn complete(&mut self) -> Result<(), BridgeError> {
+        match self.completion.take() {
+            Some(completion) => completion.complete().await,
+            None => Ok(()),
+        }
+    }
+
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -943,10 +976,7 @@ impl Drop for TurnFinishGuard {
         if !self.armed {
             return;
         }
-        let sm = self.sm.clone();
         let ctx = self.ctx.clone();
-        let generation = self.generation;
-        let op = self.op.clone();
         let observer = self.observer.clone();
         let started = self.started;
         observer.record(&ObsEvent::TurnFinished {
@@ -961,9 +991,10 @@ impl Drop for TurnFinishGuard {
             usage: usage.as_ref(),
             fin: UsageFinalization::TurnFinal,
         });
-        tokio::spawn(async move {
-            sm.finish_turn(&ctx.session_id, generation, &op).await;
-        });
+        // Dropping the still-armed shared completion guard starts its exact
+        // generation/operation-bound fallback without retaining this telemetry
+        // observer in the detached cleanup task.
+        drop(self.completion.take());
     }
 }
 
@@ -973,6 +1004,10 @@ mod tests {
     use crate::clock::ManualClock;
     use crate::session_manager::SessionManager;
     use async_trait::async_trait;
+    use bridge_core::diagnostics::{
+        DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+        FailureDiagnosticInput, FailureDisposition,
+    };
     use bridge_core::domain::{
         AgentEntry, AgentKind, Effort, Part, PeerTaskId, PendingRequest, PermissionDecision,
         PermissionRequest, RegistrySnapshot, SessionContext,
@@ -989,6 +1024,7 @@ mod tests {
         TurnLogFinished, TurnUsageFinalization,
     };
     use bridge_workflow::graph::WorkflowNode;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -1200,6 +1236,58 @@ mod tests {
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             Ok(())
         }
+    }
+
+    struct ErrorBackend {
+        error: BridgeError,
+        releases: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentBackend for ErrorBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::iter(vec![Err(self.error.clone())])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.releases.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn structured_agent_failure(class: DiagnosticFailureClass) -> BridgeError {
+        BridgeError::agent_failure(
+            FailureDiagnostic::build_static_code(
+                FailureDiagnosticInput {
+                    failed_phase: DiagnosticPhase::PromptStream,
+                    last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                    class,
+                    disposition: FailureDisposition::Fatal,
+                    code: "ignored".to_owned(),
+                    summary: "bounded test failure".to_owned(),
+                    causes: Vec::new(),
+                    stderr_observed: false,
+                    stderr_line_count: 0,
+                    stderr_scope: None,
+                    stderr_tail: None,
+                    stderr_redaction: None,
+                    retry_after_ms: None,
+                    reset_at_ms: None,
+                    prompt_may_have_been_accepted: true,
+                },
+                "test.warm.failure",
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+        )
     }
 
     #[derive(Default)]
@@ -1925,6 +2013,7 @@ mod tests {
             usage_warning: None,
             generation: bridge_core::ids::SessionGeneration::new(1),
             op: OperationId::parse("turn-1").unwrap(),
+            expiry_intent: crate::session_manager::WarmExpiryIntent::new(),
             seed: None,
             injects: Vec::new(),
             abort,
@@ -1938,6 +2027,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stop_reason, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn coordinator_expires_every_sampled_structured_warm_failure_but_preserves_legacy_policy()
+    {
+        for (index, class) in [
+            DiagnosticFailureClass::Transport,
+            DiagnosticFailureClass::AgentProcess,
+            DiagnosticFailureClass::Timeout,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let releases = Arc::new(AtomicUsize::new(0));
+            let backend: Arc<dyn AgentBackend> = Arc::new(ErrorBackend {
+                error: structured_agent_failure(class),
+                releases: releases.clone(),
+            });
+            let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+                entry: entry(),
+                backend,
+                resolved: Arc::new(StdMutex::new(Vec::new())),
+            });
+            let coordinator = coordinator_fixture_with_registry(
+                registry,
+                Arc::new(ManualClock::new(1_700_000_000_000)),
+            );
+            let context = ctx(&format!("ctx-structured-{index}"));
+            let mut params = prompt_params("fail");
+            params.context = Some(context.clone());
+
+            assert!(matches!(
+                coordinator.prompt(params).await,
+                Err(BridgeError::AgentFailure { .. })
+            ));
+            assert_eq!(releases.load(AtomicOrdering::SeqCst), 1, "{class:?}");
+            assert!(coordinator.session_manager.status(&context).await.is_none());
+        }
+
+        let releases = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn AgentBackend> = Arc::new(ErrorBackend {
+            error: BridgeError::agent_crashed("legacy"),
+            releases: releases.clone(),
+        });
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend,
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let coordinator = coordinator_fixture_with_registry(
+            registry,
+            Arc::new(ManualClock::new(1_700_000_000_000)),
+        );
+        let context = ctx("ctx-legacy-error-policy");
+        let mut params = prompt_params("fail");
+        params.context = Some(context.clone());
+        assert!(matches!(
+            coordinator.prompt(params).await,
+            Err(BridgeError::AgentCrashed { .. })
+        ));
+        assert_eq!(releases.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            coordinator
+                .session_manager
+                .status(&context)
+                .await
+                .unwrap()
+                .state,
+            "idle",
+            "coordinator legacy errors retain their pre-R2b finish behavior"
+        );
     }
 
     #[cfg(test)]
@@ -2467,6 +2627,7 @@ mod tests {
             usage_warning: None,
             generation: bridge_core::ids::SessionGeneration::new(3),
             op: op.clone(),
+            expiry_intent: crate::session_manager::WarmExpiryIntent::new(),
             seed: None,
             injects: Vec::new(),
             abort: CancellationToken::new(),

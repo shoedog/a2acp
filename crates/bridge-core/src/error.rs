@@ -77,6 +77,45 @@ pub enum BridgeError {
     TaskSpecInvalid { message: String },
 }
 
+/// Whether a failed warm turn has proved its current backend session reusable.
+///
+/// Retry disposition answers whether the *operation* may run again. This
+/// separate, closed mapping answers whether the already-failed warm session may
+/// be returned to the pool. R2b fails closed for every structured agent failure
+/// while preserving each owner's existing policy for legacy errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarmSessionSurvivability {
+    PreserveOwnerBehavior,
+    Expire,
+}
+
+pub fn warm_session_survivability(error: &BridgeError) -> WarmSessionSurvivability {
+    use crate::diagnostics::DiagnosticFailureClass;
+
+    match error {
+        BridgeError::AgentFailure { diagnostic } => match diagnostic.class() {
+            DiagnosticFailureClass::Config
+            | DiagnosticFailureClass::Authentication
+            | DiagnosticFailureClass::Model
+            | DiagnosticFailureClass::Protocol
+            | DiagnosticFailureClass::Transport
+            | DiagnosticFailureClass::AgentProcess
+            | DiagnosticFailureClass::ContainerRuntime
+            | DiagnosticFailureClass::ContainerImage
+            | DiagnosticFailureClass::ContainerNetwork
+            | DiagnosticFailureClass::ContainerMount
+            | DiagnosticFailureClass::ContainerCredentials
+            | DiagnosticFailureClass::Timeout
+            | DiagnosticFailureClass::Overloaded
+            | DiagnosticFailureClass::ProviderLimit
+            | DiagnosticFailureClass::Persistence
+            | DiagnosticFailureClass::Canceled
+            | DiagnosticFailureClass::Unknown => WarmSessionSurvivability::Expire,
+        },
+        _ => WarmSessionSurvivability::PreserveOwnerBehavior,
+    }
+}
+
 impl BridgeError {
     /// Construct an `AgentCrashed` carrying a short reason describing what failed
     /// (e.g. "spawn failed: …", "handshake timeout"), so the client/log sees WHY

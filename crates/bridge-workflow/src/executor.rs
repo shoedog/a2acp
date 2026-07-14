@@ -82,9 +82,26 @@ pub enum NodeTurnExit {
 
 #[async_trait::async_trait]
 pub trait NodeTurnCleanup: Send {
+    /// Synchronously arm the terminal action before any later cancellation
+    /// point (for example, flushing a rich-event sink). Compatibility
+    /// implementations have no pre-settlement state and may ignore this.
+    fn arm_exit(&mut self, _exit: &NodeTurnExit) {}
+
     /// Invoked once after prompt+drain on the node's exit branch. Each impl closes over what it owns
     /// (cold: backend+session for forget; warm: SessionManager+child+gen+op for finish/cancel/expire).
     async fn on_exit(self: Box<Self>, exit: NodeTurnExit);
+
+    /// Result-bearing operation-owned cleanup. Compatibility implementations
+    /// delegate to the legacy method; warm/observed owners override this so
+    /// teardown settles before node-terminal observability.
+    async fn on_exit_observed(
+        self: Box<Self>,
+        exit: NodeTurnExit,
+        _observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        self.on_exit(exit).await;
+        Ok(())
+    }
 }
 
 pub struct NodeTurn {
@@ -323,7 +340,7 @@ impl WorkflowExecutor {
             let obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 1);
             ctx.observer
                 .record(&ObsEvent::NodeStarted { ctx: &obs_ctx });
-            let turn = match d
+            let mut turn = match d
                 .checkout_observed(wf_id, node, run_id, ctx, diagnostic.clone())
                 .await
             {
@@ -342,12 +359,25 @@ impl WorkflowExecutor {
                 }
             };
             if cancel.is_cancelled() {
-                turn.cleanup.on_exit(NodeTurnExit::Normal).await;
+                let cleanup = turn
+                    .cleanup
+                    .on_exit_observed(NodeTurnExit::Normal, diagnostic.clone())
+                    .await;
+                let (text, outcome) = match cleanup {
+                    Ok(()) => (
+                        format!("[node {} canceled]", node.id.as_str()),
+                        TurnOutcome::Canceled,
+                    ),
+                    Err(error) => (
+                        format!("[node {} cleanup failed: {:?}]", node.id.as_str(), error),
+                        TurnOutcome::Failed(classify_failure(&error)),
+                    ),
+                };
                 ctx.observer.record(&ObsEvent::NodeFinished {
                     ctx: &obs_ctx,
-                    outcome: &TurnOutcome::Canceled,
+                    outcome: &outcome,
                 });
-                return (format!("[node {} canceled]", node.id.as_str()), false, None);
+                return (text, false, None);
             }
 
             let mut parts = vec![Part { text: rendered }];
@@ -371,41 +401,21 @@ impl WorkflowExecutor {
 
             let mut stream = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
-                    if let Some(sink) = &rich_sink {
-                        if let Err(flush_error) = sink.flush().await {
-                            eprintln!(
-                                "rich sink flush failed after warm prompt-open cancellation for node {}: {:?}",
-                                node.id.as_str(),
-                                flush_error
-                            );
-                        }
-                    }
-                    turn.cleanup.on_exit(NodeTurnExit::Canceled).await;
-                    ctx.observer.record(&ObsEvent::TurnFinished {
-                        ctx: &obs_ctx,
-                        latency: turn_start.elapsed(),
-                        ttft: None,
-                        outcome: &TurnOutcome::Canceled,
-                    });
-                    ctx.observer.record(&ObsEvent::UsageFinalized {
-                        ctx: &obs_ctx,
-                        usage: None,
-                        fin: UsageFinalization::TurnFinal,
-                    });
-                    ctx.observer.record(&ObsEvent::NodeFinished {
-                        ctx: &obs_ctx,
-                        outcome: &TurnOutcome::Canceled,
-                    });
-                    return (format!("[node {} canceled]", node.id.as_str()), false, None);
-                }
+                // Prompt-open is the ownership boundary. If the backend result
+                // and workflow cancellation are simultaneously ready, observe
+                // the concrete backend result first so a structured failure
+                // can arm warm-session expiry. A pending prompt still yields
+                // immediately to cancellation.
                 s = turn.backend.prompt_with_observers(
                     &turn.session,
                     parts,
-                    BackendObservers::new(diagnostic, rich_sink.clone()),
+                    BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
                 ) => match s {
                     Ok(s) => s,
                     Err(e) => {
+                        turn
+                            .cleanup
+                            .arm_exit(&NodeTurnExit::Error(e.clone()));
                         if let Some(sink) = &rich_sink {
                             if let Err(flush_error) = sink.flush().await {
                                 eprintln!(
@@ -417,7 +427,10 @@ impl WorkflowExecutor {
                         }
                         let text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
                         let fail_out = TurnOutcome::Failed(classify_failure(&e));
-                        turn.cleanup.on_exit(NodeTurnExit::Error(e)).await;
+                        let _ = turn
+                            .cleanup
+                            .on_exit_observed(NodeTurnExit::Error(e), diagnostic.clone())
+                            .await;
                         ctx.observer.record(&ObsEvent::TurnFinished {
                             ctx: &obs_ctx,
                             latency: turn_start.elapsed(),
@@ -434,6 +447,48 @@ impl WorkflowExecutor {
                         return (text, false, None);
                     }
                 },
+                _ = cancel.cancelled() => {
+                    turn.cleanup.arm_exit(&NodeTurnExit::Canceled);
+                    if let Some(sink) = &rich_sink {
+                        if let Err(flush_error) = sink.flush().await {
+                            eprintln!(
+                                "rich sink flush failed after warm prompt-open cancellation for node {}: {:?}",
+                                node.id.as_str(),
+                                flush_error
+                            );
+                        }
+                    }
+                    let cleanup = turn
+                        .cleanup
+                        .on_exit_observed(NodeTurnExit::Canceled, diagnostic.clone())
+                        .await;
+                    let (text, outcome) = match cleanup {
+                        Ok(()) => (
+                            format!("[node {} canceled]", node.id.as_str()),
+                            TurnOutcome::Canceled,
+                        ),
+                        Err(error) => (
+                            format!("[node {} cleanup failed: {:?}]", node.id.as_str(), error),
+                            TurnOutcome::Failed(classify_failure(&error)),
+                        ),
+                    };
+                    ctx.observer.record(&ObsEvent::TurnFinished {
+                        ctx: &obs_ctx,
+                        latency: turn_start.elapsed(),
+                        ttft: None,
+                        outcome: &outcome,
+                    });
+                    ctx.observer.record(&ObsEvent::UsageFinalized {
+                        ctx: &obs_ctx,
+                        usage: None,
+                        fin: UsageFinalization::TurnFinal,
+                    });
+                    ctx.observer.record(&ObsEvent::NodeFinished {
+                        ctx: &obs_ctx,
+                        outcome: &outcome,
+                    });
+                    return (text, false, None);
+                }
             };
             let mut text = String::new();
             let mut ok = true;
@@ -441,24 +496,40 @@ impl WorkflowExecutor {
             let mut exit = loop {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {
-                        ok = false;
-                        text = format!("[node {} canceled]", node.id.as_str());
-                        break NodeTurnExit::Canceled;
-                    }
+                    // Prompt ownership already exists here. If a backend item
+                    // and workflow cancellation are simultaneously ready, the
+                    // concrete backend result wins so a queued AgentFailure can
+                    // arm warm-session expiry. A pending stream still yields
+                    // immediately to cancellation.
                     item = stream.next() => match item {
                         Some(Ok(Update::Text(t))) => {
                             if ttft_val.is_none() && !t.is_empty() {
                                 ttft_val = Some(turn_start.elapsed());
                             }
                             text.push_str(&t);
+                            if cancel.is_cancelled() {
+                                ok = false;
+                                text = format!("[node {} canceled]", node.id.as_str());
+                                break NodeTurnExit::Canceled;
+                            }
                         }
-                        Some(Ok(Update::Permission(_))) => {}
+                        Some(Ok(Update::Permission(_))) => {
+                            if cancel.is_cancelled() {
+                                ok = false;
+                                text = format!("[node {} canceled]", node.id.as_str());
+                                break NodeTurnExit::Canceled;
+                            }
+                        }
                         Some(Ok(Update::Usage(mut u))) => {
                             if let Some(previous) = &last_usage {
                                 u.merge_missing_from(previous);
                             }
                             last_usage = Some(u);
+                            if cancel.is_cancelled() {
+                                ok = false;
+                                text = format!("[node {} canceled]", node.id.as_str());
+                                break NodeTurnExit::Canceled;
+                            }
                         }
                         Some(Ok(Update::Done { stop_reason })) => {
                             if stop_reason == STOP_REASON_CANCELLED { ok = false; }
@@ -470,9 +541,19 @@ impl WorkflowExecutor {
                             break NodeTurnExit::Error(e);
                         }
                         None => break NodeTurnExit::Normal,
+                    },
+                    _ = cancel.cancelled() => {
+                        ok = false;
+                        text = format!("[node {} canceled]", node.id.as_str());
+                        break NodeTurnExit::Canceled;
                     }
                 }
             };
+            // The cleanup owner must learn the terminal state before rich-sink
+            // flush, which is a cancellation point. Warm cleanup uses this to
+            // make structured-failure expiry sticky if the executor is dropped
+            // while the flush is pending.
+            turn.cleanup.arm_exit(&exit);
             if let Some(sink) = &rich_sink {
                 if let Err(flush_error) = sink.flush().await {
                     if ok && matches!(&exit, NodeTurnExit::Normal) {
@@ -483,6 +564,7 @@ impl WorkflowExecutor {
                             flush_error
                         );
                         exit = NodeTurnExit::Error(flush_error);
+                        turn.cleanup.arm_exit(&exit);
                     } else {
                         eprintln!(
                             "rich sink flush failed after warm node exit for {}: {:?}",
@@ -492,15 +574,33 @@ impl WorkflowExecutor {
                     }
                 }
             }
-            // Keep whatever usage the agent reported, even if the turn then errored or was
-            // cancelled — the tokens were really consumed and belong in the durable footprint.
-            // `last_usage` is already `None` when no `Update::Usage` was ever observed.
-            let node_outcome = match &exit {
+            // Settle operation-owned cleanup before terminal observability. A
+            // teardown failure is primary only when no earlier backend/rich
+            // failure already owns the node outcome.
+            let had_primary_failure = matches!(&exit, NodeTurnExit::Error(_));
+            let mut node_outcome = match &exit {
                 NodeTurnExit::Canceled => TurnOutcome::Canceled,
-                NodeTurnExit::Error(e) => TurnOutcome::Failed(classify_failure(e)),
+                NodeTurnExit::Error(error) => TurnOutcome::Failed(classify_failure(error)),
                 NodeTurnExit::Normal if ok => TurnOutcome::Success,
                 NodeTurnExit::Normal => TurnOutcome::Failed(FailureClass::Other),
             };
+            let cleanup_result = turn
+                .cleanup
+                .on_exit_observed(exit, diagnostic.clone())
+                .await;
+            if let Err(error) = cleanup_result {
+                if !had_primary_failure {
+                    ok = false;
+                    text = format!("[node {} cleanup failed: {:?}]", node.id.as_str(), error);
+                    node_outcome = TurnOutcome::Failed(classify_failure(&error));
+                }
+                // Otherwise the operation observer recorded bounded teardown
+                // evidence and the earlier backend/rich failure remains primary.
+            }
+
+            // Keep whatever usage the agent reported, even if the turn then errored or was
+            // cancelled — the tokens were really consumed and belong in the durable footprint.
+            // `last_usage` is already `None` when no `Update::Usage` was ever observed.
             ctx.observer.record(&ObsEvent::TurnFinished {
                 ctx: &obs_ctx,
                 latency: turn_start.elapsed(),
@@ -516,7 +616,6 @@ impl WorkflowExecutor {
                 ctx: &obs_ctx,
                 outcome: &node_outcome,
             });
-            turn.cleanup.on_exit(exit).await;
             return (text, ok, last_usage);
         }
         let rendered = render(&node.prompt_template, vars);
@@ -2741,6 +2840,397 @@ mod tests {
                 assert_eq!(u.used, Some(777), "warm path keeps usage despite the error");
             }
             other => panic!("expected NodeFinished with kept usage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_backend_error_beats_simultaneous_workflow_cancellation_after_prompt_ownership() {
+        struct ReadyErrorAndCancelBackend {
+            cancel: CancellationToken,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentBackend for ReadyErrorAndCancelBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                // The prompt-open future wins its select while making the
+                // cancellation branch ready for the immediately following
+                // stream-drain select.
+                self.cancel.cancel();
+                Ok(Box::pin(tokio_stream::iter(vec![Err(
+                    BridgeError::StoreFailure,
+                )])))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        struct ReadyErrorDispatcher {
+            cancel: CancellationToken,
+            exits: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl WorkflowNodeDispatcher for ReadyErrorDispatcher {
+            async fn checkout(
+                &self,
+                _workflow: &str,
+                _node: &WorkflowNode,
+                _run: &str,
+                _context: &WorkflowRunContext,
+            ) -> Result<NodeTurn, BridgeError> {
+                Ok(NodeTurn {
+                    backend: Arc::new(ReadyErrorAndCancelBackend {
+                        cancel: self.cancel.clone(),
+                    }),
+                    session: SessionId::parse("ready-error-and-cancel").unwrap(),
+                    seed: None,
+                    cleanup: Box::new(CountingCleanup {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        exits: self.exits.clone(),
+                    }),
+                })
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let exits = Arc::new(Mutex::new(Vec::new()));
+        let executor = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: HashMap::new(),
+        }));
+        let _events = executor
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "ready-race".into(),
+                cancel.clone(),
+                WorkflowRunContext::default(),
+                Arc::new(ReadyErrorDispatcher {
+                    cancel,
+                    exits: exits.clone(),
+                }),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            exits.lock().unwrap().as_slice(),
+            ["error:StoreFailure"],
+            "an already-ready backend failure owns the turn before simultaneous cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_usage_burst_cannot_starve_workflow_cancellation() {
+        struct ReadyUsageAndCancelBackend {
+            cancel: CancellationToken,
+            updates: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentBackend for ReadyUsageAndCancelBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                self.cancel.cancel();
+                let updates = self.updates.clone();
+                let ready = futures::stream::iter((0..128).map(move |_| {
+                    updates.fetch_add(1, Ordering::SeqCst);
+                    Ok(Update::Usage(UsageSnapshot {
+                        used: Some(1),
+                        size: Some(10),
+                        cost: None,
+                        terminal: None,
+                        at_ms: 0,
+                    }))
+                }))
+                .chain(futures::stream::pending());
+                Ok(Box::pin(ready))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        struct ReadyUsageDispatcher {
+            cancel: CancellationToken,
+            updates: Arc<AtomicUsize>,
+            exits: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl WorkflowNodeDispatcher for ReadyUsageDispatcher {
+            async fn checkout(
+                &self,
+                _workflow: &str,
+                _node: &WorkflowNode,
+                _run: &str,
+                _context: &WorkflowRunContext,
+            ) -> Result<NodeTurn, BridgeError> {
+                Ok(NodeTurn {
+                    backend: Arc::new(ReadyUsageAndCancelBackend {
+                        cancel: self.cancel.clone(),
+                        updates: self.updates.clone(),
+                    }),
+                    session: SessionId::parse("ready-usage-and-cancel").unwrap(),
+                    seed: None,
+                    cleanup: Box::new(CountingCleanup {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        exits: self.exits.clone(),
+                    }),
+                })
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let updates = Arc::new(AtomicUsize::new(0));
+        let exits = Arc::new(Mutex::new(Vec::new()));
+        let executor = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: HashMap::new(),
+        }));
+        let _events = executor
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "ready-usage-cancel".into(),
+                cancel.clone(),
+                WorkflowRunContext::default(),
+                Arc::new(ReadyUsageDispatcher {
+                    cancel,
+                    updates: updates.clone(),
+                    exits: exits.clone(),
+                }),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            updates.load(Ordering::SeqCst),
+            1,
+            "ready-result precedence may consume one benign item, then must honor cancellation"
+        );
+        assert_eq!(exits.lock().unwrap().as_slice(), ["canceled"]);
+    }
+
+    #[tokio::test]
+    async fn ready_prompt_open_error_beats_cancellation_made_ready_after_precheck() {
+        struct ReadyPromptErrorBackend;
+
+        #[async_trait::async_trait]
+        impl AgentBackend for ReadyPromptErrorBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                Err(BridgeError::StoreFailure)
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        struct ReadyPromptErrorDispatcher {
+            exits: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl WorkflowNodeDispatcher for ReadyPromptErrorDispatcher {
+            async fn checkout(
+                &self,
+                _workflow: &str,
+                _node: &WorkflowNode,
+                _run: &str,
+                _context: &WorkflowRunContext,
+            ) -> Result<NodeTurn, BridgeError> {
+                Ok(NodeTurn {
+                    backend: Arc::new(ReadyPromptErrorBackend),
+                    session: SessionId::parse("ready-prompt-error-and-cancel").unwrap(),
+                    seed: None,
+                    cleanup: Box::new(CountingCleanup {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        exits: self.exits.clone(),
+                    }),
+                })
+            }
+        }
+
+        struct CancelAfterPrecheckFactory {
+            cancel: CancellationToken,
+            sink: Arc<RecordingRichSink>,
+        }
+
+        impl RichEventSinkFactory for CancelAfterPrecheckFactory {
+            fn make(&self, _node: &NodeId) -> Arc<dyn bridge_core::ports::RichEventSink> {
+                // `make` runs after run_node's eager cancellation check and
+                // immediately before prompt-open ownership is selected. This
+                // makes both select branches ready without a scheduler race.
+                self.cancel.cancel();
+                self.sink.clone()
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let exits = Arc::new(Mutex::new(Vec::new()));
+        let executor = WorkflowExecutor::new(Arc::new(FakeRegistry {
+            backends: HashMap::new(),
+        }));
+        let context = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(CancelAfterPrecheckFactory {
+                cancel: cancel.clone(),
+                sink: Arc::new(RecordingRichSink::default()),
+            })),
+            ..WorkflowRunContext::default()
+        };
+
+        let _events = executor
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "ready-prompt-race".into(),
+                cancel,
+                context,
+                Arc::new(ReadyPromptErrorDispatcher {
+                    exits: exits.clone(),
+                }),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            exits.lock().unwrap().as_slice(),
+            ["error:StoreFailure"],
+            "an already-ready prompt-open failure owns the turn before simultaneous cancellation"
+        );
+    }
+
+    struct ResultCleanup {
+        result: Result<(), BridgeError>,
+        exits: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeTurnCleanup for ResultCleanup {
+        async fn on_exit(self: Box<Self>, _exit: NodeTurnExit) {
+            panic!("observed workflow execution must use result-bearing cleanup")
+        }
+
+        async fn on_exit_observed(
+            self: Box<Self>,
+            exit: NodeTurnExit,
+            _observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<(), BridgeError> {
+            self.exits.lock().unwrap().push(match exit {
+                NodeTurnExit::Normal => "normal".to_owned(),
+                NodeTurnExit::Canceled => "canceled".to_owned(),
+                NodeTurnExit::Error(error) => format!("error:{error:?}"),
+            });
+            self.result
+        }
+    }
+
+    struct ImmediateResultBackend {
+        error: Option<BridgeError>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ImmediateResultBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let updates = match &self.error {
+                Some(error) => vec![Err(error.clone())],
+                None => vec![Ok(Update::Done {
+                    stop_reason: "end_turn".to_owned(),
+                })],
+            };
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct ResultCleanupDispatcher {
+        backend_error: Option<BridgeError>,
+        cleanup_error: BridgeError,
+        exits: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for ResultCleanupDispatcher {
+        async fn checkout(
+            &self,
+            _workflow: &str,
+            _node: &WorkflowNode,
+            _run: &str,
+            _context: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            Ok(NodeTurn {
+                backend: Arc::new(ImmediateResultBackend {
+                    error: self.backend_error.clone(),
+                }),
+                session: SessionId::parse("result-bearing-cleanup").unwrap(),
+                seed: None,
+                cleanup: Box::new(ResultCleanup {
+                    result: Err(self.cleanup_error.clone()),
+                    exits: self.exits.clone(),
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_is_primary_only_without_an_earlier_backend_failure() {
+        for (backend_error, expected_fragment) in [
+            (None, "cleanup failed: StoreFailure"),
+            (
+                Some(BridgeError::ConfigMismatch { field: "model" }),
+                "ConfigMismatch",
+            ),
+        ] {
+            let exits = Arc::new(Mutex::new(Vec::new()));
+            let executor = WorkflowExecutor::new(Arc::new(FakeRegistry {
+                backends: HashMap::new(),
+            }));
+            let events = executor
+                .run_with_context_and_dispatcher(
+                    one_node_graph(),
+                    "DIFF".into(),
+                    "cleanup-result".into(),
+                    CancellationToken::new(),
+                    WorkflowRunContext::default(),
+                    Arc::new(ResultCleanupDispatcher {
+                        backend_error,
+                        cleanup_error: BridgeError::StoreFailure,
+                        exits: exits.clone(),
+                    }),
+                )
+                .collect::<Vec<_>>()
+                .await;
+            let finished = events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .find_map(|event| match event {
+                    WorkflowEvent::NodeFinished { ok, output, .. } => Some((*ok, output.clone())),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(!finished.0);
+            assert!(finished.1.contains(expected_fragment), "{}", finished.1);
+            assert_eq!(exits.lock().unwrap().len(), 1);
         }
     }
 

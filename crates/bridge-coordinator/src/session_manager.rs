@@ -14,8 +14,12 @@ use bridge_core::permission::PermissionRegistry;
 use bridge_core::ports::{AgentBackend, AgentRegistry, DiagnosticObserver, Lease};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::session_fingerprint::SessionSpecFingerprint;
+use futures::FutureExt;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -65,8 +69,85 @@ fn is_claimed(s: SessionState) -> bool {
 /// (or before pushing a removed handle to a deferred release). `cancel()` is synchronous → lock-safe.
 /// Latch-safe: `release_session` removes the ACP entry, so the cancel latch dies with it.
 fn fire_lingering_turn_abort(h: &mut WarmHandle) {
-    if let Some(tok) = h.turn_abort.take() {
-        tok.cancel();
+    for abort in h.turn_aborts.drain(..) {
+        abort.token.cancel();
+    }
+}
+
+fn has_armed_expiry_intent(h: &WarmHandle, op: &OperationId) -> bool {
+    h.turn_aborts
+        .iter()
+        .any(|turn| turn.op == *op && turn.expiry_intent.is_armed())
+}
+
+fn first_armed_idle_expiry(h: &WarmHandle) -> Option<OperationId> {
+    if h.state != SessionState::Idle || h.op.is_some() {
+        return None;
+    }
+    h.turn_aborts
+        .iter()
+        .find(|turn| turn.expiry_intent.is_armed())
+        .map(|turn| turn.op.clone())
+}
+
+fn reserve_idle_successor_or_armed(h: &WarmHandle) -> Option<OperationId> {
+    debug_assert_eq!(h.state, SessionState::Idle);
+    debug_assert!(h.op.is_none());
+    h.turn_aborts
+        .iter()
+        .find(|turn| !turn.expiry_intent.reserve_successor())
+        .map(|turn| turn.op.clone())
+}
+
+struct TurnAbort {
+    op: OperationId,
+    token: CancellationToken,
+    expiry_intent: WarmExpiryIntent,
+}
+
+/// Exact-operation signal shared by the synchronous completion observer and
+/// the session-table owner. A structured failure can arm this without awaiting
+/// the Tokio table lock, so concurrent cancel settlement cannot reopen the
+/// poisoned backend session before the expiry claim arrives.
+#[derive(Clone)]
+pub struct WarmExpiryIntent(Arc<std::sync::atomic::AtomicU8>);
+
+impl WarmExpiryIntent {
+    const OPEN: u8 = 0;
+    const ARMED: u8 = 1;
+    const SUCCESSOR_RESERVED: u8 = 2;
+
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU8::new(Self::OPEN)))
+    }
+
+    pub(crate) fn arm(&self) {
+        let _ = self.0.compare_exchange(
+            Self::OPEN,
+            Self::ARMED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    fn is_armed(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == Self::ARMED
+    }
+
+    /// Atomically linearize successor admission against late failure
+    /// observation for the retained operation. `false` means expiry armed
+    /// first and the caller must claim cleanup instead of minting a successor.
+    fn reserve_successor(&self) -> bool {
+        match self.0.compare_exchange(
+            Self::OPEN,
+            Self::SUCCESSOR_RESERVED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) | Err(Self::SUCCESSOR_RESERVED) => true,
+            Err(Self::ARMED) => false,
+            Err(other) => unreachable!("unknown warm expiry intent state: {other}"),
+        }
     }
 }
 
@@ -87,21 +168,259 @@ struct WarmHandle {
     expire_after_reconcile: bool,
     #[allow(dead_code)]
     op: Option<OperationId>,
-    /// The in-flight turn's abort token (cancel-tokens F2). Fired by every backend-session-release path via
+    /// All not-yet-settled turn abort tokens (cancel-tokens F2). Fired by every backend-session-release path via
     /// `fire_lingering_turn_abort` so a pre-first-poll producer aborts instead of re-minting the released
     /// session. A keep-warm `SessionCancel` deliberately LEAVES the token here (rather than firing it — that
-    /// would strand the ACP cancel latch) so a later reset/release can still fire it.
-    ///
-    /// KNOWN LIMITATION — DEFERRED TO SLICE 9 (owner decision 2026-06-21): this is a SINGLE slot. If a
-    /// keep-warm cancel leaves a token here and the NEXT checkout installs a new turn's token, the lingering
-    /// one is overwritten/orphaned — so a `cancel A → checkout B → release/reset` sequence can let producer A
-    /// re-mint the released session. Closing it needs producer-join (hold the handle claimed until the
-    /// cancelled producer confirms exit) or a `Vec` lingering-token collection drained at every release site;
-    /// both belong to Slice 9's cancel-under-concurrency work.
-    turn_abort: Option<CancellationToken>,
+    /// would strand the ACP cancel latch) so a later reset/release can still fire it. A subsequent checkout
+    /// appends rather than overwrites; `finish_turn` removes only its exact operation token, closing the
+    /// cancel-A -> checkout-B -> release/reset orphan window.
+    turn_aborts: Vec<TurnAbort>,
     pending_seed: Option<String>,
     pending_injects: Vec<QueuedInject>,
     last_used: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExpiringTombstoneState {
+    Expiring,
+    CleanupFailed { code: &'static str },
+}
+
+/// Resource-free marker retained while the exact warm-session cleanup owner is
+/// running. Generation + operation reject stale completion and the claim id
+/// prevents an older flight from clearing a newer marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpiringTombstone {
+    generation: SessionGeneration,
+    op: OperationId,
+    cleanup_claim_id: u64,
+    state: ExpiringTombstoneState,
+}
+
+/// Minimal capability retained after checked cleanup fails. The warm handle,
+/// lease, operation observer, and task-owned state have already been dropped;
+/// this pair is sufficient to re-enter the backend's exact per-session cleanup
+/// cell when an operator retries SessionRelease or SessionClear.
+#[derive(Clone)]
+struct CleanupRetryOwner {
+    backend: Arc<dyn AgentBackend>,
+    backend_session: SessionId,
+}
+
+#[derive(Default)]
+struct SessionTable {
+    live: HashMap<ContextId, WarmHandle>,
+    tombstones: HashMap<ContextId, ExpiringTombstone>,
+    cleanup_retries: HashMap<ContextId, CleanupRetryOwner>,
+}
+
+impl SessionTable {
+    fn get(&self, ctx: &ContextId) -> Option<&WarmHandle> {
+        self.live.get(ctx)
+    }
+
+    fn get_mut(&mut self, ctx: &ContextId) -> Option<&mut WarmHandle> {
+        self.live.get_mut(ctx)
+    }
+
+    fn insert(&mut self, ctx: ContextId, handle: WarmHandle) -> Option<WarmHandle> {
+        debug_assert!(!self.tombstones.contains_key(&ctx));
+        debug_assert!(!self.cleanup_retries.contains_key(&ctx));
+        self.live.insert(ctx, handle)
+    }
+
+    fn remove(&mut self, ctx: &ContextId) -> Option<WarmHandle> {
+        self.live.remove(ctx)
+    }
+
+    fn contains_key(&self, ctx: &ContextId) -> bool {
+        self.live.contains_key(ctx) || self.tombstones.contains_key(ctx)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&ContextId, &WarmHandle)> {
+        self.live.iter()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &ContextId> {
+        self.live.keys().chain(self.tombstones.keys())
+    }
+
+    fn tombstone(&self, ctx: &ContextId) -> Option<&ExpiringTombstone> {
+        self.tombstones.get(ctx)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CleanupReport {
+    pub(crate) result: Result<(), BridgeError>,
+}
+
+/// Exact-claim capability retained by both the detached cleanup worker and
+/// its joiner. The worker uses it after any caught panic; the joiner uses it
+/// when Tokio reports cancellation or an otherwise escaped panic. A stale
+/// capability cannot settle a replacement tombstone because every mutation
+/// rechecks generation, operation, and cleanup-claim identity.
+#[derive(Clone)]
+struct CleanupClaimSettlement {
+    by_context: Arc<Mutex<SessionTable>>,
+    ctx: ContextId,
+    generation: SessionGeneration,
+    op: OperationId,
+    cleanup_claim_id: u64,
+    retry: CleanupRetryOwner,
+}
+
+impl CleanupClaimSettlement {
+    async fn settle(&self, result: Result<(), BridgeError>) -> CleanupReport {
+        let mut table = self.by_context.lock().await;
+        let matches_claim = matches!(
+            table.tombstones.get(&self.ctx),
+            Some(tombstone)
+                if tombstone.generation == self.generation
+                    && tombstone.op == self.op
+                    && tombstone.cleanup_claim_id == self.cleanup_claim_id
+        );
+        if matches_claim {
+            if result.is_ok() {
+                table.tombstones.remove(&self.ctx);
+                table.cleanup_retries.remove(&self.ctx);
+            } else if let Some(tombstone) = table.tombstones.get_mut(&self.ctx) {
+                tombstone.state = ExpiringTombstoneState::CleanupFailed {
+                    code: "warm.cleanup.release_failed",
+                };
+                table
+                    .cleanup_retries
+                    .insert(self.ctx.clone(), self.retry.clone());
+            }
+        }
+        CleanupReport { result }
+    }
+}
+
+pub(crate) struct CleanupFlight {
+    task: tokio::task::JoinHandle<CleanupReport>,
+    settlement: CleanupClaimSettlement,
+}
+
+impl CleanupFlight {
+    #[cfg(test)]
+    fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+/// Owns the removed warm handle until its resources are synchronously moved
+/// into one detached cleanup task. Dropping the claim before explicit start
+/// starts that same flight unobserved.
+pub(crate) struct ExpiryClaim {
+    by_context: Arc<Mutex<SessionTable>>,
+    children: Arc<Mutex<HashMap<ContextId, HashSet<ContextId>>>>,
+    ctx: ContextId,
+    generation: SessionGeneration,
+    op: OperationId,
+    cleanup_claim_id: u64,
+    prune_children: bool,
+    handle: Option<WarmHandle>,
+    retry: Option<CleanupRetryOwner>,
+}
+
+impl ExpiryClaim {
+    fn start_flight(&mut self) -> Option<CleanupFlight> {
+        let handle = self.handle.take();
+        let retry = match handle.as_ref() {
+            Some(handle) => CleanupRetryOwner {
+                backend: handle.backend.clone(),
+                backend_session: handle.backend_session.clone(),
+            },
+            None => self.retry.take()?,
+        };
+        let by_context = self.by_context.clone();
+        let children = self.children.clone();
+        let ctx = self.ctx.clone();
+        let generation = self.generation;
+        let op = self.op.clone();
+        let cleanup_claim_id = self.cleanup_claim_id;
+        let prune_children = self.prune_children;
+        let settlement = CleanupClaimSettlement {
+            by_context,
+            ctx: ctx.clone(),
+            generation,
+            op,
+            cleanup_claim_id,
+            retry: retry.clone(),
+        };
+        let worker_settlement = settlement.clone();
+        let task = tokio::spawn(async move {
+            let recovery = worker_settlement.clone();
+            let worker = AssertUnwindSafe(async move {
+                let result = retry
+                    .backend
+                    .release_session_checked(&retry.backend_session)
+                    .await;
+                // The lease and every remaining handle-owned value belong to
+                // this task and are dropped exactly once even when the joining
+                // waiter is canceled. The whole worker is unwind-protected so
+                // a public Lease implementation cannot strand the tombstone.
+                drop(handle);
+                if prune_children {
+                    let mut registrations = children.lock().await;
+                    for set in registrations.values_mut() {
+                        set.retain(|child| child != &ctx);
+                    }
+                    registrations.retain(|_, set| !set.is_empty());
+                }
+                worker_settlement.settle(result).await
+            })
+            .catch_unwind()
+            .await;
+            match worker {
+                Ok(report) => report,
+                Err(_) => {
+                    recovery
+                        .settle(Err(BridgeError::agent_crashed(
+                            "warm cleanup task panicked",
+                        )))
+                        .await
+                }
+            }
+        });
+        Some(CleanupFlight { task, settlement })
+    }
+
+    /// Consume this claim into its detached cleanup flight without awaiting.
+    /// The returned join handle observes the report; dropping it detaches from
+    /// the already-owned task and cannot restart cleanup.
+    pub(crate) fn into_flight(mut self) -> Option<CleanupFlight> {
+        self.start_flight()
+    }
+
+    pub(crate) async fn join_flight(flight: CleanupFlight) -> CleanupReport {
+        let CleanupFlight { task, settlement } = flight;
+        match task.await {
+            Ok(report) => report,
+            Err(_) => {
+                settlement
+                    .settle(Err(BridgeError::agent_crashed("warm cleanup task failed")))
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn cleanup(mut self) -> CleanupReport {
+        // No await precedes ownership transfer. If the returned future is never
+        // polled, ExpiryClaim::drop starts the flight; once polled, dropping the
+        // JoinHandle merely detaches the already-owned task.
+        let Some(flight) = self.start_flight() else {
+            return CleanupReport { result: Ok(()) };
+        };
+        Self::join_flight(flight).await
+    }
+}
+
+impl Drop for ExpiryClaim {
+    fn drop(&mut self) {
+        let _ = self.start_flight();
+    }
 }
 
 /// What a checked-out warm turn needs to dispatch.
@@ -111,6 +430,7 @@ pub struct WarmTurn {
     pub usage_warning: Option<UsageWarning>,
     pub generation: SessionGeneration,
     pub op: OperationId,
+    pub expiry_intent: WarmExpiryIntent,
     pub abort: CancellationToken,
     pub seed: Option<String>,
     pub injects: Vec<QueuedInject>,
@@ -163,14 +483,15 @@ impl SessionStatusInfo {
 pub struct SessionManager {
     registry: Arc<dyn AgentRegistry>,
     perm_registry: Option<Arc<PermissionRegistry>>,
-    by_context: Mutex<HashMap<ContextId, WarmHandle>>,
-    children: Mutex<HashMap<ContextId, HashSet<ContextId>>>,
+    by_context: Arc<Mutex<SessionTable>>,
+    children: Arc<Mutex<HashMap<ContextId, HashSet<ContextId>>>>,
     idle_ttl: Duration,
     warn_fraction: Option<f64>,
     compact_summarize_timeout: Duration,
     clock: Arc<dyn Clock>,
     seq: std::sync::atomic::AtomicU64,
     turn_op_seq: std::sync::atomic::AtomicU64,
+    cleanup_claim_seq: std::sync::atomic::AtomicU64,
     /// Test-only deterministic-interleaving hook (whole-branch review regression test): when armed via
     /// `block_next_lock2`, `checkout_turn_inner` parks here between the off-lock resolve/fingerprint and
     /// lock #2. Compiled out entirely in non-test builds; a no-op in test builds unless armed.
@@ -195,14 +516,15 @@ impl SessionManager {
         Self {
             registry,
             perm_registry: None,
-            by_context: Mutex::new(HashMap::new()),
-            children: Mutex::new(HashMap::new()),
+            by_context: Arc::new(Mutex::new(SessionTable::default())),
+            children: Arc::new(Mutex::new(HashMap::new())),
             idle_ttl,
             warn_fraction: None,
             compact_summarize_timeout: Duration::from_secs(120),
             clock,
             seq: std::sync::atomic::AtomicU64::new(0),
             turn_op_seq: std::sync::atomic::AtomicU64::new(1),
+            cleanup_claim_seq: std::sync::atomic::AtomicU64::new(1),
             #[cfg(test)]
             lock2_pause_gate: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -335,6 +657,7 @@ impl SessionManager {
         h: &mut WarmHandle,
         usage_warning: Option<UsageWarning>,
         op: OperationId,
+        expiry_intent: WarmExpiryIntent,
         abort: CancellationToken,
     ) -> WarmTurn {
         WarmTurn {
@@ -343,6 +666,7 @@ impl SessionManager {
             usage_warning,
             generation: h.generation,
             op,
+            expiry_intent,
             abort,
             seed: h.pending_seed.take(),
             injects: std::mem::take(&mut h.pending_injects),
@@ -386,6 +710,62 @@ impl SessionManager {
             .turn_op_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         OperationId::parse(format!("turn-{n}")).expect("minted turn op is non-empty")
+    }
+
+    fn take_expiry_claim_locked(
+        &self,
+        tab: &mut SessionTable,
+        ctx: &ContextId,
+        generation: SessionGeneration,
+        op: OperationId,
+    ) -> ExpiryClaim {
+        let mut handle = tab.remove(ctx).expect("matching warm handle exists");
+        fire_lingering_turn_abort(&mut handle);
+        let cleanup_claim_id = self
+            .cleanup_claim_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tab.tombstones.insert(
+            ctx.clone(),
+            ExpiringTombstone {
+                generation,
+                op: op.clone(),
+                cleanup_claim_id,
+                state: ExpiringTombstoneState::Expiring,
+            },
+        );
+        ExpiryClaim {
+            by_context: self.by_context.clone(),
+            children: self.children.clone(),
+            ctx: ctx.clone(),
+            generation,
+            op,
+            cleanup_claim_id,
+            prune_children: true,
+            handle: Some(handle),
+            retry: None,
+        }
+    }
+
+    fn claim_armed_idle_locked(
+        &self,
+        tab: &mut SessionTable,
+        ctx: &ContextId,
+    ) -> Option<ExpiryClaim> {
+        let handle = tab.get(ctx)?;
+        let generation = handle.generation;
+        let op = first_armed_idle_expiry(handle)?;
+        Some(self.take_expiry_claim_locked(tab, ctx, generation, op))
+    }
+
+    fn claim_or_reserve_idle_successor_locked(
+        &self,
+        tab: &mut SessionTable,
+        ctx: &ContextId,
+    ) -> Option<ExpiryClaim> {
+        let handle = tab.get(ctx)?;
+        let generation = handle.generation;
+        let op = reserve_idle_successor_or_armed(handle)?;
+        Some(self.take_expiry_claim_locked(tab, ctx, generation, op))
     }
 
     async fn prune_child_registration(&self, ctx: &ContextId) {
@@ -454,7 +834,10 @@ impl SessionManager {
     /// minting a fresh session. A retired lease → `SessionExpired`; a busy handle → `HandleBusy`.
     pub async fn checkout_existing_turn(&self, ctx: &ContextId) -> Result<WarmTurn, BridgeError> {
         let mut tab = self.by_context.lock().await;
-        let Some(h) = tab.get_mut(ctx) else {
+        if tab.tombstone(ctx).is_some() {
+            return Err(BridgeError::SessionExpired);
+        }
+        let Some(h) = tab.get(ctx) else {
             return Err(BridgeError::SessionNotFound);
         };
         if h.lease.is_retired() {
@@ -463,19 +846,32 @@ impl SessionManager {
         if h.state != SessionState::Idle {
             return Err(BridgeError::HandleBusy);
         }
+        if let Some(claim) = self.claim_or_reserve_idle_successor_locked(&mut tab, ctx) {
+            drop(tab);
+            let _ = claim.into_flight();
+            return Err(BridgeError::SessionExpired);
+        }
+        let h = tab
+            .get_mut(ctx)
+            .expect("idle successor reservation remains live");
         let usage_warning = self.eval_warn(&h.usage);
         let op = self.mint_turn_op();
         let abort = CancellationToken::new();
+        let expiry_intent = WarmExpiryIntent::new();
         h.state = SessionState::Running;
         h.op = Some(op.clone());
-        h.turn_abort = Some(abort.clone());
+        h.turn_aborts.push(TurnAbort {
+            op: op.clone(),
+            token: abort.clone(),
+            expiry_intent: expiry_intent.clone(),
+        });
         h.last_used = self.clock.now_instant();
         let seed = h.pending_seed.take();
         let injects = std::mem::take(&mut h.pending_injects);
         Ok(WarmTurn {
             seed,
             injects,
-            ..Self::warm_turn_from_handle(h, usage_warning, op, abort)
+            ..Self::warm_turn_from_handle(h, usage_warning, op, expiry_intent, abort)
         })
     }
 
@@ -502,7 +898,10 @@ impl SessionManager {
         // must NOT fresh-mint; see the check at lock #2).
         let mut saw_handle = false;
         {
-            let tab = self.by_context.lock().await;
+            let mut tab = self.by_context.lock().await;
+            if tab.tombstone(ctx).is_some() {
+                return (Err(BridgeError::SessionExpired), Vec::new());
+            }
             if let Some(h) = tab.get(ctx) {
                 saw_handle = true;
                 if h.lease.is_retired() {
@@ -513,6 +912,11 @@ impl SessionManager {
                     // Configuring all mean the handle is busy.
                     return (Err(BridgeError::HandleBusy), Vec::new());
                 }
+            }
+            if let Some(claim) = self.claim_armed_idle_locked(&mut tab, ctx) {
+                drop(tab);
+                let _ = claim.into_flight();
+                return (Err(BridgeError::SessionExpired), Vec::new());
             }
         }
 
@@ -538,6 +942,9 @@ impl SessionManager {
         // state while we were off-lock. Same guards as lock #1, now correct against fresh state (may
         // now return HandleBusy/SessionExpired where lock #1 saw Idle-or-absent).
         let mut tab = self.by_context.lock().await;
+        if tab.tombstone(ctx).is_some() {
+            return (Err(BridgeError::SessionExpired), Vec::new());
+        }
         if let Some(h) = tab.get_mut(ctx) {
             if h.lease.is_retired() {
                 return (Err(BridgeError::SessionExpired), Vec::new());
@@ -549,12 +956,24 @@ impl SessionManager {
             // from before the W1-B restructuring except that `resolved`/`eff`/`fp` are precomputed. ----
             let d = h.fingerprint.diff(&fp);
             if d.is_empty() {
+                if let Some(expiry_op) = reserve_idle_successor_or_armed(h) {
+                    let generation = h.generation;
+                    let claim = self.take_expiry_claim_locked(&mut tab, ctx, generation, expiry_op);
+                    drop(tab);
+                    let _ = claim.into_flight();
+                    return (Err(BridgeError::SessionExpired), Vec::new());
+                }
                 let usage_warning = self.eval_warn(&h.usage);
                 let op = self.mint_turn_op();
                 let abort = CancellationToken::new();
+                let expiry_intent = WarmExpiryIntent::new();
                 h.state = SessionState::Running;
                 h.op = Some(op.clone());
-                h.turn_abort = Some(abort.clone());
+                h.turn_aborts.push(TurnAbort {
+                    op: op.clone(),
+                    token: abort.clone(),
+                    expiry_intent: expiry_intent.clone(),
+                });
                 h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
                 let injects = std::mem::take(&mut h.pending_injects);
@@ -562,7 +981,7 @@ impl SessionManager {
                     Ok(WarmTurn {
                         seed,
                         injects,
-                        ..Self::warm_turn_from_handle(h, usage_warning, op, abort)
+                        ..Self::warm_turn_from_handle(h, usage_warning, op, expiry_intent, abort)
                     }),
                     Vec::new(),
                 );
@@ -602,6 +1021,13 @@ impl SessionManager {
             } else {
                 "effort"
             };
+            if let Some(expiry_op) = reserve_idle_successor_or_armed(h) {
+                let generation = h.generation;
+                let claim = self.take_expiry_claim_locked(&mut tab, ctx, generation, expiry_op);
+                drop(tab);
+                let _ = claim.into_flight();
+                return (Err(BridgeError::SessionExpired), Vec::new());
+            }
             let claimed_id = h.id.clone();
             let backend = h.backend.clone();
             let backend_session = h.backend_session.clone();
@@ -642,10 +1068,15 @@ impl SessionManager {
                 let usage_warning = self.eval_warn(&h.usage);
                 let op = self.mint_turn_op();
                 let abort = CancellationToken::new();
+                let expiry_intent = WarmExpiryIntent::new();
                 h.fingerprint = fp;
                 h.state = SessionState::Running;
                 h.op = Some(op.clone());
-                h.turn_abort = Some(abort.clone());
+                h.turn_aborts.push(TurnAbort {
+                    op: op.clone(),
+                    token: abort.clone(),
+                    expiry_intent: expiry_intent.clone(),
+                });
                 h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
                 let injects = std::mem::take(&mut h.pending_injects);
@@ -653,7 +1084,7 @@ impl SessionManager {
                     Ok(WarmTurn {
                         seed,
                         injects,
-                        ..Self::warm_turn_from_handle(h, usage_warning, op, abort)
+                        ..Self::warm_turn_from_handle(h, usage_warning, op, expiry_intent, abort)
                     }),
                     Vec::new(),
                 );
@@ -706,7 +1137,7 @@ impl SessionManager {
         // as `Configuring` with a minted claim id stashed in `op` (a claim, NOT a turn op — the real turn
         // op mints at settle below).
         // `capabilities()` is sync so it is set now; NO `turn_abort` is installed (no real turn exists
-        // yet — installing one here would widen the documented single-slot `turn_abort` hazard). Drop
+        // yet). Drop
         // the lock, THEN run the (possibly slow) `configure_session` off-lock. ----
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let backend_session = match SessionId::parse(format!("ctx-{}-g0", ctx.as_str())) {
@@ -737,7 +1168,7 @@ impl SessionManager {
                 usage: UsageSnapshot::default(),
                 expire_after_reconcile: false,
                 op: Some(claim.clone()),
-                turn_abort: None,
+                turn_aborts: Vec::new(),
                 pending_seed: None,
                 pending_injects: Vec::new(),
                 last_used: self.clock.now_instant(),
@@ -813,9 +1244,14 @@ impl SessionManager {
                 let h = tab.get_mut(ctx).expect("still_ours");
                 let op = self.mint_turn_op();
                 let abort = CancellationToken::new();
+                let expiry_intent = WarmExpiryIntent::new();
                 h.state = SessionState::Running;
                 h.op = Some(op.clone());
-                h.turn_abort = Some(abort.clone());
+                h.turn_aborts.push(TurnAbort {
+                    op: op.clone(),
+                    token: abort.clone(),
+                    expiry_intent: expiry_intent.clone(),
+                });
                 h.last_used = self.clock.now_instant();
                 let seed = h.pending_seed.take();
                 let injects = std::mem::take(&mut h.pending_injects);
@@ -823,7 +1259,7 @@ impl SessionManager {
                     Ok(WarmTurn {
                         seed,
                         injects,
-                        ..Self::warm_turn_from_handle(h, None, op, abort)
+                        ..Self::warm_turn_from_handle(h, None, op, expiry_intent, abort)
                     }),
                     Vec::new(),
                 )
@@ -886,16 +1322,66 @@ impl SessionManager {
         self.release(ctx).await;
     }
 
+    /// Atomically replace the exact running generation/operation with a
+    /// resource-free expiring tombstone and return ownership of all resources.
+    /// A stale guard is a no-op.
+    pub(crate) async fn begin_expire_current(
+        self: &Arc<Self>,
+        ctx: &ContextId,
+        generation: SessionGeneration,
+        op: &OperationId,
+    ) -> Option<ExpiryClaim> {
+        let mut tab = self.by_context.lock().await;
+        if tab.tombstone(ctx).is_some() {
+            return None;
+        }
+        let matches_current = match tab.get_mut(ctx) {
+            Some(handle) if handle.generation == generation => {
+                if handle.op.as_ref() == Some(op) && handle.state == SessionState::Cancelling {
+                    // The cancel flight owns the handle. Make the exact
+                    // structured-failure expiry sticky and let that owner
+                    // publish the tombstone after backend.cancel settles.
+                    handle.expire_after_reconcile = true;
+                    return None;
+                }
+                (handle.op.as_ref() == Some(op) && handle.state == SessionState::Running)
+                    || (handle.op.is_none()
+                        && handle.state == SessionState::Idle
+                        && has_armed_expiry_intent(handle, op))
+            }
+            _ => false,
+        };
+        if !matches_current {
+            return None;
+        }
+        Some(self.take_expiry_claim_locked(&mut tab, ctx, generation, op.clone()))
+    }
+
+    pub(crate) fn expire_current_unobserved(
+        self: Arc<Self>,
+        ctx: ContextId,
+        generation: SessionGeneration,
+        op: OperationId,
+    ) {
+        tokio::spawn(async move {
+            if let Some(claim) = self.begin_expire_current(&ctx, generation, &op).await {
+                let _ = claim.cleanup().await;
+            }
+        });
+    }
+
     /// Mark the current turn finished -> Idle (keep warm). FIX-3: no-op unless this is the SAME generation
     /// and operation AND the handle is Running (a turn only legitimately idles a Running handle); a stale
     /// (reset-away, cancelled, or claim-state) completion touches NOTHING.
     pub async fn finish_turn(&self, ctx: &ContextId, gen: SessionGeneration, op: &OperationId) {
         if let Some(h) = self.by_context.lock().await.get_mut(ctx) {
+            if h.generation == gen {
+                h.turn_aborts.retain(|abort| abort.op != *op);
+            }
             if h.generation == gen && h.op.as_ref() == Some(op) && h.state == SessionState::Running
             {
                 h.state = SessionState::Idle;
                 h.op = None;
-                h.turn_abort = None;
                 h.last_used = self.clock.now_instant();
             }
         }
@@ -903,6 +1389,20 @@ impl SessionManager {
 
     pub async fn status(&self, ctx: &ContextId) -> Option<SessionStatusInfo> {
         let tab = self.by_context.lock().await;
+        if let Some(tombstone) = tab.tombstone(ctx) {
+            return Some(SessionStatusInfo {
+                state: match tombstone.state {
+                    ExpiringTombstoneState::Expiring => "expiring",
+                    ExpiringTombstoneState::CleanupFailed { .. } => "cleanup_failed",
+                },
+                agent: String::new(),
+                generation: tombstone.generation.get(),
+                idle_age_ms: 0,
+                capabilities: AgentSessionCaps::default(),
+                usage: UsageSnapshot::default(),
+                over_threshold: None,
+            });
+        }
         tab.get(ctx).map(|h| SessionStatusInfo {
             state: match h.state {
                 SessionState::Idle => "idle",
@@ -950,44 +1450,120 @@ impl SessionManager {
     }
 
     pub async fn release(&self, ctx: &ContextId) {
-        self.release_inner(ctx).await;
+        self.release_inner(ctx, true).await;
         self.prune_child_registration(ctx).await;
     }
 
-    async fn release_inner(&self, ctx: &ContextId) {
-        let h = {
-            let mut tab = self.by_context.lock().await;
-            if let Some(h) = tab.get_mut(ctx) {
-                // A reconcile owns the handle: defer teardown to its resolve (don't remove it out from
-                // under the in-flight release / let the backend_session id be reused mid-release).
-                if is_claimed(h.state) {
-                    h.expire_after_reconcile = true;
-                    return;
-                }
-                if let Some(reg) = &self.perm_registry {
-                    reg.resolve_context_cancelled(ctx);
-                }
-                // cancel-tokens F2: SessionRelease releases the session out from under any in-flight turn —
-                // fire the lingering token under the lock before release_session below.
-                fire_lingering_turn_abort(h);
+    fn claim_release_locked(
+        &self,
+        tab: &mut SessionTable,
+        ctx: &ContextId,
+        prune_children: bool,
+    ) -> Option<ExpiryClaim> {
+        if let Some(tombstone) = tab.tombstone(ctx).cloned() {
+            if !matches!(
+                tombstone.state,
+                ExpiringTombstoneState::CleanupFailed { .. }
+            ) {
+                return None;
             }
-            tab.remove(ctx)
+            let retry = tab.cleanup_retries.remove(ctx)?;
+            let cleanup_claim_id = self
+                .cleanup_claim_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let current = tab
+                .tombstones
+                .get_mut(ctx)
+                .expect("matching cleanup-failed tombstone exists");
+            current.cleanup_claim_id = cleanup_claim_id;
+            current.state = ExpiringTombstoneState::Expiring;
+            return Some(ExpiryClaim {
+                by_context: self.by_context.clone(),
+                children: self.children.clone(),
+                ctx: ctx.clone(),
+                generation: tombstone.generation,
+                op: tombstone.op,
+                cleanup_claim_id,
+                prune_children,
+                handle: None,
+                retry: Some(retry),
+            });
+        }
+        if let Some(handle) = tab.get_mut(ctx) {
+            // A reconcile owns the handle: defer teardown to its resolve (don't remove it out from
+            // under the in-flight release / let the backend_session id be reused mid-release).
+            if is_claimed(handle.state) {
+                handle.expire_after_reconcile = true;
+                return None;
+            }
+            if let Some(registry) = &self.perm_registry {
+                registry.resolve_context_cancelled(ctx);
+            }
+            // SessionRelease owns every outstanding operation token before the live handle leaves the
+            // table. The cleanup claim then owns the backend session and lease without another await.
+            fire_lingering_turn_abort(handle);
+        }
+        let handle = tab.remove(ctx)?;
+        let generation = handle.generation;
+        let op = handle.op.clone().unwrap_or_else(|| self.mint_turn_op());
+        let cleanup_claim_id = self
+            .cleanup_claim_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tab.tombstones.insert(
+            ctx.clone(),
+            ExpiringTombstone {
+                generation,
+                op: op.clone(),
+                cleanup_claim_id,
+                state: ExpiringTombstoneState::Expiring,
+            },
+        );
+        Some(ExpiryClaim {
+            by_context: self.by_context.clone(),
+            children: self.children.clone(),
+            ctx: ctx.clone(),
+            generation,
+            op,
+            cleanup_claim_id,
+            prune_children,
+            handle: Some(handle),
+            retry: None,
+        })
+    }
+
+    async fn release_inner(&self, ctx: &ContextId, prune_children: bool) {
+        let claim = {
+            let mut tab = self.by_context.lock().await;
+            self.claim_release_locked(&mut tab, ctx, prune_children)
         };
-        if let Some(h) = h {
-            h.backend.release_session(&h.backend_session).await;
-            drop(h.lease);
+        if let Some(claim) = claim {
+            let _ = claim.cleanup().await;
         }
     }
 
     pub async fn release_with_children(&self, ctx: &ContextId) {
-        let mut children = self.children.lock().await;
-        let snapshot = children.get(ctx).cloned().unwrap_or_default();
-
-        self.release_inner(ctx).await;
-        for child in &snapshot {
-            self.release_inner(child).await;
+        let claims = {
+            // The established child-checkout order is children -> by_context. Claim the parent and every
+            // registered child in that same order before cleanup's first await. Cancellation after this
+            // block drops any unjoined claims into their detached flights instead of leaving live children.
+            let mut children = self.children.lock().await;
+            let snapshot = children.get(ctx).cloned().unwrap_or_default();
+            let mut table = self.by_context.lock().await;
+            let mut claims = Vec::with_capacity(snapshot.len() + 1);
+            if let Some(claim) = self.claim_release_locked(&mut table, ctx, false) {
+                claims.push(claim);
+            }
+            for child in &snapshot {
+                if let Some(claim) = self.claim_release_locked(&mut table, child, false) {
+                    claims.push(claim);
+                }
+            }
+            children.remove(ctx);
+            claims
+        };
+        for claim in claims {
+            let _ = claim.cleanup().await;
         }
-        children.remove(ctx);
     }
 
     /// Release EVERY warm context (with children). Called on mcp stdin-EOF (FIX-5).
@@ -1000,19 +1576,57 @@ impl SessionManager {
 
     /// Cancel an in-flight turn but keep the session warm (-> Idle).
     pub async fn cancel(&self, ctx: &ContextId) -> Result<(), BridgeError> {
-        let (res, expired) = self.cancel_inner(ctx).await;
+        let (res, expired) = self.cancel_inner(ctx, true).await;
         if expired {
             self.prune_child_registration(ctx).await;
         }
         res
     }
 
-    async fn cancel_inner(&self, ctx: &ContextId) -> (Result<(), BridgeError>, bool) {
+    pub(crate) async fn cancel_turn_current(
+        &self,
+        ctx: &ContextId,
+        generation: SessionGeneration,
+        op: &OperationId,
+    ) -> Result<(), BridgeError> {
+        let (res, expired) = self
+            .cancel_inner_expected(ctx, Some((generation, op)), true)
+            .await;
+        if expired {
+            self.prune_child_registration(ctx).await;
+        }
+        res
+    }
+
+    async fn cancel_inner(
+        &self,
+        ctx: &ContextId,
+        prune_children: bool,
+    ) -> (Result<(), BridgeError>, bool) {
+        self.cancel_inner_expected(ctx, None, prune_children).await
+    }
+
+    async fn cancel_inner_expected(
+        &self,
+        ctx: &ContextId,
+        expected: Option<(SessionGeneration, &OperationId)>,
+        prune_children: bool,
+    ) -> (Result<(), BridgeError>, bool) {
         let (backend, session, claimed_id) = {
             let mut tab = self.by_context.lock().await;
+            if tab.tombstone(ctx).is_some() {
+                return (Err(BridgeError::SessionExpired), false);
+            }
             let Some(h) = tab.get_mut(ctx) else {
                 return (Err(BridgeError::SessionNotFound), false);
             };
+            if expected.is_some_and(|(generation, op)| {
+                h.generation != generation
+                    || h.op.as_ref() != Some(op)
+                    || h.state != SessionState::Running
+            }) {
+                return (Ok(()), false);
+            }
             // A reconcile owns the handle: flag it to expire on resolve rather than resetting to Idle
             // (which would let a third checkout re-claim it under the in-flight reconcile — the ABA bug).
             if h.state == SessionState::Cancelling {
@@ -1026,7 +1640,6 @@ impl SessionManager {
                 reg.resolve_context_cancelled(ctx);
             }
             let was_running = h.state == SessionState::Running;
-            h.op = None;
             // cancel-tokens (whole-branch review): a keep-warm SessionCancel must NEITHER fire NOR clear
             // the in-flight turn's abort token here.
             //   - Don't FIRE it: the session stays warm, so the producer must reach its prompt to drain the
@@ -1035,11 +1648,12 @@ impl SessionManager {
             //   - Don't CLEAR (orphan) it: a still-pre-first-poll producer holds a live token, so the token
             //     must stay reachable on the handle — else a later reset/release sees None, releases the
             //     session, and the orphaned producer re-mints the cleared context (round-3 BLOCKER).
-            // So leave it on the handle: the keep-warm success path below leaves Some(token) on the Idle
-            // handle (a later reset/release can fire it; the next checkout overwrites it), and the EXPIRE
+            // So leave it on the handle: the keep-warm success path below retains that operation's token on
+            // the Idle handle (a later reset/release can fire it; the next checkout appends its own), and the EXPIRE
             // branch below — which DOES release the session — fires it first.
             if !was_running {
                 h.state = SessionState::Idle;
+                h.op = None;
                 return (Ok(()), false);
             }
             // was_running is necessarily true here (the !was_running case returned above). Claim the
@@ -1048,48 +1662,110 @@ impl SessionManager {
             h.last_used = self.clock.now_instant();
             (h.backend.clone(), h.backend_session.clone(), h.id.clone())
         };
-        let res = backend.cancel(&session).await;
+        let by_context = self.by_context.clone();
+        let children = self.children.clone();
+        let flight_ctx = ctx.clone();
+        let cleanup_claim_id = self
+            .cleanup_claim_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fallback_op = self.mint_turn_op();
+        let mut flight = Box::pin(async move {
+            let cancel_result = AssertUnwindSafe(backend.cancel(&session))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(BridgeError::agent_crashed("warm cancel task panicked")));
 
-        let mut expired = None;
-        let mut gone = false;
-        {
-            let mut tab = self.by_context.lock().await;
-            let still_ours = matches!(
-                tab.get(ctx),
-                Some(h) if h.id == claimed_id && h.state == SessionState::Cancelling
-            );
-            if still_ours {
-                let deferred = tab
-                    .get(ctx)
-                    .map(|h| h.expire_after_reconcile)
-                    .unwrap_or(true);
-                if res.is_ok() && !deferred {
-                    // Keep-warm: leave the abort token on the Idle handle (reachable for a later
-                    // reset/release; overwritten by the next checkout). The producer drains the ACP latch.
-                    tab.get_mut(ctx).expect("still_ours").state = SessionState::Idle;
-                } else if let Some(mut h) = tab.remove(ctx) {
-                    // EXPIRE: this cancel releases the session (backend.cancel failed, or a deferred release
-                    // landed on us) → fire the lingering token before release_session below.
-                    fire_lingering_turn_abort(&mut h);
-                    expired = Some(h);
+            let mut expired = None;
+            let mut gone = false;
+            {
+                let mut table = by_context.lock().await;
+                let still_ours = matches!(
+                    table.get(&flight_ctx),
+                    Some(handle)
+                        if handle.id == claimed_id && handle.state == SessionState::Cancelling
+                );
+                if still_ours {
+                    let deferred = table
+                        .get(&flight_ctx)
+                        .map(|handle| {
+                            handle.expire_after_reconcile
+                                || handle
+                                    .op
+                                    .as_ref()
+                                    .is_some_and(|op| has_armed_expiry_intent(handle, op))
+                        })
+                        .unwrap_or(true);
+                    if cancel_result.is_ok() && !deferred {
+                        // Keep-warm: leave this operation's abort token on the Idle handle (reachable
+                        // for a later reset/release; a next checkout appends its own). The producer
+                        // drains the ACP latch.
+                        let handle = table.get_mut(&flight_ctx).expect("still_ours");
+                        handle.state = SessionState::Idle;
+                        handle.op = None;
+                    } else if let Some(mut handle) = table.remove(&flight_ctx) {
+                        // EXPIRE: cancel failed/panicked or a deferred release landed on the claim.
+                        fire_lingering_turn_abort(&mut handle);
+                        let generation = handle.generation;
+                        let op = handle.op.clone().unwrap_or(fallback_op);
+                        table.tombstones.insert(
+                            flight_ctx.clone(),
+                            ExpiringTombstone {
+                                generation,
+                                op: op.clone(),
+                                cleanup_claim_id,
+                                state: ExpiringTombstoneState::Expiring,
+                            },
+                        );
+                        expired = Some(ExpiryClaim {
+                            by_context: by_context.clone(),
+                            children: children.clone(),
+                            ctx: flight_ctx.clone(),
+                            generation,
+                            op,
+                            cleanup_claim_id,
+                            prune_children,
+                            handle: Some(handle),
+                            retry: None,
+                        });
+                    }
+                } else {
+                    gone = !table.contains_key(&flight_ctx);
                 }
-            } else {
-                gone = !tab.contains_key(ctx);
             }
-        }
-        let expired_handle = expired.is_some();
-        if let Some(h) = expired {
-            backend.release_session(&session).await;
-            drop(h.lease);
-        }
+            let expired_handle = expired.is_some();
+            let cleanup_result = match expired {
+                Some(claim) => claim.cleanup().await.result,
+                None => Ok(()),
+            };
 
-        let res = match res {
-            Ok(()) => Ok(()),
-            Err(e) if gone => Err(e),
-            Err(e) if expired_handle => Err(e),
-            Err(_) => Ok(()),
+            let result = match (cancel_result, cleanup_result) {
+                (Err(error), _) if gone || expired_handle => Err(error),
+                (Err(_), Ok(())) => Ok(()),
+                (Err(_), Err(cleanup)) => Err(cleanup),
+                (Ok(()), Err(cleanup)) => Err(cleanup),
+                (Ok(()), Ok(())) => Ok(()),
+            };
+            (result, expired_handle)
+        });
+
+        // Preserve the legacy no-yield fast path when cancel + settlement are
+        // immediately ready. If any part becomes pending, move that same
+        // partially-polled future into a task; dropping the report waiter then
+        // detaches rather than cancels it.
+        let initial_poll = {
+            let mut context = Context::from_waker(futures::task::noop_waker_ref());
+            flight.as_mut().poll(&mut context)
         };
-        (res, expired_handle)
+        match initial_poll {
+            Poll::Ready(result) => result,
+            Poll::Pending => match tokio::spawn(flight).await {
+                Ok(result) => result,
+                Err(_) => (
+                    Err(BridgeError::agent_crashed("warm cancel flight failed")),
+                    false,
+                ),
+            },
+        }
     }
 
     pub async fn cancel_with_children(&self, ctx: &ContextId) -> Result<(), BridgeError> {
@@ -1097,7 +1773,7 @@ impl SessionManager {
         let snapshot = children.get(ctx).cloned().unwrap_or_default();
         let mut expired = Vec::new();
 
-        let parent_found = match self.cancel_inner(ctx).await {
+        let parent_found = match self.cancel_inner(ctx, false).await {
             (Ok(()), parent_expired) => {
                 if parent_expired {
                     expired.push(ctx.clone());
@@ -1114,7 +1790,7 @@ impl SessionManager {
             }
         };
         for child in &snapshot {
-            match self.cancel_inner(child).await {
+            match self.cancel_inner(child, false).await {
                 (Ok(()), child_expired) => {
                     if child_expired {
                         expired.push(child.clone());
@@ -1196,6 +1872,37 @@ impl SessionManager {
         ctx: &ContextId,
         opts: ResetOpts,
     ) -> (Result<ResetOutcome, BridgeError>, Vec<ContextId>) {
+        // A prior checked teardown may have dropped the warm handle while
+        // retaining the minimal backend/session retry capability. SessionClear
+        // is an explicit retry surface: atomically replace CleanupFailed with a
+        // fresh exact claim, then run the same cancellation-safe detached
+        // cleanup flight. Do this before the live-handle reset state machine.
+        let failed_cleanup_retry = {
+            let mut tab = self.by_context.lock().await;
+            let generation = tab.tombstone(ctx).and_then(|tombstone| {
+                matches!(
+                    tombstone.state,
+                    ExpiringTombstoneState::CleanupFailed { .. }
+                )
+                .then_some(tombstone.generation)
+            });
+            generation.and_then(|generation| {
+                self.claim_release_locked(&mut tab, ctx, false)
+                    .map(|claim| (claim, generation))
+            })
+        };
+        if let Some((claim, generation)) = failed_cleanup_retry {
+            return match claim.cleanup().await.result {
+                Ok(()) => (
+                    Ok(ResetOutcome::Cleared {
+                        generation: generation.get(),
+                    }),
+                    vec![ctx.clone()],
+                ),
+                Err(error) => (Err(error), Vec::new()),
+            };
+        }
+
         // (1)+(2)+(3) claim under ONE lock hold (FIX-2: never bounce through Idle, never call self.cancel).
         let (backend, old_id, claimed_id, new_gen, new_id, spec) = {
             let mut tab = self.by_context.lock().await;
@@ -1312,7 +2019,7 @@ impl SessionManager {
         h.generation = new_gen;
         h.usage = UsageSnapshot::default();
         h.op = None;
-        h.turn_abort = None;
+        h.turn_aborts.clear();
         h.pending_seed = None;
         h.pending_injects.clear();
         h.state = SessionState::Idle;
@@ -1381,7 +2088,7 @@ impl SessionManager {
             // token (which makes its pre-mint producer abort WITHOUT draining the ACP cancel latch the earlier
             // cancel set) would let compact's own summarize prompt drain that stale latch and return cancelled,
             // failing the compact. A lingering pre-mint producer racing compact is part of the Slice-9 deferral
-            // (see the WarmHandle.turn_abort note); compact summarizes the warm gen-N session as-is.
+            // (see the WarmHandle.turn_aborts note); compact summarizes the warm gen-N session as-is.
             h.state = SessionState::Compacting;
             h.expire_after_reconcile = false;
             (backend, old_id, claimed_id, new_gen, new_id, spec)
@@ -1451,7 +2158,7 @@ impl SessionManager {
         h.generation = new_gen;
         h.usage = UsageSnapshot::default();
         h.op = None;
-        h.turn_abort = None;
+        h.turn_aborts.clear();
         h.pending_seed = Some(summary);
         h.state = SessionState::Idle;
         h.last_used = self.clock.now_instant();
@@ -1503,7 +2210,7 @@ impl SessionManager {
                 .map(|(c, _)| c.clone())
                 .collect()
         };
-        let mut handles = Vec::new();
+        let mut claims = Vec::new();
         {
             let mut children = self.children.lock().await;
             let mut tab = self.by_context.lock().await;
@@ -1525,9 +2232,34 @@ impl SessionManager {
                     if let Some(reg) = &self.perm_registry {
                         reg.resolve_context_cancelled(&c);
                     }
-                    if let Some(h) = tab.remove(&c) {
-                        reaped.insert(c);
-                        handles.push(h);
+                    if let Some(mut handle) = tab.remove(&c) {
+                        fire_lingering_turn_abort(&mut handle);
+                        let generation = handle.generation;
+                        let op = handle.op.clone().unwrap_or_else(|| self.mint_turn_op());
+                        let cleanup_claim_id = self
+                            .cleanup_claim_seq
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tab.tombstones.insert(
+                            c.clone(),
+                            ExpiringTombstone {
+                                generation,
+                                op: op.clone(),
+                                cleanup_claim_id,
+                                state: ExpiringTombstoneState::Expiring,
+                            },
+                        );
+                        reaped.insert(c.clone());
+                        claims.push(ExpiryClaim {
+                            by_context: self.by_context.clone(),
+                            children: self.children.clone(),
+                            ctx: c,
+                            generation,
+                            op,
+                            cleanup_claim_id,
+                            prune_children: true,
+                            handle: Some(handle),
+                            retry: None,
+                        });
                     }
                 }
             }
@@ -1538,12 +2270,8 @@ impl SessionManager {
                 children.retain(|_, set| !set.is_empty());
             }
         }
-        for mut h in handles {
-            // cancel-tokens F2 (whole-branch review round 4): a reaped Idle handle may carry a lingering
-            // keep-warm-cancel token — fire it before releasing so a pre-first-poll producer can't re-mint.
-            fire_lingering_turn_abort(&mut h);
-            h.backend.release_session(&h.backend_session).await;
-            drop(h.lease);
+        for claim in claims {
+            let _ = claim.cleanup().await;
         }
     }
 }
@@ -1552,7 +2280,12 @@ impl SessionManager {
 mod tests {
     use super::*;
     use crate::clock::ManualClock;
+    use crate::dispatch::{WarmCompletionExit, WarmCompletionGuard};
     use async_trait::async_trait;
+    use bridge_core::diagnostics::{
+        DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+        FailureDiagnosticInput, FailureDisposition, NoopDiagnosticObserver,
+    };
     use bridge_core::domain::{AgentEntry, AgentKind, Effort, InjectMode, Part, RegistrySnapshot};
     use bridge_core::permission::{
         PendingPermissionView, PermKey, PermissionOptionView, PermissionRegistry,
@@ -1565,6 +2298,16 @@ mod tests {
 
     struct NoopLease;
     impl Lease for NoopLease {}
+
+    struct PanickingLease;
+
+    impl Lease for PanickingLease {}
+
+    impl Drop for PanickingLease {
+        fn drop(&mut self) {
+            panic!("injected lease drop panic");
+        }
+    }
 
     #[derive(Clone)]
     struct RetiringLease {
@@ -1581,6 +2324,8 @@ mod tests {
     struct FakeBackend {
         reply: String,
         releases: StdMutex<Vec<String>>,
+        release_result: StdMutex<Result<(), BridgeError>>,
+        release_panics: AtomicBool,
         release_gate: StdMutex<Option<oneshot::Receiver<()>>>,
         release_started: Notify,
         release_started_count: AtomicUsize,
@@ -1588,6 +2333,7 @@ mod tests {
         configured: StdMutex<Vec<String>>,
         reconciled: StdMutex<Vec<(String, SessionSpec)>>,
         cancel_result: StdMutex<Result<(), BridgeError>>,
+        cancel_panics: AtomicBool,
         cancel_gate: StdMutex<Option<oneshot::Receiver<()>>>,
         cancel_started: Notify,
         cancel_started_count: AtomicUsize,
@@ -1607,6 +2353,8 @@ mod tests {
             Self {
                 reply: reply.into(),
                 releases: StdMutex::new(Vec::new()),
+                release_result: StdMutex::new(Ok(())),
+                release_panics: AtomicBool::new(false),
                 release_gate: StdMutex::new(None),
                 release_started: Notify::new(),
                 release_started_count: AtomicUsize::new(0),
@@ -1614,6 +2362,7 @@ mod tests {
                 configured: StdMutex::new(Vec::new()),
                 reconciled: StdMutex::new(Vec::new()),
                 cancel_result: StdMutex::new(Ok(())),
+                cancel_panics: AtomicBool::new(false),
                 cancel_gate: StdMutex::new(None),
                 cancel_started: Notify::new(),
                 cancel_started_count: AtomicUsize::new(0),
@@ -1640,6 +2389,14 @@ mod tests {
             self.releases.lock().unwrap().clone()
         }
 
+        fn set_release_result(&self, result: Result<(), BridgeError>) {
+            *self.release_result.lock().unwrap() = result;
+        }
+
+        fn set_release_panics(&self) {
+            self.release_panics.store(true, Ordering::SeqCst);
+        }
+
         fn block_next_release(&self) -> oneshot::Sender<()> {
             let (tx, rx) = oneshot::channel();
             *self.release_gate.lock().unwrap() = Some(rx);
@@ -1649,6 +2406,15 @@ mod tests {
         async fn wait_for_release(&self) {
             while self.release_started_count.load(Ordering::SeqCst) == 0 {
                 self.release_started.notified().await;
+            }
+        }
+
+        async fn wait_for_release_count(&self, expected: usize) {
+            while self.release_started_count.load(Ordering::SeqCst) < expected {
+                let started = self.release_started.notified();
+                if self.release_started_count.load(Ordering::SeqCst) < expected {
+                    started.await;
+                }
             }
         }
 
@@ -1666,6 +2432,10 @@ mod tests {
 
         fn set_cancel_result(&self, result: Result<(), BridgeError>) {
             *self.cancel_result.lock().unwrap() = result;
+        }
+
+        fn set_cancel_panics(&self) {
+            self.cancel_panics.store(true, Ordering::SeqCst);
         }
 
         fn block_next_cancel(&self) -> oneshot::Sender<()> {
@@ -1738,6 +2508,10 @@ mod tests {
             if let Some(gate) = gate {
                 let _ = gate.await;
             }
+            assert!(
+                !self.cancel_panics.load(Ordering::SeqCst),
+                "injected cancel panic"
+            );
             self.cancel_result.lock().unwrap().clone()
         }
 
@@ -1790,6 +2564,15 @@ mod tests {
             }
         }
 
+        async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+            self.release_session(session).await;
+            assert!(
+                !self.release_panics.load(Ordering::SeqCst),
+                "injected cleanup panic"
+            );
+            self.release_result.lock().unwrap().clone()
+        }
+
         fn capabilities(&self) -> AgentSessionCaps {
             self.capabilities.clone()
         }
@@ -1800,6 +2583,7 @@ mod tests {
         entries: Vec<AgentEntry>,
         backend: Arc<FakeBackend>,
         retired: Arc<AtomicBool>,
+        panic_next_lease_drop: AtomicBool,
         observed: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
     }
 
@@ -1809,6 +2593,7 @@ mod tests {
                 entries: vec![entry],
                 backend,
                 retired: Arc::new(AtomicBool::new(false)),
+                panic_next_lease_drop: AtomicBool::new(false),
                 observed: StdMutex::new(Vec::new()),
             }
         }
@@ -1818,12 +2603,17 @@ mod tests {
                 entries,
                 backend,
                 retired: Arc::new(AtomicBool::new(false)),
+                panic_next_lease_drop: AtomicBool::new(false),
                 observed: StdMutex::new(Vec::new()),
             }
         }
 
         fn retire(&self) {
             self.retired.store(true, Ordering::SeqCst);
+        }
+
+        fn panic_next_lease_drop(&self) {
+            self.panic_next_lease_drop.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1835,12 +2625,18 @@ mod tests {
                     id: id.as_str().into(),
                 });
             };
+            let lease: Box<dyn Lease> = if self.panic_next_lease_drop.swap(false, Ordering::SeqCst)
+            {
+                Box::new(PanickingLease)
+            } else {
+                Box::new(RetiringLease {
+                    retired: self.retired.clone(),
+                })
+            };
             Ok(Resolved {
                 entry: Arc::new(entry.clone()),
                 backend: self.backend.clone(),
-                lease: Box::new(RetiringLease {
-                    retired: self.retired.clone(),
-                }),
+                lease,
             })
         }
 
@@ -1927,6 +2723,33 @@ mod tests {
         OperationId::parse(id).unwrap()
     }
 
+    fn structured_failure(class: DiagnosticFailureClass) -> BridgeError {
+        BridgeError::agent_failure(
+            FailureDiagnostic::build_static_code(
+                FailureDiagnosticInput {
+                    failed_phase: DiagnosticPhase::PromptStart,
+                    last_completed_phase: Some(DiagnosticPhase::SessionCreate),
+                    class,
+                    disposition: FailureDisposition::Fatal,
+                    code: "ignored".to_owned(),
+                    summary: "bounded test failure".to_owned(),
+                    causes: Vec::new(),
+                    stderr_observed: false,
+                    stderr_line_count: 0,
+                    stderr_scope: None,
+                    stderr_tail: None,
+                    stderr_redaction: None,
+                    retry_after_ms: None,
+                    reset_at_ms: None,
+                    prompt_may_have_been_accepted: true,
+                },
+                "test.warm.failure",
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+        )
+    }
+
     fn pkey(
         context_id: &ContextId,
         generation: SessionGeneration,
@@ -2008,10 +2831,68 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PendingDiagnostic {
+        entered_count: AtomicUsize,
+        entered: Notify,
+    }
+
+    impl PendingDiagnostic {
+        async fn wait_until_entered(&self) {
+            while self.entered_count.load(Ordering::SeqCst) == 0 {
+                let entered = self.entered.notified();
+                if self.entered_count.load(Ordering::SeqCst) == 0 {
+                    entered.await;
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DiagnosticObserver for PendingDiagnostic {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            self.entered_count.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_waiters();
+            std::future::pending().await
+        }
+    }
+
+    struct RejectingDiagnostic;
+
+    #[async_trait]
+    impl DiagnosticObserver for RejectingDiagnostic {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            Err(BridgeError::StoreFailure)
+        }
+    }
+
     #[test]
     fn is_claimed_includes_compacting() {
         assert!(super::is_claimed(super::SessionState::Compacting));
         assert!(super::is_claimed(super::SessionState::Cancelling));
+    }
+
+    #[test]
+    fn expiry_intent_linearizes_failure_against_successor_reservation() {
+        let failure_first = WarmExpiryIntent::new();
+        failure_first.arm();
+        assert!(!failure_first.reserve_successor());
+        assert!(failure_first.is_armed());
+
+        let successor_first = WarmExpiryIntent::new();
+        assert!(successor_first.reserve_successor());
+        successor_first.arm();
+        assert!(successor_first.reserve_successor());
+        assert!(
+            !successor_first.is_armed(),
+            "a stale completion cannot arm expiry after successor admission linearizes first"
+        );
     }
 
     #[tokio::test]
@@ -2710,6 +3591,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_a_checkout_b_then_release_fires_both_operation_tokens() {
+        let (manager, _backend, _registry) = manager();
+        let c = ctx("ctx-cancel-a-checkout-b-release");
+        let first = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.cancel(&c).await.unwrap();
+        let second = manager.checkout_existing_turn(&c).await.unwrap();
+
+        assert!(!first.abort.is_cancelled());
+        assert!(!second.abort.is_cancelled());
+        manager.release(&c).await;
+        assert!(
+            first.abort.is_cancelled(),
+            "checkout B must not overwrite the lingering producer-A abort token"
+        );
+        assert!(second.abort.is_cancelled());
+        assert!(manager.status(&c).await.is_none());
+    }
+
+    #[tokio::test]
     async fn cancel_expire_fires_the_turn_abort_token() {
         // cancel-tokens (whole-branch review, round-3): when backend.cancel FAILS, cancel_inner EXPIRES —
         // it releases the session. That release path must fire the in-flight turn's abort token (like a
@@ -2944,6 +3847,800 @@ mod tests {
             .finish_turn(&c, SessionGeneration::new(99), &turn.op)
             .await;
         assert_eq!(manager.status(&c).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn expiry_claim_blocks_checkout_and_cleanup_survives_waiter_cancellation() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-detach");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let allow_release = backend.block_next_release();
+        let claim = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .expect("matching running turn is claimed");
+
+        assert_eq!(manager.status(&c).await.unwrap().state, "expiring");
+        assert_eq!(
+            manager
+                .checkout_turn(&c, agent(), None, None)
+                .await
+                .err()
+                .unwrap(),
+            BridgeError::SessionExpired,
+            "the tombstone must reject deterministic g0 remint"
+        );
+
+        let waiter = tokio::spawn(async move { claim.cleanup().await });
+        backend.wait_for_release().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(manager.status(&c).await.unwrap().state, "expiring");
+
+        allow_release.send(()).unwrap();
+        for _ in 0..100 {
+            if manager.status(&c).await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases(), vec!["ctx-expiry-detach-g0"]);
+
+        let replacement = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(replacement.generation.get(), 0);
+        assert_ne!(replacement.op, turn.op);
+    }
+
+    #[tokio::test]
+    async fn canceling_completion_before_expiry_lock_handoff_still_expires() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-pre-lock-cancel");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let mut guard = WarmCompletionGuard::finish_owner(
+            manager.clone(),
+            c.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            Arc::new(NoopDiagnosticObserver::default()),
+        );
+        let error = structured_failure(DiagnosticFailureClass::Transport);
+        guard.observe_exit(WarmCompletionExit::Error(&error));
+
+        let table_lock = manager.by_context.lock().await;
+        let completion = tokio::spawn(guard.complete());
+        tokio::task::yield_now().await;
+        completion.abort();
+        assert!(completion.await.unwrap_err().is_cancelled());
+        drop(table_lock);
+
+        backend.wait_for_release().await;
+        for _ in 0..100 {
+            if manager.status(&c).await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases(), vec!["ctx-expiry-pre-lock-cancel-g0"]);
+    }
+
+    #[tokio::test]
+    async fn structured_failure_expiry_during_cancel_settlement_stays_sticky() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-during-cancel");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let mut guard = WarmCompletionGuard::finish_owner(
+            manager.clone(),
+            c.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            Arc::new(NoopDiagnosticObserver::default()),
+        );
+        let error = structured_failure(DiagnosticFailureClass::Transport);
+        guard.observe_exit(WarmCompletionExit::Error(&error));
+        let allow_cancel = backend.block_next_cancel();
+
+        let cancel_manager = manager.clone();
+        let cancel_ctx = c.clone();
+        let cancel =
+            tokio::spawn(async move { cancel_manager.cancel_with_children(&cancel_ctx).await });
+        backend.wait_for_cancel().await;
+        assert_eq!(manager.status(&c).await.unwrap().state, "cancelling");
+
+        guard.complete().await.unwrap();
+        allow_cancel.send(()).unwrap();
+        cancel.await.unwrap().unwrap();
+
+        assert!(
+            manager.status(&c).await.is_none(),
+            "the exact structured-failure operation must expire after cancel settles"
+        );
+        assert_eq!(backend.releases(), vec!["ctx-expiry-during-cancel-g0"]);
+    }
+
+    #[tokio::test]
+    async fn armed_structured_failure_survives_completed_cancel_settlement() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-after-cancel");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let mut guard = WarmCompletionGuard::finish_owner(
+            manager.clone(),
+            c.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            Arc::new(NoopDiagnosticObserver::default()),
+        );
+        let error = structured_failure(DiagnosticFailureClass::AgentProcess);
+        guard.observe_exit(WarmCompletionExit::Error(&error));
+
+        manager.cancel_with_children(&c).await.unwrap();
+        guard.complete().await.unwrap();
+
+        assert!(
+            manager.status(&c).await.is_none(),
+            "cancel success must not reopen a turn already armed for expiry"
+        );
+        assert_eq!(backend.releases(), vec!["ctx-expiry-after-cancel-g0"]);
+    }
+
+    #[tokio::test]
+    async fn armed_idle_failure_blocks_successor_existing_checkout() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-before-existing-successor");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let mut guard = WarmCompletionGuard::finish_owner(
+            manager.clone(),
+            c.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            Arc::new(NoopDiagnosticObserver::default()),
+        );
+
+        manager.cancel_with_children(&c).await.unwrap();
+        let error = structured_failure(DiagnosticFailureClass::Transport);
+        guard.observe_exit(WarmCompletionExit::Error(&error));
+
+        assert_eq!(
+            manager.checkout_existing_turn(&c).await.err(),
+            Some(BridgeError::SessionExpired),
+            "an armed retained operation must expire before continue can mint a successor"
+        );
+        guard.complete().await.unwrap();
+        backend.wait_for_release().await;
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(
+            backend.releases(),
+            vec!["ctx-expiry-before-existing-successor-g0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn armed_idle_failure_blocks_successor_regular_checkout() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-before-regular-successor");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let mut guard = WarmCompletionGuard::finish_owner(
+            manager.clone(),
+            c.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            Arc::new(NoopDiagnosticObserver::default()),
+        );
+
+        manager.cancel_with_children(&c).await.unwrap();
+        let error = structured_failure(DiagnosticFailureClass::AgentProcess);
+        guard.observe_exit(WarmCompletionExit::Error(&error));
+
+        assert_eq!(
+            manager.checkout_turn(&c, agent(), None, None).await.err(),
+            Some(BridgeError::SessionExpired),
+            "an armed retained operation must expire before ordinary checkout can mint a successor"
+        );
+        guard.complete().await.unwrap();
+        backend.wait_for_release().await;
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(
+            backend.releases(),
+            vec!["ctx-expiry-before-regular-successor-g0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_completion_starts_cleanup_before_pending_teardown_observation() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-pending-start-observation");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let observer = Arc::new(PendingDiagnostic::default());
+        let weak_observer = Arc::downgrade(&observer);
+        let mut guard = WarmCompletionGuard::finish_owner(
+            manager.clone(),
+            c.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            observer.clone(),
+        );
+        let error = structured_failure(DiagnosticFailureClass::Transport);
+        guard.observe_exit(WarmCompletionExit::Error(&error));
+        let allow_release = backend.block_next_release();
+
+        let completion = tokio::spawn(guard.complete());
+        observer.wait_until_entered().await;
+        tokio::time::timeout(Duration::from_secs(2), backend.wait_for_release())
+            .await
+            .expect("warm cleanup must start before teardown observation settles");
+        assert_eq!(manager.status(&c).await.unwrap().state, "expiring");
+
+        completion.abort();
+        assert!(completion.await.unwrap_err().is_cancelled());
+        drop(observer);
+        assert!(
+            weak_observer.upgrade().is_none(),
+            "observer-free cleanup must not retain the pending operation observer"
+        );
+        allow_release.send(()).unwrap();
+        for _ in 0..100 {
+            if manager.status(&c).await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn teardown_start_observation_failure_still_joins_cleanup_before_returning() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-rejected-start-observation");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let mut guard = WarmCompletionGuard::finish_owner(
+            manager.clone(),
+            c.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            Arc::new(RejectingDiagnostic),
+        );
+        let error = structured_failure(DiagnosticFailureClass::AgentProcess);
+        guard.observe_exit(WarmCompletionExit::Error(&error));
+        let allow_release = backend.block_next_release();
+
+        let completion = tokio::spawn(guard.complete());
+        backend.wait_for_release().await;
+        assert!(
+            !completion.is_finished(),
+            "observation failure must not return before the owned cleanup report settles"
+        );
+        allow_release.send(()).unwrap();
+        assert_eq!(completion.await.unwrap(), Err(BridgeError::StoreFailure));
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_cancel_settlement_survives_completion_waiter_cancellation() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("cancel-settlement-detach");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let mut guard = WarmCompletionGuard::workflow_owner(
+            manager.clone(),
+            c.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            Arc::new(NoopDiagnosticObserver::default()),
+        );
+        guard.observe_exit(WarmCompletionExit::Canceled);
+        let allow_cancel = backend.block_next_cancel();
+
+        let completion = tokio::spawn(guard.complete());
+        backend.wait_for_cancel().await;
+        completion.abort();
+        assert!(completion.await.unwrap_err().is_cancelled());
+        assert!(
+            allow_cancel.send(()).is_ok(),
+            "cancel settlement must be owned by a detached flight, not the report waiter"
+        );
+
+        for _ in 0..100 {
+            if manager.status(&c).await.map(|status| status.state) == Some("idle") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-settlement-detach-g0"]);
+    }
+
+    #[tokio::test]
+    async fn detached_cleanup_flight_does_not_retain_operation_observer() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-observer-detach");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let observer = Arc::new(NoopDiagnosticObserver::default());
+        let weak_observer = Arc::downgrade(&observer);
+        let mut guard = WarmCompletionGuard::finish_owner(
+            manager.clone(),
+            c.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            observer.clone(),
+        );
+        drop(observer);
+        let error = structured_failure(DiagnosticFailureClass::AgentProcess);
+        guard.observe_exit(WarmCompletionExit::Error(&error));
+        let allow_release = backend.block_next_release();
+        let waiter = tokio::spawn(guard.complete());
+        backend.wait_for_release().await;
+
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(
+            weak_observer.upgrade().is_none(),
+            "the detached cleanup task must not capture the operation observer"
+        );
+        allow_release.send(()).unwrap();
+        for _ in 0..100 {
+            if manager.status(&c).await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(manager.status(&c).await.is_none());
+        assert!(weak_observer.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_unstarted_expiry_claim_starts_exactly_one_cleanup_flight() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-claim-drop");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let allow_release = backend.block_next_release();
+        let claim = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .unwrap();
+
+        drop(claim);
+        backend.wait_for_release().await;
+        assert_eq!(backend.releases(), vec!["ctx-expiry-claim-drop-g0"]);
+        assert_eq!(manager.status(&c).await.unwrap().state, "expiring");
+        allow_release.send(()).unwrap();
+        for _ in 0..100 {
+            if manager.status(&c).await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_leaves_non_reusable_retryable_tombstone() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-failed");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_release_result(Err(BridgeError::StoreFailure));
+        let report = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .unwrap()
+            .cleanup()
+            .await;
+
+        assert_eq!(report.result, Err(BridgeError::StoreFailure));
+        assert_eq!(manager.status(&c).await.unwrap().state, "cleanup_failed");
+        assert_eq!(
+            manager
+                .checkout_turn(&c, agent(), None, None)
+                .await
+                .err()
+                .unwrap(),
+            BridgeError::SessionExpired
+        );
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+        assert_eq!(manager.status(&c).await.unwrap().state, "cleanup_failed");
+        assert!(manager
+            .by_context
+            .lock()
+            .await
+            .cleanup_retries
+            .contains_key(&c));
+        assert_eq!(backend.releases(), vec!["ctx-expiry-failed-g0"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_release_retries_cleanup_failed_tombstone_after_backend_recovers() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-failed-release-retry");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_release_result(Err(BridgeError::StoreFailure));
+        let report = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .unwrap()
+            .cleanup()
+            .await;
+        assert_eq!(report.result, Err(BridgeError::StoreFailure));
+        assert_eq!(manager.status(&c).await.unwrap().state, "cleanup_failed");
+
+        backend.set_release_result(Ok(()));
+        manager.release(&c).await;
+
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(
+            backend.releases(),
+            vec![
+                "ctx-expiry-failed-release-retry-g0",
+                "ctx-expiry-failed-release-retry-g0"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_retry_restores_owner_for_a_later_release() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-failed-release-twice");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_release_result(Err(BridgeError::StoreFailure));
+        assert_eq!(
+            manager
+                .begin_expire_current(&c, turn.generation, &turn.op)
+                .await
+                .unwrap()
+                .cleanup()
+                .await
+                .result,
+            Err(BridgeError::StoreFailure)
+        );
+
+        manager.release(&c).await;
+        assert_eq!(manager.status(&c).await.unwrap().state, "cleanup_failed");
+        assert_eq!(backend.releases().len(), 2);
+
+        backend.set_release_result(Ok(()));
+        manager.release(&c).await;
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn canceled_cleanup_retry_waiter_does_not_cancel_the_owned_flight() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-failed-release-detached");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_release_result(Err(BridgeError::StoreFailure));
+        assert_eq!(
+            manager
+                .begin_expire_current(&c, turn.generation, &turn.op)
+                .await
+                .unwrap()
+                .cleanup()
+                .await
+                .result,
+            Err(BridgeError::StoreFailure)
+        );
+
+        backend.set_release_result(Ok(()));
+        let allow_release = backend.block_next_release();
+        let release_manager = manager.clone();
+        let release_ctx = c.clone();
+        let release = tokio::spawn(async move { release_manager.release(&release_ctx).await });
+        tokio::time::timeout(Duration::from_secs(2), backend.wait_for_release_count(2))
+            .await
+            .expect("explicit release must start the retained cleanup retry");
+        release.abort();
+        assert!(release.await.unwrap_err().is_cancelled());
+        allow_release.send(()).unwrap();
+
+        for _ in 0..100 {
+            if manager.status(&c).await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn clear_retries_cleanup_failed_tombstone_instead_of_returning_not_found() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-failed-clear-retry");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_release_result(Err(BridgeError::StoreFailure));
+        assert_eq!(
+            manager
+                .begin_expire_current(&c, turn.generation, &turn.op)
+                .await
+                .unwrap()
+                .cleanup()
+                .await
+                .result,
+            Err(BridgeError::StoreFailure)
+        );
+
+        backend.set_release_result(Ok(()));
+        assert_eq!(
+            manager.clear_with_children(&c, true).await.unwrap(),
+            ResetOutcome::Cleared {
+                generation: turn.generation.get()
+            }
+        );
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_panic_is_caught_and_finalizes_non_reusable_failure_state() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-panicked");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_release_panics();
+        let report = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .unwrap()
+            .cleanup()
+            .await;
+
+        assert!(matches!(
+            report.result,
+            Err(BridgeError::AgentCrashed { .. })
+        ));
+        assert_eq!(manager.status(&c).await.unwrap().state, "cleanup_failed");
+        assert_eq!(backend.releases(), vec!["ctx-expiry-panicked-g0"]);
+    }
+
+    #[tokio::test]
+    async fn lease_drop_panic_finalizes_retryable_cleanup_failure() {
+        let (manager, backend, registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-lease-drop-panicked");
+        registry.panic_next_lease_drop();
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+
+        let report = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .unwrap()
+            .cleanup()
+            .await;
+
+        assert!(matches!(
+            report.result,
+            Err(BridgeError::AgentCrashed { .. })
+        ));
+        assert_eq!(manager.status(&c).await.unwrap().state, "cleanup_failed");
+        assert!(manager
+            .by_context
+            .lock()
+            .await
+            .cleanup_retries
+            .contains_key(&c));
+        assert_eq!(
+            backend.releases(),
+            vec!["ctx-expiry-lease-drop-panicked-g0"]
+        );
+
+        manager.release(&c).await;
+
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_panic_recovery_does_not_depend_on_joiner_settlement() {
+        let (manager, backend, registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-worker-only-panic-recovery");
+        registry.panic_next_lease_drop();
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let allow_release = backend.block_next_release();
+        let CleanupFlight { task, settlement } = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .unwrap()
+            .into_flight()
+            .unwrap();
+        backend.wait_for_release().await;
+
+        // Remove the joiner's recovery capability before the lease destructor
+        // panics. Only the settlement owner outside the whole-worker unwind
+        // boundary can make this raw Tokio task return a CleanupReport and
+        // publish retryable state.
+        drop(settlement);
+        allow_release.send(()).unwrap();
+        let report = task
+            .await
+            .expect("the whole cleanup worker catches lease-drop panic");
+
+        assert!(matches!(
+            report.result,
+            Err(BridgeError::AgentCrashed { .. })
+        ));
+        assert_eq!(manager.status(&c).await.unwrap().state, "cleanup_failed");
+        assert!(manager
+            .by_context
+            .lock()
+            .await
+            .cleanup_retries
+            .contains_key(&c));
+
+        manager.release(&c).await;
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn aborted_cleanup_task_finalizes_retryable_failure() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-task-aborted");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let allow_release = backend.block_next_release();
+        let flight = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .unwrap()
+            .into_flight()
+            .unwrap();
+        backend.wait_for_release().await;
+
+        flight.abort();
+        let report = ExpiryClaim::join_flight(flight).await;
+
+        assert!(matches!(
+            report.result,
+            Err(BridgeError::AgentCrashed { .. })
+        ));
+        assert_eq!(manager.status(&c).await.unwrap().state, "cleanup_failed");
+        assert!(manager
+            .by_context
+            .lock()
+            .await
+            .cleanup_retries
+            .contains_key(&c));
+        drop(allow_release);
+
+        manager.release(&c).await;
+
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_expiry_operation_cannot_claim_a_newer_turn() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-stale-op");
+        let first = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, first.generation, &first.op).await;
+        let second = manager.checkout_existing_turn(&c).await.unwrap();
+
+        assert!(manager
+            .begin_expire_current(&c, first.generation, &first.op)
+            .await
+            .is_none());
+        assert_eq!(manager.status(&c).await.unwrap().state, "running");
+        assert_eq!(backend.releases().len(), 0);
+        manager.finish_turn(&c, second.generation, &second.op).await;
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_flight_cannot_clear_a_newer_claim_id_tombstone() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("expiry-stale-flight");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        let claim = manager
+            .begin_expire_current(&c, turn.generation, &turn.op)
+            .await
+            .unwrap();
+        {
+            let mut table = manager.by_context.lock().await;
+            let tombstone = table.tombstones.get_mut(&c).unwrap();
+            tombstone.cleanup_claim_id += 1;
+        }
+
+        assert!(claim.cleanup().await.result.is_ok());
+        assert_eq!(manager.status(&c).await.unwrap().state, "expiring");
+        assert_eq!(backend.releases(), vec!["ctx-expiry-stale-flight-g0"]);
     }
 
     #[tokio::test]
@@ -3298,6 +4995,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_with_children_claims_every_handle_before_cleanup_waiter_can_be_canceled() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let parent = ctx("cancel-sweep-parent");
+        let child_a = ctx("cancel-sweep-child-a");
+        let child_b = ctx("cancel-sweep-child-b");
+
+        manager
+            .checkout_turn(&parent, agent(), None, None)
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_a, agent(), None, None)
+            .await
+            .unwrap();
+        manager
+            .checkout_child_turn(&parent, &child_b, agent(), None, None)
+            .await
+            .unwrap();
+
+        let allow_first_release = backend.block_next_release();
+        let release_manager = manager.clone();
+        let release_parent = parent.clone();
+        let release = tokio::spawn(async move {
+            release_manager.release_with_children(&release_parent).await;
+        });
+        backend.wait_for_release().await;
+        release.abort();
+        assert!(release.await.unwrap_err().is_cancelled());
+
+        for _ in 0..100 {
+            if backend.releases().len() == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            backend.releases().len(),
+            3,
+            "canceling the waiter must drop three already-owned claims into their cleanup flights"
+        );
+        assert!(
+            !manager.child_parent_registered(&parent).await,
+            "the parent registration must be removed before cleanup's first await"
+        );
+
+        allow_first_release.send(()).unwrap();
+        for _ in 0..100 {
+            if manager.status(&parent).await.is_none()
+                && manager.status(&child_a).await.is_none()
+                && manager.status(&child_b).await.is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(manager.status(&parent).await.is_none());
+        assert!(manager.status(&child_a).await.is_none());
+        assert!(manager.status(&child_b).await.is_none());
+    }
+
+    #[tokio::test]
     async fn cancel_then_release_frees_children() {
         let (manager, backend, _registry) = manager();
         let parent = ctx("cancel-release-parent");
@@ -3590,8 +5349,8 @@ mod tests {
         manager.cancel(&c).await.unwrap();
         assert_permission_cancelled(rx).await;
 
-        // Unlike the single abort-token slot, the permission registry is gen+op keyed and exact-once:
-        // resolving the cancelled turn's permission does not poison a later warm checkout.
+        // The permission registry and retained abort tokens are both operation-scoped: resolving the
+        // canceled turn's permission does not poison a later warm checkout.
         let next = manager.checkout_existing_turn(&c).await.unwrap();
         assert_ne!(next.op, turn.op);
         assert_eq!(next.generation, turn.generation);
@@ -3733,6 +5492,55 @@ mod tests {
         assert!(manager.status(&child).await.is_none());
         assert!(!manager.child_registered(&parent, &child).await);
         assert!(!manager.child_parent_registered(&parent).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_backend_panic_is_caught_and_expires_handle() {
+        let (manager, backend, _registry) = manager();
+        let c = ctx("cancel-panic-expire");
+        manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_cancel_panics();
+
+        let error = manager.cancel(&c).await.unwrap_err();
+
+        assert!(matches!(error, BridgeError::AgentCrashed { .. }));
+        assert_eq!(backend.cancels(), vec!["ctx-cancel-panic-expire-g0"]);
+        assert_eq!(backend.releases(), vec!["ctx-cancel-panic-expire-g0"]);
+        assert!(manager.status(&c).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_failure_retains_tombstone_until_release_finishes() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("cancel-error-tombstone");
+        manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        backend.set_cancel_result(Err(BridgeError::CancelTimeout));
+        let allow_release = backend.block_next_release();
+        let cancel_manager = manager.clone();
+        let cancel_ctx = c.clone();
+        let cancel = tokio::spawn(async move { cancel_manager.cancel(&cancel_ctx).await });
+        backend.wait_for_release().await;
+
+        assert_eq!(manager.status(&c).await.unwrap().state, "expiring");
+        assert_eq!(
+            manager
+                .checkout_turn(&c, agent(), None, None)
+                .await
+                .err()
+                .unwrap(),
+            BridgeError::SessionExpired
+        );
+        allow_release.send(()).unwrap();
+        assert_eq!(cancel.await.unwrap(), Err(BridgeError::CancelTimeout));
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases(), vec!["ctx-cancel-error-tombstone-g0"]);
     }
 
     #[tokio::test]
@@ -4465,6 +6273,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_release_retains_tombstone_until_gated_cleanup_finishes() {
+        let (manager, backend, _registry) = manager();
+        let manager = Arc::new(manager);
+        let c = ctx("release-tombstone");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+        let allow_release = backend.block_next_release();
+        let release_manager = manager.clone();
+        let release_ctx = c.clone();
+        let release = tokio::spawn(async move { release_manager.release(&release_ctx).await });
+        backend.wait_for_release().await;
+
+        assert_eq!(manager.status(&c).await.unwrap().state, "expiring");
+        assert_eq!(
+            manager
+                .checkout_turn(&c, agent(), None, None)
+                .await
+                .err()
+                .unwrap(),
+            BridgeError::SessionExpired
+        );
+        assert_eq!(backend.configured(), vec!["ctx-release-tombstone-g0"]);
+        allow_release.send(()).unwrap();
+        release.await.unwrap();
+        assert!(manager.status(&c).await.is_none());
+    }
+
+    #[tokio::test]
     async fn reap_idle_removes_only_idle_sessions_past_ttl() {
         let backend = Arc::new(FakeBackend::new("ok"));
         let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend));
@@ -4491,6 +6330,43 @@ mod tests {
 
         assert!(manager.status(&idle).await.is_none());
         assert_eq!(manager.status(&running).await.unwrap().state, "running");
+    }
+
+    #[tokio::test]
+    async fn idle_reap_retains_tombstone_until_gated_cleanup_finishes() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let clock = Arc::new(ManualClock::new(0));
+        let manager = Arc::new(SessionManager::new_with_clock(
+            registry,
+            Duration::from_secs(5),
+            clock.clone(),
+        ));
+        let c = ctx("reap-tombstone");
+        let turn = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, turn.generation, &turn.op).await;
+        clock.advance(Duration::from_secs(6));
+        let allow_release = backend.block_next_release();
+        let reap_manager = manager.clone();
+        let reap = tokio::spawn(async move { reap_manager.reap_idle().await });
+        backend.wait_for_release().await;
+
+        assert_eq!(manager.status(&c).await.unwrap().state, "expiring");
+        assert_eq!(
+            manager
+                .checkout_turn(&c, agent(), None, None)
+                .await
+                .err()
+                .unwrap(),
+            BridgeError::SessionExpired
+        );
+        allow_release.send(()).unwrap();
+        reap.await.unwrap();
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases(), vec!["ctx-reap-tombstone-g0"]);
     }
 
     #[tokio::test]
@@ -4698,7 +6574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkout_does_not_fresh_mint_when_handle_vanishes_before_lock2() {
+    async fn checkout_does_not_fresh_mint_when_tombstone_replaces_handle_before_lock2() {
         // Whole-branch review MAJOR (codex xhigh, v2.1 fix): lock #1 observes a live Idle handle for ctx
         // but historically did not record that fact. If a concurrent `release` removes the handle from
         // `by_context` and its (off-lock) `backend.release_session("ctx-{ctx}-g0")` is still in flight
@@ -4741,18 +6617,19 @@ mod tests {
             let c = c.clone();
             tokio::spawn(async move { manager.release(&c).await })
         };
-        // release_inner removes the handle from `by_context` synchronously (under its own lock) and THEN
-        // awaits backend.release_session — wait_for_release only resolves once that await has been
-        // entered, so by this point the handle is provably gone AND the release is provably still parked
-        // on its gate (in flight).
+        // release_inner atomically replaces the live handle with an expiring tombstone and THEN awaits
+        // backend.release_session — wait_for_release only resolves once that await has been entered, so
+        // by this point the live handle is provably gone, the tombstone is visible, and the release is
+        // provably still parked on its gate (in flight).
         backend.wait_for_release().await;
-        assert!(
-            manager.status(&c).await.is_none(),
-            "handle must already be gone before the parked checkout resumes into lock #2"
+        assert_eq!(
+            manager.status(&c).await.unwrap().state,
+            "expiring",
+            "an expiring tombstone must replace the live handle before lock #2 resumes"
         );
 
-        // Let the parked checkout resume into lock #2. It must see no handle and, per the fix, must NOT
-        // fall into the fresh path while the release is still in flight.
+        // Let the parked checkout resume into lock #2. It must see the tombstone and must NOT fall into
+        // the fresh path while the release is still in flight.
         let _ = resume_checkout.send(());
         let result = tokio::time::timeout(Duration::from_secs(2), checkout)
             .await
@@ -4760,7 +6637,7 @@ mod tests {
             .unwrap();
         assert!(
             matches!(result, Err(BridgeError::SessionExpired)),
-            "handle-gone-at-lock-#2 must return SessionExpired, not fresh-mint"
+            "tombstone-at-lock-#2 must return SessionExpired, not fresh-mint"
         );
 
         // No second configure_session call happened while release_session(g0) was still in flight — no
@@ -4777,6 +6654,10 @@ mod tests {
             .await
             .expect("release must complete")
             .unwrap();
+        assert!(
+            manager.status(&c).await.is_none(),
+            "successful cleanup must clear the exact expiring tombstone"
+        );
     }
 
     #[tokio::test]

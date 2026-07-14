@@ -1,11 +1,17 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v13)
 
 - **Status:** R2a, R2b0, and R2b1 merged; R2b2 in progress; v13 is the design of record for R2b2–R2b3
+- **R2b2d review state:** closure review 12 `APPROVE`; exact six-package gate
+  **1,090 / 0 / 0 ignored**; full host workspace suite **1,806 / 0 / 12 ignored**; repository hygiene
+  **37** tracked artifacts / **7** validated example configs; R2b2d committed on its branch, with push and
+  final full-R2b2 review pending
 - **Date:** 2026-07-11
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`
 - **R2b1 commit:** `7b788c1fa6b62459e8a8473ca853f9414b28bfbc`
 - **R2b2a commit:** `4ed12f1035c16fa5dbd55169e59ca4c277373da4`
+- **R2b2b commit:** `f40096df`
+- **R2b2c commit:** `40790720`
 - **Program:** [`docs/bridge-reliability.md`](../../bridge-reliability.md), R2
 - **Security boundary:** [`ADR-0032`](../../adr/0032-sandbox-tier-model.md)
 
@@ -476,8 +482,15 @@ may use a bounded in-memory observer even when no durable bridge task exists.
   `AgentBackend::{cancel_observed,forget_session_observed,release_session_observed}` and
   `NodeTurnCleanup::on_exit_observed` accept the same observer and return `Result`; their defaults call
   the existing methods and return `Ok`. ACP/container and warm-session production owners override them,
-  and `SessionManager` exposes observed cancel/expire/release paths. The workflow/translator owner calls
-  observed cleanup before final diagnostic flush and drops the observer when cleanup returns. A teardown
+  and `SessionManager` exposes observed cancel/expire/release paths. Both an observed backend cleanup
+  entrypoint and an outer `WarmCompletionGuard` expiry synchronously select/start their observer-free
+  cleanup flight before awaiting the `teardown started` transition; diagnostic cancellation can detach
+  reporting but cannot suppress cleanup. An immediate start-observation failure is returned only after the
+  owned cleanup report settles. The detached flight and its joiner each retain the same generation/
+  operation/claim-bound settlement capability: a panic anywhere in the worker, including public lease drop,
+  or a surfaced task `JoinError` converts only the matching tombstone to retryable `CleanupFailed`. The
+  workflow/translator owner calls observed cleanup before final diagnostic flush and drops the observer when
+  cleanup returns. A teardown
   failure becomes the primary diagnostic only when no earlier failure exists; otherwise it is appended as
   bounded `teardown.secondary` evidence without replacing the primary phase/class.
 - Container cleanup keeps legacy fire-and-forget `ReapFn`/`reap_once` for `Drop`, but production container
@@ -488,13 +501,31 @@ may use a bounded in-memory observer even when no durable bridge task exists.
   exit are visible teardown failures. `Drop`/registry retirement use `reap_detached`. A legacy `ReapFn`
   adapter remains available to existing tests/constructors.
 - `WorktreeBackend` owns a sealed, per-session `WorktreeCleanupCoordinator`. Each `SessionCleanupCell`
-  retains the canonical source/path/sidecar and a monotonic requested strength (`forget < release`) until
-  one observer-free session flight finishes. Concurrent legacy/observed forget, release, and retirement
+  retains persistent configured ownership independently of any one configure admission, plus canonical
+  source/path/sidecar and a monotonic requested strength (`forget < release`) until one observer-free
+  session flight finishes. A later failed or canceled same-session configure cannot erase an earlier
+  successful configuration. Rejected admission never increments or decrements the global active-configure
+  count. Concurrent legacy/observed forget, release, and retirement
   start or join that cell; an upgrade may perform the stronger inner action once, while provider and
   sidecar removal each occur exactly once. Observed callers locally record the shared report; legacy
   callers preserve best-effort return behavior.
-- `WorktreeBackend::retire` first seals the coordinator against new sessions, snapshots every ready/running
-  cell, requests `release` strength, and joins all of those same flights before calling `inner.retire`.
+- A configuration path arms cleanup-on-drop when it publishes its reservation, before provider, sidecar, or
+  inner awaits. Returned failure marks explicitly; cancellation makes admission destruction mark the same
+  cell, balance its counters, and synchronously start observer-free Release. If immediate compensation fails,
+  the reporter retains
+  process-scoped retry ownership and re-arms `release` in that same slot with exponential backoff from one
+  to thirty seconds. An explicit release or retirement that replaces the completed failed slot wins by
+  flight id; the delayed owner exits instead of duplicating cleanup. Replacement strength is
+  `max(existing, requested)`, so a weaker Forget cannot erase failed Release. While any failed-configure
+  cleanup is pending, Worktree allocation fails closed with `AgentOverloaded` before provider add. At most 64
+  configurations may be admitted concurrently, bounding the pre-marker wave. Success evicts the exact cell,
+  notifies admission, and retries only provider/sidecar components that have not already completed. A success
+  reporter may finalize shared marker/cell state only when its flight id still owns the slot; a pending failed-
+  configure marker additionally requires that current slot to have satisfied Release strength. Superseded or
+  weaker success can notify its own waiter but cannot reopen admission or evict newer cleanup ownership.
+- `WorktreeBackend::retire` first seals the coordinator against new sessions, waits the balanced active-
+  configure count, snapshots every persistently configured/ready/running cell, requests `release` strength,
+  and joins all of those same flights before calling `inner.retire`.
   It never independently drains provider entries. Thus registry force-retirement after its grace period
   can join an observed release but cannot duplicate/cancel it. `NotFound` remains success; other
   inner/provider/filesystem failures appear in the bounded shared report and retain fail-closed cleanup
@@ -668,7 +699,15 @@ Legacy errors retain each owner's current behavior.
 All four owners use one `WarmCompletionGuard` bound to context, generation, and operation. Its synchronous
 `observe_exit(exit)` method applies the classifier and changes the armed drop action from `Finish` to
 `Expire` immediately when an `AgentFailure` is observed, before formatting, flushing, locking, or any
-other await. A stale guard can act only on the exact matching generation/operation.
+other await. The same call publishes an opaque exact-operation expiry intent shared with the session table's
+retained turn record. The intent is a three-state atomic: `open` transitions exactly once to `armed` or
+`successor_reserved`. `SessionCancel` must consult an armed intent before settling `Cancelling` to reusable
+`Idle`; an armed intent instead becomes deferred expiry owned by the cancel flight. If exact expiry reaches
+the table while cancel owns the handle, it sets the same deferred flag. Before any `Idle` handle can mint or
+reconcile a successor, admission races every retained open intent against failure observation. If failure
+wins, checkout atomically installs the exact expiry claim and returns `SessionExpired`; if admission wins,
+later stale observation cannot arm or release the successor. An old operation never expires a newer running
+operation, and a stale guard can act only on its exact generation/operation.
 
 The consuming async `complete()` uses that armed action. For expiry it calls
 `SessionManager::begin_expire_current(ctx, generation, op)`, which atomically verifies the matching live
@@ -677,17 +716,21 @@ with a resource-free `ExpiringTombstone { generation, op, cleanup_claim_id, stat
 and tombstone exist is the original completion guard disarmed. Checkout/status treat `Expiring` and
 `CleanupFailed` as non-reusable (`SessionExpired`) and perform zero resolve/configure/mint work.
 
-Before its first cancelable await, `ExpiryClaim::cleanup_observed` synchronously transfers all owned state
-into exactly one spawned `CleanupFlight`. That task owns and completes backend/session release, worktree
+Before its first cancelable teardown-observation await, the completion owner consumes `ExpiryClaim` into
+exactly one spawned `CleanupFlight`. That task owns and completes backend/session release, worktree
 and sidecar removal, lease drop, and child-registration pruning. It returns one bounded `CleanupReport`
 through a join channel, but it never receives or captures a `DiagnosticObserver`, task store, or journal
 sink. The observed caller awaits the report and only then records teardown completion/failure through its
 still-local observer. Canceling that waiter merely drops the receiver; the same cleanup task continues.
 After every owned cleanup side effect completes successfully, the flight removes the tombstone only when
 context, generation, operation, and `cleanup_claim_id` still match. On cleanup failure it changes only
-that matching tombstone to `CleanupFailed { code }`; it stays non-reusable and retains no resource or
-operator prose. Explicit release/clear may join or retry the backend's shared cleanup cell, but no ordinary
-checkout can clear the tombstone or remint deterministic `ctx-{ctx}-g0` while old cleanup is unfinished.
+that matching tombstone to `CleanupFailed { code }`; the marker stays non-reusable and contains no
+resource or operator prose. The session table separately retains one bounded
+`CleanupRetryOwner { backend, backend_session }` for that exact marker. It does not retain the warm handle,
+lease, operation observer, task store, or child-registration ownership. Explicit release/clear atomically
+consume that capability into a new claim-id cleanup flight; success clears marker and capability, while
+failure restores both for another explicit retry. No ordinary checkout can claim the capability, clear the
+tombstone, or remint deterministic `ctx-{ctx}-g0` while cleanup is unresolved.
 
 Both cancellation windows fail closed:
 
@@ -699,15 +742,24 @@ Both cancellation windows fail closed:
   waiter detaches from that same flight; `Drop` never invokes backend/worktree/container release again.
 
 `CleanupFlight` is the single-flight/idempotency boundary, generalizing the container-specific joinable
-reaper: every release side effect occurs at most once, and worktree ownership metadata remains in the
-never-canceled task until provider and sidecar removal finish. An unobserved completion may emit only a
-typed process-scoped cleanup status; it cannot write a late task transition. The slot is either still
+reaper: every completed release component occurs at most once within a cleanup generation; a component
+that reports failure may be retried only by a later explicit release/clear generation. Worktree ownership
+metadata remains in the cleanup cell until provider and sidecar removal finish. An unobserved completion
+may emit only a typed process-scoped cleanup status; it cannot write a late task transition. The slot is either still
 `Running` only until the checked expiry task obtains the lock or a non-reusable tombstone until the exact
 flight finishes—never absent during cleanup, never returned to `Idle`, and never able to expire a newer
 generation. Normal/canceled and legacy-error actions preserve their existing owner semantics.
 `Coordinator::collect_turn`, workflow `WarmNodeCleanup`, inbound streaming, and inbound synchronous
 dispatch synchronously call `observe_exit` at the error match site and then `complete`; no owner
 implements its own finish/expire race.
+
+At workflow and inbound stream-drain ownership boundaries, a ready concrete backend result wins over a
+simultaneously ready cancellation/disconnect exactly once, so an already-queued structured failure can arm
+expiry. This priority is not reapplied without a control check: after any benign text, permission, or usage
+item, workflow checks cancellation before polling another item; inbound usage checks receiver closure before
+continuing. A continuously ready benign stream therefore cannot starve cancellation/disconnect or grow local
+text without bound after control becomes ready. Force-reset abort remains the higher-priority exception and
+must not poll a backend session that has already been released.
 
 ## Diagnostic failure record
 
@@ -1067,6 +1119,29 @@ For trusted own-repo full-branch reviews, the operating policy is:
   waiters receiving one result, and detached `Drop` starting/joining without a late task write.
 - `WorktreeBackend` observed cleanup propagates inner/provider/sidecar errors (`NotFound` excepted) while
   legacy cleanup remains best-effort; primary failure ordering retains cleanup as `teardown.secondary`.
+- A pending `teardown started` observer write is canceled after entry; provider cleanup still starts from
+  the preclaimed observer-free flight, the operation observer drops, and cleanup completes exactly once.
+- The outer warm completion guard has the same gate: backend release starts while its teardown-start write
+  is pending, and an immediate start-observation failure cannot return before gated cleanup settles.
+- A public lease destructor panic after checked backend release and an explicitly aborted cleanup worker
+  both return `AgentCrashed`, leave the exact context in retryable `CleanupFailed`, and clear after one
+  explicit release; neither path can leave `Expiring` parked or settle a stale replacement claim.
+- A worker-only lease-panic test drops the joiner's settlement capability before allowing the destructor
+  panic; the raw worker still catches it and publishes retryable failure, proving whole-worker recovery.
+- Partial Worktree configuration followed by failed provider compensation keeps one backend-owned retry,
+  rejects a distinct allocation before provider add, and clears automatically after provider recovery.
+  The retry performs exactly one additional provider removal without repeating completed inner release;
+  a direct capacity test admits 64 configurations, rejects the 65th, and balances all admission counters.
+- Cancellation after reservation/provider publication triggers cleanup from admission drop without an outer
+  release, keeps the degraded barrier closed through failed compensation, then resumes only provider removal.
+- A Forget caller taking over completed failed Release executes Release again and never invokes inner Forget;
+  the marker clears only after the stronger requirement succeeds.
+- A pending Forget superseded by cancellation-owned Release may complete for its waiter but cannot clear the
+  shared marker. If Release fails, distinct admission remains closed and automatic Release retry clears only
+  after the stronger inner action succeeds.
+- A successful no-cwd configuration followed by a failed or canceled same-session configure retains one
+  known-session cell through seal. A configure rejected after cleanup starts leaves the global admission
+  count at zero, and retirement joins cleanup rather than waiting on a wrapped counter.
 - Journal diagnostics appear as `progress` before node/terminal completion and do not alter snapshot
   folding. A prior-schema reader fixture accepts the new optional payload.
 - Persisted transitions retain typed mode/model/effort operation, bridge code, and auth evidence;

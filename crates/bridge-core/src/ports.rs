@@ -129,13 +129,19 @@ pub trait AgentBackend: Send + Sync {
     /// Drop per-session state (config stash, etc.) when a task/session ends. Default: no-op.
     /// MUST be a trait method — the inbound binding eviction (T11) calls it through `Arc<dyn AgentBackend>`.
     async fn forget_session(&self, _session: &SessionId) {}
+    /// Result-bearing, observer-free cleanup used by detached cleanup ownership.
+    /// Implementors with fallible teardown override this method; the default
+    /// preserves source and behavior compatibility with legacy backends.
+    async fn forget_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+        self.forget_session(session).await;
+        Ok(())
+    }
     async fn forget_session_observed(
         &self,
         session: &SessionId,
         _observer: std::sync::Arc<dyn DiagnosticObserver>,
     ) -> Result<(), BridgeError> {
-        self.forget_session(session).await;
-        Ok(())
+        self.forget_session_checked(session).await
     }
     /// Release a warm session: drop ALL per-session backend state + reap any per-session
     /// resource (e.g. a `:rw` container). Default = `forget_session` (correct for
@@ -143,13 +149,19 @@ pub trait AgentBackend: Send + Sync {
     async fn release_session(&self, session: &SessionId) {
         self.forget_session(session).await;
     }
+    /// Result-bearing, observer-free warm release. A cleanup flight owns this
+    /// call, while its optional diagnostic waiter retains the operation observer
+    /// and records the bounded result after joining.
+    async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+        self.release_session(session).await;
+        Ok(())
+    }
     async fn release_session_observed(
         &self,
         session: &SessionId,
         _observer: std::sync::Arc<dyn DiagnosticObserver>,
     ) -> Result<(), BridgeError> {
-        self.release_session(session).await;
-        Ok(())
+        self.release_session_checked(session).await
     }
     /// Reconcile model/effort on a LIVE warm session (Slice 1). Default: NotAdvertised
     /// (non-ACP/non-process backends can't reconcile a live session). cwd/mode are NOT

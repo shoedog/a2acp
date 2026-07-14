@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bridge_core::domain::{EffectiveConfig, QueuedInject};
+use bridge_core::error::{warm_session_survivability, BridgeError, WarmSessionSurvivability};
 use bridge_core::ids::{ContextId, OperationId, SessionGeneration, SessionId, TaskId};
 use bridge_core::permission::TurnMeta;
-use bridge_core::ports::{AgentBackend, Lease};
+use bridge_core::ports::{AgentBackend, DiagnosticObserver, Lease};
 use tokio::sync::Mutex;
 
-use crate::session_manager::SessionManager;
+use crate::session_manager::{ExpiryClaim, SessionManager, WarmExpiryIntent};
 
 /// A task's binding to its resolved registry instance, created on the FIRST local
 /// message. Holds the backend driving the task, the effective config applied to its
@@ -90,22 +91,242 @@ pub struct LocalDispatch {
     pub obs_ctx: bridge_core::ports::TurnContext,
 }
 
-/// Drops the warm turn back to Idle on producer exit (mirrors BindingGuard::Drop's spawn pattern).
-pub struct WarmTurnGuard {
-    pub sm: Arc<SessionManager>,
-    pub ctx: ContextId,
-    pub generation: SessionGeneration,
-    pub op: OperationId,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WarmCompletionAction {
+    Finish,
+    Cancel,
+    Expire,
 }
 
-impl Drop for WarmTurnGuard {
+#[derive(Clone, Copy)]
+enum LegacyCrashAction {
+    Finish,
+    Expire,
+}
+
+pub enum WarmCompletionExit<'a> {
+    Normal,
+    Canceled,
+    Error(&'a BridgeError),
+}
+
+/// One owner for the current warm turn's terminal state. `observe_exit` is
+/// synchronous so a structured failure arms expiry before any formatting,
+/// persistence, flush, lock, or other cancellation point.
+pub struct WarmCompletionGuard {
+    sm: Arc<SessionManager>,
+    ctx: ContextId,
+    generation: SessionGeneration,
+    op: OperationId,
+    expiry_intent: WarmExpiryIntent,
+    diagnostic: Arc<dyn DiagnosticObserver>,
+    canceled_action: WarmCompletionAction,
+    legacy_crash_action: LegacyCrashAction,
+    action: WarmCompletionAction,
+    armed: bool,
+}
+
+/// Compatibility name retained for the inbound dispatch DTO.
+pub type WarmTurnGuard = WarmCompletionGuard;
+
+impl WarmCompletionGuard {
+    pub fn finish_owner(
+        sm: Arc<SessionManager>,
+        ctx: ContextId,
+        generation: SessionGeneration,
+        op: OperationId,
+        expiry_intent: WarmExpiryIntent,
+        diagnostic: Arc<dyn DiagnosticObserver>,
+    ) -> Self {
+        Self {
+            sm,
+            ctx,
+            generation,
+            op,
+            expiry_intent,
+            diagnostic,
+            canceled_action: WarmCompletionAction::Finish,
+            legacy_crash_action: LegacyCrashAction::Finish,
+            action: WarmCompletionAction::Finish,
+            armed: true,
+        }
+    }
+
+    pub fn workflow_owner(
+        sm: Arc<SessionManager>,
+        ctx: ContextId,
+        generation: SessionGeneration,
+        op: OperationId,
+        expiry_intent: WarmExpiryIntent,
+        diagnostic: Arc<dyn DiagnosticObserver>,
+    ) -> Self {
+        Self {
+            sm,
+            ctx,
+            generation,
+            op,
+            expiry_intent,
+            diagnostic,
+            canceled_action: WarmCompletionAction::Cancel,
+            legacy_crash_action: LegacyCrashAction::Expire,
+            action: WarmCompletionAction::Cancel,
+            armed: true,
+        }
+    }
+
+    pub fn observe_exit(&mut self, exit: WarmCompletionExit<'_>) {
+        let next = match exit {
+            WarmCompletionExit::Normal => WarmCompletionAction::Finish,
+            WarmCompletionExit::Canceled => self.canceled_action,
+            WarmCompletionExit::Error(error)
+                if warm_session_survivability(error) == WarmSessionSurvivability::Expire =>
+            {
+                WarmCompletionAction::Expire
+            }
+            WarmCompletionExit::Error(BridgeError::AgentCrashed { .. }) => {
+                match self.legacy_crash_action {
+                    LegacyCrashAction::Finish => WarmCompletionAction::Finish,
+                    LegacyCrashAction::Expire => WarmCompletionAction::Expire,
+                }
+            }
+            WarmCompletionExit::Error(_) => WarmCompletionAction::Finish,
+        };
+        if next == WarmCompletionAction::Expire {
+            self.expiry_intent.arm();
+        }
+        // Once a concrete failure has proved the session unsafe, later channel
+        // closure/cancellation bookkeeping cannot make it reusable again.
+        if self.action != WarmCompletionAction::Expire {
+            self.action = next;
+        }
+    }
+
+    pub async fn record_usage(&self, usage: bridge_core::orch::UsageSnapshot) {
+        self.sm
+            .record_usage(&self.ctx, self.generation, &self.op, usage)
+            .await;
+    }
+
+    pub async fn complete(mut self) -> Result<(), BridgeError> {
+        match self.action {
+            WarmCompletionAction::Finish => {
+                self.sm
+                    .finish_turn(&self.ctx, self.generation, &self.op)
+                    .await;
+                self.armed = false;
+                Ok(())
+            }
+            WarmCompletionAction::Cancel => {
+                let result = self
+                    .sm
+                    .cancel_turn_current(&self.ctx, self.generation, &self.op)
+                    .await;
+                self.armed = false;
+                result
+            }
+            WarmCompletionAction::Expire => {
+                let claim = self
+                    .sm
+                    .begin_expire_current(&self.ctx, self.generation, &self.op)
+                    .await;
+                let Some(claim) = claim else {
+                    self.armed = false;
+                    return Ok(());
+                };
+                // From this point the claim/tombstone pair owns fallback. The
+                // completion guard must not start a second cleanup flight.
+                // Transfer the claim into that observer-free flight before
+                // awaiting teardown-start persistence: a pending/canceled
+                // observer can detach reporting but cannot suppress cleanup.
+                let flight = claim
+                    .into_flight()
+                    .expect("a fresh expiry claim owns one cleanup flight");
+                self.armed = false;
+                let started_observation = record_cleanup_transition(
+                    self.diagnostic.as_ref(),
+                    bridge_core::diagnostics::PhaseStatus::Started,
+                    "warm.teardown.release",
+                )
+                .await;
+                let report = ExpiryClaim::join_flight(flight).await;
+                // Preserve the existing observation-error precedence, but
+                // only after the owned cleanup report has settled.
+                started_observation?;
+                let terminal = if report.result.is_ok() {
+                    (
+                        bridge_core::diagnostics::PhaseStatus::Completed,
+                        "warm.teardown.released",
+                    )
+                } else {
+                    (
+                        bridge_core::diagnostics::PhaseStatus::Failed,
+                        "warm.teardown.release_failed",
+                    )
+                };
+                let observation =
+                    record_cleanup_transition(self.diagnostic.as_ref(), terminal.0, terminal.1)
+                        .await;
+                match (report.result, observation) {
+                    (Err(primary), _) => Err(primary),
+                    (Ok(()), Err(observation)) => Err(observation),
+                    (Ok(()), Ok(())) => Ok(()),
+                }
+            }
+        }
+    }
+}
+
+async fn record_cleanup_transition(
+    observer: &dyn DiagnosticObserver,
+    status: bridge_core::diagnostics::PhaseStatus,
+    code: &'static str,
+) -> Result<(), BridgeError> {
+    use bridge_core::diagnostics::{
+        diagnostic_timestamp_ms, DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor,
+        PersistedPhaseTransition, PersistedPhaseTransitionInput,
+    };
+
+    let transition = PersistedPhaseTransition::build_static_code(
+        PersistedPhaseTransitionInput {
+            phase: DiagnosticPhase::Teardown,
+            status,
+            at_ms: diagnostic_timestamp_ms(),
+            operation: None,
+            code: None,
+            auth: None,
+        },
+        Some(code),
+        &DiagnosticRedactor::default(),
+    )
+    .map_err(|_| BridgeError::InvalidStateTransition)?;
+    let event =
+        DiagnosticEvent::new(transition, None).map_err(|_| BridgeError::InvalidStateTransition)?;
+    observer.record(event).await
+}
+
+impl Drop for WarmCompletionGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let sm = self.sm.clone();
         let ctx = self.ctx.clone();
         let generation = self.generation;
         let op = self.op.clone();
-        tokio::spawn(async move {
-            sm.finish_turn(&ctx, generation, &op).await;
-        });
+        match self.action {
+            WarmCompletionAction::Finish => {
+                tokio::spawn(async move {
+                    sm.finish_turn(&ctx, generation, &op).await;
+                });
+            }
+            WarmCompletionAction::Cancel => {
+                tokio::spawn(async move {
+                    let _ = sm.cancel_turn_current(&ctx, generation, &op).await;
+                });
+            }
+            WarmCompletionAction::Expire => {
+                sm.expire_current_unobserved(ctx, generation, op);
+            }
+        }
     }
 }
