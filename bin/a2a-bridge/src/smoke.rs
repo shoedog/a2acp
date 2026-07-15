@@ -48,11 +48,13 @@ const MAX_CAPTURED_TEXT_BYTES: usize = 1024;
 const DIAGNOSTIC_CAPACITY: usize = 128;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ARTIFACT_TEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FallbackSmokeGuard {
     expected_config_sha256: String,
     expected_executable_sha256: String,
+    expected_session_cwd: SessionCwd,
     source_agent: AgentId,
 }
 
@@ -91,6 +93,7 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
     let mut out = None;
     let mut expected_config_sha256 = None;
     let mut expected_executable_sha256 = None;
+    let mut expected_session_cwd = None;
     let mut fallback_source_agent = None;
     let mut require_host_fallback_eligible = false;
     let mut acknowledged = false;
@@ -144,6 +147,12 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
             }
             "--expected-executable-sha256" => {
                 expected_executable_sha256 = Some(value(&mut it, "--expected-executable-sha256")?);
+            }
+            "--expected-session-cwd" if expected_session_cwd.is_some() => {
+                return Err("smoke: duplicate --expected-session-cwd".into());
+            }
+            "--expected-session-cwd" => {
+                expected_session_cwd = Some(value(&mut it, "--expected-session-cwd")?);
             }
             "--fallback-source-agent" if fallback_source_agent.is_some() => {
                 return Err("smoke: duplicate --fallback-source-agent".into());
@@ -212,11 +221,12 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
 
     let guard_count = usize::from(expected_config_sha256.is_some())
         + usize::from(expected_executable_sha256.is_some())
+        + usize::from(expected_session_cwd.is_some())
         + usize::from(fallback_source_agent.is_some())
         + usize::from(require_host_fallback_eligible);
     let fallback_guard = match guard_count {
         0 => None,
-        4 if session_cwd.is_some() => {
+        5 if session_cwd.is_some() => {
             let expected_config_sha256 = expected_config_sha256.expect("counted above");
             let expected_executable_sha256 = expected_executable_sha256.expect("counted above");
             if !crate::local_file::valid_sha256(&expected_config_sha256)
@@ -230,14 +240,18 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
                 "--fallback-source-agent",
                 fallback_source_agent.expect("counted above"),
             )?;
+            let expected_session_cwd =
+                SessionCwd::parse(&expected_session_cwd.expect("counted above"))
+                    .map_err(|_| "smoke: invalid --expected-session-cwd")?;
             Some(FallbackSmokeGuard {
                 expected_config_sha256: expected_config_sha256.to_ascii_lowercase(),
                 expected_executable_sha256: expected_executable_sha256.to_ascii_lowercase(),
+                expected_session_cwd,
                 source_agent: AgentId::parse(source)
                     .map_err(|_| "smoke: invalid --fallback-source-agent")?,
             })
         }
-        4 => return Err("smoke: fallback guard requires --session-cwd".into()),
+        5 => return Err("smoke: fallback guard requires --session-cwd".into()),
         _ => {
             return Err(
                 "smoke: fallback guard flags must be supplied together as a closed set".into(),
@@ -322,6 +336,7 @@ struct RequestRecord {
 struct FallbackGuardRecord {
     expected_config_sha256: String,
     expected_executable_sha256: String,
+    expected_session_cwd: String,
     source_agent: String,
     require_host_fallback_eligible: bool,
 }
@@ -496,6 +511,7 @@ impl ArtifactState {
                         .map(|guard| FallbackGuardRecord {
                             expected_config_sha256: guard.expected_config_sha256.clone(),
                             expected_executable_sha256: guard.expected_executable_sha256.clone(),
+                            expected_session_cwd: guard.expected_session_cwd.as_str().to_owned(),
                             source_agent: guard.source_agent.as_str().to_owned(),
                             require_host_fallback_eligible: true,
                         }),
@@ -1063,24 +1079,50 @@ fn authentication(
 fn artifact_provenance(
     snapshot: &bridge_core::domain::RegistrySnapshot,
     agent: &AgentId,
+    redactor: &DiagnosticRedactor,
 ) -> Vec<doctor::CheckResult> {
     let mut rows = doctor::provenance_rows_for_agent(snapshot, agent);
     let auth_check = format!("provenance:{}:auth", agent.as_str());
-    for row in &mut rows {
+    sanitize_provenance_rows(&mut rows, &auth_check, redactor);
+    rows
+}
+
+fn sanitize_provenance_rows(
+    rows: &mut [doctor::CheckResult],
+    auth_check: &str,
+    redactor: &DiagnosticRedactor,
+) {
+    for row in rows {
         if row.check == auth_check {
             // The doctor row contains arbitrary configured ids as human-readable text. The smoke
             // artifact carries the same path separately through tagged all-or-nothing ids.
             row.detail = "authentication path recorded in target.authentication".into();
         }
+        row.detail = redactor.sanitize_stderr_line(&row.detail, MAX_ARTIFACT_TEXT_BYTES);
+        row.remedy = redactor.sanitize_stderr_line(&row.remedy, MAX_ARTIFACT_TEXT_BYTES);
     }
-    rows
 }
 
-fn effective_record(config: &EffectiveConfig) -> EffectiveConfigRecord {
+fn sanitize_optional_artifact_text(value: &mut Option<String>, redactor: &DiagnosticRedactor) {
+    if let Some(value) = value {
+        *value = redactor.sanitize_stderr_line(value, MAX_ARTIFACT_TEXT_BYTES);
+    }
+}
+
+fn effective_record(
+    config: &EffectiveConfig,
+    redactor: &DiagnosticRedactor,
+) -> EffectiveConfigRecord {
     EffectiveConfigRecord {
-        model: config.model.clone(),
+        model: config
+            .model
+            .as_deref()
+            .map(|value| redactor.sanitize_stderr_line(value, MAX_ARTIFACT_TEXT_BYTES)),
         effort: config.effort.as_ref().map(crate::effort_to_string),
-        mode: config.mode.clone(),
+        mode: config
+            .mode
+            .as_deref()
+            .map(|value| redactor.sanitize_stderr_line(value, MAX_ARTIFACT_TEXT_BYTES)),
     }
 }
 
@@ -1097,9 +1139,18 @@ async fn cleanup_backend(
     session: &SessionId,
     observer: Arc<InMemoryDiagnosticObserver>,
     cancel_first: bool,
+    run_scoped_backstop_active: bool,
 ) -> CleanupOutcome {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(CLEANUP_TIMEOUT_SECS);
-    cleanup_backend_until(backend, session, observer, cancel_first, deadline).await
+    cleanup_backend_until(
+        backend,
+        session,
+        observer,
+        cancel_first,
+        run_scoped_backstop_active,
+        deadline,
+    )
+    .await
 }
 
 async fn cleanup_backend_until(
@@ -1107,6 +1158,7 @@ async fn cleanup_backend_until(
     session: &SessionId,
     observer: Arc<InMemoryDiagnosticObserver>,
     cancel_first: bool,
+    run_scoped_backstop_active: bool,
     deadline: tokio::time::Instant,
 ) -> CleanupOutcome {
     let (cancel, cancel_error) = if cancel_first {
@@ -1130,7 +1182,11 @@ async fn cleanup_backend_until(
             cancel,
             release,
             retire,
-            run_scoped_backstop: "invoked_best_effort",
+            run_scoped_backstop: if run_scoped_backstop_active {
+                "invoked_best_effort"
+            } else {
+                "not_needed"
+            },
         },
         error: cancel_error.or(release_error).or(retire_error),
     }
@@ -1305,6 +1361,16 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         None => None,
     };
     if let Some(guard) = &args.fallback_guard {
+        if session_cwd.as_ref() != Some(&guard.expected_session_cwd) {
+            state.fail_static(
+                DiagnosticPhase::ConfigApply,
+                DiagnosticFailureClass::Config,
+                "smoke.fallback_cwd_drift",
+                "Fallback smoke cwd identity changed after planning",
+                false,
+            );
+            return state.finalize(args.include_redacted_stderr).await;
+        }
         let source = snapshot
             .entries
             .iter()
@@ -1330,9 +1396,11 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     }
 
     let artifact_redactor = artifact_redactor(&entry, session_cwd.as_ref());
+    sanitize_optional_artifact_text(&mut state.artifact.request.model, &artifact_redactor);
+    sanitize_optional_artifact_text(&mut state.artifact.request.mode, &artifact_redactor);
     state.artifact.target = Some(TargetRecord {
         execution_mode: execution_mode(&entry),
-        provenance: artifact_provenance(&snapshot, &args.agent),
+        provenance: artifact_provenance(&snapshot, &args.agent, &artifact_redactor),
         authentication: authentication(&entry, &artifact_redactor),
     });
 
@@ -1346,7 +1414,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         config: effective.clone(),
         cwd: session_cwd,
     };
-    state.artifact.session.effective_request = Some(effective_record(&effective));
+    state.artifact.session.effective_request =
+        Some(effective_record(&effective, &artifact_redactor));
 
     let host = bridge_core::liveness::host_id();
     let instance_id = format!("{}-{}", std::process::id(), crate::implement::nonce(8));
@@ -1466,6 +1535,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         &session,
         Arc::clone(&state.observer),
         result.error.is_some(),
+        run_guard.is_some(),
     )
     .await;
     apply_cleanup_outcome(&mut state, result.error.is_some(), cleanup);
@@ -1901,6 +1971,8 @@ mod tests {
             digest,
             "--expected-executable-sha256",
             digest,
+            "--expected-session-cwd",
+            "/tmp",
             "--fallback-source-agent",
             "source",
             "--require-host-fallback-eligible",
@@ -1913,6 +1985,8 @@ mod tests {
             digest,
             "--expected-executable-sha256",
             digest,
+            "--expected-session-cwd",
+            "/tmp",
             "--fallback-source-agent",
             "source",
             "--require-host-fallback-eligible",
@@ -2052,6 +2126,7 @@ mod tests {
             &SessionId::parse("cleanup").unwrap(),
             observer(),
             true,
+            true,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
@@ -2059,6 +2134,7 @@ mod tests {
         assert_eq!(outcome.record.cancel, "completed");
         assert_eq!(outcome.record.release, "completed");
         assert_eq!(outcome.record.retire, "completed");
+        assert_eq!(outcome.record.run_scoped_backstop, "invoked_best_effort");
         assert_eq!(backend.cancel_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.release_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.retire_calls.load(Ordering::SeqCst), 1);
@@ -2070,6 +2146,7 @@ mod tests {
             hanging_dyn,
             &SessionId::parse("cleanup-hang").unwrap(),
             observer(),
+            true,
             true,
             tokio::time::Instant::now() + Duration::from_millis(25),
         )
@@ -2094,6 +2171,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_cleanup_truthfully_records_no_run_scoped_backstop() {
+        let backend: Arc<dyn AgentBackend> = Arc::new(FakeBackend::new(Behavior::Exact));
+        let outcome = cleanup_backend_until(
+            backend,
+            &SessionId::parse("guarded-cleanup").unwrap(),
+            observer(),
+            false,
+            false,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.record.run_scoped_backstop, "not_needed");
+    }
+
+    #[tokio::test]
     async fn cleanup_failure_turns_a_successful_turn_into_terminal_failure() {
         let backend = Arc::new(FakeBackend::new(Behavior::Exact).with_unaccepted_failing_release());
         let backend_dyn: Arc<dyn AgentBackend> = backend;
@@ -2102,6 +2195,7 @@ mod tests {
             &SessionId::parse("cleanup-failure").unwrap(),
             observer(),
             false,
+            true,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
@@ -2131,6 +2225,7 @@ mod tests {
             &SessionId::parse("cleanup-secondary").unwrap(),
             observer(),
             false,
+            true,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
@@ -2311,7 +2406,14 @@ mod tests {
         let secret = "configured-auth-secret";
         let mut entry = test_entry("test");
         entry.auth_method = Some(secret.into());
-        let redactor = DiagnosticRedactor::new([secret]);
+        entry.model = Some(secret.into());
+        entry.mcp = vec![bridge_core::mcp::McpServerSpec {
+            name: "secret-source".into(),
+            command: "mcp".into(),
+            args: Vec::new(),
+            env: vec![("TOKEN".into(), secret.into())],
+        }];
+        let redactor = artifact_redactor(&entry, None);
 
         let auth = serde_json::to_value(authentication(&entry, &redactor)).unwrap();
         let rendered = serde_json::to_string(&auth).unwrap();
@@ -2334,10 +2436,39 @@ mod tests {
             entries: vec![entry],
             allowed_cmds: vec!["fake".into()],
         };
-        let provenance = artifact_provenance(&snapshot, &AgentId::parse("test").unwrap());
+        let provenance =
+            artifact_provenance(&snapshot, &AgentId::parse("test").unwrap(), &redactor);
         let rendered = serde_json::to_string(&provenance).unwrap();
         assert!(rendered.contains("authentication path recorded in target.authentication"));
         assert!(!rendered.contains(secret));
+        assert!(provenance
+            .iter()
+            .all(|row| !row.detail.contains(secret) && !row.remedy.contains(secret)));
+
+        let mut request_model = Some(secret.to_owned());
+        sanitize_optional_artifact_text(&mut request_model, &redactor);
+        assert!(!request_model.as_deref().unwrap().contains(secret));
+        let effective = EffectiveConfig {
+            model: Some(secret.into()),
+            mode: Some(secret.into()),
+            ..EffectiveConfig::default()
+        };
+        let effective = serde_json::to_string(&effective_record(&effective, &redactor)).unwrap();
+        assert!(!effective.contains(secret));
+
+        let mut injected = vec![doctor::CheckResult {
+            check: "provenance:test:adapter".into(),
+            status: doctor::CheckStatus::Warn,
+            detail: format!("detail contains {secret}"),
+            remedy: format!("remedy contains {secret}"),
+        }];
+        sanitize_provenance_rows(
+            &mut injected,
+            "provenance:test:auth",
+            &DiagnosticRedactor::new([secret]),
+        );
+        assert!(!injected[0].detail.contains(secret));
+        assert!(!injected[0].remedy.contains(secret));
     }
 
     #[tokio::test]

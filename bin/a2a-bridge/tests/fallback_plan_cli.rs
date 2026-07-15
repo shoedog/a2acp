@@ -722,6 +722,8 @@ fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
         "--acknowledge-billable",
         "--session-cwd",
         canonical_repo_text,
+        "--expected-session-cwd",
+        canonical_repo_text,
         "--expected-config-sha256",
         config_sha256,
         "--expected-executable-sha256",
@@ -833,6 +835,17 @@ fn drifted_config_and_contradictory_lifecycle_fail_closed() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
 
+    let mut divergent_failure = smoke_artifact(&repo, &config, "container_runtime", false);
+    divergent_failure["diagnostics"]["lifecycle"][2]["failure"]["summary"] =
+        serde_json::json!("event and outer diagnostics disagree");
+    write_json(&source, &divergent_failure);
+    let output = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+
     let mut missing_lifecycle = smoke_artifact(&repo, &config, "container_runtime", false);
     missing_lifecycle["diagnostics"]["lifecycle"] = serde_json::json!([]);
     write_json(&source, &missing_lifecycle);
@@ -899,13 +912,45 @@ fn generated_smoke_refuses_config_executable_and_cwd_drift_before_spawn() {
         let expected_code = match drift {
             "config" => "smoke.fallback_config_drift",
             "executable" => "smoke.fallback_executable_drift",
-            "cwd" => "smoke.fallback_source_drift",
+            "cwd" => "smoke.fallback_cwd_drift",
             "target-marker" => "smoke.fallback_target_drift",
             _ => unreachable!(),
         };
         assert_eq!(artifact["diagnostics"]["failure"]["code"], expected_code);
         assert!(!marker.exists(), "{drift} drift spawned the target");
     }
+}
+
+#[test]
+fn generated_smoke_refuses_trusted_cwd_symlink_swap_before_spawn() {
+    let (dir, marker, config, source) = fixture();
+    let plan = read_plan(
+        &fallback_command(&config, &source)
+            .arg("--confirm-trusted-own-repo-read-only")
+            .output()
+            .unwrap(),
+    );
+    let argv: Vec<String> = plan["rerun"]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+
+    let planned = dir.path().join("owned repo");
+    fs::rename(&planned, dir.path().join("planned-repo-moved")).unwrap();
+    let sibling = dir.path().join("sibling repo");
+    fs::create_dir(&sibling).unwrap();
+    std::os::unix::fs::symlink(&sibling, &planned).unwrap();
+
+    let output = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
+    assert!(!output.status.success());
+    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        artifact["diagnostics"]["failure"]["code"],
+        "smoke.fallback_cwd_drift"
+    );
+    assert!(!marker.exists(), "cwd identity drift spawned the target");
 }
 
 #[test]

@@ -435,11 +435,7 @@ fn validate_failure(
 }
 
 fn same_failure_identity(left: &FailureDiagnostic, right: &FailureDiagnostic) -> bool {
-    left.failed_phase() == right.failed_phase()
-        && left.class() == right.class()
-        && left.disposition() == right.disposition()
-        && left.code() == right.code()
-        && left.prompt_may_have_been_accepted() == right.prompt_may_have_been_accepted()
+    left == right
 }
 
 fn validate_smoke_lifecycle(
@@ -1086,6 +1082,8 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
             config_path_text.clone(),
             "--acknowledge-billable".to_owned(),
             "--session-cwd".to_owned(),
+            trusted_session_cwd_text.clone(),
+            "--expected-session-cwd".to_owned(),
             trusted_session_cwd_text.clone(),
             "--expected-config-sha256".to_owned(),
             config_file.sha256.clone(),

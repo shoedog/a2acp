@@ -179,14 +179,16 @@ ineligible plan contains no command. An eligible plan emits an absolute candidat
 distinct fixed-`PONG` verification smoke, bound to the current executable/config SHA-256, source-agent
 marker, and current source mount. The separately supplied trusted cwd must be an existing canonical
 directory, must exactly match the artifact-reported cwd as evidence, and must remain under that current
-mount. Only that exact operator-selected directory enters the host smoke argv.
+mount. Only that exact operator-selected directory enters the host smoke argv, and its plan-time
+canonical value is a separate closed-set guard field.
 
 `fallback-plan` never runs the emitted argv. Inspect the JSON and explicitly decide whether to invoke it;
 the generated smoke still contains `--acknowledge-billable`. At action time the smoke re-reads the config
-and executable and revalidates the source mount and target marker before any agent spawn. Any drift fails
-closed. Because the guarded target is already proven to be unsandboxed ACP, that smoke does not call the
-container runtime for recovery or run-end cleanup. Never reconstruct or omit the generated guard flags by
-hand, and never treat a fixed `PONG` as a retry/resume of the original task.
+and executable and revalidates exact cwd identity, source-mount containment, and the target marker before
+any agent spawn. Same-mount symlink/sibling replacement fails closed. Because the guarded target is
+already proven to be unsandboxed ACP, that smoke does not call the container runtime for recovery or
+run-end cleanup and records the backstop as `not_needed`. Never reconstruct or omit the generated guard
+flags by hand, and never treat a fixed `PONG` as a retry/resume of the original task.
 
 ## 5. Inspect / clean up containers
 

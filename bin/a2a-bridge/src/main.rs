@@ -179,6 +179,7 @@ usage: a2a-bridge smoke --agent <id> --config <path> --acknowledge-billable
                         [--include-redacted-stderr] [--out <path>]
                         [--expected-config-sha256 <hex>
                          --expected-executable-sha256 <hex>
+                         --expected-session-cwd <canonical-repo>
                          --fallback-source-agent <id>
                          --require-host-fallback-eligible]
 

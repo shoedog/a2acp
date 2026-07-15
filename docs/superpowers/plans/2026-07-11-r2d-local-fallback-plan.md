@@ -1,15 +1,16 @@
 # R2d — Local non-billable fallback-plan implementation plan
 
-- **Status:** IN REVIEW — initial and closure Sol/xhigh reviews returned `REVISE`; both folds are applied
-  in the working tree; full deterministic gates are green; final closure remains
+- **Status:** IN REVIEW — the initial review and closure re-reviews 1–2 returned `REVISE`; the v17 fold
+  is applied in the working tree; focused and full deterministic gates are green; final closure remains
 - **Prerequisites:** R2b and R2c merged (`be54bc51`, PR #28)
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md),
-  v16
+  v17
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Branch:** `agent/reliability-r2d-fallback-plan`
 - **Initial reviewed candidate:** `b6424d725e56d1f3fde0b7c29b6057155d69dacd`
 - **Closure re-review 1 candidate:** `0b05c409cbbf9441348b2719a537f8f4978216a3` — `REVISE`
+- **Closure re-review 2 candidate:** `c8d17b2acbe3b113ce8fcdbce243ea2e08561141` — `REVISE`
 
 R2d answers one local operator question: given complete failed R2c smoke evidence from a read-only
 container attempt, may an explicitly named host agent be proposed for a new trusted-own-repo read-only
@@ -75,7 +76,20 @@ Closure re-review 1 ran through the candidate bridge with `gpt-5.6-sol`/`xhigh` 
 5. additionally narrows broad source mounts to the explicit trusted repo and skips all container
    recovery/sweeping for the guarded unsandboxed host smoke.
 
-No Fable, Claude, retry, fallback, live provider turn, or real container was used in either review/fold.
+Closure re-review 2 ran through the candidate bridge with `gpt-5.6-sol`/`xhigh` against exact
+`c8d17b2acbe3b113ce8fcdbce243ea2e08561141`. It adjudicated all six requested v16 findings `FIXED`, found
+no `SMELL`, found four new `WRONG` items, and returned `REVISE`. The v17 fold:
+
+1. adds `--expected-session-cwd` to the closed action guard and rejects same-mount symlink/sibling swaps;
+2. requires the lifecycle failure to equal the complete outer `FailureDiagnostic`, not five identity
+   fields;
+3. applies the exact bridge-known credential sanitizer to every provenance detail/remedy plus structured
+   request/effective model and mode fields; and
+4. threads whether a run-scoped backstop exists into cleanup evidence, so guarded host artifacts report
+   `not_needed` rather than a sweep that intentionally did not run.
+
+No Fable, Claude, Haiku, retry, fallback, live provider turn, or real container was used in the three
+reviews/folds.
 
 ## Implementation sequence and restart contract
 
@@ -148,6 +162,7 @@ The generated argv includes, as one closed set:
 ```text
 --expected-config-sha256 <hex>
 --expected-executable-sha256 <hex>
+--expected-session-cwd <canonical-repo>
 --fallback-source-agent <container-agent-id>
 --require-host-fallback-eligible
 ```
@@ -155,9 +170,10 @@ The generated argv includes, as one closed set:
 It also contains the current absolute candidate executable, canonical config path, exact operator-supplied
 trusted repo as `--session-cwd`, and `--acknowledge-billable`. The planner never invokes it. When an
 operator later does, smoke re-reads the bounded regular config/executable and revalidates source
-mode/mount containment and the target marker before registry resolution/spawn. A guarded target cannot
-spawn containers, so smoke skips container orphan recovery and the run-end sweep. Any drift emits a failed
-smoke-v2 artifact and no agent process is started.
+mode/mount containment, exact planned cwd identity, and the target marker before registry
+resolution/spawn. A guarded target cannot spawn containers, so smoke skips container orphan recovery and
+the run-end sweep and truthfully records that backstop as `not_needed`. Any drift emits a failed smoke-v2
+artifact and no agent process is started.
 
 ## Pre-change-failing and edge regressions
 
@@ -168,18 +184,21 @@ smoke-v2 artifact and no agent process is started.
   lifecycle, dropped events, prompt-start race, timeout, success, malformed, legacy, task envelope,
   oversized source, controls, quotes, and schema mismatch;
 - config, executable, and source-mount drift between plan and action, all before target spawn;
+- same-mount trusted-cwd symlink/sibling replacement between planning and action;
+- complete lifecycle-failure equality, including summary/stderr/cause metadata rather than partial
+  identity matching;
+- known-credential injection through provenance detail/remedy and structured model/mode fields;
 - regular-file exact hash plus symlink, FIFO, device, socket, and descriptor/path replacement rejection;
 - anonymous volume acceptance, `~/` rejection, option-like runtime/image/network rejection, wrong
   credential file/directory/anonymous/named-volume types, and shared doctor/Claude-preflight parsing;
 - inner container-like text remains non-evidence, launch errors retain their original diagnosis, normal
   container cleanup still occurs, and guarded host smoke invokes no degraded runtime maintenance.
 
-Current v16 focused evidence is planner CLI **19 / 0**, smoke units **19 / 0**, smoke CLI **11 / 0**,
-doctor **55 / 0**, Claude credential preflight **1 / 0**, and sandbox tests **27 / 0**.
+Current v17 focused evidence is planner CLI **20 / 0** and smoke units **20 / 0**.
 
-The exact v16 working fold also passes:
+The exact v17 working fold also passes:
 
-- full serial workspace: **1,969 passed / 0 failed / 12 ignored** across 69 test/doc-test executables;
+- full serial workspace: **1,971 passed / 0 failed / 12 ignored** across 69 test/doc-test executables;
 - format check and `git diff --check`: clean;
 - workspace all-target check and warnings-denied all-target Clippy: clean;
 - release `a2a-bridge` binary build: clean;
@@ -189,9 +208,9 @@ The exact v16 working fold also passes:
 
 ## Completion boundary
 
-Freeze and commit the fully gated v16 fold, then run one Sol/xhigh
-closure re-review that adjudicates the four closure findings and the two adjacent hardening fixes. Do not
-use Fable or Claude for this closure under the current constrained usage windows. Do not run a
+Freeze and commit the fully gated v17 fold, then run one Sol/xhigh closure re-review that
+adjudicates the four closure-re-review-2 findings and the adjacent structured model/mode secrecy fix. Do
+not use Fable or Claude for this closure under the current constrained usage windows. Do not run a
 live/billable smoke: R2d behavior is proven by deterministic pre-spawn fixtures, and the R2c live result
 remains historical evidence only.
 

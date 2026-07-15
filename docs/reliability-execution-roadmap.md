@@ -5,13 +5,14 @@
 - **Completed through:** R2c **MERGED** at `be54bc51`; its fixed candidate passed the explicitly
   authorized artifact-exact host-Codex lane before merge
 - **Active slice:** R2d **IN REVIEW** on `agent/reliability-r2d-fallback-plan`
-- **Current exact R2d deterministic gate:** the v16 working fold passes fallback-plan CLI **19 / 0** and
-  the full serial workspace at **1,969 / 0 / 12 ignored** across 69 test/doc-test executables. Format/diff,
-  workspace/all-target check, warnings-denied Clippy, release build, and repository hygiene **37/7** are
-  clean
-- **Review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` review of `b6424d7` and closure
-  re-review 1 of exact `0b05c409` both returned `REVISE`. The current working fold closes the latter's
-  four findings plus exact-cwd and degraded-runtime hardening. Fable and Claude are not planned under the
+- **Current exact R2d deterministic gate:** the v17 working fold passes fallback-plan CLI **20 / 0** and
+  smoke units **20 / 0**, plus the full serial workspace at **1,971 / 0 / 12 ignored** across 69
+  test/doc-test executables. Format/diff, all-target check, warnings-denied Clippy, release build, and
+  repository hygiene **37/7** are clean
+- **Review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` review of `b6424d7`, closure
+  re-review 1 of `0b05c409`, and closure re-review 2 of `c8d17b2` all returned `REVISE`. Re-review 2
+  adjudicated all six requested findings `FIXED`, found four new `WRONG` items and no `SMELL`; v17 folds
+  all four plus adjacent structured model/mode secrecy. Fable and Claude are not planned under the
   constrained usage windows
 - **Last merged full workspace gate:** R2c host serial **1,933 / 0 / 12 ignored** across 68 executables;
   workspace/all-target check, warnings-denied Clippy, release build, and repository hygiene **37/7** clean
@@ -19,7 +20,7 @@
   initial `0644` artifact; after reviewed create-new hardening, separately authorized attempt 2 on
   `1c9e4a43` passed in 8.770 seconds with a `0600` artifact, exact terminal `PONG`, no tools/retry/fallback,
   and completed teardown
-- **Next action:** freeze/commit the v16 fold, run one Sol/xhigh closure re-review,
+- **Next action:** freeze/commit the v17 fold, run one Sol/xhigh closure re-review,
   fold only actionable closure findings if any, then open a non-draft PR; do not start R3 or R2e here
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -63,7 +64,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2b2 — ACP/Fable lifecycle diagnostics | **MERGED** at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
 | R2b3 — API/container diagnostics | **MERGED** at `afcc856c` (affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–3 `REVISE`; four review folds; closure re-review 4 `APPROVE` at `492946c`; final status re-review `APPROVE` at `afcc856c`) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
-| R2d — fallback plan | **IN REVIEW** on `agent/reliability-r2d-fallback-plan` (initial review `REVISE`; closure re-review 1 of `0b05c409` `REVISE`; v16 full workspace **1,969 / 0 / 12 ignored**, hygiene **37/7**; final closure pending) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; genuine complete smoke-v2/current-config evidence; independently supplied exact trusted cwd within current source mount; action-time config/executable/source/target guard; guarded host smoke never consults the degraded runtime. |
+| R2d — fallback plan | **IN REVIEW** on `agent/reliability-r2d-fallback-plan` (initial review and closure re-reviews 1–2 `REVISE`; v17 planner/smoke units **20/0** each; full workspace **1,971 / 0 / 12 ignored**, hygiene **37/7**; final closure pending) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config evidence; exact trusted cwd identity within current source mount; action-time config/executable/cwd/source/target guard; guarded host smoke never consults the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
 | R3 — compatibility canaries | **NOT STARTED** | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | Local manifest/runner first; scheduling requires runner/credential owner. |
@@ -219,19 +220,22 @@ Next action:
   and never resolves, spawns, prompts, performs network/runtime probes, or executes its output.
 - An eligible output is a new distinct fixed-PONG verification smoke, not an original-task retry. Its
   absolute candidate-binary argv is guarded by executable/config SHA-256, source agent/mount/mode, and
-  the target's current eligibility marker. The later smoke revalidates the closed guard before spawn and,
-  because the target is unsandboxed ACP, performs no container recovery/sweep; drift fails closed.
+  the target's current eligibility marker plus the exact plan-time canonical cwd. The later smoke
+  revalidates the closed guard before spawn and, because the target is unsandboxed ACP, performs no
+  container recovery/sweep and records that backstop as `not_needed`; drift fails closed.
   Source/config/executable reads reject symlink, FIFO, device, socket, oversized, and descriptor/path
   replacement inputs. Absolute host, named, and anonymous volume forms share one grammar; `~/` is rejected
   because direct runtime argv does not expand it. External post-failure probes were removed.
 - The initial bridge-mediated Sol/xhigh review of exact `b6424d725e56d1f3fde0b7c29b6057155d69dacd`
   returned `REVISE` with the nine findings recorded in the R2d plan and design v15; closure re-review 1 of
   exact `0b05c409cbbf9441348b2719a537f8f4978216a3` also returned `REVISE` with four new findings. Design v16
-  and the working fold close them plus exact-cwd/runtime-dependency hardening. Planner CLI passes **19/0**;
-  the full serial workspace passes **1,969/0/12 ignored** across 69 executables; format/diff, all-target
-  check, warnings-denied Clippy, release build, and hygiene **37/7** are clean. Final Sol/xhigh closure
-  remains before `APPROVED / PENDING MERGE`. No Fable, Claude, live, billable, or real-container turn ran
-  or is planned.
+  closed them plus exact-cwd/runtime-dependency hardening and passed full gates at reviewed candidate
+  `c8d17b2`, but closure re-review 2 returned `REVISE` with exact-cwd identity, full-diagnostic equality,
+  provenance secrecy, and cleanup-evidence findings. Design v17 folds all four plus adjacent structured
+  model/mode secrecy; planner and smoke units pass **20/0** each, the full workspace passes
+  **1,971/0/12 ignored** across 69 executables, and format/diff, check, warnings-denied Clippy, release,
+  and hygiene **37/7** are clean. Final Sol/xhigh closure remains before `APPROVED / PENDING MERGE`. No
+  Fable, Claude, Haiku, live, billable, or real-container turn ran or is planned.
 
 - R2b3 is implemented at `ed172ee726c06c3ee2e3f363c80178d367f8834a` with four review folds on
   `agent/reliability-r2b3-api-container`, based on `origin/main` at

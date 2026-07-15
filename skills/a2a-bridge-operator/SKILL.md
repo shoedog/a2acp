@@ -102,12 +102,14 @@ evidence, any prompt barrier, source/config drift, write-capable sources, and no
 An eligible schema-v2 plan emits an absolute candidate-binary argv for a **new distinct fixed-PONG
 verification smoke**. The separately supplied trusted cwd must be an existing canonical directory, must
 exactly match the artifact-reported cwd as evidence, and must remain under the current canonical source
-mount. Only that exact operator-selected directory enters argv. The plan binds the later smoke to the
-config SHA-256, executable SHA-256, source agent/mount/mode, and target marker. The later smoke rechecks
-the closed guard before spawn and, because its target is already proven unsandboxed ACP, performs no
-container recovery or run-end sweep. Inspect the plan and invoke it only as a separate explicit billable
-operator action; never strip/reconstruct its guard flags, call it a retry of the original task, or infer
-that fixed `PONG` proves the original arbitrary prompt would succeed.
+mount. Only that exact operator-selected directory enters argv, and its plan-time canonical value is a
+separate closed-set guard field. The plan binds the later smoke to the config SHA-256, executable SHA-256,
+exact cwd identity, source agent/mount/mode, and target marker. The later smoke rechecks the closed guard
+before spawn; same-mount symlink/sibling replacement fails closed. Because its target is already proven
+unsandboxed ACP, it performs no container recovery or run-end sweep and records the backstop as
+`not_needed`. Inspect the plan and invoke it only as a separate explicit billable operator action; never
+strip/reconstruct its guard flags, call it a retry of the original task, or infer that fixed `PONG` proves
+the original arbitrary prompt would succeed.
 
 When an agent runtime launches the command, distinguish its managed sandbox from approved host
 execution. A sandboxed ACP failure does not prove that the computer lacks DNS, egress, or authentication;
