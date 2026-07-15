@@ -3,9 +3,10 @@
 - **Status:** R2a, R2b0, and R2b1 merged; R2b2 in progress; v13 is the design of record for R2b2–R2b3
 - **R2b2 review state:** R2b2d closure review 12 `APPROVE` at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; final full-R2b2 review 1 `REVISE`; cold-path fold
-  `a459b31de5a4665138a7330868e38dfb8992438b`; exact six-package gate **1,096 / 0 / 0 ignored**; full host
-  workspace suite **1,812 / 0 / 12 ignored**; repository hygiene **37** tracked artifacts / **7** validated
-  example configs; fresh full-R2b2 re-review pending
+  `a459b31de5a4665138a7330868e38dfb8992438b`; closure re-review 1 `REVISE`; retry-veto fold
+  `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`; exact six-package gate **1,100 / 0 / 0 ignored**; full host
+  workspace suite **1,816 / 0 / 12 ignored**; repository hygiene **37** tracked artifacts / **7** validated
+  example configs; closure re-review 2 pending
 - **Date:** 2026-07-11
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`
@@ -15,6 +16,7 @@
 - **R2b2c commit:** `40790720`
 - **R2b2d commit:** `14402f895a5eda2852684a8fbd35f83452e2645f`
 - **R2b2 final-review fold:** `a459b31de5a4665138a7330868e38dfb8992438b`
+- **R2b2 re-review-1 fold:** `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`
 - **Program:** [`docs/bridge-reliability.md`](../../bridge-reliability.md), R2
 - **Security boundary:** [`ADR-0032`](../../adr/0032-sandbox-tier-model.md)
 

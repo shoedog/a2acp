@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`, closure review 12 `APPROVE`; final review 1 `REVISE`, fold `a459b31`; exact **1,096 / 0 / 0**; full host workspace **1,812 / 0 / 12 ignored**; hygiene **37/7**; re-review pending); R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`, closure review 12 `APPROVE`; final review 1 `REVISE`, fold `a459b31`; re-review 1 `REVISE`, fold `e63d4d0`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**; re-review 2 pending); R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -623,6 +623,23 @@ R2b2d implementation handoff (review-approved branch commit based on
   workspace passes **1,812 / 0 / 12 ignored**. Format/diff, workspace/all-target check, warnings-denied
   workspace/all-target Clippy, workspace release build, and hygiene **37/7** are clean. No live/billable gate
   ran. Run a fresh full-R2b2 re-review; do not merge before approval.
+- Closure re-review 1 marked cold ready-result precedence and terminal disposition `FIXED`, but cleanup
+  `PARTIAL`: failed observed cleanup after a transient configure, prompt-open, or stream failure did not veto
+  attempt 2. Because registry invalidation retires the old slot asynchronously, a fresh slot could begin work
+  before partial Worktree cleanup settled. The reviewer also required mutation locks for all three transient
+  sites, non-transient configure and prompt-open cancellation cleanup, and Text/Permission benign-prefix
+  control checks.
+- Fold `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01` makes retry eligibility explicit on
+  `Attempt::Transient`: resolution errors remain retryable without a session, while every configured-session
+  transient retries only after observed cleanup succeeds. A cleanup error ends the current workflow after one
+  attempt while the original `AgentTimedOut` remains primary. Three independent tests were red as `Completed`
+  and now prove one resolution, one configure, at most one prompt, one Release, and one observer. Checked
+  prompt-open cancellation and non-transient configure tests plus Text/Permission/Usage controls complete the
+  negative matrix.
+- Workflow passes **86 / 0 / 0**; the exact six-package gate passes **1,100 / 0 / 0 ignored**; the host serial
+  workspace passes **1,816 / 0 / 12 ignored**. Format/diff, workspace/all-target check, warnings-denied
+  workspace/all-target Clippy, workspace release build, and hygiene **37/7** are clean. No live/billable gate
+  ran. Run closure re-review 2; do not merge before approval.
 
 ### Observation plumbing
 
