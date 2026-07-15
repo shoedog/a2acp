@@ -1,13 +1,14 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v14)
 
-- **Status:** R2a, R2b0, R2b1, and R2b2 merged; R2b3 IN PROGRESS on
+- **Status:** R2a, R2b0, R2b1, and R2b2 merged; R2b3 APPROVED / PENDING MERGE on
   `agent/reliability-r2b3-api-container` from `2e9ed640`; v14 is the design of record for R2b3
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
   and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,
   full host workspace **1,896 / 0 / 12 ignored** across 66 executables, all-target check,
-  warnings-denied Clippy, release build, format/diff, and hygiene **37/7**; closure re-review 4 is pending.
-  No R2c smoke ran.
+  warnings-denied Clippy, release build, format/diff, and hygiene **37/7**. Closure re-review 4 adjudicated
+  all three inherited findings `FIXED`, found no new `WRONG` or `SMELL`, and returned `APPROVE` on
+  `492946cbb28ec624aa6b43a9a059581ef5f84538`. No R2c smoke ran.
 - **R2b2 review state:** R2b2d closure review 12 `APPROVE` at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; final full-R2b2 review 1 `REVISE`; cold-path fold
   `a459b31de5a4665138a7330868e38dfb8992438b`; closure re-review 1 `REVISE`; retry-veto fold

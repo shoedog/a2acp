@@ -4,19 +4,20 @@
 - **R2b2 merge head:** `main` at `0627e911` on 2026-07-12
 - **Completed through:** R2b2 **MERGED** at `0627e911` after final folds `a459b31` and `e63d4d0` and
   closure re-review 2 `APPROVE` at `0c0e3fe`
-- **Active slice:** R2b3 **IN PROGRESS** on `agent/reliability-r2b3-api-container`, based on
+- **Active slice:** R2b3 **APPROVED / PENDING MERGE** on `agent/reliability-r2b3-api-container`, based on
   `2e9ed6408162c5af760c70c9d27237330429e81a`
 - **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
 - **Current exact R2b3 gate:** **602 / 0 / 1 ignored** across `bridge-acp`, `bridge-api`,
   `bridge-container`, and `bridge-core`; format/diff clean
 - **Review state:** initial review and fresh Sol/xhigh closure re-reviews 1–3 returned `REVISE`; four
-  review folds are committed on the branch head, with the fourth addressing shared ACP process ownership,
-  raw duplicate JSON, and checked-release race coverage
+  review folds are committed, and closure re-review 4 returned `APPROVE` on exact head
+  `492946cbb28ec624aa6b43a9a059581ef5f84538`
 - **Full workspace gate:** the fourth-fold tree passes host serial **1,896 / 0 / 12 ignored** across 66
   executables; workspace/all-target check, warnings-denied Clippy, release build, and repository hygiene
   **37/7** are clean
 - **Current execution boundary:** no R2c live/billable smoke ran; no docs-link checker is present
-- **Next action:** run fresh full-branch Sol/xhigh closure re-review 4 before proposing merge
+- **Next action:** run one final Sol/xhigh consistency review of this approval-recording docs fold, then
+  merge R2b3 and advance the cursor to R2c
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -57,7 +58,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
 | R2b2 — ACP/Fable lifecycle diagnostics | **MERGED** at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
-| R2b3 — API/container diagnostics | **IN PROGRESS** on `agent/reliability-r2b3-api-container`; affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–3 `REVISE`; four committed review folds; closure re-review 4 pending | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
+| R2b3 — API/container diagnostics | **APPROVED / PENDING MERGE** on `agent/reliability-r2b3-api-container`; affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–3 `REVISE`; four committed review folds; closure re-review 4 `APPROVE` at `492946c` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
@@ -83,9 +84,9 @@ meaningful-progress evidence, false-positive controls for silent long tests, a s
 process-tree identity, and a bounded takeover artifact. Do not use file mtime or process existence alone,
 do not broad-kill by process name, and do not auto-start a duplicate billable attempt.
 
-Allowed status values are `NOT STARTED`, `IN PROGRESS`, `IN REVIEW`, `MERGED`, `BLOCKED`, and
-`DEFERRED`. Update this table in the same PR that changes a slice status. Never mark `MERGED` from a
-local commit or open PR.
+Allowed status values are `NOT STARTED`, `IN PROGRESS`, `IN REVIEW`, `APPROVED / PENDING MERGE`,
+`MERGED`, `BLOCKED`, and `DEFERRED`. Update this table in the same PR that changes a slice status. Never
+mark `MERGED` from a local commit or open PR.
 
 ## Resume protocol for a new session
 
@@ -271,8 +272,13 @@ Next action:
   Ollama test, container 53, core 278), and host serial workspace passes **1,896 / 0 / 12 ignored** across
   66 test/doc-test executables. Workspace/all-target check, warnings-denied all-target Clippy, release
   build, format/diff, and repository hygiene (**37** tracked artifacts / **7** validated example configs)
-  are clean. Run fresh Sol/xhigh closure re-review 4. Do not run R2c smoke or
-  merge yet.
+  are clean.
+- Fresh bridge-mediated Sol/xhigh closure re-review 4 on
+  `492946cbb28ec624aa6b43a9a059581ef5f84538` adjudicated all three inherited findings `FIXED`, found no
+  new `WRONG` or `SMELL`, and returned `APPROVE`. It accepted the supplied exact-tree gates rather than
+  rerunning them and confirmed no R2c/R2d/parked-issue scope entered the branch. Run one final read-only
+  consistency review of the approval-recording docs fold, then merge; do not run R2c smoke before its
+  separately authorized bounded slice.
 - `origin/main` contains R2b2 at `0627e91144e79d9328ed9b5635033cf410c9e96e`. R2b2d was approved at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; the final full-branch review fold is committed at
   `a459b31de5a4665138a7330868e38dfb8992438b`, and the re-review-1 fold at

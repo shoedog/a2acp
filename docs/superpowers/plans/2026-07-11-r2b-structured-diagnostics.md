@@ -1,8 +1,8 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 IN PROGRESS on `agent/reliability-r2b3-api-container` from `2e9ed640` (initial review and closure re-reviews 1–3 `REVISE`; four committed review folds; affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; closure re-review 4 pending)
-- **Current execution boundary:** no R2c live/billable smoke ran; run a fresh full-branch closure
-  re-review; no docs-link checker is present
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 APPROVED / PENDING MERGE on `agent/reliability-r2b3-api-container` from `2e9ed640` (initial review and closure re-reviews 1–3 `REVISE`; four committed review folds; closure re-review 4 `APPROVE` at `492946c`; affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**)
+- **Current execution boundary:** no R2c live/billable smoke ran; run one final read-only consistency review
+  of the approval-recording docs fold, then merge R2b3; no docs-link checker is present
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -936,8 +936,12 @@ automatically.
   ignored local Ollama case, container 53, and core 278. The full host workspace passes serial
   **1,896 / 0 / 12 ignored** across 66 test/doc-test executables. Workspace/all-target check,
   warnings-denied all-target Clippy, release binary build, format/diff, and repository hygiene **37/7**
-  are clean. Request closure re-review 4. No R2c live/billable smoke has run, and no docs-link checker is
-  present.
+  are clean.
+- Fresh bridge-mediated Sol/xhigh closure re-review 4 on
+  `492946cbb28ec624aa6b43a9a059581ef5f84538` adjudicated the shared-process `WRONG/BLOCKER`, raw-JSON
+  `WRONG/MINOR`, and release-race `SMELL/MINOR` as `FIXED`; it found no new findings and returned
+  `APPROVE`. It accepted the supplied gates rather than rerunning them. No R2c live/billable smoke has run,
+  and no docs-link checker is present. Run one final status-only consistency review, then merge R2b3.
 
 ## R2b completion gate
 
