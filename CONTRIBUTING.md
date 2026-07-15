@@ -10,6 +10,26 @@ support commitments, no SLAs, and no API/config stability guarantees pre-1.0**.
 Breaking changes land when the design needs them (each significant one is recorded in
 `docs/adr/`).
 
+## Issue intake and lifecycle
+
+GitHub Issues are the canonical intake for bugs, compatibility regressions,
+enhancements, and agent wedge incidents. Choose the matching structured form and
+provide the smallest safe reproduction or outcome statement it requests. Do not put
+secrets, credentials, private prompts, sensitive logs, or security vulnerabilities in
+a public issue; use the repository's private security-advisory link for vulnerabilities.
+
+Labels are orthogonal. A form applies only its `kind:*` label and `status:triage`;
+maintainers separately classify `area:*`, `priority:*`, lifecycle `status:*`, and
+`environment:*` after reviewing the evidence. Existing GitHub default labels remain
+available for compatibility with earlier issues and pull requests.
+
+Once work is accepted or scheduled, maintainers link the issue to the applicable
+reliability-roadmap increment, design, or implementation plan. Pull requests should
+close the canonical issue with a [supported closing
+keyword](https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue),
+include regression and edge-case tests for changed behavior, and record the review and
+verification evidence needed by that increment.
+
 ## Contributor License Agreement (required)
 
 All contributions require signing the [Individual CLA](CLA.md). It grants the project

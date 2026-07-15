@@ -1,0 +1,83 @@
+labels:
+  - name: "kind:bug"
+    color: "d73a4a"
+    description: Reproducible incorrect behavior.
+  - name: "kind:compatibility"
+    color: "b60205"
+    description: Regression caused by an agent, provider, protocol, model, or dependency change.
+  - name: "kind:enhancement"
+    color: "a2eeef"
+    description: New capability or material improvement.
+  - name: "kind:wedge"
+    color: "5319e7"
+    description: Stalled run, parked agent, missing termination, or lifecycle leak.
+
+  - name: "area:acp"
+    color: "1d76db"
+    description: ACP protocol, adapter, provider, or agent integration.
+  - name: "area:workflow"
+    color: "1d76db"
+    description: Workflow scheduling, execution, resume, or terminal semantics.
+  - name: "area:container"
+    color: "1d76db"
+    description: Managed container lifecycle, isolation, egress, or credentials.
+  - name: "area:cli"
+    color: "1d76db"
+    description: Command-line interface and operator output.
+  - name: "area:model-compatibility"
+    color: "1d76db"
+    description: Model discovery, selection, effort, or release compatibility.
+  - name: "area:docs"
+    color: "1d76db"
+    description: Documentation, examples, skills, or agent instructions.
+  - name: "area:release"
+    color: "1d76db"
+    description: Packaging, images, versioning, or release automation.
+  - name: "area:repository"
+    color: "1d76db"
+    description: Repository policy, issue intake, CI, or contributor automation.
+
+  - name: "priority:p0"
+    color: "b60205"
+    description: Active critical incident or safety/data-loss risk.
+  - name: "priority:p1"
+    color: "d93f0b"
+    description: High-impact reliability or compatibility failure.
+  - name: "priority:p2"
+    color: "fbca04"
+    description: Normal planned work.
+  - name: "priority:p3"
+    color: "c2e0c6"
+    description: Low urgency or opportunistic improvement.
+
+  - name: "status:triage"
+    color: "ededed"
+    description: Awaiting reproduction, classification, or maintainer decision.
+  - name: "status:needs-info"
+    color: "d4c5f9"
+    description: More evidence or reporter input is required.
+  - name: "status:accepted"
+    color: "0e8a16"
+    description: Scope and outcome are accepted, but not yet scheduled.
+  - name: "status:scheduled"
+    color: "0052cc"
+    description: Linked to an active roadmap increment or implementation plan.
+  - name: "status:in-progress"
+    color: "006b75"
+    description: Implementation or investigation is active.
+  - name: "status:blocked"
+    color: "e99695"
+    description: Cannot progress until a named dependency or condition changes.
+
+  - name: "environment:host"
+    color: "bfdadc"
+    description: Reproduces in host or non-container execution.
+  - name: "environment:container"
+    color: "bfdadc"
+    description: Reproduces in a managed container.
+  - name: "environment:ci"
+    color: "bfdadc"
+    description: Reproduces in continuous integration or automation.
+  - name: "environment:mixed"
+    color: "bfdadc"
+    description: Reproduces across more than one execution environment.
