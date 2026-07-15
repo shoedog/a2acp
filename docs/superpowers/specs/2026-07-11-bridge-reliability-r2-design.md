@@ -6,7 +6,8 @@
   `a459b31de5a4665138a7330868e38dfb8992438b`; closure re-review 1 `REVISE`; retry-veto fold
   `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`; exact six-package gate **1,100 / 0 / 0 ignored**; full host
   workspace suite **1,816 / 0 / 12 ignored**; repository hygiene **37** tracked artifacts / **7** validated
-  example configs; closure re-review 2 pending
+  example configs; fresh Sol/xhigh closure re-review 2 `APPROVE` at
+  `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; merge pending
 - **Date:** 2026-07-11
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`

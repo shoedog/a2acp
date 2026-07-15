@@ -2,12 +2,12 @@
 
 - **Program status:** active P0
 - **R2b1 implementation baseline:** `main` at `7b788c1f` on 2026-07-12
-- **Completed through:** R2b2d (`14402f8`) plus final-review folds `a459b31` and `e63d4d0`
+- **Completed through:** R2b2 implementation and closure re-review 2 `APPROVE` at `0c0e3fe`
 - **Current exact gate:** **1,100 / 0 / 0 ignored** across the six affected packages; format/diff,
   workspace/all-target check, warnings-denied Clippy, and release build clean
 - **Full workspace gate:** host serial **1,816 / 0 / 12 ignored**; repository hygiene **37** tracked
   artifacts / **7** validated example configs
-- **Next action:** run full-R2b2 closure re-review 2 of the `e63d4d0` fold before merge
+- **Next action:** merge R2b2 to `main`, then begin independently reviewed R2b3
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -47,7 +47,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
-| R2b2 — ACP/Fable lifecycle diagnostics | **IN PROGRESS** (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`, closure review 12 `APPROVE`; final review 1 `REVISE`, fold `a459b31`; re-review 1 `REVISE`, fold `e63d4d0`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**; re-review 2 pending) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
+| R2b2 — ACP/Fable lifecycle diagnostics | **IN REVIEW** (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**; merge pending) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
 | R2b3 — API/container diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
@@ -200,7 +200,8 @@ Next action:
   `agent/reliability-r2b2-acp-lifecycle`. R2b2d is review-approved, committed, and pushed at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; the final full-branch review fold is committed at
   `a459b31de5a4665138a7330868e38dfb8992438b`, and the re-review-1 fold at
-  `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`, with re-review 2 pending.
+  `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`. Fresh Sol/xhigh closure re-review 2 returned `APPROVE`
+  on published head `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; merge is pending.
 - R2b0's full local suite was 1,607 passed / 0 failed / 12 ignored live-agent tests.
 - A fresh bridge-mediated Fable/xhigh review returned `R2A: READY`, `V6 DESIGN: READY`, `MERGE`.
 - The Podman bare image-id normalization and non-vacuous descendant survivor-marker regression were
@@ -536,3 +537,9 @@ Next action:
   **1,816 / 0 / 12 ignored**. Format/diff, workspace/all-target check, warnings-denied workspace/all-target
   Clippy, workspace release build, and hygiene **37/7** are clean. No live/billable gate ran. Run full-R2b2
   closure re-review 2 before merge.
+- Fresh Sol/xhigh closure re-review 2 inspected every line in the retry-veto fold plus the relevant trait,
+  registry, Worktree, retry, terminal, and test surfaces. It adjudicated the transient-cleanup
+  `WRONG/MAJOR` and branch-completeness `SMELL/MAJOR` `FIXED`, confirmed the earlier ready-result and terminal
+  folds remain closed, found no new findings, and returned `APPROVE`. The retained Git-fixture and bounded-yield
+  debts remain minor. Exact published head was `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; no live/billable gate
+  ran. Merge R2b2, then begin R2b3.

@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN PROGRESS (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`, closure review 12 `APPROVE`; final review 1 `REVISE`, fold `a459b31`; re-review 1 `REVISE`, fold `e63d4d0`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**; re-review 2 pending); R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN REVIEW (merge pending; 2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 NOT STARTED
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -640,6 +640,12 @@ R2b2d implementation handoff (review-approved branch commit based on
   workspace passes **1,816 / 0 / 12 ignored**. Format/diff, workspace/all-target check, warnings-denied
   workspace/all-target Clippy, workspace release build, and hygiene **37/7** are clean. No live/billable gate
   ran. Run closure re-review 2; do not merge before approval.
+- Fresh Sol/xhigh closure re-review 2 adjudicated the transient-cleanup `WRONG/MAJOR` and coverage
+  `SMELL/MAJOR` `FIXED`. It confirmed resolve-only retry remains eligible, configured-session retry now
+  requires successful observed cleanup, the original transient failure stays primary, all requested mutation
+  controls are live, and the prior ready-result/terminal folds remain closed. It found no new findings and
+  returned `APPROVE` on published head `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`. Merge R2b2, then begin
+  R2b3.
 
 ### Observation plumbing
 
