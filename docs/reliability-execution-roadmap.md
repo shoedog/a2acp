@@ -1,24 +1,27 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **R2b3 merge head:** `origin/main` at `afcc856c3276fe682fb78dc657591021f5e604fc` on 2026-07-15
+- **Current main base:** `origin/main` at `14b69bb2` on 2026-07-15 (PR #26 merged; model-probe
+  failures retained)
 - **Completed through:** R2b3 **MERGED** at `afcc856c` after closure re-review 4 `APPROVE` on
   `492946cb` and final status re-review `APPROVE` on the merge head
-- **Active slice:** R2c **NOT STARTED**; its one bounded billable turn requires explicit operator
-  authorization and must not retry
+- **Active slice:** R2c **APPROVED / PENDING MERGE** on `agent/reliability-r2c-live-smoke`; the fixed
+  candidate passed its explicitly authorized artifact-exact host-Codex lane
 - **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
-- **Current exact R2b3 gate:** **602 / 0 / 1 ignored** across `bridge-acp`, `bridge-api`,
-  `bridge-container`, and `bridge-core`; format/diff clean
-- **Review state:** initial review and fresh Sol/xhigh closure re-reviews 1–3 returned `REVISE`; four
-  review folds are committed; closure re-review 4 returned `APPROVE` on `492946cb`; the first status-only
-  review returned `REVISE` on `15a5ed97`, and the corrected status re-review returned `APPROVE` on merge
-  head `afcc856c`
-- **Full workspace gate:** the fourth-fold tree passes host serial **1,896 / 0 / 12 ignored** across 66
-  executables; workspace/all-target check, warnings-denied Clippy, release build, and repository hygiene
-  **37/7** are clean
-- **Current execution boundary:** no R2c live/billable smoke ran; no docs-link checker is present
-- **Next action:** await explicit operator authorization, then execute exactly one R2c live-smoke turn
-  from its plan with no retry
+- **Current exact R2c deterministic gate:** smoke unit **19 / 0 / 0 ignored**, smoke CLI **11 / 0 / 0
+  ignored**, and `bridge-api` **59 / 0 / 1 ignored**; format/diff clean
+- **Review state:** initial bridge-mediated Fable/xhigh review returned `REVISE` on `a2946bc` with two
+  `WRONG/MAJOR`, one `WRONG/MINOR`, and three `SMELL/MINOR`; closure re-review returned `APPROVE` on
+  `0e3b8ce`; permission-fold review returned `APPROVE` on `23384622`; its concrete inode-reuse/link risks
+  are folded with create-new refusal, and targeted closure review returned `APPROVE` on `ffb7e891`
+- **Full workspace gate:** the create-new artifact fold passes host serial **1,933 / 0 / 12 ignored**
+  across 68 executables; workspace/all-target check, warnings-denied Clippy, release build, and repository
+  hygiene **37/7** are clean
+- **Current execution boundary:** attempt 1 on `ce605eaf` passed provider/lifecycle but was rejected for an
+  initial `0644` artifact; after reviewed create-new hardening, separately authorized attempt 2 on
+  `1c9e4a43` passed in 8.770 seconds with a `0600` artifact, exact terminal `PONG`, no tools/retry/fallback,
+  and completed teardown
+- **Next action:** run final status/evidence review and open the non-draft R2c PR; after merge, begin R2d
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -37,7 +40,7 @@ R2a provenance (MERGED)
   -> R2b1 diagnostic types + rollback-safe persistence surface (MERGED)
   -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (MERGED)
   -> R2b3 API/provider mapping + remaining container/dispatch observation (MERGED)
-  -> R2c explicit one-turn billable smoke (NOT STARTED)
+  -> R2c explicit one-turn billable smoke (APPROVED / PENDING MERGE)
        -> R2d local non-billable fallback plan
        -> R3 compatibility manifest + pinned/floating canaries
             -> R4 reproducible dependency/image pins + release promotion gate
@@ -60,7 +63,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
 | R2b2 — ACP/Fable lifecycle diagnostics | **MERGED** at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
 | R2b3 — API/container diagnostics | **MERGED** at `afcc856c` (affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–3 `REVISE`; four review folds; closure re-review 4 `APPROVE` at `492946c`; final status re-review `APPROVE` at `afcc856c`) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
-| R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
+| R2c — live smoke | **APPROVED / PENDING MERGE** on `agent/reliability-r2c-live-smoke` (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
@@ -283,8 +286,8 @@ Next action:
   The amended `afcc856c` fold made the roadmap top, table, vocabulary, plan, and design agree on
   `APPROVED / PENDING MERGE`; it reran the same full/hygiene gates, and targeted Sol/xhigh re-review
   adjudicated the mismatch `FIXED`, found no new findings, and returned `APPROVE`. The branch was then
-  fast-forwarded and pushed to `origin/main` at `afcc856c3276fe682fb78dc657591021f5e604fc`. R2c remains
-  unrun and requires separate operator authorization.
+  fast-forwarded and pushed to `origin/main` at `afcc856c3276fe682fb78dc657591021f5e604fc`. At that R2b3
+  merge checkpoint, R2c was unrun and required separate operator authorization.
 - `origin/main` contains R2b3 at `afcc856c3276fe682fb78dc657591021f5e604fc`. R2b2d was approved at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; the final full-branch review fold is committed at
   `a459b31de5a4665138a7330868e38dfb8992438b`, and the re-review-1 fold at
@@ -592,8 +595,8 @@ Next action:
   (`PermissionDenied`) and two file-watch cases timed out. The identical host-level serial command then passed
   **1,806 / 0 / 12 ignored** across 64 terminal result groups, falsifying a branch regression. Repository
   hygiene passes with **37** tracked artifacts and **7** validated example configs. The Git command-fixture
-  limitation and bounded yield polling remain minor test-coverage follow-ups. No docs-link checker is present
-  and no live/billable gate has run.
+  limitation and bounded yield polling remain minor test-coverage follow-ups. At that R2b2 checkpoint, no
+  docs-link checker was present and no live/billable gate had run.
 - The first final full-R2b2 Max review inspected all 36 changed paths at published head `5917f175` and
   returned `REVISE` with two `WRONG/MAJOR` cold-workflow asymmetries. A successful cold turn could discard a
   result-bearing Worktree teardown failure and report `Completed`; separately, cancellation-first cold

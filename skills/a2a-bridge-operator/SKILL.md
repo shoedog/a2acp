@@ -50,6 +50,35 @@ a2a-bridge doctor --config /path/to/a2a-bridge.toml
 a2a-bridge models --config /path/to/a2a-bridge.toml --json
 ```
 
+For a minimal live compatibility probe, stop here until the implementation's deterministic timeout,
+artifact, redaction, and no-retry tests are green and the operator explicitly authorizes a billable turn.
+Then build and invoke the candidate artifact itself:
+
+```bash
+evidence_dir="$(mktemp -d /private/tmp/a2a-bridge-smoke.XXXXXX)"
+chmod 700 "$evidence_dir"
+cargo build --release --bin a2a-bridge
+./target/release/a2a-bridge smoke \
+  --agent <exact-configured-id> \
+  --config /absolute/path/to/a2a-bridge.toml \
+  --model <raw-advertised-id> --effort <advertised-level> \
+  --session-cwd /absolute/path/to/trusted-repo \
+  --timeout-secs 120 \
+  --acknowledge-billable \
+  --out "$evidence_dir/<lane>-smoke.json"
+```
+
+`smoke` sends one fixed `PONG` prompt and has no workflow, arbitrary prompt, retry, resume, provider
+routing, alias guessing beyond normal capability resolution, or host fallback. Missing acknowledgement
+refuses before config/registry/spawn work. Once argument and output preflight passes, a failed acknowledged
+attempt writes its artifact before nonzero exit; do not automatically rerun it because the artifact may show
+that prompt acceptance was possible.
+Use `--include-redacted-stderr` only when explicitly needed: it adds bounded opaque text labeled
+`best_effort`; default evidence retains stderr metadata without text. Without `--out`, stdout is reserved
+for the JSON artifact. An explicit output path must not already exist. On Unix, it is created owner-only as
+`0600` before agent resolution or spawn; an existing file/link or failure to apply that restriction is a
+pre-attempt refusal.
+
 When an agent runtime launches the command, distinguish its managed sandbox from approved host
 execution. A sandboxed ACP failure does not prove that the computer lacks DNS, egress, or authentication;
 repeat the exact minimal control through approved host execution before changing credentials, packages,

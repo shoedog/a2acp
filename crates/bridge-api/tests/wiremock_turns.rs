@@ -2,9 +2,10 @@ use bridge_api::{ApiBackend, ApiConfig};
 use bridge_core::domain::{Part, PermissionDecision, PermissionRequest, SessionContext};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::ports::{AgentBackend, PolicyEngine, Update};
+use bridge_core::orch::OrchEventKind;
+use bridge_core::ports::{AgentBackend, PolicyEngine, RichEventSink, Update};
 use futures::StreamExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -112,6 +113,68 @@ async fn tool_approve_path_executes_and_feeds_result() {
     assert_eq!(msgs[2]["role"], "tool");
     assert_eq!(msgs[2]["tool_call_id"], "call_1");
     assert_eq!(msgs[2]["content"], "2026-01-01T00:00:00Z");
+}
+
+#[derive(Default)]
+struct ToolEventCounter(Mutex<Vec<OrchEventKind>>);
+
+#[async_trait::async_trait]
+impl RichEventSink for ToolEventCounter {
+    fn record(&self, kind: OrchEventKind) {
+        if matches!(kind, OrchEventKind::ToolCall { .. }) {
+            self.0.lock().unwrap().push(kind);
+        }
+    }
+
+    async fn flush(&self) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn observed_api_prompt_reports_tool_request_before_followup() {
+    let server = MockServer::start().await;
+    let call1 = fixture_tool_sse();
+    let call2 = "data: {\"choices\":[{\"delta\":{\"content\":\"PONG\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("permission denied"))
+        .respond_with(sse(call2))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&call1))
+        .mount(&server)
+        .await;
+
+    let backend =
+        ApiBackend::new(ApiConfig::new(format!("{}/v1", server.uri()))).with_policy(Arc::new(Deny));
+    let sink = Arc::new(ToolEventCounter::default());
+    let sink_dyn: Arc<dyn RichEventSink> = sink.clone();
+    let mut stream = backend
+        .prompt_observed(
+            &SessionId::parse("observed-tool").unwrap(),
+            vec![Part { text: "hi".into() }],
+            sink_dyn,
+        )
+        .await
+        .unwrap();
+    while let Some(update) = stream.next().await {
+        update.unwrap();
+    }
+
+    {
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = serde_json::to_string(&events[0]).unwrap();
+        assert!(event.contains("api-tool-0-0"));
+        assert!(event.contains("API tool request"));
+        assert!(!event.contains("call_1"));
+        assert!(!event.contains("get_current_time"));
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 struct Deny;

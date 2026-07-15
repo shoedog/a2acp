@@ -150,8 +150,10 @@ impl ProcessStderrRing {
         });
     }
 
-    #[cfg(test)]
-    fn snapshot_since(&self, cursor: ProcessStderrCursor) -> ProcessStderrSnapshot {
+    /// Snapshot bounded lines after `cursor` for an operation that explicitly opted into
+    /// best-effort-redacted process text. Callers must keep the default diagnostic path on
+    /// [`Self::metadata_since`]. The ring has already applied exact-value and shape redaction.
+    pub fn best_effort_since(&self, cursor: ProcessStderrCursor) -> ProcessStderrSnapshot {
         self.snapshot_since_inner(cursor, true)
     }
 
@@ -208,8 +210,8 @@ impl ProcessStderrSnapshot {
         crate::diagnostics::StderrScope::Process
     }
 
-    #[cfg(test)]
-    fn retained_lines(&self) -> &[String] {
+    /// Bounded, already-redacted lines. Metadata-only snapshots return an empty slice.
+    pub fn retained_lines(&self) -> &[String] {
         &self.retained_lines
     }
 }
@@ -448,12 +450,12 @@ mod tests {
         assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("READY"));
 
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+            if ring.best_effort_since(ring.origin()).line_count() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(ring.snapshot_since(ring.origin()).line_count(), 1);
+        assert_eq!(ring.best_effort_since(ring.origin()).line_count(), 1);
         let cursor = ring.cursor();
 
         sup.child_mut()
@@ -465,13 +467,13 @@ mod tests {
             .unwrap();
         assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("DONE"));
         for _ in 0..100 {
-            if ring.snapshot_since(cursor).line_count() == 2 {
+            if ring.best_effort_since(cursor).line_count() == 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        let snapshot = ring.snapshot_since(cursor);
+        let snapshot = ring.best_effort_since(cursor);
         assert_eq!(snapshot.line_count(), 2);
         assert_eq!(snapshot.scope(), crate::diagnostics::StderrScope::Process);
         assert_eq!(snapshot.retained_lines(), &["new-a", "new-b"]);
@@ -491,13 +493,13 @@ mod tests {
         let ring = sup.stderr_ring();
         let _ = sup.child_mut().wait().await;
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 80 {
+            if ring.best_effort_since(ring.origin()).line_count() == 80 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        let snapshot = ring.snapshot_since(ring.origin());
+        let snapshot = ring.best_effort_since(ring.origin());
         assert_eq!(snapshot.line_count(), 80, "count includes evicted lines");
         assert_eq!(
             snapshot.retained_lines().len(),
@@ -532,12 +534,12 @@ mod tests {
         let _ = sup.child_mut().wait().await;
 
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+            if ring.best_effort_since(ring.origin()).line_count() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let snapshot = ring.snapshot_since(ring.origin());
+        let snapshot = ring.best_effort_since(ring.origin());
         assert_eq!(snapshot.line_count(), 1);
         assert_eq!(snapshot.retained_lines(), &["[REDACTED LINE]"]);
     }
@@ -556,13 +558,13 @@ mod tests {
         let ring = sup.stderr_ring();
         let _ = sup.child_mut().wait().await;
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+            if ring.best_effort_since(ring.origin()).line_count() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        let snapshot = ring.snapshot_since(ring.origin());
+        let snapshot = ring.best_effort_since(ring.origin());
         assert_eq!(snapshot.line_count(), 1);
         assert!(!snapshot.retained_lines()[0].contains(SECRET));
         assert!(snapshot.retained_lines()[0].contains("[REDACTED KNOWN SECRET]"));
@@ -588,7 +590,7 @@ mod tests {
         let mut stdout = BufReader::new(stdout).lines();
         assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("READY"));
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+            if ring.best_effort_since(ring.origin()).line_count() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -605,13 +607,13 @@ mod tests {
         assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("DONE"));
         let _ = sup.child_mut().wait().await;
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 2 {
+            if ring.best_effort_since(ring.origin()).line_count() == 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        let snapshot = ring.snapshot_since(ring.origin());
+        let snapshot = ring.best_effort_since(ring.origin());
         assert_eq!(snapshot.line_count(), 2);
         assert!(snapshot
             .retained_lines()
@@ -640,7 +642,7 @@ mod tests {
         let mut stdout = BufReader::new(stdout).lines();
         assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("READY"));
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 1 {
+            if ring.best_effort_since(ring.origin()).line_count() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -659,13 +661,13 @@ mod tests {
         assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("DONE"));
         let _ = sup.child_mut().wait().await;
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 2 {
+            if ring.best_effort_since(ring.origin()).line_count() == 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        let snapshot = ring.snapshot_since(ring.origin());
+        let snapshot = ring.best_effort_since(ring.origin());
         assert_eq!(snapshot.line_count(), 2);
         assert_eq!(
             snapshot.retained_lines(),
@@ -689,13 +691,13 @@ mod tests {
         let ring = sup.stderr_ring();
         let _ = sup.child_mut().wait().await;
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 3 {
+            if ring.best_effort_since(ring.origin()).line_count() == 3 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        let snapshot = ring.snapshot_since(ring.origin());
+        let snapshot = ring.best_effort_since(ring.origin());
         assert_eq!(snapshot.line_count(), 3);
         assert_eq!(snapshot.retained_lines()[0].len(), STDERR_LINE_MAX_BYTES);
         assert_eq!(snapshot.retained_lines()[1], "[REDACTED LINE]");
@@ -718,12 +720,12 @@ mod tests {
         let ring = sup.stderr_ring();
         let _ = sup.child_mut().wait().await;
         for _ in 0..100 {
-            if ring.snapshot_since(ring.origin()).line_count() == 20 {
+            if ring.best_effort_since(ring.origin()).line_count() == 20 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let snapshot = ring.snapshot_since(ring.origin());
+        let snapshot = ring.best_effort_since(ring.origin());
         assert_eq!(snapshot.line_count(), 20);
         assert_eq!(snapshot.scope(), crate::diagnostics::StderrScope::Process);
         assert!(snapshot

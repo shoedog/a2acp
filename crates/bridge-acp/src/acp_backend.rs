@@ -47,7 +47,7 @@ use bridge_core::diagnostics::{
     diagnostic_timestamp_ms, AuthenticationEvidenceInput, DiagnosticFailureClass,
     DiagnosticOperation, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
     FailureDiagnosticInput, FailureDisposition, PersistedPhaseTransition,
-    PersistedPhaseTransitionInput, PhaseStatus, StderrScope,
+    PersistedPhaseTransitionInput, PhaseStatus, StderrRedaction, StderrScope,
 };
 use bridge_core::domain::{
     EffectiveConfig, Effort, PermissionDecision, PermissionRequest, PermitDecision, SessionContext,
@@ -232,7 +232,19 @@ impl AcpLifecycle {
     fn stderr_snapshot(&self) -> Option<ProcessStderrSnapshot> {
         self.stderr
             .as_ref()
-            .map(|(ring, cursor)| ring.metadata_since(*cursor))
+            .map(|(ring, cursor)| self.stderr_snapshot_since(ring, *cursor))
+    }
+
+    fn stderr_snapshot_since(
+        &self,
+        ring: &ProcessStderrRing,
+        cursor: ProcessStderrCursor,
+    ) -> ProcessStderrSnapshot {
+        if self.observer.include_redacted_stderr() {
+            ring.best_effort_since(cursor)
+        } else {
+            ring.metadata_since(cursor)
+        }
     }
 
     async fn record(
@@ -314,6 +326,10 @@ impl AcpLifecycle {
         let stderr = stderr.or_else(|| self.stderr_snapshot());
         let stderr_line_count = stderr.as_ref().map_or(0, ProcessStderrSnapshot::line_count);
         let stderr_observed = stderr_line_count != 0;
+        let stderr_tail = stderr.as_ref().and_then(|snapshot| {
+            (!snapshot.retained_lines().is_empty()).then(|| snapshot.retained_lines().to_vec())
+        });
+        let stderr_redaction = stderr_tail.as_ref().map(|_| StderrRedaction::BestEffort);
         let failure = match FailureDiagnostic::build_static_code(
             FailureDiagnosticInput {
                 failed_phase: phase,
@@ -326,8 +342,8 @@ impl AcpLifecycle {
                 stderr_observed,
                 stderr_line_count,
                 stderr_scope: stderr_observed.then_some(StderrScope::Process),
-                stderr_tail: None,
-                stderr_redaction: None,
+                stderr_tail,
+                stderr_redaction,
                 retry_after_ms,
                 reset_at_ms,
                 prompt_may_have_been_accepted,
@@ -4275,9 +4291,9 @@ impl AcpBackend {
                 // that reads as a clean `Completed`.
                 Err(failure) => {
                     AcpTraceEvent::PromptFailed.emit();
-                    let stderr = stderr_ring_for_driver
-                        .as_ref()
-                        .and_then(|ring| stderr_cursor.map(|cursor| ring.metadata_since(cursor)));
+                    let stderr = stderr_ring_for_driver.as_ref().and_then(|ring| {
+                        stderr_cursor.map(|cursor| lifecycle.stderr_snapshot_since(ring, cursor))
+                    });
                     let (class, code, summary, cause, retry_after_ms, reset_at_ms) = match failure {
                         PromptDriverFailure::Sdk(error) => {
                             let ProviderEvidence {
@@ -8204,6 +8220,88 @@ mod tests {
         let encoded = serde_json::to_string(&json).unwrap();
         assert!(!encoded.contains("old-process-line"));
         assert!(!encoded.contains("new-unlabeled-secret"));
+    }
+
+    #[tokio::test]
+    async fn prompt_failure_includes_bounded_redacted_stderr_only_for_opted_in_observer() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const KNOWN_SECRET: &str = "r2c-known-secret-value";
+        const ENCODED_SECRET: &str = "cjJjLWtub3duLXNlY3JldC12YWx1ZQ==";
+        const TRANSFORMED_LINE: &str = "encoded-secret=cjJjLWtub3duLXNlY3JldC12YWx1ZQ==";
+
+        let mut process = Supervised::spawn_with_stderr_redactor(
+            "/bin/sh",
+            &[
+                "-c",
+                "echo READY; read _; echo encoded-secret=cjJjLWtub3duLXNlY3JldC12YWx1ZQ== 1>&2; sleep 30",
+            ],
+            None,
+            DiagnosticRedactor::new([KNOWN_SECRET]),
+        )
+        .unwrap();
+        let ring = process.stderr_ring();
+        let stdout = process.child_mut().stdout.take().unwrap();
+        let mut stdout = BufReader::new(stdout).lines();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("READY"));
+
+        let rec = Recorder::new("agent-sess-STDERR-OPT-IN");
+        rec.fail_prompt.store(true, Ordering::SeqCst);
+        rec.gate_prompt.store(true, Ordering::SeqCst);
+        let mut backend = connect_recording(rec.clone()).await;
+        backend.stderr_ring = Some(ring.clone());
+        let observer = Arc::new(
+            InMemoryDiagnosticObserver::new(32)
+                .unwrap()
+                .with_redacted_stderr(true),
+        );
+        let mut stream = backend
+            .prompt_with_observers(
+                &bkey("bridge-STDERR-OPT-IN"),
+                vec![],
+                BackendObservers::diagnostic_only(observer),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rec.prompt_started.notified())
+            .await
+            .expect("prompt reaches gated fake agent");
+
+        process
+            .child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"continue\n")
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if ring.metadata_since(ring.origin()).line_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        rec.prompt_gate.notify_one();
+
+        let error = match stream.next().await {
+            Some(Err(error)) => error,
+            other => panic!("gated prompt must fail, got {other:?}"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::PromptStream,
+            DiagnosticFailureClass::Unknown,
+            true,
+        );
+        let json = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(json["stderr_observed"], true);
+        assert_eq!(json["stderr_line_count"], 1);
+        assert_eq!(json["stderr_scope"], "process");
+        assert_eq!(json["stderr_redaction"], "best_effort");
+        assert_eq!(json["stderr_tail"], serde_json::json!([TRANSFORMED_LINE]));
+        let encoded = serde_json::to_string(&json).unwrap();
+        assert!(!encoded.contains(KNOWN_SECRET));
+        assert!(encoded.contains(ENCODED_SECRET));
     }
 
     #[tokio::test]

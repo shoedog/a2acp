@@ -275,6 +275,13 @@ impl DiagnosticRedactor {
         self.sanitize_text(value, max_bytes)
     }
 
+    /// Sanitize one arbitrary identifier with the same all-or-nothing policy used by
+    /// persisted authentication evidence. Callers receive either the complete safe id or
+    /// a tagged redacted value; a partially rewritten identifier is never exposed.
+    pub fn sanitize_diagnostic_id(&self, value: String) -> RedactedDiagnosticId {
+        self.sanitize_id(value)
+    }
+
     fn contains_known_value(&self, value: &str) -> bool {
         self.known_values.iter().any(|known| value.contains(known))
     }
@@ -1254,6 +1261,24 @@ impl FailureDiagnostic {
     pub fn prompt_may_have_been_accepted(&self) -> bool {
         self.prompt_may_have_been_accepted
     }
+
+    /// Preserve the primary diagnostic while recording that bounded teardown also failed. The static
+    /// marker is inserted first so the total diagnostic text budget cannot erase it behind opaque causes.
+    #[doc(hidden)]
+    pub fn with_secondary_teardown_marker(mut self) -> Self {
+        const MARKER: &str = "teardown.secondary";
+        self.causes.retain(|cause| cause != MARKER);
+        if self.causes.len() == MAX_CAUSES {
+            self.causes.pop();
+        }
+        self.causes.insert(0, MARKER.to_owned());
+        enforce_text_budget(
+            &mut self.summary,
+            &mut self.causes,
+            self.stderr_tail.as_mut(),
+        );
+        self
+    }
 }
 
 fn validate_disposition(input: &FailureDiagnosticInput) -> Result<(), DiagnosticBuildError> {
@@ -1529,6 +1554,7 @@ struct InMemoryDiagnosticState {
 /// Bounded, non-durable operation observer for direct prompts and smoke.
 pub struct InMemoryDiagnosticObserver {
     capacity: usize,
+    include_redacted_stderr: bool,
     state: Mutex<InMemoryDiagnosticState>,
 }
 
@@ -1547,8 +1573,15 @@ impl InMemoryDiagnosticObserver {
         }
         Ok(Self {
             capacity,
+            include_redacted_stderr: false,
             state: Mutex::new(InMemoryDiagnosticState::default()),
         })
+    }
+
+    #[must_use]
+    pub fn with_redacted_stderr(mut self, include: bool) -> Self {
+        self.include_redacted_stderr = include;
+        self
     }
 
     pub async fn snapshot(&self) -> Vec<DiagnosticEvent> {
@@ -1562,6 +1595,10 @@ impl InMemoryDiagnosticObserver {
 
 #[async_trait::async_trait]
 impl crate::ports::DiagnosticObserver for InMemoryDiagnosticObserver {
+    fn include_redacted_stderr(&self) -> bool {
+        self.include_redacted_stderr
+    }
+
     async fn record(&self, event: DiagnosticEvent) -> Result<(), crate::error::BridgeError> {
         let mut state = self.state.lock().await;
         state.sequence.accept(&event)?;

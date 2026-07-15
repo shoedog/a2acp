@@ -1,11 +1,98 @@
 # R2c — Explicit bounded live smoke implementation plan
 
-- **Status:** NOT STARTED
+- **Status:** APPROVED / PENDING MERGE
 - **Prerequisite:** all R2b sub-slices merged
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Branch:** `agent/reliability-r2c-live-smoke`
+
+Implementation and acceptance are complete on the named branch. Deterministic CLI, terminal, timeout,
+artifact/redaction, and API tool-observation regressions are green. The first authorized host-Codex turn
+exposed an artifact-permission defect and was not accepted; after reviewed hardening, a separately
+authorized fixed-candidate turn passed artifact-exact with no retry or fallback.
+
+## Approval checkpoint — 2026-07-15
+
+- Implemented the strict one-turn `smoke` command, pre-attempt output validation, absolute attempt and
+  cleanup bounds, private versioned artifact, default recursive stderr-text removal, exact terminal/PONG
+  rules, deny-all tool policy, and single-pass ownership cleanup.
+- Added safe API tool-attempt observation so a denied tool call cannot be mistaken for a clean PONG-only
+  turn; provider tool names, ids, and arguments do not enter the diagnostic event.
+- Deterministic evidence after review fold 1: smoke unit **18 / 0 / 0 ignored**, smoke CLI
+  **10 / 0 / 0 ignored**, `bridge-api` **59 / 0 / 1 ignored**, and full host-serial workspace
+  **1,931 / 0 / 12 ignored**
+  across 68 executables.
+  Workspace/all-target check, warnings-denied Clippy, format/diff checks, release build, and repository
+  hygiene **37/7** are clean.
+- Bridge-dogfooded Fable/xhigh closure re-review returned `APPROVE` on `0e3b8ce`. Its sole new item was a
+  non-blocking `SMELL/MINOR`: the production opt-in regression did not explicitly exercise a transformed
+  known secret. The tightened regression now seeds the real process-ring redactor with the raw credential,
+  emits its base64-transformed form, and proves the raw value is absent while the transformed value remains
+  covered only by the honest `best_effort` label.
+- The create-new artifact fold passes smoke unit **19 / 0 / 0 ignored**, smoke CLI **11 / 0 / 0 ignored**,
+  full host-serial workspace **1,933 / 0 / 12 ignored** across 68 executables, workspace/all-target check,
+  warnings-denied Clippy, release build, format/diff checks, and repository hygiene **37/7**.
+- Targeted bridge-dogfooded Fable/xhigh closure review returned `APPROVE` on `ffb7e891`: all three inherited
+  inode-reuse/link/metadata items were fixed. Its sole new `SMELL/MINOR` requires an operator to ignore the
+  documented `0700` mktemp directory and supply a symlinked parent; the fresh artifact remains `0600`, and
+  no overwrite, disclosure, or prompt-gating contract is violated. It is non-blocking follow-up risk.
+- Still pending: final status/evidence review, non-draft PR, and merge. Host Claude, reader/container, and
+  live negative pre-prompt lanes were not run; only one passing live lane is required for R2c completion.
+
+### Review fold 1 — 2026-07-15
+
+Initial bridge-mediated Fable/xhigh review on `a2946bc` returned `REVISE`: two `WRONG/MAJOR`, one
+`WRONG/MINOR`, and three `SMELL/MINOR`. The fold:
+
+- makes attempt-level prompt acceptance monotonic across a later teardown-scoped diagnostic;
+- makes `--include-redacted-stderr` a real operation-scoped, default-off ACP path from the bounded/redacted
+  process ring into `stderr_tail`, while durable observers remain metadata-only;
+- routes tracing to stderr so stdout remains one JSON artifact even with `RUST_LOG=trace`;
+- preserves a `teardown.secondary` marker behind a primary failure, gives cleanup timeout its own static
+  code, and keeps legacy synchronous prompt construction failure at `prompt_start`; and
+- adds blocked-model, invalid-session-cwd, duplicate-flag, symlink-alias, logging, acceptance-monotonicity,
+  secondary-cleanup, legacy-phase, and production stderr opt-in regressions.
+
+Fresh bridge-mediated Fable/xhigh closure re-review returned `APPROVE` on `0e3b8ce`: all three inherited
+WRONG findings were fixed with pre-fold-failing regressions, all three inherited SMELL findings were
+addressed, and the unobserved direct cancel was adjudicated as the safe choice under timeout-abandoned
+teardown futures. The review's sole new item was the non-blocking transformed-secret coverage gap folded
+above. At that review checkpoint, no live/billable smoke had run.
+
+### Authorized live attempt 1 — 2026-07-15 — gate not accepted
+
+The operator authorized exactly one host Codex lane from candidate `ce605eaf`: ACP adapter 1.1.2, Codex
+0.144.1, raw `gpt-5.6-sol`, `xhigh`, explicit `read-only`, trusted R2c worktree, 120-second bound, default
+metadata-only stderr, and no retry/fallback. The fixed prompt completed in 4.872 seconds with one configure,
+one accepted prompt, terminal `end_turn`, exact four-byte `PONG`, zero tool/permission events, zero dropped
+diagnostics, and completed release/retirement. The artifact content contract passed.
+
+The overall lane is nevertheless **not accepted**: the new explicit `--out` artifact inherited umask and
+was created mode `0644`, contradicting the private-artifact contract. It was immediately restricted to
+`0600`; no prompt was replayed. Root cause was ordinary `OpenOptions::create(true)` without an explicit
+mode. The first fold created new Unix artifacts as `0600` and tightened pre-existing destinations; fresh
+Fable/xhigh review returned `APPROVE` on `23384622` but identified residual open-descriptor disclosure and
+planted-link truncation states. The final follow-up instead requires an unused path and uses create-new
+semantics: existing regular files, symlinks, and hard links are refused without mutation or agent spawn.
+This also makes config-metadata comparison failure non-destructive because no existing inode is opened.
+The pre-existing-file regression fails on `ce605eaf` independently of umask, the link regression preserves
+both victim files, and the new-file CLI case asserts `0600`. The follow-up passes the complete deterministic
+gate set recorded above. Targeted Fable/xhigh closure review returned `APPROVE` on `ffb7e891`; its one
+runbook-mitigated symlinked-parent SMELL does not reopen the gate.
+
+### Authorized live attempt 2 — 2026-07-15 — accepted
+
+After separate explicit authorization, candidate `1c9e4a43` used host ACP adapter 1.1.2, Codex 0.144.1,
+pre-authentication, raw `gpt-5.6-sol`, `xhigh`, explicit `read-only`, the trusted R2c worktree, a 120-second
+bound, and default metadata-only stderr. The release binary completed in 8.770 seconds with one configure,
+one accepted prompt, terminal `end_turn`, exact four-byte `PONG`, zero tool/permission events, zero dropped
+diagnostics, and completed release/retirement. It reported 23,528 total tokens and no cost. The versioned
+artifact was born mode `0600` inside a fresh `0700` evidence directory and passed every schema/content
+assertion. No retry, fallback, alternate provider, or second prompt ran.
+
+Unrun R2c live lanes: host Claude/Fable or Sonnet control, reader/container, and negative pre-prompt
+model/config. They remain explicit future compatibility evidence, not prerequisites to merge this slice.
 
 R2c turns R2b's diagnostic record into one deliberate end-to-end operator probe. It is the first R2
 slice that is intentionally billable. It is not a generic prompt command, workflow runner, retry
@@ -26,6 +113,7 @@ a2a-bridge smoke --agent <id> --config <path> --acknowledge-billable
 - Exactly one resolve/configure/prompt attempt. No workflow, resume, retry, provider routing, alias
   guessing beyond the normal advertised-capability resolver, or host fallback.
 - Refuse before resolve/spawn when `--acknowledge-billable` is absent.
+- Require an unused explicit output path; refuse any existing file or link before resolve/spawn.
 - Print/write the versioned artifact before returning nonzero on terminal failure.
 
 ## Implementation sequence
@@ -86,6 +174,8 @@ SDK/stderr text. Output serialization happens before the CLI selects its nonzero
 - exact PONG + terminal success; PONG without terminal, wrong text, tool output, cancellation, and clean
   EOF without terminal all fail;
 - failure artifact is valid and emitted before nonzero exit;
+- a new explicit output artifact is owner-only; an existing regular file, symlink, or hard link is refused
+  without mutation or attempt execution;
 - default artifact has stderr metadata but no text; opt-in is bounded and labeled `best_effort`;
 - provider-limit reset/retry fields survive when structured but cause no sleep/retry/reroute;
 - all secret redaction, `Display`/`Debug`, and four-tier execution guardrails remain intact;
@@ -105,6 +195,6 @@ unrun lane. No automatic cross-provider attempt is permitted.
 
 ## Completion
 
-R2c merges only after adversarial review, full local gates, and at least one explicitly acknowledged
-artifact-exact live smoke. Update the central roadmap's next action to R2d and make the R2c artifact the
-input contract for R2d/R3.
+The implementation satisfies the R2c merge criteria: adversarial review, full local gates, and one
+explicitly acknowledged artifact-exact live smoke. Final status review and PR merge remain. After merge,
+the central roadmap advances to R2d and this artifact becomes the input contract for R2d/R3.

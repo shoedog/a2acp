@@ -11,11 +11,11 @@ Status meanings:
 - **STALE** — it passed previously, but a relevant component has changed or the evidence is too old for
   a release decision.
 
-## Snapshot — 2026-07-11
+## Snapshot — 2026-07-15
 
 | Path | Exact observed components | Model / effort | Status | Evidence |
 |---|---|---|---|---|
-| Codex, host bridge | `@agentclientprotocol/codex-acp` 1.1.2; its locally resolved `@openai/codex` is 0.144.1 | `gpt-5.6-sol` / `xhigh` | **PASS** | [PR #16](https://github.com/shoedog/a2acp/pull/16) completed an authenticated `PONG` through the bridge on 2026-07-10. The hyphenated `gpt-5-6-sol` input resolved to the raw advertised ID. The live record did not capture the transitive Codex patch version, so re-record it before the next release. |
+| Codex, host bridge | R2c candidate `1c9e4a43`, bridge 0.2.1; `@agentclientprotocol/codex-acp` 1.1.2; locally resolved `@openai/codex` 0.144.1; host pre-authentication | raw `gpt-5.6-sol` / `xhigh`; explicit `read-only` | **PASS** | The explicitly authorized R2c fixed-candidate smoke completed one terminal exact `PONG` in 8.770 s with no retry/fallback, tools, permission updates, timeout, dropped diagnostics, or stderr text. The artifact was created mode `0600` inside a `0700` evidence directory; release/retirement completed; usage exposed 23,528 total tokens and no cost. Host Claude, reader/container, and live negative pre-prompt R2c lanes were not run. [PR #16](https://github.com/shoedog/a2acp/pull/16) remains the earlier alias-resolution evidence. |
 | Codex, PR #17 reader/container build | `node:24-slim`; top-level `@agentclientprotocol/codex-acp` 1.1.2; `pre_authenticated = true` | `gpt-5.6-sol` / `xhigh` | **PASS** | [PR #17](https://github.com/shoedog/a2acp/pull/17) completed `SMOKE_OK` in the real container path. The settled cause and falsified model-API hypothesis are recorded in [`superpowers/2026-07-11-gpt56-sol-container-root-cause-correction.md`](superpowers/2026-07-11-gpt56-sol-container-root-cause-correction.md). This proves that build, not every future rebuild. |
 | Claude, direct host CLI control | Claude Code 2.1.207 | Fable | **PASS** | On 2026-07-11, `claude -p --model fable` returned `PONG`. This proves that invocation's direct CLI/auth/model path only. |
 | Claude, host ACP 0.44 through bridge | `claude-agent-acp` 0.44.0; Agent SDK 0.3.170; bundled Claude 2.1.170; Node 26.0.0; ambient host subscription auth | raw `claude-fable-5[1m]` / `xhigh`; Sonnet / `high` control | **PASS** | Direct ACP and the fresh bridge both returned `PONG` for Fable and Sonnet outside the managed sandbox. Fable required `A2A_BRIDGE_ALLOW_FABLE=1`. See the [R1 disposition](superpowers/2026-07-11-fable-r1-disposition.md). |
@@ -54,6 +54,12 @@ retention remains R2.
 
 ## Evidence required for an update
 
+Use the release-mode candidate's `smoke` command for the minimal live turn. Do not add or refresh a PASS
+row from unit tests, an unacknowledged refusal, a source-tree helper, or a stale installed binary. Retain the
+versioned smoke artifact under disposable/operator evidence storage (not this repository), and record every
+lane that was not run. After argument and output preflight passes, a nonzero smoke emits the artifact first;
+it is failure evidence, never a signal to retry or switch providers automatically.
+
 Every changed row must record:
 
 - date, OS/architecture, host or image identity;
@@ -65,5 +71,7 @@ Every changed row must record:
 - minimal prompt result and, if applicable, representative workflow result;
 - exact failing phase and deepest retained error;
 - ignored or unexercised paths.
+- smoke artifact schema version, attempt id, timeout, terminal state, prompt-acceptance evidence, and whether
+  opaque stderr text remained excluded (the default).
 
 Use the [`a2a-bridge-operator` skill](../skills/a2a-bridge-operator/SKILL.md) to collect the evidence.
