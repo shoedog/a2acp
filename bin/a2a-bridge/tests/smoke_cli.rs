@@ -74,6 +74,7 @@ fn malformed_options_refuse_before_agent_spawn_or_artifact() {
         ["--mode", " padded "],
         ["--out", "-"],
         ["--unknown", "value"],
+        ["--agent", "duplicate"],
     ] {
         let (_dir, marker, config) = marker_fixture();
         let output = smoke_command(&config)
@@ -88,6 +89,42 @@ fn malformed_options_refuse_before_agent_spawn_or_artifact() {
         );
         assert!(!marker.exists(), "malformed args {bad:?} spawned an agent");
     }
+}
+
+#[test]
+fn blocked_model_refuses_before_agent_spawn() {
+    let (_dir, marker, config) = marker_fixture();
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .arg("--model")
+        .arg("claude-fable-5[1m]")
+        .env_remove("A2A_BRIDGE_ALLOW_FABLE")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("blocked model"));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn invalid_session_cwd_is_an_artifact_failure_before_agent_spawn() {
+    let (dir, marker, config) = marker_fixture();
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .arg("--session-cwd")
+        .arg(dir.path().join("missing-repo"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        artifact["diagnostics"]["failure"]["code"],
+        "smoke.session_cwd"
+    );
+    assert!(!marker.exists());
 }
 
 #[test]
@@ -176,6 +213,21 @@ fn artifact_path_cannot_alias_or_truncate_config() {
     assert!(!marker.exists());
 
     let (_dir, marker, config) = marker_fixture();
+    let alias = config.with_file_name("symlink-artifact.json");
+    std::os::unix::fs::symlink(&config, &alias).unwrap();
+    let before = fs::read(&config).unwrap();
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .arg("--out")
+        .arg(&alias)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert_eq!(fs::read(&alias).unwrap(), before);
+    assert!(!marker.exists());
+
+    let (_dir, marker, config) = marker_fixture();
     let alias = config.with_file_name("hard-link-artifact.json");
     fs::hard_link(&config, &alias).unwrap();
     let before = fs::read(&config).unwrap();
@@ -203,6 +255,23 @@ fn artifact_path_cannot_alias_or_truncate_config() {
         !missing.exists(),
         "a missing config/output alias must not be created"
     );
+}
+
+#[test]
+fn stdout_remains_one_json_artifact_when_tracing_is_enabled() {
+    let (_dir, _marker, config) = marker_fixture();
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .arg("--timeout-secs")
+        .arg("1")
+        .env("RUST_LOG", "trace")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("stdout must remain exactly one JSON artifact under tracing");
+    assert_eq!(artifact["schema_version"], 1);
 }
 
 #[test]

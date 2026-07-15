@@ -8,15 +8,16 @@
 - **Active slice:** R2c **IN PROGRESS** on `agent/reliability-r2c-live-smoke`; deterministic implementation
   and tests precede its explicitly authorized one-turn billable gate
 - **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
-- **Current exact R2c deterministic gate:** smoke unit **16 / 0 / 0 ignored**, smoke CLI **7 / 0 / 0
+- **Current exact R2c deterministic gate:** smoke unit **18 / 0 / 0 ignored**, smoke CLI **10 / 0 / 0
   ignored**, and `bridge-api` **59 / 0 / 1 ignored**; format/diff clean
-- **Review state:** R2c implementation is not yet adversarially reviewed; the R2b3 review history remains
-  recorded in the completed-slice table below
-- **Full workspace gate:** the R2c tree passes host serial **1,925 / 0 / 12 ignored** across 68 executables; workspace/all-target
+- **Review state:** initial bridge-mediated Fable/xhigh review returned `REVISE` on `a2946bc` with two
+  `WRONG/MAJOR`, one `WRONG/MINOR`, and three `SMELL/MINOR`; all concrete defects and actionable coverage
+  gaps are folded locally, and a fresh closure re-review is pending
+- **Full workspace gate:** the folded R2c tree passes host serial **1,931 / 0 / 12 ignored** across 68 executables; workspace/all-target
   check, warnings-denied Clippy, release build, and repository hygiene **37/7** are clean
 - **Current execution boundary:** no R2c live/billable smoke ran; no docs-link checker is present
-- **Next action:** commit and run an adversarial bridge-dogfooded R2c review, fold any findings, and repeat
-  the full local gates; only then request explicit authorization for exactly one live-smoke lane
+- **Next action:** commit the first review fold and run a fresh bridge-mediated Fable/xhigh closure
+  re-review; only after approval request explicit authorization for exactly one live-smoke lane
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -58,7 +59,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
 | R2b2 — ACP/Fable lifecycle diagnostics | **MERGED** at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
 | R2b3 — API/container diagnostics | **MERGED** at `afcc856c` (affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–3 `REVISE`; four review folds; closure re-review 4 `APPROVE` at `492946c`; final status re-review `APPROVE` at `afcc856c`) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
-| R2c — live smoke | **IN PROGRESS** on `agent/reliability-r2c-live-smoke` (deterministic gates **1,925 / 0 / 12 ignored**; adversarial review pending; no live lane run) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
+| R2c — live smoke | **IN PROGRESS** on `agent/reliability-r2c-live-smoke` (initial Fable/xhigh review `REVISE`; first fold **1,931 / 0 / 12 ignored**; closure re-review pending; no live lane run) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |

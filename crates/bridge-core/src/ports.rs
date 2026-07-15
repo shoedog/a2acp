@@ -48,6 +48,13 @@ pub trait RichEventSinkFactory: Send + Sync {
 /// callers must not turn them into best-effort logging.
 #[async_trait::async_trait]
 pub trait DiagnosticObserver: Send + Sync {
+    /// Whether this operation explicitly opted into bounded best-effort-redacted process stderr text.
+    /// Durable observers stay metadata-only through the default. Implementations must never infer this
+    /// from logging configuration, caller metadata, or the mere availability of a stderr ring.
+    fn include_redacted_stderr(&self) -> bool {
+        false
+    }
+
     async fn record(&self, event: crate::diagnostics::DiagnosticEvent) -> Result<(), BridgeError>;
 }
 

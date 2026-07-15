@@ -18,14 +18,31 @@ live smoke has run.
   rules, deny-all tool policy, and single-pass ownership cleanup.
 - Added safe API tool-attempt observation so a denied tool call cannot be mistaken for a clean PONG-only
   turn; provider tool names, ids, and arguments do not enter the diagnostic event.
-- Deterministic evidence: smoke unit **16 / 0 / 0 ignored**, smoke CLI **7 / 0 / 0 ignored**,
-  `bridge-api` **59 / 0 / 1 ignored**, and full host-serial workspace **1,925 / 0 / 12 ignored**
+- Deterministic evidence after review fold 1: smoke unit **18 / 0 / 0 ignored**, smoke CLI
+  **10 / 0 / 0 ignored**, `bridge-api` **59 / 0 / 1 ignored**, and full host-serial workspace
+  **1,931 / 0 / 12 ignored**
   across 68 executables.
   Workspace/all-target check, warnings-denied Clippy, format/diff checks, release build, and repository
   hygiene **37/7** are clean.
-- Still pending: adversarial bridge-dogfooded review, any resulting folds and repeated full gates, then
-  separate operator authorization for an exact live lane. No live/billable smoke has run, and this
+- Still pending: fresh bridge-dogfooded closure re-review, any resulting folds and repeated full gates,
+  then separate operator authorization for an exact live lane. No live/billable smoke has run, and this
   checkpoint is not approval or completion evidence.
+
+### Review fold 1 — 2026-07-15
+
+Initial bridge-mediated Fable/xhigh review on `a2946bc` returned `REVISE`: two `WRONG/MAJOR`, one
+`WRONG/MINOR`, and three `SMELL/MINOR`. The fold:
+
+- makes attempt-level prompt acceptance monotonic across a later teardown-scoped diagnostic;
+- makes `--include-redacted-stderr` a real operation-scoped, default-off ACP path from the bounded/redacted
+  process ring into `stderr_tail`, while durable observers remain metadata-only;
+- routes tracing to stderr so stdout remains one JSON artifact even with `RUST_LOG=trace`;
+- preserves a `teardown.secondary` marker behind a primary failure, gives cleanup timeout its own static
+  code, and keeps legacy synchronous prompt construction failure at `prompt_start`; and
+- adds blocked-model, invalid-session-cwd, duplicate-flag, symlink-alias, logging, acceptance-monotonicity,
+  secondary-cleanup, legacy-phase, and production stderr opt-in regressions.
+
+Fresh bridge-mediated closure re-review is still required. No live/billable smoke has run.
 
 R2c turns R2b's diagnostic record into one deliberate end-to-end operator probe. It is the first R2
 slice that is intentionally billable. It is not a generic prompt command, workflow runner, retry

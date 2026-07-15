@@ -427,7 +427,8 @@ impl ArtifactState {
             failure: None,
             observer: Arc::new(
                 InMemoryDiagnosticObserver::new(DIAGNOSTIC_CAPACITY)
-                    .expect("positive smoke diagnostic capacity"),
+                    .expect("positive smoke diagnostic capacity")
+                    .with_redacted_stderr(args.include_redacted_stderr),
             ),
         }
     }
@@ -446,7 +447,7 @@ impl ArtifactState {
 
     fn fail_error(&mut self, error: &BridgeError, fallback_phase: DiagnosticPhase, accepted: bool) {
         if let BridgeError::AgentFailure { diagnostic } = error {
-            self.artifact.attempt.prompt_may_have_been_accepted =
+            self.artifact.attempt.prompt_may_have_been_accepted |=
                 diagnostic.prompt_may_have_been_accepted();
             self.failure = Some((**diagnostic).clone());
             return;
@@ -701,6 +702,21 @@ enum ResolveOnce {
     Resolved(Resolved),
     Failed(BridgeError),
     TimedOut,
+}
+
+fn turn_failure_phase(turn: &TurnRecord) -> DiagnosticPhase {
+    if turn.prompt_calls == 0 {
+        DiagnosticPhase::ConfigApply
+    } else if turn.terminal_state == "prompt_failed" {
+        DiagnosticPhase::PromptStart
+    } else if matches!(
+        turn.terminal_state,
+        "eof_without_terminal" | "backend_error" | "timeout"
+    ) {
+        DiagnosticPhase::PromptStream
+    } else {
+        DiagnosticPhase::PromptFinish
+    }
 }
 
 async fn resolve_once(
@@ -1037,9 +1053,27 @@ fn cleanup_step(
 
 fn apply_cleanup_outcome(state: &mut ArtifactState, primary_failed: bool, cleanup: CleanupOutcome) {
     state.artifact.cleanup = cleanup.record;
-    if !primary_failed {
-        if let Some(error) = cleanup.error {
-            state.artifact.success = false;
+    if primary_failed {
+        if cleanup.error.is_some() {
+            state.failure = state
+                .failure
+                .take()
+                .map(FailureDiagnostic::with_secondary_teardown_marker);
+        }
+    } else if let Some(error) = cleanup.error {
+        state.artifact.success = false;
+        if matches!(
+            error,
+            BridgeError::AgentTimedOut | BridgeError::CancelTimeout
+        ) {
+            state.fail_static(
+                DiagnosticPhase::Teardown,
+                DiagnosticFailureClass::Timeout,
+                "smoke.cleanup_timeout",
+                "Smoke cleanup grace timed out",
+                true,
+            );
+        } else {
             state.fail_error(&error, DiagnosticPhase::Teardown, true);
         }
     }
@@ -1247,16 +1281,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV1 {
     if let Some(error) = &result.error {
         state.artifact.attempt.timed_out = is_timeout_failure(error);
         let accepted = state.artifact.turn.prompt_calls == 1;
-        let phase = if state.artifact.turn.prompt_calls == 0 {
-            DiagnosticPhase::ConfigApply
-        } else if state.artifact.turn.terminal_state == "eof_without_terminal"
-            || state.artifact.turn.terminal_state == "backend_error"
-            || state.artifact.turn.terminal_state == "timeout"
-        {
-            DiagnosticPhase::PromptStream
-        } else {
-            DiagnosticPhase::PromptFinish
-        };
+        let phase = turn_failure_phase(&state.artifact.turn);
         state.fail_turn_error(error, phase, accepted);
     } else {
         state.artifact.success = true;
@@ -1399,7 +1424,7 @@ pub(crate) async fn smoke_cmd(args: &[String]) -> Result<(), BoxError> {
     }
     // Prove the selected evidence destination is writable before a provider process/request can exist.
     let mut artifact_file = prepare_artifact_file(args.out.as_deref(), &args.config)?;
-    bridge_observ::init();
+    bridge_observ::init_stderr();
     let artifact = run_attempt(&args).await;
     let success = artifact.success;
     write_artifact(&artifact, artifact_file.as_mut())?;
@@ -1432,6 +1457,7 @@ mod tests {
         Empty,
         Silent,
         ConfigFailure,
+        PromptFailure,
     }
 
     struct FakeBackend {
@@ -1443,6 +1469,7 @@ mod tests {
         retire_calls: AtomicUsize,
         hanging_release: bool,
         failing_release: bool,
+        release_failure_accepted: bool,
         prompts: Mutex<Vec<String>>,
     }
 
@@ -1457,6 +1484,7 @@ mod tests {
                 retire_calls: AtomicUsize::new(0),
                 hanging_release: false,
                 failing_release: false,
+                release_failure_accepted: true,
                 prompts: Mutex::new(Vec::new()),
             }
         }
@@ -1466,8 +1494,9 @@ mod tests {
             self
         }
 
-        fn with_failing_release(mut self) -> Self {
+        fn with_unaccepted_failing_release(mut self) -> Self {
             self.failing_release = true;
+            self.release_failure_accepted = false;
             self
         }
     }
@@ -1493,6 +1522,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(parts.into_iter().map(|part| part.text).collect());
+            if matches!(self.behavior, Behavior::PromptFailure) {
+                return Err(BridgeError::FrameError);
+            }
             let stream: BackendStream = match self.behavior {
                 Behavior::Exact => Box::pin(futures::stream::iter(vec![
                     Ok(Update::Text("PONG".into())),
@@ -1556,6 +1588,7 @@ mod tests {
                 Behavior::Empty => Box::pin(futures::stream::empty()),
                 Behavior::Silent => Box::pin(futures::stream::pending()),
                 Behavior::ConfigFailure => unreachable!("configure rejects first"),
+                Behavior::PromptFailure => unreachable!("prompt rejects before stream"),
             };
             Ok(stream)
         }
@@ -1580,7 +1613,7 @@ mod tests {
                     DiagnosticFailureClass::Transport,
                     "smoke.test_teardown",
                     "Teardown failed",
-                    true,
+                    self.release_failure_accepted,
                 )))
             } else {
                 Ok(())
@@ -1781,6 +1814,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_prompt_construction_failure_stays_at_prompt_start() {
+        let (backend, result) = execute(Behavior::PromptFailure, Duration::from_secs(1)).await;
+        assert!(matches!(result.error, Some(BridgeError::FrameError)));
+        assert_eq!(result.turn.terminal_state, "prompt_failed");
+        assert_eq!(
+            turn_failure_phase(&result.turn),
+            DiagnosticPhase::PromptStart
+        );
+        assert_eq!(backend.configure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn silent_backend_is_bounded_by_the_single_deadline() {
         let started = Instant::now();
         let (backend, result) = execute(Behavior::Silent, Duration::from_millis(25)).await;
@@ -1830,11 +1876,20 @@ mod tests {
         assert_eq!(hanging.release_calls.load(Ordering::SeqCst), 1);
         assert_eq!(hanging.retire_calls.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < Duration::from_secs(1));
+
+        let mut state = ArtifactState::new(&args());
+        state.artifact.success = true;
+        state.artifact.attempt.prompt_may_have_been_accepted = true;
+        apply_cleanup_outcome(&mut state, false, outcome);
+        assert_eq!(
+            state.failure.as_ref().unwrap().code().as_str(),
+            "smoke.cleanup_timeout"
+        );
     }
 
     #[tokio::test]
     async fn cleanup_failure_turns_a_successful_turn_into_terminal_failure() {
-        let backend = Arc::new(FakeBackend::new(Behavior::Exact).with_failing_release());
+        let backend = Arc::new(FakeBackend::new(Behavior::Exact).with_unaccepted_failing_release());
         let backend_dyn: Arc<dyn AgentBackend> = backend;
         let cleanup = cleanup_backend_until(
             backend_dyn,
@@ -1848,11 +1903,46 @@ mod tests {
 
         let mut state = ArtifactState::new(&args());
         state.artifact.success = true;
+        state.artifact.attempt.prompt_may_have_been_accepted = true;
         apply_cleanup_outcome(&mut state, false, cleanup);
         assert!(!state.artifact.success);
+        assert!(
+            state.artifact.attempt.prompt_may_have_been_accepted,
+            "a teardown-scoped false flag must never lower completed attempt acceptance"
+        );
         assert_eq!(
             state.failure.as_ref().unwrap().code().as_str(),
             "smoke.test_teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_is_secondary_to_an_existing_primary_failure() {
+        let backend = Arc::new(FakeBackend::new(Behavior::Exact).with_unaccepted_failing_release());
+        let backend_dyn: Arc<dyn AgentBackend> = backend;
+        let cleanup = cleanup_backend_until(
+            backend_dyn,
+            &SessionId::parse("cleanup-secondary").unwrap(),
+            observer(),
+            false,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+
+        let mut state = ArtifactState::new(&args());
+        state.failure = Some(static_failure(
+            DiagnosticPhase::PromptStream,
+            DiagnosticFailureClass::Transport,
+            "smoke.test_primary",
+            "Primary failed",
+            true,
+        ));
+        apply_cleanup_outcome(&mut state, true, cleanup);
+        let failure = state.failure.as_ref().unwrap();
+        assert_eq!(failure.code().as_str(), "smoke.test_primary");
+        assert_eq!(
+            failure.causes().first().map(String::as_str),
+            Some("teardown.secondary")
         );
     }
 
