@@ -180,6 +180,8 @@ usage: a2a-bridge smoke --agent <id> --config <path> --acknowledge-billable
                         [--expected-config-sha256 <hex>
                          --expected-executable-sha256 <hex>
                          --expected-session-cwd <canonical-repo>
+                         --expected-session-cwd-device <u64>
+                         --expected-session-cwd-inode <u64>
                          --fallback-source-agent <id>
                          --require-host-fallback-eligible]
 
@@ -876,6 +878,20 @@ async fn observe_static_container_spawn_failure(
 /// run-workflow and the `implement` subcommand so their registry builds can't drift.
 /// `owner_config_path` seeds the ContainerRw owner token. R2b2b consumes the observer in ACP; R2b3
 /// completes API and ContainerRw observation through the same ownership path.
+#[derive(Clone, Debug)]
+pub(crate) struct HostProcessCwd {
+    pub(crate) pinned_directory: Arc<std::fs::File>,
+    pub(crate) acp_session_cwd: PathBuf,
+    pub(crate) retain_descriptor_after_exec: bool,
+}
+
+impl HostProcessCwd {
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.pinned_directory.as_raw_fd()
+    }
+}
+
 fn make_spawn_fn(
     policy_for_spawn: Arc<dyn bridge_core::ports::PolicyEngine>,
     owner_config_path: PathBuf,
@@ -883,6 +899,7 @@ fn make_spawn_fn(
     permission_registry: Option<Arc<PermissionRegistry>>,
     perm_timeout_ms: u64,
     worktree_cfg: Option<WorktreeRuntimeCfg>,
+    host_process_cwd: Option<HostProcessCwd>,
 ) -> ObservedSpawnFn {
     Arc::new(move |entry: Arc<AgentEntry>, observer| {
         let policy = Arc::clone(&policy_for_spawn);
@@ -890,9 +907,10 @@ fn make_spawn_fn(
         let run = run.clone();
         let permission_registry = permission_registry.clone();
         let worktree_cfg = worktree_cfg.clone();
+        let host_process_cwd = host_process_cwd.clone();
         Box::pin(async move {
-            // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
-            // Resolution chain: session_cwd → cwd → "."; then absolutize relative values.
+            // Ordinary host children inherit the bridge cwd; AcpConfig.cwd is their ACP session cwd.
+            // Guarded fallback instead fchdirs the child to a pinned directory object and uses ".".
             let resolved =
                 resolve_static_session_cwd(entry.session_cwd.as_deref(), entry.cwd.as_deref());
             let cwd = {
@@ -911,7 +929,7 @@ fn make_spawn_fn(
             match entry.kind {
                 AgentKind::Acp => {
                     // Compose-or-raw + the `:ro` reaper via the shared helper (both factories agree).
-                    let (program, argv, acp) =
+                    let (program, argv, mut acp) =
                         match acp_spawn_inputs(&entry, cwd, &owner_config_path, &run) {
                             Ok(inputs) => inputs,
                             Err(error) => {
@@ -929,17 +947,35 @@ fn make_spawn_fn(
                                 return Err(error);
                             }
                         };
+                    if let Some(pinned) = host_process_cwd.as_ref() {
+                        if acp.container.is_some() {
+                            return Err(BridgeError::ConfigInvalid {
+                                reason: "pinned host cwd cannot be applied to a container target"
+                                    .into(),
+                            });
+                        }
+                        if !pinned.acp_session_cwd.is_absolute() {
+                            return Err(BridgeError::ConfigInvalid {
+                                reason: "pinned host ACP cwd must be absolute".into(),
+                            });
+                        }
+                        acp.cwd = pinned.acp_session_cwd.clone();
+                    }
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
                     let controller = acp
                         .container
                         .as_ref()
                         .map(bridge_acp::acp_backend::ContainerReap::production_controller);
-                    let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
+                    let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller_and_pinned_cwd(
                         &program,
                         &argv_ref,
                         acp,
                         observer,
                         controller,
+                        host_process_cwd.as_ref().map(HostProcessCwd::raw_fd),
+                        host_process_cwd
+                            .as_ref()
+                            .is_some_and(|cwd| cwd.retain_descriptor_after_exec),
                     )
                     .await?
                     .with_policy(policy);
@@ -2513,6 +2549,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
         120_000,
         worktree_cfg.clone(),
+        None,
     );
     let registry = Arc::new(
         bridge_registry::registry::Registry::new_observed(snapshot, spawn)
@@ -2837,6 +2874,7 @@ async fn implement_resume_cmd(
         None,
         120_000,
         worktree_cfg.clone(),
+        None,
     );
     let registry = Arc::new(
         bridge_registry::registry::Registry::new_observed(snapshot, spawn)
@@ -3266,6 +3304,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
         120_000,
         worktree_cfg,
+        None,
     );
     let registry = Arc::new(
         bridge_registry::registry::Registry::new_observed(snapshot, spawn)
@@ -4953,6 +4992,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         Some(Arc::clone(&perm_registry)),
         perm_timeout,
         worktree_cfg.clone(),
+        None,
     );
 
     let source = FileConfigSource::new(config_path.clone());
@@ -6209,6 +6249,7 @@ async fn main() -> Result<(), BoxError> {
         Some(Arc::clone(&perm_registry)),
         perm_timeout,
         worktree_cfg.clone(),
+        None,
     );
 
     // 5. Config source + registry. `load()` is the initial desired state; the
@@ -9734,6 +9775,7 @@ cmd = "cargo build --locked"
             run,
             None,
             120_000,
+            None,
             None,
         );
         bridge_registry::registry::Registry::new_observed(snap, spawn)

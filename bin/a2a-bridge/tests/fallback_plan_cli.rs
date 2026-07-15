@@ -6,10 +6,14 @@ use std::process::Command;
 fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("spawned");
+    let cwd_marker = dir.path().join("spawned.cwd");
     let adapter = dir.path().join("codex-acp");
     fs::write(
         &adapter,
-        format!("#!/bin/sh\ntouch {:?}\nexit 99\n", marker),
+        format!(
+            "#!/bin/sh\ntouch {:?}\npwd -P > {:?}\nexit 99\n",
+            marker, cwd_marker
+        ),
     )
     .unwrap();
     let mut permissions = fs::metadata(&adapter).unwrap().permissions();
@@ -698,6 +702,66 @@ fn production_auth_wire_matches_current_source_and_impossible_provenance_fails_c
 }
 
 #[test]
+fn redacted_configured_auth_matches_only_the_current_source_redactor() {
+    let (_dir, marker, config, source) = fixture();
+    let secret = "shared-auth-and-mcp-secret";
+    let configured = fs::read_to_string(&config).unwrap().replacen(
+        "[agents.sandbox]",
+        &format!(
+            "auth_method = {secret:?}\n\n\
+             [[agents.mcp]]\nname = \"secret-source\"\ncommand = \"docker\"\n\n\
+             [[agents.mcp.env]]\nname = \"TOKEN\"\nvalue = {secret:?}\n\n\
+             [agents.sandbox]"
+        ),
+        1,
+    );
+    fs::write(&config, configured).unwrap();
+    let mut artifact: serde_json::Value =
+        serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+    artifact["request"]["config_sha256"] =
+        serde_json::json!(sha256_hex(&fs::read(&config).unwrap()));
+    artifact["target"]["authentication"] = serde_json::json!({
+        "path": "configured_method",
+        "method": {"state": "redacted"}
+    });
+    write_json(&source, &artifact);
+
+    let genuine = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert_eq!(read_plan(&genuine)["eligible"], true);
+    assert!(!marker.exists());
+
+    let (_dir, marker, config, source) = fixture();
+    let configured = fs::read_to_string(&config).unwrap().replacen(
+        "[agents.sandbox]",
+        "auth_method = \"ordinary-method\"\n\n[agents.sandbox]",
+        1,
+    );
+    fs::write(&config, configured).unwrap();
+    let mut artifact: serde_json::Value =
+        serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+    artifact["request"]["config_sha256"] =
+        serde_json::json!(sha256_hex(&fs::read(&config).unwrap()));
+    artifact["target"]["authentication"] = serde_json::json!({
+        "path": "configured_method",
+        "method": {"state": "redacted"}
+    });
+    write_json(&source, &artifact);
+
+    let fabricated = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert_ineligible_without_command(
+        &read_plan(&fabricated),
+        "source_agent_configuration_mismatch",
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
 fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
     let (_dir, marker, config, source) = fixture();
     let output = fallback_command(&config, &source)
@@ -708,6 +772,10 @@ fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
     let canonical_config = fs::canonicalize(&config).unwrap();
     let canonical_repo = fs::canonicalize(source.parent().unwrap().join("owned repo")).unwrap();
     let canonical_repo_text = canonical_repo.to_string_lossy().into_owned();
+    let canonical_repo_metadata = fs::metadata(&canonical_repo).unwrap();
+    use std::os::unix::fs::MetadataExt as _;
+    let canonical_repo_device = canonical_repo_metadata.dev().to_string();
+    let canonical_repo_inode = canonical_repo_metadata.ino().to_string();
     let config_sha256 = sha256_hex(&fs::read(&config).unwrap());
     let executable = fs::canonicalize(env!("CARGO_BIN_EXE_a2a-bridge")).unwrap();
     let executable_sha256 = sha256_hex(&fs::read(&executable).unwrap());
@@ -724,6 +792,10 @@ fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
         canonical_repo_text,
         "--expected-session-cwd",
         canonical_repo_text,
+        "--expected-session-cwd-device",
+        canonical_repo_device,
+        "--expected-session-cwd-inode",
+        canonical_repo_inode,
         "--expected-config-sha256",
         config_sha256,
         "--expected-executable-sha256",
@@ -743,6 +815,14 @@ fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
             .as_ref()
     );
     assert_eq!(plan["trust"]["trusted_session_cwd"], canonical_repo_text);
+    assert_eq!(
+        plan["trust"]["trusted_session_cwd_device"],
+        canonical_repo_metadata.dev()
+    );
+    assert_eq!(
+        plan["trust"]["trusted_session_cwd_inode"],
+        canonical_repo_metadata.ino()
+    );
     assert_eq!(plan["target"]["config_sha256"], config_sha256);
     assert!(
         plan["rerun"]["shell_command"]
@@ -936,7 +1016,6 @@ fn generated_smoke_refuses_trusted_cwd_symlink_swap_before_spawn() {
         .iter()
         .map(|value| value.as_str().unwrap().to_owned())
         .collect();
-
     let planned = dir.path().join("owned repo");
     fs::rename(&planned, dir.path().join("planned-repo-moved")).unwrap();
     let sibling = dir.path().join("sibling repo");
@@ -954,8 +1033,42 @@ fn generated_smoke_refuses_trusted_cwd_symlink_swap_before_spawn() {
 }
 
 #[test]
+fn generated_smoke_refuses_same_path_directory_replacement_before_spawn() {
+    let (dir, marker, config, source) = fixture();
+    let plan = read_plan(
+        &fallback_command(&config, &source)
+            .arg("--confirm-trusted-own-repo-read-only")
+            .output()
+            .unwrap(),
+    );
+    let mut argv: Vec<String> = plan["rerun"]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    argv.extend(["--timeout-secs".into(), "1".into()]);
+
+    let planned = dir.path().join("owned repo");
+    fs::rename(&planned, dir.path().join("planned-repo-moved")).unwrap();
+    let replacement = dir.path().join("replacement-repo");
+    fs::create_dir(&replacement).unwrap();
+    fs::rename(&replacement, &planned).unwrap();
+
+    let output = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
+    assert!(!output.status.success());
+    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!marker.exists(), "replacement repo spawned the target");
+    assert_eq!(
+        artifact["diagnostics"]["failure"]["code"],
+        "smoke.fallback_cwd_drift"
+    );
+}
+
+#[test]
 fn guarded_host_smoke_never_invokes_the_degraded_container_runtime() {
     let (dir, target_marker, _fixture_config, _fixture_source) = fixture();
+    let target_cwd_marker = target_marker.with_file_name("spawned.cwd");
     let adapter = target_marker.with_file_name("codex-acp");
     let repo = dir.path().join("owned repo");
     let source_root = dir.path();
@@ -1005,6 +1118,11 @@ fn guarded_host_smoke_never_invokes_the_degraded_container_runtime() {
     assert!(
         target_marker.exists(),
         "guarded host target should be reached"
+    );
+    assert_eq!(
+        fs::read_to_string(target_cwd_marker).unwrap().trim(),
+        fs::canonicalize(&repo).unwrap().to_string_lossy(),
+        "guarded host adapter must start inside the pinned trusted repo object"
     );
     assert!(
         !runtime_marker.exists(),

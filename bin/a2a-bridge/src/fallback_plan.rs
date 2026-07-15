@@ -250,7 +250,7 @@ struct SmokeProvenanceRow {
     remedy: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 enum SmokeRedactedId {
     Value { value: String },
@@ -266,7 +266,7 @@ impl SmokeRedactedId {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(tag = "path", rename_all = "snake_case", deny_unknown_fields)]
 enum SmokeAuthentication {
     ApiKeyEnv {
@@ -603,6 +603,7 @@ fn validate_current_source_evidence(
     target: &SmokeTarget,
     source_agent: &str,
     entry: &bridge_core::domain::AgentEntry,
+    trusted_session_cwd: &SessionCwd,
     reasons: &mut Vec<IneligibilityReason>,
 ) {
     let prefix = format!("provenance:{source_agent}:");
@@ -637,17 +638,12 @@ fn validate_current_source_evidence(
         push_reason(reasons, IneligibilityReason::SourceDiagnosticsIncomplete);
     }
 
-    let authentication_matches = if entry.pre_authenticated {
-        matches!(target.authentication, SmokeAuthentication::PreAuthenticated)
-    } else if let Some(expected_method) = entry.auth_method.as_deref() {
-        matches!(
-            &target.authentication,
-            SmokeAuthentication::ConfiguredMethod { method }
-                if method.value() == Some(expected_method)
-        )
-    } else {
-        matches!(target.authentication, SmokeAuthentication::Automatic)
-    };
+    let authentication_matches = serde_json::from_value::<SmokeAuthentication>(
+        crate::smoke::authentication_wire_value(entry, Some(trusted_session_cwd)),
+    )
+    .ok()
+    .as_ref()
+        == Some(&target.authentication);
     if !authentication_matches {
         push_reason(
             reasons,
@@ -925,6 +921,8 @@ struct TargetRecord {
 struct TrustRecord {
     confirmed_trusted_own_repo_read_only: bool,
     trusted_session_cwd: String,
+    trusted_session_cwd_device: u64,
+    trusted_session_cwd_inode: u64,
     authority: &'static str,
 }
 
@@ -936,8 +934,10 @@ struct RerunRecord {
 }
 
 fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
-    let trusted_session_cwd =
-        canonical_existing_directory(&args.trusted_session_cwd, "trusted session cwd")?;
+    let trusted_session_cwd_snapshot =
+        crate::local_file::snapshot_directory(&args.trusted_session_cwd, "trusted session cwd")?;
+    let trusted_session_cwd = trusted_session_cwd_snapshot.canonical_cwd;
+    let trusted_session_cwd_identity = trusted_session_cwd_snapshot.identity;
     let trusted_session_cwd_text = trusted_session_cwd.as_str().to_owned();
     let config_requested_path = validated_path_text(&args.config, "requested config path")?;
     let source_file = crate::local_file::read_regular_file_bounded(
@@ -992,6 +992,7 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
                     target,
                     &source.original_agent,
                     entry,
+                    &trusted_session_cwd,
                     &mut reasons,
                 );
             } else {
@@ -1085,6 +1086,10 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
             trusted_session_cwd_text.clone(),
             "--expected-session-cwd".to_owned(),
             trusted_session_cwd_text.clone(),
+            "--expected-session-cwd-device".to_owned(),
+            trusted_session_cwd_identity.device.to_string(),
+            "--expected-session-cwd-inode".to_owned(),
+            trusted_session_cwd_identity.inode.to_string(),
             "--expected-config-sha256".to_owned(),
             config_file.sha256.clone(),
             "--expected-executable-sha256".to_owned(),
@@ -1117,7 +1122,9 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
         trust: TrustRecord {
             confirmed_trusted_own_repo_read_only: args.confirm_trusted_own_repo_read_only,
             trusted_session_cwd: trusted_session_cwd_text,
-            authority: "local_cli_flag_and_explicit_canonical_cwd",
+            trusted_session_cwd_device: trusted_session_cwd_identity.device,
+            trusted_session_cwd_inode: trusted_session_cwd_identity.inode,
+            authority: "local_cli_flag_and_explicit_directory_identity",
         },
         rerun,
     })

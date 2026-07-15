@@ -1,7 +1,7 @@
-# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v17)
+# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v18)
 
 - **Status:** R2a, R2b0–R2b3, and R2c merged; R2d is **IN REVIEW** on
-  `agent/reliability-r2d-fallback-plan`; v17 is the design of record for R2b–R2e
+  `agent/reliability-r2d-fallback-plan`; v18 is the design of record for R2b–R2e
 - **R2d review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` security review of exact
   candidate `b6424d725e56d1f3fde0b7c29b6057155d69dacd` returned `REVISE`; its nine findings were folded at
   `0b05c409cbbf9441348b2719a537f8f4978216a3`. Closure re-review 1 of that exact fold also returned
@@ -13,9 +13,12 @@
   **1,969 / 0 / 12 ignored** across 69 executables. Closure re-review 2 of exact
   `c8d17b2acbe3b113ce8fcdbce243ea2e08561141` adjudicated all six requested findings `FIXED`, found four
   new `WRONG` items, no `SMELL`, and returned `REVISE`. V17 closes them; planner and smoke-unit focused
-  gates are green at **20 / 0** each, and the full serial workspace is green at
-  **1,971 / 0 / 12 ignored** across 69 executables, with format/diff, check, warnings-denied Clippy,
-  release, and hygiene **37/7** clean. Final closure remains pending.
+  gates were green at **20 / 0** each. Closure re-review 3 of exact
+  `69152d7360a4900fe49390338b56efd94c784495` adjudicated those four `FIXED`, kept adjacent
+  complete-artifact secrecy `PARTIAL`, found three new `WRONG` items, no `SMELL`, and returned `REVISE`.
+  V18 closes them; planner and smoke-unit focused gates are green at **22 / 0** each, and the full serial
+  workspace is green at **1,979 / 0 / 12 ignored** across 69 executables, with format/diff, check,
+  warnings-denied Clippy, release, and hygiene **37/7** clean. Final closure remains pending.
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
   and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,
@@ -395,6 +398,22 @@ them and the adjacent structured artifact-secrecy path:
 | **WRONG/MAJOR:** a lifecycle event failure can contradict un-compared outer diagnostic fields | Compare the complete validated `FailureDiagnostic` values with derived `Eq`; summary, causes, stderr metadata, retry metadata, and every other field must match. |
 | **WRONG/MAJOR:** bridge-known credentials can enter smoke provenance text | Apply the exact-value diagnostic sanitizer to every provenance detail/remedy. The same known value also passes through request/effective model and mode sanitization so the complete artifact, not only provenance, satisfies the R2c secrecy boundary. |
 | **WRONG/MINOR:** guarded host cleanup reports a run-scoped backstop that did not run | Thread whether the ordinary `RunEndGuard` exists into cleanup recording. Ordinary smoke retains `invoked_best_effort`; guarded host smoke records `not_needed`. |
+
+Closure re-review 3 of exact `69152d7360a4900fe49390338b56efd94c784495` adjudicated all four v17
+findings `FIXED`, kept the adjacent complete-artifact secrecy item `PARTIAL`, found no `SMELL`, found
+three new correctness defects, and returned `REVISE`. V18 closes them and preserves the central
+lifecycle-constructor boundary:
+
+| Finding | Disposition in v18 |
+|---|---|
+| **WRONG/BLOCKER:** canonical pathname equality does not preserve repository object identity across same-path replacement or the check/use window | Snapshot the canonical directory with an open descriptor and its device/inode identity; carry both identity fields in the closed plan/action guard; reopen and pin the expected object at action time; revalidate the named path before registry resolution, before configure, and after configure immediately before prompt. The guarded host adapter child performs `fchdir` to the pinned object before exec and ACP receives an object-addressed absolute cwd (`/.vol/<device>/<inode>` on macOS; inherited `/proc/self/fd/<n>` on Linux), so a later rename cannot redirect the process and the ACP absolute-cwd contract remains intact. Same-path pre-spawn and configure-window replacements are deterministic regressions. |
+| **WRONG/MAJOR:** early smoke failures can serialize raw selected-entry credentials in request model/mode before the cwd-aware redactor exists | Construct the selected-entry redactor immediately after entry selection and sanitize request model/mode before every later return. A second cwd-aware pass still expands sanitization before effective/provenance serialization. The invalid-cwd regression searches the complete artifact for the injected credential. |
+| **WRONG/MAJOR:** planner authentication validation rejects genuine tagged-redacted production evidence | Reconstruct the current source authentication through the exact production smoke serializer and exact source redactor, then compare the complete tagged JSON value. Genuine configured-secret evidence matches; a fabricated `redacted` tag for an ordinary non-secret configured method remains ineligible. |
+
+The first v18 full-suite run caught a direct smoke-side `BridgeError::agent_failure` introduced while
+transporting the local cwd-drift refusal. The final v18 fold carries an optional static diagnostic in the
+smoke drain result instead, while backend errors continue through their audited lifecycle builders. The
+constructor guard and the behavior regression both pass without adding an allowlist exemption.
 
 The first bridge-mediated Sol/xhigh R2b1 implementation review returned `REVISE` with four `WRONG` and
 three `SMELL` findings. The implementation folds all seven before re-review:

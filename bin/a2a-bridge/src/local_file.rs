@@ -7,6 +7,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use bridge_core::session_cwd::SessionCwd;
 
 use crate::BoxError;
 
@@ -15,6 +18,42 @@ pub(crate) struct LocalFileSnapshot {
     pub(crate) canonical_path: PathBuf,
     pub(crate) bytes: Vec<u8>,
     pub(crate) sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirectoryIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+impl DirectoryIdentity {
+    #[cfg(unix)]
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectorySnapshot {
+    pub(crate) canonical_cwd: SessionCwd,
+    pub(crate) identity: DirectoryIdentity,
+}
+
+/// An open directory object whose descriptor is retained through the host ACP
+/// process lifetime. The parent descriptor remains close-on-exec; the forked
+/// child binds its cwd with `fchdir` and may retain only its copy when the OS
+/// stable absolute path is descriptor-backed.
+#[derive(Debug)]
+pub(crate) struct PinnedDirectory {
+    file: Arc<File>,
+    canonical_cwd: SessionCwd,
+    identity: DirectoryIdentity,
+    acp_session_cwd: PathBuf,
+    retain_descriptor_after_exec: bool,
 }
 
 fn open_read_only_nonblocking(path: &Path) -> Result<File, std::io::Error> {
@@ -28,10 +67,157 @@ fn open_read_only_nonblocking(path: &Path) -> Result<File, std::io::Error> {
     options.open(path)
 }
 
+fn open_directory(path: &Path) -> Result<File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
 #[cfg(unix)]
 fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn open_directory_snapshot(
+    path: &Path,
+    label: &str,
+) -> Result<(File, DirectorySnapshot), BoxError> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{label}: path must be non-empty").into());
+    }
+    let canonical_path = std::fs::canonicalize(path)
+        .map_err(|error| format!("{label}: cannot resolve {}: {error}", path.display()))?;
+    let file = open_directory(&canonical_path).map_err(|error| {
+        format!(
+            "{label}: cannot open resolved directory {}: {error}",
+            canonical_path.display()
+        )
+    })?;
+    let descriptor_metadata = file.metadata().map_err(|error| {
+        format!(
+            "{label}: cannot inspect resolved directory {}: {error}",
+            canonical_path.display()
+        )
+    })?;
+    let path_metadata = std::fs::metadata(&canonical_path).map_err(|error| {
+        format!(
+            "{label}: cannot re-inspect resolved directory {}: {error}",
+            canonical_path.display()
+        )
+    })?;
+    if !descriptor_metadata.is_dir()
+        || !path_metadata.is_dir()
+        || !same_file(&descriptor_metadata, &path_metadata)
+    {
+        return Err(format!("{label}: directory path changed while it was being opened").into());
+    }
+    let canonical_cwd = SessionCwd::parse(&canonical_path.to_string_lossy())
+        .map_err(|_| format!("{label}: resolved directory is not a valid session cwd"))?;
+    let identity = DirectoryIdentity::from_metadata(&descriptor_metadata);
+    Ok((
+        file,
+        DirectorySnapshot {
+            canonical_cwd,
+            identity,
+        },
+    ))
+}
+
+pub(crate) fn snapshot_directory(path: &Path, label: &str) -> Result<DirectorySnapshot, BoxError> {
+    let (_file, snapshot) = open_directory_snapshot(path, label)?;
+    Ok(snapshot)
+}
+
+fn stable_directory_path(
+    _file: &File,
+    identity: DirectoryIdentity,
+    label: &str,
+) -> Result<(PathBuf, bool), BoxError> {
+    #[cfg(target_os = "macos")]
+    let (path, retain_descriptor_after_exec) = (
+        PathBuf::from(format!("/.vol/{}/{}", identity.device, identity.inode)),
+        false,
+    );
+    #[cfg(target_os = "linux")]
+    let (path, retain_descriptor_after_exec) = {
+        use std::os::fd::AsRawFd as _;
+        (
+            PathBuf::from(format!("/proc/self/fd/{}", _file.as_raw_fd())),
+            true,
+        )
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err(format!(
+        "{label}: descriptor-pinned host fallback is unsupported on this operating system"
+    )
+    .into());
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            format!(
+                "{label}: stable directory handle {} is unavailable: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_dir() || DirectoryIdentity::from_metadata(&metadata) != identity {
+            return Err(format!(
+                "{label}: stable directory handle {} does not identify the planned directory",
+                path.display()
+            )
+            .into());
+        }
+        Ok((path, retain_descriptor_after_exec))
+    }
+}
+
+impl PinnedDirectory {
+    pub(crate) fn open(
+        path: &Path,
+        expected_cwd: &SessionCwd,
+        expected_identity: DirectoryIdentity,
+        label: &str,
+    ) -> Result<Self, BoxError> {
+        let (file, snapshot) = open_directory_snapshot(path, label)?;
+        if &snapshot.canonical_cwd != expected_cwd || snapshot.identity != expected_identity {
+            return Err(format!("{label}: directory identity changed after planning").into());
+        }
+        let (acp_session_cwd, retain_descriptor_after_exec) =
+            stable_directory_path(&file, snapshot.identity, label)?;
+        Ok(Self {
+            file: Arc::new(file),
+            canonical_cwd: snapshot.canonical_cwd,
+            identity: snapshot.identity,
+            acp_session_cwd,
+            retain_descriptor_after_exec,
+        })
+    }
+
+    pub(crate) fn file_handle(&self) -> Arc<File> {
+        Arc::clone(&self.file)
+    }
+
+    pub(crate) fn acp_session_cwd(&self) -> PathBuf {
+        self.acp_session_cwd.clone()
+    }
+
+    pub(crate) fn retain_descriptor_after_exec(&self) -> bool {
+        self.retain_descriptor_after_exec
+    }
+
+    pub(crate) fn current_path_matches(&self) -> bool {
+        std::fs::metadata(self.canonical_cwd.as_str())
+            .ok()
+            .is_some_and(|metadata| {
+                metadata.is_dir() && DirectoryIdentity::from_metadata(&metadata) == self.identity
+            })
+    }
 }
 
 #[cfg(not(unix))]
@@ -185,5 +371,43 @@ mod tests {
         assert!(error
             .to_string()
             .contains("path changed while it was being opened"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn pinned_directory_exposes_an_absolute_object_path_across_same_name_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let planned = dir.path().join("planned");
+        let moved = dir.path().join("moved");
+        fs::create_dir(&planned).unwrap();
+        fs::write(planned.join("original-marker"), b"original").unwrap();
+        let snapshot = snapshot_directory(&planned, "test cwd").unwrap();
+        let pin = PinnedDirectory::open(
+            &planned,
+            &snapshot.canonical_cwd,
+            snapshot.identity,
+            "test cwd",
+        )
+        .unwrap();
+        let stable = pin.acp_session_cwd();
+        assert!(stable.is_absolute());
+
+        fs::rename(&planned, &moved).unwrap();
+        fs::create_dir(&planned).unwrap();
+
+        let stable_metadata = fs::metadata(&stable).unwrap();
+        assert_eq!(
+            DirectoryIdentity::from_metadata(&stable_metadata),
+            snapshot.identity
+        );
+        assert_eq!(
+            fs::read(stable.join("original-marker")).unwrap(),
+            b"original"
+        );
+        assert!(!pin.current_path_matches());
+        #[cfg(target_os = "macos")]
+        assert!(!pin.retain_descriptor_after_exec());
+        #[cfg(target_os = "linux")]
+        assert!(pin.retain_descriptor_after_exec());
     }
 }

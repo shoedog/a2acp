@@ -1,16 +1,17 @@
 # R2d — Local non-billable fallback-plan implementation plan
 
-- **Status:** IN REVIEW — the initial review and closure re-reviews 1–2 returned `REVISE`; the v17 fold
+- **Status:** IN REVIEW — the initial review and closure re-reviews 1–3 returned `REVISE`; the v18 fold
   is applied in the working tree; focused and full deterministic gates are green; final closure remains
 - **Prerequisites:** R2b and R2c merged (`be54bc51`, PR #28)
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md),
-  v17
+  v18
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Branch:** `agent/reliability-r2d-fallback-plan`
 - **Initial reviewed candidate:** `b6424d725e56d1f3fde0b7c29b6057155d69dacd`
 - **Closure re-review 1 candidate:** `0b05c409cbbf9441348b2719a537f8f4978216a3` — `REVISE`
 - **Closure re-review 2 candidate:** `c8d17b2acbe3b113ce8fcdbce243ea2e08561141` — `REVISE`
+- **Closure re-review 3 candidate:** `69152d7360a4900fe49390338b56efd94c784495` — `REVISE`
 
 R2d answers one local operator question: given complete failed R2c smoke evidence from a read-only
 container attempt, may an explicitly named host agent be proposed for a new trusted-own-repo read-only
@@ -88,8 +89,28 @@ no `SMELL`, found four new `WRONG` items, and returned `REVISE`. The v17 fold:
 4. threads whether a run-scoped backstop exists into cleanup evidence, so guarded host artifacts report
    `not_needed` rather than a sweep that intentionally did not run.
 
-No Fable, Claude, Haiku, retry, fallback, live provider turn, or real container was used in the three
-reviews/folds.
+Closure re-review 3 ran through the candidate bridge with `gpt-5.6-sol`/`xhigh` against exact
+`69152d7360a4900fe49390338b56efd94c784495`. It adjudicated all four requested v17 findings `FIXED`, kept
+the adjacent complete-artifact secrecy item `PARTIAL`, found no `SMELL`, found three new `WRONG` items,
+and returned `REVISE`. The v18 fold:
+
+1. binds the plan and action to the repository directory object's device/inode identity, keeps that
+   object open, revalidates the named path before resolve/configure/prompt, and starts the guarded host
+   adapter with `fchdir` to the pinned object before exec;
+2. builds the selected-entry redactor immediately after entry selection and sanitizes request model/mode
+   before every later early return, including invalid-cwd failure; and
+3. reconstructs current authentication through the exact production serializer and source redactor,
+   allowing genuine tagged-redacted evidence while rejecting a fabricated redacted tag for an ordinary
+   non-secret configured method.
+
+The full suite also caught one direct smoke-side `AgentFailure` construction in the first v18 draft.
+The final fold carries that local static refusal separately from backend errors, preserving the audited
+lifecycle-constructor boundary without weakening its guard.
+
+No Fable, Claude model/Haiku, retry, fallback, live provider turn, or real container was used in the four
+reviews/folds. Separate adapter-only compatibility probes sent `initialize` + `session/new` (never
+`session/prompt`) through installed Codex ACP 1.1.2 and Claude Agent ACP 0.44.0; both accepted the macOS
+object-addressed absolute cwd.
 
 ## Implementation sequence and restart contract
 
@@ -163,6 +184,8 @@ The generated argv includes, as one closed set:
 --expected-config-sha256 <hex>
 --expected-executable-sha256 <hex>
 --expected-session-cwd <canonical-repo>
+--expected-session-cwd-device <u64>
+--expected-session-cwd-inode <u64>
 --fallback-source-agent <container-agent-id>
 --require-host-fallback-eligible
 ```
@@ -173,7 +196,11 @@ operator later does, smoke re-reads the bounded regular config/executable and re
 mode/mount containment, exact planned cwd identity, and the target marker before registry
 resolution/spawn. A guarded target cannot spawn containers, so smoke skips container orphan recovery and
 the run-end sweep and truthfully records that backstop as `not_needed`. Any drift emits a failed smoke-v2
-artifact and no agent process is started.
+artifact and no agent process is started. Once the guard opens the expected directory object, the host
+adapter child performs `fchdir` to that pinned descriptor and guarded ACP uses an object-addressed
+absolute cwd (`/.vol/<device>/<inode>` on macOS; inherited `/proc/self/fd/<n>` on Linux). The parent
+descriptor remains close-on-exec; only the already-forked Linux child retains its copy. Later pathname
+replacement therefore cannot redirect the spawned process or violate ACP's absolute-cwd contract.
 
 ## Pre-change-failing and edge regressions
 
@@ -184,32 +211,39 @@ artifact and no agent process is started.
   lifecycle, dropped events, prompt-start race, timeout, success, malformed, legacy, task envelope,
   oversized source, controls, quotes, and schema mismatch;
 - config, executable, and source-mount drift between plan and action, all before target spawn;
-- same-mount trusted-cwd symlink/sibling replacement between planning and action;
+- same-mount trusted-cwd symlink/sibling replacement and same-path directory-object replacement between
+  planning and action, plus replacement during configure immediately before lazy prompt/session mint;
 - complete lifecycle-failure equality, including summary/stderr/cause metadata rather than partial
   identity matching;
 - known-credential injection through provenance detail/remedy and structured model/mode fields;
+- selected-entry credential injection into request model/mode on an invalid-cwd early return;
+- genuine production tagged-redacted configured authentication plus a fabricated-redacted ordinary
+  configured-method negative;
 - regular-file exact hash plus symlink, FIFO, device, socket, and descriptor/path replacement rejection;
 - anonymous volume acceptance, `~/` rejection, option-like runtime/image/network rejection, wrong
   credential file/directory/anonymous/named-volume types, and shared doctor/Claude-preflight parsing;
 - inner container-like text remains non-evidence, launch errors retain their original diagnosis, normal
   container cleanup still occurs, and guarded host smoke invokes no degraded runtime maintenance.
 
-Current v17 focused evidence is planner CLI **20 / 0** and smoke units **20 / 0**.
+Current v18 focused evidence is planner CLI **22 / 0** and smoke units **22 / 0**.
 
-The exact v17 working fold also passes:
+The exact v18 working fold also passes:
 
-- full serial workspace: **1,971 passed / 0 failed / 12 ignored** across 69 test/doc-test executables;
+- full serial workspace: **1,979 passed / 0 failed / 12 ignored** across 69 test/doc-test executables;
 - format check and `git diff --check`: clean;
 - workspace all-target check and warnings-denied all-target Clippy: clean;
 - release `a2a-bridge` binary build: clean;
 - repository hygiene: **37** tracked artifacts / **7** validated example configs;
+- non-prompt adapter compatibility: Codex ACP 1.1.2 and Claude Agent ACP 0.44.0 each accepted
+  `initialize` + `session/new` with the macOS object-addressed absolute cwd; no model prompt was sent;
 - live/billable gates: not run; no provider, container, or agent turn is required for this deterministic
   plan/pre-spawn surface.
 
 ## Completion boundary
 
-Freeze and commit the fully gated v17 fold, then run one Sol/xhigh closure re-review that
-adjudicates the four closure-re-review-2 findings and the adjacent structured model/mode secrecy fix. Do
+Freeze and commit the fully gated v18 fold, then run one Sol/xhigh closure re-review that
+adjudicates the three closure-re-review-3 findings, complete early-artifact secrecy, and guarded ACP's
+descriptor-pinned absolute-cwd compatibility. Do
 not use Fable or Claude for this closure under the current constrained usage windows. Do not run a
 live/billable smoke: R2d behavior is proven by deterministic pre-spawn fixtures, and the R2c live result
 remains historical evidence only.

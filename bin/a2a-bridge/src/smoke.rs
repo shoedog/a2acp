@@ -55,6 +55,7 @@ struct FallbackSmokeGuard {
     expected_config_sha256: String,
     expected_executable_sha256: String,
     expected_session_cwd: SessionCwd,
+    expected_session_cwd_identity: crate::local_file::DirectoryIdentity,
     source_agent: AgentId,
 }
 
@@ -94,6 +95,8 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
     let mut expected_config_sha256 = None;
     let mut expected_executable_sha256 = None;
     let mut expected_session_cwd = None;
+    let mut expected_session_cwd_device = None;
+    let mut expected_session_cwd_inode = None;
     let mut fallback_source_agent = None;
     let mut require_host_fallback_eligible = false;
     let mut acknowledged = false;
@@ -153,6 +156,19 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
             }
             "--expected-session-cwd" => {
                 expected_session_cwd = Some(value(&mut it, "--expected-session-cwd")?);
+            }
+            "--expected-session-cwd-device" if expected_session_cwd_device.is_some() => {
+                return Err("smoke: duplicate --expected-session-cwd-device".into());
+            }
+            "--expected-session-cwd-device" => {
+                expected_session_cwd_device =
+                    Some(value(&mut it, "--expected-session-cwd-device")?);
+            }
+            "--expected-session-cwd-inode" if expected_session_cwd_inode.is_some() => {
+                return Err("smoke: duplicate --expected-session-cwd-inode".into());
+            }
+            "--expected-session-cwd-inode" => {
+                expected_session_cwd_inode = Some(value(&mut it, "--expected-session-cwd-inode")?);
             }
             "--fallback-source-agent" if fallback_source_agent.is_some() => {
                 return Err("smoke: duplicate --fallback-source-agent".into());
@@ -222,11 +238,13 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
     let guard_count = usize::from(expected_config_sha256.is_some())
         + usize::from(expected_executable_sha256.is_some())
         + usize::from(expected_session_cwd.is_some())
+        + usize::from(expected_session_cwd_device.is_some())
+        + usize::from(expected_session_cwd_inode.is_some())
         + usize::from(fallback_source_agent.is_some())
         + usize::from(require_host_fallback_eligible);
     let fallback_guard = match guard_count {
         0 => None,
-        5 if session_cwd.is_some() => {
+        7 if session_cwd.is_some() => {
             let expected_config_sha256 = expected_config_sha256.expect("counted above");
             let expected_executable_sha256 = expected_executable_sha256.expect("counted above");
             if !crate::local_file::valid_sha256(&expected_config_sha256)
@@ -243,15 +261,27 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
             let expected_session_cwd =
                 SessionCwd::parse(&expected_session_cwd.expect("counted above"))
                     .map_err(|_| "smoke: invalid --expected-session-cwd")?;
+            let expected_session_cwd_device = expected_session_cwd_device
+                .expect("counted above")
+                .parse::<u64>()
+                .map_err(|_| "smoke: invalid --expected-session-cwd-device")?;
+            let expected_session_cwd_inode = expected_session_cwd_inode
+                .expect("counted above")
+                .parse::<u64>()
+                .map_err(|_| "smoke: invalid --expected-session-cwd-inode")?;
             Some(FallbackSmokeGuard {
                 expected_config_sha256: expected_config_sha256.to_ascii_lowercase(),
                 expected_executable_sha256: expected_executable_sha256.to_ascii_lowercase(),
                 expected_session_cwd,
+                expected_session_cwd_identity: crate::local_file::DirectoryIdentity {
+                    device: expected_session_cwd_device,
+                    inode: expected_session_cwd_inode,
+                },
                 source_agent: AgentId::parse(source)
                     .map_err(|_| "smoke: invalid --fallback-source-agent")?,
             })
         }
-        5 => return Err("smoke: fallback guard requires --session-cwd".into()),
+        7 => return Err("smoke: fallback guard requires --session-cwd".into()),
         _ => {
             return Err(
                 "smoke: fallback guard flags must be supplied together as a closed set".into(),
@@ -337,6 +367,8 @@ struct FallbackGuardRecord {
     expected_config_sha256: String,
     expected_executable_sha256: String,
     expected_session_cwd: String,
+    expected_session_cwd_device: u64,
+    expected_session_cwd_inode: u64,
     source_agent: String,
     require_host_fallback_eligible: bool,
 }
@@ -512,6 +544,8 @@ impl ArtifactState {
                             expected_config_sha256: guard.expected_config_sha256.clone(),
                             expected_executable_sha256: guard.expected_executable_sha256.clone(),
                             expected_session_cwd: guard.expected_session_cwd.as_str().to_owned(),
+                            expected_session_cwd_device: guard.expected_session_cwd_identity.device,
+                            expected_session_cwd_inode: guard.expected_session_cwd_identity.inode,
                             source_agent: guard.source_agent.as_str().to_owned(),
                             require_host_fallback_eligible: true,
                         }),
@@ -807,6 +841,7 @@ impl PolicyEngine for DenyAllPolicy {
 struct DrainResult {
     turn: TurnRecord,
     error: Option<BridgeError>,
+    static_failure: Option<FailureDiagnostic>,
 }
 
 enum ResolveOnce {
@@ -850,8 +885,27 @@ async fn execute_one(
     observer: Arc<InMemoryDiagnosticObserver>,
     rich: Arc<SmokeRichSink>,
     deadline: tokio::time::Instant,
+    fallback_cwd: Option<&crate::local_file::PinnedDirectory>,
 ) -> DrainResult {
     let mut turn = TurnRecord::default();
+
+    let cwd_drift = || DrainResult {
+        turn: TurnRecord {
+            terminal_state: "config_failed",
+            ..TurnRecord::default()
+        },
+        error: None,
+        static_failure: Some(static_failure(
+            DiagnosticPhase::ConfigApply,
+            DiagnosticFailureClass::Config,
+            "smoke.fallback_cwd_drift",
+            "Fallback smoke cwd identity changed before host execution",
+            false,
+        )),
+    };
+    if fallback_cwd.is_some_and(|cwd| !cwd.current_path_matches()) {
+        return cwd_drift();
+    }
 
     match tokio::time::timeout_at(deadline, backend.configure_session(session, spec)).await {
         Err(_) => {
@@ -859,6 +913,7 @@ async fn execute_one(
             return DrainResult {
                 turn,
                 error: Some(BridgeError::AgentTimedOut),
+                static_failure: None,
             };
         }
         Ok(Err(error)) => {
@@ -866,9 +921,17 @@ async fn execute_one(
             return DrainResult {
                 turn,
                 error: Some(error),
+                static_failure: None,
             };
         }
         Ok(Ok(())) => turn.prompt_calls = 0,
+    }
+
+    // ACP configure only stashes SessionSpec; lazy session mint happens at prompt. Revalidate after
+    // configure so a replacement in that exact window cannot reach the billable handoff. A later
+    // replacement is still pinned by the host process spawn context and object-addressed ACP cwd.
+    if fallback_cwd.is_some_and(|cwd| !cwd.current_path_matches()) {
+        return cwd_drift();
     }
 
     turn.prompt_calls = 1;
@@ -891,6 +954,7 @@ async fn execute_one(
             return DrainResult {
                 turn,
                 error: Some(BridgeError::AgentTimedOut),
+                static_failure: None,
             };
         }
         Ok(Err(error)) => {
@@ -898,6 +962,7 @@ async fn execute_one(
             return DrainResult {
                 turn,
                 error: Some(error),
+                static_failure: None,
             };
         }
         Ok(Ok(stream)) => stream,
@@ -910,6 +975,7 @@ async fn execute_one(
             DrainResult {
                 turn,
                 error: Some(BridgeError::AgentTimedOut),
+                static_failure: None,
             }
         }
         Ok(result) => result,
@@ -937,6 +1003,7 @@ async fn drain_stream(
                 return DrainResult {
                     turn,
                     error: Some(error),
+                    static_failure: None,
                 };
             }
             Ok(Update::Text(text)) => {
@@ -987,7 +1054,11 @@ async fn drain_stream(
         && turn.tool_event_count == 0
         && turn.permission_update_count == 0;
     let error = (!successful).then_some(BridgeError::FrameError);
-    DrainResult { turn, error }
+    DrainResult {
+        turn,
+        error,
+        static_failure: None,
+    }
 }
 
 fn safe_stop_reason(reason: &str) -> &'static str {
@@ -1033,7 +1104,7 @@ pub(crate) fn execution_mode(entry: &bridge_core::domain::AgentEntry) -> &'stati
     }
 }
 
-fn artifact_redactor(
+pub(crate) fn artifact_redactor(
     entry: &bridge_core::domain::AgentEntry,
     session_cwd: Option<&SessionCwd>,
 ) -> DiagnosticRedactor {
@@ -1074,6 +1145,17 @@ fn authentication(
     } else {
         AuthenticationRecord::Automatic
     }
+}
+
+pub(crate) fn authentication_wire_value(
+    entry: &bridge_core::domain::AgentEntry,
+    session_cwd: Option<&SessionCwd>,
+) -> Value {
+    serde_json::to_value(authentication(
+        entry,
+        &artifact_redactor(entry, session_cwd),
+    ))
+    .expect("authentication record is always JSON-serializable")
 }
 
 fn artifact_provenance(
@@ -1327,6 +1409,15 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             return state.finalize(args.include_redacted_stderr).await;
         }
     };
+    // Once the selected entry is known, every later return must sanitize request fields with that
+    // entry's credential set. A later, cwd-aware pass expands the set before target serialization.
+    let early_session_cwd = args
+        .session_cwd
+        .as_deref()
+        .and_then(|path| canonical_session_cwd(path).ok());
+    let entry_redactor = artifact_redactor(&entry, early_session_cwd.as_ref());
+    sanitize_optional_artifact_text(&mut state.artifact.request.model, &entry_redactor);
+    sanitize_optional_artifact_text(&mut state.artifact.request.mode, &entry_redactor);
     if args.fallback_guard.is_some()
         && (!entry.host_fallback_eligible
             || !matches!(entry.kind, AgentKind::Acp)
@@ -1360,6 +1451,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         },
         None => None,
     };
+    let mut pinned_session_cwd = None;
     if let Some(guard) = &args.fallback_guard {
         if session_cwd.as_ref() != Some(&guard.expected_session_cwd) {
             state.fail_static(
@@ -1371,6 +1463,25 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             );
             return state.finalize(args.include_redacted_stderr).await;
         }
+        let pin = match crate::local_file::PinnedDirectory::open(
+            Path::new(guard.expected_session_cwd.as_str()),
+            &guard.expected_session_cwd,
+            guard.expected_session_cwd_identity,
+            "fallback smoke cwd",
+        ) {
+            Ok(pin) => pin,
+            Err(_) => {
+                state.fail_static(
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Config,
+                    "smoke.fallback_cwd_drift",
+                    "Fallback smoke cwd identity changed after planning",
+                    false,
+                );
+                return state.finalize(args.include_redacted_stderr).await;
+            }
+        };
+        pinned_session_cwd = Some(pin);
         let source = snapshot
             .entries
             .iter()
@@ -1410,9 +1521,15 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         mode: args.mode.clone(),
     };
     let effective = effective_config(&entry, Some(&overrides));
+    // Guarded host fallback uses the ACP child's pinned process cwd and an object-addressed absolute
+    // session cwd installed by make_spawn_fn. Ordinary smoke retains the explicit SessionSpec cwd.
+    let execution_session_cwd = pinned_session_cwd
+        .is_none()
+        .then(|| session_cwd.clone())
+        .flatten();
     let spec = SessionSpec {
         config: effective.clone(),
-        cwd: session_cwd,
+        cwd: execution_session_cwd,
     };
     state.artifact.session.effective_request =
         Some(effective_record(&effective, &artifact_redactor));
@@ -1451,7 +1568,14 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         None
     };
     let policy: Arc<dyn PolicyEngine> = Arc::new(DenyAllPolicy);
-    let spawn = make_spawn_fn(policy, config_path, run, None, 1, None);
+    let host_process_cwd = pinned_session_cwd
+        .as_ref()
+        .map(|pin| crate::HostProcessCwd {
+            pinned_directory: pin.file_handle(),
+            acp_session_cwd: pin.acp_session_cwd(),
+            retain_descriptor_after_exec: pin.retain_descriptor_after_exec(),
+        });
+    let spawn = make_spawn_fn(policy, config_path, run, None, 1, None, host_process_cwd);
     let registry = match Registry::new_observed(snapshot, spawn) {
         Ok(registry) => Arc::new(registry),
         Err(error) => {
@@ -1464,6 +1588,23 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             return state.finalize(args.include_redacted_stderr).await;
         }
     };
+
+    if pinned_session_cwd
+        .as_ref()
+        .is_some_and(|cwd| !cwd.current_path_matches())
+    {
+        state.fail_static(
+            DiagnosticPhase::ConfigApply,
+            DiagnosticFailureClass::Config,
+            "smoke.fallback_cwd_drift",
+            "Fallback smoke cwd identity changed before host spawn",
+            false,
+        );
+        drop(registry);
+        drop(run_guard);
+        drop(lease);
+        return state.finalize(args.include_redacted_stderr).await;
+    }
 
     // One absolute turn deadline covers resolve/spawn, session config/mint, prompt installation, and
     // terminal drain. Cleanup has its own short bounded grace so a timeout can still reap ownership.
@@ -1516,11 +1657,22 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         Arc::clone(&state.observer),
         rich,
         deadline,
+        pinned_session_cwd.as_ref(),
     )
     .await;
-    state.artifact.turn = result.turn;
+    let DrainResult {
+        turn,
+        error,
+        static_failure,
+    } = result;
+    state.artifact.turn = turn;
+    let failed = error.is_some() || static_failure.is_some();
 
-    if let Some(error) = &result.error {
+    if let Some(failure) = static_failure {
+        state.artifact.attempt.prompt_may_have_been_accepted |=
+            failure.prompt_may_have_been_accepted();
+        state.failure = Some(failure);
+    } else if let Some(error) = &error {
         state.artifact.attempt.timed_out = is_timeout_failure(error);
         let accepted = state.artifact.turn.prompt_calls == 1;
         let phase = turn_failure_phase(&state.artifact.turn);
@@ -1534,11 +1686,11 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         backend,
         &session,
         Arc::clone(&state.observer),
-        result.error.is_some(),
+        failed,
         run_guard.is_some(),
     )
     .await;
-    apply_cleanup_outcome(&mut state, result.error.is_some(), cleanup);
+    apply_cleanup_outcome(&mut state, failed, cleanup);
     drop(resolved);
     drop(registry);
     drop(run_guard);
@@ -1689,6 +1841,7 @@ mod tests {
     use super::*;
     use bridge_core::diagnostics::{StderrRedaction, StderrScope};
     use bridge_core::ports::BackendStream;
+    use std::fs;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
     use std::time::Instant;
@@ -1720,6 +1873,7 @@ mod tests {
         failing_release: bool,
         release_failure_accepted: bool,
         prompts: Mutex<Vec<String>>,
+        cwd_swap: Mutex<Option<(PathBuf, PathBuf, PathBuf)>>,
     }
 
     impl FakeBackend {
@@ -1735,6 +1889,7 @@ mod tests {
                 failing_release: false,
                 release_failure_accepted: true,
                 prompts: Mutex::new(Vec::new()),
+                cwd_swap: Mutex::new(None),
             }
         }
 
@@ -1746,6 +1901,11 @@ mod tests {
         fn with_unaccepted_failing_release(mut self) -> Self {
             self.failing_release = true;
             self.release_failure_accepted = false;
+            self
+        }
+
+        fn with_cwd_swap(self, planned: PathBuf, moved: PathBuf, replacement: PathBuf) -> Self {
+            *self.cwd_swap.lock().unwrap() = Some((planned, moved, replacement));
             self
         }
     }
@@ -1880,6 +2040,10 @@ mod tests {
             _spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
             self.configure_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((planned, moved, replacement)) = self.cwd_swap.lock().unwrap().take() {
+                fs::rename(&planned, &moved).unwrap();
+                fs::rename(&replacement, &planned).unwrap();
+            }
             if matches!(self.behavior, Behavior::ConfigFailure) {
                 Err(BridgeError::ModelNotAvailable)
             } else {
@@ -1929,6 +2093,7 @@ mod tests {
             observer(),
             Arc::new(SmokeRichSink::default()),
             tokio::time::Instant::now() + timeout,
+            None,
         )
         .await;
         (backend, result)
@@ -1973,6 +2138,10 @@ mod tests {
             digest,
             "--expected-session-cwd",
             "/tmp",
+            "--expected-session-cwd-device",
+            "1",
+            "--expected-session-cwd-inode",
+            "2",
             "--fallback-source-agent",
             "source",
             "--require-host-fallback-eligible",
@@ -1987,12 +2156,34 @@ mod tests {
             digest,
             "--expected-session-cwd",
             "/tmp",
+            "--expected-session-cwd-device",
+            "1",
+            "--expected-session-cwd-inode",
+            "2",
             "--fallback-source-agent",
             "source",
             "--require-host-fallback-eligible",
         ]))
         .unwrap();
         assert!(guarded.fallback_guard.is_some());
+        assert!(parse_args(&cli_args(&[
+            "--session-cwd",
+            "/tmp",
+            "--expected-config-sha256",
+            digest,
+            "--expected-executable-sha256",
+            digest,
+            "--expected-session-cwd",
+            "/tmp",
+            "--expected-session-cwd-device",
+            "not-a-device",
+            "--expected-session-cwd-inode",
+            "2",
+            "--fallback-source-agent",
+            "source",
+            "--require-host-fallback-eligible",
+        ]))
+        .is_err());
 
         let consumed_ack = vec![
             "--agent".into(),
@@ -2091,6 +2282,55 @@ mod tests {
         assert_eq!(backend.configure_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 0);
         assert_eq!(result.turn.prompt_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_cwd_replacement_during_configure_blocks_prompt_and_keeps_pinned_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let planned = dir.path().join("planned");
+        let moved = dir.path().join("planned-moved");
+        let replacement = dir.path().join("replacement");
+        fs::create_dir(&planned).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(planned.join("original-marker"), b"original").unwrap();
+        fs::write(replacement.join("replacement-marker"), b"replacement").unwrap();
+        let snapshot = crate::local_file::snapshot_directory(&planned, "test cwd").unwrap();
+        let pin = crate::local_file::PinnedDirectory::open(
+            &planned,
+            &snapshot.canonical_cwd,
+            snapshot.identity,
+            "test cwd",
+        )
+        .unwrap();
+        let backend = Arc::new(FakeBackend::new(Behavior::Exact).with_cwd_swap(
+            planned.clone(),
+            moved.clone(),
+            replacement,
+        ));
+        let backend_dyn: Arc<dyn AgentBackend> = backend.clone();
+        let result = execute_one(
+            backend_dyn,
+            &SessionId::parse("smoke-cwd-swap").unwrap(),
+            &SessionSpec {
+                config: EffectiveConfig::default(),
+                cwd: None,
+            },
+            observer(),
+            Arc::new(SmokeRichSink::default()),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Some(&pin),
+        )
+        .await;
+
+        assert!(result.error.is_none());
+        let diagnostic = result
+            .static_failure
+            .expect("cwd drift must produce a structured failure");
+        assert_eq!(diagnostic.code().as_str(), "smoke.fallback_cwd_drift");
+        assert_eq!(backend.configure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 0);
+        assert!(moved.join("original-marker").is_file());
+        assert!(planned.join("replacement-marker").is_file());
     }
 
     #[tokio::test]
@@ -2415,7 +2655,7 @@ mod tests {
         }];
         let redactor = artifact_redactor(&entry, None);
 
-        let auth = serde_json::to_value(authentication(&entry, &redactor)).unwrap();
+        let auth = authentication_wire_value(&entry, None);
         let rendered = serde_json::to_string(&auth).unwrap();
         assert_eq!(auth["path"], "configured_method");
         assert_eq!(auth["method"]["state"], "redacted");
@@ -2469,6 +2709,45 @@ mod tests {
         );
         assert!(!injected[0].detail.contains(secret));
         assert!(!injected[0].remedy.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn early_failure_artifact_redacts_selected_entry_credentials_from_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("bridge.toml");
+        let secret = "selected-entry-mcp-secret";
+        fs::write(
+            &config,
+            format!(
+                "default = \"test\"\nallowed_cwd_root = {:?}\n\n\
+                 [registry]\nallowed_cmds = [\"/bin/false\"]\n\n\
+                 [[agents]]\nid = \"test\"\ncmd = \"/bin/false\"\nauth_method = {secret:?}\nmcp_delivery = \"acp\"\n\n\
+                 [[agents.mcp]]\nname = \"secret-source\"\ncommand = \"/bin/false\"\n\n\
+                 [[agents.mcp.env]]\nname = \"TOKEN\"\nvalue = {secret:?}\n\n\
+                 [server]\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+        crate::validate_registry_config_contents(&fs::read_to_string(&config).unwrap())
+            .expect("early-failure secrecy fixture must be valid");
+        let mut args = args();
+        args.config = config;
+        args.model = Some(secret.into());
+        args.mode = Some(secret.into());
+        args.session_cwd = Some(dir.path().join("missing-repo"));
+
+        let artifact = run_attempt(&args).await;
+        let rendered = serde_json::to_string(&artifact).unwrap();
+
+        assert_eq!(
+            artifact.diagnostics.failure.as_ref().unwrap()["code"],
+            "smoke.session_cwd"
+        );
+        assert!(
+            !rendered.contains(secret),
+            "early failure leaked selected-entry credential: {rendered}"
+        );
     }
 
     #[tokio::test]
