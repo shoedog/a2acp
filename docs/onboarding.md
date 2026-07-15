@@ -72,6 +72,12 @@ the local `fallback-plan` command for trusted own-repo read-only verification. T
 does not infer trust, and does not execute or authorize an in-process fallback. API, sandboxed ACP, and
 `container_rw` entries reject the field when true.
 
+Planning that distinct verification requires `--trusted-session-cwd <exact-owned-repo>`. The path must be
+an existing canonical directory, must exactly match the failed smoke's reported cwd as evidence, and must
+remain under the current source agent's canonical read-only mount. Only that exact path enters the emitted
+argv. A guarded host smoke revalidates the source/target/config/executable guard before spawn and does not
+invoke the degraded container runtime for recovery or run-end cleanup.
+
 ### model / effort / mode
 
 All three are OPTIONAL and applied per session. Model and effort are

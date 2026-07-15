@@ -168,6 +168,7 @@ marked `host_fallback_eligible = true`:
   --from /absolute/path/to/failed-container-smoke.json \
   --host-agent trusted-host-review \
   --config /absolute/path/to/a2a-bridge.toml \
+  --trusted-session-cwd /absolute/path/to/exact-owned-repo \
   --confirm-trusted-own-repo-read-only \
   > /private/tmp/fallback-plan.json
 ```
@@ -176,14 +177,16 @@ The command is local and non-billable. It accepts only a pinned, bounded regular
 hand-assembled task envelopes and historical smoke-v1 artifacts are not trusted fallback evidence. An
 ineligible plan contains no command. An eligible plan emits an absolute candidate-binary argv for a
 distinct fixed-`PONG` verification smoke, bound to the current executable/config SHA-256, source-agent
-marker, and config-owned source mount. The artifact-reported cwd is informational and cannot select host
-scope.
+marker, and current source mount. The separately supplied trusted cwd must be an existing canonical
+directory, must exactly match the artifact-reported cwd as evidence, and must remain under that current
+mount. Only that exact operator-selected directory enters the host smoke argv.
 
 `fallback-plan` never runs the emitted argv. Inspect the JSON and explicitly decide whether to invoke it;
 the generated smoke still contains `--acknowledge-billable`. At action time the smoke re-reads the config
 and executable and revalidates the source mount and target marker before any agent spawn. Any drift fails
-closed. Never reconstruct or omit the generated guard flags by hand, and never treat a fixed `PONG` as a
-retry/resume of the original task.
+closed. Because the guarded target is already proven to be unsandboxed ACP, that smoke does not call the
+container runtime for recovery or run-end cleanup. Never reconstruct or omit the generated guard flags by
+hand, and never treat a fixed `PONG` as a retry/resume of the original task.
 
 ## 5. Inspect / clean up containers
 

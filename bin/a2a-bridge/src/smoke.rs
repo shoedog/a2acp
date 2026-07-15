@@ -1313,14 +1313,16 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             .filter(|entry| execution_mode(entry) == "container_ro")
             .and_then(|entry| entry.sandbox.as_ref())
             .and_then(|sandbox| canonical_session_cwd(Path::new(&sandbox.mount)).ok());
-        if source_cwd.as_ref().map(SessionCwd::as_str)
-            != session_cwd.as_ref().map(SessionCwd::as_str)
+        if !session_cwd
+            .as_ref()
+            .zip(source_cwd.as_ref())
+            .is_some_and(|(cwd, root)| cwd.is_under(root))
         {
             state.fail_static(
                 DiagnosticPhase::ConfigApply,
                 DiagnosticFailureClass::Config,
                 "smoke.fallback_source_drift",
-                "Fallback smoke cwd is not the current source container mount",
+                "Fallback smoke cwd is not within the current source container mount",
                 false,
             );
             return state.finalize(args.include_redacted_stderr).await;
@@ -1367,10 +1369,17 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         lease: lease.path().to_string_lossy().into_owned(),
         start: epoch_secs(),
     };
-    recover_orphans(&snapshot, &config_path, &host);
-    let run_guard = RunEndGuard {
-        runtimes: run_guard_runtimes(&snapshot, &config_path),
-        instance_id,
+    // A guarded fallback target is already proven to be unsandboxed ACP. Do not consult the degraded
+    // container runtime while attempting to verify the independent host lane; this run cannot create a
+    // container, so it needs neither orphan recovery nor a container run-end sweep.
+    let run_guard = if args.fallback_guard.is_none() {
+        recover_orphans(&snapshot, &config_path, &host);
+        Some(RunEndGuard {
+            runtimes: run_guard_runtimes(&snapshot, &config_path),
+            instance_id,
+        })
+    } else {
+        None
     };
     let policy: Arc<dyn PolicyEngine> = Arc::new(DenyAllPolicy);
     let spawn = make_spawn_fn(policy, config_path, run, None, 1, None);
@@ -1378,7 +1387,9 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         Ok(registry) => Arc::new(registry),
         Err(error) => {
             state.fail_error(&error, DiagnosticPhase::Resolve, false);
-            state.artifact.cleanup.run_scoped_backstop = "invoked_best_effort";
+            if run_guard.is_some() {
+                state.artifact.cleanup.run_scoped_backstop = "invoked_best_effort";
+            }
             drop(run_guard);
             drop(lease);
             return state.finalize(args.include_redacted_stderr).await;
@@ -1402,7 +1413,9 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
                 false,
             );
             registry.invalidate(&args.agent).await;
-            state.artifact.cleanup.run_scoped_backstop = "invoked_best_effort";
+            if run_guard.is_some() {
+                state.artifact.cleanup.run_scoped_backstop = "invoked_best_effort";
+            }
             drop(registry);
             drop(run_guard);
             drop(lease);
@@ -1411,7 +1424,9 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         ResolveOnce::Failed(error) => {
             state.artifact.attempt.timed_out = is_timeout_failure(&error);
             state.fail_error(&error, DiagnosticPhase::Resolve, false);
-            state.artifact.cleanup.run_scoped_backstop = "invoked_best_effort";
+            if run_guard.is_some() {
+                state.artifact.cleanup.run_scoped_backstop = "invoked_best_effort";
+            }
             drop(registry);
             drop(run_guard);
             drop(lease);

@@ -93,6 +93,7 @@ impl CheckResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathStat {
     pub exists: bool,
+    pub is_file: bool,
     pub is_dir: bool,
     /// Advisory: no write permission for the current user (best-effort; `Permissions::readonly()`).
     pub readonly: bool,
@@ -101,6 +102,7 @@ pub struct PathStat {
 impl PathStat {
     const ABSENT: Self = Self {
         exists: false,
+        is_file: false,
         is_dir: false,
         readonly: false,
     };
@@ -254,6 +256,7 @@ fn path_stat_impl(path: &Path) -> PathStat {
     match std::fs::metadata(path) {
         Ok(m) => PathStat {
             exists: true,
+            is_file: m.is_file(),
             is_dir: m.is_dir(),
             readonly: m.permissions().readonly(),
         },
@@ -1718,22 +1721,6 @@ fn check_review_slice_cmd(
     }
 }
 
-fn expand_tilde(s: &str) -> String {
-    match s.strip_prefix("~/") {
-        Some(rest) => match std::env::var("HOME") {
-            Ok(home) => format!("{home}/{rest}"),
-            Err(_) => s.to_string(),
-        },
-        None => s.to_string(),
-    }
-}
-
-/// A bind-mount host source is an absolute (or `~`-relative) path; a bare name (e.g.
-/// `a2a-kiro-data:/root/.local/share`) is a named/managed volume, not a host path — nothing to stat.
-fn is_bind_mount_host(host_seg: &str) -> bool {
-    host_seg.starts_with('/') || host_seg.starts_with('~')
-}
-
 /// Check 9 — configured bind-mount sources (the sandbox's `volumes`, e.g. mounted credentials or an
 /// isolated settings file) exist as host files; named volumes are skipped (informational — not a host
 /// path). The `creds:*` check-name prefix is retained for output compatibility with the original check.
@@ -1751,28 +1738,66 @@ fn check_creds(
         };
         let id = entry.id.as_str();
         for (i, vol) in sb.volumes.iter().enumerate() {
-            let host_seg = vol.split(':').next().unwrap_or("");
             let check = format!("creds:{id}:{i}");
-            if !is_bind_mount_host(host_seg) {
-                out.push(CheckResult::ok(
+            let declaration = match bridge_core::sandbox::parse_sandbox_volume(vol) {
+                Ok(declaration) => declaration,
+                Err(reason) => {
+                    out.push(CheckResult::fail(
+                        check,
+                        format!("invalid volume declaration {vol:?}: {reason}"),
+                        "fix the volume declaration (see docs/containerized-agents.md)",
+                    ));
+                    continue;
+                }
+            };
+            let destination = declaration.destination();
+            let credential = bridge_core::sandbox::is_credential_destination(destination);
+            let requirement = bridge_core::sandbox::sandbox_volume_host_requirement(destination);
+            use bridge_core::sandbox::{SandboxVolumeHostRequirement, SandboxVolumeSource};
+            match declaration.source() {
+                SandboxVolumeSource::Anonymous if credential => out.push(CheckResult::fail(
                     check,
-                    format!("named volume {host_seg:?} (not a host path, skipped)"),
-                ));
-                continue;
-            }
-            let host_path = expand_tilde(host_seg);
-            let st = probes.path_stat(Path::new(&host_path));
-            if st.exists {
-                out.push(CheckResult::ok(
+                    format!("credential destination {destination:?} has no source"),
+                    "configure the required credential file or directory source",
+                )),
+                SandboxVolumeSource::Anonymous => out.push(CheckResult::ok(
                     check,
-                    format!("bind-mount source {host_path:?} exists"),
-                ));
-            } else {
-                out.push(CheckResult::fail(
+                    format!("anonymous volume at {destination:?} (not a host path, skipped)"),
+                )),
+                SandboxVolumeSource::Named(name)
+                    if credential
+                        && matches!(requirement, SandboxVolumeHostRequirement::RegularFile) =>
+                {
+                    out.push(CheckResult::fail(
+                        check,
+                        format!("credential file destination {destination:?} uses named volume {name:?}"),
+                        "configure an absolute regular-file bind source",
+                    ));
+                }
+                SandboxVolumeSource::Named(name) => out.push(CheckResult::ok(
                     check,
-                    format!("bind-mount source {host_path:?} does not exist"),
-                    format!("create the bind-mount source at {host_path:?} for agent {id} (see docs/containerized-agents.md)"),
-                ));
+                    format!("named volume {name:?} (not a host path, skipped)"),
+                )),
+                SandboxVolumeSource::Host(host_path) => {
+                    let st = probes.path_stat(Path::new(host_path));
+                    let correct_type = match requirement {
+                        SandboxVolumeHostRequirement::MountSource => st.is_file || st.is_dir,
+                        SandboxVolumeHostRequirement::RegularFile => st.is_file,
+                        SandboxVolumeHostRequirement::Directory => st.is_dir,
+                    };
+                    if st.exists && correct_type {
+                        out.push(CheckResult::ok(
+                            check,
+                            format!("bind-mount source {host_path:?} has the required type"),
+                        ));
+                    } else {
+                        out.push(CheckResult::fail(
+                            check,
+                            format!("bind-mount source {host_path:?} is missing or has the wrong type"),
+                            format!("create the required bind-mount source at {host_path:?} for agent {id} (see docs/containerized-agents.md)"),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1796,10 +1821,8 @@ fn is_claude_acp_cmd(cmd: Option<&str>) -> bool {
 
 fn has_container_mount_destination(volumes: &[String], destination: &str) -> bool {
     volumes.iter().any(|volume| {
-        volume
-            .split(':')
-            .nth(1)
-            .is_some_and(|mounted_at| mounted_at == destination)
+        bridge_core::sandbox::parse_sandbox_volume(volume)
+            .is_ok_and(|declaration| declaration.destination() == destination)
     })
 }
 
@@ -2145,6 +2168,7 @@ mod tests {
                 p,
                 PathStat {
                     exists: true,
+                    is_file: false,
                     is_dir: true,
                     readonly: !writable,
                 },
@@ -2155,6 +2179,7 @@ mod tests {
                 p,
                 PathStat {
                     exists: true,
+                    is_file: true,
                     is_dir: false,
                     readonly: false,
                 },
@@ -2857,6 +2882,48 @@ mod tests {
         let row = find(&results, "creds:kiro:0");
         assert_eq!(row.status, CheckStatus::Ok);
         assert!(row.detail.contains("not a host path"), "{}", row.detail);
+    }
+
+    #[test]
+    fn anonymous_volume_is_not_misread_as_a_missing_host_bind() {
+        let mut agent = acp_entry("reader", "codex-acp");
+        agent.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec!["/cache".to_string()],
+        ));
+        let cfg = base_loaded(snapshot("reader", vec![agent], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest");
+        let results = run_checks(&cfg, &probes);
+        let row = find(&results, "creds:reader:0");
+        assert_eq!(row.status, CheckStatus::Ok);
+        assert!(row.detail.contains("anonymous volume"), "{}", row.detail);
+    }
+
+    #[test]
+    fn credential_bind_sources_require_the_destination_specific_type() {
+        let mut agent = acp_entry("reader", "codex-acp");
+        agent.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec![
+                "/creds/auth:/root/.codex/auth.json:ro".to_string(),
+                "/creds/data:/root/.local/share:ro".to_string(),
+            ],
+        ));
+        let cfg = base_loaded(snapshot("reader", vec![agent], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest")
+            .with_dir("/creds/auth", false)
+            .with_file("/creds/data");
+        let results = run_checks(&cfg, &probes);
+        assert_eq!(find(&results, "creds:reader:0").status, CheckStatus::Fail);
+        assert_eq!(find(&results, "creds:reader:1").status, CheckStatus::Fail);
     }
 
     // ---- check 10: explicit Fable prerequisites ----

@@ -148,8 +148,8 @@ fn valid_runtime_operand(value: &str) -> bool {
     valid_declaration(value) && !value.starts_with('-')
 }
 
-#[derive(Clone, Copy)]
-enum FilesystemRequirement {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxVolumeHostRequirement {
     MountSource,
     RegularFile,
     Directory,
@@ -157,14 +157,16 @@ enum FilesystemRequirement {
 
 fn filesystem_state(
     path: &std::path::Path,
-    requirement: FilesystemRequirement,
+    requirement: SandboxVolumeHostRequirement,
 ) -> ContainerEvidenceState {
     match std::fs::metadata(path) {
         Ok(metadata)
             if match requirement {
-                FilesystemRequirement::MountSource => metadata.is_file() || metadata.is_dir(),
-                FilesystemRequirement::RegularFile => metadata.is_file(),
-                FilesystemRequirement::Directory => metadata.is_dir(),
+                SandboxVolumeHostRequirement::MountSource => {
+                    metadata.is_file() || metadata.is_dir()
+                }
+                SandboxVolumeHostRequirement::RegularFile => metadata.is_file(),
+                SandboxVolumeHostRequirement::Directory => metadata.is_dir(),
             } =>
         {
             ContainerEvidenceState::Healthy
@@ -204,7 +206,7 @@ fn executable_state(program: &str) -> ContainerEvidenceState {
 }
 
 fn executable_path_state(path: &std::path::Path) -> ContainerEvidenceState {
-    let state = filesystem_state(path, FilesystemRequirement::RegularFile);
+    let state = filesystem_state(path, SandboxVolumeHostRequirement::RegularFile);
     if state != ContainerEvidenceState::Healthy {
         return state;
     }
@@ -242,11 +244,21 @@ fn merge_evidence_state(
     }
 }
 
-fn is_credential_destination(destination: &str) -> bool {
+pub fn is_credential_destination(destination: &str) -> bool {
     matches!(
         destination,
         "/root/.claude/.credentials.json" | "/root/.codex/auth.json" | "/root/.local/share"
     )
+}
+
+pub fn sandbox_volume_host_requirement(destination: &str) -> SandboxVolumeHostRequirement {
+    match destination {
+        "/root/.claude/.credentials.json" | "/root/.codex/auth.json" => {
+            SandboxVolumeHostRequirement::RegularFile
+        }
+        "/root/.local/share" => SandboxVolumeHostRequirement::Directory,
+        _ => SandboxVolumeHostRequirement::MountSource,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,7 +295,8 @@ fn valid_named_volume(value: &str) -> bool {
 
 /// Parse the `-v` grammar used by config validation, static evidence, and composition. Supported
 /// forms are an anonymous absolute destination or `source:absolute-destination[:options]` where the
-/// source is an absolute/`~/` host path or a runtime-owned named volume.
+/// source is an absolute host path or a runtime-owned named volume. Shell-style `~/` sources are rejected:
+/// container runtimes receive direct argv and do not perform shell expansion.
 pub fn parse_sandbox_volume(value: &str) -> Result<SandboxVolumeDeclaration, &'static str> {
     if !valid_declaration(value) {
         return Err("volume declaration is empty, padded, or contains controls");
@@ -292,7 +305,7 @@ pub fn parse_sandbox_volume(value: &str) -> Result<SandboxVolumeDeclaration, &'s
     let (source, destination, options) = match fields.as_slice() {
         [destination] => (SandboxVolumeSource::Anonymous, *destination, None),
         [source, destination] => (
-            if source.starts_with('/') || source.starts_with("~/") {
+            if source.starts_with('/') {
                 SandboxVolumeSource::Host((*source).to_owned())
             } else if valid_named_volume(source) {
                 SandboxVolumeSource::Named((*source).to_owned())
@@ -303,7 +316,7 @@ pub fn parse_sandbox_volume(value: &str) -> Result<SandboxVolumeDeclaration, &'s
             None,
         ),
         [source, destination, options] => (
-            if source.starts_with('/') || source.starts_with("~/") {
+            if source.starts_with('/') {
                 SandboxVolumeSource::Host((*source).to_owned())
             } else if valid_named_volume(source) {
                 SandboxVolumeSource::Named((*source).to_owned())
@@ -335,12 +348,7 @@ fn host_volume_path(source: &str) -> Result<std::path::PathBuf, ()> {
     if source.starts_with('/') {
         return Ok(std::path::PathBuf::from(source));
     }
-    source
-        .strip_prefix("~/")
-        .and_then(|relative| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(relative))
-        })
-        .ok_or(())
+    Err(())
 }
 
 pub fn validate_sandbox_declarations(sandbox: &SandboxConfig) -> Result<(), &'static str> {
@@ -391,18 +399,13 @@ fn extra_volume_states(volumes: &[String]) -> (ContainerEvidenceState, Container
         } else {
             &mut mount
         };
-        let requirement = match declaration.destination() {
-            "/root/.claude/.credentials.json" | "/root/.codex/auth.json" => {
-                FilesystemRequirement::RegularFile
-            }
-            "/root/.local/share" => FilesystemRequirement::Directory,
-            _ => FilesystemRequirement::MountSource,
-        };
+        let requirement = sandbox_volume_host_requirement(declaration.destination());
         let state = match declaration.source() {
             SandboxVolumeSource::Anonymous if credential => ContainerEvidenceState::Failed,
             SandboxVolumeSource::Anonymous => ContainerEvidenceState::Healthy,
             SandboxVolumeSource::Named(_)
-                if credential && matches!(requirement, FilesystemRequirement::RegularFile) =>
+                if credential
+                    && matches!(requirement, SandboxVolumeHostRequirement::RegularFile) =>
             {
                 ContainerEvidenceState::Failed
             }
@@ -455,7 +458,7 @@ pub fn inspect_container_infrastructure(
             merge_evidence_state(
                 filesystem_state(
                     std::path::Path::new(&sandbox.mount),
-                    FilesystemRequirement::Directory,
+                    SandboxVolumeHostRequirement::Directory,
                 ),
                 extra_mount,
             ),
@@ -1274,6 +1277,10 @@ mod tests {
                 source: SandboxVolumeSource::Anonymous,
                 destination: "/cache".into(),
             }
+        );
+        assert!(
+            parse_sandbox_volume("~/.config/auth.json:/root/.codex/auth.json:ro").is_err(),
+            "direct runtime argv does not expand shell-style tilde sources"
         );
 
         let temp = tempfile::tempdir().unwrap();

@@ -31,7 +31,8 @@
 //   a2a-bridge smoke --agent <id> --config <path>
 //             --acknowledge-billable                    — run one bounded fixed PONG probe
 //   a2a-bridge fallback-plan --from <artifact> --host-agent <id>
-//             --config <path>                           — emit a local-only host fallback plan
+//             --config <path> --trusted-session-cwd <repo>
+//                                                       — emit a local-only host fallback plan
 
 mod catalog_probe;
 mod config;
@@ -105,7 +106,8 @@ SUBCOMMANDS:
   smoke               Run one explicitly acknowledged, bounded, fixed PONG probe.
                       --agent <id> --config <f> --acknowledge-billable [--out <f>]
   fallback-plan       Validate a local failed artifact and emit a host fallback recommendation.
-                      --from <artifact> --host-agent <id> --config <f> [--confirm-trusted-own-repo-read-only]
+                      --from <artifact> --host-agent <id> --config <f> --trusted-session-cwd <repo>
+                      [--confirm-trusted-own-repo-read-only]
   implement --input <file|-> Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
@@ -833,6 +835,42 @@ fn validate_worktree_runtime_cfg(cfg: &RegistryConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Static container preflight can fail before an ACP backend exists. In that one case the composition
+/// root owns the missing spawn lifecycle pair so the typed failure is represented in the same observer
+/// stream as the enclosing registry resolve. Once preflight succeeds, the ACP backend remains the sole
+/// owner of spawn observation.
+async fn observe_static_container_spawn_failure(
+    observer: &Arc<dyn bridge_core::ports::DiagnosticObserver>,
+    failure: &bridge_core::diagnostics::FailureDiagnostic,
+) -> Result<(), BridgeError> {
+    use bridge_core::diagnostics::{
+        DiagnosticEvent, DiagnosticRedactor, PersistedPhaseTransition,
+        PersistedPhaseTransitionInput, PhaseStatus,
+    };
+
+    for (status, event_failure) in [
+        (PhaseStatus::Started, None),
+        (PhaseStatus::Failed, Some(failure.clone())),
+    ] {
+        let transition = PersistedPhaseTransition::build(
+            PersistedPhaseTransitionInput {
+                phase: bridge_core::diagnostics::DiagnosticPhase::Spawn,
+                status,
+                at_ms: bridge_core::diagnostics::diagnostic_timestamp_ms(),
+                operation: None,
+                code: None,
+                auth: None,
+            },
+            &DiagnosticRedactor::default(),
+        )
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+        let event = DiagnosticEvent::new(transition, event_failure)
+            .map_err(|_| BridgeError::InvalidStateTransition)?;
+        observer.record(event).await?;
+    }
+    Ok(())
+}
+
 /// The production observer-aware spawn factory (Acp compose-or-raw / Api / ContainerRw arms) — shared by
 /// run-workflow and the `implement` subcommand so their registry builds can't drift.
 /// `owner_config_path` seeds the ContainerRw owner token. R2b2b consumes the observer in ACP; R2b3
@@ -873,7 +911,23 @@ fn make_spawn_fn(
                 AgentKind::Acp => {
                     // Compose-or-raw + the `:ro` reaper via the shared helper (both factories agree).
                     let (program, argv, acp) =
-                        acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)?;
+                        match acp_spawn_inputs(&entry, cwd, &owner_config_path, &run) {
+                            Ok(inputs) => inputs,
+                            Err(error) => {
+                                if let BridgeError::AgentFailure { diagnostic } = &error {
+                                    if diagnostic.failed_phase()
+                                        == bridge_core::diagnostics::DiagnosticPhase::Spawn
+                                        && diagnostic.class().is_container_fallback_class()
+                                    {
+                                        observe_static_container_spawn_failure(
+                                            &observer, diagnostic,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                return Err(error);
+                            }
+                        };
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
                     let controller = acp
                         .container

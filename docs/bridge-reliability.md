@@ -157,10 +157,12 @@ Exit: a release cannot claim an agent path that was not tested from its distribu
 
 ## Immediate queue
 
-1. Run one Sol/xhigh inherited-finding closure re-review for R2d's local non-billable fallback-plan from
-   the [R2d plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md). Its initial review returned
-   `REVISE`, all nine findings are folded, and post-fold deterministic gates are green at
-   **1,962 / 0 / 12 ignored**. Keep authenticated in-process
+1. Freeze the fully gated R2d design-v16 fold, then run one Sol/xhigh closure re-review for the local
+   non-billable fallback-plan from the
+   [R2d plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md). Its initial review and closure
+   re-review 1 both returned `REVISE`; both folds are applied and the full serial workspace is green at
+   **1,969 / 0 / 12 ignored**. Keep
+   authenticated in-process
    [R2e](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) deferred.
 2. Establish the pinned/floating compatibility lanes in the
    [R3 plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md).

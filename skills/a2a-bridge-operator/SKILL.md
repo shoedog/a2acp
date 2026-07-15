@@ -89,6 +89,7 @@ a2a-bridge fallback-plan \
   --from /absolute/path/to/failed-container-smoke.json \
   --host-agent <explicit-marked-host-id> \
   --config /absolute/path/to/a2a-bridge.toml \
+  --trusted-session-cwd /absolute/path/to/exact-owned-repo \
   --confirm-trusted-own-repo-read-only
 ```
 
@@ -99,11 +100,14 @@ match the current bounded regular config. It rejects hand-assembled task envelop
 evidence, any prompt barrier, source/config drift, write-capable sources, and non-container classes.
 
 An eligible schema-v2 plan emits an absolute candidate-binary argv for a **new distinct fixed-PONG
-verification smoke**. It uses the current config-owned source sandbox mount, never the artifact-reported
-cwd, and binds the later smoke to the config SHA-256, executable SHA-256, source agent, and target marker.
-The later smoke rechecks all four before spawn. Inspect the plan and invoke it only as a separate explicit
-billable operator action; never strip/reconstruct its guard flags, call it a retry of the original task, or
-infer that fixed `PONG` proves the original arbitrary prompt would succeed.
+verification smoke**. The separately supplied trusted cwd must be an existing canonical directory, must
+exactly match the artifact-reported cwd as evidence, and must remain under the current canonical source
+mount. Only that exact operator-selected directory enters argv. The plan binds the later smoke to the
+config SHA-256, executable SHA-256, source agent/mount/mode, and target marker. The later smoke rechecks
+the closed guard before spawn and, because its target is already proven unsandboxed ACP, performs no
+container recovery or run-end sweep. Inspect the plan and invoke it only as a separate explicit billable
+operator action; never strip/reconstruct its guard flags, call it a retry of the original task, or infer
+that fixed `PONG` proves the original arbitrary prompt would succeed.
 
 When an agent runtime launches the command, distinguish its managed sandbox from approved host
 execution. A sandboxed ACP failure does not prove that the computer lacks DNS, egress, or authentication;

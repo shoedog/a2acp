@@ -19,6 +19,7 @@ use crate::BoxError;
 pub(crate) const USAGE: &str = "\
 usage: a2a-bridge fallback-plan --from <failed-smoke-v2-artifact.json>
                                 --host-agent <explicit-agent-id>
+                                --trusted-session-cwd <exact-owned-repo>
                                 [--confirm-trusted-own-repo-read-only]
                                 --config <path>
 
@@ -40,6 +41,7 @@ struct FallbackArgs {
     source: PathBuf,
     host_agent: AgentId,
     host_agent_raw: String,
+    trusted_session_cwd: PathBuf,
     confirm_trusted_own_repo_read_only: bool,
     config: PathBuf,
 }
@@ -82,6 +84,20 @@ fn validated_path_text(path: &Path, label: &str) -> Result<String, BoxError> {
     Ok(value.to_owned())
 }
 
+fn canonical_existing_directory(path: &Path, label: &str) -> Result<SessionCwd, BoxError> {
+    validated_path_text(path, label)?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("fallback-plan: {label} is not an existing directory: {error}"))?;
+    if !std::fs::metadata(&canonical)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        return Err(format!("fallback-plan: {label} is not an existing directory").into());
+    }
+    SessionCwd::parse(&canonical.to_string_lossy())
+        .map_err(|_| format!("fallback-plan: {label} is not a valid absolute directory").into())
+}
+
 fn parse_args(args: &[String]) -> Result<Option<FallbackArgs>, BoxError> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{USAGE}");
@@ -89,6 +105,7 @@ fn parse_args(args: &[String]) -> Result<Option<FallbackArgs>, BoxError> {
     }
     let mut source = None;
     let mut host_agent = None;
+    let mut trusted_session_cwd = None;
     let mut config = None;
     let mut confirm = false;
     let mut index = 0;
@@ -107,6 +124,14 @@ fn parse_args(args: &[String]) -> Result<Option<FallbackArgs>, BoxError> {
                     take_value(args, &mut index, "--host-agent")?,
                 )?;
                 set_once(&mut host_agent, value, "--host-agent")?;
+            }
+            "--trusted-session-cwd" => {
+                let value = take_value(args, &mut index, "--trusted-session-cwd")?;
+                set_once(
+                    &mut trusted_session_cwd,
+                    PathBuf::from(value),
+                    "--trusted-session-cwd",
+                )?;
             }
             "--config" => {
                 let value = take_value(args, &mut index, "--config")?;
@@ -132,11 +157,14 @@ fn parse_args(args: &[String]) -> Result<Option<FallbackArgs>, BoxError> {
         host_agent.ok_or_else(|| format!("fallback-plan: missing --host-agent\n{USAGE}"))?;
     let host_agent = AgentId::parse(host_agent_raw.clone())
         .map_err(|_| "fallback-plan: invalid --host-agent")?;
+    let trusted_session_cwd = trusted_session_cwd
+        .ok_or_else(|| format!("fallback-plan: missing --trusted-session-cwd\n{USAGE}"))?;
     let config = config.ok_or_else(|| format!("fallback-plan: missing --config\n{USAGE}"))?;
     Ok(Some(FallbackArgs {
         source,
         host_agent,
         host_agent_raw,
+        trusted_session_cwd,
         confirm_trusted_own_repo_read_only: confirm,
         config,
     }))
@@ -193,8 +221,8 @@ struct SmokeRequest {
     _mode: Option<String>,
     #[serde(default)]
     session_cwd: Option<String>,
-    #[serde(default, rename = "fallback_guard")]
-    _fallback_guard: Option<serde_json::Value>,
+    #[serde(default)]
+    fallback_guard: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -205,7 +233,7 @@ struct SmokeTarget {
     authentication: SmokeAuthentication,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SmokeCheckStatus {
     Ok,
@@ -217,18 +245,38 @@ enum SmokeCheckStatus {
 #[serde(deny_unknown_fields)]
 struct SmokeProvenanceRow {
     check: String,
-    #[serde(rename = "status")]
-    _status: SmokeCheckStatus,
+    status: SmokeCheckStatus,
     detail: String,
     remedy: String,
 }
 
 #[derive(Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum SmokeRedactedId {
+    Value { value: String },
+    Redacted,
+}
+
+impl SmokeRedactedId {
+    fn value(&self) -> Option<&str> {
+        match self {
+            Self::Value { value } => Some(value),
+            Self::Redacted => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "path", rename_all = "snake_case", deny_unknown_fields)]
 enum SmokeAuthentication {
-    ApiKeyEnv { name: String, present: bool },
+    ApiKeyEnv {
+        name: SmokeRedactedId,
+        present: bool,
+    },
     PreAuthenticated,
-    ConfiguredMethod { method: String },
+    ConfiguredMethod {
+        method: SmokeRedactedId,
+    },
     Automatic,
     NotApplicable,
 }
@@ -238,8 +286,8 @@ enum SmokeAuthentication {
 struct SmokeSession {
     id: String,
     configure_calls: u8,
-    #[serde(default, rename = "effective_request")]
-    _effective_request: Option<serde_json::Value>,
+    #[serde(default)]
+    effective_request: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -248,14 +296,14 @@ struct SmokeTurn {
     prompt: String,
     prompt_calls: u8,
     terminal_state: String,
-    #[serde(default, rename = "stop_reason")]
-    _stop_reason: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
     exact_pong: bool,
     text_bytes: u64,
     tool_event_count: u64,
     permission_update_count: u64,
-    #[serde(default, rename = "usage")]
-    _usage: Option<serde_json::Value>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -288,10 +336,12 @@ enum IneligibilityReason {
     SourceDiagnosticsIncomplete,
     SourceConfigProvenanceMissing,
     SourceConfigProvenanceMismatch,
+    SourceSessionCwdMismatch,
     SourceNotContainerExecution,
     SourceNotReadOnly,
     SourceAgentUnknown,
     SourceAgentConfigurationMismatch,
+    TrustedSessionCwdOutsideSourceMount,
     SourceFailureNotContainer,
     SourceFailurePhaseInvalid,
     SourceDispositionNotFallbackCandidate,
@@ -312,6 +362,7 @@ struct NormalizedSource {
     config_sha256: Option<String>,
     prompt_may_have_been_accepted: bool,
     failure: Option<FailureDiagnostic>,
+    target: Option<SmokeTarget>,
     reasons: Vec<IneligibilityReason>,
 }
 
@@ -404,7 +455,9 @@ fn validate_smoke_lifecycle(
         return Ok(());
     }
     let mut open: Vec<(DiagnosticPhase, Option<DiagnosticOperation>)> = Vec::new();
-    let mut matched_outer_failure = false;
+    let mut closed: Vec<(DiagnosticPhase, Option<DiagnosticOperation>)> = Vec::new();
+    let mut matched_outer_failures = 0usize;
+    let mut sequence = Vec::with_capacity(events.len());
     let mut previous_at_ms = started_at_ms;
     for event in events {
         let transition = event.transition();
@@ -413,6 +466,11 @@ fn validate_smoke_lifecycle(
         }
         previous_at_ms = transition.at_ms();
         let key = (transition.phase(), transition.operation());
+        sequence.push((
+            transition.phase(),
+            transition.status(),
+            transition.operation(),
+        ));
         if !accepted
             && matches!(
                 transition.phase(),
@@ -427,8 +485,8 @@ fn validate_smoke_lifecycle(
         }
         match transition.status() {
             PhaseStatus::Started => {
-                if open.contains(&key) {
-                    return Err("fallback-plan: lifecycle starts one phase twice".into());
+                if open.contains(&key) || closed.contains(&key) {
+                    return Err("fallback-plan: lifecycle re-enters one closed phase".into());
                 }
                 open.push(key);
             }
@@ -439,6 +497,7 @@ fn validate_smoke_lifecycle(
                     );
                 };
                 open.remove(index);
+                closed.push(key);
             }
         }
         if let Some(event_failure) = event.failure() {
@@ -447,11 +506,37 @@ fn validate_smoke_lifecycle(
                     "fallback-plan: lifecycle failure is missing from the artifact summary".into(),
                 );
             };
-            matched_outer_failure |= same_failure_identity(event_failure, outer_failure);
+            if !same_failure_identity(event_failure, outer_failure) {
+                return Err("fallback-plan: lifecycle contradicts its outer failure".into());
+            }
+            matched_outer_failures += 1;
+        } else if transition.status() == PhaseStatus::Failed
+            && transition.phase() != DiagnosticPhase::Resolve
+        {
+            return Err("fallback-plan: lifecycle failed phase lacks a diagnostic".into());
         }
     }
-    if !open.is_empty() || outer_failure.is_some() && !matched_outer_failure {
+    if !open.is_empty() || outer_failure.is_some() && matched_outer_failures != 1 {
         push_reason(reasons, IneligibilityReason::SourceDiagnosticsIncomplete);
+    }
+    let is_container_spawn_candidate = outer_failure.is_some_and(|failure| {
+        failure.failed_phase() == DiagnosticPhase::Spawn
+            && failure.class().is_container_fallback_class()
+            && failure.disposition() == FailureDisposition::ContainerFallbackCandidate
+            && !accepted
+    });
+    if is_container_spawn_candidate
+        && sequence
+            != [
+                (DiagnosticPhase::Resolve, PhaseStatus::Started, None),
+                (DiagnosticPhase::Spawn, PhaseStatus::Started, None),
+                (DiagnosticPhase::Spawn, PhaseStatus::Failed, None),
+                (DiagnosticPhase::Resolve, PhaseStatus::Failed, None),
+            ]
+    {
+        return Err(
+            "fallback-plan: container lifecycle is not one production resolve/spawn attempt".into(),
+        );
     }
     Ok(())
 }
@@ -474,13 +559,8 @@ fn validate_cleanup(cleanup: &SmokeCleanup) -> Result<(), BoxError> {
     Ok(())
 }
 
-fn validate_target_evidence(
-    target: &SmokeTarget,
-    source_agent: &str,
-    reasons: &mut Vec<IneligibilityReason>,
-) -> Result<(), BoxError> {
-    let expected_auth = format!("provenance:{source_agent}:auth");
-    let expected_model = format!("provenance:{source_agent}:model");
+fn validate_target_evidence(target: &SmokeTarget, source_agent: &str) -> Result<(), BoxError> {
+    let expected_prefix = format!("provenance:{source_agent}:");
     let mut checks = std::collections::HashSet::new();
     for row in &target.provenance {
         bounded_nonempty("source provenance check", &row.check, MAX_ID_BYTES)?;
@@ -488,28 +568,96 @@ fn validate_target_evidence(
         if row.remedy.len() > MAX_PATH_BYTES || row.remedy.chars().any(char::is_control) {
             return Err("fallback-plan: invalid source provenance remedy".into());
         }
+        if !row.check.starts_with(&expected_prefix)
+            || matches!(row.status, SmokeCheckStatus::Ok) && !row.remedy.is_empty()
+            || matches!(row.status, SmokeCheckStatus::Warn | SmokeCheckStatus::Fail)
+                && row.remedy.is_empty()
+        {
+            return Err("fallback-plan: invalid source provenance row".into());
+        }
         if !checks.insert(row.check.as_str()) {
             return Err("fallback-plan: duplicate source provenance check".into());
         }
     }
-    if !checks.contains(expected_auth.as_str()) || !checks.contains(expected_model.as_str()) {
-        push_reason(reasons, IneligibilityReason::SourceDiagnosticsIncomplete);
-    }
     match &target.authentication {
         SmokeAuthentication::PreAuthenticated | SmokeAuthentication::Automatic => {}
         SmokeAuthentication::ConfiguredMethod { method } => {
-            bounded_nonempty("source authentication method", method, MAX_ID_BYTES)?;
+            if let Some(method) = method.value() {
+                bounded_nonempty("source authentication method", method, MAX_ID_BYTES)?;
+            }
         }
         SmokeAuthentication::ApiKeyEnv { name, present } => {
             let _ = present;
-            bounded_nonempty("source authentication environment", name, MAX_ID_BYTES)?;
-            push_reason(reasons, IneligibilityReason::SourceDiagnosticsIncomplete);
+            if let Some(name) = name.value() {
+                bounded_nonempty("source authentication environment", name, MAX_ID_BYTES)?;
+            }
         }
-        SmokeAuthentication::NotApplicable => {
-            push_reason(reasons, IneligibilityReason::SourceDiagnosticsIncomplete);
-        }
+        SmokeAuthentication::NotApplicable => {}
     }
     Ok(())
+}
+
+fn known_container_agent_cli(cmd: Option<&str>) -> bool {
+    cmd.and_then(|cmd| Path::new(cmd).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "codex-acp" | "claude-agent-acp"))
+}
+
+fn validate_current_source_evidence(
+    target: &SmokeTarget,
+    source_agent: &str,
+    entry: &bridge_core::domain::AgentEntry,
+    reasons: &mut Vec<IneligibilityReason>,
+) {
+    let prefix = format!("provenance:{source_agent}:");
+    let rows: std::collections::HashMap<&str, SmokeCheckStatus> = target
+        .provenance
+        .iter()
+        .filter_map(|row| {
+            row.check
+                .strip_prefix(&prefix)
+                .map(|name| (name, row.status))
+        })
+        .collect();
+    let mut expected = vec!["execution", "adapter", "image", "auth", "model"];
+    if known_container_agent_cli(entry.cmd.as_deref()) {
+        expected.push("agent-cli");
+    }
+    expected.sort_unstable();
+    let mut actual: Vec<&str> = rows.keys().copied().collect();
+    actual.sort_unstable();
+    let statuses_match = rows
+        .get("execution")
+        .is_some_and(|status| matches!(status, SmokeCheckStatus::Ok | SmokeCheckStatus::Warn))
+        && rows.get("adapter") == Some(&SmokeCheckStatus::Warn)
+        && rows
+            .get("image")
+            .is_some_and(|status| matches!(status, SmokeCheckStatus::Ok | SmokeCheckStatus::Warn))
+        && rows.get("auth") == Some(&SmokeCheckStatus::Ok)
+        && rows.get("model") == Some(&SmokeCheckStatus::Ok)
+        && (!known_container_agent_cli(entry.cmd.as_deref())
+            || rows.get("agent-cli") == Some(&SmokeCheckStatus::Warn));
+    if actual != expected || !statuses_match {
+        push_reason(reasons, IneligibilityReason::SourceDiagnosticsIncomplete);
+    }
+
+    let authentication_matches = if entry.pre_authenticated {
+        matches!(target.authentication, SmokeAuthentication::PreAuthenticated)
+    } else if let Some(expected_method) = entry.auth_method.as_deref() {
+        matches!(
+            &target.authentication,
+            SmokeAuthentication::ConfiguredMethod { method }
+                if method.value() == Some(expected_method)
+        )
+    } else {
+        matches!(target.authentication, SmokeAuthentication::Automatic)
+    };
+    if !authentication_matches {
+        push_reason(
+            reasons,
+            IneligibilityReason::SourceAgentConfigurationMismatch,
+        );
+    }
 }
 
 fn parse_smoke_source(bytes: &[u8]) -> Result<NormalizedSource, BoxError> {
@@ -557,6 +705,7 @@ fn parse_smoke_source(bytes: &[u8]) -> Result<NormalizedSource, BoxError> {
         || source.session.configure_calls > 1
         || source.turn.prompt != crate::smoke::FIXED_PROMPT
         || source.turn.prompt_calls > 1
+        || source.request.fallback_guard.is_some()
     {
         return Err("fallback-plan: inconsistent smoke artifact lifecycle".into());
     }
@@ -594,7 +743,7 @@ fn parse_smoke_source(bytes: &[u8]) -> Result<NormalizedSource, BoxError> {
         push_reason(&mut reasons, IneligibilityReason::SourceNotReadOnly);
     }
     if let Some(target) = source.target.as_ref() {
-        validate_target_evidence(target, &source_agent_raw, &mut reasons)?;
+        validate_target_evidence(target, &source_agent_raw)?;
     }
     validate_failure(
         source.diagnostics.failure.as_ref(),
@@ -609,13 +758,27 @@ fn parse_smoke_source(bytes: &[u8]) -> Result<NormalizedSource, BoxError> {
         source.attempt.ended_at_ms,
         &mut reasons,
     )?;
+    let container_spawn_candidate = source.diagnostics.failure.as_ref().is_some_and(|failure| {
+        failure.failed_phase() == DiagnosticPhase::Spawn
+            && failure.class().is_container_fallback_class()
+            && failure.disposition() == FailureDisposition::ContainerFallbackCandidate
+    });
+    if container_spawn_candidate
+        && (source.session.configure_calls != 0 || source.session.effective_request.is_none())
+    {
+        return Err(
+            "fallback-plan: container spawn artifact has impossible session evidence".into(),
+        );
+    }
     if !source.attempt.prompt_may_have_been_accepted
         && (source.turn.prompt_calls != 0
             || source.turn.terminal_state != "not_started"
             || source.turn.exact_pong
+            || source.turn.stop_reason.is_some()
             || source.turn.text_bytes != 0
             || source.turn.tool_event_count != 0
-            || source.turn.permission_update_count != 0)
+            || source.turn.permission_update_count != 0
+            || source.turn.usage.is_some())
     {
         return Err("fallback-plan: pre-prompt smoke artifact contains turn activity".into());
     }
@@ -633,6 +796,7 @@ fn parse_smoke_source(bytes: &[u8]) -> Result<NormalizedSource, BoxError> {
             .map(|digest| digest.to_ascii_lowercase()),
         prompt_may_have_been_accepted: source.attempt.prompt_may_have_been_accepted,
         failure: source.diagnostics.failure,
+        target: source.target,
         reasons,
     })
 }
@@ -764,6 +928,7 @@ struct TargetRecord {
 #[derive(Serialize)]
 struct TrustRecord {
     confirmed_trusted_own_repo_read_only: bool,
+    trusted_session_cwd: String,
     authority: &'static str,
 }
 
@@ -775,6 +940,9 @@ struct RerunRecord {
 }
 
 fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
+    let trusted_session_cwd =
+        canonical_existing_directory(&args.trusted_session_cwd, "trusted session cwd")?;
+    let trusted_session_cwd_text = trusted_session_cwd.as_str().to_owned();
     let config_requested_path = validated_path_text(&args.config, "requested config path")?;
     let source_file = crate::local_file::read_regular_file_bounded(
         &args.source,
@@ -800,7 +968,15 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
     if !args.confirm_trusted_own_repo_read_only {
         push_reason(&mut reasons, IneligibilityReason::TrustConfirmationMissing);
     }
-    let mut source_execution_cwd = None;
+    let reported_session_cwd_matches = source
+        .reported_session_cwd
+        .as_deref()
+        .and_then(|path| canonical_existing_directory(Path::new(path), "source session cwd").ok())
+        .is_some_and(|path| path == trusted_session_cwd);
+    if !reported_session_cwd_matches {
+        push_reason(&mut reasons, IneligibilityReason::SourceSessionCwdMismatch);
+    }
+    let mut source_execution_root = None;
     match snapshot
         .entries
         .iter()
@@ -812,17 +988,32 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
             IneligibilityReason::SourceAgentConfigurationMismatch,
         ),
         Some(entry) => {
-            source_execution_cwd = entry
-                .sandbox
-                .as_ref()
-                .and_then(|sandbox| std::fs::canonicalize(&sandbox.mount).ok())
-                .and_then(|path| SessionCwd::parse(&path.to_string_lossy()).ok())
-                .map(|cwd| cwd.as_str().to_owned());
-            if source_execution_cwd.is_none() {
+            source_execution_root = entry.sandbox.as_ref().and_then(|sandbox| {
+                canonical_existing_directory(Path::new(&sandbox.mount), "source sandbox mount").ok()
+            });
+            if let Some(target) = source.target.as_ref() {
+                validate_current_source_evidence(
+                    target,
+                    &source.original_agent,
+                    entry,
+                    &mut reasons,
+                );
+            } else {
                 push_reason(
                     &mut reasons,
-                    IneligibilityReason::SourceAgentConfigurationMismatch,
+                    IneligibilityReason::SourceDiagnosticsIncomplete,
                 );
+            }
+            match source_execution_root.as_ref() {
+                None => push_reason(
+                    &mut reasons,
+                    IneligibilityReason::SourceAgentConfigurationMismatch,
+                ),
+                Some(root) if !trusted_session_cwd.is_under(root) => push_reason(
+                    &mut reasons,
+                    IneligibilityReason::TrustedSessionCwdOutsideSourceMount,
+                ),
+                Some(_) => {}
             }
         }
     }
@@ -884,7 +1075,7 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
         )?;
         let executable_path_text =
             validated_path_text(&executable.canonical_path, "current executable path")?;
-        let source_cwd = source_execution_cwd
+        let _source_root = source_execution_root
             .ok_or("fallback-plan: eligible source has no current config-owned mount")?;
         let argv = vec![
             executable_path_text,
@@ -895,7 +1086,7 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
             config_path_text.clone(),
             "--acknowledge-billable".to_owned(),
             "--session-cwd".to_owned(),
-            source_cwd,
+            trusted_session_cwd_text.clone(),
             "--expected-config-sha256".to_owned(),
             config_file.sha256.clone(),
             "--expected-executable-sha256".to_owned(),
@@ -927,7 +1118,8 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
         },
         trust: TrustRecord {
             confirmed_trusted_own_repo_read_only: args.confirm_trusted_own_repo_read_only,
-            authority: "local_cli_flag",
+            trusted_session_cwd: trusted_session_cwd_text,
+            authority: "local_cli_flag_and_explicit_canonical_cwd",
         },
         rerun,
     })
