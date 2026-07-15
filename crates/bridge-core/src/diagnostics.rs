@@ -275,6 +275,13 @@ impl DiagnosticRedactor {
         self.sanitize_text(value, max_bytes)
     }
 
+    /// Sanitize one arbitrary identifier with the same all-or-nothing policy used by
+    /// persisted authentication evidence. Callers receive either the complete safe id or
+    /// a tagged redacted value; a partially rewritten identifier is never exposed.
+    pub fn sanitize_diagnostic_id(&self, value: String) -> RedactedDiagnosticId {
+        self.sanitize_id(value)
+    }
+
     fn contains_known_value(&self, value: &str) -> bool {
         self.known_values.iter().any(|known| value.contains(known))
     }

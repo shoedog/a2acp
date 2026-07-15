@@ -28,6 +28,8 @@
 //                                                        — stream a task's progress (SSE)
 //   a2a-bridge task-spec schema|template|input           — inspect/validate typed task-spec inputs
 //   a2a-bridge validate --config <path>                  — validate config, workflows, and prompt refs
+//   a2a-bridge smoke --agent <id> --config <path>
+//             --acknowledge-billable                    — run one bounded fixed PONG probe
 
 mod catalog_probe;
 mod config;
@@ -35,6 +37,7 @@ mod containers;
 mod doctor;
 mod route;
 mod slice;
+mod smoke;
 
 pub(crate) use bridge_controller::{
     implement, implement_resume, merge, resilient, review, turn, tweak, verify,
@@ -95,6 +98,8 @@ SUBCOMMANDS:
                       --manifest <file> [--concurrency K] [--detach] [--url <url>]
   batch               Batch store.  status <id> | list | cancel <id>
   models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
+  smoke               Run one explicitly acknowledged, bounded, fixed PONG probe.
+                      --agent <id> --config <f> --acknowledge-billable [--out <f>]
   implement --input <file|-> Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
@@ -159,6 +164,18 @@ container, or touches the network beyond a local `<runtime> network|image inspec
 
 Exit code is 0 unless at least one check is `fail` (warnings alone exit 0).";
 
+const SMOKE_USAGE: &str = "\
+usage: a2a-bridge smoke --agent <id> --config <path> --acknowledge-billable
+                        [--model <raw-id>] [--effort <level>] [--mode <id>]
+                        [--session-cwd <trusted-repo>] [--timeout-secs <1..900>]
+                        [--include-redacted-stderr] [--out <path>]
+
+Run exactly one billable agent turn with the fixed prompt `Reply exactly PONG. Do not use tools.`.
+There is no retry, fallback, workflow, resume, or caller-supplied prompt. The default timeout is 120
+seconds and the hard maximum is 900 seconds. Without --out, stdout contains only the versioned JSON
+artifact. Opaque stderr text is excluded unless --include-redacted-stderr explicitly opts into bounded
+best-effort redaction.";
+
 const TASK_SPEC_USAGE: &str = "\
 usage: a2a-bridge task-spec schema [type]
        a2a-bridge task-spec template <type>
@@ -185,6 +202,7 @@ enum TopSubcommand {
     TaskSpec,
     Prompt,
     Doctor,
+    Smoke,
     Help,
     Serve,
     Unknown(String),
@@ -208,6 +226,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("task-spec") => TopSubcommand::TaskSpec,
         Some("prompt") => TopSubcommand::Prompt,
         Some("doctor") => TopSubcommand::Doctor,
+        Some("smoke") => TopSubcommand::Smoke,
         Some("help") | Some("--help") | Some("-h") => TopSubcommand::Help,
         Some("serve") | None => TopSubcommand::Serve,
         Some(other) => TopSubcommand::Unknown(other.to_string()),
@@ -239,6 +258,7 @@ fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static 
         TopSubcommand::Merge => Some(MERGE_USAGE),
         TopSubcommand::Init => Some(INIT_USAGE),
         TopSubcommand::Doctor => Some(DOCTOR_USAGE),
+        TopSubcommand::Smoke => Some(SMOKE_USAGE),
         _ => None,
     }
 }
@@ -5972,6 +5992,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
         TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
         TopSubcommand::Doctor => return doctor::doctor_cmd(&raw_args[2..]),
+        TopSubcommand::Smoke => return smoke::smoke_cmd(&raw_args[2..]).await,
         TopSubcommand::Help => {
             println!("{TOP_USAGE}");
             return Ok(());
@@ -5982,7 +6003,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | smoke | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }
@@ -7228,6 +7249,21 @@ mod cli_tests {
                 Some(DOCTOR_USAGE),
                 "doctor {help} should print its usage and exit 0"
             );
+        }
+    }
+
+    #[test]
+    fn dispatcher_help_covers_smoke_before_the_billing_barrier() {
+        assert!(SMOKE_USAGE.starts_with("usage: a2a-bridge smoke"));
+        for help in ["--help", "-h"] {
+            let args = vec![
+                "a2a-bridge".to_string(),
+                "smoke".to_string(),
+                help.to_string(),
+            ];
+            let sub = parse_top_subcommand(&args);
+            assert_eq!(sub, TopSubcommand::Smoke);
+            assert_eq!(dispatcher_help(&sub, &args), Some(SMOKE_USAGE));
         }
     }
 

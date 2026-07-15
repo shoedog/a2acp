@@ -1,11 +1,31 @@
 # R2c — Explicit bounded live smoke implementation plan
 
-- **Status:** NOT STARTED
+- **Status:** IN PROGRESS
 - **Prerequisite:** all R2b sub-slices merged
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Branch:** `agent/reliability-r2c-live-smoke`
+
+Implementation is active on the named branch. Deterministic CLI, terminal, timeout, artifact/redaction, and
+API tool-observation regressions must be green before any live/billable acceptance lane is authorized. No
+live smoke has run.
+
+## In-progress checkpoint — 2026-07-15
+
+- Implemented the strict one-turn `smoke` command, pre-attempt output validation, absolute attempt and
+  cleanup bounds, private versioned artifact, default recursive stderr-text removal, exact terminal/PONG
+  rules, deny-all tool policy, and single-pass ownership cleanup.
+- Added safe API tool-attempt observation so a denied tool call cannot be mistaken for a clean PONG-only
+  turn; provider tool names, ids, and arguments do not enter the diagnostic event.
+- Deterministic evidence: smoke unit **16 / 0 / 0 ignored**, smoke CLI **7 / 0 / 0 ignored**,
+  `bridge-api` **59 / 0 / 1 ignored**, and full host-serial workspace **1,925 / 0 / 12 ignored**
+  across 68 executables.
+  Workspace/all-target check, warnings-denied Clippy, format/diff checks, release build, and repository
+  hygiene **37/7** are clean.
+- Still pending: adversarial bridge-dogfooded review, any resulting folds and repeated full gates, then
+  separate operator authorization for an exact live lane. No live/billable smoke has run, and this
+  checkpoint is not approval or completion evidence.
 
 R2c turns R2b's diagnostic record into one deliberate end-to-end operator probe. It is the first R2
 slice that is intentionally billable. It is not a generic prompt command, workflow runner, retry

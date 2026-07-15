@@ -93,6 +93,7 @@ containers) see [AGENTS.md](AGENTS.md); for running your own multi-agent bridge 
 | `implement` | Clone a repo, implement a task on a warm containerized agent, build/test-verify, review the diff, hand off a branch. `--input <file|-> --repo <path> [--config <f>] [--merge [--onto <branch>]]` |
 | `merge <id>` | Land an **Approved** `implement` run's commit into its source repo, fast-forward, re-authored to the operator. `[--onto <branch>] [--force]` |
 | `models` | List each configured agent's advertised models/effort/modes (probed live). `[--config <f>] [--agent <id>] [--json]` |
+| `smoke` | Run one explicitly acknowledged, bounded, billable fixed-`PONG` turn and emit a versioned JSON artifact. `--agent <id> --config <f> --acknowledge-billable [--model <id>] [--effort <e>] [--mode <m>] [--session-cwd <repo>] [--timeout-secs <1..900>] [--out <f>]` |
 | `init` | Scaffold `a2a-bridge.toml` + prompts for the given agents. `--agents codex,claude [--dir <d>] [--force]` |
 | `validate` | Validate config schema, registry, workflow DAGs, and prompt refs — or `--repo-hygiene` (this repo's own workflow-artifact hygiene gate) |
 | `doctor` | Run a bounded, read-only preflight for config, commands/runtimes, egress, credentials, store, verify/review, and MCP/LSP. `[--config <f>] [--json]` |

@@ -123,6 +123,35 @@ requested failed agent exits nonzero after printing that machine-readable record
 keeps partial-success exit behavior. Pass any listed value to the per-request override
 (`message.metadata` `a2a-bridge.{model,effort,mode}`) or an agent's config default.
 
+## 4c. Run one explicit live smoke (billable)
+
+Only after the operator explicitly authorizes a billable turn, use the candidate release binary for one
+fixed, bounded `PONG` probe:
+
+```bash
+cargo build --release --bin a2a-bridge
+./target/release/a2a-bridge smoke \
+  --agent codex \
+  --config /absolute/path/to/a2a-bridge.toml \
+  --model gpt-5.6-sol --effort xhigh \
+  --session-cwd /absolute/path/to/trusted-repo \
+  --timeout-secs 120 \
+  --acknowledge-billable \
+  --out /private/tmp/codex-host-smoke.json
+```
+
+The command sends only `Reply exactly PONG. Do not use tools.`, resolves/configures/prompts once, never
+retries or falls back, and requires both exact `PONG` and a successful terminal event. Missing billing
+acknowledgement and malformed options refuse before config/registry/spawn work. Once argument and output
+preflight passes, an acknowledged attempt writes its versioned artifact before returning nonzero.
+Without `--out`, stdout is JSON only; human direction goes to stderr. Do not pass
+`--include-redacted-stderr` unless bounded best-effort-redacted process text is specifically required.
+
+Run `validate`, `doctor --json`, and `models --agent <id> --json` first. Never use a stale installed binary
+for compatibility evidence, and never automatically rerun a failed or timed-out smoke: the first prompt may
+have been accepted. Do not update `docs/compatibility.md` until the release-mode artifact records the exact
+lane that actually ran.
+
 ## 5. Inspect / clean up containers
 
 ```bash

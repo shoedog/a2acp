@@ -54,6 +54,12 @@ retention remains R2.
 
 ## Evidence required for an update
 
+Use the release-mode candidate's `smoke` command for the minimal live turn. Do not add or refresh a PASS
+row from unit tests, an unacknowledged refusal, a source-tree helper, or a stale installed binary. Retain the
+versioned smoke artifact under disposable/operator evidence storage (not this repository), and record every
+lane that was not run. After argument and output preflight passes, a nonzero smoke emits the artifact first;
+it is failure evidence, never a signal to retry or switch providers automatically.
+
 Every changed row must record:
 
 - date, OS/architecture, host or image identity;
@@ -65,5 +71,7 @@ Every changed row must record:
 - minimal prompt result and, if applicable, representative workflow result;
 - exact failing phase and deepest retained error;
 - ignored or unexercised paths.
+- smoke artifact schema version, attempt id, timeout, terminal state, prompt-acceptance evidence, and whether
+  opaque stderr text remained excluded (the default).
 
 Use the [`a2a-bridge-operator` skill](../skills/a2a-bridge-operator/SKILL.md) to collect the evidence.

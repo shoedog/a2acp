@@ -13,6 +13,7 @@ use bridge_core::domain::{
 };
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
+use bridge_core::orch::OrchEventKind;
 use bridge_core::ports::{
     AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, PolicyEngine, RichEventSink,
     Update, STOP_REASON_CANCELLED,
@@ -291,7 +292,7 @@ impl ApiBackend {
         &self,
         session: &SessionId,
         parts: Vec<Part>,
-        _rich_sink: Option<Arc<dyn RichEventSink>>,
+        rich_sink: Option<Arc<dyn RichEventSink>>,
         diagnostic_observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<BackendStream, BridgeError> {
         let url = format!(
@@ -332,7 +333,7 @@ impl ApiBackend {
             // never cleared between tool rounds: once any request may have reached
             // the provider, every later failure is fatal and non-replayable.
             let mut acceptance_barrier_crossed = false;
-            for _round in 0..max_rounds {
+            for round in 0..max_rounds {
                 let req = ChatRequest { model: model.clone(), messages: messages.clone(),
                     tools: vec![crate::tool::tool_def()], stream: do_stream };
                 let mut builder = client.post(&url).json(&req);
@@ -544,6 +545,21 @@ impl ApiBackend {
                 if parsed.tool_calls.is_empty() {
                     complete_prompt_lifecycle(&lifecycle).await?;
                     yield Update::Done { stop_reason: "stop".into() }; return;
+                }
+                // Rich observers need to know that the provider requested a tool so callers such as
+                // `smoke` can fail closed. Keep the event metadata-only: provider-controlled ids,
+                // names, arguments, locations, and content never cross this diagnostic boundary.
+                if let Some(sink) = &rich_sink {
+                    for (index, _) in parsed.tool_calls.iter().enumerate() {
+                        sink.record(OrchEventKind::ToolCall {
+                            tool_call_id: format!("api-tool-{round}-{index}"),
+                            title: "API tool request".into(),
+                            kind: "other".into(),
+                            status: "requested".into(),
+                            locations: Vec::new(),
+                            content: None,
+                        });
+                    }
                 }
                 // Tool round: decide each call SILENTLY via the injected policy.
                 // NO Update::Permission is yielded — the backend is the sole authority.

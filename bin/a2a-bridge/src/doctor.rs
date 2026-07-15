@@ -1285,6 +1285,26 @@ fn check_provenance(
     }
 }
 
+/// R2c reuses the exact R2a provenance implementation for the one selected smoke target.
+/// This deliberately runs only the bounded, read-only provenance probes; it does not execute an
+/// agent turn or any provider request.
+pub(crate) fn provenance_rows_for_agent(
+    snapshot: &RegistrySnapshot,
+    agent: &bridge_core::ids::AgentId,
+) -> Vec<CheckResult> {
+    let Some(entry) = snapshot.entries.iter().find(|entry| &entry.id == agent) else {
+        return Vec::new();
+    };
+    let selected = RegistrySnapshot {
+        default: agent.clone(),
+        entries: vec![entry.clone()],
+        allowed_cmds: snapshot.allowed_cmds.clone(),
+    };
+    let mut rows = Vec::new();
+    check_provenance(&selected, &RealProbes, &mut rows);
+    rows
+}
+
 /// Whether `runtime` is present in the snapshot's `[registry].allowed_cmds` allowlist. Every runtime
 /// probe (checks 2/4/5: `runtime_responds`/`network_exists`/`image_exists`) MUST gate on this BEFORE
 /// executing the config-named `runtime` binary — mirrors main.rs's `preflight_runtimes`, which restricts
