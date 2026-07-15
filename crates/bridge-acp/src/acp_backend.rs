@@ -8226,13 +8226,18 @@ mod tests {
     async fn prompt_failure_includes_bounded_redacted_stderr_only_for_opted_in_observer() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        let mut process = Supervised::spawn(
+        const KNOWN_SECRET: &str = "r2c-known-secret-value";
+        const ENCODED_SECRET: &str = "cjJjLWtub3duLXNlY3JldC12YWx1ZQ==";
+        const TRANSFORMED_LINE: &str = "encoded-secret=cjJjLWtub3duLXNlY3JldC12YWx1ZQ==";
+
+        let mut process = Supervised::spawn_with_stderr_redactor(
             "/bin/sh",
             &[
                 "-c",
-                "echo READY; read _; echo opted-process-line 1>&2; sleep 30",
+                "echo READY; read _; echo encoded-secret=cjJjLWtub3duLXNlY3JldC12YWx1ZQ== 1>&2; sleep 30",
             ],
             None,
+            DiagnosticRedactor::new([KNOWN_SECRET]),
         )
         .unwrap();
         let ring = process.stderr_ring();
@@ -8293,10 +8298,10 @@ mod tests {
         assert_eq!(json["stderr_line_count"], 1);
         assert_eq!(json["stderr_scope"], "process");
         assert_eq!(json["stderr_redaction"], "best_effort");
-        assert_eq!(
-            json["stderr_tail"],
-            serde_json::json!(["opted-process-line"])
-        );
+        assert_eq!(json["stderr_tail"], serde_json::json!([TRANSFORMED_LINE]));
+        let encoded = serde_json::to_string(&json).unwrap();
+        assert!(!encoded.contains(KNOWN_SECRET));
+        assert!(encoded.contains(ENCODED_SECRET));
     }
 
     #[tokio::test]

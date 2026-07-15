@@ -24,9 +24,14 @@ live smoke has run.
   across 68 executables.
   Workspace/all-target check, warnings-denied Clippy, format/diff checks, release build, and repository
   hygiene **37/7** are clean.
-- Still pending: fresh bridge-dogfooded closure re-review, any resulting folds and repeated full gates,
-  then separate operator authorization for an exact live lane. No live/billable smoke has run, and this
-  checkpoint is not approval or completion evidence.
+- Bridge-dogfooded Fable/xhigh closure re-review returned `APPROVE` on `0e3b8ce`. Its sole new item was a
+  non-blocking `SMELL/MINOR`: the production opt-in regression did not explicitly exercise a transformed
+  known secret. The tightened regression now seeds the real process-ring redactor with the raw credential,
+  emits its base64-transformed form, and proves the raw value is absent while the transformed value remains
+  covered only by the honest `best_effort` label.
+- Still pending: separate operator authorization for an exact live lane, the authorized artifact-exact
+  smoke, and final status/evidence review. No live/billable smoke has run, and this checkpoint is not
+  completion evidence.
 
 ### Review fold 1 — 2026-07-15
 
@@ -42,7 +47,11 @@ Initial bridge-mediated Fable/xhigh review on `a2946bc` returned `REVISE`: two `
 - adds blocked-model, invalid-session-cwd, duplicate-flag, symlink-alias, logging, acceptance-monotonicity,
   secondary-cleanup, legacy-phase, and production stderr opt-in regressions.
 
-Fresh bridge-mediated closure re-review is still required. No live/billable smoke has run.
+Fresh bridge-mediated Fable/xhigh closure re-review returned `APPROVE` on `0e3b8ce`: all three inherited
+WRONG findings were fixed with pre-fold-failing regressions, all three inherited SMELL findings were
+addressed, and the unobserved direct cancel was adjudicated as the safe choice under timeout-abandoned
+teardown futures. The review's sole new item was the non-blocking transformed-secret coverage gap folded
+above. No live/billable smoke has run.
 
 R2c turns R2b's diagnostic record into one deliberate end-to-end operator probe. It is the first R2
 slice that is intentionally billable. It is not a generic prompt command, workflow runner, retry
