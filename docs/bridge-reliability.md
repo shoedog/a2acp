@@ -50,7 +50,10 @@ may have been accepted; the retry could duplicate cost or side effects. The curr
 host and container entries but no automatic fallback policy. R2's first fallback surface is a local,
 non-billable operator plan/recommendation only; caller-supplied A2A metadata cannot assert trust or start
 a host attempt. In-process fallback is deferred until policy can bind a non-forgeable trust attestation
-to authenticated caller context.
+to authenticated caller context. The local planner accepts only complete smoke-v2 evidence bound to the
+current config bytes, derives host scope from the current read-only source mount rather than artifact cwd,
+and emits a guarded distinct fixed-PONG smoke that the operator must invoke separately. It performs no
+external post-failure runtime probe and never executes the emitted plan.
 
 Provider capacity is a separate axis. For trusted own-repo full-branch reviews, use Fable xhigh only when
 its usage window has headroom; when Claude is known to be near its usage limit, select the explicit
@@ -60,6 +63,10 @@ already reached prompt start, a Sol review
 is a new operator-selected attempt, not an automatic retry: preserve the first attempt as possibly
 accepted and record both costs/provenance. A structured provider-limit/reset signal may recommend that
 choice but never executes it. Tier 2/3 rules still apply independently.
+
+Claude Haiku is available only as a low-cost dogfood lane for small, tightly specified Anthropic-model or
+Claude Code compatibility checks. It is not a substitute for a broad implementation or for
+Sonnet/Opus/Fable/Sol-caliber review.
 
 ## Work slices
 
@@ -150,8 +157,10 @@ Exit: a release cannot claim an agent path that was not tested from its distribu
 
 ## Immediate queue
 
-1. Finish the full gates and security review for R2d's local non-billable fallback-plan from the
-   [R2d plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md); keep authenticated in-process
+1. Run one Sol/xhigh inherited-finding closure re-review for R2d's local non-billable fallback-plan from
+   the [R2d plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md). Its initial review returned
+   `REVISE`, all nine findings are folded, and post-fold deterministic gates are green at
+   **1,962 / 0 / 12 ignored**. Keep authenticated in-process
    [R2e](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) deferred.
 2. Establish the pinned/floating compatibility lanes in the
    [R3 plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md).

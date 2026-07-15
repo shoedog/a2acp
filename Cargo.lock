@@ -30,6 +30,7 @@ dependencies = [
  "lsp-mcp",
  "notify",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

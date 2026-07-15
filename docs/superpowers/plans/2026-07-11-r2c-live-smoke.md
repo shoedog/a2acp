@@ -132,7 +132,11 @@ resolve/spawn/prompt calls.
 
 ### C2 — versioned artifact
 
-Define private-field `SmokeArtifactV1` and validated subrecords containing:
+The merged R2c artifact was schema v1. R2d extends the private record to `SmokeArtifactV2` by adding the
+exact config SHA-256 and an optional closed fallback-action guard. Historical attempt evidence below
+remains schema v1 and is not accepted as current R2d fallback evidence.
+
+Define private-field `SmokeArtifactV2` and validated subrecords containing:
 
 - artifact schema version and terminal success/failure;
 - bridge package version and git/build identity when available;

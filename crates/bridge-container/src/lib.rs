@@ -36,16 +36,6 @@ pub trait ContainerSpawn: Send + Sync {
         Ok(())
     }
 
-    /// Production may replace one pre-prompt opaque launch error with uniquely typed, bounded,
-    /// read-only infrastructure evidence. Test seams preserve their original error by default.
-    async fn classify_spawn_failure(
-        &self,
-        _sandbox: SandboxConfig,
-        error: BridgeError,
-    ) -> BridgeError {
-        error
-    }
-
     async fn spawn(
         &self,
         program: &str,
@@ -316,7 +306,6 @@ impl InflightState {
 
 struct PreparedInner {
     owner: ReapOwner,
-    sandbox: SandboxConfig,
     program: String,
     argv: Vec<String>,
     acp: AcpConfig,
@@ -555,7 +544,6 @@ impl ContainerRwBackend {
         };
         Ok(PreparedInner {
             owner,
-            sandbox: preflight_sandbox,
             program,
             argv,
             acp,
@@ -624,7 +612,6 @@ impl ContainerRwBackend {
     ) -> Result<WarmInner, BridgeError> {
         let PreparedInner {
             owner,
-            sandbox,
             program,
             argv,
             acp,
@@ -648,7 +635,7 @@ impl ContainerRwBackend {
             Ok(i) => i,
             Err(e) => {
                 owner.reap_detached();
-                return Err(self.spawn.classify_spawn_failure(sandbox, e).await);
+                return Err(e);
             }
         };
         // The inner prefers the stashed SessionSpec.cwd over AcpConfig.cwd → configure with CANONICAL cwd.
@@ -1675,12 +1662,6 @@ mod tests {
         spawn_count: AtomicUsize,
     }
 
-    #[derive(Default)]
-    struct ClassifyingFailureSpawn {
-        spawn_count: AtomicUsize,
-        classify_count: AtomicUsize,
-    }
-
     #[async_trait]
     impl ContainerSpawn for RejectingPreflightSpawn {
         fn validate_infrastructure(&self, sandbox: &SandboxConfig) -> Result<(), BridgeError> {
@@ -1697,30 +1678,6 @@ mod tests {
         ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
             self.spawn_count.fetch_add(1, Ordering::SeqCst);
             Err(BridgeError::InvalidStateTransition)
-        }
-    }
-
-    #[async_trait]
-    impl ContainerSpawn for ClassifyingFailureSpawn {
-        async fn classify_spawn_failure(
-            &self,
-            _sandbox: SandboxConfig,
-            _error: BridgeError,
-        ) -> BridgeError {
-            self.classify_count.fetch_add(1, Ordering::SeqCst);
-            BridgeError::ConfigInvalid {
-                reason: "post-failure classifier invoked".into(),
-            }
-        }
-
-        async fn spawn(
-            &self,
-            _program: &str,
-            _argv: &[String],
-            _cfg: AcpConfig,
-        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
-            self.spawn_count.fetch_add(1, Ordering::SeqCst);
-            Err(BridgeError::agent_crashed("opaque launch failure"))
         }
     }
 
@@ -2326,24 +2283,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_failure_is_classified_before_return_and_still_reaped() {
+    async fn launch_failure_is_preserved_without_keyword_promotion_and_still_reaped() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
-        let spawn = Arc::new(ClassifyingFailureSpawn::default());
+        let spawn = CountingSpawn::new(true);
         let (reap, reaps) = counting_reap();
         let be = backend(root, spawn.clone(), reap).await;
-        let session = SessionId::parse("post-failure-classify").unwrap();
+        let session = SessionId::parse("post-failure-preserve").unwrap();
         be.configure_session(&session, &spec_cwd(root))
             .await
             .unwrap();
 
         let error = prompt_err(&be, &session).await;
-        let BridgeError::ConfigInvalid { reason } = error else {
-            panic!("post-failure classifier result was not returned");
+        let BridgeError::AgentCrashed { reason } = error else {
+            panic!("opaque launch failure should be preserved");
         };
-        assert_eq!(reason, "post-failure classifier invoked");
-        assert_eq!(spawn.spawn_count.load(Ordering::SeqCst), 1);
-        assert_eq!(spawn.classify_count.load(Ordering::SeqCst), 1);
+        assert_eq!(reason, "boom docker image network mount credential");
+        assert_eq!(spawn.count.load(Ordering::SeqCst), 1);
         wait_for_reaps(&reaps, 1).await;
         assert!(be.inflight.lock().await.is_empty());
     }

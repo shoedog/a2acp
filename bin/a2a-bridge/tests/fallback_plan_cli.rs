@@ -37,23 +37,45 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     .unwrap();
 
     let source = dir.path().join("failed-smoke.json");
-    write_smoke_artifact(&source, &repo, "container_runtime", false);
+    write_smoke_artifact(&source, &repo, &config, "container_runtime", false);
     (dir, marker, config, source)
 }
 
-fn write_smoke_artifact(path: &Path, repo: &Path, class: &str, accepted: bool) {
-    let artifact = smoke_artifact(repo, class, accepted);
+fn write_smoke_artifact(path: &Path, repo: &Path, config: &Path, class: &str, accepted: bool) {
+    let artifact = smoke_artifact(repo, config, class, accepted);
     write_json(path, &artifact);
 }
 
-fn smoke_artifact(repo: &Path, class: &str, accepted: bool) -> serde_json::Value {
+fn sha256_hex(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn smoke_artifact(repo: &Path, config: &Path, class: &str, accepted: bool) -> serde_json::Value {
     let disposition = if accepted {
         "fatal"
     } else {
         "container_fallback_candidate"
     };
-    serde_json::json!({
+    let failure = serde_json::json!({
         "schema_version": 1,
+        "failed_phase": "spawn",
+        "class": class,
+        "disposition": disposition,
+        "code": "container.fixture.failure",
+        "summary": "fixture failure",
+        "causes": [],
+        "stderr_observed": false,
+        "stderr_line_count": 0,
+        "prompt_may_have_been_accepted": accepted
+    });
+    let canonical_config = fs::canonicalize(config).unwrap();
+    let config_sha256 = sha256_hex(&fs::read(config).unwrap());
+    serde_json::json!({
+        "schema_version": 2,
         "success": false,
         "bridge": {"package_version": "0.2.1", "git_commit": "fixture"},
         "attempt": {
@@ -66,13 +88,17 @@ fn smoke_artifact(repo: &Path, class: &str, accepted: bool) -> serde_json::Value
         },
         "request": {
             "agent": "reader-container",
-            "requested_config_path": "/untrusted/from-artifact.toml",
-            "canonical_config_path": "/untrusted/from-artifact.toml",
+            "requested_config_path": config,
+            "canonical_config_path": canonical_config,
+            "config_sha256": config_sha256,
             "session_cwd": repo
         },
         "target": {
             "execution_mode": "container_ro",
-            "provenance": [],
+            "provenance": [
+                {"check": "provenance:reader-container:auth", "status": "ok", "detail": "fixture", "remedy": ""},
+                {"check": "provenance:reader-container:model", "status": "ok", "detail": "fixture", "remedy": ""}
+            ],
             "authentication": {"path": "automatic"}
         },
         "session": {"id": "smoke-fixture-1", "configure_calls": 0},
@@ -86,20 +112,12 @@ fn smoke_artifact(repo: &Path, class: &str, accepted: bool) -> serde_json::Value
             "permission_update_count": 0
         },
         "diagnostics": {
-            "lifecycle": [],
+            "lifecycle": [
+                {"transition": {"phase": "spawn", "status": "started", "at_ms": 11}},
+                {"transition": {"phase": "spawn", "status": "failed", "at_ms": 12}, "failure": failure.clone()}
+            ],
             "dropped_events": 0,
-            "failure": {
-                "schema_version": 1,
-                "failed_phase": "spawn",
-                "class": class,
-                "disposition": disposition,
-                "code": "container.fixture.failure",
-                "summary": "fixture failure",
-                "causes": [],
-                "stderr_observed": false,
-                "stderr_line_count": 0,
-                "prompt_may_have_been_accepted": accepted
-            },
+            "failure": failure,
             "stderr_text": "excluded"
         },
         "cleanup": {
@@ -168,7 +186,7 @@ fn eligible_plan_is_local_non_billable_and_emits_separate_rerun() {
         String::from_utf8_lossy(&output.stderr)
     );
     let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(plan["schema_version"], 1);
+    assert_eq!(plan["schema_version"], 2);
     assert_eq!(plan["eligible"], true);
     assert_eq!(plan["reasons"], serde_json::json!([]));
     assert_eq!(plan["source"]["attempt_id"], "smoke-fixture-1");
@@ -215,7 +233,7 @@ fn every_typed_container_class_is_eligible_only_as_a_plan() {
         "container_credentials",
     ] {
         let repo = source.parent().unwrap().join("owned repo");
-        write_smoke_artifact(&source, &repo, class, false);
+        write_smoke_artifact(&source, &repo, &config, class, false);
         let output = fallback_command(&config, &source)
             .arg("--confirm-trusted-own-repo-read-only")
             .output()
@@ -223,7 +241,10 @@ fn every_typed_container_class_is_eligible_only_as_a_plan() {
         let plan = read_plan(&output);
         assert_eq!(plan["eligible"], true, "class {class}: {plan:#}");
         assert_eq!(plan["source"]["failure_class"], class);
-        assert_eq!(plan["rerun"]["attempt_semantics"], "new_distinct_attempt");
+        assert_eq!(
+            plan["rerun"]["attempt_semantics"],
+            "new_distinct_verification_smoke"
+        );
         assert!(!marker.exists(), "class {class} spawned the target");
     }
 }
@@ -246,10 +267,12 @@ fn every_non_container_class_is_ineligible_even_with_container_words() {
         "canceled",
         "unknown",
     ] {
-        let mut artifact = smoke_artifact(&repo, class, false);
+        let mut artifact = smoke_artifact(&repo, &config, class, false);
         artifact["diagnostics"]["failure"]["disposition"] = serde_json::json!("fatal");
         artifact["diagnostics"]["failure"]["summary"] =
             serde_json::json!("docker image network mount credential exit 125");
+        artifact["diagnostics"]["lifecycle"][1]["failure"] =
+            artifact["diagnostics"]["failure"].clone();
         write_json(&source, &artifact);
         let output = fallback_command(&config, &source)
             .arg("--confirm-trusted-own-repo-read-only")
@@ -267,9 +290,16 @@ fn prompt_start_race_and_missing_diagnostic_both_fail_closed() {
     let (_dir, marker, config, source) = fixture();
     let repo = source.parent().unwrap().join("owned repo");
 
-    let mut race = smoke_artifact(&repo, "container_runtime", true);
+    let mut race = smoke_artifact(&repo, &config, "container_runtime", true);
     race["diagnostics"]["failure"]["failed_phase"] = serde_json::json!("prompt_start");
     race["diagnostics"]["failure"]["last_completed_phase"] = serde_json::json!("config_apply");
+    race["diagnostics"]["lifecycle"] = serde_json::json!([
+        {"transition": {"phase": "prompt_start", "status": "started", "at_ms": 11}},
+        {
+            "transition": {"phase": "prompt_start", "status": "failed", "at_ms": 12},
+            "failure": race["diagnostics"]["failure"].clone()
+        }
+    ]);
     race["turn"]["prompt_calls"] = serde_json::json!(1);
     race["turn"]["terminal_state"] = serde_json::json!("non_success_terminal");
     write_json(&source, &race);
@@ -281,12 +311,18 @@ fn prompt_start_race_and_missing_diagnostic_both_fail_closed() {
     assert_ineligible_without_command(&race_plan, "source_prompt_may_have_been_accepted");
     assert_eq!(race_plan["source"]["prompt_may_have_been_accepted"], true);
 
-    let mut missing = smoke_artifact(&repo, "container_runtime", false);
+    let mut missing = smoke_artifact(&repo, &config, "container_runtime", false);
     missing["attempt"]["prompt_may_have_been_accepted"] = serde_json::json!(true);
     missing["diagnostics"]
         .as_object_mut()
         .unwrap()
         .remove("failure");
+    missing["diagnostics"]["lifecycle"] = serde_json::json!([
+        {"transition": {"phase": "prompt_start", "status": "started", "at_ms": 11}},
+        {"transition": {"phase": "prompt_start", "status": "completed", "at_ms": 12}}
+    ]);
+    missing["turn"]["prompt_calls"] = serde_json::json!(1);
+    missing["turn"]["terminal_state"] = serde_json::json!("non_success_terminal");
     write_json(&source, &missing);
     let missing_output = fallback_command(&config, &source)
         .arg("--confirm-trusted-own-repo-read-only")
@@ -318,7 +354,7 @@ fn source_must_be_current_known_container_read_only_agent() {
         ("reader-container", "host", "source_not_container_execution"),
     ];
     for (agent, mode, expected_reason) in cases {
-        let mut artifact = smoke_artifact(&repo, "container_runtime", false);
+        let mut artifact = smoke_artifact(&repo, &config, "container_runtime", false);
         artifact["request"]["agent"] = serde_json::json!(agent);
         artifact["target"]["execution_mode"] = serde_json::json!(mode);
         write_json(&source, &artifact);
@@ -364,7 +400,7 @@ fn failed_success_timeout_and_dropped_event_invariants_are_closed() {
         ("phase", "source_failure_phase_invalid"),
     ];
     for (case, reason) in cases {
-        let mut artifact = smoke_artifact(&repo, "container_runtime", false);
+        let mut artifact = smoke_artifact(&repo, &config, "container_runtime", false);
         match case {
             "success" => artifact["success"] = serde_json::json!(true),
             "timeout" => artifact["attempt"]["timed_out"] = serde_json::json!(true),
@@ -378,6 +414,12 @@ fn failed_success_timeout_and_dropped_event_invariants_are_closed() {
             "phase" => {
                 artifact["diagnostics"]["failure"]["failed_phase"] =
                     serde_json::json!("initialize");
+                artifact["diagnostics"]["lifecycle"][0]["transition"]["phase"] =
+                    serde_json::json!("initialize");
+                artifact["diagnostics"]["lifecycle"][1]["transition"]["phase"] =
+                    serde_json::json!("initialize");
+                artifact["diagnostics"]["lifecycle"][1]["failure"] =
+                    artifact["diagnostics"]["failure"].clone();
             }
             _ => unreachable!(),
         }
@@ -392,10 +434,10 @@ fn failed_success_timeout_and_dropped_event_invariants_are_closed() {
 }
 
 #[test]
-fn task_diagnostic_v1_uses_the_same_closed_gate() {
+fn hand_assembled_task_diagnostic_is_rejected_without_a_plan() {
     let (_dir, marker, config, source) = fixture();
     let repo = source.parent().unwrap().join("owned repo");
-    let smoke = smoke_artifact(&repo, "container_mount", false);
+    let smoke = smoke_artifact(&repo, &config, "container_mount", false);
     let task = serde_json::json!({
         "artifact_type": "task_diagnostic",
         "schema_version": 1,
@@ -412,12 +454,9 @@ fn task_diagnostic_v1_uses_the_same_closed_gate() {
         .arg("--confirm-trusted-own-repo-read-only")
         .output()
         .unwrap();
-    let plan = read_plan(&output);
-    assert_eq!(plan["eligible"], true, "plan: {plan:#}");
-    assert_eq!(plan["source"]["artifact_schema"], "task_diagnostic_v1");
-    assert_eq!(plan["source"]["task_id"], "task-fixture-1");
-    assert_eq!(plan["source"]["attempt_id"], "attempt-fixture-1");
-    assert_eq!(plan["source"]["failure_class"], "container_mount");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not trusted evidence"));
     assert!(!marker.exists());
 }
 
@@ -425,8 +464,12 @@ fn task_diagnostic_v1_uses_the_same_closed_gate() {
 fn malformed_legacy_unsupported_and_oversized_sources_are_rejected() {
     let (dir, marker, config, source) = fixture();
     let repo = source.parent().unwrap().join("owned repo");
-    let mut unsupported = smoke_artifact(&repo, "container_runtime", false);
-    unsupported["schema_version"] = serde_json::json!(2);
+    let mut unsupported = smoke_artifact(&repo, &config, "container_runtime", false);
+    unsupported["schema_version"] = serde_json::json!(3);
+    let mut bogus_provenance = smoke_artifact(&repo, &config, "container_runtime", false);
+    bogus_provenance["target"]["provenance"] = serde_json::json!([0]);
+    let mut bogus_authentication = smoke_artifact(&repo, &config, "container_runtime", false);
+    bogus_authentication["target"]["authentication"] = serde_json::json!(true);
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("malformed", b"{".to_vec()),
         (
@@ -436,6 +479,14 @@ fn malformed_legacy_unsupported_and_oversized_sources_are_rejected() {
         (
             "unsupported",
             serde_json::to_vec_pretty(&unsupported).unwrap(),
+        ),
+        (
+            "bogus-provenance",
+            serde_json::to_vec_pretty(&bogus_provenance).unwrap(),
+        ),
+        (
+            "bogus-authentication",
+            serde_json::to_vec_pretty(&bogus_authentication).unwrap(),
         ),
         ("oversized", vec![b' '; 1024 * 1024 + 1]),
     ];
@@ -467,17 +518,25 @@ fn malformed_legacy_unsupported_and_oversized_sources_are_rejected() {
 }
 
 #[test]
-fn exact_argv_uses_cli_config_not_artifact_config_and_escapes_quotes() {
+fn exact_argv_uses_current_binary_config_digest_and_config_owned_cwd() {
     let (_dir, marker, config, source) = fixture();
+    let mut artifact: serde_json::Value =
+        serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+    artifact["request"]["session_cwd"] = serde_json::json!("/etc");
+    write_json(&source, &artifact);
     let output = fallback_command(&config, &source)
         .arg("--confirm-trusted-own-repo-read-only")
         .output()
         .unwrap();
     let plan = read_plan(&output);
     let canonical_config = fs::canonicalize(&config).unwrap();
+    let canonical_repo = fs::canonicalize(source.parent().unwrap().join("owned repo")).unwrap();
+    let config_sha256 = sha256_hex(&fs::read(&config).unwrap());
+    let executable = fs::canonicalize(env!("CARGO_BIN_EXE_a2a-bridge")).unwrap();
+    let executable_sha256 = sha256_hex(&fs::read(&executable).unwrap());
     let argv = plan["rerun"]["argv"].as_array().unwrap();
     let expected_argv = serde_json::json!([
-        "a2a-bridge",
+        executable,
         "smoke",
         "--agent",
         "trusted-host",
@@ -485,13 +544,18 @@ fn exact_argv_uses_cli_config_not_artifact_config_and_escapes_quotes() {
         canonical_config,
         "--acknowledge-billable",
         "--session-cwd",
-        source.parent().unwrap().join("owned repo")
+        canonical_repo,
+        "--expected-config-sha256",
+        config_sha256,
+        "--expected-executable-sha256",
+        executable_sha256,
+        "--fallback-source-agent",
+        "reader-container",
+        "--require-host-fallback-eligible"
     ]);
     assert_eq!(argv, expected_argv.as_array().unwrap());
-    assert_ne!(
-        plan["target"]["config_canonical_path"],
-        "/untrusted/from-artifact.toml"
-    );
+    assert_eq!(plan["source"]["reported_session_cwd"], "/etc");
+    assert_eq!(plan["target"]["config_sha256"], config_sha256);
     assert!(
         plan["rerun"]["shell_command"]
             .as_str()
@@ -500,6 +564,128 @@ fn exact_argv_uses_cli_config_not_artifact_config_and_escapes_quotes() {
         "single quote in config path must use POSIX-safe quoting: {plan:#}"
     );
     assert!(!marker.exists());
+}
+
+#[test]
+fn drifted_config_and_contradictory_lifecycle_fail_closed() {
+    let (_dir, marker, config, source) = fixture();
+
+    let mut drifted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+    drifted["request"]["canonical_config_path"] = serde_json::json!("/different/config.toml");
+    write_json(&source, &drifted);
+    let output = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert_ineligible_without_command(&read_plan(&output), "source_config_provenance_mismatch");
+
+    let repo = source.parent().unwrap().join("owned repo");
+    let mut contradictory = smoke_artifact(&repo, &config, "container_runtime", false);
+    contradictory["diagnostics"]["lifecycle"]
+        .as_array_mut()
+        .unwrap()
+        .extend(
+            serde_json::json!([
+                {"transition": {"phase": "prompt_start", "status": "started", "at_ms": 13}},
+                {"transition": {"phase": "prompt_start", "status": "completed", "at_ms": 14}}
+            ])
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+        );
+    write_json(&source, &contradictory);
+    let output = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+
+    let mut time_reversed = smoke_artifact(&repo, &config, "container_runtime", false);
+    time_reversed["diagnostics"]["lifecycle"][1]["transition"]["at_ms"] = serde_json::json!(10);
+    write_json(&source, &time_reversed);
+    let output = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+
+    let mut missing_lifecycle = smoke_artifact(&repo, &config, "container_runtime", false);
+    missing_lifecycle["diagnostics"]["lifecycle"] = serde_json::json!([]);
+    write_json(&source, &missing_lifecycle);
+    let output = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert_ineligible_without_command(&read_plan(&output), "source_diagnostics_incomplete");
+    assert!(!marker.exists());
+}
+
+#[test]
+fn generated_smoke_refuses_config_executable_and_cwd_drift_before_spawn() {
+    for drift in ["config", "executable", "cwd", "target-marker"] {
+        let (_dir, marker, config, source) = fixture();
+        let plan_output = fallback_command(&config, &source)
+            .arg("--confirm-trusted-own-repo-read-only")
+            .output()
+            .unwrap();
+        let plan = read_plan(&plan_output);
+        let mut argv: Vec<String> = plan["rerun"]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect();
+        match drift {
+            "config" => fs::write(
+                &config,
+                format!("{}\n# drift\n", fs::read_to_string(&config).unwrap()),
+            )
+            .unwrap(),
+            "executable" => {
+                let index = argv
+                    .iter()
+                    .position(|value| value == "--expected-executable-sha256")
+                    .unwrap();
+                argv[index + 1] = "0".repeat(64);
+            }
+            "cwd" => {
+                let index = argv
+                    .iter()
+                    .position(|value| value == "--session-cwd")
+                    .unwrap();
+                argv[index + 1] = "/etc".into();
+            }
+            "target-marker" => {
+                let changed = fs::read_to_string(&config).unwrap().replace(
+                    "host_fallback_eligible = true",
+                    "host_fallback_eligible = false",
+                );
+                fs::write(&config, changed).unwrap();
+                let index = argv
+                    .iter()
+                    .position(|value| value == "--expected-config-sha256")
+                    .unwrap();
+                argv[index + 1] = sha256_hex(&fs::read(&config).unwrap());
+            }
+            _ => unreachable!(),
+        }
+        let output = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
+        assert!(!output.status.success(), "{drift} drift unexpectedly ran");
+        let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let expected_code = match drift {
+            "config" => "smoke.fallback_config_drift",
+            "executable" => "smoke.fallback_executable_drift",
+            "cwd" => "smoke.fallback_source_drift",
+            "target-marker" => "smoke.fallback_target_drift",
+            _ => unreachable!(),
+        };
+        assert_eq!(artifact["diagnostics"]["failure"]["code"], expected_code);
+        assert!(!marker.exists(), "{drift} drift spawned the target");
+    }
 }
 
 #[test]
@@ -522,7 +708,7 @@ fn control_character_injection_is_rejected_without_a_plan() {
     assert!(bad_path.stdout.is_empty());
 
     let repo = source.parent().unwrap().join("owned repo");
-    let mut artifact = smoke_artifact(&repo, "container_runtime", false);
+    let mut artifact = smoke_artifact(&repo, &config, "container_runtime", false);
     artifact["request"]["session_cwd"] = serde_json::json!("/trusted\nrepo");
     write_json(&source, &artifact);
     let bad_cwd = fallback_command(&config, &source)

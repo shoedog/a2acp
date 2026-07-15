@@ -35,10 +35,9 @@ use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::RegistryConfig;
 use crate::{
-    doctor, epoch_secs, make_spawn_fn, recover_orphans, run_guard_runtimes, BoxError,
-    ExamplesPolicy, RunEndGuard, ValidationScope, SMOKE_USAGE,
+    doctor, epoch_secs, make_spawn_fn, recover_orphans, run_guard_runtimes, BoxError, RunEndGuard,
+    SMOKE_USAGE,
 };
 
 pub(crate) const FIXED_PROMPT: &str = "Reply exactly PONG. Do not use tools.";
@@ -47,6 +46,15 @@ const MAX_TIMEOUT_SECS: u64 = 900;
 const CLEANUP_TIMEOUT_SECS: u64 = 10;
 const MAX_CAPTURED_TEXT_BYTES: usize = 1024;
 const DIAGNOSTIC_CAPACITY: usize = 128;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FallbackSmokeGuard {
+    expected_config_sha256: String,
+    expected_executable_sha256: String,
+    source_agent: AgentId,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SmokeArgs {
@@ -59,6 +67,7 @@ struct SmokeArgs {
     timeout_secs: u64,
     include_redacted_stderr: bool,
     out: Option<PathBuf>,
+    fallback_guard: Option<FallbackSmokeGuard>,
 }
 
 fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
@@ -80,6 +89,10 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
     let mut timeout_secs = None;
     let mut include_redacted_stderr = false;
     let mut out = None;
+    let mut expected_config_sha256 = None;
+    let mut expected_executable_sha256 = None;
+    let mut fallback_source_agent = None;
+    let mut require_host_fallback_eligible = false;
     let mut acknowledged = false;
 
     let mut it = args.iter();
@@ -120,6 +133,28 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
             "--timeout-secs" => timeout_secs = Some(value(&mut it, "--timeout-secs")?),
             "--out" if out.is_some() => return Err("smoke: duplicate --out".into()),
             "--out" => out = Some(PathBuf::from(value(&mut it, "--out")?)),
+            "--expected-config-sha256" if expected_config_sha256.is_some() => {
+                return Err("smoke: duplicate --expected-config-sha256".into());
+            }
+            "--expected-config-sha256" => {
+                expected_config_sha256 = Some(value(&mut it, "--expected-config-sha256")?);
+            }
+            "--expected-executable-sha256" if expected_executable_sha256.is_some() => {
+                return Err("smoke: duplicate --expected-executable-sha256".into());
+            }
+            "--expected-executable-sha256" => {
+                expected_executable_sha256 = Some(value(&mut it, "--expected-executable-sha256")?);
+            }
+            "--fallback-source-agent" if fallback_source_agent.is_some() => {
+                return Err("smoke: duplicate --fallback-source-agent".into());
+            }
+            "--fallback-source-agent" => {
+                fallback_source_agent = Some(value(&mut it, "--fallback-source-agent")?);
+            }
+            "--require-host-fallback-eligible" if require_host_fallback_eligible => {
+                return Err("smoke: duplicate --require-host-fallback-eligible".into());
+            }
+            "--require-host-fallback-eligible" => require_host_fallback_eligible = true,
             other => {
                 return Err(format!("smoke: unknown argument {other:?}\n{SMOKE_USAGE}").into());
             }
@@ -175,6 +210,41 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
         return Err("smoke: --session-cwd requires a non-empty directory path".into());
     }
 
+    let guard_count = usize::from(expected_config_sha256.is_some())
+        + usize::from(expected_executable_sha256.is_some())
+        + usize::from(fallback_source_agent.is_some())
+        + usize::from(require_host_fallback_eligible);
+    let fallback_guard = match guard_count {
+        0 => None,
+        4 if session_cwd.is_some() => {
+            let expected_config_sha256 = expected_config_sha256.expect("counted above");
+            let expected_executable_sha256 = expected_executable_sha256.expect("counted above");
+            if !crate::local_file::valid_sha256(&expected_config_sha256)
+                || !crate::local_file::valid_sha256(&expected_executable_sha256)
+            {
+                return Err(
+                    "smoke: fallback guard digests must be 64 hexadecimal characters".into(),
+                );
+            }
+            let source = validate_raw_id(
+                "--fallback-source-agent",
+                fallback_source_agent.expect("counted above"),
+            )?;
+            Some(FallbackSmokeGuard {
+                expected_config_sha256: expected_config_sha256.to_ascii_lowercase(),
+                expected_executable_sha256: expected_executable_sha256.to_ascii_lowercase(),
+                source_agent: AgentId::parse(source)
+                    .map_err(|_| "smoke: invalid --fallback-source-agent")?,
+            })
+        }
+        4 => return Err("smoke: fallback guard requires --session-cwd".into()),
+        _ => {
+            return Err(
+                "smoke: fallback guard flags must be supplied together as a closed set".into(),
+            )
+        }
+    };
+
     Ok(SmokeArgs {
         agent,
         config,
@@ -185,6 +255,7 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
         timeout_secs,
         include_redacted_stderr,
         out,
+        fallback_guard,
     })
 }
 
@@ -196,7 +267,7 @@ fn validate_raw_id(flag: &str, raw: String) -> Result<String, String> {
 }
 
 #[derive(Serialize)]
-struct SmokeArtifactV1 {
+struct SmokeArtifactV2 {
     schema_version: u16,
     success: bool,
     bridge: BridgeIdentity,
@@ -234,6 +305,8 @@ struct RequestRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     canonical_config_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    config_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
@@ -241,6 +314,16 @@ struct RequestRecord {
     mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_guard: Option<FallbackGuardRecord>,
+}
+
+#[derive(Serialize)]
+struct FallbackGuardRecord {
+    expected_config_sha256: String,
+    expected_executable_sha256: String,
+    source_agent: String,
+    require_host_fallback_eligible: bool,
 }
 
 #[derive(Serialize)]
@@ -369,7 +452,7 @@ impl Default for CleanupRecord {
 }
 
 struct ArtifactState {
-    artifact: SmokeArtifactV1,
+    artifact: SmokeArtifactV2,
     failure: Option<FailureDiagnostic>,
     observer: Arc<InMemoryDiagnosticObserver>,
 }
@@ -383,8 +466,8 @@ impl ArtifactState {
             crate::implement::nonce(8)
         );
         Self {
-            artifact: SmokeArtifactV1 {
-                schema_version: 1,
+            artifact: SmokeArtifactV2 {
+                schema_version: 2,
                 success: false,
                 bridge: BridgeIdentity {
                     package_version: env!("CARGO_PKG_VERSION"),
@@ -402,10 +485,20 @@ impl ArtifactState {
                     agent: args.agent.as_str().to_owned(),
                     requested_config_path: args.config.to_string_lossy().into_owned(),
                     canonical_config_path: None,
+                    config_sha256: None,
                     model: args.model.clone(),
                     effort: args.effort.as_ref().map(crate::effort_to_string),
                     mode: args.mode.clone(),
                     session_cwd: None,
+                    fallback_guard: args
+                        .fallback_guard
+                        .as_ref()
+                        .map(|guard| FallbackGuardRecord {
+                            expected_config_sha256: guard.expected_config_sha256.clone(),
+                            expected_executable_sha256: guard.expected_executable_sha256.clone(),
+                            source_agent: guard.source_agent.as_str().to_owned(),
+                            require_host_fallback_eligible: true,
+                        }),
                 },
                 target: None,
                 session: SessionRecord {
@@ -512,7 +605,7 @@ impl ArtifactState {
         self.fail_static(fallback_phase, class, code, summary, accepted);
     }
 
-    async fn finalize(mut self, include_stderr: bool) -> SmokeArtifactV1 {
+    async fn finalize(mut self, include_stderr: bool) -> SmokeArtifactV2 {
         self.artifact.attempt.ended_at_ms = diagnostic_timestamp_ms();
         let events = self.observer.snapshot().await;
         self.artifact.diagnostics.dropped_events = self.observer.dropped_count().await;
@@ -1081,52 +1174,79 @@ fn apply_cleanup_outcome(state: &mut ArtifactState, primary_failed: bool, cleanu
     }
 }
 
-async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV1 {
+async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let mut state = ArtifactState::new(args);
 
-    let config_path = match crate::require_config_path(Some(args.config.clone())).and_then(|path| {
-        std::fs::canonicalize(&path)
-            .map_err(|_| format!("smoke: cannot canonicalize config {}", path.display()).into())
-    }) {
-        Ok(path) => path,
+    let config_file = match crate::local_file::read_regular_file_bounded(
+        &args.config,
+        "smoke config",
+        MAX_CONFIG_BYTES,
+    ) {
+        Ok(snapshot) => snapshot,
         Err(_) => {
             state.fail_static(
                 DiagnosticPhase::Resolve,
                 DiagnosticFailureClass::Config,
                 "smoke.config_path",
-                "Smoke config path is unavailable",
+                "Smoke config must be one bounded regular file",
                 false,
             );
             return state.finalize(args.include_redacted_stderr).await;
         }
     };
+    let config_path = config_file.canonical_path.clone();
     state.artifact.request.canonical_config_path = Some(config_path.to_string_lossy().into_owned());
+    state.artifact.request.config_sha256 = Some(config_file.sha256.clone());
 
-    if crate::validate_config_file(
-        &config_path,
-        ExamplesPolicy::Off,
-        &[],
-        ValidationScope::Startup,
-    )
-    .is_err()
-    {
-        state.fail_static(
-            DiagnosticPhase::Resolve,
-            DiagnosticFailureClass::Config,
-            "smoke.config_invalid",
-            "Smoke config validation failed",
-            false,
-        );
-        return state.finalize(args.include_redacted_stderr).await;
+    if let Some(guard) = &args.fallback_guard {
+        if guard.expected_config_sha256 != config_file.sha256 {
+            state.fail_static(
+                DiagnosticPhase::Resolve,
+                DiagnosticFailureClass::Config,
+                "smoke.fallback_config_drift",
+                "Fallback smoke config changed after planning",
+                false,
+            );
+            return state.finalize(args.include_redacted_stderr).await;
+        }
+        let executable = std::env::current_exe().ok().and_then(|path| {
+            crate::local_file::read_regular_file_bounded(
+                &path,
+                "smoke executable",
+                MAX_EXECUTABLE_BYTES,
+            )
+            .ok()
+        });
+        if executable.as_ref().map(|file| file.sha256.as_str())
+            != Some(guard.expected_executable_sha256.as_str())
+        {
+            state.fail_static(
+                DiagnosticPhase::Resolve,
+                DiagnosticFailureClass::Config,
+                "smoke.fallback_executable_drift",
+                "Fallback smoke executable changed after planning",
+                false,
+            );
+            return state.finalize(args.include_redacted_stderr).await;
+        }
     }
 
-    let snapshot = match std::fs::read_to_string(&config_path)
-        .map_err(|_| ())
-        .and_then(|raw| RegistryConfig::parse(&raw).map_err(|_| ()))
-        .and_then(|config| config.into_snapshot().map_err(|_| ()))
-    {
+    let raw = match std::str::from_utf8(&config_file.bytes) {
+        Ok(raw) => raw,
+        Err(_) => {
+            state.fail_static(
+                DiagnosticPhase::Resolve,
+                DiagnosticFailureClass::Config,
+                "smoke.config_utf8",
+                "Smoke config is not valid UTF-8",
+                false,
+            );
+            return state.finalize(args.include_redacted_stderr).await;
+        }
+    };
+    let snapshot = match crate::validate_registry_config_contents(raw) {
         Ok(snapshot) => snapshot,
-        Err(()) => {
+        Err(_) => {
             state.fail_static(
                 DiagnosticPhase::Resolve,
                 DiagnosticFailureClass::Config,
@@ -1151,6 +1271,20 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV1 {
             return state.finalize(args.include_redacted_stderr).await;
         }
     };
+    if args.fallback_guard.is_some()
+        && (!entry.host_fallback_eligible
+            || !matches!(entry.kind, AgentKind::Acp)
+            || entry.sandbox.is_some())
+    {
+        state.fail_static(
+            DiagnosticPhase::Resolve,
+            DiagnosticFailureClass::Config,
+            "smoke.fallback_target_drift",
+            "Fallback smoke target is no longer an eligible host ACP entry",
+            false,
+        );
+        return state.finalize(args.include_redacted_stderr).await;
+    }
     let session_cwd = match args.session_cwd.as_deref() {
         Some(path) => match canonical_session_cwd(path) {
             Ok(cwd) => {
@@ -1170,6 +1304,28 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV1 {
         },
         None => None,
     };
+    if let Some(guard) = &args.fallback_guard {
+        let source = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == guard.source_agent);
+        let source_cwd = source
+            .filter(|entry| execution_mode(entry) == "container_ro")
+            .and_then(|entry| entry.sandbox.as_ref())
+            .and_then(|sandbox| canonical_session_cwd(Path::new(&sandbox.mount)).ok());
+        if source_cwd.as_ref().map(SessionCwd::as_str)
+            != session_cwd.as_ref().map(SessionCwd::as_str)
+        {
+            state.fail_static(
+                DiagnosticPhase::ConfigApply,
+                DiagnosticFailureClass::Config,
+                "smoke.fallback_source_drift",
+                "Fallback smoke cwd is not the current source container mount",
+                false,
+            );
+            return state.finalize(args.include_redacted_stderr).await;
+        }
+    }
 
     let artifact_redactor = artifact_redactor(&entry, session_cwd.as_ref());
     state.artifact.target = Some(TargetRecord {
@@ -1396,7 +1552,7 @@ fn lexical_absolute(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
-fn write_artifact(artifact: &SmokeArtifactV1, out: Option<&mut File>) -> Result<(), BoxError> {
+fn write_artifact(artifact: &SmokeArtifactV2, out: Option<&mut File>) -> Result<(), BoxError> {
     match out {
         Some(file) => {
             serde_json::to_writer_pretty(&mut *file, artifact)?;
@@ -1658,6 +1814,7 @@ mod tests {
             timeout_secs: 1,
             include_redacted_stderr: false,
             out: None,
+            fallback_guard: None,
         }
     }
 
@@ -1721,6 +1878,32 @@ mod tests {
             parse_args(&cli_args(&[])).unwrap().timeout_secs,
             DEFAULT_TIMEOUT_SECS
         );
+
+        let digest = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(parse_args(&cli_args(&["--expected-config-sha256", digest])).is_err());
+        assert!(parse_args(&cli_args(&[
+            "--expected-config-sha256",
+            digest,
+            "--expected-executable-sha256",
+            digest,
+            "--fallback-source-agent",
+            "source",
+            "--require-host-fallback-eligible",
+        ]))
+        .is_err());
+        let guarded = parse_args(&cli_args(&[
+            "--session-cwd",
+            "/tmp",
+            "--expected-config-sha256",
+            digest,
+            "--expected-executable-sha256",
+            digest,
+            "--fallback-source-agent",
+            "source",
+            "--require-host-fallback-eligible",
+        ]))
+        .unwrap();
+        assert!(guarded.fallback_guard.is_some());
 
         let consumed_ack = vec![
             "--agent".into(),
@@ -2254,7 +2437,7 @@ mod tests {
         write_artifact(&artifact, Some(&mut file)).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["cleanup"]["grace_timeout_secs"], CLEANUP_TIMEOUT_SECS);
         assert!(bytes.ends_with(b"\n"));
     }

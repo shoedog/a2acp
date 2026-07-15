@@ -141,12 +141,34 @@ pub fn classify_container_infrastructure(
 }
 
 fn valid_declaration(value: &str) -> bool {
-    !value.is_empty() && value.trim() == value && !value.contains('\0')
+    !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
 }
 
-fn filesystem_state(path: &std::path::Path, require_directory: bool) -> ContainerEvidenceState {
+fn valid_runtime_operand(value: &str) -> bool {
+    valid_declaration(value) && !value.starts_with('-')
+}
+
+#[derive(Clone, Copy)]
+enum FilesystemRequirement {
+    MountSource,
+    RegularFile,
+    Directory,
+}
+
+fn filesystem_state(
+    path: &std::path::Path,
+    requirement: FilesystemRequirement,
+) -> ContainerEvidenceState {
     match std::fs::metadata(path) {
-        Ok(metadata) if !require_directory || metadata.is_dir() => ContainerEvidenceState::Healthy,
+        Ok(metadata)
+            if match requirement {
+                FilesystemRequirement::MountSource => metadata.is_file() || metadata.is_dir(),
+                FilesystemRequirement::RegularFile => metadata.is_file(),
+                FilesystemRequirement::Directory => metadata.is_dir(),
+            } =>
+        {
+            ContainerEvidenceState::Healthy
+        }
         Ok(_) => ContainerEvidenceState::Failed,
         Err(error)
             if matches!(
@@ -182,7 +204,7 @@ fn executable_state(program: &str) -> ContainerEvidenceState {
 }
 
 fn executable_path_state(path: &std::path::Path) -> ContainerEvidenceState {
-    let state = filesystem_state(path, false);
+    let state = filesystem_state(path, FilesystemRequirement::RegularFile);
     if state != ContainerEvidenceState::Healthy {
         return state;
     }
@@ -227,16 +249,126 @@ fn is_credential_destination(destination: &str) -> bool {
     )
 }
 
-fn host_volume_source(source: &str) -> Result<Option<std::path::PathBuf>, ()> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SandboxVolumeSource {
+    Anonymous,
+    Host(String),
+    Named(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxVolumeDeclaration {
+    source: SandboxVolumeSource,
+    destination: String,
+}
+
+impl SandboxVolumeDeclaration {
+    pub fn source(&self) -> &SandboxVolumeSource {
+        &self.source
+    }
+
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+}
+
+fn valid_named_volume(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => true,
+            b'_' | b'.' | b'-' => index > 0,
+            _ => false,
+        })
+}
+
+/// Parse the `-v` grammar used by config validation, static evidence, and composition. Supported
+/// forms are an anonymous absolute destination or `source:absolute-destination[:options]` where the
+/// source is an absolute/`~/` host path or a runtime-owned named volume.
+pub fn parse_sandbox_volume(value: &str) -> Result<SandboxVolumeDeclaration, &'static str> {
+    if !valid_declaration(value) {
+        return Err("volume declaration is empty, padded, or contains controls");
+    }
+    let fields: Vec<&str> = value.split(':').collect();
+    let (source, destination, options) = match fields.as_slice() {
+        [destination] => (SandboxVolumeSource::Anonymous, *destination, None),
+        [source, destination] => (
+            if source.starts_with('/') || source.starts_with("~/") {
+                SandboxVolumeSource::Host((*source).to_owned())
+            } else if valid_named_volume(source) {
+                SandboxVolumeSource::Named((*source).to_owned())
+            } else {
+                return Err("volume source is not a host path or named volume");
+            },
+            *destination,
+            None,
+        ),
+        [source, destination, options] => (
+            if source.starts_with('/') || source.starts_with("~/") {
+                SandboxVolumeSource::Host((*source).to_owned())
+            } else if valid_named_volume(source) {
+                SandboxVolumeSource::Named((*source).to_owned())
+            } else {
+                return Err("volume source is not a host path or named volume");
+            },
+            *destination,
+            Some(*options),
+        ),
+        _ => return Err("volume declaration has too many colon-separated fields"),
+    };
+    let destination = crate::SessionCwd::parse(destination)
+        .map_err(|_| "volume destination must be an absolute normalized path")?;
+    if options.is_some_and(|options| {
+        options.is_empty()
+            || options.split(',').any(|option| {
+                !valid_declaration(option) || option.starts_with('-') || option.contains('/')
+            })
+    }) {
+        return Err("volume options are malformed");
+    }
+    Ok(SandboxVolumeDeclaration {
+        source,
+        destination: destination.as_str().to_owned(),
+    })
+}
+
+fn host_volume_path(source: &str) -> Result<std::path::PathBuf, ()> {
     if source.starts_with('/') {
-        return Ok(Some(std::path::PathBuf::from(source)));
+        return Ok(std::path::PathBuf::from(source));
     }
-    if let Some(relative) = source.strip_prefix("~/") {
-        return std::env::var_os("HOME")
-            .map(|home| Some(std::path::PathBuf::from(home).join(relative)))
-            .ok_or(());
+    source
+        .strip_prefix("~/")
+        .and_then(|relative| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(relative))
+        })
+        .ok_or(())
+}
+
+pub fn validate_sandbox_declarations(sandbox: &SandboxConfig) -> Result<(), &'static str> {
+    if !valid_runtime_operand(sandbox.runtime()) {
+        return Err("sandbox runtime is not a valid command operand");
     }
-    Ok(None)
+    if !valid_runtime_operand(&sandbox.image) {
+        return Err("sandbox image is not a valid runtime operand");
+    }
+    if let EgressPolicy::Locked {
+        network,
+        proxy,
+        no_proxy,
+    } = &sandbox.egress
+    {
+        if !valid_runtime_operand(network)
+            || !valid_declaration(proxy)
+            || no_proxy
+                .as_deref()
+                .is_some_and(|value| !valid_declaration(value))
+        {
+            return Err("locked sandbox egress declaration is malformed");
+        }
+    }
+    for volume in &sandbox.volumes {
+        parse_sandbox_volume(volume)?;
+    }
+    Ok(())
 }
 
 /// Classify extra volumes from their structured source/destination fields. Only the closed set of
@@ -246,109 +378,43 @@ fn extra_volume_states(volumes: &[String]) -> (ContainerEvidenceState, Container
     let mut mount = ContainerEvidenceState::Healthy;
     let mut credentials = ContainerEvidenceState::Healthy;
     for volume in volumes {
-        let mut fields = volume.splitn(3, ':');
-        let source = fields.next().unwrap_or_default();
-        let Some(destination) = fields.next() else {
-            mount = merge_evidence_state(mount, ContainerEvidenceState::Unavailable);
-            continue;
+        let declaration = match parse_sandbox_volume(volume) {
+            Ok(declaration) => declaration,
+            Err(_) => {
+                mount = merge_evidence_state(mount, ContainerEvidenceState::Unavailable);
+                continue;
+            }
         };
-        let credential = is_credential_destination(destination);
+        let credential = is_credential_destination(declaration.destination());
         let selected = if credential {
             &mut credentials
         } else {
             &mut mount
         };
-        if source.is_empty() || destination.is_empty() {
-            *selected = merge_evidence_state(*selected, ContainerEvidenceState::Failed);
-            continue;
-        }
-        let state = match host_volume_source(source) {
-            Ok(Some(path)) => filesystem_state(&path, false),
-            // Runtime-owned named volumes are valid declarations; their contents cannot be inferred
-            // from the host filesystem and are not promoted by this static preflight.
-            Ok(None) => ContainerEvidenceState::Healthy,
-            Err(()) => ContainerEvidenceState::Unavailable,
+        let requirement = match declaration.destination() {
+            "/root/.claude/.credentials.json" | "/root/.codex/auth.json" => {
+                FilesystemRequirement::RegularFile
+            }
+            "/root/.local/share" => FilesystemRequirement::Directory,
+            _ => FilesystemRequirement::MountSource,
+        };
+        let state = match declaration.source() {
+            SandboxVolumeSource::Anonymous if credential => ContainerEvidenceState::Failed,
+            SandboxVolumeSource::Anonymous => ContainerEvidenceState::Healthy,
+            SandboxVolumeSource::Named(_)
+                if credential && matches!(requirement, FilesystemRequirement::RegularFile) =>
+            {
+                ContainerEvidenceState::Failed
+            }
+            SandboxVolumeSource::Named(_) => ContainerEvidenceState::Healthy,
+            SandboxVolumeSource::Host(source) => match host_volume_path(source) {
+                Ok(path) => filesystem_state(&path, requirement),
+                Err(()) => ContainerEvidenceState::Unavailable,
+            },
         };
         *selected = merge_evidence_state(*selected, state);
     }
     (mount, credentials)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BoundedProbeResult {
-    Success,
-    Failed,
-    Unavailable,
-}
-
-#[cfg(unix)]
-fn terminate_probe_group(child: &mut std::process::Child) {
-    if let Ok(process_group) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: the child is spawned into a fresh process group whose id is its pid. The negative
-        // pid targets only that group and is used even after the direct child exits so forked probe
-        // descendants cannot survive the bounded inspection.
-        unsafe {
-            libc::kill(-process_group, libc::SIGKILL);
-        }
-    }
-    let _ = child.wait();
-}
-
-#[cfg(not(unix))]
-fn terminate_probe_group(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn bounded_probe(program: &str, args: &[&str]) -> BoundedProbeResult {
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt as _;
-
-    let mut command = std::process::Command::new(program);
-    command
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            return BoundedProbeResult::Failed;
-        }
-        Err(_) => return BoundedProbeResult::Unavailable,
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let result = if status.success() {
-                    BoundedProbeResult::Success
-                } else {
-                    BoundedProbeResult::Failed
-                };
-                terminate_probe_group(&mut child);
-                return result;
-            }
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Ok(None) => {
-                terminate_probe_group(&mut child);
-                return BoundedProbeResult::Failed;
-            }
-            Err(_) => {
-                terminate_probe_group(&mut child);
-                return BoundedProbeResult::Unavailable;
-            }
-        }
-    }
 }
 
 /// Inspect only bridge-owned configuration and host filesystem/executable metadata. This performs no
@@ -358,7 +424,7 @@ pub fn inspect_container_infrastructure(
     sandbox: &SandboxConfig,
 ) -> ContainerInfrastructureEvidence {
     let (extra_mount, credentials) = extra_volume_states(&sandbox.volumes);
-    let image = if valid_declaration(&sandbox.image) {
+    let image = if valid_runtime_operand(&sandbox.image) {
         ContainerEvidenceState::Healthy
     } else {
         ContainerEvidenceState::Failed
@@ -369,7 +435,7 @@ pub fn inspect_container_infrastructure(
             network,
             proxy,
             no_proxy,
-        } if valid_declaration(network)
+        } if valid_runtime_operand(network)
             && valid_declaration(proxy)
             && no_proxy.as_deref().is_none_or(valid_declaration) =>
         {
@@ -387,57 +453,14 @@ pub fn inspect_container_infrastructure(
         .with(
             ContainerInfrastructureKind::Mount,
             merge_evidence_state(
-                filesystem_state(std::path::Path::new(&sandbox.mount), true),
+                filesystem_state(
+                    std::path::Path::new(&sandbox.mount),
+                    FilesystemRequirement::Directory,
+                ),
                 extra_mount,
             ),
         )
         .with(ContainerInfrastructureKind::Credentials, credentials)
-}
-
-fn inspect_container_infrastructure_after_failure(
-    sandbox: &SandboxConfig,
-) -> ContainerInfrastructureEvidence {
-    let mut evidence = inspect_container_infrastructure(sandbox);
-    if classify_container_infrastructure(evidence) != ContainerInfrastructureAssessment::Healthy {
-        return evidence;
-    }
-
-    let runtime = sandbox.runtime();
-    evidence.runtime = match bounded_probe(runtime, &["info"]) {
-        BoundedProbeResult::Success => ContainerEvidenceState::Healthy,
-        BoundedProbeResult::Failed => ContainerEvidenceState::Failed,
-        BoundedProbeResult::Unavailable => ContainerEvidenceState::Unavailable,
-    };
-    if evidence.runtime != ContainerEvidenceState::Healthy {
-        return evidence;
-    }
-
-    evidence.image = match bounded_probe(runtime, &["image", "inspect", &sandbox.image]) {
-        BoundedProbeResult::Success => ContainerEvidenceState::Healthy,
-        BoundedProbeResult::Failed => ContainerEvidenceState::Failed,
-        BoundedProbeResult::Unavailable => ContainerEvidenceState::Unavailable,
-    };
-    evidence.network = match &sandbox.egress {
-        EgressPolicy::Open => ContainerEvidenceState::Healthy,
-        EgressPolicy::Locked { network, .. } => {
-            match bounded_probe(runtime, &["network", "inspect", network]) {
-                BoundedProbeResult::Success => ContainerEvidenceState::Healthy,
-                BoundedProbeResult::Failed => ContainerEvidenceState::Failed,
-                BoundedProbeResult::Unavailable => ContainerEvidenceState::Unavailable,
-            }
-        }
-    };
-
-    if evidence.image != ContainerEvidenceState::Healthy
-        || evidence.network != ContainerEvidenceState::Healthy
-    {
-        evidence.runtime = match bounded_probe(runtime, &["info"]) {
-            BoundedProbeResult::Success => ContainerEvidenceState::Healthy,
-            BoundedProbeResult::Failed => ContainerEvidenceState::Failed,
-            BoundedProbeResult::Unavailable => ContainerEvidenceState::Unavailable,
-        };
-    }
-    evidence
 }
 
 fn container_infrastructure_failure_error(
@@ -497,32 +520,6 @@ pub fn validate_container_infrastructure(
     match classify_container_infrastructure(inspect_container_infrastructure(sandbox)) {
         ContainerInfrastructureAssessment::Healthy => Ok(()),
         assessment => Err(container_infrastructure_failure_error(assessment)),
-    }
-}
-
-/// After a pre-prompt container launch fails, run only bounded read-only runtime inspections. A
-/// uniquely demonstrated infrastructure dimension replaces the opaque launch error; complete healthy
-/// evidence preserves it; conflicting or unavailable evidence returns typed `unknown`/fatal. Callers
-/// must pass a sandbox from a validated registry snapshot so the configured runtime is allowlisted.
-pub async fn classify_container_spawn_failure(
-    sandbox: SandboxConfig,
-    original: crate::error::BridgeError,
-) -> crate::error::BridgeError {
-    let evidence = match tokio::task::spawn_blocking(move || {
-        inspect_container_infrastructure_after_failure(&sandbox)
-    })
-    .await
-    {
-        Ok(evidence) => evidence,
-        Err(_) => {
-            return container_infrastructure_failure_error(
-                ContainerInfrastructureAssessment::Unknown,
-            );
-        }
-    };
-    match classify_container_infrastructure(evidence) {
-        ContainerInfrastructureAssessment::Healthy => original,
-        assessment => container_infrastructure_failure_error(assessment),
     }
 }
 
@@ -1269,146 +1266,92 @@ mod tests {
         assert_eq!(diagnostic.class(), DiagnosticFailureClass::ContainerMount);
     }
 
-    #[tokio::test]
-    async fn post_failure_probe_classifies_only_unique_runtime_image_or_network_evidence() {
-        use crate::diagnostics::{DiagnosticFailureClass, FailureDisposition};
-        use crate::error::BridgeError;
-        use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn volume_parser_accepts_anonymous_destination_and_rejects_option_like_operands() {
+        assert_eq!(
+            parse_sandbox_volume("/cache").unwrap(),
+            SandboxVolumeDeclaration {
+                source: SandboxVolumeSource::Anonymous,
+                destination: "/cache".into(),
+            }
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut sandbox = SandboxConfig {
+            runtime: Some("docker".into()),
+            image: "reader:fixed".into(),
+            mount: temp.path().to_string_lossy().into_owned(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec!["/cache".into()],
+        };
+        assert!(validate_sandbox_declarations(&sandbox).is_ok());
+
+        sandbox.runtime = Some("--help".into());
+        assert!(validate_sandbox_declarations(&sandbox)
+            .unwrap_err()
+            .contains("runtime"));
+        sandbox.runtime = Some("docker".into());
+        sandbox.image = "--help".into();
+        assert!(validate_sandbox_declarations(&sandbox)
+            .unwrap_err()
+            .contains("image"));
+        sandbox.image = "reader:fixed".into();
+        sandbox.egress = EgressPolicy::Locked {
+            network: "--help".into(),
+            proxy: "http://proxy:3128".into(),
+            no_proxy: None,
+        };
+        assert!(validate_sandbox_declarations(&sandbox)
+            .unwrap_err()
+            .contains("egress"));
+    }
+
+    #[test]
+    fn credential_destinations_require_the_declared_source_type() {
+        use crate::diagnostics::DiagnosticFailureClass;
 
         let temp = tempfile::tempdir().unwrap();
         let mount = temp.path().join("repo");
+        let directory = temp.path().join("directory");
+        let file = temp.path().join("file");
         std::fs::create_dir(&mount).unwrap();
-        let runtime = temp.path().join("runtime-probe");
-        std::fs::write(
-            &runtime,
-            "#!/bin/sh\ncase \"$1:$3\" in\n  info:*) exit 0 ;;\n  image:missing-image) exit 1 ;;\n  network:missing-network) exit 1 ;;\n  *) exit 0 ;;\nesac\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&runtime, permissions).unwrap();
-        let healthy = SandboxConfig {
-            runtime: Some(runtime.to_string_lossy().into_owned()),
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"credential").unwrap();
+
+        let base = SandboxConfig {
+            runtime: Some(
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             image: "reader:fixed".into(),
             mount: mount.to_string_lossy().into_owned(),
             access: MountAccess::Ro,
             egress: EgressPolicy::Open,
             volumes: vec![],
         };
+        let invalid = [
+            format!("{}:/root/.codex/auth.json:ro", directory.display()),
+            format!("{}:/root/.local/share:ro", file.display()),
+            "/root/.codex/auth.json".into(),
+            "codex-auth:/root/.codex/auth.json:ro".into(),
+        ];
 
-        let healthy_error = classify_container_spawn_failure(
-            healthy.clone(),
-            BridgeError::agent_crashed("docker image network mount credential"),
-        )
-        .await;
-        assert!(matches!(healthy_error, BridgeError::AgentCrashed { .. }));
-
-        let runtime_down = temp.path().join("runtime-down");
-        std::fs::write(&runtime_down, "#!/bin/sh\nexit 1\n").unwrap();
-        let mut permissions = std::fs::metadata(&runtime_down).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&runtime_down, permissions).unwrap();
-        let mut unavailable_runtime = healthy.clone();
-        unavailable_runtime.runtime = Some(runtime_down.to_string_lossy().into_owned());
-        let runtime_error = classify_container_spawn_failure(
-            unavailable_runtime,
-            BridgeError::agent_crashed("generic process failure"),
-        )
-        .await;
-        let BridgeError::AgentFailure { diagnostic } = runtime_error else {
-            panic!("unresponsive runtime should return typed evidence");
-        };
-        assert_eq!(diagnostic.class(), DiagnosticFailureClass::ContainerRuntime);
-
-        let mut image = healthy.clone();
-        image.image = "missing-image".into();
-        let image_error = classify_container_spawn_failure(
-            image,
-            BridgeError::agent_crashed("generic process failure"),
-        )
-        .await;
-        let BridgeError::AgentFailure { diagnostic } = image_error else {
-            panic!("missing image should return typed evidence");
-        };
-        assert_eq!(diagnostic.class(), DiagnosticFailureClass::ContainerImage);
-        assert_eq!(
-            diagnostic.disposition(),
-            FailureDisposition::ContainerFallbackCandidate
-        );
-
-        let mut network = healthy.clone();
-        network.egress = EgressPolicy::Locked {
-            network: "missing-network".into(),
-            proxy: "http://proxy.invalid".into(),
-            no_proxy: None,
-        };
-        let network_error = classify_container_spawn_failure(
-            network,
-            BridgeError::agent_crashed("generic process failure"),
-        )
-        .await;
-        let BridgeError::AgentFailure { diagnostic } = network_error else {
-            panic!("missing network should return typed evidence");
-        };
-        assert_eq!(diagnostic.class(), DiagnosticFailureClass::ContainerNetwork);
-
-        let mut conflicting = healthy;
-        conflicting.image = "missing-image".into();
-        conflicting.egress = EgressPolicy::Locked {
-            network: "missing-network".into(),
-            proxy: "http://proxy.invalid".into(),
-            no_proxy: None,
-        };
-        let conflict_error = classify_container_spawn_failure(
-            conflicting,
-            BridgeError::agent_crashed("generic process failure"),
-        )
-        .await;
-        let BridgeError::AgentFailure { diagnostic } = conflict_error else {
-            panic!("conflicting evidence should return typed unknown");
-        };
-        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Unknown);
-        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_probe_kills_forked_descendants_after_wrapper_exit() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("descendant.pid");
-        let probe = temp.path().join("forking-probe");
-        std::fs::write(
-            &probe,
-            format!("#!/bin/sh\nsleep 30 &\necho $! > {:?}\nexit 0\n", pid_file),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&probe).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&probe, permissions).unwrap();
-
-        assert_eq!(
-            bounded_probe(probe.to_str().unwrap(), &["info"]),
-            BoundedProbeResult::Success
-        );
-        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            // SAFETY: signal 0 performs only an existence check for the recorded child pid.
-            let exists = unsafe { libc::kill(pid, 0) } == 0;
-            if !exists {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "probe descendant {pid} survived process-group cleanup"
+        for volume in invalid {
+            let mut sandbox = base.clone();
+            sandbox.volumes = vec![volume.clone()];
+            let error = validate_container_infrastructure(&sandbox)
+                .expect_err("credential source type must fail static preflight");
+            let crate::error::BridgeError::AgentFailure { diagnostic } = error else {
+                panic!("{volume:?} should return structured credential evidence");
+            };
+            assert_eq!(
+                diagnostic.class(),
+                DiagnosticFailureClass::ContainerCredentials,
+                "wrong class for {volume:?}"
             );
-            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 }

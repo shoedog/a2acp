@@ -38,6 +38,7 @@ mod config;
 mod containers;
 mod doctor;
 mod fallback_plan;
+mod local_file;
 mod route;
 mod slice;
 mod smoke;
@@ -174,6 +175,10 @@ usage: a2a-bridge smoke --agent <id> --config <path> --acknowledge-billable
                         [--model <raw-id>] [--effort <level>] [--mode <id>]
                         [--session-cwd <trusted-repo>] [--timeout-secs <1..900>]
                         [--include-redacted-stderr] [--out <path>]
+                        [--expected-config-sha256 <hex>
+                         --expected-executable-sha256 <hex>
+                         --fallback-source-agent <id>
+                         --require-host-fallback-eligible]
 
 Run exactly one billable agent turn with the fixed prompt `Reply exactly PONG. Do not use tools.`.
 There is no retry, fallback, workflow, resume, or caller-supplied prompt. The default timeout is 120
@@ -464,14 +469,6 @@ impl bridge_container::ContainerSpawn for AcpContainerSpawn {
         sandbox: &bridge_core::domain::SandboxConfig,
     ) -> Result<(), BridgeError> {
         bridge_core::sandbox::validate_container_infrastructure(sandbox)
-    }
-
-    async fn classify_spawn_failure(
-        &self,
-        sandbox: bridge_core::domain::SandboxConfig,
-        error: BridgeError,
-    ) -> BridgeError {
-        bridge_core::sandbox::classify_container_spawn_failure(sandbox, error).await
     }
 
     async fn spawn(
@@ -882,30 +879,15 @@ fn make_spawn_fn(
                         .container
                         .as_ref()
                         .map(bridge_acp::acp_backend::ContainerReap::production_controller);
-                    let sandbox_for_failure = entry.sandbox.clone();
-                    let spawned = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
+                    let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
                         &program,
                         &argv_ref,
                         acp,
                         observer,
                         controller,
                     )
-                    .await;
-                    let mut be = match spawned {
-                        Ok(backend) => backend.with_policy(policy),
-                        Err(error) => {
-                            let classified = match sandbox_for_failure {
-                                Some(sandbox) => {
-                                    bridge_core::sandbox::classify_container_spawn_failure(
-                                        sandbox, error,
-                                    )
-                                    .await
-                                }
-                                None => error,
-                            };
-                            return Err(classified);
-                        }
-                    };
+                    .await?
+                    .with_policy(policy);
                     if let Some(reg) = permission_registry.clone() {
                         be = be
                             .with_permission_registry(reg)
@@ -5214,7 +5196,27 @@ fn validate_config_file(
     let raw = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("read {}: {e}", config_path.display()))?;
 
-    let cfg = RegistryConfig::parse(&raw).map_err(|e| format!("config parse: {e}"))?;
+    validate_config_contents(&config_path, &raw, examples_policy, project_markers, scope)
+        .map(|(report, _)| report)
+}
+
+/// Validate one already-pinned config byte snapshot and return the exact registry snapshot it
+/// produced. Security-sensitive local commands use this seam so validation and execution cannot
+/// silently reopen different config contents between phases.
+pub(crate) fn validate_config_contents(
+    config_path: &Path,
+    raw: &str,
+    examples_policy: ExamplesPolicy,
+    project_markers: &[String],
+    scope: ValidationScope,
+) -> Result<
+    (
+        ConfigValidationReport,
+        bridge_core::domain::RegistrySnapshot,
+    ),
+    BoxError,
+> {
+    let cfg = RegistryConfig::parse(raw).map_err(|e| format!("config parse: {e}"))?;
     let base = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -5227,8 +5229,8 @@ fn validate_config_file(
     let warnings = match examples_policy {
         ExamplesPolicy::Off => Vec::new(),
         ExamplesPolicy::Warn | ExamplesPolicy::Deny => {
-            let config_in_examples = examples_ancestor(&config_path).is_some();
-            let raw_match = has_project_marker_in_examples(&config_path, &raw, project_markers);
+            let config_in_examples = examples_ancestor(config_path).is_some();
+            let raw_match = has_project_marker_in_examples(config_path, raw, project_markers);
             let workflow_prompt_match = workflows.values().any(|workflow| {
                 workflow
                     .nodes
@@ -5239,7 +5241,7 @@ fn validate_config_file(
                 .values()
                 .any(|prompt| contains_project_marker(&prompt.template, project_markers));
             if config_in_examples && (raw_match || workflow_prompt_match || named_prompt_match) {
-                examples_policy_warning_for_config(&config_path)
+                examples_policy_warning_for_config(config_path)
             } else {
                 Vec::new()
             }
@@ -5271,16 +5273,41 @@ fn validate_config_file(
             })
         })
     });
-    bridge_registry::registry::Registry::new(snap, spawn)
+    bridge_registry::registry::Registry::new(snap.clone(), spawn)
         .map_err(|e| format!("registry: {}", e.client_message()))?;
 
-    Ok(ConfigValidationReport {
-        config_path,
-        agent_count,
-        workflow_count,
-        prompt_count,
-        warnings,
-    })
+    Ok((
+        ConfigValidationReport {
+            config_path: config_path.to_path_buf(),
+            agent_count,
+            workflow_count,
+            prompt_count,
+            warnings,
+        },
+        snap,
+    ))
+}
+
+/// Validate only the registry surface consumed by the one-agent `smoke` and local `fallback-plan`
+/// commands. Workflows, prompt files, metrics, worktrees, and batch configuration cannot affect those
+/// commands and are deliberately not reopened as unbound side inputs.
+pub(crate) fn validate_registry_config_contents(
+    raw: &str,
+) -> Result<bridge_core::domain::RegistrySnapshot, BoxError> {
+    let snapshot = RegistryConfig::parse(raw)
+        .map_err(|error| format!("config parse: {error}"))?
+        .into_snapshot()
+        .map_err(|error| format!("registry snapshot: {error}"))?;
+    let spawn: SpawnFn = Arc::new(|_| {
+        Box::pin(async {
+            Err(BridgeError::ConfigInvalid {
+                reason: "registry-only validation must not spawn agents".into(),
+            })
+        })
+    });
+    bridge_registry::registry::Registry::new(snapshot.clone(), spawn)
+        .map_err(|error| format!("registry: {}", error.client_message()))?;
+    Ok(snapshot)
 }
 
 fn parse_validate_args(args: &[String]) -> Result<ValidateMode, BoxError> {

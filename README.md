@@ -94,6 +94,7 @@ containers) see [AGENTS.md](AGENTS.md); for running your own multi-agent bridge 
 | `merge <id>` | Land an **Approved** `implement` run's commit into its source repo, fast-forward, re-authored to the operator. `[--onto <branch>] [--force]` |
 | `models` | List each configured agent's advertised models/effort/modes (probed live). `[--config <f>] [--agent <id>] [--json]` |
 | `smoke` | Run one explicitly acknowledged, bounded, billable fixed-`PONG` turn and emit a versioned JSON artifact. `--agent <id> --config <f> --acknowledge-billable [--model <id>] [--effort <e>] [--mode <m>] [--session-cwd <repo>] [--timeout-secs <1..900>] [--out <f>]` |
+| `fallback-plan` | Validate one complete failed smoke-v2 artifact and emit, but never execute, a guarded distinct host-verification smoke. `--from <artifact> --host-agent <id> --config <f> [--confirm-trusted-own-repo-read-only]` |
 | `init` | Scaffold `a2a-bridge.toml` + prompts for the given agents. `--agents codex,claude [--dir <d>] [--force]` |
 | `validate` | Validate config schema, registry, workflow DAGs, and prompt refs — or `--repo-hygiene` (this repo's own workflow-artifact hygiene gate) |
 | `doctor` | Run a bounded, read-only preflight for config, commands/runtimes, egress, credentials, store, verify/review, and MCP/LSP. `[--config <f>] [--json]` |
@@ -227,6 +228,7 @@ addr = "127.0.0.1:8080"
 | `cwd` | no | Working directory for `session/new`; relative values join onto the bridge's `current_dir()` |
 | `auth_method` | no | Auth method id for `authenticate` (defaults to ChatGPT-style auth when advertised, else the first advertised method) |
 | `pre_authenticated` | no | Skip `authenticate` because credentials are already ambient (for example, `codex login` or a mounted `auth.json`); cannot be combined with `auth_method` |
+| `host_fallback_eligible` | no | Default `false`. Marks only an unsandboxed `kind="acp"` entry as an allowed target for a locally confirmed trusted-own-repo read-only fallback plan; it never asserts content trust or starts a fallback. |
 | `description`, `tags`, `version` | no | Seamed for future per-entry Agent Cards |
 
 Model/effort resolution details, the effort-level-per-model table, and the `kind="api"` fields

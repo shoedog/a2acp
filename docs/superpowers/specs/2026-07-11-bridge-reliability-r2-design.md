@@ -1,7 +1,15 @@
-# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v14)
+# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v15)
 
 - **Status:** R2a, R2b0–R2b3, and R2c merged; R2d is **IN REVIEW** on
-  `agent/reliability-r2d-fallback-plan`; v14 is the design of record for R2b–R2e
+  `agent/reliability-r2d-fallback-plan`; v15 is the design of record for R2b–R2e
+- **R2d review state:** the first bridge-mediated `gpt-5.6-sol`/`xhigh` security review of exact
+  candidate `b6424d725e56d1f3fde0b7c29b6057155d69dacd` returned `REVISE`. V15 folds its nine findings by
+  removing artifact-cwd authority and all external post-failure probes, accepting only complete
+  smoke-v2 evidence bound to the current config bytes, pinning regular-file descriptors and digests,
+  deriving cwd from the current source mount, guarding the later smoke against config/executable/marker
+  drift, and sharing one validated sandbox declaration grammar. The post-fold full workspace is
+  **1,962 / 0 / 12 ignored** across 69 executables with format/diff, all-target check, warnings-denied
+  Clippy, release, and hygiene **37/7** clean; closure re-review remains.
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
   and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,
@@ -343,6 +351,21 @@ missing test pair. V14 closes all three without changing the approved R2b0/R2b2 
 | **WRONG:** the ACP SDK exposes error `data` as `serde_json::Value`, after same-object duplicate members have collapsed | Production `spawn` and `from_child` validate every raw ACP JSON frame for unique object members before SDK deserialization. Malformed or duplicate-bearing frames fail at the transport boundary; typed in-process transports cannot construct duplicate object members. |
 | **SMELL:** cancel/retire dispatch-gate tests did not directly cover checked release | Add one cold and one warm checked-release regression at the inner-prompt installation gate, and mutation-prove both fail when only that gate wait is removed. |
 
+The first R2d security review of `b6424d7` found one blocker, six major correctness failures, and two
+minor correctness failures. V15 closes them without changing the merged R2b/R2c wire contract:
+
+| Finding | Disposition in v15 |
+|---|---|
+| **WRONG/BLOCKER:** artifact cwd can widen unsandboxed host scope | Treat artifact cwd as informational; derive the generated smoke cwd only from the current source entry's canonical read-only sandbox mount. |
+| **WRONG/MAJOR:** runnable output is not bound to candidate binary/config/marker at action time | Emit current executable/config SHA-256 and source/target guards; smoke revalidates the closed set before spawn. |
+| **WRONG/MAJOR:** outer post-failure probes overwrite precise lifecycle failures | Remove all external post-failure probes; use composition/config-owned static evidence only. |
+| **WRONG/MAJOR:** config switching and hand-assembled task envelopes lack complete provenance | Accept only complete smoke-v2; require its canonical config path and exact-byte digest to match the current pinned config. |
+| **WRONG/MAJOR:** FIFO/special-file input can block before inspection | Open source/config/executable descriptor-first with bounded regular-file, no-follow/nonblocking Unix flags and descriptor/path identity checks. |
+| **WRONG/MAJOR:** probe descendants can escape group cleanup | Remove the probe subprocess surface; dynamic daemon/image/network inspection remains deferred. |
+| **WRONG/MAJOR:** volume and credential grammar differs among validation/evidence/composition | Share one parser; accept anonymous destinations, host binds, and named volumes; enforce option-safe operands and credential source types. |
+| **WRONG/MINOR:** planner and smoke validate different/reopened config surfaces | Parse one pinned registry-only byte snapshot for both commands; exclude unrelated config surfaces. |
+| **WRONG/MINOR:** current status/docs describe stale schema and probe behavior | Promote v15 and align roadmap, plan, operator skill, onboarding, and command help. |
+
 The first bridge-mediated Sol/xhigh R2b1 implementation review returned `REVISE` with four `WRONG` and
 three `SMELL` findings. The implementation folds all seven before re-review:
 
@@ -610,20 +633,24 @@ The fallback-candidate column is only the failure-level gate. Eligibility to emi
 additionally requires all of:
 
 1. the local operator passes the explicit trusted-own-repo-read-only confirmation flag;
-2. a named host target is explicitly configured/selected and is not sandboxed or write-capable;
-3. `prompt_may_have_been_accepted == false`;
-4. the primary failure is one of the five container classes above; and
-5. `fallback-plan` is invoked directly on a local source artifact.
+2. the complete source is smoke schema v2, its canonical config path/exact-byte digest match the current
+   pinned config, and its current source entry is still `container_ro` with a canonical mount;
+3. a named host target is explicitly configured/selected, marked eligible, and is not sandboxed or
+   write-capable;
+4. `prompt_may_have_been_accepted == false`, lifecycle evidence is closed, and no events were dropped;
+5. the primary failure is one of the five container classes above; and
+6. `fallback-plan` is invoked directly on the local artifact with an explicit trust confirmation.
 
 R2e replaces item 1 with a policy-issued authenticated attestation; caller metadata never satisfies it.
 
 `unknown`, `AgentCrashed`, exit code 1/125, or a substring such as `docker` is never sufficient.
-The five `container_*` classes may be constructed only from composition-owned typed validation (for
-example runtime ENOENT, mount/credential source validation, or configured image/network identity) or a
-bounded, read-only post-failure runtime probe with a structured result. An inner adapter's stdout/stderr,
-generic runtime prose, or an exit code alone is never classification evidence. When the typed evidence
-is unavailable, contradictory, or ambiguous, construction returns `unknown`/`Fatal`; the probe never
-pulls an image, starts a container, or changes runtime state.
+The five `container_*` classes may be constructed only from composition/config-owned typed validation,
+such as runtime ENOENT, mount/credential source validation, and valid image/network declarations. An
+inner adapter's stdout/stderr, generic runtime prose, or an exit code alone is never classification
+evidence. R2d runs no external post-failure runtime/image/network probe because the bridge cannot yet
+prove descendant containment or prevent a late probe from replacing a more precise lifecycle failure.
+When local typed evidence is unavailable, contradictory, or ambiguous, construction remains
+`unknown`/`Fatal`; dynamic daemon/image/network-state classification is deferred.
 
 ### Closed provider evidence mapping (diagnostic schema v1)
 
@@ -1043,15 +1070,16 @@ R2d exposes a local operator command only; no A2A request field, metadata key, w
 configuration can invoke it:
 
 ```text
-a2a-bridge fallback-plan --from <failed-smoke-or-task-artifact.json>
+a2a-bridge fallback-plan --from <failed-smoke-v2-artifact.json>
                          --host-agent <explicit-agent-id>
                          --confirm-trusted-own-repo-read-only
                          --config <path>
 ```
 
-The command is read-only and non-billable. It validates an already persisted source diagnostic and emits
-a versioned JSON plan plus an exact separate rerun command. It does not resolve/spawn an agent or execute
-the rerun.
+The command is read-only and non-billable. It reads bounded regular-file snapshots of one complete
+smoke-v2 artifact and the explicit current config, then emits a schema-v2 JSON plan plus an exact separate
+rerun command. Historical smoke-v1 and hand-assembled task-diagnostic envelopes are rejected. It does not
+resolve/spawn an agent or execute the rerun.
 
 The selected host entry must also opt in at its declaration site:
 
@@ -1071,11 +1099,25 @@ Requirements:
   Claude/Fable is eligible through this marker even though its upstream CLI has no native read-only flag.
 - Never infer content trust from repository ownership, filesystem path, git remote, workflow name, or
   branch name.
-- Require the source artifact to prove `prompt_may_have_been_accepted=false` and one of the five typed
-  container classes. Legacy `AgentCrashed`, a missing artifact, or ambiguous evidence is ineligible.
+- Source, config, and current executable inputs are descriptor-first bounded regular-file snapshots. On
+  Unix, final symlinks/special files fail closed, FIFO opens are nonblocking, and descriptor/path identity
+  rejects replacement between open and canonicalization.
+- Require the smoke-v2 source to prove `prompt_may_have_been_accepted=false`, a timestamp-ordered closed
+  lifecycle inside the attempt interval carrying
+  the outer failure, zero dropped events, no turn activity, complete provenance/auth/cleanup, and one of
+  the five typed spawn-phase container classes. Legacy `AgentCrashed`, missing/incomplete evidence,
+  contradictory phase records, success, or timeout is ineligible or rejected.
+- Require the source's canonical config path and exact-byte SHA-256 to match the current pinned config.
+  Resolve the source agent in that same snapshot and derive host scope only from its current canonical
+  read-only sandbox mount. The artifact-reported cwd is informational and never controls the rerun.
 - Include source attempt id, original agent, failure code/class, selected host target, local trust
-  assertion, config provenance, and generated rerun command in the plan. The eventual rerun creates a
-  distinct task/attempt and cost record; it never resumes or mutates the source attempt.
+  assertion, config path/digest, and generated rerun command in the plan. The eventual fixed-PONG smoke
+  creates a distinct attempt/cost record and is only a compatibility verification; it never resumes,
+  mutates, or proves the original arbitrary task.
+- Bind the generated absolute candidate-binary argv to current executable/config SHA-256, the source
+  agent, and the required host marker. The smoke accepts those four guard fields only as a closed set and
+  rechecks config bytes, executable bytes, source mode/mount, and target marker before spawn. Drift fails
+  closed.
 - A2A caller-supplied `content_trust` or equivalent metadata is ignored/rejected and has no code path to
   `fallback-plan`. `AlwaysGrant` is not a trust authority.
 - If any predicate is false, emit an ineligible plan with stable reasons and no runnable command.
@@ -1094,6 +1136,8 @@ For trusted own-repo full-branch reviews, the operating policy is:
   configured `gpt-5.6-sol` reviewer at `xhigh` up front. Reserve max for tightly connected concurrency,
   transaction-safety, critical-proof/migration, complex leak, or rare-failure work, or after High/xhigh
   fails to resolve the issue; provider degradation alone is not sufficient.
+- Claude Haiku may run a small, tightly specified Anthropic-model or Claude Code compatibility check. It
+  is not a broad implementation lane or a substitute for Sonnet/Opus/Fable/Sol review quality.
 - If a Fable turn fails after `prompt_start`, do not resume, retry, or automatically route the same
   attempt. Preserve it as possibly accepted. An operator may explicitly start a distinct cross-provider
   review attempt; the new attempt has its own id, provenance, usage, and cost.
@@ -1271,8 +1315,8 @@ For trusted own-repo full-branch reviews, the operating policy is:
 
 - Every non-container class refuses fallback.
 - An inner-agent crash in an otherwise healthy container, including stderr containing `docker`, `image`,
-  `network`, or `mount`, cannot construct any `container_*` class. A typed composition error or bounded
-  structured runtime probe can construct only its matching class; an ambiguous probe returns `unknown`.
+  `network`, or `mount`, cannot construct any `container_*` class. Only typed static
+  composition/config evidence can construct its matching class; no external post-failure probe runs.
 - Every candidate container class still refuses when trust, host target, enablement, or replay safety is
   missing.
 - An absent/false eligibility marker, sandboxed entry, API entry, or write-capable target is rejected at
@@ -1280,7 +1324,13 @@ For trusted own-repo full-branch reviews, the operating policy is:
 - `prompt_start` begun is a hard no-replay barrier with a constructible same-poll race test.
 - Untrusted read and every write-capable request fail closed.
 - `fallback-plan` performs zero resolve/spawn/prompt calls. A valid local operator assertion plus an
-  eligible source artifact emits a versioned plan and separate rerun command; it never executes it.
+  eligible complete smoke-v2 artifact emits a versioned plan and separate rerun command; it never
+  executes it. Historical smoke-v1 and hand-assembled task envelopes reject.
+- Artifact cwd cannot control host scope. Current config path/digest/source/mount drift makes the plan
+  ineligible, and config/executable/source-marker/target-marker drift before the later smoke refuses
+  before spawn.
+- Symlink, FIFO, device, socket, and descriptor/path replacement inputs fail promptly; anonymous volume
+  syntax, option-like operands, and credential file/directory source types have direct regressions.
 - Spoofed A2A `content_trust` metadata under `AlwaysGrant`, server config, and workflow input cannot reach
   plan generation or host execution. Missing/malformed/legacy source diagnostics and every failed
   eligibility predicate emit an ineligible plan with no command.

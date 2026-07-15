@@ -67,6 +67,11 @@ Set `pre_authenticated = true` when an ACP process already has credentials from 
 mounted auth file. This prevents the bridge from invoking an advertised interactive login method during
 startup. Do not combine it with `auth_method`, which explicitly asks the bridge to authenticate.
 
+Set `host_fallback_eligible = true` only on an unsandboxed `kind = "acp"` entry that may be selected by
+the local `fallback-plan` command for trusted own-repo read-only verification. The field defaults false,
+does not infer trust, and does not execute or authorize an in-process fallback. API, sandboxed ACP, and
+`container_rw` entries reject the field when true.
+
 ### model / effort / mode
 
 All three are OPTIONAL and applied per session. Model and effort are

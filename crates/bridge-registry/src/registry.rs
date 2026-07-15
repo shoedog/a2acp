@@ -126,6 +126,11 @@ fn validate_sandbox(
     sb: &bridge_core::domain::SandboxConfig,
     allowed_cmds: &[String],
 ) -> Result<(), BridgeError> {
+    bridge_core::sandbox::validate_sandbox_declarations(sb).map_err(|reason| {
+        BridgeError::ConfigInvalid {
+            reason: format!("invalid sandbox declaration: {reason}"),
+        }
+    })?;
     // S3: allowlist the RESOLVED RUNTIME (NOT the inner cli, which runs contained).
     let runtime = sb.runtime();
     if !allowed_cmds.iter().any(|c| c == runtime) {
@@ -138,19 +143,27 @@ fn validate_sandbox(
         bridge_core::SessionCwd::parse(&sb.mount).map_err(|_| BridgeError::ConfigInvalid {
             reason: format!("sandbox mount must be an absolute path: {}", sb.mount),
         })?;
-    // S6: no volume DEST equal-to / nested-under `mount`. Normalize both via SessionCwd so `/work/.`
-    // etc. can't slip past. Bare / anonymous vol specs (no `:dest`, or non-absolute) aren't S6-checked.
+    // S6: no parsed volume destination equal-to / nested-under `mount`. The same parser feeds static
+    // evidence and composition, including anonymous absolute destinations such as `/cache`.
     for v in &sb.volumes {
-        let dest = v.split(':').nth(1).unwrap_or("");
-        if let Ok(d) = bridge_core::SessionCwd::parse(dest) {
-            if d.as_str() == mount.as_str() || d.is_under(&mount) {
-                return Err(BridgeError::ConfigInvalid {
-                    reason: format!(
-                        "sandbox volume dest {dest:?} is nested under the mount {:?}",
-                        sb.mount
-                    ),
-                });
+        let declaration = bridge_core::sandbox::parse_sandbox_volume(v).map_err(|reason| {
+            BridgeError::ConfigInvalid {
+                reason: format!("invalid sandbox volume {v:?}: {reason}"),
             }
+        })?;
+        let d = bridge_core::SessionCwd::parse(declaration.destination()).map_err(|_| {
+            BridgeError::ConfigInvalid {
+                reason: format!("invalid sandbox volume destination in {v:?}"),
+            }
+        })?;
+        if d.as_str() == mount.as_str() || d.is_under(&mount) {
+            return Err(BridgeError::ConfigInvalid {
+                reason: format!(
+                    "sandbox volume dest {:?} is nested under the mount {:?}",
+                    declaration.destination(),
+                    sb.mount
+                ),
+            });
         }
     }
     Ok(())
