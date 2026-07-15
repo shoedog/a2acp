@@ -30,11 +30,14 @@
 //   a2a-bridge validate --config <path>                  — validate config, workflows, and prompt refs
 //   a2a-bridge smoke --agent <id> --config <path>
 //             --acknowledge-billable                    — run one bounded fixed PONG probe
+//   a2a-bridge fallback-plan --from <artifact> --host-agent <id>
+//             --config <path>                           — emit a local-only host fallback plan
 
 mod catalog_probe;
 mod config;
 mod containers;
 mod doctor;
+mod fallback_plan;
 mod route;
 mod slice;
 mod smoke;
@@ -100,6 +103,8 @@ SUBCOMMANDS:
   models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
   smoke               Run one explicitly acknowledged, bounded, fixed PONG probe.
                       --agent <id> --config <f> --acknowledge-billable [--out <f>]
+  fallback-plan       Validate a local failed artifact and emit a host fallback recommendation.
+                      --from <artifact> --host-agent <id> --config <f> [--confirm-trusted-own-repo-read-only]
   implement --input <file|-> Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
@@ -203,6 +208,7 @@ enum TopSubcommand {
     Prompt,
     Doctor,
     Smoke,
+    FallbackPlan,
     Help,
     Serve,
     Unknown(String),
@@ -227,6 +233,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("prompt") => TopSubcommand::Prompt,
         Some("doctor") => TopSubcommand::Doctor,
         Some("smoke") => TopSubcommand::Smoke,
+        Some("fallback-plan") => TopSubcommand::FallbackPlan,
         Some("help") | Some("--help") | Some("-h") => TopSubcommand::Help,
         Some("serve") | None => TopSubcommand::Serve,
         Some(other) => TopSubcommand::Unknown(other.to_string()),
@@ -259,6 +266,7 @@ fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static 
         TopSubcommand::Init => Some(INIT_USAGE),
         TopSubcommand::Doctor => Some(DOCTOR_USAGE),
         TopSubcommand::Smoke => Some(SMOKE_USAGE),
+        TopSubcommand::FallbackPlan => Some(fallback_plan::USAGE),
         _ => None,
     }
 }
@@ -361,6 +369,9 @@ fn acp_spawn_inputs(
     let mcp_cwd = std::fs::canonicalize(&cwd)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| cwd_str.clone());
+    if let Some(sandbox) = &entry.sandbox {
+        bridge_core::sandbox::validate_container_infrastructure(sandbox)?;
+    }
     // kiro MCP delivery (ADR-0028): write the named agent-config (prism, {cwd}-substituted) to
     // ~/.kiro/agents/<name>.json BEFORE spawn; `acp_program_argv` points kiro at it via `--agent`.
     if matches!(
@@ -448,6 +459,21 @@ struct AcpContainerSpawn {
 }
 #[async_trait::async_trait]
 impl bridge_container::ContainerSpawn for AcpContainerSpawn {
+    fn validate_infrastructure(
+        &self,
+        sandbox: &bridge_core::domain::SandboxConfig,
+    ) -> Result<(), BridgeError> {
+        bridge_core::sandbox::validate_container_infrastructure(sandbox)
+    }
+
+    async fn classify_spawn_failure(
+        &self,
+        sandbox: bridge_core::domain::SandboxConfig,
+        error: BridgeError,
+    ) -> BridgeError {
+        bridge_core::sandbox::classify_container_spawn_failure(sandbox, error).await
+    }
+
     async fn spawn(
         &self,
         program: &str,
@@ -856,15 +882,30 @@ fn make_spawn_fn(
                         .container
                         .as_ref()
                         .map(bridge_acp::acp_backend::ContainerReap::production_controller);
-                    let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
+                    let sandbox_for_failure = entry.sandbox.clone();
+                    let spawned = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
                         &program,
                         &argv_ref,
                         acp,
                         observer,
                         controller,
                     )
-                    .await?
-                    .with_policy(policy);
+                    .await;
+                    let mut be = match spawned {
+                        Ok(backend) => backend.with_policy(policy),
+                        Err(error) => {
+                            let classified = match sandbox_for_failure {
+                                Some(sandbox) => {
+                                    bridge_core::sandbox::classify_container_spawn_failure(
+                                        sandbox, error,
+                                    )
+                                    .await
+                                }
+                                None => error,
+                            };
+                            return Err(classified);
+                        }
+                    };
                     if let Some(reg) = permission_registry.clone() {
                         be = be
                             .with_permission_registry(reg)
@@ -5993,6 +6034,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
         TopSubcommand::Doctor => return doctor::doctor_cmd(&raw_args[2..]),
         TopSubcommand::Smoke => return smoke::smoke_cmd(&raw_args[2..]).await,
+        TopSubcommand::FallbackPlan => return fallback_plan::fallback_plan_cmd(&raw_args[2..]),
         TopSubcommand::Help => {
             println!("{TOP_USAGE}");
             return Ok(());
@@ -6003,7 +6045,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | smoke | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | smoke | fallback-plan | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }
@@ -6979,6 +7021,133 @@ mod cli_tests {
         }
     }
 
+    #[test]
+    fn acp_spawn_inputs_constructs_only_unique_typed_container_failures() {
+        use bridge_core::diagnostics::{DiagnosticFailureClass, FailureDisposition};
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("repo");
+        std::fs::create_dir(&mount).unwrap();
+        let credential = temp.path().join("auth.json");
+        std::fs::write(&credential, "{}").unwrap();
+        let runtime = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let healthy = SandboxConfig {
+            runtime: Some(runtime),
+            image: "reader:fixed".into(),
+            mount: mount.to_string_lossy().into_owned(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![format!(
+                "{}:/root/.codex/auth.json:ro",
+                credential.display()
+            )],
+        };
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "typed-container-preflight".into(),
+            host: "host".into(),
+            lease: "/lease".into(),
+            start: "0".into(),
+        };
+
+        let mut healthy_entry = acp_entry("reader");
+        healthy_entry.sandbox = Some(healthy.clone());
+        assert!(
+            acp_spawn_inputs(
+                &healthy_entry,
+                mount.clone(),
+                temp.path().join("a2a-bridge.toml").as_path(),
+                &run,
+            )
+            .is_ok(),
+            "complete healthy typed evidence should permit composition"
+        );
+
+        let mut cases = Vec::new();
+        let mut sandbox = healthy.clone();
+        sandbox.runtime = Some(
+            temp.path()
+                .join("missing-runtime")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        cases.push((DiagnosticFailureClass::ContainerRuntime, sandbox));
+        let mut sandbox = healthy.clone();
+        sandbox.image.clear();
+        cases.push((DiagnosticFailureClass::ContainerImage, sandbox));
+        let mut sandbox = healthy.clone();
+        sandbox.egress = EgressPolicy::Locked {
+            network: String::new(),
+            proxy: "http://proxy.invalid".into(),
+            no_proxy: None,
+        };
+        cases.push((DiagnosticFailureClass::ContainerNetwork, sandbox));
+        let mut sandbox = healthy.clone();
+        sandbox.mount = temp
+            .path()
+            .join("missing-mount")
+            .to_string_lossy()
+            .into_owned();
+        cases.push((DiagnosticFailureClass::ContainerMount, sandbox));
+        let mut sandbox = healthy.clone();
+        sandbox.volumes = vec![format!(
+            "{}:/root/.codex/auth.json:ro",
+            temp.path().join("missing-auth.json").display()
+        )];
+        cases.push((DiagnosticFailureClass::ContainerCredentials, sandbox));
+
+        for (expected, sandbox) in cases {
+            let mut entry = acp_entry("reader");
+            entry.sandbox = Some(sandbox);
+            let error = match acp_spawn_inputs(
+                &entry,
+                mount.clone(),
+                temp.path().join("a2a-bridge.toml").as_path(),
+                &run,
+            ) {
+                Ok(_) => panic!("{expected:?} evidence unexpectedly composed"),
+                Err(error) => error,
+            };
+            let BridgeError::AgentFailure { diagnostic } = error else {
+                panic!("{expected:?} evidence returned an unstructured error");
+            };
+            assert_eq!(diagnostic.class(), expected);
+            assert_eq!(
+                diagnostic.disposition(),
+                FailureDisposition::ContainerFallbackCandidate
+            );
+            assert!(!diagnostic.prompt_may_have_been_accepted());
+        }
+
+        let mut ambiguous = healthy;
+        ambiguous.runtime = Some(
+            temp.path()
+                .join("missing-runtime")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        ambiguous.image.clear();
+        let mut entry = acp_entry("reader");
+        entry.sandbox = Some(ambiguous);
+        let error = match acp_spawn_inputs(
+            &entry,
+            mount,
+            temp.path().join("a2a-bridge.toml").as_path(),
+            &run,
+        ) {
+            Ok(_) => panic!("contradictory evidence unexpectedly composed"),
+            Err(error) => error,
+        };
+        let BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("contradictory evidence returned an unstructured error");
+        };
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Unknown);
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+    }
+
     fn acp_entry(id: &str) -> AgentEntry {
         use bridge_core::ids::AgentId;
         use std::collections::BTreeMap;
@@ -7001,6 +7170,7 @@ mod cli_tests {
             mcp_delivery: Default::default(),
             auth_method: None,
             pre_authenticated: false,
+            host_fallback_eligible: false,
             name: None,
             description: None,
             tags: vec![],
@@ -7264,6 +7434,21 @@ mod cli_tests {
             let sub = parse_top_subcommand(&args);
             assert_eq!(sub, TopSubcommand::Smoke);
             assert_eq!(dispatcher_help(&sub, &args), Some(SMOKE_USAGE));
+        }
+    }
+
+    #[test]
+    fn dispatcher_help_covers_fallback_plan_before_any_file_read() {
+        assert!(fallback_plan::USAGE.starts_with("usage: a2a-bridge fallback-plan"));
+        for help in ["--help", "-h"] {
+            let args = vec![
+                "a2a-bridge".to_string(),
+                "fallback-plan".to_string(),
+                help.to_string(),
+            ];
+            let sub = parse_top_subcommand(&args);
+            assert_eq!(sub, TopSubcommand::FallbackPlan);
+            assert_eq!(dispatcher_help(&sub, &args), Some(fallback_plan::USAGE));
         }
     }
 

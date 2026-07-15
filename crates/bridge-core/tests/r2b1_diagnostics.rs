@@ -548,6 +548,8 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
         api_lifecycle_constructor_count: usize,
         in_container_reap_failure: bool,
         container_reap_constructor_count: usize,
+        in_container_infrastructure_failure: bool,
+        container_infrastructure_constructor_count: usize,
     }
 
     impl<'ast> Visit<'ast> for ConstructorVisitor<'_> {
@@ -624,8 +626,13 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
             self.in_container_reap_failure =
                 self.path.ends_with("crates/bridge-container/src/lib.rs")
                     && node.sig.ident == "container_reap_failure_error";
+            let was_in_container_infrastructure_failure = self.in_container_infrastructure_failure;
+            self.in_container_infrastructure_failure =
+                self.path.ends_with("crates/bridge-core/src/sandbox.rs")
+                    && node.sig.ident == "container_infrastructure_failure_error";
             syn::visit::visit_item_fn(self, node);
             self.in_container_reap_failure = was_in_container_reap_failure;
+            self.in_container_infrastructure_failure = was_in_container_infrastructure_failure;
         }
 
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
@@ -681,6 +688,8 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
                     self.api_lifecycle_constructor_count += 1;
                 } else if self.in_container_reap_failure && exact_path {
                     self.container_reap_constructor_count += 1;
+                } else if self.in_container_infrastructure_failure && exact_path {
+                    self.container_infrastructure_constructor_count += 1;
                 } else {
                     self.violations.push(format!(
                         "{}: BridgeError::agent_failure outside an audited lifecycle builder",
@@ -722,6 +731,8 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
             api_lifecycle_constructor_count: 0,
             in_container_reap_failure: false,
             container_reap_constructor_count: 0,
+            in_container_infrastructure_failure: false,
+            container_infrastructure_constructor_count: 0,
         };
         visitor.visit_file(&file);
         if path.ends_with("crates/bridge-core/src/error.rs")
@@ -758,6 +769,15 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
                 "{}: container_reap_failure_error contains {} agent_failure calls, expected 1",
                 path.display(),
                 visitor.container_reap_constructor_count
+            ));
+        }
+        if path.ends_with("crates/bridge-core/src/sandbox.rs")
+            && visitor.container_infrastructure_constructor_count != 1
+        {
+            visitor.violations.push(format!(
+                "{}: container_infrastructure_failure_error contains {} agent_failure calls, expected 1",
+                path.display(),
+                visitor.container_infrastructure_constructor_count
             ));
         }
         visitor.violations

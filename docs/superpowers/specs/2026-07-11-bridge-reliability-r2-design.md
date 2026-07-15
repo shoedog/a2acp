@@ -1,7 +1,7 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v14)
 
-- **Status:** R2a and R2b0–R2b3 merged; R2c is **APPROVED / PENDING MERGE** on
-  `agent/reliability-r2c-live-smoke`; v14 is the design of record for R2b–R2c
+- **Status:** R2a, R2b0–R2b3, and R2c merged; R2d is **IN REVIEW** on
+  `agent/reliability-r2d-fallback-plan`; v14 is the design of record for R2b–R2e
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
   and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,
@@ -37,6 +37,7 @@
 - **R2b2 merge head:** `0627e91144e79d9328ed9b5635033cf410c9e96e`
 - **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
 - **R2b3 merge head:** `afcc856c3276fe682fb78dc657591021f5e604fc`
+- **R2c merge head:** `be54bc51bf1d54df028d44f0cbd8dfdf45f779d7` (PR #28)
 - **Program:** [`docs/bridge-reliability.md`](../../bridge-reliability.md), R2
 - **Security boundary:** [`ADR-0032`](../../adr/0032-sandbox-tier-model.md)
 

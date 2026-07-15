@@ -41,7 +41,7 @@ use crate::{
     ExamplesPolicy, RunEndGuard, ValidationScope, SMOKE_USAGE,
 };
 
-const FIXED_PROMPT: &str = "Reply exactly PONG. Do not use tools.";
+pub(crate) const FIXED_PROMPT: &str = "Reply exactly PONG. Do not use tools.";
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 900;
 const CLEANUP_TIMEOUT_SECS: u64 = 10;
@@ -915,7 +915,7 @@ fn smoke_usage(value: UsageSnapshot) -> SmokeUsage {
     }
 }
 
-fn execution_mode(entry: &bridge_core::domain::AgentEntry) -> &'static str {
+pub(crate) fn execution_mode(entry: &bridge_core::domain::AgentEntry) -> &'static str {
     match entry.kind {
         AgentKind::Api => "remote_api",
         AgentKind::ContainerRw => "container_rw",
@@ -2013,6 +2013,7 @@ mod tests {
             mcp_delivery: Default::default(),
             auth_method: None,
             pre_authenticated: false,
+            host_fallback_eligible: false,
             name: None,
             description: None,
             tags: Vec::new(),

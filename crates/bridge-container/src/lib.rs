@@ -30,6 +30,22 @@ use tokio::sync::Mutex;
 /// (and applies the system `PolicyEngine` to the inner backend — see `main.rs`'s `AcpContainerSpawn`).
 #[async_trait]
 pub trait ContainerSpawn: Send + Sync {
+    /// Production validates composition-owned host/runtime evidence before a generation is published.
+    /// Test seams default to healthy so Docker-free behavior tests do not depend on host tooling.
+    fn validate_infrastructure(&self, _sandbox: &SandboxConfig) -> Result<(), BridgeError> {
+        Ok(())
+    }
+
+    /// Production may replace one pre-prompt opaque launch error with uniquely typed, bounded,
+    /// read-only infrastructure evidence. Test seams preserve their original error by default.
+    async fn classify_spawn_failure(
+        &self,
+        _sandbox: SandboxConfig,
+        error: BridgeError,
+    ) -> BridgeError {
+        error
+    }
+
     async fn spawn(
         &self,
         program: &str,
@@ -300,6 +316,7 @@ impl InflightState {
 
 struct PreparedInner {
     owner: ReapOwner,
+    sandbox: SandboxConfig,
     program: String,
     argv: Vec<String>,
     acp: AcpConfig,
@@ -448,6 +465,12 @@ impl ContainerRwBackend {
             reason: "missing session cwd".into(),
         })?;
         let rw_canon = self.resolve_rw_target(&cwd)?;
+        let preflight_sandbox = SandboxConfig {
+            mount: rw_canon.as_str().to_owned(),
+            access: bridge_core::domain::MountAccess::Rw,
+            ..self.cfg.sandbox.clone()
+        };
+        self.spawn.validate_infrastructure(&preflight_sandbox)?;
         let generation = self.turn_seq.fetch_add(1, Ordering::Relaxed);
         // Increment A: the run-id segment defeats same-owner concurrent name clashes; the label set is
         // built PER MINT so `kind` (warm|perturn) is never stale and `repo`/`cwd` reflect this :rw target.
@@ -532,6 +555,7 @@ impl ContainerRwBackend {
         };
         Ok(PreparedInner {
             owner,
+            sandbox: preflight_sandbox,
             program,
             argv,
             acp,
@@ -600,6 +624,7 @@ impl ContainerRwBackend {
     ) -> Result<WarmInner, BridgeError> {
         let PreparedInner {
             owner,
+            sandbox,
             program,
             argv,
             acp,
@@ -623,7 +648,7 @@ impl ContainerRwBackend {
             Ok(i) => i,
             Err(e) => {
                 owner.reap_detached();
-                return Err(e);
+                return Err(self.spawn.classify_spawn_failure(sandbox, e).await);
             }
         };
         // The inner prefers the stashed SessionSpec.cwd over AcpConfig.cwd → configure with CANONICAL cwd.
@@ -1644,6 +1669,61 @@ mod tests {
         turn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
+
+    #[derive(Default)]
+    struct RejectingPreflightSpawn {
+        spawn_count: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct ClassifyingFailureSpawn {
+        spawn_count: AtomicUsize,
+        classify_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContainerSpawn for RejectingPreflightSpawn {
+        fn validate_infrastructure(&self, sandbox: &SandboxConfig) -> Result<(), BridgeError> {
+            let mut invalid = sandbox.clone();
+            invalid.image.clear();
+            bridge_core::sandbox::validate_container_infrastructure(&invalid)
+        }
+
+        async fn spawn(
+            &self,
+            _program: &str,
+            _argv: &[String],
+            _cfg: AcpConfig,
+        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+            self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            Err(BridgeError::InvalidStateTransition)
+        }
+    }
+
+    #[async_trait]
+    impl ContainerSpawn for ClassifyingFailureSpawn {
+        async fn classify_spawn_failure(
+            &self,
+            _sandbox: SandboxConfig,
+            _error: BridgeError,
+        ) -> BridgeError {
+            self.classify_count.fetch_add(1, Ordering::SeqCst);
+            BridgeError::ConfigInvalid {
+                reason: "post-failure classifier invoked".into(),
+            }
+        }
+
+        async fn spawn(
+            &self,
+            _program: &str,
+            _argv: &[String],
+            _cfg: AcpConfig,
+        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+            self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            Err(BridgeError::agent_crashed("opaque launch failure"))
+        }
+    }
+
     impl CountingSpawn {
         fn new(fail: bool) -> Arc<Self> {
             Self::with_optional_gates(fail, None, None, None, None, None)
@@ -1739,7 +1819,9 @@ mod tests {
                 release.notified().await;
             }
             if self.fail {
-                return Err(BridgeError::agent_crashed("boom"));
+                return Err(BridgeError::agent_crashed(
+                    "boom docker image network mount credential",
+                ));
             }
             if let Some(resource_exists) = &self.resource_exists {
                 resource_exists.store(true, Ordering::SeqCst);
@@ -2194,7 +2276,12 @@ mod tests {
         be.configure_turn(&s, turn_meta("ctx-spawn-fail", 1, "turn-spawn-fail"))
             .await;
         let err = prompt_err(&be, &s).await;
-        assert!(format!("{err:?}").contains("boom"), "got {err:?}");
+        let BridgeError::AgentCrashed { reason } = &err else {
+            panic!("inner process prose must remain an agent-process error: {err:?}");
+        };
+        for keyword in ["docker", "image", "network", "mount", "credential"] {
+            assert!(reason.contains(keyword));
+        }
         wait_for_reaps(&reaps, 1).await;
         assert_eq!(reaps.load(Ordering::SeqCst), 1, "spawn failure MUST reap");
         assert!(be.inflight.lock().await.is_empty(), "reservation removed");
@@ -2202,6 +2289,63 @@ mod tests {
             !be.pending_turn_meta.lock().await.contains_key(&s),
             "open_inner failure consumed pending turn metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn typed_preflight_failure_stops_before_generation_or_spawn() {
+        use bridge_core::diagnostics::{DiagnosticFailureClass, FailureDisposition};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = Arc::new(RejectingPreflightSpawn::default());
+        let (reap, reaps) = counting_reap();
+        let be = backend(root, spawn.clone(), reap).await;
+        let session = SessionId::parse("typed-preflight").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+
+        let error = prompt_err(&be, &session).await;
+        let BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("typed preflight should return a structured failure");
+        };
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::ContainerImage);
+        assert_eq!(
+            diagnostic.disposition(),
+            FailureDisposition::ContainerFallbackCandidate
+        );
+        assert!(!diagnostic.prompt_may_have_been_accepted());
+        assert_eq!(spawn.spawn_count.load(Ordering::SeqCst), 0);
+        assert_eq!(reaps.load(Ordering::SeqCst), 0);
+        assert!(be.inflight.lock().await.is_empty());
+        assert!(be
+            .session_reaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_failure_is_classified_before_return_and_still_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = Arc::new(ClassifyingFailureSpawn::default());
+        let (reap, reaps) = counting_reap();
+        let be = backend(root, spawn.clone(), reap).await;
+        let session = SessionId::parse("post-failure-classify").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+
+        let error = prompt_err(&be, &session).await;
+        let BridgeError::ConfigInvalid { reason } = error else {
+            panic!("post-failure classifier result was not returned");
+        };
+        assert_eq!(reason, "post-failure classifier invoked");
+        assert_eq!(spawn.spawn_count.load(Ordering::SeqCst), 1);
+        assert_eq!(spawn.classify_count.load(Ordering::SeqCst), 1);
+        wait_for_reaps(&reaps, 1).await;
+        assert!(be.inflight.lock().await.is_empty());
     }
 
     #[tokio::test]

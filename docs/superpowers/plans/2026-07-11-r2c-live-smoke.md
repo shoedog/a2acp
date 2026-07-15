@@ -1,6 +1,6 @@
 # R2c — Explicit bounded live smoke implementation plan
 
-- **Status:** APPROVED / PENDING MERGE
+- **Status:** MERGED at `be54bc51` by PR #28 on 2026-07-15
 - **Prerequisite:** all R2b sub-slices merged
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)

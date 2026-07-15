@@ -554,6 +554,10 @@ pub struct AgentEntryToml {
     /// so the bridge must not invoke an interactive ACP auth method.
     #[serde(default)]
     pub pre_authenticated: bool,
+    /// Target capability for the local R2d fallback planner. This does not assert content trust or
+    /// authorize execution; absent/default false keeps existing entries ineligible.
+    #[serde(default)]
+    pub host_fallback_eligible: bool,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -1487,6 +1491,12 @@ impl RegistryConfig {
                     id.as_str()
                 )));
             }
+            if a.host_fallback_eligible && (!matches!(kind, AgentKind::Acp) || sandbox.is_some()) {
+                return Err(ConfigError::Registry(format!(
+                    "agent {:?}: host_fallback_eligible=true requires an unsandboxed kind=acp target",
+                    id.as_str()
+                )));
+            }
             let watchdog = match &a.watchdog {
                 None => None,
                 Some(wd) => {
@@ -1539,6 +1549,7 @@ impl RegistryConfig {
                 mcp_delivery,
                 auth_method: a.auth_method,
                 pre_authenticated: a.pre_authenticated,
+                host_fallback_eligible: a.host_fallback_eligible,
                 name: a.name,
                 description: a.description,
                 tags: a.tags,
@@ -2117,6 +2128,114 @@ pre_authenticated = true
                 && err.to_string().contains("ACP process agents"),
             "invalid API auth policy should be explicit: {err}"
         );
+    }
+
+    #[test]
+    fn host_fallback_eligibility_defaults_false_and_accepts_only_unsandboxed_acp() {
+        let default_snapshot = RegistryConfig::parse(
+            r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[server]
+"#,
+        )
+        .unwrap()
+        .into_snapshot()
+        .unwrap();
+        assert!(!default_snapshot.entries[0].host_fallback_eligible);
+
+        let eligible_snapshot = RegistryConfig::parse(
+            r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+host_fallback_eligible = true
+
+[server]
+"#,
+        )
+        .unwrap()
+        .into_snapshot()
+        .unwrap();
+        assert!(eligible_snapshot.entries[0].host_fallback_eligible);
+    }
+
+    #[test]
+    fn host_fallback_eligibility_rejects_non_host_read_only_targets() {
+        let invalid = [
+            (
+                "api",
+                r#"
+default = "target"
+
+[[agents]]
+id = "target"
+kind = "api"
+base_url = "http://localhost:11434/v1"
+host_fallback_eligible = true
+
+[server]
+"#,
+            ),
+            (
+                "sandboxed acp",
+                r#"
+default = "target"
+allowed_cwd_root = "/repo"
+
+[[agents]]
+id = "target"
+cmd = "codex-acp"
+host_fallback_eligible = true
+
+[agents.sandbox]
+image = "reader:latest"
+mount = "/repo"
+access = "ro"
+egress = "open"
+
+[server]
+"#,
+            ),
+            (
+                "container_rw",
+                r#"
+default = "target"
+allowed_cwd_root = "/repo"
+
+[[agents]]
+id = "target"
+kind = "container_rw"
+cmd = "codex-acp"
+host_fallback_eligible = true
+
+[agents.sandbox]
+image = "writer:latest"
+mount = "/repo"
+access = "rw"
+egress = "open"
+
+[server]
+"#,
+            ),
+        ];
+
+        for (case, toml) in invalid {
+            let error = RegistryConfig::parse(toml)
+                .unwrap()
+                .into_snapshot()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("host_fallback_eligible"),
+                "{case} rejection should name the invalid capability: {error}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

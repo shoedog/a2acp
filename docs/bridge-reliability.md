@@ -150,21 +150,15 @@ Exit: a release cannot claim an agent path that was not tested from its distribu
 
 ## Immediate queue
 
-1. Finish, independently review, and merge R2b3's API/provider/container portion of the reviewed R2b
-   phase/diagnostic contract, including post-acceptance no-replay mappings and joinable cleanup. Use the
-   [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md).
-2. Add the separate explicitly billable R2c live-smoke command from the
-   [R2c plan](superpowers/plans/2026-07-11-r2c-live-smoke.md).
-3. Implement R2d's local non-billable fallback-plan only from the
+1. Finish the full gates and security review for R2d's local non-billable fallback-plan from the
    [R2d plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md); keep authenticated in-process
    [R2e](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) deferred.
-4. Preserve adapter stderr and the deepest prompt error in the task journal.
-5. Make provider-limit failures explicit and keep the Fable-xhigh → Sol-xhigh full-review fallback an
-   operator-selected, separately recorded attempt.
-6. Establish the pinned/floating compatibility lanes in the
+2. Establish the pinned/floating compatibility lanes in the
    [R3 plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md).
-7. Make the reader image reproducible and the compatibility matrix a release gate through the
+3. Make the reader image reproducible and the compatibility matrix a release gate through the
    [R4 plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md).
+4. Keep provider/model fallback operator-selected and separately recorded; it never enters the
+   container-degradation eligibility gate.
 
 ## Guardrails
 

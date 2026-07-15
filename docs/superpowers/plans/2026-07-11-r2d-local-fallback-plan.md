@@ -1,7 +1,7 @@
 # R2d — Local non-billable fallback-plan implementation plan
 
-- **Status:** NOT STARTED
-- **Prerequisites:** R2b and R2c merged
+- **Status:** IN REVIEW — implementation and full deterministic gates complete; security review pending
+- **Prerequisites:** R2b and R2c merged (`be54bc51`, PR #28)
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -22,6 +22,25 @@ a2a-bridge fallback-plan --from <failed-smoke-or-task-artifact.json>
 
 The command is local, read-only, and non-billable. There is no server/A2A/workflow entry point for plan
 generation.
+
+## Implementation checkpoint — 2026-07-15
+
+- D1 is implemented with a serde-default-false `host_fallback_eligible` capability. Snapshot validation
+  accepts it only on unsandboxed `kind=acp` entries.
+- D2 performs composition-owned static executable/mount/credential checks before spawn. After a
+  pre-prompt launch failure, production direct-ACP and `container_rw` owners may run bounded read-only
+  `info`, `image inspect`, and locked `network inspect` probes in a dedicated process group. A unique
+  typed failure is promoted; healthy evidence preserves the inner error; conflicting/unavailable
+  evidence is `unknown`/fatal. Ordinary MCP/cache/data volumes remain `container_mount`; only the closed
+  supported auth destinations are credential evidence.
+- D3–D5 are implemented in `fallback_plan.rs`: one-mebibyte file/config bounds, exact schema/version and
+  replay checks, current-config source/target validation, local trust flag, stable reasons, structured
+  argv, and POSIX-safe shell rendering. An ineligible plan contains no rerun object.
+- Focused gates pass fallback-plan CLI **12 / 0**, planner/help unit **2 / 0**, the typed
+  preflight/probe/reap cases, inner-text non-promotion, and descendant cleanup. The full workspace passes
+  **1,957 / 0 / 12 ignored** across 69 test/doc-test executables. Format/diff, workspace check,
+  warnings-denied all-target Clippy, release binary build, and repository hygiene **37/7** are clean. The
+  required Sol/xhigh ADR-0032 review remains pending.
 
 ## Implementation sequence
 
@@ -57,6 +76,42 @@ agent crash whose stderr contains every container keyword.
 - Reject missing/malformed/oversized artifacts, legacy `AgentCrashed`, missing replay evidence, unknown
   agents, and diagnostics whose integrity/required fields cannot be established.
 - Parse under explicit file/JSON size bounds; never follow an artifact-provided config path or command.
+
+#### Supported task-diagnostic import schema
+
+`task get` does not export diagnostic journal rows. R2d therefore does not treat ordinary A2A task JSON
+as a diagnostic artifact. The supported local import is this explicit versioned envelope, assembled from
+already persisted task evidence; it contains no executable command or config authority:
+
+```json
+{
+  "artifact_type": "task_diagnostic",
+  "schema_version": 1,
+  "task_id": "task-id",
+  "attempt_id": "attempt-id",
+  "agent": "configured-container-agent",
+  "execution_mode": "container_ro",
+  "prompt_may_have_been_accepted": false,
+  "session_cwd": "/absolute/trusted/repo",
+  "diagnostic": {
+    "schema_version": 1,
+    "failed_phase": "spawn",
+    "class": "container_runtime",
+    "disposition": "container_fallback_candidate",
+    "code": "container.runtime.preflight",
+    "summary": "Container runtime preflight failed",
+    "causes": [],
+    "stderr_observed": false,
+    "stderr_line_count": 0,
+    "prompt_may_have_been_accepted": false
+  }
+}
+```
+
+The nested diagnostic is the complete validated `FailureDiagnosticV1` object. Missing required fields
+reject. `container_rw`, an unknown/currently mismatched source agent, a non-spawn container class, or a
+replay-barrier mismatch is ineligible. The planner never accepts a command or config path from this
+envelope.
 
 ### D4 — closed eligibility matrix
 
