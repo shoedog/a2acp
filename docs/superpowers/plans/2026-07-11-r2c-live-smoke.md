@@ -33,9 +33,12 @@ defect keeps the overall gate open. No replay has run.
 - The create-new artifact fold passes smoke unit **19 / 0 / 0 ignored**, smoke CLI **11 / 0 / 0 ignored**,
   full host-serial workspace **1,933 / 0 / 12 ignored** across 68 executables, workspace/all-target check,
   warnings-denied Clippy, release build, format/diff checks, and repository hygiene **37/7**.
-- Still pending: fresh review for the create-new follow-up, new explicit operator authorization for a
-  fixed-candidate lane, that artifact-exact smoke, and final status/evidence review. This checkpoint is not
-  completion evidence.
+- Targeted bridge-dogfooded Fable/xhigh closure review returned `APPROVE` on `ffb7e891`: all three inherited
+  inode-reuse/link/metadata items were fixed. Its sole new `SMELL/MINOR` requires an operator to ignore the
+  documented `0700` mktemp directory and supply a symlinked parent; the fresh artifact remains `0600`, and
+  no overwrite, disclosure, or prompt-gating contract is violated. It is non-blocking follow-up risk.
+- Still pending: new explicit operator authorization for a fixed-candidate lane, that artifact-exact smoke,
+  and final status/evidence review. This checkpoint is not completion evidence.
 
 ### Review fold 1 — 2026-07-15
 
@@ -75,7 +78,8 @@ semantics: existing regular files, symlinks, and hard links are refused without 
 This also makes config-metadata comparison failure non-destructive because no existing inode is opened.
 The pre-existing-file regression fails on `ce605eaf` independently of umask, the link regression preserves
 both victim files, and the new-file CLI case asserts `0600`. The follow-up passes the complete deterministic
-gate set recorded above and awaits fresh review.
+gate set recorded above. Targeted Fable/xhigh closure review returned `APPROVE` on `ffb7e891`; its one
+runbook-mitigated symlinked-parent SMELL does not reopen the gate.
 
 R2c turns R2b's diagnostic record into one deliberate end-to-end operator probe. It is the first R2
 slice that is intentionally billable. It is not a generic prompt command, workflow runner, retry
