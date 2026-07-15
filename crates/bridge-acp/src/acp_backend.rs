@@ -4554,6 +4554,13 @@ impl AgentBackend for AcpBackend {
 
     async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
         let container = self.container_reap.clone();
+        // Transfer cleanup to the process-owned controller before the first
+        // async lifecycle snapshot. Canceling this checked waiter while the
+        // session map is contended cannot suppress container removal.
+        if let Some(container) = &container {
+            self.reaped.store(true, Ordering::SeqCst);
+            container.reap_detached();
+        }
         let lifecycle = if container.is_some() {
             Some(
                 self.operation_lifecycle(
@@ -4565,10 +4572,6 @@ impl AgentBackend for AcpBackend {
         } else {
             None
         };
-        if let Some(container) = &container {
-            self.reaped.store(true, Ordering::SeqCst);
-            container.reap_detached();
-        }
         if let Some(lifecycle) = &lifecycle {
             lifecycle
                 .record(
@@ -4614,17 +4617,17 @@ impl AgentBackend for AcpBackend {
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<(), BridgeError> {
-        let lifecycle = self.operation_lifecycle(session, observer).await;
         let container = self.container_reap.clone();
 
         // A `:ro` release owns process cleanup, not just the ACP session map.
-        // Select/start the observer-free flight before the first cancellable
-        // diagnostic write. If that write is rejected, cleanup still runs and
-        // this waiter returns only after the shared reap has settled.
+        // Select/start the observer-free flight before even the async lifecycle
+        // snapshot, then before the first cancellable diagnostic write. If the
+        // waiter or write is canceled/rejected, cleanup still runs.
         if let Some(container) = &container {
             self.reaped.store(true, Ordering::SeqCst);
             container.reap_detached();
         }
+        let lifecycle = self.operation_lifecycle(session, observer).await;
 
         let start_result = lifecycle
             .record(
@@ -11974,6 +11977,83 @@ mod tests {
         release.notify_one();
         task.await.unwrap().unwrap();
         assert_eq!(controller.result(), Some(Ok(())));
+    }
+
+    #[tokio::test]
+    async fn canceled_checked_ro_release_cannot_suppress_reap_before_lifecycle_snapshot() {
+        let entered = Arc::new(Notify::new());
+        let attempt: ReapAttemptFn = {
+            let entered = Arc::clone(&entered);
+            Arc::new(move |_runtime, _name| {
+                let entered = Arc::clone(&entered);
+                Box::pin(async move {
+                    entered.notify_one();
+                    Ok(())
+                })
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-ro-checked-cancel-safe", attempt);
+        let mut backend = connect_recording_with(
+            Recorder::new("agent-sess-RO-CHECKED-CANCEL-SAFE"),
+            test_config(),
+        )
+        .await;
+        backend.container_reap = Some(controller.clone());
+        let backend = Arc::new(backend);
+        let session = bkey("bridge-RO-CHECKED-CANCEL-SAFE");
+
+        let sessions_guard = backend.sessions.lock().await;
+        let release = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.release_session_checked(&session).await })
+        };
+        tokio::time::timeout(Duration::from_millis(100), entered.notified())
+            .await
+            .expect("checked :ro release must start cleanup before its lifecycle snapshot await");
+        release.abort();
+        assert!(release.await.unwrap_err().is_cancelled());
+        assert_eq!(controller.reap_observed().await, Ok(()));
+        drop(sessions_guard);
+    }
+
+    #[tokio::test]
+    async fn canceled_observed_ro_release_cannot_suppress_reap_before_lifecycle_snapshot() {
+        let entered = Arc::new(Notify::new());
+        let attempt: ReapAttemptFn = {
+            let entered = Arc::clone(&entered);
+            Arc::new(move |_runtime, _name| {
+                let entered = Arc::clone(&entered);
+                Box::pin(async move {
+                    entered.notify_one();
+                    Ok(())
+                })
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-ro-observed-cancel-safe", attempt);
+        let mut backend = connect_recording_with(
+            Recorder::new("agent-sess-RO-OBSERVED-CANCEL-SAFE"),
+            test_config(),
+        )
+        .await;
+        backend.container_reap = Some(controller.clone());
+        let backend = Arc::new(backend);
+        let session = bkey("bridge-RO-OBSERVED-CANCEL-SAFE");
+
+        let sessions_guard = backend.sessions.lock().await;
+        let release = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+            tokio::spawn(async move { backend.release_session_observed(&session, observer).await })
+        };
+        tokio::time::timeout(Duration::from_millis(100), entered.notified())
+            .await
+            .expect("observed :ro release must start cleanup before its lifecycle snapshot await");
+        release.abort();
+        assert!(release.await.unwrap_err().is_cancelled());
+        assert_eq!(controller.reap_observed().await, Ok(()));
+        drop(sessions_guard);
     }
 
     #[tokio::test]

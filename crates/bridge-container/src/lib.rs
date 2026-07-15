@@ -185,6 +185,11 @@ pub struct ContainerRwConfig {
 struct ReapOwner {
     generation: u64,
     reap: ReapController,
+    /// Linearizes the final inner prompt installation against cancel, release,
+    /// and retirement for this exact container generation. The prompt holds it
+    /// only until `inner.prompt*` returns its stream; teardown starts the
+    /// process-owned reaper first, then joins this gate before returning.
+    dispatch_gate: Arc<Mutex<()>>,
 }
 
 struct InflightTurn {
@@ -385,7 +390,11 @@ impl ContainerRwBackend {
             &generation.to_string(),
         );
         let reap = (self.reap_factory)(runtime.clone(), name.clone());
-        let owner = ReapOwner { generation, reap };
+        let owner = ReapOwner {
+            generation,
+            reap,
+            dispatch_gate: Arc::new(Mutex::new(())),
+        };
         let kind = if self.is_warm() { "warm" } else { "perturn" };
         let repo = rw_canon.as_str();
         let labels = self
@@ -709,8 +718,15 @@ impl ContainerRwBackend {
         if let Some(meta) = meta {
             inner.configure_turn(session, meta).await;
         }
-        let still_active = self.turn_active.lock().await.get(session) == Some(&epoch);
+        // This exact generation owns dispatch until the inner backend has
+        // installed its prompt and returned the stream. Teardown that starts
+        // after this lock acquisition waits here; teardown that wins first
+        // clears admission, so the recheck below fails before inner dispatch.
+        let dispatch = owner.dispatch_gate.lock().await;
+        let still_active = !self.retired.load(Ordering::SeqCst)
+            && self.turn_active.lock().await.get(session) == Some(&epoch);
         if !still_active {
+            drop(dispatch);
             if cache_miss {
                 let mut warm = self.warm.lock().await;
                 if warm.get(session).map(|wi| wi.owner.generation) == Some(owner.generation) {
@@ -726,6 +742,7 @@ impl ContainerRwBackend {
             Some(observers) => inner.prompt_with_observers(session, parts, observers).await,
             None => inner.prompt(session, parts).await,
         };
+        drop(dispatch);
         let inner_stream = match prompt_result {
             Ok(s) => s,
             Err(e) => {
@@ -752,39 +769,48 @@ impl ContainerRwBackend {
     /// Warm cancel: cancel the cached inner's current turn + clear `turn_active`. Does NOT reap (the warm
     /// container survives for the next turn; `retire` owns reaping).
     async fn cancel_warm(&self, session: &SessionId) -> Result<(), BridgeError> {
-        let reserved = {
-            let mut inflight = self.inflight.lock().await;
+        let candidate = {
+            let inflight = self.inflight.lock().await;
             match inflight.get(session) {
-                Some(InflightState::Reserving(_)) => inflight.remove(session),
-                _ => None,
+                Some(InflightState::Reserving(owner)) => Some((owner.clone(), true)),
+                _ => self
+                    .warm
+                    .lock()
+                    .await
+                    .get(session)
+                    .map(|warm| (warm.owner.clone(), false)),
             }
         };
-        if let Some(InflightState::Reserving(owner)) = reserved {
+        let Some((owner, was_reserving)) = candidate else {
+            self.turn_active.lock().await.remove(session);
+            return Ok(());
+        };
+        if was_reserving {
             owner.reap.reap_detached();
         }
-        let inner = self
-            .warm
-            .lock()
-            .await
-            .get(session)
-            .map(|wi| wi.inner.clone());
-        if let Some(inner) = inner {
-            let _ = inner.cancel(session).await;
+        let _dispatch = owner.dispatch_gate.lock().await;
+        let mut inner = None;
+        {
+            let mut inflight = self.inflight.lock().await;
+            if inflight.get(session).map(InflightState::generation) == Some(owner.generation) {
+                if let Some(InflightState::Live(turn)) = inflight.remove(session) {
+                    inner = Some(turn.inner);
+                }
+            }
+            let mut warm = self.warm.lock().await;
+            if warm.get(session).map(|warm| warm.owner.generation) == Some(owner.generation) {
+                if was_reserving {
+                    if let Some(warm) = warm.remove(session) {
+                        inner = Some(warm.inner);
+                    }
+                } else {
+                    inner = warm.get(session).map(|warm| Arc::clone(&warm.inner));
+                }
+            }
         }
         self.turn_active.lock().await.remove(session);
-        Ok(())
-    }
-
-    /// Warm retire. Drain the cache; per entry: cancel the inner, reap once, and clear any stale
-    /// `turn_active` marker (a held/raced stream could leave one behind).
-    async fn retire_warm(&self) -> Result<(), BridgeError> {
-        let entries: Vec<(SessionId, WarmInner)> = { self.warm.lock().await.drain().collect() };
-        for (_, wi) in &entries {
-            wi.owner.reap.reap_detached();
-        }
-        for (s, wi) in entries {
-            let _ = wi.inner.cancel(&s).await;
-            self.turn_active.lock().await.remove(&s);
+        if let Some(inner) = inner {
+            let _ = inner.cancel(session).await;
         }
         Ok(())
     }
@@ -798,6 +824,11 @@ impl ContainerRwBackend {
             self.turn_active.lock().await.remove(session);
             return (None, None);
         };
+        // The controller owns cleanup before any async gate/map wait. Canceling
+        // this waiter can detach reporting, but cannot suppress container
+        // removal.
+        owner.reap.reap_detached();
+        let _dispatch = owner.dispatch_gate.lock().await;
         let mut inner = None;
         {
             // Same lock order as cache-miss publication and retirement.
@@ -814,8 +845,8 @@ impl ContainerRwBackend {
                 }
             }
         }
-        owner.reap.reap_detached();
         self.turn_active.lock().await.remove(session);
+        drop(_dispatch);
         (Some(owner), inner)
     }
 
@@ -827,6 +858,8 @@ impl ContainerRwBackend {
         let Some(owner) = owner else {
             return (None, None);
         };
+        owner.reap.reap_detached();
+        let _dispatch = owner.dispatch_gate.lock().await;
         let inner = {
             let mut inflight = self.inflight.lock().await;
             if inflight.get(session).map(InflightState::generation) == Some(owner.generation) {
@@ -838,7 +871,7 @@ impl ContainerRwBackend {
                 None
             }
         };
-        owner.reap.reap_detached();
+        drop(_dispatch);
         (Some(owner), inner)
     }
 
@@ -1037,14 +1070,20 @@ impl ContainerRwBackend {
         if let Some(meta) = meta {
             wi.inner.configure_turn(session, meta).await;
         }
+        // Match the warm path's generation gate: prompt installation and
+        // teardown have one exact linearization point instead of a check/call
+        // window.
+        let dispatch = wi.owner.dispatch_gate.lock().await;
         let still_owned = {
             let inflight = self.inflight.lock().await;
-            matches!(
-                inflight.get(session),
-                Some(InflightState::Live(turn)) if turn.owner.generation == generation
-            )
+            !self.retired.load(Ordering::SeqCst)
+                && matches!(
+                    inflight.get(session),
+                    Some(InflightState::Live(turn)) if turn.owner.generation == generation
+                )
         };
         if !still_owned {
+            drop(dispatch);
             wi.owner.reap.reap_detached();
             return Err(BridgeError::SessionExpired);
         }
@@ -1056,6 +1095,7 @@ impl ContainerRwBackend {
             }
             None => wi.inner.prompt(session, parts).await,
         };
+        drop(dispatch);
         let inner_stream = match prompt_result {
             Ok(s) => s,
             Err(e) => {
@@ -1117,13 +1157,22 @@ impl AgentBackend for ContainerRwBackend {
         if self.is_warm() {
             return self.cancel_warm(session).await;
         }
-        let state = {
-            let mut m = self.inflight.lock().await;
-            m.remove(session)
+        let owner = {
+            let inflight = self.inflight.lock().await;
+            inflight.get(session).map(|state| state.owner().clone())
         };
-        if let Some(state) = state {
-            state.owner().reap.reap_detached();
-            if let InflightState::Live(turn) = state {
+        if let Some(owner) = owner {
+            owner.reap.reap_detached();
+            let _dispatch = owner.dispatch_gate.lock().await;
+            let state = {
+                let mut inflight = self.inflight.lock().await;
+                if inflight.get(session).map(InflightState::generation) == Some(owner.generation) {
+                    inflight.remove(session)
+                } else {
+                    None
+                }
+            };
+            if let Some(InflightState::Live(turn)) = state {
                 let _ = turn.inner.cancel(session).await;
             }
         }
@@ -1218,21 +1267,44 @@ impl AgentBackend for ContainerRwBackend {
     }
 
     async fn retire(&self) -> Result<(), BridgeError> {
-        let states: Vec<(SessionId, InflightState)> = {
-            let mut m = self.inflight.lock().await;
+        // Seal admission and snapshot every retained generation under the same
+        // lock used by reservation. Start every process-owned reap before the
+        // first dispatch-gate await, then join each generation's gate before
+        // removing/canceling its inner backend.
+        let owners: Vec<(SessionId, ReapOwner)> = {
+            let _inflight = self.inflight.lock().await;
             self.retired.store(true, Ordering::SeqCst);
-            m.drain().collect()
+            self.session_reaps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(session, owner)| (session.clone(), owner.clone()))
+                .collect()
         };
-        for (_, state) in &states {
-            state.owner().reap.reap_detached();
+        for (_, owner) in &owners {
+            owner.reap.reap_detached();
         }
-        for (session, state) in states {
-            if let InflightState::Live(turn) = state {
-                let _ = turn.inner.cancel(&session).await;
+        for (session, owner) in owners {
+            let _dispatch = owner.dispatch_gate.lock().await;
+            let mut inner = None;
+            {
+                let mut inflight = self.inflight.lock().await;
+                if inflight.get(&session).map(InflightState::generation) == Some(owner.generation) {
+                    if let Some(InflightState::Live(turn)) = inflight.remove(&session) {
+                        inner = Some(turn.inner);
+                    }
+                }
+                let mut warm = self.warm.lock().await;
+                if warm.get(&session).map(|warm| warm.owner.generation) == Some(owner.generation) {
+                    if let Some(warm) = warm.remove(&session) {
+                        inner = Some(warm.inner);
+                    }
+                }
             }
-        }
-        if self.is_warm() {
-            self.retire_warm().await?;
+            self.turn_active.lock().await.remove(&session);
+            if let Some(inner) = inner {
+                let _ = inner.cancel(&session).await;
+            }
         }
         Ok(())
     }
@@ -1419,12 +1491,17 @@ mod tests {
         fail_prompt: AtomicBool,
         configured_turns: Mutex<Vec<(SessionId, TurnMeta)>>,
         call_order: Mutex<Vec<&'static str>>,
+        prompt_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         turn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
     #[async_trait]
     impl AgentBackend for StubInner {
         async fn prompt(&self, s: &SessionId, _p: Vec<Part>) -> Result<BackendStream, BridgeError> {
+            if let Some((entered, release)) = &self.prompt_gate {
+                entered.notify_one();
+                release.notified().await;
+            }
             self.prompts.fetch_add(1, Ordering::SeqCst);
             self.sessions.lock().await.insert(s.as_str().to_string());
             self.call_order.lock().await.push("prompt");
@@ -1487,12 +1564,13 @@ mod tests {
         last_diagnostic_redactor: Mutex<Option<bridge_core::diagnostics::DiagnosticRedactor>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
         spawn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        prompt_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         turn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
     impl CountingSpawn {
         fn new(fail: bool) -> Arc<Self> {
-            Self::with_optional_gates(fail, None, None, None)
+            Self::with_optional_gates(fail, None, None, None, None)
         }
 
         fn with_cancel_gate(
@@ -1500,7 +1578,7 @@ mod tests {
             entered: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
         ) -> Arc<Self> {
-            Self::with_optional_gates(fail, None, None, Some((entered, release)))
+            Self::with_optional_gates(fail, None, None, None, Some((entered, release)))
         }
 
         fn with_spawn_gate(
@@ -1508,7 +1586,15 @@ mod tests {
             entered: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
         ) -> Arc<Self> {
-            Self::with_optional_gates(fail, Some((entered, release)), None, None)
+            Self::with_optional_gates(fail, Some((entered, release)), None, None, None)
+        }
+
+        fn with_prompt_gate(
+            fail: bool,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        ) -> Arc<Self> {
+            Self::with_optional_gates(fail, None, Some((entered, release)), None, None)
         }
 
         fn with_turn_gate(
@@ -1516,12 +1602,13 @@ mod tests {
             entered: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
         ) -> Arc<Self> {
-            Self::with_optional_gates(fail, None, Some((entered, release)), None)
+            Self::with_optional_gates(fail, None, None, Some((entered, release)), None)
         }
 
         fn with_optional_gates(
             fail: bool,
             spawn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+            prompt_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
             turn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
             cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         ) -> Arc<Self> {
@@ -1535,6 +1622,7 @@ mod tests {
                 last_diagnostic_redactor: Mutex::new(None),
                 last_inner: Mutex::new(None),
                 spawn_gate,
+                prompt_gate,
                 turn_gate,
                 cancel_gate,
             })
@@ -1566,6 +1654,7 @@ mod tests {
                 fail_prompt: AtomicBool::new(self.fail_prompt),
                 configured_turns: Mutex::new(Vec::new()),
                 call_order: Mutex::new(Vec::new()),
+                prompt_gate: self.prompt_gate.clone(),
                 turn_gate: self.turn_gate.clone(),
                 cancel_gate: self.cancel_gate.clone(),
             });
@@ -2251,6 +2340,93 @@ mod tests {
         assert_eq!(inner.prompts.load(Ordering::SeqCst), 0);
     }
 
+    #[derive(Clone, Copy)]
+    enum TeardownAction {
+        Cancel,
+        Retire,
+    }
+
+    async fn assert_teardown_waits_for_inner_prompt_dispatch(warm: bool, action: TeardownAction) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let prompt_entered = Arc::new(tokio::sync::Notify::new());
+        let prompt_release = Arc::new(tokio::sync::Notify::new());
+        let spawn = CountingSpawn::with_prompt_gate(
+            false,
+            Arc::clone(&prompt_entered),
+            Arc::clone(&prompt_release),
+        );
+        let (reap, _) = counting_reap();
+        let backend = Arc::new(if warm {
+            warm_backend(root, spawn.clone(), reap).await
+        } else {
+            backend(root, spawn.clone(), reap).await
+        });
+        let session = SessionId::parse(if warm {
+            "warm-dispatch-linearization"
+        } else {
+            "cold-dispatch-linearization"
+        })
+        .unwrap();
+        backend
+            .configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+
+        let prompt = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.prompt(&session, vec![]).await })
+        };
+        prompt_entered.notified().await;
+
+        let mut teardown = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move {
+                match action {
+                    TeardownAction::Cancel => backend.cancel(&session).await,
+                    TeardownAction::Retire => backend.retire().await,
+                }
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut teardown)
+                .await
+                .is_err(),
+            "teardown returned while the winning inner prompt had not installed dispatch"
+        );
+
+        prompt_release.notify_one();
+        let stream = prompt.await.unwrap().unwrap();
+        teardown.await.unwrap().unwrap();
+        drop(stream);
+
+        let inner = spawn.last_inner.lock().await.clone().unwrap();
+        assert_eq!(inner.prompts.load(Ordering::SeqCst), 1);
+        assert!(inner.canceled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cold_cancel_waits_for_winning_inner_prompt_dispatch() {
+        assert_teardown_waits_for_inner_prompt_dispatch(false, TeardownAction::Cancel).await;
+    }
+
+    #[tokio::test]
+    async fn cold_retire_waits_for_winning_inner_prompt_dispatch() {
+        assert_teardown_waits_for_inner_prompt_dispatch(false, TeardownAction::Retire).await;
+    }
+
+    #[tokio::test]
+    async fn warm_cancel_waits_for_winning_inner_prompt_dispatch() {
+        assert_teardown_waits_for_inner_prompt_dispatch(true, TeardownAction::Cancel).await;
+    }
+
+    #[tokio::test]
+    async fn warm_retire_waits_for_winning_inner_prompt_dispatch() {
+        assert_teardown_waits_for_inner_prompt_dispatch(true, TeardownAction::Retire).await;
+    }
+
     #[tokio::test]
     async fn cold_prompt_threads_diagnostic_and_rich_observers_through_spawn_and_inner() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2370,6 +2546,7 @@ mod tests {
             owner: ReapOwner {
                 generation: 0,
                 reap: ReapController::from_legacy("docker", "a2a-rw-inst-0", reap),
+                dispatch_gate: Arc::new(Mutex::new(())),
             },
             inflight,
             session: SessionId::parse("s1").unwrap(),
@@ -2667,6 +2844,89 @@ mod tests {
             Some("container.teardown.reaped")
         );
         assert!(!be.warm.lock().await.contains_key(&session));
+    }
+
+    #[tokio::test]
+    async fn canceled_warm_checked_release_cannot_suppress_reap_start_before_inflight_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let attempt: ReapAttemptFn = {
+            let entered = Arc::clone(&entered);
+            Arc::new(move |_runtime, _name| {
+                let entered = Arc::clone(&entered);
+                Box::pin(async move {
+                    entered.notify_one();
+                    Ok(())
+                })
+            })
+        };
+        let backend =
+            Arc::new(warm_backend_with_attempt(root, CountingSpawn::new(false), attempt).await);
+        let session = SessionId::parse("warm-release-cancel-safe-start").unwrap();
+        backend
+            .configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+        let controller = backend.current_reap_owner(&session).unwrap().reap;
+
+        let inflight_guard = backend.inflight.lock().await;
+        let release = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.release_session_checked(&session).await })
+        };
+        tokio::time::timeout(Duration::from_millis(100), entered.notified())
+            .await
+            .expect("checked release must start its reaper before waiting on async state");
+        release.abort();
+        assert!(release.await.unwrap_err().is_cancelled());
+        assert_eq!(controller.reap_observed().await, Ok(()));
+        drop(inflight_guard);
+    }
+
+    #[tokio::test]
+    async fn canceled_cold_observed_release_cannot_suppress_reap_start_before_inflight_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let attempt: ReapAttemptFn = {
+            let entered = Arc::clone(&entered);
+            Arc::new(move |_runtime, _name| {
+                let entered = Arc::clone(&entered);
+                Box::pin(async move {
+                    entered.notify_one();
+                    Ok(())
+                })
+            })
+        };
+        let backend =
+            Arc::new(backend_with_attempt(root, CountingSpawn::new(false), attempt).await);
+        let session = SessionId::parse("cold-release-cancel-safe-start").unwrap();
+        backend
+            .configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let stream = backend.prompt(&session, vec![]).await.unwrap();
+        let controller = backend.current_reap_owner(&session).unwrap().reap;
+
+        let inflight_guard = backend.inflight.lock().await;
+        let release = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+            tokio::spawn(async move { backend.release_session_observed(&session, observer).await })
+        };
+        tokio::time::timeout(Duration::from_millis(100), entered.notified())
+            .await
+            .expect("observed release must start its reaper before waiting on async state");
+        release.abort();
+        assert!(release.await.unwrap_err().is_cancelled());
+        assert_eq!(controller.reap_observed().await, Ok(()));
+        drop(inflight_guard);
+        drop(stream);
     }
 
     #[tokio::test]

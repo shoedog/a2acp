@@ -492,6 +492,18 @@ impl ApiBackend {
                             }
                         }
                     }
+                    if !acc.is_done() {
+                        Err(lifecycle
+                            .failure(
+                                DiagnosticFailureClass::Protocol,
+                                "api.prompt.sse_incomplete",
+                                "Upstream API ended SSE before terminal evidence",
+                                None,
+                                None,
+                                None,
+                            )
+                            .await)?;
+                    }
                     acc.finish()
                 } else {
                     let body = match resp.text().await {

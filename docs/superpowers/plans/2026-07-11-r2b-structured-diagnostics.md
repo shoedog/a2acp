@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 IN PROGRESS on `agent/reliability-r2b3-api-container` from `2e9ed640` (review 1 `REVISE`; fold on branch head; affected packages **584 / 0 / 1 ignored**; full host workspace **1,878 / 0 / 12 ignored**; hygiene **37/7**; closure re-review pending)
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 IN PROGRESS on `agent/reliability-r2b3-api-container` from `2e9ed640` (initial review and closure re-review 1 `REVISE`; two folds on branch head; affected packages **594 / 0 / 1 ignored**; full host workspace **1,888 / 0 / 12 ignored**; hygiene **37/7**; closure re-review 2 pending)
 - **Current execution boundary:** no R2c live/billable smoke ran; run a fresh full-branch closure
   re-review; no docs-link checker is present
 - **Prerequisite:** R2a merged at `24aff09c`
@@ -889,11 +889,23 @@ automatically.
   typed controller. Self-audit also closes cancel-during-turn-configuration for cold and first warm turns.
 - Pre-change-red regressions cover all of those schedules, successful and failed checked cleanup, stale
   dispatch suppression, synchronous and asynchronous worker panic, and production timeout child killing.
-  `cargo fmt --all` plus the exact affected-package command pass **584 / 0 / 1 ignored**: ACP 208, API 56
-  plus one ignored local Ollama case, container 42, and core 278. The exact review-fold tree passes host
-  serial workspace **1,878 / 0 / 12 ignored**, workspace/all-target check, warnings-denied all-target
-  Clippy, release binary build, and repository hygiene **37/7**. Request closure re-review. No R2c
-  live/billable smoke has run, and no docs-link checker is present.
+- Fresh Sol/xhigh closure re-review 1 on `51dad0130998ffb5e3598e67a0df7ca1efba9a39` adjudicated the
+  generation owner, warm `Drop`, public compatibility, panic/timeout coverage, and persistence precedence
+  findings closed. It retained the outer final-dispatch race as partial: cancel/retire could pass the final
+  ownership check while the inner ACP prompt was still installing, then return before that stale dispatch.
+  It also found that a clean SSE EOF without `[DONE]` or `finish_reason` was accepted and that this design
+  header retained stale gate totals.
+- The second fold adds one exact-generation dispatch gate, held only across inner prompt installation and
+  joined by cancel/release/retire before return. Every teardown starts its process-owned reaper before its
+  first cancellable gate or lifecycle-snapshot await. Clean SSE EOF now requires terminal evidence while
+  preserving `finish_reason`-only success. Ten deterministic pre-change-red regressions cover cold/warm
+  cancel/retire dispatch, ACP/container waiter cancellation before cleanup start, incomplete SSE EOF, and
+  its terminal negative control.
+- `cargo fmt --all` plus the exact affected-package command pass **594 / 0 / 1 ignored**: ACP 210, API 58
+  plus one ignored local Ollama case, container 48, and core 278. The exact second-fold tree passes host
+  serial workspace **1,888 / 0 / 12 ignored** across 66 test/doc-test executables, workspace/all-target
+  check, warnings-denied all-target Clippy, release binary build, and repository hygiene **37/7**. Request
+  closure re-review 2. No R2c live/billable smoke has run, and no docs-link checker is present.
 
 ## R2b completion gate
 

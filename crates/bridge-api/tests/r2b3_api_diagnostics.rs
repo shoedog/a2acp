@@ -247,6 +247,44 @@ async fn truncated_sse_chunk_is_structured_transport_failure() {
 }
 
 #[tokio::test]
+async fn clean_sse_eof_without_terminal_evidence_is_fatal_protocol_failure() {
+    let body =
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+    let response = raw_response("200 OK", "text/event-stream", body, body.len());
+    let backend = ApiBackend::new(ApiConfig::new(one_response_server(response).await));
+
+    let (updates, error, _) = observed_turn(&backend, "clean-incomplete-sse").await;
+    assert!(updates
+        .iter()
+        .any(|update| matches!(update, Update::Text(text) if text == "partial")));
+    let diagnostic = agent_failure(error);
+    assert_eq!(diagnostic.class(), DiagnosticFailureClass::Protocol);
+    assert_eq!(diagnostic.code().as_str(), "api.prompt.sse_incomplete");
+    assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+    assert!(diagnostic.prompt_may_have_been_accepted());
+}
+
+#[tokio::test]
+async fn clean_sse_eof_after_finish_reason_remains_successful_without_done_sentinel() {
+    let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"complete\"},\"finish_reason\":\"stop\"}]}\n\n";
+    let response = raw_response("200 OK", "text/event-stream", body, body.len());
+    let backend = ApiBackend::new(ApiConfig::new(one_response_server(response).await));
+
+    let (updates, error, _) = observed_turn(&backend, "clean-terminal-sse").await;
+    assert!(
+        error.is_none(),
+        "terminal finish_reason must permit clean EOF"
+    );
+    assert!(updates
+        .iter()
+        .any(|update| matches!(update, Update::Text(text) if text == "complete")));
+    assert!(matches!(
+        updates.last(),
+        Some(Update::Done { stop_reason }) if stop_reason == "stop"
+    ));
+}
+
+#[tokio::test]
 async fn truncated_nonstream_body_is_structured_transport_failure() {
     let response = raw_response(
         "200 OK",
