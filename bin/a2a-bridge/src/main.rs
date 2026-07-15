@@ -3267,7 +3267,8 @@ usage: a2a-bridge models [--config <path>] [--agent <id>] [--json]
   Pass models only when model_configurable=true; effort/mode only when those lists are present.
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --agent <id>     show only this agent
-  --json           emit JSON (same shape as the card's agent-models extension params.agents)";
+  --json           emit an agent map; successful values match the card's agent-models shape, while
+                   failed probes are explicit {available:false,failure:{...}} records";
 
 struct ModelsArgs {
     config: Option<String>,
@@ -3309,11 +3310,29 @@ fn parse_models_args(args: &[String]) -> Result<ModelsArgs, BoxError> {
     })
 }
 
-/// The catalog as the card's `params.agents` JSON object (each value via the shared `caps_to_json`).
-fn catalog_to_json(catalog: &bridge_core::catalog::ModelCatalog) -> serde_json::Value {
-    let agents: serde_json::Map<String, serde_json::Value> = catalog
+/// Render every configured probe target. Successful values retain the exact Agent Card capability
+/// shape; a failed target gets an additive CLI-only record instead of disappearing.
+fn catalog_report_to_json(
+    entries: &[(String, AgentEntry)],
+    report: &catalog_probe::CatalogProbeReport,
+) -> serde_json::Value {
+    let agents: serde_json::Map<String, serde_json::Value> = entries
         .iter()
-        .map(|(id, caps)| (id.clone(), bridge_core::catalog::caps_to_json(caps)))
+        .map(|(id, _)| {
+            let value = if let Some(caps) = report.catalog.get(id) {
+                bridge_core::catalog::caps_to_json(caps)
+            } else {
+                let failure = report
+                    .failures
+                    .get(id)
+                    .expect("every probe target has either capabilities or a failure");
+                serde_json::json!({
+                    "available": false,
+                    "failure": failure,
+                })
+            };
+            (id.clone(), value)
+        })
         .collect();
     serde_json::Value::Object(agents)
 }
@@ -3338,7 +3357,7 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
         .into_snapshot()
         .map_err(|e| format!("models: registry snapshot error: {e}"))?;
     // (id, entry) pairs, optionally filtered to one agent. Probing is on-demand (separate process from
-    // serve, so always live) and degrades per-agent.
+    // serve, so always live). The server catalog degrades per-agent; this CLI retains each failure.
     let entries: Vec<(String, AgentEntry)> = snapshot
         .entries
         .iter()
@@ -3352,15 +3371,15 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
         return Err(format!("models: no agents configured in {config_path:?}").into());
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let catalog = catalog_probe::probe_all(&entries, &cwd).await;
+    let report = catalog_probe::probe_all_report(&entries, &cwd).await;
     if parsed.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&catalog_to_json(&catalog))?
+            serde_json::to_string_pretty(&catalog_report_to_json(&entries, &report))?
         );
     } else {
         for (id, _) in &entries {
-            match catalog.get(id) {
+            match report.catalog.get(id) {
                 Some(caps) => {
                     let current = caps.current_model.as_deref().unwrap_or("?");
                     let configurable = if caps.models.is_empty() || caps.model_configurable {
@@ -3379,9 +3398,20 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
                         println!("    modes:  {}", caps.modes.join(", "));
                     }
                 }
-                None => println!("{id}: unavailable (probe failed — see logs)"),
+                None => {
+                    let failure = report
+                        .failures
+                        .get(id)
+                        .expect("every probe target has either capabilities or a failure");
+                    println!("{id}: unavailable ({})", failure.cli_message());
+                }
             }
         }
+    }
+    // A specifically requested configured agent must never report an empty-success result. Render the
+    // machine-readable record first, then return nonzero with the same bounded safe cause on stderr.
+    if let Some(failure) = parsed.agent.as_ref().and_then(|id| report.failures.get(id)) {
+        return Err(failure.cli_message().into());
     }
     Ok(())
 }

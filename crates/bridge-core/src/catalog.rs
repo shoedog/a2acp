@@ -100,10 +100,10 @@ pub fn parse_kiro_list_models(stdout: &str) -> AgentCaps {
     caps
 }
 
-/// The per-agent JSON object the Agent Card extension AND the `a2a-bridge models --json` CLI both
-/// emit (DRY). `current`/`models`/`model_configurable`/`current_mode` ride through; empty
-/// `effort`/`modes` keys are OMITTED (no `"effort":[]` noise for kiro/api). Renderers wrap a map
-/// of these under `params.agents`.
+/// The per-agent JSON object the Agent Card extension and each successful `a2a-bridge models --json`
+/// entry both emit (DRY). `current`/`models`/`model_configurable`/`current_mode` ride through; empty
+/// `effort`/`modes` keys are OMITTED (no `"effort":[]` noise for kiro/api). The CLI may additionally
+/// include explicit failure entries for agents whose live discovery probe failed.
 pub fn caps_to_json(caps: &AgentCaps) -> serde_json::Value {
     let caps = sanitize_model_caps(caps.clone());
     let mut object = serde_json::Map::new();
