@@ -5,9 +5,8 @@
   failures retained)
 - **Completed through:** R2b3 **MERGED** at `afcc856c` after closure re-review 4 `APPROVE` on
   `492946cb` and final status re-review `APPROVE` on the merge head
-- **Active slice:** R2c **IN PROGRESS** on `agent/reliability-r2c-live-smoke`; deterministic implementation
-  and tests preceded one explicitly authorized host-Codex turn, whose artifact-permission defect is being
-  folded without replay
+- **Active slice:** R2c **APPROVED / PENDING MERGE** on `agent/reliability-r2c-live-smoke`; the fixed
+  candidate passed its explicitly authorized artifact-exact host-Codex lane
 - **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
 - **Current exact R2c deterministic gate:** smoke unit **19 / 0 / 0 ignored**, smoke CLI **11 / 0 / 0
   ignored**, and `bridge-api` **59 / 0 / 1 ignored**; format/diff clean
@@ -18,11 +17,11 @@
 - **Full workspace gate:** the create-new artifact fold passes host serial **1,933 / 0 / 12 ignored**
   across 68 executables; workspace/all-target check, warnings-denied Clippy, release build, and repository
   hygiene **37/7** are clean
-- **Current execution boundary:** one authorized host `gpt-5.6-sol`/`xhigh` smoke ran on `ce605eaf` with
-  no retry: provider/lifecycle evidence passed, but the overall gate is **NOT ACCEPTED** because the new
-  artifact was initially mode `0644`; it was immediately restricted to `0600`, and no replay ran
-- **Next action:** request new explicit authorization for one fixed-candidate host Codex smoke; do not run
-  it or any alternate lane until the exact lane is acknowledged
+- **Current execution boundary:** attempt 1 on `ce605eaf` passed provider/lifecycle but was rejected for an
+  initial `0644` artifact; after reviewed create-new hardening, separately authorized attempt 2 on
+  `1c9e4a43` passed in 8.770 seconds with a `0600` artifact, exact terminal `PONG`, no tools/retry/fallback,
+  and completed teardown
+- **Next action:** run final status/evidence review and open the non-draft R2c PR; after merge, begin R2d
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -41,7 +40,7 @@ R2a provenance (MERGED)
   -> R2b1 diagnostic types + rollback-safe persistence surface (MERGED)
   -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (MERGED)
   -> R2b3 API/provider mapping + remaining container/dispatch observation (MERGED)
-  -> R2c explicit one-turn billable smoke (IN PROGRESS)
+  -> R2c explicit one-turn billable smoke (APPROVED / PENDING MERGE)
        -> R2d local non-billable fallback plan
        -> R3 compatibility manifest + pinned/floating canaries
             -> R4 reproducible dependency/image pins + release promotion gate
@@ -64,7 +63,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
 | R2b2 — ACP/Fable lifecycle diagnostics | **MERGED** at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
 | R2b3 — API/container diagnostics | **MERGED** at `afcc856c` (affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–3 `REVISE`; four review folds; closure re-review 4 `APPROVE` at `492946c`; final status re-review `APPROVE` at `afcc856c`) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
-| R2c — live smoke | **IN PROGRESS** on `agent/reliability-r2c-live-smoke` (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; first authorized host Codex turn passed provider/lifecycle but overall gate rejected its initial `0644` artifact; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; no replay) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
+| R2c — live smoke | **APPROVED / PENDING MERGE** on `agent/reliability-r2c-live-smoke` (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |

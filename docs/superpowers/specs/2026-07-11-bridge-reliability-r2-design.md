@@ -1,7 +1,7 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v14)
 
-- **Status:** R2a and R2b0–R2b3 merged; R2b3 merge head is
-  `afcc856c3276fe682fb78dc657591021f5e604fc`; v14 is the design of record for completed R2b
+- **Status:** R2a and R2b0–R2b3 merged; R2c is **APPROVED / PENDING MERGE** on
+  `agent/reliability-r2c-live-smoke`; v14 is the design of record for R2b–R2c
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
   and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,
@@ -10,7 +10,7 @@
   all three inherited findings `FIXED`, found no new `WRONG` or `SMELL`, and returned `APPROVE` on
   `492946cbb28ec624aa6b43a9a059581ef5f84538`. The approval-recording fold's first status review returned
   `REVISE`; its corrected final re-review adjudicated that cursor mismatch `FIXED`, found no new findings,
-  and returned `APPROVE` on merge head `afcc856c`. No R2c smoke ran.
+  and returned `APPROVE` on merge head `afcc856c`. At that R2b3 checkpoint, no R2c smoke had run.
 - **R2b2 review state:** R2b2d closure review 12 `APPROVE` at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; final full-R2b2 review 1 `REVISE`; cold-path fold
   `a459b31de5a4665138a7330868e38dfb8992438b`; closure re-review 1 `REVISE`; retry-veto fold
@@ -19,7 +19,10 @@
   example configs; fresh Sol/xhigh closure re-review 2 `APPROVE` at
   `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; final docs-only Sol/xhigh re-review `APPROVE`; merged at
   `0627e91144e79d9328ed9b5635033cf410c9e96e`
-- **Current execution boundary:** no live/billable gate ran; no docs-link checker is present
+- **Current execution boundary:** separately authorized fixed-candidate R2c host Codex smoke on
+  `1c9e4a43` passed artifact-exact in 8.770 seconds with mode `0600`, exact terminal `PONG`, no
+  retry/fallback, and clean teardown; host Claude, reader/container, and live negative pre-prompt lanes
+  were not run; no docs-link checker is present
 - **Date:** 2026-07-11
 - **Last amended:** 2026-07-15
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)

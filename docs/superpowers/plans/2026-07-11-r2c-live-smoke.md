@@ -1,16 +1,16 @@
 # R2c — Explicit bounded live smoke implementation plan
 
-- **Status:** IN PROGRESS
+- **Status:** APPROVED / PENDING MERGE
 - **Prerequisite:** all R2b sub-slices merged
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Branch:** `agent/reliability-r2c-live-smoke`
 
-Implementation is active on the named branch. Deterministic CLI, terminal, timeout, artifact/redaction, and
-API tool-observation regressions must be green before any live/billable acceptance lane is authorized. One
-authorized host-Codex smoke has run; its provider/lifecycle evidence passed, but its artifact-permission
-defect keeps the overall gate open. No replay has run.
+Implementation and acceptance are complete on the named branch. Deterministic CLI, terminal, timeout,
+artifact/redaction, and API tool-observation regressions are green. The first authorized host-Codex turn
+exposed an artifact-permission defect and was not accepted; after reviewed hardening, a separately
+authorized fixed-candidate turn passed artifact-exact with no retry or fallback.
 
 ## In-progress checkpoint — 2026-07-15
 
@@ -37,8 +37,8 @@ defect keeps the overall gate open. No replay has run.
   inode-reuse/link/metadata items were fixed. Its sole new `SMELL/MINOR` requires an operator to ignore the
   documented `0700` mktemp directory and supply a symlinked parent; the fresh artifact remains `0600`, and
   no overwrite, disclosure, or prompt-gating contract is violated. It is non-blocking follow-up risk.
-- Still pending: new explicit operator authorization for a fixed-candidate lane, that artifact-exact smoke,
-  and final status/evidence review. This checkpoint is not completion evidence.
+- Still pending: final status/evidence review, non-draft PR, and merge. Host Claude, reader/container, and
+  live negative pre-prompt lanes were not run; only one passing live lane is required for R2c completion.
 
 ### Review fold 1 — 2026-07-15
 
@@ -80,6 +80,19 @@ The pre-existing-file regression fails on `ce605eaf` independently of umask, the
 both victim files, and the new-file CLI case asserts `0600`. The follow-up passes the complete deterministic
 gate set recorded above. Targeted Fable/xhigh closure review returned `APPROVE` on `ffb7e891`; its one
 runbook-mitigated symlinked-parent SMELL does not reopen the gate.
+
+### Authorized live attempt 2 — 2026-07-15 — accepted
+
+After separate explicit authorization, candidate `1c9e4a43` used host ACP adapter 1.1.2, Codex 0.144.1,
+pre-authentication, raw `gpt-5.6-sol`, `xhigh`, explicit `read-only`, the trusted R2c worktree, a 120-second
+bound, and default metadata-only stderr. The release binary completed in 8.770 seconds with one configure,
+one accepted prompt, terminal `end_turn`, exact four-byte `PONG`, zero tool/permission events, zero dropped
+diagnostics, and completed release/retirement. It reported 23,528 total tokens and no cost. The versioned
+artifact was born mode `0600` inside a fresh `0700` evidence directory and passed every schema/content
+assertion. No retry, fallback, alternate provider, or second prompt ran.
+
+Unrun R2c live lanes: host Claude/Fable or Sonnet control, reader/container, and negative pre-prompt
+model/config. They remain explicit future compatibility evidence, not prerequisites to merge this slice.
 
 R2c turns R2b's diagnostic record into one deliberate end-to-end operator probe. It is the first R2
 slice that is intentionally billable. It is not a generic prompt command, workflow runner, retry
@@ -182,6 +195,6 @@ unrun lane. No automatic cross-provider attempt is permitted.
 
 ## Completion
 
-R2c merges only after adversarial review, full local gates, and at least one explicitly acknowledged
-artifact-exact live smoke. Update the central roadmap's next action to R2d and make the R2c artifact the
-input contract for R2d/R3.
+The implementation satisfies the R2c merge criteria: adversarial review, full local gates, and one
+explicitly acknowledged artifact-exact live smoke. Final status review and PR merge remain. After merge,
+the central roadmap advances to R2d and this artifact becomes the input contract for R2d/R3.

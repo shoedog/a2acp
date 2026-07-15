@@ -11,11 +11,11 @@ Status meanings:
 - **STALE** — it passed previously, but a relevant component has changed or the evidence is too old for
   a release decision.
 
-## Snapshot — 2026-07-11
+## Snapshot — 2026-07-15
 
 | Path | Exact observed components | Model / effort | Status | Evidence |
 |---|---|---|---|---|
-| Codex, host bridge | `@agentclientprotocol/codex-acp` 1.1.2; its locally resolved `@openai/codex` is 0.144.1 | `gpt-5.6-sol` / `xhigh` | **PASS** | [PR #16](https://github.com/shoedog/a2acp/pull/16) completed an authenticated `PONG` through the bridge on 2026-07-10. The hyphenated `gpt-5-6-sol` input resolved to the raw advertised ID. The live record did not capture the transitive Codex patch version, so re-record it before the next release. |
+| Codex, host bridge | R2c candidate `1c9e4a43`, bridge 0.2.1; `@agentclientprotocol/codex-acp` 1.1.2; locally resolved `@openai/codex` 0.144.1; host pre-authentication | raw `gpt-5.6-sol` / `xhigh`; explicit `read-only` | **PASS** | The explicitly authorized R2c fixed-candidate smoke completed one terminal exact `PONG` in 8.770 s with no retry/fallback, tools, permission updates, timeout, dropped diagnostics, or stderr text. The artifact was created mode `0600` inside a `0700` evidence directory; release/retirement completed; usage exposed 23,528 total tokens and no cost. Host Claude, reader/container, and live negative pre-prompt R2c lanes were not run. [PR #16](https://github.com/shoedog/a2acp/pull/16) remains the earlier alias-resolution evidence. |
 | Codex, PR #17 reader/container build | `node:24-slim`; top-level `@agentclientprotocol/codex-acp` 1.1.2; `pre_authenticated = true` | `gpt-5.6-sol` / `xhigh` | **PASS** | [PR #17](https://github.com/shoedog/a2acp/pull/17) completed `SMOKE_OK` in the real container path. The settled cause and falsified model-API hypothesis are recorded in [`superpowers/2026-07-11-gpt56-sol-container-root-cause-correction.md`](superpowers/2026-07-11-gpt56-sol-container-root-cause-correction.md). This proves that build, not every future rebuild. |
 | Claude, direct host CLI control | Claude Code 2.1.207 | Fable | **PASS** | On 2026-07-11, `claude -p --model fable` returned `PONG`. This proves that invocation's direct CLI/auth/model path only. |
 | Claude, host ACP 0.44 through bridge | `claude-agent-acp` 0.44.0; Agent SDK 0.3.170; bundled Claude 2.1.170; Node 26.0.0; ambient host subscription auth | raw `claude-fable-5[1m]` / `xhigh`; Sonnet / `high` control | **PASS** | Direct ACP and the fresh bridge both returned `PONG` for Fable and Sonnet outside the managed sandbox. Fable required `A2A_BRIDGE_ALLOW_FABLE=1`. See the [R1 disposition](superpowers/2026-07-11-fable-r1-disposition.md). |
