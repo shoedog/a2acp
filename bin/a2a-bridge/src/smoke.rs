@@ -1308,7 +1308,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV1 {
 fn prepare_artifact_file(out: Option<&Path>, config: &Path) -> Result<Option<File>, BoxError> {
     out.map(|path| {
         let mut options = OpenOptions::new();
-        options.create(true).truncate(false).write(true);
+        options.create_new(true).write(true);
         #[cfg(unix)]
         options.mode(0o600);
         let file = options.open(path).map_err(|error| -> BoxError {
@@ -1341,13 +1341,6 @@ fn prepare_artifact_file(out: Option<&Path>, config: &Path) -> Result<Option<Fil
                 return Err("smoke: --out must not alias --config".into());
             }
         }
-        file.set_len(0).map_err(|error| -> BoxError {
-            format!(
-                "smoke: cannot truncate artifact {} before attempt: {error}",
-                path.display()
-            )
-            .into()
-        })?;
         Ok(file)
     })
     .transpose()
@@ -2251,9 +2244,6 @@ mod tests {
     async fn output_file_contains_one_machine_readable_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("smoke.json");
-        std::fs::write(&path, b"stale artifact").unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let artifact = ArtifactState::new(&args()).finalize(false).await;
         let mut file = prepare_artifact_file(Some(&path), Path::new("/not-the-config"))
             .unwrap()
@@ -2266,5 +2256,25 @@ mod tests {
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["cleanup"]["grace_timeout_secs"], CLEANUP_TIMEOUT_SECS);
         assert!(bytes.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn preexisting_output_is_refused_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("smoke.json");
+        std::fs::write(&path, b"stale artifact").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = prepare_artifact_file(Some(&path), Path::new("/not-the-config"))
+            .expect_err("an existing output path must be refused");
+
+        assert!(error.to_string().contains("cannot open artifact"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"stale artifact");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 }

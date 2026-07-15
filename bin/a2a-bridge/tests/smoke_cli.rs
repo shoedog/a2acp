@@ -177,6 +177,68 @@ fn explicit_out_gets_failure_artifact_and_stdout_stays_empty() {
 }
 
 #[test]
+fn existing_out_or_link_refuses_before_agent_spawn_or_mutation() {
+    let (_dir, marker, config) = marker_fixture();
+    let artifact_path = config.with_file_name("existing-artifact.json");
+    fs::write(&artifact_path, b"stale artifact").unwrap();
+    let mut permissions = fs::metadata(&artifact_path).unwrap().permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&artifact_path, permissions).unwrap();
+
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .arg("--out")
+        .arg(&artifact_path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!marker.exists());
+    assert_eq!(fs::read(&artifact_path).unwrap(), b"stale artifact");
+    assert_eq!(
+        fs::metadata(&artifact_path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+
+    let (_dir, marker, config) = marker_fixture();
+    let victim = config.with_file_name("symlink-victim");
+    let artifact_path = config.with_file_name("symlink-output.json");
+    fs::write(&victim, b"symlink victim").unwrap();
+    std::os::unix::fs::symlink(&victim, &artifact_path).unwrap();
+
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .arg("--out")
+        .arg(&artifact_path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!marker.exists());
+    assert_eq!(fs::read(&victim).unwrap(), b"symlink victim");
+
+    let (_dir, marker, config) = marker_fixture();
+    let victim = config.with_file_name("hard-link-victim");
+    let artifact_path = config.with_file_name("hard-link-output.json");
+    fs::write(&victim, b"hard-link victim").unwrap();
+    fs::hard_link(&victim, &artifact_path).unwrap();
+
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .arg("--out")
+        .arg(&artifact_path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!marker.exists());
+    assert_eq!(fs::read(&victim).unwrap(), b"hard-link victim");
+}
+
+#[test]
 fn unwritable_out_refuses_before_agent_spawn() {
     let (dir, marker, config) = marker_fixture();
     let impossible = dir.path().join("missing-parent").join("artifact.json");

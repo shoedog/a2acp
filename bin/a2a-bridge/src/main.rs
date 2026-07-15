@@ -174,7 +174,7 @@ Run exactly one billable agent turn with the fixed prompt `Reply exactly PONG. D
 There is no retry, fallback, workflow, resume, or caller-supplied prompt. The default timeout is 120
 seconds and the hard maximum is 900 seconds. Without --out, stdout contains only the versioned JSON
 artifact. Opaque stderr text is excluded unless --include-redacted-stderr explicitly opts into bounded
-best-effort redaction.";
+best-effort redaction. An explicit --out path must not already exist.";
 
 const TASK_SPEC_USAGE: &str = "\
 usage: a2a-bridge task-spec schema [type]

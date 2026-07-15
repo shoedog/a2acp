@@ -129,6 +129,8 @@ Only after the operator explicitly authorizes a billable turn, use the candidate
 fixed, bounded `PONG` probe:
 
 ```bash
+evidence_dir="$(mktemp -d /private/tmp/a2a-bridge-smoke.XXXXXX)"
+chmod 700 "$evidence_dir"
 cargo build --release --bin a2a-bridge
 ./target/release/a2a-bridge smoke \
   --agent codex \
@@ -137,7 +139,7 @@ cargo build --release --bin a2a-bridge
   --session-cwd /absolute/path/to/trusted-repo \
   --timeout-secs 120 \
   --acknowledge-billable \
-  --out /private/tmp/codex-host-smoke.json
+  --out "$evidence_dir/codex-host-smoke.json"
 ```
 
 The command sends only `Reply exactly PONG. Do not use tools.`, resolves/configures/prompts once, never
@@ -146,8 +148,8 @@ acknowledgement and malformed options refuse before config/registry/spawn work. 
 preflight passes, an acknowledged attempt writes its versioned artifact before returning nonzero.
 Without `--out`, stdout is JSON only; human direction goes to stderr. Do not pass
 `--include-redacted-stderr` unless bounded best-effort-redacted process text is specifically required.
-On Unix, an explicit output is created or tightened to owner-only mode `0600` before agent resolution or
-spawn; the command refuses if that restriction cannot be applied.
+An explicit output path must not already exist. On Unix, it is created owner-only as `0600` before agent
+resolution or spawn; an existing file/link or failure to apply that restriction is a pre-attempt refusal.
 
 Run `validate`, `doctor --json`, and `models --agent <id> --json` first. Never use a stale installed binary
 for compatibility evidence, and never automatically rerun a failed or timed-out smoke: the first prompt may

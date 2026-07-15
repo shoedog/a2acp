@@ -1022,7 +1022,9 @@ Contract:
 - Resolve one agent and perform exactly one turn. No workflow, retry, fallback, or automatic model alias
   guessing beyond the normal advertised-capability resolver.
 - Default timeout is 120 seconds; the hard maximum is 900 seconds.
-- Print one versioned JSON artifact to stdout, or write it only when `--out` is explicitly provided.
+- Print one versioned JSON artifact to stdout, or write it only when `--out` is explicitly provided. An
+  explicit output path must not already exist; create it owner-only as `0600` on Unix before resolution or
+  spawn, and refuse an existing file/link or permission failure without starting an attempt.
 - Include bridge commit/version, config path, execution mode, provenance rows, applied model/effort/mode,
   auth path, phase transitions, terminal result, and optional failure diagnostic.
 - `--include-redacted-stderr` explicitly opts the artifact into bounded opaque stderr text and labels its

@@ -30,10 +30,10 @@ defect keeps the overall gate open. No replay has run.
   known secret. The tightened regression now seeds the real process-ring redactor with the raw credential,
   emits its base64-transformed form, and proves the raw value is absent while the transformed value remains
   covered only by the honest `best_effort` label.
-- The owner-only artifact fold passes smoke unit **18 / 0 / 0 ignored**, smoke CLI **10 / 0 / 0 ignored**,
-  full host-serial workspace **1,931 / 0 / 12 ignored** across 68 executables, workspace/all-target check,
+- The create-new artifact fold passes smoke unit **19 / 0 / 0 ignored**, smoke CLI **11 / 0 / 0 ignored**,
+  full host-serial workspace **1,933 / 0 / 12 ignored** across 68 executables, workspace/all-target check,
   warnings-denied Clippy, release build, format/diff checks, and repository hygiene **37/7**.
-- Still pending: fresh review for the artifact-permission fold, new explicit operator authorization for a
+- Still pending: fresh review for the create-new follow-up, new explicit operator authorization for a
   fixed-candidate lane, that artifact-exact smoke, and final status/evidence review. This checkpoint is not
   completion evidence.
 
@@ -68,10 +68,14 @@ diagnostics, and completed release/retirement. The artifact content contract pas
 The overall lane is nevertheless **not accepted**: the new explicit `--out` artifact inherited umask and
 was created mode `0644`, contradicting the private-artifact contract. It was immediately restricted to
 `0600`; no prompt was replayed. Root cause was ordinary `OpenOptions::create(true)` without an explicit
-mode or permission tightening. The fold creates new Unix artifacts as `0600` and tightens a pre-existing
-broader destination before truncation or provider spawn. A deterministic edge regression pre-creates
-`0644`, so it fails on `ce605eaf` independently of the test runner's umask; the new-file CLI case also
-asserts `0600`. The fold passes the complete deterministic gate set recorded above.
+mode. The first fold created new Unix artifacts as `0600` and tightened pre-existing destinations; fresh
+Fable/xhigh review returned `APPROVE` on `23384622` but identified residual open-descriptor disclosure and
+planted-link truncation states. The final follow-up instead requires an unused path and uses create-new
+semantics: existing regular files, symlinks, and hard links are refused without mutation or agent spawn.
+This also makes config-metadata comparison failure non-destructive because no existing inode is opened.
+The pre-existing-file regression fails on `ce605eaf` independently of umask, the link regression preserves
+both victim files, and the new-file CLI case asserts `0600`. The follow-up passes the complete deterministic
+gate set recorded above and awaits fresh review.
 
 R2c turns R2b's diagnostic record into one deliberate end-to-end operator probe. It is the first R2
 slice that is intentionally billable. It is not a generic prompt command, workflow runner, retry
@@ -92,6 +96,7 @@ a2a-bridge smoke --agent <id> --config <path> --acknowledge-billable
 - Exactly one resolve/configure/prompt attempt. No workflow, resume, retry, provider routing, alias
   guessing beyond the normal advertised-capability resolver, or host fallback.
 - Refuse before resolve/spawn when `--acknowledge-billable` is absent.
+- Require an unused explicit output path; refuse any existing file or link before resolve/spawn.
 - Print/write the versioned artifact before returning nonzero on terminal failure.
 
 ## Implementation sequence
@@ -152,8 +157,8 @@ SDK/stderr text. Output serialization happens before the CLI selects its nonzero
 - exact PONG + terminal success; PONG without terminal, wrong text, tool output, cancellation, and clean
   EOF without terminal all fail;
 - failure artifact is valid and emitted before nonzero exit;
-- a new explicit output artifact is owner-only, and a pre-existing broader output is restricted before
-  attempt execution;
+- a new explicit output artifact is owner-only; an existing regular file, symlink, or hard link is refused
+  without mutation or attempt execution;
 - default artifact has stderr metadata but no text; opt-in is bounded and labeled `best_effort`;
 - provider-limit reset/retry fields survive when structured but cause no sleep/retry/reroute;
 - all secret redaction, `Display`/`Debug`, and four-tier execution guardrails remain intact;
