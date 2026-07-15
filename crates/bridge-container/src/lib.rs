@@ -185,11 +185,79 @@ pub struct ContainerRwConfig {
 struct ReapOwner {
     generation: u64,
     reap: ReapController,
+    /// A removal request may be selected before the async spawn attempt has
+    /// reached the point where it can no longer create the named resource.
+    /// The detached cleanup flight waits for this cancellation-safe fence so
+    /// its one underlying attempt cannot settle against an absent container
+    /// and then be followed by a late `docker run`.
+    spawn_settlement: Arc<SpawnSettlement>,
     /// Linearizes the final inner prompt installation against cancel, release,
     /// and retirement for this exact container generation. The prompt holds it
     /// only until `inner.prompt*` returns its stream; teardown starts the
     /// process-owned reaper first, then joins this gate before returning.
     dispatch_gate: Arc<Mutex<()>>,
+}
+
+struct SpawnSettlement {
+    settled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl SpawnSettlement {
+    fn pending() -> Self {
+        Self {
+            settled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn settle(&self) {
+        if !self.settled.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.settled.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct SpawnSettlementGuard(Arc<SpawnSettlement>);
+
+impl Drop for SpawnSettlementGuard {
+    fn drop(&mut self) {
+        self.0.settle();
+    }
+}
+
+impl ReapOwner {
+    /// Transfer cleanup to an observer-free task immediately, but do not
+    /// consume the one-shot removal until spawn returns or is canceled.
+    fn reap_detached(&self) {
+        let settlement = Arc::clone(&self.spawn_settlement);
+        let reap = self.reap.clone();
+        spawn_detached(async move {
+            settlement.wait().await;
+            // Await internally so an off-runtime throwaway runtime cannot drop
+            // after spawning, but before polling, a nested detached worker.
+            // This task owns no operation observer and discards only the report.
+            let _ = reap.reap_observed().await;
+        });
+    }
+
+    /// Join the same cleanup flight. Starting the detached waiter before this
+    /// await keeps removal owned if the observed caller is canceled.
+    async fn reap_observed(&self) -> Result<(), ReapFailure> {
+        self.reap_detached();
+        self.spawn_settlement.wait().await;
+        self.reap.reap_observed().await
+    }
 }
 
 struct InflightTurn {
@@ -393,6 +461,7 @@ impl ContainerRwBackend {
         let owner = ReapOwner {
             generation,
             reap,
+            spawn_settlement: Arc::new(SpawnSettlement::pending()),
             dispatch_gate: Arc::new(Mutex::new(())),
         };
         let kind = if self.is_warm() { "warm" } else { "perturn" };
@@ -536,18 +605,24 @@ impl ContainerRwBackend {
             acp,
             rw_canon,
         } = prepared;
-        let spawned = match diagnostic_observer {
-            Some(observer) => {
-                self.spawn
-                    .spawn_observed(&program, &argv, acp, observer)
-                    .await
+        let spawned = {
+            // Dropping this scope after success, failure, panic unwind, or
+            // caller cancellation proves that no later poll of this spawn
+            // future can create the named resource.
+            let _spawn_settlement = SpawnSettlementGuard(Arc::clone(&owner.spawn_settlement));
+            match diagnostic_observer {
+                Some(observer) => {
+                    self.spawn
+                        .spawn_observed(&program, &argv, acp, observer)
+                        .await
+                }
+                None => self.spawn.spawn(&program, &argv, acp).await,
             }
-            None => self.spawn.spawn(&program, &argv, acp).await,
         };
         let inner = match spawned {
             Ok(i) => i,
             Err(e) => {
-                owner.reap.reap_detached();
+                owner.reap_detached();
                 return Err(e);
             }
         };
@@ -555,7 +630,7 @@ impl ContainerRwBackend {
         let mut spec_canon = spec.clone();
         spec_canon.cwd = Some(rw_canon.clone());
         if let Err(e) = inner.configure_session(session, &spec_canon).await {
-            owner.reap.reap_detached();
+            owner.reap_detached();
             return Err(e);
         }
         Ok(WarmInner {
@@ -656,7 +731,7 @@ impl ContainerRwBackend {
                 owns_reservation
             };
             if !published {
-                wi.owner.reap.reap_detached();
+                wi.owner.reap_detached();
                 let _ = wi.inner.cancel(session).await;
                 fail!(BridgeError::SessionExpired);
             }
@@ -733,7 +808,7 @@ impl ContainerRwBackend {
                     warm.remove(session);
                 }
                 drop(warm);
-                owner.reap.reap_detached();
+                owner.reap_detached();
                 let _ = inner.cancel(session).await;
             }
             return Err(BridgeError::SessionExpired);
@@ -752,7 +827,7 @@ impl ContainerRwBackend {
                     if warm.get(session).map(|wi| wi.owner.generation) == Some(owner.generation) {
                         warm.remove(session);
                     }
-                    owner.reap.reap_detached();
+                    owner.reap_detached();
                 }
                 fail!(e) // reuse: keep the warm entry, do NOT reap
             }
@@ -786,7 +861,7 @@ impl ContainerRwBackend {
             return Ok(());
         };
         if was_reserving {
-            owner.reap.reap_detached();
+            owner.reap_detached();
         }
         let _dispatch = owner.dispatch_gate.lock().await;
         let mut inner = None;
@@ -827,7 +902,7 @@ impl ContainerRwBackend {
         // The controller owns cleanup before any async gate/map wait. Canceling
         // this waiter can detach reporting, but cannot suppress container
         // removal.
-        owner.reap.reap_detached();
+        owner.reap_detached();
         let _dispatch = owner.dispatch_gate.lock().await;
         let mut inner = None;
         {
@@ -858,7 +933,7 @@ impl ContainerRwBackend {
         let Some(owner) = owner else {
             return (None, None);
         };
-        owner.reap.reap_detached();
+        owner.reap_detached();
         let _dispatch = owner.dispatch_gate.lock().await;
         let inner = {
             let mut inflight = self.inflight.lock().await;
@@ -894,7 +969,7 @@ impl ContainerRwBackend {
             let _ = inner.cancel(session).await;
         }
         let result = match &owner {
-            Some(owner) => owner.reap.reap_observed().await,
+            Some(owner) => owner.reap_observed().await,
             None => Ok(()),
         };
         self.finish_reap(session, &owner, &result);
@@ -921,7 +996,7 @@ impl ContainerRwBackend {
             let _ = inner.cancel(session).await;
         }
         let reap_result = match &owner {
-            Some(owner) => owner.reap.reap_observed().await,
+            Some(owner) => owner.reap_observed().await,
             None => Ok(()),
         };
         self.finish_reap(session, &owner, &reap_result);
@@ -946,7 +1021,7 @@ impl ContainerRwBackend {
             let _ = inner.cancel(session).await;
         }
         let result = match &owner {
-            Some(owner) => owner.reap.reap_observed().await,
+            Some(owner) => owner.reap_observed().await,
             None => Ok(()),
         };
         self.finish_reap(session, &owner, &result);
@@ -972,7 +1047,7 @@ impl ContainerRwBackend {
             let _ = inner.cancel(session).await;
         }
         let reap_result = match &owner {
-            Some(owner) => owner.reap.reap_observed().await,
+            Some(owner) => owner.reap_observed().await,
             None => Ok(()),
         };
         self.finish_reap(session, &owner, &reap_result);
@@ -1062,7 +1137,7 @@ impl ContainerRwBackend {
             owns_reservation
         };
         if !promoted {
-            wi.owner.reap.reap_detached();
+            wi.owner.reap_detached();
             let _ = wi.inner.cancel(session).await;
             return Err(BridgeError::SessionExpired);
         }
@@ -1084,7 +1159,7 @@ impl ContainerRwBackend {
         };
         if !still_owned {
             drop(dispatch);
-            wi.owner.reap.reap_detached();
+            wi.owner.reap_detached();
             return Err(BridgeError::SessionExpired);
         }
         let prompt_result = match observers {
@@ -1103,7 +1178,7 @@ impl ContainerRwBackend {
                 if inflight.get(session).map(InflightState::generation) == Some(generation) {
                     inflight.remove(session);
                 }
-                wi.owner.reap.reap_detached();
+                wi.owner.reap_detached();
                 return Err(e);
             }
         };
@@ -1162,7 +1237,7 @@ impl AgentBackend for ContainerRwBackend {
             inflight.get(session).map(|state| state.owner().clone())
         };
         if let Some(owner) = owner {
-            owner.reap.reap_detached();
+            owner.reap_detached();
             let _dispatch = owner.dispatch_gate.lock().await;
             let state = {
                 let mut inflight = self.inflight.lock().await;
@@ -1282,7 +1357,7 @@ impl AgentBackend for ContainerRwBackend {
                 .collect()
         };
         for (_, owner) in &owners {
-            owner.reap.reap_detached();
+            owner.reap_detached();
         }
         for (session, owner) in owners {
             let _dispatch = owner.dispatch_gate.lock().await;
@@ -1320,7 +1395,7 @@ impl Drop for ContainerRwBackend {
             .cloned()
             .collect();
         for owner in owners {
-            owner.reap.reap_detached();
+            owner.reap_detached();
         }
     }
 }
@@ -1353,7 +1428,7 @@ impl Drop for ContainerReaper {
                 inflight.remove(&session);
             }
         });
-        self.owner.reap.reap_detached();
+        self.owner.reap_detached();
     }
 }
 
@@ -1564,13 +1639,14 @@ mod tests {
         last_diagnostic_redactor: Mutex<Option<bridge_core::diagnostics::DiagnosticRedactor>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
         spawn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        resource_exists: Option<Arc<AtomicBool>>,
         prompt_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         turn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
     impl CountingSpawn {
         fn new(fail: bool) -> Arc<Self> {
-            Self::with_optional_gates(fail, None, None, None, None)
+            Self::with_optional_gates(fail, None, None, None, None, None)
         }
 
         fn with_cancel_gate(
@@ -1578,7 +1654,7 @@ mod tests {
             entered: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
         ) -> Arc<Self> {
-            Self::with_optional_gates(fail, None, None, None, Some((entered, release)))
+            Self::with_optional_gates(fail, None, None, None, None, Some((entered, release)))
         }
 
         fn with_spawn_gate(
@@ -1586,7 +1662,23 @@ mod tests {
             entered: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
         ) -> Arc<Self> {
-            Self::with_optional_gates(fail, Some((entered, release)), None, None, None)
+            Self::with_optional_gates(fail, Some((entered, release)), None, None, None, None)
+        }
+
+        fn with_spawn_gate_and_resource(
+            fail: bool,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            resource_exists: Arc<AtomicBool>,
+        ) -> Arc<Self> {
+            Self::with_optional_gates(
+                fail,
+                Some((entered, release)),
+                Some(resource_exists),
+                None,
+                None,
+                None,
+            )
         }
 
         fn with_prompt_gate(
@@ -1594,7 +1686,7 @@ mod tests {
             entered: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
         ) -> Arc<Self> {
-            Self::with_optional_gates(fail, None, Some((entered, release)), None, None)
+            Self::with_optional_gates(fail, None, None, Some((entered, release)), None, None)
         }
 
         fn with_turn_gate(
@@ -1602,12 +1694,13 @@ mod tests {
             entered: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
         ) -> Arc<Self> {
-            Self::with_optional_gates(fail, None, None, Some((entered, release)), None)
+            Self::with_optional_gates(fail, None, None, None, Some((entered, release)), None)
         }
 
         fn with_optional_gates(
             fail: bool,
             spawn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+            resource_exists: Option<Arc<AtomicBool>>,
             prompt_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
             turn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
             cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -1622,6 +1715,7 @@ mod tests {
                 last_diagnostic_redactor: Mutex::new(None),
                 last_inner: Mutex::new(None),
                 spawn_gate,
+                resource_exists,
                 prompt_gate,
                 turn_gate,
                 cancel_gate,
@@ -1646,6 +1740,9 @@ mod tests {
             }
             if self.fail {
                 return Err(BridgeError::agent_crashed("boom"));
+            }
+            if let Some(resource_exists) = &self.resource_exists {
+                resource_exists.store(true, Ordering::SeqCst);
             }
             let inner = Arc::new(StubInner {
                 canceled: AtomicBool::new(false),
@@ -2427,6 +2524,165 @@ mod tests {
         assert_teardown_waits_for_inner_prompt_dispatch(true, TeardownAction::Retire).await;
     }
 
+    async fn assert_reap_waits_until_spawn_can_no_longer_create_resource(
+        warm: bool,
+        action: TeardownAction,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn_entered = Arc::new(tokio::sync::Notify::new());
+        let spawn_release = Arc::new(tokio::sync::Notify::new());
+        let resource_exists = Arc::new(AtomicBool::new(false));
+        let spawn = CountingSpawn::with_spawn_gate_and_resource(
+            false,
+            Arc::clone(&spawn_entered),
+            Arc::clone(&spawn_release),
+            Arc::clone(&resource_exists),
+        );
+        let reap_entered = Arc::new(tokio::sync::Notify::new());
+        let reap_calls = Arc::new(AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let resource_exists = Arc::clone(&resource_exists);
+            let reap_entered = Arc::clone(&reap_entered);
+            let reap_calls = Arc::clone(&reap_calls);
+            Arc::new(move |_runtime, _name| {
+                let resource_exists = Arc::clone(&resource_exists);
+                let reap_entered = Arc::clone(&reap_entered);
+                let reap_calls = Arc::clone(&reap_calls);
+                Box::pin(async move {
+                    reap_calls.fetch_add(1, Ordering::SeqCst);
+                    reap_entered.notify_one();
+                    if resource_exists.swap(false, Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(ReapFailure::NonZeroExit)
+                    }
+                })
+            })
+        };
+        let backend = Arc::new(if warm {
+            warm_backend_with_attempt(root, spawn.clone(), attempt).await
+        } else {
+            backend_with_attempt(root, spawn.clone(), attempt).await
+        });
+        let session = SessionId::parse(if warm {
+            "warm-spawn-settlement"
+        } else {
+            "cold-spawn-settlement"
+        })
+        .unwrap();
+        backend
+            .configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+
+        let prompt = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.prompt(&session, vec![]).await })
+        };
+        spawn_entered.notified().await;
+        let owner = backend.current_reap_owner(&session).unwrap();
+        match action {
+            TeardownAction::Cancel => backend.cancel(&session).await.unwrap(),
+            TeardownAction::Retire => backend.retire().await.unwrap(),
+        }
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), reap_entered.notified())
+                .await
+                .is_err(),
+            "the one-shot removal ran before spawn could no longer create the resource"
+        );
+        spawn_release.notify_one();
+        assert!(matches!(
+            prompt.await.unwrap(),
+            Err(BridgeError::SessionExpired)
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), owner.reap.reap_observed())
+                .await
+                .expect("post-spawn cleanup must settle"),
+            Ok(())
+        );
+        assert_eq!(reap_calls.load(Ordering::SeqCst), 1);
+        assert!(!resource_exists.load(Ordering::SeqCst));
+        let inner = spawn.last_inner.lock().await.clone().unwrap();
+        assert!(inner.canceled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cold_cancel_cannot_consume_reap_before_late_spawn_creates_resource() {
+        assert_reap_waits_until_spawn_can_no_longer_create_resource(false, TeardownAction::Cancel)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn warm_retire_cannot_consume_reap_before_late_spawn_creates_resource() {
+        assert_reap_waits_until_spawn_can_no_longer_create_resource(true, TeardownAction::Retire)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn aborting_spawn_future_opens_settlement_fence_for_owned_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn_entered = Arc::new(tokio::sync::Notify::new());
+        let spawn_release = Arc::new(tokio::sync::Notify::new());
+        let resource_exists = Arc::new(AtomicBool::new(false));
+        let spawn = CountingSpawn::with_spawn_gate_and_resource(
+            false,
+            Arc::clone(&spawn_entered),
+            spawn_release,
+            Arc::clone(&resource_exists),
+        );
+        let reap_calls = Arc::new(AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let resource_exists = Arc::clone(&resource_exists);
+            let reap_calls = Arc::clone(&reap_calls);
+            Arc::new(move |_runtime, _name| {
+                let resource_exists = Arc::clone(&resource_exists);
+                let reap_calls = Arc::clone(&reap_calls);
+                Box::pin(async move {
+                    reap_calls.fetch_add(1, Ordering::SeqCst);
+                    if resource_exists.swap(false, Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(ReapFailure::NonZeroExit)
+                    }
+                })
+            })
+        };
+        let backend = Arc::new(backend_with_attempt(root, spawn, attempt).await);
+        let session = SessionId::parse("aborted-spawn-settlement").unwrap();
+        backend
+            .configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let prompt = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.prompt(&session, vec![]).await })
+        };
+        spawn_entered.notified().await;
+        let owner = backend.current_reap_owner(&session).unwrap();
+        backend.cancel(&session).await.unwrap();
+        prompt.abort();
+        match prompt.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("aborted spawn prompt unexpectedly completed"),
+        }
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), owner.reap_observed())
+                .await
+                .expect("aborting spawn must open the cleanup settlement fence"),
+            Err(ReapFailure::NonZeroExit)
+        );
+        assert_eq!(reap_calls.load(Ordering::SeqCst), 1);
+        assert!(!resource_exists.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn cold_prompt_threads_diagnostic_and_rich_observers_through_spawn_and_inner() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2542,10 +2798,13 @@ mod tests {
         // Drop firing OUTSIDE a tokio runtime must not panic (process-shutdown path).
         let (reap, reaps) = counting_reap();
         let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
+        let spawn_settlement = Arc::new(SpawnSettlement::pending());
+        spawn_settlement.settle();
         let reaper = ContainerReaper {
             owner: ReapOwner {
                 generation: 0,
                 reap: ReapController::from_legacy("docker", "a2a-rw-inst-0", reap),
+                spawn_settlement,
                 dispatch_gate: Arc::new(Mutex::new(())),
             },
             inflight,
