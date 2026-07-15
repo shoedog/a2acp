@@ -1,8 +1,8 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 APPROVED / PENDING MERGE on `agent/reliability-r2b3-api-container` from `2e9ed640` (initial review and closure re-reviews 1–3 `REVISE`; four committed review folds; closure re-review 4 `APPROVE` at `492946c`; affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**)
-- **Current execution boundary:** no R2c live/billable smoke ran; run one final read-only consistency review
-  of the approval-recording docs fold, then merge R2b3; no docs-link checker is present
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 MERGED at `afcc856c` (initial review and closure re-reviews 1–3 `REVISE`; four review folds; closure re-review 4 `APPROVE` at `492946c`; final status re-review `APPROVE` at `afcc856c`; affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**)
+- **Current execution boundary:** R2b is complete; no R2c live/billable smoke ran. R2c requires explicit
+  operator authorization for exactly one bounded turn with no retry; no docs-link checker is present
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -940,11 +940,18 @@ automatically.
 - Fresh bridge-mediated Sol/xhigh closure re-review 4 on
   `492946cbb28ec624aa6b43a9a059581ef5f84538` adjudicated the shared-process `WRONG/BLOCKER`, raw-JSON
   `WRONG/MINOR`, and release-race `SMELL/MINOR` as `FIXED`; it found no new findings and returned
-  `APPROVE`. It accepted the supplied gates rather than rerunning them. No R2c live/billable smoke has run,
-  and no docs-link checker is present. Run one final status-only consistency review, then merge R2b3.
+  `APPROVE`. It accepted the supplied gates rather than rerunning them.
+- The approval-recording fold reran full workspace **1,896 / 0 / 12 ignored** and hygiene **37/7**. Its
+  first status-only review returned `REVISE` on `15a5ed97` for contradictory top-level status. The amended
+  `afcc856c` fold aligned the roadmap top/table/vocabulary, plan, and design; reran the same full/hygiene
+  gates; and received targeted Sol/xhigh `APPROVE` with the inherited mismatch `FIXED` and no new findings.
+  R2b3 was fast-forwarded and pushed to `origin/main` at
+  `afcc856c3276fe682fb78dc657591021f5e604fc`. No R2c live/billable smoke has run, and no docs-link checker
+  is present.
 
 ## R2b completion gate
 
-R2b is complete only when R2b0–R2b3 are merged and the R2 design's entire R2b test list is satisfied.
-Record the final commit/PRs, exact suite totals, review verdicts, and unrun live gates in the central
-roadmap. Then change the single next action to R2c.
+R2b completed at `afcc856c3276fe682fb78dc657591021f5e604fc`: R2b0–R2b3 are merged and the R2 design's
+entire R2b test list is satisfied.
+The central roadmap records the final direct-main commit, exact suite totals, review verdicts, unrun live
+gates, and R2c as the single next action.

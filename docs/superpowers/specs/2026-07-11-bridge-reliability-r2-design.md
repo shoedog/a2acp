@@ -1,14 +1,16 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v14)
 
-- **Status:** R2a, R2b0, R2b1, and R2b2 merged; R2b3 APPROVED / PENDING MERGE on
-  `agent/reliability-r2b3-api-container` from `2e9ed640`; v14 is the design of record for R2b3
+- **Status:** R2a and R2b0–R2b3 merged; R2b3 merge head is
+  `afcc856c3276fe682fb78dc657591021f5e604fc`; v14 is the design of record for completed R2b
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
   and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,
   full host workspace **1,896 / 0 / 12 ignored** across 66 executables, all-target check,
   warnings-denied Clippy, release build, format/diff, and hygiene **37/7**. Closure re-review 4 adjudicated
   all three inherited findings `FIXED`, found no new `WRONG` or `SMELL`, and returned `APPROVE` on
-  `492946cbb28ec624aa6b43a9a059581ef5f84538`. No R2c smoke ran.
+  `492946cbb28ec624aa6b43a9a059581ef5f84538`. The approval-recording fold's first status review returned
+  `REVISE`; its corrected final re-review adjudicated that cursor mismatch `FIXED`, found no new findings,
+  and returned `APPROVE` on merge head `afcc856c`. No R2c smoke ran.
 - **R2b2 review state:** R2b2d closure review 12 `APPROVE` at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; final full-R2b2 review 1 `REVISE`; cold-path fold
   `a459b31de5a4665138a7330868e38dfb8992438b`; closure re-review 1 `REVISE`; retry-veto fold
@@ -19,7 +21,7 @@
   `0627e91144e79d9328ed9b5635033cf410c9e96e`
 - **Current execution boundary:** no live/billable gate ran; no docs-link checker is present
 - **Date:** 2026-07-11
-- **Last amended:** 2026-07-14
+- **Last amended:** 2026-07-15
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`
 - **R2b1 commit:** `7b788c1fa6b62459e8a8473ca853f9414b28bfbc`
@@ -31,6 +33,7 @@
 - **R2b2 re-review-1 fold:** `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`
 - **R2b2 merge head:** `0627e91144e79d9328ed9b5635033cf410c9e96e`
 - **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
+- **R2b3 merge head:** `afcc856c3276fe682fb78dc657591021f5e604fc`
 - **Program:** [`docs/bridge-reliability.md`](../../bridge-reliability.md), R2
 - **Security boundary:** [`ADR-0032`](../../adr/0032-sandbox-tier-model.md)
 
