@@ -811,6 +811,7 @@ automatically.
 ## R2b3 — API/provider mapping and remaining container/dispatch observation
 
 - **Branch:** `agent/reliability-r2b3-api-container`
+- **Implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
 - **Prerequisite:** R2b2 merged
 
 ### API work

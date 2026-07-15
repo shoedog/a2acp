@@ -25,6 +25,7 @@
 - **R2b2 final-review fold:** `a459b31de5a4665138a7330868e38dfb8992438b`
 - **R2b2 re-review-1 fold:** `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`
 - **R2b2 merge head:** `0627e91144e79d9328ed9b5635033cf410c9e96e`
+- **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
 - **Program:** [`docs/bridge-reliability.md`](../../bridge-reliability.md), R2
 - **Security boundary:** [`ADR-0032`](../../adr/0032-sandbox-tier-model.md)
 

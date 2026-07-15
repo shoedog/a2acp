@@ -6,6 +6,7 @@
   closure re-review 2 `APPROVE` at `0c0e3fe`
 - **Active slice:** R2b3 **IN PROGRESS** on `agent/reliability-r2b3-api-container`, based on
   `2e9ed6408162c5af760c70c9d27237330429e81a`
+- **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
 - **Current exact R2b3 gate:** **566 / 0 / 1 ignored** across `bridge-acp`, `bridge-api`,
   `bridge-container`, and `bridge-core`; format/diff clean
 - **Full workspace gate:** host serial **1,860 / 0 / 12 ignored** across 65 harness groups; workspace
@@ -202,8 +203,9 @@ Next action:
 
 ## Current handoff
 
-- R2b3 is implemented but uncommitted and unreviewed on `agent/reliability-r2b3-api-container`, based on
-  `origin/main` at `2e9ed6408162c5af760c70c9d27237330429e81a`. The branch adds the API prompt acceptance
+- R2b3 is implemented and committed at `ed172ee726c06c3ee2e3f363c80178d367f8834a`, but not yet
+  reviewed, on `agent/reliability-r2b3-api-container`, based on `origin/main` at
+  `2e9ed6408162c5af760c70c9d27237330429e81a`. The branch adds the API prompt acceptance
   barrier, bounded provider-error parsing and exact HTTP/ACP mapping, shared joinable container reaping,
   cold/cache-miss/reuse observation, and observed cleanup across ACP `:ro` and `container_rw` paths.
   Focused regressions include pre-change-red first-send ordering, provider conflict/unknown boundaries,
