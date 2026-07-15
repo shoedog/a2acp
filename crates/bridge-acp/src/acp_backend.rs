@@ -8,7 +8,7 @@
 // Full cancel *completion* semantics live in Task 4; Task 3's `cancel` only
 // latches + sends the notification.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -30,9 +30,10 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Error as AcpError, ErrorCode,
+    Agent, Client, ConnectTo, ConnectionTo, Error as AcpError, ErrorCode, Lines,
 };
 use async_trait::async_trait;
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -91,6 +92,122 @@ const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(50
 const RICH_CONTENT_CAP: usize = 2048;
 const RICH_VEC_CAP: usize = 64;
 const PERMISSION_VIEW_CAP: usize = 4096;
+
+struct UniqueJsonObjectMembers;
+
+impl<'de> serde::Deserialize<'de> for UniqueJsonObjectMembers {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonObjectMembersVisitor)
+    }
+}
+
+struct UniqueJsonObjectMembersVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueJsonObjectMembersVisitor {
+    type Value = UniqueJsonObjectMembers;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object members")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonObjectMembers)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonObjectMembers)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonObjectMembers)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonObjectMembers)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonObjectMembers)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonObjectMembers)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonObjectMembers)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonObjectMembers)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while sequence
+            .next_element::<UniqueJsonObjectMembers>()?
+            .is_some()
+        {}
+        Ok(UniqueJsonObjectMembers)
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut members = HashSet::new();
+        while let Some(member) = object.next_key::<String>()? {
+            if !members.insert(member) {
+                return Err(<A::Error as serde::de::Error>::custom(
+                    "duplicate JSON object member",
+                ));
+            }
+            object.next_value::<UniqueJsonObjectMembers>()?;
+        }
+        Ok(UniqueJsonObjectMembers)
+    }
+}
+
+fn validate_unique_acp_json_line(line: String) -> std::io::Result<String> {
+    let mut deserializer = serde_json::Deserializer::from_str(&line);
+    UniqueJsonObjectMembers::deserialize(&mut deserializer)
+        .and_then(|_| deserializer.end())
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ACP JSON frame is malformed or contains duplicate object members",
+            )
+        })?;
+    Ok(line)
+}
+
+fn validated_acp_transport<OB, IB>(outgoing: OB, incoming: IB) -> impl ConnectTo<Client> + 'static
+where
+    OB: futures::io::AsyncWrite + Send + 'static,
+    IB: futures::io::AsyncRead + Send + 'static,
+{
+    use futures::io::BufReader;
+    use futures::{AsyncBufReadExt, AsyncWriteExt, StreamExt};
+
+    let incoming_lines = Box::pin(
+        BufReader::new(incoming)
+            .lines()
+            .map(|line| line.and_then(validate_unique_acp_json_line)),
+    );
+    let outgoing_sink =
+        futures::sink::unfold(Box::pin(outgoing), async move |mut writer, line: String| {
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            writer.write_all(&bytes).await?;
+            Ok::<_, std::io::Error>(writer)
+        });
+    Lines::new(outgoing_sink, incoming_lines)
+}
 
 #[derive(Clone)]
 struct AcpLifecycle {
@@ -1573,9 +1690,9 @@ impl AcpBackend {
 
     /// **Production** constructor: spawn `cmd args` as a `Supervised` child
     /// (its own process group, tested SIGTERM→SIGKILL reaping) and drive the
-    /// ACP connection over its stdin/stdout as `ByteStreams`.
+    /// ACP connection over its stdin/stdout with raw-frame uniqueness validation.
     ///
-    /// This is `Supervised` + `connect(ByteStreams)`: process lifecycle stays
+    /// This is `Supervised` + `connect(Lines)`: process lifecycle stays
     /// with `Supervised`; protocol drive is the shared `connect` core.
     pub async fn spawn(cmd: &str, args: &[&str], config: AcpConfig) -> Result<Self, BridgeError> {
         Self::spawn_observed(
@@ -1698,9 +1815,11 @@ impl AcpBackend {
                         .await)
                 }
             };
-            // The crate uses `futures` async-io; our child uses tokio pipes — adapt
-            // with tokio_util::compat. ByteStreams::new(outgoing_writer, incoming_reader).
-            let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+            // Validate raw JSON object-member uniqueness before the ACP SDK
+            // deserializes error data into `serde_json::Value` (which otherwise
+            // collapses duplicate keys). The crate uses `futures` async-io; our
+            // child uses tokio pipes, so adapt them with tokio-util compat.
+            let transport = validated_acp_transport(stdin.compat_write(), stdout.compat());
             lifecycle
                 .record(
                     DiagnosticPhase::Spawn,
@@ -3139,7 +3258,7 @@ impl AcpBackend {
 
     /// Construct from an already-spawned `Supervised` child, driving the ACP
     /// connection over its stdin/stdout via the SDK — a thin shim over `connect`
-    /// (same `ByteStreams` + tokio→futures-io compat as `spawn`, but for a child
+    /// (same validated line transport + tokio→futures-io compat as `spawn`, but for a child
     /// the caller already spawned). The returned backend owns `supervised` for
     /// its lifetime (so `kill_on_drop` does not SIGKILL it on return).
     ///
@@ -3161,7 +3280,7 @@ impl AcpBackend {
             .stdout
             .take()
             .ok_or_else(|| BridgeError::agent_crashed("agent stdout unavailable in from_child"))?;
-        let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+        let transport = validated_acp_transport(stdin.compat_write(), stdout.compat());
         let mut backend = Self::connect_observed_after(
             transport,
             config,
@@ -4553,63 +4672,12 @@ impl AgentBackend for AcpBackend {
     }
 
     async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
-        let container = self.container_reap.clone();
-        // Transfer cleanup to the process-owned controller before the first
-        // async lifecycle snapshot. Canceling this checked waiter while the
-        // session map is contended cannot suppress container removal.
-        if let Some(container) = &container {
-            self.reaped.store(true, Ordering::SeqCst);
-            container.reap_detached();
-        }
-        let lifecycle = if container.is_some() {
-            Some(
-                self.operation_lifecycle(
-                    session,
-                    Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
-                )
-                .await,
-            )
-        } else {
-            None
-        };
-        if let Some(lifecycle) = &lifecycle {
-            lifecycle
-                .record(
-                    DiagnosticPhase::Teardown,
-                    PhaseStatus::Started,
-                    None,
-                    Some("acp.teardown.release"),
-                    None,
-                )
-                .await?;
-        }
-        let release_result = self.release_session_result(session).await;
-        let reap_result = match &container {
-            Some(container) => container.reap_observed().await,
-            None => Ok(()),
-        };
-        if let Err(failure) = release_result {
-            return Err(failure.error);
-        }
-        if let Err(failure) = reap_result {
-            return Err(lifecycle
-                .expect("container cleanup lifecycle")
-                .failure(
-                    DiagnosticPhase::Teardown,
-                    None,
-                    DiagnosticFailureClass::ContainerRuntime,
-                    FailureDisposition::Fatal,
-                    failure.code(),
-                    "Container removal failed",
-                    None,
-                    true,
-                    None,
-                    None,
-                    None,
-                )
-                .await);
-        }
-        Ok(())
+        // ACP multiplexes every bridge session over one process. Releasing a
+        // session must clear only that session; process/container ownership is
+        // retired by `retire`, escalation, spawn-failure cleanup, or `Drop`.
+        self.release_session_result(session)
+            .await
+            .map_err(|failure| failure.error)
     }
 
     async fn release_session_observed(
@@ -4617,19 +4685,9 @@ impl AgentBackend for AcpBackend {
         session: &SessionId,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<(), BridgeError> {
-        let container = self.container_reap.clone();
-
-        // A `:ro` release owns process cleanup, not just the ACP session map.
-        // Select/start the observer-free flight before even the async lifecycle
-        // snapshot, then before the first cancellable diagnostic write. If the
-        // waiter or write is canceled/rejected, cleanup still runs.
-        if let Some(container) = &container {
-            self.reaped.store(true, Ordering::SeqCst);
-            container.reap_detached();
-        }
         let lifecycle = self.operation_lifecycle(session, observer).await;
 
-        let start_result = lifecycle
+        lifecycle
             .record(
                 DiagnosticPhase::Teardown,
                 PhaseStatus::Started,
@@ -4637,21 +4695,9 @@ impl AgentBackend for AcpBackend {
                 Some("acp.teardown.release"),
                 None,
             )
-            .await;
-        if container.is_none() {
-            if let Err(error) = &start_result {
-                // Preserve the existing persistence-first behavior for the
-                // shared, non-container ACP backend.
-                return Err(error.clone());
-            }
-        }
+            .await?;
         let release_result = self.release_session_result(session).await;
-        let reap_result = match &container {
-            Some(container) => container.reap_observed().await,
-            None => Ok(()),
-        };
 
-        start_result?;
         if let Err(TeardownFailure {
             error,
             prompt_may_have_been_accepted,
@@ -4673,33 +4719,12 @@ impl AgentBackend for AcpBackend {
                 )
                 .await);
         }
-        if let Err(failure) = reap_result {
-            return Err(lifecycle
-                .failure(
-                    DiagnosticPhase::Teardown,
-                    None,
-                    DiagnosticFailureClass::ContainerRuntime,
-                    FailureDisposition::Fatal,
-                    failure.code(),
-                    "Container removal failed",
-                    None,
-                    true,
-                    None,
-                    None,
-                    None,
-                )
-                .await);
-        }
         lifecycle
             .record(
                 DiagnosticPhase::Teardown,
                 PhaseStatus::Completed,
                 None,
-                Some(if container.is_some() {
-                    "acp.teardown.container_reaped"
-                } else {
-                    "acp.teardown.released"
-                }),
+                Some("acp.teardown.released"),
                 None,
             )
             .await
@@ -6178,6 +6203,9 @@ mod tests {
         new_session_started: Arc<Notify>,
         /// The agent-minted session id the fake returns from `session/new`.
         minted_id: &'static str,
+        /// When set, append the mint sequence so multi-session tests exercise
+        /// distinct agent-side session ids on one shared connection.
+        unique_minted_ids: Arc<AtomicBool>,
         /// Agent session ids observed via `session/cancel` notifications.
         cancels: Arc<Mutex<Vec<String>>>,
         /// Fires every time a `session/cancel` is recorded (for awaiting it).
@@ -6311,6 +6339,7 @@ mod tests {
                 gate_new_session: Arc::new(AtomicBool::new(false)),
                 new_session_started: Arc::new(Notify::new()),
                 minted_id,
+                unique_minted_ids: Arc::new(AtomicBool::new(false)),
                 cancels: Arc::new(Mutex::new(Vec::new())),
                 cancel_seen: Arc::new(Notify::new()),
                 prompt_log: Arc::new(Mutex::new(Vec::new())),
@@ -6883,7 +6912,8 @@ mod tests {
                           _cx| {
                         let r = r_new.clone();
                         async move {
-                            r.new_session_calls.fetch_add(1, Ordering::SeqCst);
+                            let mint_sequence =
+                                r.new_session_calls.fetch_add(1, Ordering::SeqCst) + 1;
                             // Record the cwd the client sent so Task-4 tests can
                             // assert the correct cwd reached the wire.
                             *r.new_session_cwd.lock().await = Some(req.cwd);
@@ -6896,8 +6926,13 @@ mod tests {
                                 r.new_session_gate.notified().await;
                             }
                             let modes = r.session_modes.lock().await.clone();
+                            let minted_id = if r.unique_minted_ids.load(Ordering::SeqCst) {
+                                format!("{}-{mint_sequence}", r.minted_id)
+                            } else {
+                                r.minted_id.to_string()
+                            };
                             responder.respond(
-                                NewSessionResponse::new(AgentSessionId::new(r.minted_id))
+                                NewSessionResponse::new(AgentSessionId::new(minted_id))
                                     .modes(modes)
                                     .config_options(r.advertised_config_options().await),
                             )?;
@@ -8012,6 +8047,21 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| event.transition().phase() != DiagnosticPhase::PromptFinish));
+    }
+
+    #[test]
+    fn raw_acp_json_rejects_duplicate_members_before_sdk_value_collapse() {
+        let duplicate = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"limited","data":{"retry_after_ms":1,"retry_after_ms":2}}}"#;
+        assert!(
+            validate_unique_acp_json_line(duplicate.to_string()).is_err(),
+            "the raw line boundary must reject duplicate object members before serde_json::Value keeps only the last value"
+        );
+
+        let distinct_paths = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"limited","data":{"retry_after_ms":1,"error":{"retry_after_ms":1}}}}"#;
+        assert_eq!(
+            validate_unique_acp_json_line(distinct_paths.to_string()).unwrap(),
+            distinct_paths
+        );
     }
 
     #[tokio::test]
@@ -11826,7 +11876,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_ro_release_joins_one_container_reap_and_records_completion() {
+    async fn checked_release_keeps_shared_ro_process_for_another_session() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_attempt = Arc::clone(&calls);
+        let process_unavailable = Arc::new(AtomicBool::new(false));
+        let unavailable_for_attempt = Arc::clone(&process_unavailable);
+        let attempt: ReapAttemptFn = Arc::new(move |_runtime, _name| {
+            let calls = Arc::clone(&calls_for_attempt);
+            let unavailable = Arc::clone(&unavailable_for_attempt);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                unavailable.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let controller = ReapController::new("docker", "a2a-ro-shared-checked", attempt);
+        let recorder = Recorder::new("agent-sess-RO-SHARED-CHECKED");
+        recorder.unique_minted_ids.store(true, Ordering::SeqCst);
+        let mut backend = connect_recording(recorder).await;
+        backend.container_reap = Some(controller.clone());
+        backend.unavailable = Arc::clone(&process_unavailable);
+        let first = bkey("bridge-RO-SHARED-CHECKED-1");
+        let second = bkey("bridge-RO-SHARED-CHECKED-2");
+        backend.ensure_session(&first).await.unwrap();
+
+        backend.release_session_checked(&first).await.unwrap();
+        let reaps_after_session_release = calls.load(Ordering::SeqCst);
+
+        let mut stream = backend.prompt(&second, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+        backend.retire().await.unwrap();
+        controller.reap_observed().await.unwrap();
+
+        assert_eq!(
+            reaps_after_session_release, 0,
+            "per-session release must not reap the process shared by another session"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn observed_release_keeps_shared_ro_process_during_another_session_prompt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_attempt = Arc::clone(&calls);
+        let process_unavailable = Arc::new(AtomicBool::new(false));
+        let unavailable_for_attempt = Arc::clone(&process_unavailable);
+        let attempt: ReapAttemptFn = Arc::new(move |_runtime, _name| {
+            let calls = Arc::clone(&calls_for_attempt);
+            let unavailable = Arc::clone(&unavailable_for_attempt);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                unavailable.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let controller = ReapController::new("docker", "a2a-ro-shared-observed", attempt);
+        let recorder = Recorder::new("agent-sess-RO-SHARED-OBSERVED");
+        recorder.unique_minted_ids.store(true, Ordering::SeqCst);
+        recorder.gate_prompt.store(true, Ordering::SeqCst);
+        let mut backend = connect_recording(recorder.clone()).await;
+        backend.container_reap = Some(controller.clone());
+        backend.unavailable = Arc::clone(&process_unavailable);
+        let backend = Arc::new(backend);
+        let first = bkey("bridge-RO-SHARED-OBSERVED-1");
+        let second = bkey("bridge-RO-SHARED-OBSERVED-2");
+        backend.ensure_session(&first).await.unwrap();
+        backend.ensure_session(&second).await.unwrap();
+
+        let mut stream = backend.prompt(&second, vec![]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), recorder.prompt_started.notified())
+            .await
+            .expect("the second session prompt must be active before releasing the first");
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        backend
+            .release_session_observed(&first, observer)
+            .await
+            .unwrap();
+        let reaps_while_other_prompt_active = calls.load(Ordering::SeqCst);
+        let unavailable_while_other_prompt_active = process_unavailable.load(Ordering::SeqCst);
+
+        recorder.prompt_gate.notify_one();
+        while stream.next().await.is_some() {}
+        backend.retire().await.unwrap();
+        controller.reap_observed().await.unwrap();
+
+        assert_eq!(
+            reaps_while_other_prompt_active, 0,
+            "releasing one session must not reap a shared process with accepted work in another"
+        );
+        assert!(
+            !unavailable_while_other_prompt_active,
+            "releasing one session must leave the shared connection usable"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn observed_ro_session_release_defers_one_container_reap_until_retirement() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_attempt = Arc::clone(&calls);
         let attempt: ReapAttemptFn = Arc::new(move |_runtime, _name| {
@@ -11849,8 +11995,10 @@ mod tests {
             .release_session_observed(&session, observer.clone())
             .await
             .unwrap();
-        // Retirement/drop may join the same controller later, but no path may
-        // install a second runtime removal attempt.
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(controller.result(), None);
+
+        // Process-scoped retirement owns the one removal attempt.
         backend.retire().await.unwrap();
         controller.reap_observed().await.unwrap();
 
@@ -11861,7 +12009,7 @@ mod tests {
         assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
         assert_eq!(
             events[1].transition().code().map(|code| code.as_str()),
-            Some("acp.teardown.container_reaped")
+            Some("acp.teardown.released")
         );
         tokio::time::timeout(Duration::from_secs(2), recorder.cancel_seen.notified())
             .await
@@ -11869,7 +12017,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_ro_release_surfaces_each_typed_runtime_failure() {
+    async fn observed_ro_session_release_defers_typed_runtime_failure_to_retirement() {
         for failure in [
             ReapFailure::Spawn,
             ReapFailure::Timeout,
@@ -11890,33 +12038,30 @@ mod tests {
             let mut backend =
                 connect_recording_with(Recorder::new("agent-sess-RO-RELEASE-FAILURE"), config)
                     .await;
-            backend.container_reap = Some(controller);
+            backend.container_reap = Some(controller.clone());
             let session = bkey("bridge-RO-RELEASE-FAILURE");
             backend.ensure_session(&session).await.unwrap();
             let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
 
-            let error = backend
+            backend
                 .release_session_observed(&session, observer.clone())
                 .await
-                .expect_err("typed runtime failure must fail observed release");
-            let diagnostic = assert_agent_failure(
-                &error,
-                DiagnosticPhase::Teardown,
-                DiagnosticFailureClass::ContainerRuntime,
-                true,
-            );
-            assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
-            assert_eq!(diagnostic.code().as_str(), failure.code());
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
+                .expect("per-session release does not own process cleanup");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controller.result(), None);
             let events = observer.snapshot().await;
             assert_eq!(events.len(), 2);
             assert_eq!(events[0].transition().status(), PhaseStatus::Started);
-            assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+            assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+
+            backend.retire().await.unwrap();
+            assert_eq!(controller.reap_observed().await, Err(failure));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
     }
 
     #[tokio::test]
-    async fn checked_ro_release_surfaces_the_typed_runtime_failure() {
+    async fn checked_ro_session_release_defers_typed_runtime_failure_to_retirement() {
         let attempt: ReapAttemptFn =
             Arc::new(|_runtime, _name| Box::pin(async move { Err(ReapFailure::Timeout) }));
         let controller = ReapController::new("docker", "a2a-ro-checked", attempt);
@@ -11926,22 +12071,16 @@ mod tests {
         let session = bkey("bridge-RO-CHECKED");
         backend.ensure_session(&session).await.unwrap();
 
-        let error = backend
-            .release_session_checked(&session)
-            .await
-            .expect_err("checked cleanup must join the container-removal flight");
-        let diagnostic = assert_agent_failure(
-            &error,
-            DiagnosticPhase::Teardown,
-            DiagnosticFailureClass::ContainerRuntime,
-            true,
-        );
-        assert_eq!(diagnostic.code().as_str(), ReapFailure::Timeout.code());
+        backend.release_session_checked(&session).await.unwrap();
+        assert_eq!(controller.result(), None);
+
+        backend.retire().await.unwrap();
+        assert_eq!(controller.reap_observed().await, Err(ReapFailure::Timeout));
         assert_eq!(controller.result(), Some(Err(ReapFailure::Timeout)));
     }
 
     #[tokio::test]
-    async fn checked_ro_release_waits_for_the_owned_successful_cleanup() {
+    async fn checked_ro_session_release_does_not_wait_for_process_cleanup() {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let attempt: ReapAttemptFn = {
@@ -11970,17 +12109,24 @@ mod tests {
             let session = session.clone();
             tokio::spawn(async move { backend.release_session_checked(&session).await })
         };
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("checked session release must not wait for process cleanup")
+            .unwrap()
+            .unwrap();
+        assert_eq!(controller.result(), None);
+
+        backend.retire().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
-            .expect("checked release starts the container cleanup");
-        assert!(!task.is_finished());
+            .expect("retirement starts process cleanup");
         release.notify_one();
-        task.await.unwrap().unwrap();
+        controller.reap_observed().await.unwrap();
         assert_eq!(controller.result(), Some(Ok(())));
     }
 
     #[tokio::test]
-    async fn canceled_checked_ro_release_cannot_suppress_reap_before_lifecycle_snapshot() {
+    async fn canceled_checked_ro_session_release_leaves_process_cleanup_for_retirement() {
         let entered = Arc::new(Notify::new());
         let attempt: ReapAttemptFn = {
             let entered = Arc::clone(&entered);
@@ -12008,17 +12154,21 @@ mod tests {
             let session = session.clone();
             tokio::spawn(async move { backend.release_session_checked(&session).await })
         };
-        tokio::time::timeout(Duration::from_millis(100), entered.notified())
-            .await
-            .expect("checked :ro release must start cleanup before its lifecycle snapshot await");
+        tokio::task::yield_now().await;
         release.abort();
         assert!(release.await.unwrap_err().is_cancelled());
-        assert_eq!(controller.reap_observed().await, Ok(()));
+        assert_eq!(controller.result(), None);
         drop(sessions_guard);
+
+        backend.retire().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("retirement starts process cleanup");
+        assert_eq!(controller.reap_observed().await, Ok(()));
     }
 
     #[tokio::test]
-    async fn canceled_observed_ro_release_cannot_suppress_reap_before_lifecycle_snapshot() {
+    async fn canceled_observed_ro_session_release_leaves_process_cleanup_for_retirement() {
         let entered = Arc::new(Notify::new());
         let attempt: ReapAttemptFn = {
             let entered = Arc::clone(&entered);
@@ -12047,17 +12197,21 @@ mod tests {
             let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
             tokio::spawn(async move { backend.release_session_observed(&session, observer).await })
         };
-        tokio::time::timeout(Duration::from_millis(100), entered.notified())
-            .await
-            .expect("observed :ro release must start cleanup before its lifecycle snapshot await");
+        tokio::task::yield_now().await;
         release.abort();
         assert!(release.await.unwrap_err().is_cancelled());
-        assert_eq!(controller.reap_observed().await, Ok(()));
+        assert_eq!(controller.result(), None);
         drop(sessions_guard);
+
+        backend.retire().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("retirement starts process cleanup");
+        assert_eq!(controller.reap_observed().await, Ok(()));
     }
 
     #[tokio::test]
-    async fn rejected_ro_release_observation_cannot_suppress_or_detach_cleanup() {
+    async fn rejected_ro_session_release_observation_does_not_reap_shared_process() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_attempt = Arc::clone(&calls);
         let entered = Arc::new(Notify::new());
@@ -12095,22 +12249,28 @@ mod tests {
                 .await
         });
 
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("the rejected diagnostic write must return promptly")
+                .unwrap(),
+            Err(BridgeError::StoreFailure)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(controller.result(), None);
+        assert!(backend.sessions.lock().await.get(&session).is_some());
+
+        backend.retire().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
-            .expect("reap must start before the rejected diagnostic write can return");
-        assert!(
-            !task.is_finished(),
-            "observer failure must wait for the already-owned cleanup result"
-        );
+            .expect("retirement starts process cleanup");
         release.notify_one();
-        assert_eq!(task.await.unwrap(), Err(BridgeError::StoreFailure));
+        assert_eq!(controller.reap_observed().await, Ok(()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(controller.result(), Some(Ok(())));
-        assert!(backend.sessions.lock().await.get(&session).is_none());
     }
 
     #[tokio::test]
-    async fn failed_ro_cleanup_event_persistence_remains_the_public_error() {
+    async fn failed_release_event_persistence_precedes_later_retirement_result() {
         let attempt: ReapAttemptFn =
             Arc::new(|_runtime, _name| Box::pin(async move { Err(ReapFailure::Timeout) }));
         let controller = ReapController::new("docker", "a2a-ro-persistence", attempt);
@@ -12131,9 +12291,12 @@ mod tests {
         );
         assert_eq!(
             controller.result(),
-            Some(Err(ReapFailure::Timeout)),
-            "the process-owned controller still retains its typed result"
+            None,
+            "per-session observation never starts process cleanup"
         );
+        backend.retire().await.unwrap();
+        assert_eq!(controller.reap_observed().await, Err(ReapFailure::Timeout));
+        assert_eq!(controller.result(), Some(Err(ReapFailure::Timeout)));
     }
 
     #[tokio::test]

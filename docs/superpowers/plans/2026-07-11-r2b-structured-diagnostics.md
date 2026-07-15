@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 IN PROGRESS on `agent/reliability-r2b3-api-container` from `2e9ed640` (initial review and closure re-reviews 1–2 `REVISE`; three folds on branch head; affected packages **597 / 0 / 1 ignored**; full host workspace **1,891 / 0 / 12 ignored**; hygiene **37/7**; closure re-review 3 pending)
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 IN PROGRESS on `agent/reliability-r2b3-api-container` from `2e9ed640` (initial review and closure re-reviews 1–3 `REVISE`; four committed review folds; affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; closure re-review 4 pending)
 - **Current execution boundary:** no R2c live/billable smoke ran; run a fresh full-branch closure
   re-review; no docs-link checker is present
 - **Prerequisite:** R2a merged at `24aff09c`
@@ -830,8 +830,9 @@ automatically.
 - Preserve `ContainerSpawn::spawn`, override defaulted `spawn_observed` in production, and have
   `ContainerRwBackend::prompt_with_observers` thread both channels through `open_inner` without storing
   the operation observer in `WarmInner`.
-- Add the shared-state joinable `ReapController`: observed release awaits and returns one bounded reap
-  result; `Drop`/registry retirement use detached start/join and never write late task diagnostics.
+- Add the shared-state joinable `ReapController`: `ContainerRwBackend` checked/observed release awaits
+  and returns one bounded process reap result; `Drop`/registry retirement use detached start/join and never
+  write late task diagnostics. ACP per-session release does not own its multiplexed process/container.
 - Cover cold per-turn container creation, warm cache miss, and warm reuse (`backend.reused`).
 - Complete any production prompt owner named by R2b0 that is not yet observed.
 - Do not implement R2d fallback eligibility or host execution here.
@@ -843,9 +844,11 @@ automatically.
 - every post-installation failure is fatal and neither E6 nor warm respawn replays it;
 - every recognized code/status pair and every conflict/unknown boundary;
 - duplicate/malformed/out-of-range retry/reset metadata is omitted with a bridge-owned diagnostic code;
+  production ACP rejects duplicate-bearing raw frames before SDK map normalization;
 - provider-limit remains fatal and never routes to Sol/Fable/container fallback automatically;
 - cold, cache-miss, and reuse container observer sequences;
 - observed reap success, spawn failure, timeout, nonzero exit, concurrent joiners, and detached drop;
+- cold and warm checked release race inner prompt installation and join the exact dispatch gate;
 - full task-journal, CLI/operator artifact, trace, and A2A wire secret regressions.
 
 ### R2b3 implementation evidence before full review
@@ -858,17 +861,18 @@ automatically.
   `Retry-After`; malformed, duplicate, conflicting, fuzzy, status-only 429/503/529, and incompatible
   evidence remains `unknown` or receives a bridge-owned conflict/invalid-metadata code.
 - ACP preserves the structured SDK error and applies the same token table only at the four normative flat
-  or nested `code`/`type` paths. Auth-required is authoritative; arbitrary message/stderr prose remains
-  `unknown`.
+  or nested `code`/`type` paths. Production raw frames are validated for unique object-member names before
+  SDK deserialization. Auth-required is authoritative; arbitrary message/stderr prose remains `unknown`.
 - `ReapController` owns one cancellation-safe detached cleanup flight and one stable typed result for all
   observed and detached joiners. Production reaping bounds `<runtime> rm -f` and distinguishes spawn,
   timeout, nonzero-exit, and worker-panic failures.
 - `ContainerRwBackend` forwards operation-local observers through cold creation, warm cache miss, and
   warm reuse without storing them in `WarmInner`. Reuse emits `backend.reused`; owned retirement starts
   cleanup before cancellable agent termination; cold spawn failures retain a joinable cleanup result.
-- ACP observed `:ro` release and `container_rw` release await the same controller and surface cleanup
-  failures as fatal accepted `container_runtime` diagnostics. Observer rejection cannot suppress or
-  detach cleanup.
+- `container_rw` checked/observed release awaits its per-turn/per-warm-session controller and surfaces
+  cleanup failures as fatal accepted `container_runtime` diagnostics. ACP checked/observed release clears
+  only the named session because its `:ro` process is shared across sessions; spawn failure, escalation,
+  retirement, and `Drop` own ACP process cleanup.
 - Pre-change-red regressions cover first-send installation order, closed provider mappings and their
   negative/conflict edges, cold spawn-failure cleanup joining, retirement-before-cancel, typed cleanup
   failures, concurrent joiners, detached cleanup, and centralized diagnostic-construction guards.
@@ -883,8 +887,10 @@ automatically.
 - The review fold publishes a generation-bound controller in every cold/warm reservation before spawn,
   seals retirement under the same admission lock, starts cleanup when cancel/retire takes the reservation,
   and permits only the exact generation to promote or dispatch. A later cold generation is fenced until
-  checked/observed cleanup acknowledges the retained owner. Cold Forget, warm `Drop`, and ACP checked `:ro`
-  release now join/start the same process-owned flight. The exact public
+  checked/observed cleanup acknowledges the retained owner. Cold Forget and warm `Drop` join/start their
+  process-owned flight. The earlier ACP checked `:ro` release ownership claim is superseded by v14: an ACP
+  backend shares one process across sessions, so only process-scoped retirement/escalation/drop may reap
+  it. The exact public
   `ContainerReap { runtime, name, reap_fn }` shape is restored; bridge production spawn supplies a private
   typed controller. Self-audit also closes cancel-during-turn-configuration for cold and first warm turns.
 - Pre-change-red regressions cover all of those schedules, successful and failed checked cleanup, stale
@@ -896,11 +902,11 @@ automatically.
   It also found that a clean SSE EOF without `[DONE]` or `finish_reason` was accepted and that this design
   header retained stale gate totals.
 - The second fold adds one exact-generation dispatch gate, held only across inner prompt installation and
-  joined by cancel/release/retire before return. Every teardown starts its process-owned reaper before its
-  first cancellable gate or lifecycle-snapshot await. Clean SSE EOF now requires terminal evidence while
-  preserving `finish_reason`-only success. Ten deterministic pre-change-red regressions cover cold/warm
-  cancel/retire dispatch, ACP/container waiter cancellation before cleanup start, incomplete SSE EOF, and
-  its terminal negative control.
+  joined by container cancel/release/retire before return. Container teardown starts its generation-owned
+  reaper before its first cancellable gate; ACP process retirement retains separate process-scoped cleanup.
+  Clean SSE EOF now requires terminal evidence while preserving `finish_reason`-only success. Ten
+  deterministic pre-change-red regressions cover cold/warm cancel/retire dispatch, the then-current
+  ACP/container cleanup-start contract, incomplete SSE EOF, and its terminal negative control.
 - Fresh Sol/xhigh closure re-review 2 on `99cf8b02c73edc42b93dae6792a8701a5df13192` adjudicated all five
   inherited dispatch, SSE, cursor, container, and ACP cleanup-start findings `FIXED`, then found one new
   `WRONG/BLOCKER`: teardown could consume the one-shot removal while spawn was still parked before
@@ -914,11 +920,24 @@ automatically.
   dropping a parked spawn opens the fence. The first implementation exposed the existing off-runtime Drop
   regression **0/1**; the observer-free coordinator now awaits and discards the stable result internally so
   its throwaway runtime cannot drop an unpolled nested worker, and that test is green again.
-- `cargo fmt --all` plus the exact affected-package command pass **597 / 0 / 1 ignored**: ACP 210, API 58
-  plus one ignored local Ollama case, container 51, and core 278. The exact third-fold tree passes host
-  serial workspace **1,891 / 0 / 12 ignored** across 66 test/doc-test executables, workspace/all-target
-  check, warnings-denied all-target Clippy, release binary build, and repository hygiene **37/7**. Request
-  closure re-review 3. No R2c live/billable smoke has run, and no docs-link checker is present.
+- Fresh Sol/xhigh closure re-review 3 on `a3cafe61e810bcf93bad23095d162c9ff0b3e1ad` adjudicated the
+  spawn-settlement blocker `FIXED`, then returned `REVISE`: ACP per-session release incorrectly reaped the
+  one process shared by every session; same-object duplicate ACP JSON members collapsed before the
+  classifier could enforce uniqueness; and checked release lacked direct cold/warm prompt-installation
+  races.
+- The fourth fold makes ACP release session-scoped and leaves process/container cleanup to spawn failure,
+  escalation, retirement, and `Drop`. Two shared-backend regressions failed **0/2** before the fold and now
+  prove sequential reuse and an accepted concurrent S2 prompt survive S1 release. Production ACP
+  `spawn`/`from_child` now reject duplicate-bearing raw JSON before SDK `Value` normalization; its exact
+  regression failed **0/1** before the fold and retains a distinct-path negative control. Cold and warm
+  checked-release dispatch tests mutation-fail **0/2** when only their gate waits are removed and pass
+  **2/2** after restoration.
+- The fourth-fold affected-package command passes **602 / 0 / 1 ignored**: ACP 213, API 58 plus one
+  ignored local Ollama case, container 53, and core 278. The full host workspace passes serial
+  **1,896 / 0 / 12 ignored** across 66 test/doc-test executables. Workspace/all-target check,
+  warnings-denied all-target Clippy, release binary build, format/diff, and repository hygiene **37/7**
+  are clean. Request closure re-review 4. No R2c live/billable smoke has run, and no docs-link checker is
+  present.
 
 ## R2b completion gate
 

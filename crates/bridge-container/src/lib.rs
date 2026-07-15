@@ -2440,6 +2440,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum TeardownAction {
         Cancel,
+        ReleaseChecked,
         Retire,
     }
 
@@ -2483,6 +2484,9 @@ mod tests {
             tokio::spawn(async move {
                 match action {
                     TeardownAction::Cancel => backend.cancel(&session).await,
+                    TeardownAction::ReleaseChecked => {
+                        backend.release_session_checked(&session).await
+                    }
                     TeardownAction::Retire => backend.retire().await,
                 }
             })
@@ -2515,6 +2519,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_checked_release_waits_for_winning_inner_prompt_dispatch() {
+        assert_teardown_waits_for_inner_prompt_dispatch(false, TeardownAction::ReleaseChecked)
+            .await;
+    }
+
+    #[tokio::test]
     async fn warm_cancel_waits_for_winning_inner_prompt_dispatch() {
         assert_teardown_waits_for_inner_prompt_dispatch(true, TeardownAction::Cancel).await;
     }
@@ -2522,6 +2532,11 @@ mod tests {
     #[tokio::test]
     async fn warm_retire_waits_for_winning_inner_prompt_dispatch() {
         assert_teardown_waits_for_inner_prompt_dispatch(true, TeardownAction::Retire).await;
+    }
+
+    #[tokio::test]
+    async fn warm_checked_release_waits_for_winning_inner_prompt_dispatch() {
+        assert_teardown_waits_for_inner_prompt_dispatch(true, TeardownAction::ReleaseChecked).await;
     }
 
     async fn assert_reap_waits_until_spawn_can_no_longer_create_resource(
@@ -2585,6 +2600,9 @@ mod tests {
         let owner = backend.current_reap_owner(&session).unwrap();
         match action {
             TeardownAction::Cancel => backend.cancel(&session).await.unwrap(),
+            TeardownAction::ReleaseChecked => {
+                backend.release_session_checked(&session).await.unwrap()
+            }
             TeardownAction::Retire => backend.retire().await.unwrap(),
         }
 

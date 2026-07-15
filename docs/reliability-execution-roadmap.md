@@ -7,14 +7,16 @@
 - **Active slice:** R2b3 **IN PROGRESS** on `agent/reliability-r2b3-api-container`, based on
   `2e9ed6408162c5af760c70c9d27237330429e81a`
 - **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
-- **Current exact R2b3 gate:** **597 / 0 / 1 ignored** across `bridge-acp`, `bridge-api`,
+- **Current exact R2b3 gate:** **602 / 0 / 1 ignored** across `bridge-acp`, `bridge-api`,
   `bridge-container`, and `bridge-core`; format/diff clean
-- **Review state:** initial review and fresh Sol/xhigh closure re-reviews 1–2 returned `REVISE`; all three
-  folds, including spawn-settled removal ownership, are on the branch head and await closure re-review 3
-- **Full workspace gate:** the third-fold tree passes host serial **1,891 / 0 / 12 ignored**; workspace
-  check, all-target warnings-denied Clippy, release build, and repository hygiene **37/7** are clean
+- **Review state:** initial review and fresh Sol/xhigh closure re-reviews 1–3 returned `REVISE`; four
+  review folds are committed on the branch head, with the fourth addressing shared ACP process ownership,
+  raw duplicate JSON, and checked-release race coverage
+- **Full workspace gate:** the fourth-fold tree passes host serial **1,896 / 0 / 12 ignored** across 66
+  executables; workspace/all-target check, warnings-denied Clippy, release build, and repository hygiene
+  **37/7** are clean
 - **Current execution boundary:** no R2c live/billable smoke ran; no docs-link checker is present
-- **Next action:** run fresh full-branch Sol/xhigh closure re-review 3 before proposing merge
+- **Next action:** run fresh full-branch Sol/xhigh closure re-review 4 before proposing merge
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -55,7 +57,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
 | R2b2 — ACP/Fable lifecycle diagnostics | **MERGED** at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
-| R2b3 — API/container diagnostics | **IN PROGRESS** on `agent/reliability-r2b3-api-container`; affected packages **597 / 0 / 1 ignored**; full host workspace **1,891 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–2 `REVISE`, three folds on branch head; closure re-review 3 pending | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
+| R2b3 — API/container diagnostics | **IN PROGRESS** on `agent/reliability-r2b3-api-container`; affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–3 `REVISE`; four committed review folds; closure re-review 4 pending | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
@@ -203,7 +205,7 @@ Next action:
 
 ## Current handoff
 
-- R2b3 is implemented at `ed172ee726c06c3ee2e3f363c80178d367f8834a` with a local review fold on
+- R2b3 is implemented at `ed172ee726c06c3ee2e3f363c80178d367f8834a` with four review folds on
   `agent/reliability-r2b3-api-container`, based on `origin/main` at
   `2e9ed6408162c5af760c70c9d27237330429e81a`. The branch adds the API prompt acceptance
   barrier, bounded provider-error parsing and exact HTTP/ACP mapping, shared joinable container reaping,
@@ -216,12 +218,13 @@ Next action:
   production-timeout tests were absent. Its claim that observer failure should lose to a settled cleanup
   failure is not a defect: the design explicitly keeps a real journal persistence failure authoritative;
   container and ACP regressions now lock that precedence while retaining the typed controller result.
-- The local fold makes reservations own generation-bound controllers, seals retirement under the same
+- The first review fold makes reservations own generation-bound controllers, seals retirement under the same
   admission lock, rejects stale promotion/dispatch, fences a later generation until checked cleanup
-  acknowledges the prior owner, joins cold Forget and ACP checked `:ro` release, starts warm cleanup from
-  `Drop`, restores the exact public `ContainerReap { runtime, name, reap_fn }` shape while injecting a
+  acknowledges the prior owner, joins cold Forget, starts warm cleanup from `Drop`, restores the exact
+  public `ContainerReap { runtime, name, reap_fn }` shape while injecting a
   private typed production controller, and proves synchronous/asynchronous panic capture plus production
-  timeout child killing. Self-audit added cancel-during-turn-configuration coverage for cold and warm paths.
+  timeout child killing. Its earlier ACP checked-release process-ownership claim is superseded by design
+  v14 and the fourth fold. Self-audit added cancel-during-turn-configuration coverage for cold and warm paths.
   Fresh Sol/xhigh closure re-review 1 on `51dad0130998ffb5e3598e67a0df7ca1efba9a39` confirmed those
   findings closed but retained the final check-to-inner-prompt race: cancel/retire could return while the
   winning inner prompt was still installing. It also found that clean SSE EOF without terminal evidence
@@ -229,12 +232,12 @@ Next action:
   container cleanup could still be suppressed if a release waiter was canceled before an async lifecycle
   or state snapshot completed.
 - The second fold gives each exact container generation one dispatch gate. Prompt holds it only through
-  inner stream installation; teardown starts process-owned reaping first, joins the gate, removes only the
-  matching generation, and cancels the installed inner before returning. ACP and container checked/
-  observed release start reaping before their first cancellable await. API SSE now rejects clean EOF without
-  `[DONE]` or `finish_reason` while retaining finish-reason-only compatibility. Ten deterministic
-  pre-change-red regressions cover all four cold/warm cancel/retire schedules, both ACP and both container
-  cleanup-start schedules, incomplete EOF, and its terminal negative control.
+  inner stream installation; container teardown starts generation-owned reaping first, joins the gate,
+  removes only the matching generation, and cancels the installed inner before returning. API SSE now
+  rejects clean EOF without `[DONE]` or `finish_reason` while retaining finish-reason-only compatibility.
+  Ten deterministic pre-change-red regressions cover all four cold/warm cancel/retire schedules, the
+  then-current ACP cleanup-start contract, both container cleanup-start schedules, incomplete EOF, and its
+  terminal negative control.
 - On exact second-fold head `99cf8b02c73edc42b93dae6792a8701a5df13192`, the affected gate passed
   **594 / 0 / 1 ignored** (ACP 210, API 58 plus one ignored local Ollama test, container 48, core 278), and
   the host serial workspace passed
@@ -252,11 +255,24 @@ Next action:
   regressions failed **0/2** before the fold and now prove exactly one post-spawn removal; an abort edge
   proves dropping a parked spawn opens the fence. The fold also keeps off-runtime Drop alive through the
   bounded worker instead of losing a nested detached task.
-- The exact affected gate passes **597 / 0 / 1 ignored** (ACP 210, API 58 plus one ignored local Ollama
-  test, container 51, core 278). The exact third-fold tree passes host serial workspace
-  **1,891 / 0 / 12 ignored** across 66 test/doc-test executables, workspace/all-target check, all-target
-  warnings-denied Clippy, release build, and repository hygiene (**37** tracked artifacts / **7** validated
-  example configs). Run fresh Sol/xhigh closure re-review 3. Do not run R2c smoke or merge yet.
+- Fresh Sol/xhigh closure re-review 3 on `a3cafe61e810bcf93bad23095d162c9ff0b3e1ad` marked the inherited
+  spawn-settlement blocker `FIXED`, then returned `REVISE` with one `WRONG/BLOCKER`, one `WRONG/MINOR`,
+  and one `SMELL/MINOR`: per-session ACP release reaped the process shared by S1/S2; same-object duplicate
+  ACP JSON members collapsed before classification; and checked release lacked direct cold/warm
+  prompt-installation races.
+- The fourth fold makes ACP release session-scoped. Spawn failure, escalation, registry retirement, and
+  backend `Drop` exclusively own ACP process/container cleanup. Two shared-backend regressions failed
+  **0/2** before the fold and prove S2 remains promptable both after S1 release and while S1 is released
+  during accepted S2 work. Production ACP `spawn`/`from_child` validates unique raw JSON members before SDK
+  decoding; the duplicate regression failed **0/1** before the fold and includes a distinct-path negative
+  control. Cold/warm checked-release dispatch tests mutation-fail **0/2** with only the gate waits removed
+  and pass **2/2** after restoration.
+- The fourth-fold affected gate passes **602 / 0 / 1 ignored** (ACP 213, API 58 plus one ignored local
+  Ollama test, container 53, core 278), and host serial workspace passes **1,896 / 0 / 12 ignored** across
+  66 test/doc-test executables. Workspace/all-target check, warnings-denied all-target Clippy, release
+  build, format/diff, and repository hygiene (**37** tracked artifacts / **7** validated example configs)
+  are clean. Run fresh Sol/xhigh closure re-review 4. Do not run R2c smoke or
+  merge yet.
 - `origin/main` contains R2b2 at `0627e91144e79d9328ed9b5635033cf410c9e96e`. R2b2d was approved at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; the final full-branch review fold is committed at
   `a459b31de5a4665138a7330868e38dfb8992438b`, and the re-review-1 fold at

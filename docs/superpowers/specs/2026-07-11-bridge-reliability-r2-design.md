@@ -1,12 +1,13 @@
-# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v13)
+# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v14)
 
 - **Status:** R2a, R2b0, R2b1, and R2b2 merged; R2b3 IN PROGRESS on
-  `agent/reliability-r2b3-api-container` from `2e9ed640`; v13 is the design of record for R2b2–R2b3
-- **R2b3 review state:** implementation plus three review folds, affected-package gate **597 / 0 / 1
-  ignored**, full host workspace **1,891 / 0 / 12 ignored**, all-target check, warnings-denied Clippy,
-  release binary, and hygiene **37/7** complete; initial review and closure re-reviews 1–2 returned
-  `REVISE`, their findings are folded on the branch head, and fresh Sol/xhigh closure re-review 3 is
-  pending; no R2c smoke ran
+  `agent/reliability-r2b3-api-container` from `2e9ed640`; v14 is the design of record for R2b3
+- **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
+  re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
+  and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,
+  full host workspace **1,896 / 0 / 12 ignored** across 66 executables, all-target check,
+  warnings-denied Clippy, release build, format/diff, and hygiene **37/7**; closure re-review 4 is pending.
+  No R2c smoke ran.
 - **R2b2 review state:** R2b2d closure review 12 `APPROVE` at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; final full-R2b2 review 1 `REVISE`; cold-path fold
   `a459b31de5a4665138a7330868e38dfb8992438b`; closure re-review 1 `REVISE`; retry-veto fold
@@ -17,6 +18,7 @@
   `0627e91144e79d9328ed9b5635033cf410c9e96e`
 - **Current execution boundary:** no live/billable gate ran; no docs-link checker is present
 - **Date:** 2026-07-11
+- **Last amended:** 2026-07-14
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`
 - **R2b1 commit:** `7b788c1fa6b62459e8a8473ca853f9414b28bfbc`
@@ -324,6 +326,15 @@ remint window and a worktree retirement race. V13 closes both:
 The fresh Sol/xhigh v13 re-review adjudicated both findings `FIXED`, found no new issues, and returned
 `APPROVE`.
 
+R2b3 closure re-review 3 exposed one design-level ownership error and one raw-boundary ambiguity, plus a
+missing test pair. V14 closes all three without changing the approved R2b0/R2b2 worktree contract:
+
+| Finding | Disposition in v14 |
+|---|---|
+| **WRONG:** an ACP `:ro` backend multiplexes bridge sessions over one process, but per-session release was specified to reap that process-wide container | ACP checked/observed release cancels and removes only the named session. Spawn failure, process escalation, registry retirement, and backend `Drop` exclusively own the process/container reaper. Releasing S1 cannot terminate accepted or future work on S2. |
+| **WRONG:** the ACP SDK exposes error `data` as `serde_json::Value`, after same-object duplicate members have collapsed | Production `spawn` and `from_child` validate every raw ACP JSON frame for unique object members before SDK deserialization. Malformed or duplicate-bearing frames fail at the transport boundary; typed in-process transports cannot construct duplicate object members. |
+| **SMELL:** cancel/retire dispatch-gate tests did not directly cover checked release | Add one cold and one warm checked-release regression at the inner-prompt installation gate, and mutation-prove both fail when only that gate wait is removed. |
+
 The first bridge-mediated Sol/xhigh R2b1 implementation review returned `REVISE` with four `WRONG` and
 three `SMELL` findings. The implementation folds all seven before re-review:
 
@@ -513,9 +524,12 @@ may use a bounded in-memory observer even when no durable bridge task exists.
   backends also own a joinable `ReapController`. Its shared state is `not_started | running | succeeded |
   failed(code)`: `reap_observed` starts or joins one bounded removal attempt and returns the same typed
   result to every waiter, while `reap_detached` starts/joins without attaching an operation observer.
-  `ContainerRwBackend` and observed ACP `:ro` release await `reap_observed`; timeout, spawn, and nonzero
-  exit are visible teardown failures. `Drop`/registry retirement use `reap_detached`. A legacy `ReapFn`
-  adapter remains available to existing tests/constructors.
+  `ContainerRwBackend` owns one process per cold turn or warm session, so checked/observed release joins
+  that process cleanup and surfaces timeout, spawn, and nonzero-exit teardown failures. An ACP `:ro`
+  backend instead multiplexes many bridge sessions over one shared process: per-session ACP release never
+  starts its process/container reaper. ACP spawn failure, process escalation, registry retirement, and
+  backend `Drop` own that process cleanup and use detached observation because no single session/task owns
+  it. A legacy `ReapFn` adapter remains available to existing tests/constructors.
 - `WorktreeBackend` owns a sealed, per-session `WorktreeCleanupCoordinator`. Each `SessionCleanupCell`
   retains persistent configured ownership independently of any one configure admission, plus canonical
   source/path/sidecar and a monotonic requested strength (`forget < release`) until one observer-free
@@ -611,7 +625,7 @@ schemas:
 | Source | Accepted classification fields | Bounds / rejected forms |
 |---|---|---|
 | OpenAI-compatible HTTP error | JSON object `error.code` and `error.type`, each an exact lowercase string | Read at most 64 KiB; arrays, numbers, nested substitutes, trailing non-whitespace, and malformed/oversized bodies provide no classification evidence. |
-| ACP/JSON-RPC error | exact lowercase strings at `data.code`, `data.type`, `data.error.code`, or `data.error.type` | SDK message/`Display`/`Debug` and arbitrary data strings are prose; the JSON-RPC numeric code alone never means provider limit/overload. |
+| ACP/JSON-RPC error | exact lowercase strings at `data.code`, `data.type`, `data.error.code`, or `data.error.type` | Production raw frames require unique object-member names before SDK decoding. SDK message/`Display`/`Debug` and arbitrary data strings are prose; the JSON-RPC numeric code alone never means provider limit/overload. |
 | HTTP headers | none | Headers can contribute retry/reset hints below, but never select a failure class. |
 | Adapter stderr/stdout | none | Opaque process text never selects a failure class. |
 
@@ -648,7 +662,9 @@ Retry/reset hints are advisory and independently bounded:
 | single HTTP `Retry-After` | decimal seconds `0..2592000` or one IMF-fixdate no more than 30 days ahead | fills only a missing structured field |
 
 Duplicate values, sign/exponent/string coercion, every other rate-limit header, and malformed or
-out-of-range values are omitted. A valid structured value wins over a conflicting `Retry-After`; the
+out-of-range values are omitted. HTTP detects duplicate normative values in its bounded parser; ACP
+rejects any duplicate-bearing raw frame before the SDK can collapse it into a map. A valid structured
+value wins over a conflicting `Retry-After`; the
 header is omitted and `upstream.retry_metadata_conflict` is recorded. Hints never change `Fatal`, trigger
 sleep/retry, or turn an otherwise `unknown` failure into `provider_limit`/`overloaded`. Table-driven
 fixtures cover every listed token, status mismatch, bare status, flat/nested ACP conflict, body-size
