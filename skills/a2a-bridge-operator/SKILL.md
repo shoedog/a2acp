@@ -73,7 +73,8 @@ attempt writes its artifact before nonzero exit; do not automatically rerun it b
 that prompt acceptance was possible.
 Use `--include-redacted-stderr` only when explicitly needed: it adds bounded opaque text labeled
 `best_effort`; default evidence retains stderr metadata without text. Without `--out`, stdout is reserved
-for the JSON artifact.
+for the JSON artifact. On Unix, an explicit output is created or tightened to owner-only mode `0600`
+before agent resolution or spawn; refusal to apply that restriction is a pre-attempt failure.
 
 When an agent runtime launches the command, distinguish its managed sandbox from approved host
 execution. A sandboxed ACP failure does not prove that the computer lacks DNS, egress, or authentication;

@@ -8,8 +8,9 @@
 - **Branch:** `agent/reliability-r2c-live-smoke`
 
 Implementation is active on the named branch. Deterministic CLI, terminal, timeout, artifact/redaction, and
-API tool-observation regressions must be green before any live/billable acceptance lane is authorized. No
-live smoke has run.
+API tool-observation regressions must be green before any live/billable acceptance lane is authorized. One
+authorized host-Codex smoke has run; its provider/lifecycle evidence passed, but its artifact-permission
+defect keeps the overall gate open. No replay has run.
 
 ## In-progress checkpoint — 2026-07-15
 
@@ -29,8 +30,11 @@ live smoke has run.
   known secret. The tightened regression now seeds the real process-ring redactor with the raw credential,
   emits its base64-transformed form, and proves the raw value is absent while the transformed value remains
   covered only by the honest `best_effort` label.
-- Still pending: separate operator authorization for an exact live lane, the authorized artifact-exact
-  smoke, and final status/evidence review. No live/billable smoke has run, and this checkpoint is not
+- The owner-only artifact fold passes smoke unit **18 / 0 / 0 ignored**, smoke CLI **10 / 0 / 0 ignored**,
+  full host-serial workspace **1,931 / 0 / 12 ignored** across 68 executables, workspace/all-target check,
+  warnings-denied Clippy, release build, format/diff checks, and repository hygiene **37/7**.
+- Still pending: fresh review for the artifact-permission fold, new explicit operator authorization for a
+  fixed-candidate lane, that artifact-exact smoke, and final status/evidence review. This checkpoint is not
   completion evidence.
 
 ### Review fold 1 — 2026-07-15
@@ -51,7 +55,23 @@ Fresh bridge-mediated Fable/xhigh closure re-review returned `APPROVE` on `0e3b8
 WRONG findings were fixed with pre-fold-failing regressions, all three inherited SMELL findings were
 addressed, and the unobserved direct cancel was adjudicated as the safe choice under timeout-abandoned
 teardown futures. The review's sole new item was the non-blocking transformed-secret coverage gap folded
-above. No live/billable smoke has run.
+above. At that review checkpoint, no live/billable smoke had run.
+
+### Authorized live attempt 1 — 2026-07-15 — gate not accepted
+
+The operator authorized exactly one host Codex lane from candidate `ce605eaf`: ACP adapter 1.1.2, Codex
+0.144.1, raw `gpt-5.6-sol`, `xhigh`, explicit `read-only`, trusted R2c worktree, 120-second bound, default
+metadata-only stderr, and no retry/fallback. The fixed prompt completed in 4.872 seconds with one configure,
+one accepted prompt, terminal `end_turn`, exact four-byte `PONG`, zero tool/permission events, zero dropped
+diagnostics, and completed release/retirement. The artifact content contract passed.
+
+The overall lane is nevertheless **not accepted**: the new explicit `--out` artifact inherited umask and
+was created mode `0644`, contradicting the private-artifact contract. It was immediately restricted to
+`0600`; no prompt was replayed. Root cause was ordinary `OpenOptions::create(true)` without an explicit
+mode or permission tightening. The fold creates new Unix artifacts as `0600` and tightens a pre-existing
+broader destination before truncation or provider spawn. A deterministic edge regression pre-creates
+`0644`, so it fails on `ce605eaf` independently of the test runner's umask; the new-file CLI case also
+asserts `0600`. The fold passes the complete deterministic gate set recorded above.
 
 R2c turns R2b's diagnostic record into one deliberate end-to-end operator probe. It is the first R2
 slice that is intentionally billable. It is not a generic prompt command, workflow runner, retry
@@ -132,6 +152,8 @@ SDK/stderr text. Output serialization happens before the CLI selects its nonzero
 - exact PONG + terminal success; PONG without terminal, wrong text, tool output, cancellation, and clean
   EOF without terminal all fail;
 - failure artifact is valid and emitted before nonzero exit;
+- a new explicit output artifact is owner-only, and a pre-existing broader output is restricted before
+  attempt execution;
 - default artifact has stderr metadata but no text; opt-in is bounded and labeled `best_effort`;
 - provider-limit reset/retry fields survive when structured but cause no sleep/retry/reroute;
 - all secret redaction, `Display`/`Debug`, and four-tier execution guardrails remain intact;

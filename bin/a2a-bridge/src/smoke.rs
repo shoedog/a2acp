@@ -5,6 +5,8 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1305,18 +1307,17 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV1 {
 
 fn prepare_artifact_file(out: Option<&Path>, config: &Path) -> Result<Option<File>, BoxError> {
     out.map(|path| {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .map_err(|error| -> BoxError {
-                format!(
-                    "smoke: cannot open artifact {} before attempt: {error}",
-                    path.display()
-                )
-                .into()
-            })?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path).map_err(|error| -> BoxError {
+            format!(
+                "smoke: cannot open artifact {} before attempt: {error}",
+                path.display()
+            )
+            .into()
+        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -1324,6 +1325,20 @@ fn prepare_artifact_file(out: Option<&Path>, config: &Path) -> Result<Option<Fil
                 if config.dev() == artifact.dev() && config.ino() == artifact.ino() {
                     return Err("smoke: --out must not alias --config".into());
                 }
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| -> BoxError {
+                    format!(
+                        "smoke: cannot restrict artifact {} before attempt: {error}",
+                        path.display()
+                    )
+                    .into()
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            if artifact_aliases_config(config, path) {
+                return Err("smoke: --out must not alias --config".into());
             }
         }
         file.set_len(0).map_err(|error| -> BoxError {
@@ -2236,10 +2251,15 @@ mod tests {
     async fn output_file_contains_one_machine_readable_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("smoke.json");
+        std::fs::write(&path, b"stale artifact").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let artifact = ArtifactState::new(&args()).finalize(false).await;
         let mut file = prepare_artifact_file(Some(&path), Path::new("/not-the-config"))
             .unwrap()
             .unwrap();
+        #[cfg(unix)]
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         write_artifact(&artifact, Some(&mut file)).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();

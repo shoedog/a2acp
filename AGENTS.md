@@ -146,6 +146,8 @@ acknowledgement and malformed options refuse before config/registry/spawn work. 
 preflight passes, an acknowledged attempt writes its versioned artifact before returning nonzero.
 Without `--out`, stdout is JSON only; human direction goes to stderr. Do not pass
 `--include-redacted-stderr` unless bounded best-effort-redacted process text is specifically required.
+On Unix, an explicit output is created or tightened to owner-only mode `0600` before agent resolution or
+spawn; the command refuses if that restriction cannot be applied.
 
 Run `validate`, `doctor --json`, and `models --agent <id> --json` first. Never use a stale installed binary
 for compatibility evidence, and never automatically rerun a failed or timed-out smoke: the first prompt may

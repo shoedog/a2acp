@@ -166,9 +166,14 @@ fn explicit_out_gets_failure_artifact_and_stdout_stays_empty() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let artifact: serde_json::Value =
-        serde_json::from_slice(&fs::read(artifact_path).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(&artifact_path).unwrap()).unwrap();
     assert_eq!(artifact["schema_version"], 1);
     assert_eq!(artifact["success"], false);
+    assert_eq!(
+        fs::metadata(artifact_path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "a newly created artifact must be owner-only"
+    );
 }
 
 #[test]
